@@ -61,11 +61,18 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
     STUDY_SCHEMA_ATTR,
-    _outcome_sequence_counts,
+    STUDY_SCHEMA_VERSION,
     _recovered_trial_state,
     _study_schema_supported,
+    _unique_trial_outcomes,
 )
-from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.errors import (
+    OTHER_FORMAT_STEP,
+    OperatorAction,
+    PhaseSweepError,
+    format_found,
+    format_reads,
+)
 from phasesweep.runtime.files import fsync_directory, journal_file_path, try_flock, unlock_file
 from phasesweep.runtime.shutdown import defer_shutdown_signals
 
@@ -634,10 +641,11 @@ def _validate_storage_versions(versions: Iterable[tuple[str, object, bool]]) -> 
         if not _study_schema_supported(version, has_trials)
     ]
     if unsupported:
-        detail = ", ".join(f"{name!r} ({version!r})" for name, version in unsupported)
+        detail = ", ".join(f"{name!r} {format_found(version)}" for name, version in unsupported)
         raise StudySchemaMismatchError(
             "The selected local storage ledger contains unsupported PhaseSweep study "
-            f"state: {detail}. Nothing was written.",
+            f"state: {detail}; {format_reads(STUDY_SCHEMA_VERSION)}. Nothing was written.",
+            remediation=OTHER_FORMAT_STEP,
         )
 
 
@@ -730,7 +738,7 @@ def _phase_trial_stats(
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_TrialRef] = []
     published_trial_available = False
-    sequence_counts = _outcome_sequence_counts(trials)
+    outcomes = _unique_trial_outcomes(study_name, trials)
     for trial in trials:
         if published_trial is not None and _published_trial_matches(trial, published_trial):
             published_trial_available = True
@@ -748,7 +756,7 @@ def _phase_trial_stats(
                 trial_number=trial.number,
                 generation_id=generation_id if isinstance(generation_id, str) else None,
                 attempt_id=attempt_id if isinstance(attempt_id, str) else None,
-                recovers_as=_recovered_trial_state(trial, sequence_counts),
+                recovers_as=_recovered_trial_state(trial, outcomes.get(trial.number)),
             )
         )
     return _PhaseTrialStats(

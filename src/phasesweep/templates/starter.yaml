@@ -1,10 +1,8 @@
 # phasesweep template: two chained phases on the packaged toy trainer, the smallest complete setup
 # Details on any key: phasesweep explain <key>, e.g. phasesweep explain 'phases[].sampler'
 #
-# Runnable PhaseSweep starter. The human owns this file: review trainer commands,
-# paths, search spaces, and permissions before launching real workloads.
-# To use your own trainer, replace trial_command, the trainer_config keys and the
-# metric extractor.
+# Runnable PhaseSweep starter. To use your own trainer, replace trial_command,
+# the trainer_config keys and the metric extractor.
 experiment: phasesweep_starter
 storage: auto
 provenance:
@@ -20,9 +18,10 @@ execution:
   # write inherit_env: [PYTHONPATH]; inherit_env: all passes the whole shell.
   inherit_env: none
 
-# This trainer ships inside the installed PhaseSweep package. Replace it with
-# your own command after the local smoke test.
-trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
+# This trainer ships inside the installed PhaseSweep package as the
+# phasesweep-fake-train console script. Replace it with your own command after
+# the local smoke test.
+trial_command: "phasesweep-fake-train --config {config_path}"
 
 # This is the trainer's ordinary base configuration. PhaseSweep copies it for
 # every trial, applies inherited/fixed/sampled dotted-path values, and passes
@@ -41,7 +40,7 @@ metric:
   # without a PhaseSweep reporting import.
   name: eval_loss
   goal: minimize
-  # Goal ranks trial scalars; the trainer owns evaluation and aggregation.
+  # Goal ranks trial scalars.
   extractor:
     type: json_envelope
     path: result.json
@@ -52,7 +51,9 @@ metric:
     expected_step: 100
 
 phases:
+  # The toy trainer uses only the CPU. For a GPU trainer, remove both gpu_policy entries to enable leasing.
   - name: depth
+    gpu_policy: none
     comment: "Compare two model depths before tuning the learning rate."
     n_trials: 2
     sampler: { type: grid }
@@ -60,6 +61,7 @@ phases:
       model.n_layers: { type: categorical, choices: [6, 8] }
 
   - name: learning_rate
+    gpu_policy: none
     comment: "Keep the winning depth fixed and compare two learning rates."
     inherits: [depth]
     n_trials: 2

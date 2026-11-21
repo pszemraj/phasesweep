@@ -23,7 +23,7 @@ from phasesweep.runtime.json import (
     json_text,
     json_text_map,
 )
-from phasesweep.runtime.remote_worker import run_worker
+from phasesweep.runtime.remote_worker import report_reserve, run_worker
 from phasesweep.runtime.time import utc_now_iso
 
 if TYPE_CHECKING:
@@ -44,10 +44,16 @@ if TYPE_CHECKING:
     )
 
 _SDK_RETRIES = "MLFLOW_HTTP_REQUEST_MAX_RETRIES"
-# Time a capture or find keeps for its last poll and its report before the parent stops it.
+# Once polling stops, a capture still reads every selected metric's history and the run again,
+# each an SDK request with its own retries, before it reports.
 _REPORT_SECONDS = 5.0
-# Worker response statuses; "unknown" reports a creation that may have taken effect.
-_STATUSES = frozenset({"ok", "error", "unknown"})
+# Worker response statuses; "unavailable" reports a request the tracker gave no answer to,
+# "unknown" a creation that may have taken effect, and "objective_missing" a finished managed
+# run without the configured objective metric.
+_STATUSES = frozenset({"ok", "error", "unavailable", "unknown", "objective_missing"})
+# Server error codes that answer the request about its subject: the experiment or run is gone,
+# or a value was rejected. Every other code says the tracker could not serve the request.
+_ANSWERED_CODES = frozenset({"RESOURCE_DOES_NOT_EXIST", "NOT_FOUND", "INVALID_PARAMETER_VALUE"})
 # Server verdicts that reject a creation request outright, so no run was created.
 _REJECTED_CREATION = frozenset(
     {
@@ -67,6 +73,21 @@ class OperationOutcomeUnknownError(RuntimeError):
 
 class OperationRejectedError(RuntimeError):
     """A confirmed request rejection, including creation refused before sending."""
+
+
+class OperationUnavailableError(OperationRejectedError):
+    """The tracker gave no answer: it was unreachable, refused access, or lacked its SDK.
+
+    No request reached a server that acted on it, so it is a rejection to every caller;
+    an evidence read additionally learns nothing about its run.
+    """
+
+
+class ManagedObjectiveMissingError(ValueError):
+    """A finished managed run lacks the configured objective metric.
+
+    The trainer logged the objective under another key, into another run, or not at all.
+    """
 
 
 class _SdkExperiment(Protocol):
@@ -312,7 +333,10 @@ def request_operation(
     :raises UnsafeProcessCleanupError: The worker's cleanup is uncertain, so it may still run.
     :raises OperationOutcomeUnknownError: The worker crashed, its response could not be read
         or trusted, or it reported that a creation may have taken effect.
+    :raises OperationUnavailableError: The worker reported that the tracker gave no answer.
     :raises OperationRejectedError: The worker reported that the request failed.
+    :raises ManagedObjectiveMissingError: The worker reported that a finished managed run lacks
+        the configured objective metric.
     :return JsonObject: Successful public-client response.
     """
     try:
@@ -351,6 +375,10 @@ def request_operation(
         ) from exc
     if status == "error":
         raise OperationRejectedError(message)
+    if status == "objective_missing":
+        raise ManagedObjectiveMissingError(message)
+    if status == "unavailable":
+        raise OperationUnavailableError(message)
     raise OperationOutcomeUnknownError(message)
 
 
@@ -485,6 +513,20 @@ def _failure_cause(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {code}" if code else type(exc).__name__
 
 
+def _creation_identity(client: _SdkClient, request: CreateRequest | FindRequest) -> RunIdentity:
+    """Confirm that the configured target still names the recorded MLflow experiment.
+
+    :param _SdkClient client: Public MLflow client in the supervised worker.
+    :param CreateRequest | FindRequest request: Worker target and creation identity.
+    :raises ValueError: The configured experiment contradicts the identity.
+    :return RunIdentity: The verified identity.
+    """
+    identity = request["binding"]
+    if _resolve(client, request["settings"]) != identity["experiment_id"]:
+        raise ValueError("MLflow experiment resolves differently from the creation intent.")
+    return identity
+
+
 def _create(client: _SdkClient, request: CreateRequest) -> RunBinding:
     """Find or create the run carrying an exact identity, without SDK creation retries.
 
@@ -493,14 +535,14 @@ def _create(client: _SdkClient, request: CreateRequest) -> RunBinding:
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param CreateRequest request: Trusted target and identity.
-    :raises ValueError: More than one run carries the identity, or a run found by
-        search contradicts it.
+    :raises ValueError: The configured experiment or matching run contradicts the identity,
+        or more than one run carries it.
     :raises OperationOutcomeUnknownError: The creation request failed without a server
         rejection, or the run it created fails verification.
     :return RunBinding: Verified remote run binding.
     """
-    experiment_id = _resolve(client, request["settings"])
-    identity: RunIdentity = {**request["binding"], "experiment_id": experiment_id}
+    identity = _creation_identity(client, request)
+    experiment_id = identity["experiment_id"]
     run = _identity_run(client, identity)
     created = run is None
     if run is None:
@@ -540,12 +582,12 @@ def _find(client: _SdkClient, request: FindRequest) -> FindResult:
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param FindRequest request: Trusted target, identity, and polling bound.
-    :raises ValueError: More than one run carries the identity, or the run contradicts it.
+    :raises ValueError: The configured experiment or matching run contradicts the identity,
+        or more than one run carries it.
     :return FindResult: The verified binding, or that no run carries the identity.
     """
-    experiment_id = _resolve(client, request["settings"])
-    identity: RunIdentity = {**request["binding"], "experiment_id": experiment_id}
-    reserve = min(_REPORT_SECONDS, request["settings"]["timeout_seconds"] / 2)
+    identity = _creation_identity(client, request)
+    reserve = report_reserve(request["settings"]["timeout_seconds"], _REPORT_SECONDS)
     stop = request["timeout_at"] - reserve
     while True:
         run = _identity_run(client, identity)
@@ -605,7 +647,7 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     binding, query = request["binding"], request["query"]
     # Stop just before timeout_at, a shared monotonic instant, so the worker can report
     # the run's state; a nearer phase or run deadline still stops it first.
-    reserve = min(_REPORT_SECONDS, request["settings"]["timeout_seconds"] / 2)
+    reserve = report_reserve(request["settings"]["timeout_seconds"], _REPORT_SECONDS)
     stop = request["timeout_at"] - reserve
     while True:
         run = client.get_run(binding["run_id"])
@@ -634,13 +676,7 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
                     and MlflowExtractor.model_validate(query["objective"]).metric_key
                     not in run.data.metrics
                 ):
-                    lacking += (
-                        " Check whether the objective was logged under another key or logging "
-                        "went to another run. Log the configured metric key into the supplied "
-                        "run; after end_run() or another start_run(), resume its saved ID. "
-                        "Give a logger the supplied run ID: read MLFLOW_RUN_ID before any "
-                        "MLflow call, or use mlflow.active_run().info.run_id while the run is active."
-                    )
+                    raise ManagedObjectiveMissingError(lacking)
                 raise ValueError(lacking)
             observations: dict[str, Observation] = {}
             for key in keys:
@@ -823,6 +859,10 @@ class _Arguments(argparse.Namespace):
 def main(argv: list[str] | None = None) -> int:
     """Run an internal request without leaking SDK error details.
 
+    A missing SDK or dependency, a refused connection, a request with no response, and a
+    server error other than a verdict on the experiment, run or value report ``unavailable``;
+    other failures, a run that ended FAILED or KILLED and missing evidence report ``error``.
+
     :param list[str] | None argv: Private request/response paths.
     :return int: Zero after a structured response, 130 on interruption.
     """
@@ -839,13 +879,15 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError as exc:
         missing = exc.name or "an optional dependency"
         response = {
-            "status": "error",
+            "status": "unavailable",
             "message": "MLflow requires phasesweep[mlflow] in the controller environment."
             if missing.partition(".")[0] == "mlflow"
             else f"MLflow {request['action']} needs Python module {missing!r}, which is not installed in the controller environment.",
         }
     except OperationOutcomeUnknownError as exc:
         response = {"status": "unknown", "message": str(exc)}
+    except ManagedObjectiveMissingError as exc:
+        response = {"status": "objective_missing", "message": str(exc)}
     except (ValueError, TimeoutError) as exc:
         response = {"status": "error", "message": str(exc)}
     except KeyboardInterrupt:
@@ -879,8 +921,15 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             advice = "check tracking access and credentials"
+        # A refused connection, a request that got no response, or a server error that is not
+        # a verdict on the experiment, run or value leaves the request unanswered.
+        unanswered = (
+            isinstance(failure, ConnectionRefusedError)
+            or (isinstance(exc, RequestException) and exc.response is None)
+            or (isinstance(exc, MlflowException) and code not in _ANSWERED_CODES)
+        )
         response = {
-            "status": "error",
+            "status": "unavailable" if unanswered else "error",
             "message": f"MLflow {request['action']} failed ({cause}); {advice}.",
         }
     private_atomic_write_text(args.response, json.dumps(response, allow_nan=False))

@@ -5,7 +5,7 @@ storage: journal:////tmp/phasesweep-mcp-tiny-lm/phases.journal
 provenance:
   revision: "phasesweep-fake-trainer-v1"
 workdir: /tmp/phasesweep-mcp-tiny-lm/runs
-trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
+trial_command: "phasesweep-fake-train --config {config_path}"
 trainer_config:
   model:
     n_layers: 8
@@ -35,7 +35,9 @@ constraints:
     max: 16777216
 
 phases:
+  # The toy trainer runs on CPU. For a GPU trainer, remove gpu_policy: none to enable leasing.
   - name: depth
+    gpu_policy: none
     comment: "Settle on a network depth before tuning anything else."
     n_trials: 4
     sampler:
@@ -44,6 +46,7 @@ phases:
       model.n_layers: { type: categorical, choices: [4, 8, 12, 16] }
 
   - name: lr
+    gpu_policy: none
     comment: "With depth locked, find the learning rate."
     inherits: [depth]
     n_trials: 12
@@ -55,6 +58,7 @@ phases:
       optimizer.lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
 
   - name: regularization
+    gpu_policy: none
     comment: "Last, jointly tune weight_decay and dropout because they interact."
     inherits: [lr]
     n_trials: 16

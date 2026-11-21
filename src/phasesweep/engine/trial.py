@@ -17,32 +17,34 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from stat import S_ISDIR
 from typing import Any
 
 import optuna
 
 from phasesweep.config.common import check_bounds
 from phasesweep.config.models import TRIAL_BOUND_ENV, Experiment, Observation, _wandb_query
+from phasesweep.engine.errors import LaunchEnvironmentError
 from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.state import (
+    CONSTRAINT_PREFIX,
     DURATION_ATTR,
     FEASIBLE_ATTR,
     GATES_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
+    OBSERVED_PREFIX,
     OVERRIDES_ATTR,
     RETURN_CODE_ATTR,
     TRAINER_INPUT_SCHEMA_VERSION,
     constraint_attr,
     observed_attr,
 )
-from phasesweep.errors import (
-    OperatorAction,
-    PhaseSweepError,
-)
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
+    EvidenceUnreadableError,
     ExtractorError,
     GateResult,
+    MlflowObjectiveMissingError,
     TrialContext,
     evaluate_gates,
     locate_objective_position,
@@ -116,6 +118,9 @@ class TrialResult:
     objective_provenance: dict[str, Any] | None = None
     # True only when the phase/run deadline caused the failure.
     deadline_exhausted: bool = False
+    # True only when every failure is a tracker that gave no answer, so a persistent
+    # study's finished training waits for a later read instead of being recorded as failed.
+    evidence_unreadable: bool = False
     # Report-only values read after acceptance, by observation name. A name
     # whose extraction failed or came out non-finite is absent.
     observed: dict[str, float] = field(default_factory=dict)
@@ -124,34 +129,47 @@ class TrialResult:
 def record_trial_result(trial: optuna.Trial, result: TrialResult, *, overrides_json: str) -> None:
     """Persist extracted evidence before committing a trial's terminal outcome.
 
+    Replace optional attributes from an earlier extraction with this result's values.
+
     :param optuna.Trial trial: Active trial receiving extracted evidence.
     :param TrialResult result: Canonical extraction result.
     :param str overrides_json: Fully composed trainer overrides serialized as JSON.
     """
+    previous = trial.user_attrs
     trial.set_user_attr(FEASIBLE_ATTR, result.feasible)
     trial.set_user_attr(RETURN_CODE_ATTR, result.return_code)
     trial.set_user_attr(DURATION_ATTR, result.duration_seconds)
     trial.set_user_attr(OVERRIDES_ATTR, overrides_json)
+    optional: dict[str, str | float | None] = {}
     if result.objective_provenance is not None:
-        trial.set_user_attr(
-            OBJECTIVE_PROVENANCE_ATTR, json.dumps(result.objective_provenance, sort_keys=True)
+        optional[OBJECTIVE_PROVENANCE_ATTR] = json.dumps(
+            result.objective_provenance, sort_keys=True
         )
     if result.gate_results is not None:
-        trial.set_user_attr(
-            GATES_ATTR,
-            json.dumps(
-                [
-                    {"type": gate.gate_type, "passed": gate.passed, "detail": gate.detail}
-                    for gate in result.gate_results
-                ],
-                sort_keys=True,
-            ),
+        optional[GATES_ATTR] = json.dumps(
+            [
+                {"type": gate.gate_type, "passed": gate.passed, "detail": gate.detail}
+                for gate in result.gate_results
+            ],
+            sort_keys=True,
         )
     if result.failure_reason is None:
-        for name, value in result.constraints.items():
-            trial.set_user_attr(constraint_attr(name), value)
-        for name, value in result.observed.items():
-            trial.set_user_attr(observed_attr(name), value)
+        optional.update(
+            {constraint_attr(name): value for name, value in result.constraints.items()}
+        )
+        optional.update({observed_attr(name): value for name, value in result.observed.items()})
+    for key, value in previous.items():
+        if (
+            (
+                key in {OBJECTIVE_PROVENANCE_ATTR, GATES_ATTR}
+                or key.startswith((CONSTRAINT_PREFIX, OBSERVED_PREFIX))
+            )
+            and key not in optional
+            and value is not None
+        ):
+            optional[key] = None
+    for key, value in optional.items():
+        trial.set_user_attr(key, value)
 
 
 # How far back from the end of ``stderr.log`` a failed trial's reason reads.
@@ -163,10 +181,11 @@ _STDERR_QUOTE_CHARS = 200
 # A terminal color or cursor sequence, which would otherwise leave its ``[31m`` residue.
 _ANSI_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
-# Stderr patterns eligible for the narrowed-environment hint.
+# Stderr patterns eligible for the narrowed-environment hint. ``sh: 1: NAME: not found``
+# is dash's wording for a program missing from PATH.
 _MISSING_ENVIRONMENT_STDERR = re.compile(
     r"ModuleNotFoundError|ImportError|No module named"
-    r"|command not found|No such file or directory"
+    r"|command not found|sh: \d+: .+: not found|No such file or directory"
     r"|KeyError: ['\"][A-Z][A-Z0-9_]*['\"]"
     r"|(?i:environment variable|is not set)"
 )
@@ -205,6 +224,8 @@ def _environment_identity(
     :param Experiment experiment: Experiment supplying the environment contract.
     :param str phase_name: Phase whose remote consumers normalize W&B defaults.
     :param bool require_wandb_online: Reject offline or disabled W&B for new remote work.
+    :raises LaunchEnvironmentError: The managed W&B bindings conflict with the configured
+        environment, or W&B logging is offline or disabled.
     :return EnvironmentIdentity: Tracked values, their digest, and the full launch environment.
     """
     cohort_names = set(experiment.execution.tracked_env_names()) | set(experiment.env)
@@ -234,7 +255,7 @@ def _environment_identity(
                 require_online=require_wandb_online,
             )
         except ValueError as exc:
-            raise PhaseSweepError(str(exc), action=OperatorAction.FIX_CONFIG) from exc
+            raise LaunchEnvironmentError(str(exc)) from exc
     elif "WANDB_RUN_ID" not in experiment.env:
         # Track explicit trainer-owned W&B identities, but exclude inherited ids from the cohort.
         env.pop("WANDB_RUN_ID", None)
@@ -423,11 +444,60 @@ def _warn_narrowed_environment_exit(
     )
 
 
+def _warn_managed_objective_missing(
+    *, experiment: Experiment, phase_name: str, trial_id: int
+) -> None:
+    """Explain the managed one-run contract on a phase's first trial that lacks its objective.
+
+    :param Experiment experiment: Experiment used for the warning identity.
+    :param str phase_name: Phase used for the warning identity.
+    :param int trial_id: Trial whose managed run finished without the objective metric.
+    """
+    _warn_once(
+        log,
+        ("mlflow-objective-missing", experiment.experiment, phase_name),
+        "[%s/trial_%d] the managed MLflow run finished without the objective metric. Check "
+        "whether the objective was logged under another key or logging went to another run. "
+        "Log the configured metric key into the supplied run; after end_run() or another "
+        "start_run(), resume its saved ID. Give a logger the supplied run ID: read "
+        "MLFLOW_RUN_ID before any MLflow call, or use mlflow.active_run().info.run_id while "
+        "the run is active. This hint is shown once per phase.",
+        phase_name,
+        trial_id,
+    )
+
+
 class TrialExecutionError(RuntimeError):
     """Raised when a trial subprocess crashes or extraction fails.
 
     Caught by ``study.optimize`` to record the trial as FAIL.
     """
+
+
+def _missing_trainer_cwd(experiment: Experiment) -> str | None:
+    """Describe a configured trainer directory that is not a directory on this host.
+
+    :param Experiment experiment: Experiment whose ``execution.cwd`` is checked.
+    :raises OSError: The directory cannot be inspected for a reason other than absence.
+    :return str | None: The diagnostic, or ``None`` when ``execution.cwd`` is unset or names
+        a directory.
+    """
+    trainer_cwd = experiment.execution.resolved_cwd()
+    if trainer_cwd is None:
+        return None
+    try:
+        is_directory = S_ISDIR(trainer_cwd.stat().st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        is_directory = False
+    if is_directory:
+        return None
+    configured = experiment.execution.cwd
+    if configured == str(trainer_cwd):
+        return f"execution.cwd is {configured!r}, which is not a directory on this host."
+    return (
+        f"execution.cwd {configured!r} resolves to {trainer_cwd}, which is not a "
+        "directory on this host."
+    )
 
 
 def _failed_trial(
@@ -438,6 +508,7 @@ def _failed_trial(
     constraints: dict[str, float] | None = None,
     gate_results: list[GateResult] | None = None,
     deadline_exhausted: bool = False,
+    evidence_unreadable: bool = False,
     objective_provenance: dict[str, Any] | None = None,
 ) -> TrialResult:
     """Build a ``TrialResult`` representing a failed trial.
@@ -453,6 +524,7 @@ def _failed_trial(
     :param list[GateResult] | None gate_results: Evidence gate results collected before the
         failure, if any.
     :param bool deadline_exhausted: Whether the phase/run deadline caused the failure.
+    :param bool evidence_unreadable: Whether every failure is a tracker that gave no answer.
     :param dict[str, object] | None objective_provenance: Frozen evidence already captured
         before a later gate failed.
     :return TrialResult: A result with ``metric=None`` and ``feasible=False``.
@@ -466,6 +538,7 @@ def _failed_trial(
         failure_reason=failure_reason,
         gate_results=gate_results,
         deadline_exhausted=deadline_exhausted,
+        evidence_unreadable=evidence_unreadable,
         objective_provenance=objective_provenance,
     )
 
@@ -611,12 +684,11 @@ def launch_trial(
         env["MLFLOW_EXPERIMENT_ID"] = json_text(expected, "experiment_id")
         if experiment.mlflow.run_mode == "managed":
             env["MLFLOW_RUN_ID"] = read_binding(workdir)["run_id"]
+    # The launch preflight checked this directory, but it can vanish while a phase runs.
+    missing_cwd = _missing_trainer_cwd(experiment)
+    if missing_cwd is not None:
+        raise TrialExecutionError(missing_cwd)
     trainer_cwd = experiment.execution.resolved_cwd()
-    if trainer_cwd is not None and not trainer_cwd.is_dir():
-        raise TrialExecutionError(
-            f"execution.cwd {experiment.execution.cwd!r} resolves to {trainer_cwd}, which is not a "
-            "directory on this host."
-        )
     env["PHASESWEEP_TRIAL_DIR"] = str(workdir)
     env["PHASESWEEP_TRIAL_ID"] = str(trial_id)
     env["PHASESWEEP_PHASE"] = phase_name
@@ -786,20 +858,34 @@ def extract_trial_result(
             value = run_extractor(executed.ctx, extractor, deadline=deadline, provenance=provenance)
         except ExtractorError as exc:
             exhausted = isinstance(exc, DeadlineExceededError)
+            unreadable = isinstance(exc, EvidenceUnreadableError)
             log.warning(
                 "[%s/trial_%d] %s extraction %s: %s",
                 executed.ctx.phase,
                 executed.ctx.trial_id,
                 log_label,
-                "exceeded deadline" if exhausted else "failed",
+                "exceeded deadline"
+                if exhausted
+                else "got no answer from the tracker"
+                if unreadable
+                else "failed",
                 exc,
             )
+            if isinstance(exc, MlflowObjectiveMissingError):
+                _warn_managed_objective_missing(
+                    experiment=experiment,
+                    phase_name=executed.ctx.phase,
+                    trial_id=executed.ctx.trial_id,
+                )
+            # Gates run only on a result that has its objective. A trial left pending by an
+            # unreadable tracker meets them when a later read answers, with the same verdict.
             return _failed_trial(
                 rc=rc,
                 duration=duration,
                 failure_reason=f"{label}: {exc}",
                 constraints=constraint_values,
                 deadline_exhausted=exhausted,
+                evidence_unreadable=unreadable,
             )
         if not math.isfinite(value):
             log.warning(
@@ -864,6 +950,8 @@ def extract_trial_result(
             constraints=constraint_values,
             gate_results=gate_results,
             deadline_exhausted=any(gate.deadline_exhausted for gate in failed_gates),
+            # A definite gate failure fails the trial whatever the tracker would answer.
+            evidence_unreadable=all(gate.evidence_unreadable for gate in failed_gates),
         )
 
     expired = _deadline_failure("the trial result could be accepted")

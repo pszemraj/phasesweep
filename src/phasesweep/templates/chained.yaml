@@ -21,7 +21,7 @@ execution:
   # none: the trainer sees only a minimal environment. See phasesweep explain execution.inherit_env.
   inherit_env: none
 
-trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
+trial_command: "phasesweep-fake-train --config {config_path}"
 
 trainer_config:
   model:
@@ -44,7 +44,9 @@ metric:
     expected_step: 100
 
 phases:
+  # The toy trainer runs on CPU. For a GPU trainer, remove gpu_policy: none to enable leasing.
   - name: learning_rate
+    gpu_policy: none
     comment: "Search the learning rate on a shallow model, which is cheap to train."
     n_trials: 4
     # Each draw derives from this seed and the draw position, so a resumed phase draws the same set as an uninterrupted one.
@@ -55,6 +57,7 @@ phases:
       optimizer.lr: { type: float, low: 0.0001, high: 0.001, log: true }
 
   - name: depth
+    gpu_policy: none
     comment: "Keep the winning learning rate and search the depth the first phase held at four layers."
     inherits: [learning_rate]
     n_trials: 3

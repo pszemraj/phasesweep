@@ -62,6 +62,7 @@ dev = [
 [project.scripts]
 phasesweep = "phasesweep.cli:main"
 phasesweep-mcp = "phasesweep.mcp.server:main"
+phasesweep-fake-train = "phasesweep.examples.fake_train:main"
 phasesweep-mlflow-train = "phasesweep.examples.mlflow_train:main"
 
 [project.urls]
@@ -157,4 +158,5 @@ markers = [
     "live: tests that use real host hardware or a live external service; explicit opt-in with -m live",
     "signals_own_pid: tests that signal pytest's own PID on purpose; lifts that one target from the runner signal guard in tests/conftest.py",
     "integration: slow tests with real process management, durable recovery workflows, or backend integration; excluded from the fast review tier; classification is documented in docs/development.md",
+    "contract: test modules that pin a cross-module contract; the commit hook and CI run them with -m 'contract and not live'",
 ]

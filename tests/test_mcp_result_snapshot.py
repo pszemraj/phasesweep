@@ -55,12 +55,14 @@ from tests.conftest import (
     write_constant_trainer,
     write_trainer,
 )
+from tests.experiments import write_experiment
 from tests.ledger_fixtures import published_generation_id
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     SEEDED_RANDOM,
     fail_prepared_snapshot_reads,
     make_mcp_app,
+    run_claimed_runner,
     stage_dead_run,
     write_run_status,
     write_slow_mcp_config,
@@ -88,6 +90,7 @@ def _frozen_result_payload(snapshot: RunResultSnapshot) -> dict[str, object]:
         declared_phases=snapshot.status.result_phase_plan,
         result_source="frozen_run_snapshot",
         publication_integrity=snapshot.status.publication_integrity,
+        current_generation_id=snapshot.status.current_generation_id,
     )
 
 
@@ -904,3 +907,35 @@ def test_pending_snapshot_uses_actual_recovered_state_without_changing_frozen_co
     assert "EVIDENCE_PENDING" not in recovered["trials"]
     assert status["result_snapshot_state"] == "complete"
     assert len(study.get_trials()) == 2
+
+
+def test_run_results_say_whether_the_run_wrote_its_generation(tmp_path: Path) -> None:
+    """get_run_results reports run_wrote_generation as get_run_status does: false for a replay whose winners are the earlier generation's."""
+    config = write_experiment(
+        tmp_path / "srv.yaml",
+        experiment="srv",
+        trial_command="echo x=0.5 {overrides}",
+        metric={"extractor": {"type": "log_regex", "pattern": r"x=(?P<value>[0-9.eE+-]+)"}},
+        storage="auto",
+        workdir=str(tmp_path / "runs"),
+        provenance={"revision": "rev-1"},
+        phases=[
+            {
+                "name": "p",
+                "n_trials": 2,
+                "sampler": {"type": "random", "seed": 0},
+                "search_space": {"x": {"type": "int", "low": 0, "high": 10}},
+            }
+        ],
+    )
+    app, _registry, store = make_mcp_app(write_srv_catalog(tmp_path, config))
+    assert run_claimed_runner(store, "srv-first", config) == 0
+    assert run_claimed_runner(store, "srv-replay", config) == 0
+
+    first, replay = app.winners("srv-first"), app.winners("srv-replay")
+
+    assert (first["run_wrote_generation"], replay["run_wrote_generation"]) == (True, False)
+    for run_id, results in (("srv-first", first), ("srv-replay", replay)):
+        assert results["run_wrote_generation"] == app.status(run_id)["run_wrote_generation"]
+    assert replay["represented_generation_id"] == "srv-first"
+    assert [phase["winner_generation"] for phase in replay["phases"]] == ["represented_generation"]

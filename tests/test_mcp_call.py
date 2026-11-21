@@ -18,6 +18,7 @@ from phasesweep.mcp.tool_names import (
     TOOL_INSPECT_EXPERIMENT,
     TOOL_LAUNCH_RUN,
     TOOL_LIST_EXPERIMENTS,
+    TOOL_NAMES,
 )
 from tests.mcp_helpers import (
     call_mcp_tool,
@@ -97,7 +98,6 @@ def test_mcp_call_prints_structured_result_as_json(tmp_path: Path) -> None:
             TOOL_INSPECT_EXPERIMENT, {"experiment_id": "missing"}, id="unknown_experiment"
         ),
         pytest.param(TOOL_INSPECT_EXPERIMENT, {"experiment_id": 3}, id="wrong_argument_type"),
-        pytest.param("no_such_tool", {}, id="unknown_tool"),
         pytest.param(TOOL_LAUNCH_RUN, {"experiment_id": "srv"}, id="refused_launch"),
     ],
 )
@@ -116,6 +116,15 @@ def test_mcp_call_tool_error_matches_client_is_error_text(
     assert result.exit_code == 1
     assert result.stdout == ""
     assert result.stderr.strip() == client.content[0].text
+
+
+def test_mcp_call_names_the_tools_for_an_unknown_one(tmp_path: Path) -> None:
+    """A tool name that does not exist is bad input: exit 2, with every tool listed."""
+    result = _mcp_call(_catalog(tmp_path), "no_such_tool")
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert all(name in result.stderr for name in TOOL_NAMES)
 
 
 def test_mcp_call_rejects_undeclared_argument(tmp_path: Path) -> None:
@@ -245,11 +254,36 @@ def test_mcp_call_requires_mcp_extra(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert not (tmp_path / "state").exists()
 
 
-def test_mcp_call_catalog_error_exits_2(tmp_path: Path) -> None:
-    """A catalog entry that fails startup validation exits 2, as ``serve`` does."""
+def test_mcp_call_serves_the_entries_that_load_when_one_fails(tmp_path: Path) -> None:
+    """A failing entry is reported with its fix on stderr and marks the catalog stale with a remedy naming it and the launch flag it forces off; the rest is served."""
     catalog = write_mcp_config_catalog(
-        tmp_path, {"srv": mcp_experiment_config_text(tmp_path, with_storage=False)}
+        tmp_path,
+        {
+            "srv": mcp_experiment_config_text(tmp_path, with_storage=False),
+            "other": mcp_experiment_config_text(tmp_path, name="other"),
+        },
     )
+
+    result = _mcp_call(catalog, TOOL_LIST_EXPERIMENTS)
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert [entry["id"] for entry in payload["experiments"]] == ["other"]
+    assert payload["catalog_status"]["stale"] is True
+    assert payload["catalog_status"]["reload_refusal"] == "invalid"
+    assert payload["experiments"][0]["capabilities"]["launch"] is False
+    assert payload["catalog_status"]["remediation"].startswith(
+        "catalog entry 'srv' failed to load, so this server refuses launches of every experiment, "
+        "showing `launch: false` for each,"
+    )
+    assert result.stderr.startswith("phasesweep mcp: 'srv': storage must be persistent")
+    assert "\nfix: use a persistent local ledger" in result.stderr
+
+
+def test_mcp_call_catalog_level_error_exits_2(tmp_path: Path) -> None:
+    """A catalog that cannot be parsed exits 2 before any tool exists, as ``serve`` does."""
+    catalog = tmp_path / "catalog.yaml"
+    catalog.write_text("not: [valid catalog\n")
 
     result = _mcp_call(catalog, TOOL_LIST_EXPERIMENTS)
 

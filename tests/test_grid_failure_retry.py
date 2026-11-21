@@ -19,7 +19,7 @@ from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialTargetRefusedError
-from phasesweep.engine.preview import validate_grid_targets
+from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
     PhaseAbortRefusedError,
@@ -76,7 +76,7 @@ def test_fully_failed_grid_recovers_only_the_raised_target(tmp_path: Path, repea
     assert len(calls.read_text().splitlines()) == 2
 
     raised = _grid(tmp_path, trainer, 3, repeats=repeats)
-    validate_grid_targets(raised)
+    validate_trial_targets(raised)
     if repeats:
         with pytest.raises(NoFeasibleTrialError):
             run_experiment(raised)
@@ -204,9 +204,9 @@ def _assert_advises_limit(message: str, above: int, left: int, target: int) -> N
 
 
 def _assert_fresh_study_remedy(message: str) -> None:
-    """Assert new-workdir advice is conditional on automatic storage."""
+    """Assert new-workdir advice excludes a config whose storage names a ledger."""
     assert "new `experiment` name" in message
-    assert "with `storage: auto`, a new `workdir` also works" in message
+    assert "a new `workdir` also works unless `storage` names a ledger" in message
 
 
 def _assert_no_recovery(message: str) -> None:
@@ -496,8 +496,15 @@ def test_infeasible_streak_advice_says_recorded_results_stay_unless_the_experime
         _assert_advises_limit(message, 2, 2, 4)
         assert "The recorded trial results stay in the study." in message
         assert "new `experiment` name" in message
+        assert message.index("The recorded trial results stay in the study.") < message.index(
+            "new `experiment` name"
+        )
         assert message.index("metric.min, metric.max") < message.index(
             "phases[p].max_consecutive_failures"
+        )
+        assert "Fix the cause" not in message
+        assert (
+            "For work under unchanged limits: Raise phases[p].max_consecutive_failures" in message
         )
     headline = str(aborted.value)
     assert "stderr" not in headline
@@ -544,6 +551,34 @@ def test_sampling_phase_asks_for_a_higher_target_without_a_retry_rule(tmp_path: 
         assert "max_consecutive_failures above" not in message
 
 
+def test_infeasible_sampling_streak_offers_the_raised_target_under_unchanged_limits(
+    tmp_path: Path,
+) -> None:
+    """An infeasible streak leads with the new-study step and keeps the target raise as the unchanged-limits option."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
+    phase = Phase(
+        name="p",
+        n_trials=2,
+        max_consecutive_failures=2,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": IntParam(type="int", low=1, high=9)},
+    )
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=trainer, phases=[phase], metric=_out_of_bounds_metric()
+    )
+    with pytest.raises(NoFeasibleTrialError) as aborted:
+        run_experiment(experiment)
+    message = _operational_error_text(aborted.value)
+    assert (
+        "For work under unchanged limits: raise phases[p].n_trials above 2 in the config" in message
+    )
+    assert "Fix the cause" not in message
+    assert message.index("The recorded trial results stay in the study.") < message.index(
+        "new `experiment` name"
+    )
+    assert message.index("new `experiment` name") < message.index("For work under unchanged limits")
+
+
 def _coverage_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     """Return the advisories saying some grid cell has no successful trial."""
     return [
@@ -567,7 +602,7 @@ def test_winner_from_a_partly_failed_grid_names_the_cells_that_never_succeeded(
     trials = phase_trials(raised)
     assert [trial.state.name for trial in trials] == ["FAIL", "FAIL", "COMPLETE"]
     expected = (
-        "[p] only 1 of 2 grid cells succeeded (advisory); the winner was chosen without a "
+        "[p] only 1 of 2 grid cells succeeded; the winner was chosen without a "
         f"successful trial for: {trials[1].params}."
     )
     assert _coverage_warnings(caplog) == [expected]
@@ -594,7 +629,7 @@ def test_grid_winner_warns_about_cells_the_abort_never_reached(
     }
     (missing,) = {1, 2, 3, 4} - succeeded
     assert _coverage_warnings(caplog) == [
-        "[p] only 3 of 4 grid cells succeeded (advisory); the winner was chosen without a "
+        "[p] only 3 of 4 grid cells succeeded; the winner was chosen without a "
         f"successful trial for: {{'x': {missing}}}."
     ]
 
@@ -617,7 +652,7 @@ def test_repeat_grid_winner_warns_about_the_failed_member(
         assert run_experiment(experiment)["p"].metric == 1.0
     (failed,) = (trial for trial in phase_trials(experiment) if trial.state.name == "FAIL")
     (warning,) = _coverage_warnings(caplog)
-    assert warning.startswith("[p] only 3 of 4 grid cells succeeded (advisory); ")
+    assert warning.startswith("[p] only 3 of 4 grid cells succeeded; ")
     assert f"'x': {failed.params['x']}" in warning and f"'seed': {failed.params['seed']}" in warning
 
 
@@ -714,7 +749,7 @@ def test_cell_advisory_spells_out_ten_cells_and_counts_the_rest(
         _warn_unsuccessful_grid_cells(phase, [trial])
 
     (warning,) = _coverage_warnings(caplog)
-    assert warning.startswith("[p] only 1 of 15 grid cells succeeded (advisory); ")
+    assert warning.startswith("[p] only 1 of 15 grid cells succeeded; ")
     assert "{'x': 10}" in warning and "{'x': 11}" not in warning
     assert warning.endswith("; and 4 more.")
 
@@ -754,3 +789,18 @@ def test_validate_refuses_an_oversized_fresh_persistent_grid(
     )
     assert diagnosis not in remedy
     assert "correct the experiment configuration" not in error
+    assert "new `experiment` name" not in error
+    assert "old study" not in error
+
+
+def test_oversized_grid_target_over_a_recorded_study_points_at_a_new_study(
+    tmp_path: Path,
+) -> None:
+    """Changing the search space of a grid that already ran needs a new study, and the remedy says so."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=0)
+    assert run_experiment(_grid(tmp_path, trainer, 2))["p"].metric == 1.0
+    with pytest.raises(TrialTargetRefusedError) as refused:
+        run_experiment(_grid(tmp_path, trainer, 4))
+    message = _operational_error_text(refused.value)
+    assert "To enlarge the grid instead, change the search space." in message
+    _assert_fresh_study_remedy(message)

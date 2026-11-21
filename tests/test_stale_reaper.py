@@ -13,7 +13,6 @@ from collections.abc import Container, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from typing import NoReturn
 
 import optuna
 import pytest
@@ -63,6 +62,7 @@ from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
@@ -1043,7 +1043,12 @@ def test_reaper_raises_for_malformed_trial_dir_attr(
     [
         pytest.param("outcome", "durable interrupted outcome could not be recorded", id="outcome"),
         pytest.param(
-            "outcome-read", "durable recovered outcome could not be recorded", id="outcome-read"
+            "outcome-read",
+            "could not reload its durable outcome before settlement",
+            id="outcome-read",
+        ),
+        pytest.param(
+            "policy-read", "durable interrupted outcome could not be recorded", id="policy-read"
         ),
         pytest.param("ledger", "cleanup recovery ledger could not be updated", id="ledger"),
         pytest.param(
@@ -1098,13 +1103,20 @@ def test_reaper_reports_storage_failures_after_cleanup(
             return original_get_trials(deepcopy=deepcopy, states=states)
 
         monkeypatch.setattr(study, "get_trials", read_trials)
-    elif failure_site == "ledger-read":
+    elif failure_site in {"policy-read", "ledger-read"}:
+        original_get_attrs = study._storage.get_study_user_attrs
+        reads = 0
+        failed_read = 1 if failure_site == "policy-read" else 2
 
-        def read_ledger(_study_id: int) -> NoReturn:
-            """Refuse the study-level cleanup ledger read."""
-            raise OSError("storage read failed")
+        def read_study_attrs(study_id: int) -> JsonObject:
+            """Fail while loading the phase policy or the subsequent cleanup ledger."""
+            nonlocal reads
+            reads += 1
+            if reads == failed_read:
+                raise OSError("storage read failed")
+            return original_get_attrs(study_id)
 
-        monkeypatch.setattr(study._storage, "get_study_user_attrs", read_ledger)
+        monkeypatch.setattr(study._storage, "get_study_user_attrs", read_study_attrs)
     elif failure_site == "outcome":
         patch_rejected_trial_user_attr(
             monkeypatch,
@@ -1127,7 +1139,6 @@ def test_reaper_reports_storage_failures_after_cleanup(
     with pytest.raises(StudyStorageUnavailableError, match=match):
         _reap_stale_trials(study, exp, exp.phases[0].name, confirm=True)
 
-    # The trial must NOT have been marked FAIL (because tell raised).
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
 
 
@@ -1155,10 +1166,10 @@ def test_reaper_keeps_uncertain_cleanup_actionable(
     text = _operational_error_text(excinfo.value)
     assert "pid=99999 pgid=99998" in text
     assert (
-        "Inspect the recorded PID/PGID with ps and check GPU processes before retrying recovery"
-        in text
-    )
-    assert text.index("with ps") < text.index("fix:")
+        "List the members of process group 99998 with `pgrep -a -g 99998` "
+        "and check GPU processes before retrying recovery"
+    ) in text
+    assert text.index("`pgrep") < text.index("fix:")
     assert "recover-run" in text
     assert uncertain == {"uncertain-attempt"}
     assert stale.study.trials[stale.number].state == optuna.trial.TrialState.RUNNING

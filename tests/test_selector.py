@@ -477,7 +477,7 @@ def test_seeded_random_duplicate_configs_rank_as_separate_slots() -> None:
 def test_crashed_trials_remedy_names_the_next_attempt_budget(
     tmp_path: Path, persistent: bool
 ) -> None:
-    """A crashed population retries with a raised persistent budget or a fresh memory run."""
+    """A crashed population retries with a raised persistent budget, a fresh study when the fix edits the config, or a fresh memory run."""
     from tests.conftest import make_experiment
 
     experiment = make_experiment(persistent=tmp_path if persistent else None, n_trials=2)
@@ -489,8 +489,11 @@ def test_crashed_trials_remedy_names_the_next_attempt_budget(
     remedy = refused.value.remediation
     assert remedy is not None
     if persistent:
-        assert "raise phases[p].n_trials above 2" in remedy
+        assert "raise phases[p].n_trials above 2 in the config" in remedy
         assert "Fix the failure" in remedy
+        assert "`n_jobs` can change on retry" in remedy
+        assert "changes study identity" in remedy
+        assert "set a new `experiment` name" in remedy
     else:
         assert "storage: null starts fresh" in remedy
         assert "raise" not in remedy

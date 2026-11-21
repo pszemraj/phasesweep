@@ -16,3 +16,17 @@ TOOL_CANCEL_RUN = "cancel_run"
 TOOL_AWAIT_RUN = "await_run"
 TOOL_LIST_EXPERIMENTS = "list_experiments"
 TOOL_EXPLAIN_CONFIG = "explain_config"
+
+#: Every registered tool, in the order a session meets them; `phasesweep mcp call` offers these.
+TOOL_NAMES = (
+    TOOL_GET_GUIDE,
+    TOOL_LIST_EXPERIMENTS,
+    TOOL_INSPECT_EXPERIMENT,
+    TOOL_EXPLAIN_CONFIG,
+    TOOL_LAUNCH_RUN,
+    TOOL_AWAIT_RUN,
+    TOOL_GET_RUN_STATUS,
+    TOOL_GET_LATEST_RUN,
+    TOOL_GET_RUN_RESULTS,
+    TOOL_CANCEL_RUN,
+)

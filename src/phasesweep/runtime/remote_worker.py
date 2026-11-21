@@ -1,4 +1,15 @@
-"""Shared supervised launch mechanics for remote SDK workers."""
+"""Shared supervised launch mechanics for remote SDK workers.
+
+W&B evidence reads and every MLflow operation the controller performs, writes included, run the
+tracker SDK in a separate process instead of in the controller. The engine promises one absolute
+deadline over SDK construction, requests and retries. A call blocked in an SDK's HTTP layer cannot
+be cancelled from the process that made it, and the SDKs retry on their own, so no timeout the
+code can hand an SDK is that deadline. A process the supervisor can kill is: it stops at the
+deadline and takes its descendants with it, where an in-process call would run past the trial,
+phase or run budget. Evidence reads use the trial attempt's durable process slot. Controller
+tracking operations register their own slots under the invoking generation so recovery can find
+and clean up those workers after the controller dies.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +34,20 @@ if TYPE_CHECKING:
 _TELEMETRY_OPT_OUTS = ("DO_NOT_TRACK", "MLFLOW_DISABLE_TELEMETRY")
 
 
+def report_reserve(budget_seconds: float, report_seconds: float) -> float:
+    """Return how long before its deadline a polling worker stops polling.
+
+    The requests still to come after polling stops, and the response that reports them, finish
+    before the supervisor stops the worker, so a missing run or an unfinished one is reported as
+    such instead of surfacing as a timeout. An answer that arrives in the reserve is still used.
+
+    :param float budget_seconds: Time the worker has to poll and report.
+    :param float report_seconds: Time the backend's last requests and report need.
+    :return float: The reserve, at most half the budget so a short budget still polls.
+    """
+    return min(report_seconds, budget_seconds / 2)
+
+
 def worker_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
     """Retain composed credentials plus the orchestrator's Python bootstrap and opt-outs.
 
@@ -33,6 +58,10 @@ def worker_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
         orchestrator sets.
     """
     worker_environment = dict(os.environ if environment is None else environment)
+    # The worker runs the controller's interpreter and must import the SDK installation the
+    # controller checked for. The composed trainer environment can differ, say by naming a
+    # source checkout in PYTHONPATH, so each PYTHON* variable takes the controller's value, and
+    # one the controller does not set is dropped.
     for name in set(worker_environment) | set(os.environ):
         if name.startswith("PYTHON"):
             if name in os.environ:
@@ -97,6 +126,10 @@ def run_worker(
                 shlex.join(
                     [
                         sys.executable,
+                        # A flag is not inherited as the PYTHON* variables are: the worker
+                        # keeps or drops the user site as the controller does, so it imports
+                        # the installation the controller checked for.
+                        *(["-s"] if sys.flags.no_user_site else []),
                         "-P",
                         str(worker_path),
                         str(request_path),

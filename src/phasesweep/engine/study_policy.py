@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import os
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from stat import S_ISREG
 from typing import Any, Literal, NamedTuple, TypedDict
 
 import optuna
 
-from phasesweep.config.models import Phase
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import (
     fixed_configuration_target_refusal,
     grid_cardinality,
@@ -21,6 +25,7 @@ from phasesweep.engine.attempts import (
     _trial_requires_cleanup_recovery,
 )
 from phasesweep.engine.errors import (
+    LaunchEnvironmentError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     TrialTargetRefusedError,
@@ -30,6 +35,7 @@ from phasesweep.engine.fingerprints import (
     _MAX_REPORTED_CHANGES,
     _changed_payload_keys,
     _render_changed_values,
+    _render_value,
 )
 from phasesweep.engine.optuna import _finished_trial_count, _measured_trial_count
 from phasesweep.engine.state import (
@@ -48,12 +54,19 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
-    _parsed_trial_outcome,
     _study_schema_supported,
     _trial_interrupted,
+    _unique_trial_outcomes,
 )
-from phasesweep.engine.trial import EnvironmentIdentity
-from phasesweep.errors import NEW_STUDY_STEP, RERUN_CLEANUP_RECOVERY, OperatorAction
+from phasesweep.engine.trial import EnvironmentIdentity, _environment_identity, _missing_trainer_cwd
+from phasesweep.errors import (
+    FRESH_STUDY,
+    NEW_STUDY_STEP,
+    OTHER_FORMAT_STEP,
+    RERUN_CLEANUP_RECOVERY,
+    OperatorAction,
+    format_mismatch,
+)
 from phasesweep.runtime.json import JsonObject, json_text_map
 
 _ALLOCATION_CONTEXT_ATTR = "phasesweep_allocation_context"
@@ -254,29 +267,20 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
     recovery = _load_recovery_record(study)
     recovery_boundary = 0 if recovery is None else recovery.start_after_sequence
 
-    events: list[tuple[int, str, dict[str, Any] | None, int]] = []
-    seen_sequences: dict[int, int] = {}
-    for trial in study.get_trials(deepcopy=False):
-        raw = trial.user_attrs.get(TRIAL_OUTCOME_ATTR)
-        parsed = _parsed_trial_outcome(raw)
-        if trial.state.is_finished() and parsed is None:
+    trials = study.get_trials(deepcopy=False)
+    outcomes = _unique_trial_outcomes(study.study_name, trials)
+    for trial in trials:
+        if trial.state.is_finished() and trial.number not in outcomes:
+            raw = trial.user_attrs.get(TRIAL_OUTCOME_ATTR)
             raise _phase_policy_schema_error(
                 study,
                 f"terminal trial {trial.number} has missing or malformed "
                 f"{TRIAL_OUTCOME_ATTR!r}: {raw!r}",
             )
-        if parsed is None:
-            continue
-        sequence = parsed.sequence
-        other_trial = seen_sequences.get(sequence)
-        if other_trial is not None:
-            raise _phase_policy_schema_error(
-                study,
-                f"trials {other_trial} and {trial.number} both use completion sequence {sequence}",
-            )
-        seen_sequences[sequence] = trial.number
-        events.append((sequence, parsed.outcome, parsed.abort, trial.number))
-
+    events = [
+        (parsed.sequence, parsed.outcome, parsed.abort, number)
+        for number, parsed in outcomes.items()
+    ]
     events.sort(key=lambda event: event[0])
     max_sequence = events[-1][0] if events else 0
     if recovery_boundary > max_sequence:
@@ -356,10 +360,10 @@ def _validate_study_schema(study: optuna.Study) -> None:
         return
 
     trial_numbers = [trial.number for trial in trials]
-    detail = "missing" if version is None else repr(version)
     raise StudySchemaMismatchError(
-        f"Study {study.study_name!r} uses unsupported phasesweep storage schema {detail}; "
-        f"current schema is {STUDY_SCHEMA_VERSION}. Affected trial numbers: {trial_numbers}.",
+        f"Study {study.study_name!r} {format_mismatch(version, STUDY_SCHEMA_VERSION)}. "
+        f"Affected trial numbers: {trial_numbers}.",
+        remediation=OTHER_FORMAT_STEP,
     )
 
 
@@ -458,10 +462,13 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
         phase,
         finished=_finished_trial_count(trials),
         measured=_measured_trial_count(trials),
+        has_study=True,
     )
 
 
-def _validate_fixed_configuration_target(phase: Phase, *, finished: int, measured: int) -> None:
+def _validate_fixed_configuration_target(
+    phase: Phase, *, finished: int, measured: int, has_study: bool
+) -> None:
     """Reject a fixed configuration or grid target that would repeat measured cells.
 
     A fixed configuration draws nothing, so every attempt runs the same trial.
@@ -475,12 +482,16 @@ def _validate_fixed_configuration_target(phase: Phase, *, finished: int, measure
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
     :param int finished: Finished attempts the phase's study holds.
     :param int measured: How many of those are COMPLETE, feasible or not.
+    :param bool has_study: Whether the phase's study exists, which decides whether a grid
+        refusal points at a new study.
     :raises TrialTargetRefusedError: The fixed configuration asks for more
         attempts than it may retry; the message names the largest allowed target.
     """
     refusal = fixed_configuration_target_refusal(phase, finished=finished, measured=measured)
     if refusal is None:
-        refusal = grid_target_refusal(phase, finished=finished, measured=measured)
+        refusal = grid_target_refusal(
+            phase, finished=finished, measured=measured, has_study=has_study
+        )
     if refusal is not None:
         message, remediation = refusal
         raise TrialTargetRefusedError(message, remediation=remediation)
@@ -761,10 +772,10 @@ def _retry_remedy(
         allows, above ``phase.n_trials``; it also runs the cells no attempt has reached.
     :param bool restarts: Whether the abort recorded a failure streak, which the recovery
         restarts from zero.
-    :return str: The sentence.
+    :return str: The step, in lower case so a caller can lead into it, ending with a period.
     """
     raise_to = (
-        f"Fix the cause, then raise phases[{phase.name}].n_trials from {phase.n_trials} "
+        f"raise phases[{phase.name}].n_trials from {phase.n_trials} "
         f"to {ceiling} in the config and rerun to"
     )
     restart = f", and {_COUNT_RESTARTS}" if restarts else ""
@@ -796,25 +807,30 @@ def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, obje
     :param Mapping[str, object] abort: The recorded abort.
     :return str | None: The advice, or ``None`` when no remedy or explanation applies.
     """
-    remedies = _recovery_remedies(phase, study, abort)
-    if remedies is None:
-        return None
-    retained = (
-        "The recorded trial results stay in the study. Raising n_trials does not change "
-        "the study fingerprint."
-    )
+    results_stay = "The recorded trial results stay in the study."
+    fingerprint_kept = "Raising n_trials does not change the study fingerprint."
     if _streak_trials_all_infeasible(study, _load_phase_policy_state(study)):
+        remedies = _recovery_remedies(phase, study, abort, lead_in="")
+        if remedies is None:
+            return None
         return (
             "The tripping trials violated metric bounds or constraints. Changing "
             "metric.min, metric.max, constraints, or the search space changes persistent "
-            f"study identity. {NEW_STUDY_STEP} "
-            f"{retained} For work under unchanged limits: {remedies.removeprefix('Fix the cause, then ')}"
+            f"study identity. {results_stay} {NEW_STUDY_STEP} "
+            f"{fingerprint_kept} For work under unchanged limits: {remedies}"
         )
-    return f"{remedies} {retained} To discard invalid recorded results: {NEW_STUDY_STEP}"
+    remedies = _recovery_remedies(phase, study, abort, lead_in="Fix the cause, then ")
+    if remedies is None:
+        return None
+    return (
+        f"{remedies} {results_stay} {fingerprint_kept} "
+        f"If the fix changes trial_command or the trainer's PATH, or the recorded results "
+        f"are invalid, {FRESH_STUDY}."
+    )
 
 
 def _recovery_remedies(
-    phase: Phase, study: optuna.Study, abort: Mapping[str, object]
+    phase: Phase, study: optuna.Study, abort: Mapping[str, object], *, lead_in: str
 ) -> str | None:
     """Name the steps that continue a phase whose study recorded ``abort``, or say none does.
 
@@ -829,6 +845,8 @@ def _recovery_remedies(
     :param Phase phase: Phase that aborted.
     :param optuna.Study study: The phase's study.
     :param Mapping[str, object] abort: The recorded abort.
+    :param str lead_in: Words the caller puts before a raised ``n_trials`` step, or empty
+        when its own sentence leads into the step.
     :return str | None: The steps, or ``None`` when no remedy or explanation applies.
     """
     name, target = phase.name, phase.n_trials
@@ -851,11 +869,13 @@ def _recovery_remedies(
     if ceiling is None:
         restart = "" if streak is None else f"; {_COUNT_RESTARTS}"
         remedies.append(
-            f"Fix the cause, then raise phases[{name}].n_trials above {target} in the config "
+            f"{lead_in}raise phases[{name}].n_trials above {target} in the config "
             f"and rerun to schedule new attempts{restart}."
         )
     elif ceiling > target:
-        remedies.append(_retry_remedy(phase, trials, ceiling, restarts=streak is not None))
+        remedies.append(
+            f"{lead_in}{_retry_remedy(phase, trials, ceiling, restarts=streak is not None)}"
+        )
     if streak is not None and finished < target:
         left = target - finished
         remedies.append(
@@ -970,30 +990,88 @@ _NO_RECORDED_ENVIRONMENT = (
 )
 
 
-def _describe_environment_changes(old: dict[str, str], new: dict[str, str]) -> str:
-    """Render how a tracked environment differs, with the values on both sides.
+class _EnvironmentChange(NamedTuple):
+    """One variable a tracked environment differs in, as the refusal shows it."""
 
-    The values are cut by the window :func:`~phasesweep.engine.fingerprints._render_changed_values`
-    applies to a phase fingerprint refusal, so a long ``PATH`` shows where the two differ.
+    name: str
+    #: ``NAME old -> new``, ``added NAME=value`` or ``removed NAME (was value)``.
+    text: str
+    #: Whether the other cohort's trial recorded the variable, so that it can be restored.
+    recorded: bool
+
+
+def _environment_entries(
+    old: dict[str, str], new: dict[str, str], *, full: bool
+) -> list[_EnvironmentChange]:
+    """List each variable a tracked environment changed, with how it changed.
 
     :param dict[str, str] old: Mapping a trial of the other cohort recorded.
     :param dict[str, str] new: Mapping this invocation composes.
-    :return str: Each differing variable as ``NAME old -> new``, then each added name with its
-        value and each removed name with its old value, up to :data:`_MAX_REPORTED_CHANGES`
-        entries and a count of the rest; empty when the mappings are equal.
+    :param bool full: Show every value whole; otherwise cut a long pair to the window
+        :func:`~phasesweep.engine.fingerprints._render_changed_values` applies to a phase
+        fingerprint refusal, so a long ``PATH`` shows where the two differ.
+    :return list[_EnvironmentChange]: Each differing variable as ``NAME old -> new``, then each
+        added name with its value and each removed name with its old value.
     """
-    changed: list[str] = []
-    added: list[str] = []
-    removed: list[str] = []
+    changed: list[_EnvironmentChange] = []
+    added: list[_EnvironmentChange] = []
+    removed: list[_EnvironmentChange] = []
     for name, before, after in _changed_payload_keys(old, new):
-        old_text, new_text = _render_changed_values(before, after)
+        old_text, new_text = (
+            (_render_value(before), _render_value(after))
+            if full
+            else _render_changed_values(before, after)
+        )
         if before is _ABSENT:
-            added.append(f"added {name}={new_text}")
+            added.append(_EnvironmentChange(name, f"added {name}={new_text}", recorded=False))
         elif after is _ABSENT:
-            removed.append(f"removed {name} (was {old_text})")
+            removed.append(
+                _EnvironmentChange(name, f"removed {name} (was {old_text})", recorded=True)
+            )
         else:
-            changed.append(f"{name} {old_text} -> {new_text}")
-    entries = [*changed, *added, *removed]
+            entries = _path_list_difference(before, after) if full else ""
+            changed.append(
+                _EnvironmentChange(name, f"{name} {old_text} -> {new_text}{entries}", recorded=True)
+            )
+    return [*changed, *added, *removed]
+
+
+def _path_list_difference(before: object, after: object) -> str:
+    """Name the entries two ``PATH``-like values do not share, which their whole text hides.
+
+    :param object before: Recorded value.
+    :param object after: Current value.
+    :return str: A parenthesised note led by a space, or an empty string when neither value
+        is a separator-joined list.
+    """
+    if not isinstance(before, str) or not isinstance(after, str):
+        return ""
+    if os.pathsep not in before and os.pathsep not in after:
+        return ""
+    recorded, current = before.split(os.pathsep), after.split(os.pathsep)
+    parts = [
+        f"only {side}: {', '.join(entries)}"
+        for side, entries in (
+            ("recorded", [entry for entry in recorded if entry not in current]),
+            ("current", [entry for entry in current if entry not in recorded]),
+        )
+        if entries
+    ]
+    return f" ({'; '.join(parts)})" if parts else " (the same entries in another order)"
+
+
+def _describe_environment_changes(
+    old: dict[str, str], new: dict[str, str], *, full: bool = False
+) -> str:
+    """Render how a tracked environment differs, with the values on both sides.
+
+    :param dict[str, str] old: Mapping a trial of the other cohort recorded.
+    :param dict[str, str] new: Mapping this invocation composes.
+    :param bool full: Show every value whole instead of cut to where the two differ.
+    :return str: The entries of :func:`_environment_entries` up to :data:`_MAX_REPORTED_CHANGES`
+        and a count of the rest; empty when the mappings are equal.
+    """
+    entries = [change.text for change in _environment_entries(old, new, full=full)]
     shown = entries[:_MAX_REPORTED_CHANGES]
     if len(entries) > _MAX_REPORTED_CHANGES:
         shown.append(f"and {len(entries) - _MAX_REPORTED_CHANGES} more")
@@ -1002,7 +1080,7 @@ def _describe_environment_changes(old: dict[str, str], new: dict[str, str]) -> s
 
 def _environment_difference(
     current: EnvironmentIdentity, trials: Sequence[optuna.trial.FrozenTrial]
-) -> str:
+) -> tuple[str, list[str], list[str]]:
     """Show what differs between this invocation's environment and another cohort's trial.
 
     Compares the tracked mapping against the latest of ``trials`` that recorded one. Pass-through
@@ -1010,18 +1088,53 @@ def _environment_difference(
 
     :param EnvironmentIdentity current: Environment this invocation composes.
     :param Sequence[optuna.trial.FrozenTrial] trials: Trials from other cohorts, oldest first.
-    :return str: A sentence showing each differing, added and removed variable with its values,
-        or one saying no trial of the other cohort recorded its environment.
+    :return tuple[str, list[str], list[str]]: A sentence showing each differing, added and
+        removed variable with both values whole, or one saying no trial of the other cohort
+        recorded its environment; the names whose recorded value restores them; and the added
+        names, which restoring unsets. The lists are empty in the second case.
     """
     for trial in reversed(trials):
         recorded = json_text_map(trial.user_attrs.get(TRAINER_ENV_ATTR))
         if recorded is None:
             # Allocation stopped before recording the mapping, or the mapping is malformed.
             continue
-        description = _describe_environment_changes(recorded, current.tracked)
-        if description:
-            return f"Compared with trial {trial.number}: {description}."
-    return _NO_RECORDED_ENVIRONMENT
+        changes = _environment_entries(recorded, current.tracked, full=True)
+        if changes:
+            restore = [change.name for change in changes if change.recorded]
+            unset = [change.name for change in changes if not change.recorded]
+            description = _describe_environment_changes(recorded, current.tracked, full=True)
+            return f"Compared with trial {trial.number}: {description}.", restore, unset
+    return _NO_RECORDED_ENVIRONMENT, [], []
+
+
+def _environment_cohort_remediation(restore: Sequence[str], unset: Sequence[str]) -> str:
+    """Name the way back to a study's recorded environment, or the way out of it.
+
+    :param Sequence[str] restore: Variables whose recorded value the run needs again.
+    :param Sequence[str] unset: Variables the recorded environment lacks. Both are empty when
+        no trial recorded its environment.
+    :return str: The step that continues the study and the one that starts a fresh study.
+    """
+    if restore or unset:
+        parts = []
+        if restore:
+            parts.append("with the recorded " + ", ".join(f"`{name}`" for name in restore))
+        if unset:
+            parts.append("without " + ", ".join(f"`{name}`" for name in unset))
+        way_back = (
+            f"Run {' and '.join(parts)} to continue this study "
+            "(for an MCP run, do the same in the client's server `env`)"
+        )
+    else:
+        way_back = (
+            "Run in the environment that created this study to continue it "
+            "(for an MCP run, set that environment in the client's server `env`)"
+        )
+    return (
+        f"{way_back}, or set a new `experiment` name to start a fresh study. "
+        "Pinning a variable under `env` or listing it under `execution.passthrough_env` changes "
+        "the study's identity, so that edit needs the new `experiment` name too."
+    )
 
 
 def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdentity) -> None:
@@ -1033,7 +1146,8 @@ def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdenti
         no usable environment identity.
     :raises StudyFingerprintMismatchError: Recorded trials belong to another
         semantic environment cohort. The message shows each variable that differs,
-        was added or was removed, with its old and new value.
+        was added or was removed, with its whole old and new value, and the remediation
+        names those to restore and those to unset.
     """
     trials = study.get_trials(deepcopy=False)
     if not trials:
@@ -1058,11 +1172,240 @@ def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdenti
         )
     if recorded != {current.digest}:
         rendered = ", ".join(sorted(digest[:12] for digest in recorded))
+        difference, restore, unset = _environment_difference(current, elsewhere)
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} contains trial(s) from semantic trainer "
             f"environment cohort(s) [{rendered}], but this invocation composes "
-            f"{current.digest[:12]}. {_environment_difference(current, elsewhere)} "
-            "No trial was allocated. Values under env are pinned; ambient variables under "
-            "execution.passthrough_env, such as rotating credentials, do not split cohorts.",
+            f"{current.digest[:12]}. {difference} No trial was allocated.",
             action=OperatorAction.FIX_CONFIG,
+            remediation=_environment_cohort_remediation(restore, unset),
         )
+
+
+#: Reserved words and builtins of dash and bash, either of which may be ``/bin/sh``.
+_SHELL_OWN_WORDS = frozenset(
+    [
+        "case",
+        "coproc",
+        "do",
+        "done",
+        "elif",
+        "else",
+        "esac",
+        "fi",
+        "for",
+        "function",
+        "if",
+        "in",
+        "select",
+        "then",
+        "time",
+        "until",
+        "while",
+        ".",
+        "alias",
+        "bg",
+        "bind",
+        "break",
+        "builtin",
+        "caller",
+        "cd",
+        "chdir",
+        "command",
+        "compgen",
+        "complete",
+        "compopt",
+        "continue",
+        "declare",
+        "dirs",
+        "disown",
+        "echo",
+        "enable",
+        "eval",
+        "exec",
+        "exit",
+        "export",
+        "false",
+        "fc",
+        "fg",
+        "getopts",
+        "hash",
+        "help",
+        "history",
+        "jobs",
+        "kill",
+        "let",
+        "local",
+        "logout",
+        "mapfile",
+        "popd",
+        "printf",
+        "pushd",
+        "pwd",
+        "read",
+        "readarray",
+        "readonly",
+        "return",
+        "set",
+        "shift",
+        "shopt",
+        "source",
+        "suspend",
+        "test",
+        "times",
+        "trap",
+        "true",
+        "type",
+        "typeset",
+        "ulimit",
+        "umask",
+        "unalias",
+        "unset",
+        "wait",
+    ]
+)
+_PLAIN_PROGRAM = re.compile(r"[A-Za-z0-9_./+-]+")
+
+
+def _require_launch_target(experiment: Experiment, *, path: str | None = None) -> None:
+    """Refuse a trainer directory that does not exist or a trial program the shell cannot run.
+
+    Without ``path`` no shell's ``PATH`` changes the answer, so ``validate`` and ``mcp check``
+    call it that way. A launch passes the trainer's ``PATH`` in
+    :func:`_launch_preflight`, because the ``PATH`` that counts is the one the run starts with.
+    With ``execution.cwd`` unset the trainer starts where PhaseSweep was started, so a relative
+    program is judged against that directory, as a run started there would resolve it.
+
+    :param Experiment experiment: Experiment whose ``execution.cwd`` and trial command are checked.
+    :param str | None path: ``PATH`` the trainer receives, or ``None`` to judge only a program
+        written with a ``/``, which no ``PATH`` changes.
+    :raises LaunchEnvironmentError: The trainer directory or plain program is known
+        to be unavailable.
+    """
+    try:
+        missing = _missing_trainer_cwd(experiment)
+        if missing is not None:
+            raise LaunchEnvironmentError(
+                missing,
+                remediation="Create that directory, or set execution.cwd to an existing one.",
+            )
+        cwd = experiment.execution.resolved_cwd() or Path.cwd()
+    except PermissionError as exc:
+        raise LaunchEnvironmentError(
+            f"Cannot access the trainer directory: {exc}. No trial was allocated.",
+            remediation="Restore access to the directory, or set execution.cwd to an accessible one.",
+        ) from exc
+    except OSError:
+        return
+    refusal = _trial_program_refusal(
+        experiment.trial_command,
+        path=path,
+        cwd=cwd,
+        path_from_config="PATH" in experiment.env,
+    )
+    if refusal is not None:
+        message, remediation = refusal
+        raise LaunchEnvironmentError(
+            f"{message} Starting new trials requires this program.",
+            remediation=remediation,
+        )
+
+
+def _is_executable_file(path: Path) -> bool | None:
+    """Check for a regular executable when its path can be inspected.
+
+    :param Path path: Program candidate as resolved from the trainer's directory.
+    :return bool | None: Whether the candidate is executable, or ``None`` if unknown.
+    """
+    try:
+        return S_ISREG(path.stat().st_mode) and os.access(path, os.X_OK)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return None
+
+
+def _trial_program_refusal(
+    command: str, *, path: str | None, cwd: Path, path_from_config: bool = False
+) -> tuple[str, str] | None:
+    """Judge whether the shell that runs a trial command can find its program.
+
+    A plain first word is required even with quoted arguments, redirection or an AND-list.
+    Leave command substitution, parameter assignments and other control flow to the shell.
+
+    :param str command: The trial command template.
+    :param str | None path: ``PATH`` the trainer receives, or ``None`` to judge only a program
+        written with a ``/``.
+    :param Path cwd: Directory the trainer starts in, which relative paths resolve against.
+    :param bool path_from_config: The config's ``env`` sets ``PATH``, so no shell or client
+        entry changes the one searched.
+    :return tuple[str, str] | None: Refusal diagnosis and remedy, or ``None`` when the program
+        is found or cannot be judged.
+    """
+    text = command
+    if "#" not in text:
+        # The shell removes a continued newline without inserting a word boundary.
+        text = re.sub(r"(?<!\\)\\\n", "", text)
+    text = text.strip(" \t\n")
+    # Only an unescaped `&&` or descriptor duplication can account for a bare ampersand.
+    control_text = re.sub(r"(?<!\\)(?:&&|[<>]&(?:[0-9]+|-)(?=$|[ \t<>]))", "", text)
+    if any(char in control_text for char in "\n\r();|&`") or "${" in text:
+        return None
+    program = re.split(r"[ \t]", text, maxsplit=1)[0]
+    if program in _SHELL_OWN_WORDS or _PLAIN_PROGRAM.fullmatch(program) is None:
+        return None
+    if "/" in program:
+        resolved = cwd / program
+        if _is_executable_file(resolved) is not False:
+            return None
+        where = (
+            f"is {program!r}" if str(resolved) == program else f"{program!r} resolves to {resolved}"
+        )
+        return (
+            f"The trial command's program {where}, which is not an executable file.",
+            "Correct the path in trial_command or make the file executable; a relative path "
+            "resolves against the trainer's working directory.",
+        )
+    if path is None:
+        return None
+    if any(
+        _is_executable_file(cwd / entry / program) is not False for entry in path.split(os.pathsep)
+    ):
+        return None
+    source = (
+        "the PATH the config's `env` sets"
+        if path_from_config
+        else "the PATH used to launch PhaseSweep (activate the environment containing the program "
+        "for CLI runs, or set PATH in the MCP server entry)"
+    )
+    return (
+        f"The trial command's program {program!r} is not on the trainer's PATH ({path}).",
+        f"Put the program on {source}, or name it by absolute path in trial_command.",
+    )
+
+
+def _launch_preflight(
+    experiment: Experiment, phase_name: str, study: optuna.Study | None
+) -> EnvironmentIdentity:
+    """Refuse a phase launch whose trials could not start, before any trial is allocated.
+
+    The cohort check comes first, so a changed ``PATH`` reads as a cohort refusal that shows
+    the old and new values, not as a missing program.
+
+    :param Experiment experiment: Experiment supplying the trainer environment, working
+        directory and trial command.
+    :param str phase_name: Phase about to allocate trials.
+    :param optuna.Study | None study: The phase's existing study, or ``None`` when it has none.
+    :return EnvironmentIdentity: The trainer environment the phase launches with.
+    :raises StudySchemaMismatchError: A populated study has a trial with no usable
+        environment identity.
+    :raises StudyFingerprintMismatchError: The study's trials ran under another environment
+        cohort.
+    :raises LaunchEnvironmentError: The trainer environment cannot be composed,
+        ``execution.cwd`` is not a directory, or the trial command's program cannot be found.
+    """
+    identity = _environment_identity(experiment, phase_name)
+    if study is not None:
+        _validate_environment_cohort(study, identity)
+    _require_launch_target(experiment, path=identity.values.get("PATH"))
+    return identity

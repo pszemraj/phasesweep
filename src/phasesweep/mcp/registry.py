@@ -1,8 +1,12 @@
 """Load an operator-authored experiment catalog.
 
-Experiment IDs map to validated configs and absolute paths resolved at load. Invalid
-entries refuse server startup. A running server reloads the catalog through
-:meth:`Registry.load` when the catalog file or a listed config changes on disk.
+Experiment IDs map to validated configs and absolute paths resolved at load. A server
+starts through :meth:`Registry.load` with ``collect_errors=True``, so an invalid entry
+fails alone: the entries that load are served, the failed ones are kept in
+:attr:`Registry.failures`, and launches stay refused until every entry validates. A
+running server rereads the catalog the same way when the catalog file or a listed config
+changes on disk, or while any entry has failed, and serves the reread only when every
+entry loads. Every entry error carries the fix ``phasesweep mcp check`` prints for it.
 """
 
 from __future__ import annotations
@@ -12,6 +16,8 @@ import os
 import shlex
 import stat
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
@@ -26,16 +32,32 @@ from phasesweep.config.io import (
     load_experiment_bytes,
 )
 from phasesweep.config.models import Experiment, _metric_semantics_payload
+from phasesweep.engine.errors import LaunchEnvironmentError
 from phasesweep.engine.paths import _artifact_root_identity
-from phasesweep.mcp.errors import CatalogError, StateDirChangedError, UnknownExperimentError
-from phasesweep.mcp.runs import RunStore
+from phasesweep.engine.study_policy import _require_launch_target
+from phasesweep.errors import operator_step
+from phasesweep.mcp.errors import (
+    CatalogEntryInvalidError,
+    CatalogError,
+    RunCapacityUnknownError,
+    StateDirChangedError,
+    UnknownExperimentError,
+)
+from phasesweep.mcp.runs import (
+    FRESH_STATE_DIR_STEP,
+    RunStore,
+    UnsupportedStateFormatError,
+    decode_unreadable_record,
+)
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
+    UnsafeLockPathError,
     UnsafePrivatePathError,
     canonical_storage_identity,
     file_sha256,
     require_supported_runtime,
 )
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.reaper import read_pid_namespace, read_proc_starttime
 
 VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
@@ -166,31 +188,62 @@ class RegisteredExperiment:
         return [phase.name for phase in self.experiment.phases]
 
     @property
-    def metric_payload(self) -> dict[str, Any]:
-        """Return the agent-visible optimization metric descriptor."""
+    def metric_payload(self) -> JsonObject:
+        """Return the agent-visible optimization metric descriptor.
+
+        :return JsonObject: Metric name, goal, and the extractor kind under ``objective_evidence``.
+        """
         return _metric_semantics_payload(self.experiment.metric)
 
     @property
     def capabilities(self) -> dict[str, bool]:
-        """Return the agent-visible catalog permissions for this experiment."""
+        """Return the agent-visible catalog permissions for this experiment.
+
+        ``from_phase`` is an option of a launch, so it is false whenever ``launch`` is.
+        """
         return {
             "launch": self.allow_launch,
             "cancel": self.allow_cancel,
-            "resume_from_phase": self.allow_from_phase,
+            "from_phase": self.allow_launch and self.allow_from_phase,
         }
 
 
-def _resolve_catalog_relative_path(base: Path, path: Path) -> Path:
+def without_launch(capabilities: dict[str, bool]) -> dict[str, bool]:
+    """Clear what a server that refuses every launch cannot offer.
+
+    :param dict[str, bool] capabilities: An experiment's catalog permissions.
+    :return dict[str, bool]: The same permissions with ``launch`` and its ``from_phase``
+        option false; ``cancel`` stays, since it covers runs launched earlier.
+    """
+    return {**capabilities, "launch": False, "from_phase": False}
+
+
+@contextmanager
+def _catalog_path_errors(label: str) -> Iterator[None]:
+    """Report filesystem access and pathlib home or symlink resolution errors to the operator.
+
+    :param str label: Catalog field or entry whose paths are being loaded.
+    :raises CatalogError: If a configured path cannot be resolved or accessed.
+    """
+    try:
+        yield
+    except (OSError, RuntimeError) as exc:
+        raise CatalogError(
+            f"cannot access paths for {label}: {exc}",
+            suggestion="Correct the path or restore access for the account running PhaseSweep.",
+        ) from exc
+
+
+def _resolve_catalog_relative_path(base: Path, path: Path, *, label: str) -> Path:
     """Resolve an operator path relative to the catalog file when not absolute.
 
     :param Path base: Directory containing the catalog file.
     :param Path path: Operator-authored path from the catalog.
+    :param str label: Field and, for entry paths, the owning entry id.
     :return Path: Absolute, resolved filesystem path.
     """
-    expanded = path.expanduser()
-    if expanded.is_absolute():
-        return expanded.resolve()
-    return (base / expanded).resolve()
+    with _catalog_path_errors(f"{label} ({path})"):
+        return (base / path.expanduser()).resolve()
 
 
 def _resolve_existing_dir(base: Path, path: Path, *, label: str) -> Path:
@@ -202,34 +255,66 @@ def _resolve_existing_dir(base: Path, path: Path, *, label: str) -> Path:
     :return Path: Absolute, resolved existing directory path.
     :raises CatalogError: If the resolved path is not an existing directory.
     """
-    resolved = _resolve_catalog_relative_path(base, path)
+    resolved = _resolve_catalog_relative_path(base, path, label=label)
     if not resolved.is_dir():
-        raise CatalogError(f"{label} is not an existing directory: {resolved}")
+        raise CatalogError(
+            f"{label} is not an existing directory: {resolved}",
+            suggestion="create that directory, or point the entry's cwd at an existing one",
+        )
     return resolved
 
 
-def _prepare_state_dir(base: Path, path: Path) -> Path:
-    """Resolve and initialize the run-store directories used at server startup.
+def _prepare_state_dir(base: Path, path: Path, *, check_runs: bool = False) -> Path:
+    """Resolve, initialize and probe the run-store directories.
 
     :param Path base: Directory containing the catalog file.
     :param Path path: Operator-authored ``state_dir`` path.
+    :param bool check_runs: Check for run records that prevent launches.
     :return Path: Absolute initialized state directory.
     :raises CatalogError: If the run store cannot create or secure its directories.
     """
-    resolved = _resolve_catalog_relative_path(base, path)
+    resolved = _resolve_catalog_relative_path(base, path, label="state_dir")
     try:
-        RunStore(resolved)
+        store = RunStore(resolved)
         for directory in (resolved, resolved / "runs", resolved / "logs"):
             with tempfile.NamedTemporaryFile(dir=directory):
                 pass
+        if check_runs:
+            _check_run_inventory(store)
+    except UnsupportedStateFormatError as exc:
+        raise CatalogError(
+            f"state_dir is not usable: {resolved}: {exc}", suggestion=FRESH_STATE_DIR_STEP
+        ) from exc
     except ValueError as exc:
         raise CatalogError(f"state_dir is not usable: {resolved}: {exc}") from exc
-    except (OSError, UnsafePrivatePathError) as exc:
+    except (OSError, UnsafeLockPathError, UnsafePrivatePathError) as exc:
         raise CatalogError(
             f"state_dir is not usable: {resolved}: {exc}",
             suggestion=_state_dir_remediation(resolved),
         ) from exc
     return resolved
+
+
+def _check_run_inventory(store: RunStore) -> None:
+    """Report unreadable records that a launch cannot clear automatically.
+
+    :param RunStore store: Initialized run store to check without removing records.
+    :raises CatalogError: The inventory is busy or has unreadable records that block launch.
+    """
+    with store.launch_lock() as acquired:
+        if not acquired:
+            raise CatalogError(
+                "another MCP launch or recovery holds the launch lock",
+                suggestion="Run this check again after the launch or recovery finishes.",
+            )
+        _, unreadable = store.launch_inventory()
+        blocking = set()
+        for identity in unreadable:
+            run_id, _ = decode_unreadable_record(identity)
+            if run_id is None or not store.is_pre_spawn_orphan(run_id):
+                blocking.add(identity)
+        if blocking:
+            raise CatalogError(str(RunCapacityUnknownError(blocking)))
 
 
 def _state_dir_remediation(state_dir: Path) -> str:
@@ -261,7 +346,7 @@ def _require_persistent_storage(experiment_id: str, experiment: Experiment) -> N
     :param Experiment experiment: Parsed experiment config registered for MCP access.
     :raises CatalogError: If storage is absent or in-memory.
     """
-    if experiment.resolved_storage is None:
+    if not experiment.persistent:
         raise CatalogError(
             f"{experiment_id!r}: storage must be persistent; "
             "in-memory storage cannot be monitored or resumed across processes",
@@ -314,22 +399,35 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     :raises CatalogError: If the config path or ``cwd`` does not exist, the
         config cannot be parsed, or its storage is not persistent.
     """
-    cfg_path = _resolve_catalog_relative_path(base, entry.config)
+    cfg_path = _resolve_catalog_relative_path(base, entry.config, label=f"{entry.id!r}: config")
     if not cfg_path.is_file():
-        raise CatalogError(f"{entry.id!r}: config not found: {cfg_path}")
+        raise CatalogError(
+            f"{entry.id!r}: config not found: {cfg_path}",
+            suggestion=(
+                "point the entry's config at an existing experiment YAML file; a relative path "
+                "resolves against the catalog's directory"
+            ),
+        )
     cwd = _resolve_existing_dir(
         base,
         entry.cwd if entry.cwd is not None else cfg_path.parent,
         label=f"{entry.id!r}: cwd",
+    )
+    invalid_config_fix = (
+        f"correct the config until `phasesweep validate {shlex.quote(str(cfg_path))}` passes"
     )
     try:
         config_bytes = cfg_path.read_bytes()
         config = load_experiment_bytes(config_bytes, source=cfg_path, config_dir=cfg_path.parent)
     except ValidationError as exc:
         detail = describe_validation_error(exc)
-        raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {detail}") from exc
-    except (ValueError, OSError) as exc:
-        raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {exc}") from exc
+        raise CatalogError(
+            f"{entry.id!r}: invalid config {cfg_path}: {detail}", suggestion=invalid_config_fix
+        ) from exc
+    except ValueError as exc:
+        raise CatalogError(
+            f"{entry.id!r}: invalid config {cfg_path}: {exc}", suggestion=invalid_config_fix
+        ) from exc
     _require_persistent_storage(entry.id, config)
     if config.execution.cwd is None:
         # Server fingerprints use the runner's effective trainer cwd.
@@ -363,13 +461,18 @@ def _claim_catalog_entry_identity(
     :param dict[str, str] storage_owners: Catalog ids keyed by Optuna study namespace.
     :raises CatalogError: If another catalog id already governs either namespace.
     """
+    one_entry_fix = (
+        "keep one catalog entry per experiment: remove one of these entries, or give its config "
+        "its own experiment name"
+    )
     namespace = _artifact_root_identity(loaded.experiment)
     other = namespace_owners.get(namespace)
     if other is not None:
         raise CatalogError(
             f"catalog ids {other!r} and {loaded.id!r} resolve to the same "
             f"experiment output namespace ({namespace}); one engine "
-            "experiment must be governed by exactly one catalog entry."
+            "experiment must be governed by exactly one catalog entry.",
+            suggestion=one_entry_fix,
         )
     namespace_owners[namespace] = loaded.id
 
@@ -383,23 +486,31 @@ def _claim_catalog_entry_identity(
             f"catalog ids {other!r} and {loaded.id!r} resolve to the same "
             f"Optuna study namespace ({loaded.experiment.experiment!r} on "
             f"{storage_identity}); one engine experiment must be governed "
-            "by exactly one catalog entry."
+            "by exactly one catalog entry.",
+            suggestion=one_entry_fix,
         )
     storage_owners[storage_key] = loaded.id
 
 
 @dataclass(frozen=True)
 class CatalogCheckEntry:
-    """Operator-facing validation verdict for one catalog entry."""
+    """Operator-facing validation verdict for one catalog entry.
+
+    ``trainer_cwd`` is the resolved directory the entry's trainer starts in: its
+    ``execution.cwd``, or the entry's runner ``cwd`` when that is unset. It is set for
+    entries that loaded. ``actions`` lists what the entry's ``allow`` block grants,
+    declared the same way for an entry that failed to load, whose catalog file still parsed.
+    """
 
     experiment_id: str
     error: str | None = None
     suggestion: str | None = None
     actions: tuple[str, ...] = ()
+    trainer_cwd: Path | None = None
 
     @property
     def ok(self) -> bool:
-        """Whether the entry would load at server startup.
+        """Whether the entry passed the requested catalog checks.
 
         :return bool: True when the entry passed every validation rule.
         """
@@ -414,7 +525,7 @@ class CatalogCheckReport:
 
     @property
     def ok(self) -> bool:
-        """Whether the whole catalog would load at server startup.
+        """Whether the catalog and its launch-enabled trainer paths passed the checks.
 
         :return bool: True when every entry passed validation.
         """
@@ -426,6 +537,7 @@ def _load_catalog_entries(
     base: Path,
     *,
     collect_errors: bool,
+    check_trainers: bool = False,
 ) -> tuple[dict[str, RegisteredExperiment], tuple[CatalogCheckEntry, ...]]:
     """Validate catalog entries under the check or startup error policy.
 
@@ -433,6 +545,7 @@ def _load_catalog_entries(
     :param Path base: Catalog directory used to resolve relative paths.
     :param bool collect_errors: Collect one verdict per entry when true; raise
         the first :class:`CatalogError` when false.
+    :param bool check_trainers: Check launch-enabled trainer paths for the operator's preflight.
     :return tuple: Successfully loaded entries keyed by id and any collected
         check verdicts, in catalog order.
     :raises CatalogError: The first entry error when ``collect_errors`` is false.
@@ -446,51 +559,84 @@ def _load_catalog_entries(
     for entry in catalog.experiments:
         try:
             if entry.id in seen:
-                raise CatalogError(f"duplicate catalog id {entry.id!r}")
+                raise CatalogError(
+                    f"duplicate catalog id {entry.id!r}",
+                    suggestion="give each catalog entry its own id",
+                )
             seen.add(entry.id)
-            registered = _load_entry(base, entry)
-            _claim_catalog_entry_identity(registered, namespace_owners, storage_owners)
+            with _catalog_path_errors(f"entry {entry.id!r} ({entry.config})"):
+                registered = _load_entry(base, entry)
+                trainer_cwd = registered.experiment.execution.resolved_cwd()
+                _claim_catalog_entry_identity(registered, namespace_owners, storage_owners)
+            if check_trainers and registered.allow_launch:
+                try:
+                    _require_launch_target(registered.experiment)
+                except LaunchEnvironmentError as exc:
+                    raise CatalogError(
+                        f"{entry.id!r}: {exc}", suggestion=operator_step(exc)
+                    ) from exc
         except CatalogError as exc:
             if not collect_errors:
                 raise
-            verdicts.append(CatalogCheckEntry(entry.id, error=str(exc), suggestion=exc.suggestion))
+            verdicts.append(
+                CatalogCheckEntry(
+                    entry.id,
+                    error=str(exc),
+                    suggestion=exc.suggestion,
+                    actions=_granted_actions(entry.allow),
+                )
+            )
             continue
 
         items[entry.id] = registered
         if collect_errors:
-            actions = tuple(
-                action
-                for action, allowed in (
-                    ("launch", registered.allow_launch),
-                    ("cancel", registered.allow_cancel),
-                    ("from_phase", registered.allow_from_phase),
+            verdicts.append(
+                CatalogCheckEntry(
+                    entry.id,
+                    actions=_granted_actions(entry.allow),
+                    trainer_cwd=trainer_cwd,
                 )
-                if allowed
             )
-            verdicts.append(CatalogCheckEntry(entry.id, actions=actions))
     return items, tuple(verdicts)
+
+
+def _granted_actions(allow: _Allow) -> tuple[str, ...]:
+    """List the actions an entry's ``allow`` block grants, in the order ``check`` prints them.
+
+    :param _Allow allow: The entry's declared permissions.
+    :return tuple[str, ...]: Granted action names among ``launch``, ``cancel`` and ``from_phase``.
+    """
+    return tuple(
+        action
+        for action, allowed in (
+            ("launch", allow.launch),
+            ("cancel", allow.cancel),
+            ("from_phase", allow.from_phase),
+        )
+        if allowed
+    )
 
 
 def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     """Validate all catalog entries and report each verdict.
 
-    If every entry passes, provision and probe the state directory as server startup does.
-    Catalog-level schema, file and state failures raise :class:`CatalogError`.
+    If every entry passes, provision and probe the state directory and check for run records
+    that block launches. Catalog-level schema, file and state failures raise :class:`CatalogError`.
 
     :param Path catalog_path: Path to the operator-authored catalog YAML.
     :return CatalogCheckReport: One verdict per catalog entry, in catalog order.
     """
     require_supported_mcp_host()
     catalog, base, _catalog_sha256 = _parse_catalog(catalog_path)
-    _, verdicts = _load_catalog_entries(catalog, base, collect_errors=True)
+    _, verdicts = _load_catalog_entries(catalog, base, collect_errors=True, check_trainers=True)
     report = CatalogCheckReport(entries=verdicts)
     if report.ok:
-        _prepare_state_dir(base, catalog.state_dir)
+        _prepare_state_dir(base, catalog.state_dir, check_runs=True)
     return report
 
 
 class Registry:
-    """Immutable id -> RegisteredExperiment map, the server state dir, and the catalog it came from."""
+    """Immutable id -> RegisteredExperiment map with the failed entries, state dir and source catalog."""
 
     def __init__(
         self,
@@ -500,6 +646,8 @@ class Registry:
         *,
         catalog_path: Path,
         catalog_sha256: str,
+        failures: tuple[CatalogCheckEntry, ...] = (),
+        cancellable_failed_ids: frozenset[str] = frozenset(),
     ) -> None:
         """Create an immutable registry from already validated entries.
 
@@ -508,11 +656,17 @@ class Registry:
         :param int max_concurrent_runs: Maximum live sweeps allowed across all entries.
         :param Path catalog_path: Absolute catalog file the entries were loaded from.
         :param str catalog_sha256: SHA-256 of the catalog bytes the entries were loaded from.
+        :param tuple[CatalogCheckEntry, ...] failures: Verdicts of the entries that failed to
+            load, none of whose ids are in ``items``.
+        :param frozenset[str] cancellable_failed_ids: Ids in ``failures`` whose every catalog
+            entry, including one that loaded before its duplicate failed, grants cancellation.
         """
         self.state_dir = state_dir
         self.max_concurrent_runs = max_concurrent_runs
         self.catalog_path = catalog_path
         self.catalog_sha256 = catalog_sha256
+        self.failures = failures
+        self._cancellable_failed_ids = cancellable_failed_ids
         self._items = items
 
     def __len__(self) -> int:
@@ -522,8 +676,21 @@ class Registry:
         """
         return len(self._items)
 
+    def __iter__(self) -> Iterator[RegisteredExperiment]:
+        """Iterate the registered experiments in catalog order.
+
+        :return Iterator[RegisteredExperiment]: Entries that loaded.
+        """
+        return iter(self._items.values())
+
     @classmethod
-    def load(cls, catalog_path: Path, *, bound_state_dir: Path | None = None) -> Registry:
+    def load(
+        cls,
+        catalog_path: Path,
+        *,
+        bound_state_dir: Path | None = None,
+        collect_errors: bool = False,
+    ) -> Registry:
         """Load validated experiments with persistent local journal storage.
 
         A running server reloads an edited catalog by passing the state directory its
@@ -533,25 +700,42 @@ class Registry:
         :param Path catalog_path: Path to the operator-authored catalog YAML.
         :param Path | None bound_state_dir: State directory a running server is bound
             to, or ``None`` at startup, which provisions the catalog's own.
+        :param bool collect_errors: Keep an entry that fails validation in ``failures``
+            and load the others, instead of raising the first entry error.
         :return Registry: Immutable registry of validated catalog entries.
         :raises StateDirChangedError: If ``bound_state_dir`` is given and the catalog
             resolves ``state_dir`` to another directory.
         :raises CatalogError: If the host is not a supported Linux or macOS MCP host, the
-            catalog cannot be parsed, an id is duplicated, an entry fails
-            validation, two entries claim one engine namespace, or the state
-            directory cannot be prepared.
+            catalog cannot be parsed, the state directory cannot be prepared, or, unless
+            ``collect_errors``, an id is duplicated, an entry fails validation, or two
+            entries claim one engine namespace.
         """
         require_supported_mcp_host()
         catalog, base, catalog_sha256 = _parse_catalog(catalog_path)
         if bound_state_dir is not None:
-            state_dir = _resolve_catalog_relative_path(base, catalog.state_dir)
+            state_dir = _resolve_catalog_relative_path(base, catalog.state_dir, label="state_dir")
             if state_dir != bound_state_dir:
                 raise StateDirChangedError(
                     f"catalog {catalog_path} now resolves state_dir to {state_dir}, but this "
                     f"server keeps its runs in {bound_state_dir}; restart the MCP server to "
                     "serve the new state_dir"
                 )
-        items, _ = _load_catalog_entries(catalog, base, collect_errors=False)
+        items, verdicts = _load_catalog_entries(catalog, base, collect_errors=collect_errors)
+        failures = tuple(verdict for verdict in verdicts if not verdict.ok)
+        failed_ids = {failure.experiment_id for failure in failures}
+        for experiment_id in failed_ids:
+            # A repeated id fails its second entry; the id is then served by neither.
+            items.pop(experiment_id, None)
+        # The entry that loaded before its duplicate failed still counts, so its revocation holds.
+        cancellable_failed_ids = frozenset(
+            experiment_id
+            for experiment_id in failed_ids
+            if all(
+                "cancel" in verdict.actions
+                for verdict in verdicts
+                if verdict.experiment_id == experiment_id
+            )
+        )
         if bound_state_dir is None:
             state_dir = _prepare_state_dir(base, catalog.state_dir)
         return cls(
@@ -560,15 +744,23 @@ class Registry:
             max_concurrent_runs=catalog.max_concurrent_runs,
             catalog_path=catalog_path.absolute(),
             catalog_sha256=catalog_sha256,
+            failures=failures,
+            cancellable_failed_ids=cancellable_failed_ids,
         )
 
     def unchanged_on_disk(self) -> bool:
         """Whether the catalog file and every config it lists still hold the loaded bytes.
 
-        A file that can no longer be read counts as changed, so a reload reports why.
+        A file that can no longer be read counts as changed, so a reload reports why. A
+        registry with failed entries is never unchanged: a failed entry's config is not
+        hashed, and a fix that changes no file, such as creating a missing ``cwd``
+        directory, must still be noticed.
 
-        :return bool: True when no current digest differs from the one recorded at load.
+        :return bool: True when every entry loaded and no current digest differs from the
+            one recorded at load.
         """
+        if self.failures:
+            return False
         if _current_sha256(self.catalog_path) != self.catalog_sha256:
             return False
         return all(
@@ -580,12 +772,29 @@ class Registry:
 
         :param str experiment_id: Agent-visible catalog id.
         :return RegisteredExperiment: Validated registry entry for the id.
+        :raises CatalogEntryInvalidError: If the catalog has an entry with that id that failed
+            to load.
         :raises UnknownExperimentError: If no catalog entry has that id.
         """
+        if any(failure.experiment_id == experiment_id for failure in self.failures):
+            raise CatalogEntryInvalidError(experiment_id)
         try:
             return self._items[experiment_id]
         except KeyError:
             raise UnknownExperimentError(experiment_id) from None
+
+    def failed_entry_allows_cancel(self, experiment_id: str) -> bool:
+        """Return whether every catalog entry with this failed id still declares ``allow.cancel``.
+
+        The catalog file parsed, so a failed entry's ``allow`` block is known even though
+        its experiment did not load. A repeated id fails only its later entries, and the
+        entry that loaded first is counted with them.
+
+        :param str experiment_id: Catalog id of an entry that failed to load.
+        :return bool: Whether an entry with that id failed and every catalog entry with that
+            id grants cancellation.
+        """
+        return experiment_id in self._cancellable_failed_ids
 
     def summaries(self) -> list[dict[str, Any]]:
         """Path-free catalog listing for ``list_experiments``.

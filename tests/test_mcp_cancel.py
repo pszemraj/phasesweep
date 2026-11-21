@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import phasesweep.mcp.errors as mcp_errors
 import phasesweep.mcp.runs as mcp_runs
 import phasesweep.mcp.tools as mcp_tools
 from phasesweep.engine.errors import StudyStorageUnavailableError
@@ -20,8 +21,11 @@ from phasesweep.mcp.errors import (
     PermissionDeniedError,
     RunLaunchUnsettledError,
 )
+from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runner import _cleanup_failure_payload, _cleanup_uncertain_payload
-from phasesweep.mcp.runs import RunHandle, RunnerView, RunObservation
+from phasesweep.mcp.runs import RunHandle, RunnerView, RunObservation, RunStore
+from phasesweep.mcp.tools import PhaseSweepMCP
+from phasesweep.runtime import reaper
 from phasesweep.runtime.reaper import (
     read_boot_id,
     read_pid_namespace,
@@ -38,6 +42,7 @@ from tests.mcp_helpers import (
     make_run_handle,
     side_effect_app,
     stage_dead_run,
+    stage_live_run,
     write_mcp_catalog,
     write_run_status,
     write_srv_catalog,
@@ -190,10 +195,12 @@ def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
 )
 def test_cancel_requires_catalog_and_launch_time_permission(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     catalog_allows_cancel: bool,
     run_allows_cancel: bool,
 ) -> None:
     """Cancellation remains denied when either authority source forbids it."""
+    monkeypatch.setattr(mcp_errors, "in_initial_pid_namespace", lambda: True)
     config = write_srv_config(tmp_path)
     allowed = ALLOW_SIDE_EFFECTS
     if not catalog_allows_cancel:
@@ -203,17 +210,160 @@ def test_cancel_requires_catalog_and_launch_time_permission(
     )
     reg = registry.get("srv")
     run_id = "srv-denied"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        allow_cancel=run_allows_cancel,
+    )
+    store.create(handle)
+
+    with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted") as denied:
+        app.cancel(run_id)
+    assert (
+        f"To stop this run, the operator can check that `ps -p {handle.pid} -o args=` shows "
+        f"`runner.py --run-id {run_id}`, then run `kill -TERM {handle.pid}` from a host shell. "
+        "The runner handles SIGTERM as cancellation. Do not retry."
+    ) in str(denied.value)
+
+
+@pytest.mark.parametrize(
+    "dead_runner",
+    [
+        "cleanup-marker",
+        "pending-snapshot",
+        "pending-snapshot-with-recorded-failure",
+        "pending-snapshot-from-earlier-boot",
+        "exits-after-observation",
+    ],
+)
+def test_cancel_refusal_for_a_dead_runner_names_recovery_not_a_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dead_runner: str
+) -> None:
+    """A run whose runner is gone has no group to signal, so the refusal gives its recover-run step, also while a pending result snapshot reads the run as running."""
+    # A host-namespace server would name the recorded group, which may now lead another job's.
+    monkeypatch.setattr(mcp_errors, "in_initial_pid_namespace", lambda: True)
+    config, app, registry, store = side_effect_app(tmp_path)
+    run_id = "srv-denied-dead"
+    experiment_id = registry.get("srv").id
+    if dead_runner == "exits-after-observation":
+        # The run's observation saw the runner alive; the stop step's own probe sees it exited.
+        stage_live_run(store, run_id, config, experiment_id)
+        observe, probe = store.observe, store.runner_may_be_alive
+        observed = False
+
+        def observe_then_exit(
+            handle: RunHandle, *, view: RunnerView | None = None
+        ) -> RunObservation:
+            nonlocal observed
+            observation = observe(handle, view=view)
+            observed = True
+            return observation
+
+        def exited_once_observed(handle: RunHandle, *, view: RunnerView | None = None) -> bool:
+            return not observed and probe(handle, view=view)
+
+        monkeypatch.setattr(store, "observe", observe_then_exit)
+        monkeypatch.setattr(store, "runner_may_be_alive", exited_once_observed)
+    else:
+        boot_id = earlier_boot_id() if dead_runner == "pending-snapshot-from-earlier-boot" else None
+        stage_dead_run(
+            store,
+            run_id,
+            config,
+            experiment_id,
+            cleanup_uncertain=dead_runner == "cleanup-marker",
+            boot_id=boot_id,
+        )
+    if dead_runner == "pending-snapshot-with-recorded-failure":
+        recorded = {
+            "code": "trials_failed",
+            "stage": "execution",
+            "retryable": False,
+            "actor": "agent",
+            "remediation": "Every trial failed; fix the trainer.",
+        }
+        write_run_status(
+            store, run_id, returncode=1, result_snapshot_state="pending", failure=recorded
+        )
+    elif dead_runner.startswith("pending-snapshot"):
+        write_run_status(store, run_id, returncode=0, result_snapshot_state="pending")
+
+    with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted") as denied:
+        app.cancel(run_id)
+
+    message = str(denied.value)
+    assert "kill" not in message
+    assert f"phasesweep mcp recover-run --state-dir STATE_DIR --run-id {run_id}" in message
+    if dead_runner != "exits-after-observation":
+        assert app.status(run_id=run_id)["run"]["recovery_required"] is True
+
+
+def test_cancel_refusal_gives_no_pid_number_from_a_container_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server in a nested PID namespace finds the runner by run id, since its numbers name other processes on the host."""
+    monkeypatch.setattr(mcp_errors, "in_initial_pid_namespace", lambda: False)
+    config = write_srv_config(tmp_path)
+    app, registry, store = make_mcp_app(
+        write_srv_catalog(
+            tmp_path,
+            config,
+            allow={"launch": True, "cancel": False, "from_phase": True},
+        )
+    )
+    reg = registry.get("srv")
+    handle = make_run_handle(
+        run_id="srv-denied-nested",
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+    )
+    store.create(handle)
+
+    with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted") as denied:
+        app.cancel(handle.run_id)
+
+    message = str(denied.value)
+    assert f"find the PID of `runner.py --run-id {handle.run_id}`" in message
+    assert str(handle.pid) not in message
+    assert str(handle.pgid) not in message
+
+
+@pytest.mark.parametrize("runner", ["foreign_namespace", "finished"])
+def test_cancel_refusal_names_a_stop_route_only_it_can_give(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: str
+) -> None:
+    """A runner whose PID cannot be read here is found by its run id; a finished run gets no stop route."""
+    config = write_srv_config(tmp_path)
+    app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
+    reg = registry.get("srv")
+    run_id = "srv-denied"
+    if runner == "foreign_namespace":
+        monkeypatch.setattr(reaper, "read_pid_namespace", lambda: "pid:[4026539333]@100")
     store.create(
         make_run_handle(
             run_id=run_id,
             experiment_id=reg.id,
             config_sha256=reg.config_sha256,
-            allow_cancel=run_allows_cancel,
+            pid_namespace="pid:[4026539001]@100" if runner == "foreign_namespace" else None,
         )
     )
+    if runner == "finished":
+        write_run_status(store, run_id, returncode=0, result_snapshot_state="failed")
 
-    with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted"):
+    with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted") as denied:
         app.cancel(run_id)
+
+    message = str(denied.value)
+    if runner == "finished":
+        assert "To stop this run" not in message
+    else:
+        assert (
+            f"find the PID of `runner.py --run-id {run_id}` in `ps -A -o pid=,args=`, "
+            "then run `kill -TERM PID` with that PID from a host shell."
+        ) in message
 
 
 def test_cancel_decataloged_run_uses_launch_time_permission(
@@ -291,12 +441,79 @@ def test_cancel_decataloged_run_is_denied_without_launch_permission(tmp_path: Pa
 
 
 @pytest.mark.parametrize(
-    ("runner_group_gone", "status_cleanup_confirmed", "preexisting_marker", "check_launch_gate"),
+    "declared_cancels",
     [
-        pytest.param(False, None, False, True, id="runner-group-still-live"),
-        pytest.param(True, None, False, True, id="forced-runner-kill-without-status"),
-        pytest.param(True, False, False, False, id="runner-status-cleanup-unconfirmed"),
-        pytest.param(True, True, True, False, id="runner-status-cleanup-confirmed"),
+        pytest.param((False,), id="failed-entry-revokes"),
+        pytest.param((True,), id="failed-entry-grants"),
+        pytest.param((False, True), id="entry-loaded-before-its-duplicate-revokes"),
+        pytest.param((True, True), id="every-entry-of-a-duplicated-id-grants"),
+    ],
+)
+def test_cancel_of_an_entry_that_failed_to_load_follows_its_declared_permission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared_cancels: tuple[bool, ...]
+) -> None:
+    """A failed id keeps cancellation only while every catalog entry with that id declares it, including one that loaded before its duplicate failed, so a revocation holds and a grant stays usable."""
+    config = write_srv_config(tmp_path, name="broken")
+    snapshot = config.read_bytes()
+    first_cancel, *duplicate_cancels = declared_cancels
+    catalog = write_mcp_catalog(
+        tmp_path,
+        {"broken": config},
+        allow={"launch": True, "cancel": first_cancel, "from_phase": True},
+        # A lone entry fails on its missing cwd; a repeated id fails on its duplicate.
+        cwd=None if duplicate_cancels else {"broken": tmp_path / "missing-cwd"},
+    )
+    for duplicate_cancel in duplicate_cancels:
+        catalog.write_text(
+            catalog.read_text()
+            + f"  - id: broken\n    config: {config}\n    allow:\n"
+            + f"      cancel: {str(duplicate_cancel).lower()}\n"
+        )
+    declared_cancel = all(declared_cancels)
+    registry = Registry.load(catalog, collect_errors=True)
+    assert [failure.experiment_id for failure in registry.failures] == ["broken"]
+    store = RunStore(registry.state_dir)
+    app = PhaseSweepMCP(registry, store)
+    run_id = "broken-running"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id="broken",
+        config_sha256=hashlib.sha256(snapshot).hexdigest(),
+        allow_cancel=True,
+    )
+    store.create(handle)
+    store.mark_cleanup_uncertain(handle)
+
+    def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
+        write_run_status(
+            store, run_id, returncode=143, error_class="cancelled", cleanup_confirmed=True
+        )
+        return True
+
+    monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", fake_kill_stale_group)
+
+    if declared_cancel:
+        assert app.cancel(run_id)["state"] == "cancelled"
+    else:
+        with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted"):
+            app.cancel(run_id)
+        assert store.observe(handle).state == "running"
+
+
+@pytest.mark.parametrize(
+    (
+        "runner_group_gone",
+        "status_cleanup_confirmed",
+        "preexisting_marker",
+        "check_launch_gate",
+        "initial_namespace",
+    ),
+    [
+        pytest.param(False, None, False, True, True, id="runner-group-still-live"),
+        pytest.param(False, None, False, True, False, id="runner-group-still-live-in-container"),
+        pytest.param(True, None, False, True, True, id="forced-runner-kill-without-status"),
+        pytest.param(True, False, False, False, True, id="runner-status-cleanup-unconfirmed"),
+        pytest.param(True, True, True, False, True, id="runner-status-cleanup-confirmed"),
     ],
 )
 def test_cancel_cleanup_confirmation_policy(
@@ -306,8 +523,10 @@ def test_cancel_cleanup_confirmation_policy(
     status_cleanup_confirmed: bool | None,
     preexisting_marker: bool,
     check_launch_gate: bool,
+    initial_namespace: bool,
 ) -> None:
     """Cancellation confirms cleanup or reserves it with a static remedy every reader retains."""
+    monkeypatch.setattr(mcp_errors, "in_initial_pid_namespace", lambda: initial_namespace)
     config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-cancel-policy"
@@ -353,9 +572,13 @@ def test_cancel_cleanup_confirmation_policy(
     if not runner_group_gone:
         failure = json.loads(store.cleanup_uncertain_path(run_id).read_text())["failure"]
         remedy = failure["remediation"]
-        assert f"runner PID {handle.pid} (process group {handle.pgid})" in remedy
-        assert "If it is still running on the host" in remedy
-        assert "clear the cause" in remedy
+        if initial_namespace:
+            assert f"runner PID {handle.pid} (process group {handle.pgid})" in remedy
+        else:
+            assert f"`pgrep -af {run_id}` from a host shell" in remedy
+            assert str(handle.pid) not in remedy
+            assert str(handle.pgid) not in remedy
+        assert "is still running on the host, clear the cause there" in remedy
         assert "uninterruptible I/O ignores SIGKILL until the I/O ends" in remedy
         assert "cancel_run" not in remedy
         assert len(remedy.splitlines()) == 1
@@ -414,9 +637,13 @@ def test_terminal_cleanup_failure_precedes_the_cancellation_marker(
         store, "srv-terminal-failure", config, "srv", cleanup_uncertain=False, allow_cancel=True
     )
     specific = _cleanup_failure_payload(
-        StudyStorageUnavailableError("ledger unavailable"), cause_stage="execution"
+        StudyStorageUnavailableError("ledger unavailable"),
+        run_id=handle.run_id,
+        cause_stage="execution",
     )
-    store.mark_cleanup_uncertain(handle, failure=_cleanup_uncertain_payload([]))
+    store.mark_cleanup_uncertain(
+        handle, failure=_cleanup_uncertain_payload([], run_id=handle.run_id)
+    )
     write_unsafe_cleanup_status(store, handle.run_id, failure=specific)
     if unobservable:
         monkeypatch.setattr(store, "runner_view", lambda _handle: RunnerView("unobservable"))
@@ -444,7 +671,9 @@ def test_live_cancellation_reservation_preserves_a_runner_failure(
     store.create(handle)
     store.config_snapshot_path(handle.run_id).write_bytes(snapshot)
     specific = _cleanup_failure_payload(
-        StudyStorageUnavailableError("ledger unavailable"), cause_stage="execution"
+        StudyStorageUnavailableError("ledger unavailable"),
+        run_id=handle.run_id,
+        cause_stage="execution",
     )
 
     def record_terminal_failure(*_args: object, **_kwargs: object) -> bool:

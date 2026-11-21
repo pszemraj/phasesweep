@@ -16,13 +16,14 @@ import typing
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from stat import S_ISDIR, S_ISREG
 from typing import Any, Literal, TypeAlias
 
 import optuna
 
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import Experiment, Phase, _metric_semantics_payload
-from phasesweep.engine.artifact_roots import _artifact_root_binding_applies
+from phasesweep.engine.artifact_roots import _artifact_path_mode
 from phasesweep.engine.artifacts import read_yaml_or_none
 from phasesweep.engine.confound import (
     _confound_summary,
@@ -34,6 +35,7 @@ from phasesweep.engine.fingerprints import (
     _recorded_config_matches,
 )
 from phasesweep.engine.ledger import (
+    ValidatedLedger,
     log_storage_read_failure,
     read_phase_studies,
     read_phase_trials,
@@ -41,7 +43,6 @@ from phasesweep.engine.ledger import (
     resolved_ledger_path,
     validate_ledger,
 )
-from phasesweep.engine.locking import experiment_is_busy
 from phasesweep.engine.optuna import (
     _finished_trial_count,
     _PhaseTrialStats,
@@ -102,7 +103,7 @@ from phasesweep.engine.study_policy import (
     _recovery_advice,
 )
 from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
-from phasesweep.evidence.models import EXTRACTOR_KINDS, _ObjectiveEvidenceFields
+from phasesweep.evidence.models import EXTRACTOR_KINDS
 from phasesweep.runtime.json import JsonObject, JsonValue, json_object
 
 log = logging.getLogger(__name__)
@@ -434,11 +435,13 @@ def require_study(experiment: Experiment) -> None:
     """Require evidence of a started study at the configured artifact root.
 
     :param Experiment experiment: Config locating the study.
+    :raises ArtifactRootConflictError: Access to the study path is denied.
     :raises StudyStorageUnavailableError: No study has initialized this root.
     """
     ledger_path = resolved_ledger_path(experiment)
-    if not _experiment_dir(experiment).is_dir() or not any(
-        path.is_file()
+    artifact_root = _experiment_dir(experiment)
+    if not S_ISDIR(_artifact_path_mode(artifact_root)) or not any(
+        S_ISREG(_artifact_path_mode(path))
         for path in (
             _artifact_root_binding_path(experiment),
             _generation_path(experiment),
@@ -446,7 +449,7 @@ def require_study(experiment: Experiment) -> None:
         )
     ):
         raise StudyStorageUnavailableError(
-            f"No study directory at {_experiment_dir(experiment)} contains a started study.",
+            f"No study directory at {artifact_root} contains a started study.",
             action=OperatorAction.FIX_CONFIG,
             remediation=(
                 "Use the same config and --set overrides as the run that created the study. "
@@ -607,25 +610,6 @@ def _summary_phase_plan(summary_payload: Mapping[str, Any] | None) -> list[str] 
     return None if plan is None else [phase.name for phase in plan]
 
 
-_OBJECTIVE_EVIDENCE_KEYS = frozenset(_ObjectiveEvidenceFields.model_fields)
-"""The ``objective_evidence`` keys, taken from the model its writers declare."""
-
-
-def _recorded_objective_evidence(candidate: object) -> JsonObject | None:
-    """Return a complete current-format assurance payload, if present.
-
-    :param object candidate: Summary ``objective_evidence`` value.
-    :return JsonObject | None: Complete recorded flags, or ``None``.
-    """
-    if not isinstance(candidate, Mapping) or set(candidate) != _OBJECTIVE_EVIDENCE_KEYS:
-        return None
-    if candidate.get("kind") not in EXTRACTOR_KINDS:
-        return None
-    if any(type(candidate[key]) is not bool for key in candidate if key != "kind"):
-        return None
-    return dict(candidate)
-
-
 def _current_pointer_generation_id(experiment: Experiment) -> str | None:
     """Read the mutable current-generation pointer's own id, or ``None``.
 
@@ -784,6 +768,7 @@ def _read_status(
     trial_generation_id: str | None,
     comparison_experiment: Experiment | None,
     latest: bool = False,
+    ledger: ValidatedLedger | None = None,
 ) -> tuple[EngineStatus, PublicationPointer]:
     """Build the :func:`read_status` payload and return the resolution behind it.
 
@@ -794,6 +779,8 @@ def _read_status(
     :param Experiment | None comparison_experiment: Optional current config for
         drift comparison.
     :param bool latest: Represent the captured current generation when its namespace exists.
+    :param ValidatedLedger | None ledger: Handle the caller already validated for ``experiment``,
+        so one command validates once; validated here when omitted.
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
     :raises ValueError: If ``generation_id`` or ``trial_generation_id`` is not a safe
@@ -801,7 +788,7 @@ def _read_status(
     :return tuple[EngineStatus, PublicationPointer]: The status payload and
         the single pointer resolution every fact in it came from.
     """
-    ledger = validate_ledger(experiment)
+    ledger = validate_ledger(experiment) if ledger is None else ledger
     current_generation_id, represented_generation_id, publication = _read_generation_selection(
         experiment, generation_id=generation_id, latest=latest
     )
@@ -825,7 +812,7 @@ def _read_status(
         _published_phase_trial_refs(
             None if publication.validated is None else publication.validated.summary
         )
-        if _artifact_root_binding_applies(experiment)
+        if experiment.persistent
         else {}
     )
     # Captured after the pointer is resolved: a publication tells its trials
@@ -873,19 +860,22 @@ def _read_status(
         if stored_plan is not None:
             result_phase_plan = stored_plan
         stored_metric = None if summary_payload is None else summary_payload.get("metric")
+        stored_evidence = (
+            stored_metric.get("objective_evidence") if isinstance(stored_metric, Mapping) else None
+        )
         if (
             isinstance(stored_metric, Mapping)
             and isinstance(stored_metric.get("name"), str)
             and stored_metric.get("goal") in ("minimize", "maximize")
+            and isinstance(stored_evidence, Mapping)
+            and stored_evidence.get("kind") in EXTRACTOR_KINDS
         ):
-            stored_evidence = _recorded_objective_evidence(stored_metric.get("objective_evidence"))
-            if stored_evidence is not None:
-                metric_payload = {
-                    "name": stored_metric["name"],
-                    "goal": stored_metric["goal"],
-                    "objective_evidence": stored_evidence,
-                }
-                result_context = "represented_generation"
+            metric_payload = {
+                "name": stored_metric["name"],
+                "goal": stored_metric["goal"],
+                "objective_evidence": {"kind": stored_evidence["kind"]},
+            }
+            result_context = "represented_generation"
     stored_fingerprint = (
         None if summary_payload is None else summary_payload.get("config_fingerprint")
     )
@@ -1052,18 +1042,30 @@ def _cli_phase_payloads(
     return cli_phases
 
 
-def unpublished_winner_step(experiment: Experiment) -> str | None:
-    """Give one publication remedy from recorded failures, suppressing it during live work.
+@dataclass(frozen=True)
+class UnpublishedWinnerStep:
+    """How a retained winner gets published: the recorded cause when one blocks it, then the fix."""
+
+    cause: str | None
+    fix: str
+
+
+def unpublished_winner_step(
+    experiment: Experiment, ledger: ValidatedLedger
+) -> UnpublishedWinnerStep | None:
+    """Give one publication remedy from recorded failures for an idle experiment.
 
     :param Experiment experiment: Current config used to inspect durable phase policy.
-    :return str | None: The recorded remedy or rerun instruction; none while busy or if storage is unreadable.
+    :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
+    :return UnpublishedWinnerStep | None: The recorded cause and remedy, the rerun instruction,
+        or ``None`` if storage is unreadable.
     """
-    if experiment_is_busy(experiment):
-        return None
-    if experiment.resolved_storage is None:
-        return "Rerun the same config to start the run again; storage: null keeps no completed trials between runs."
+    if not experiment.persistent:
+        return UnpublishedWinnerStep(
+            None,
+            "Rerun the same config to start the run again; storage: null keeps no completed trials between runs.",
+        )
     try:
-        ledger = validate_ledger(experiment)
         studies = read_phase_studies(ledger)
     except StudyStorageUnavailableError:
         return None
@@ -1079,7 +1081,7 @@ def unpublished_winner_step(experiment: Experiment) -> str | None:
         ):
             cause = str(abort["cause"]).rstrip(".")
             advice = _recovery_advice(phase, study, abort) or NEW_STUDY_STEP
-            return f"Phase {phase.name!r}: {cause}. fix: {advice}"
+            return UnpublishedWinnerStep(f"Phase {phase.name!r}: {cause}.", advice)
         if _finished_trial_count(trials) < phase.n_trials:
             continue
         axis = repeat_axis(phase)
@@ -1089,11 +1091,21 @@ def unpublished_winner_step(experiment: Experiment) -> str | None:
             else bool(_rank_groups(trials, experiment, axis).groups)
         )
         if not eligible:
-            return f"Phase {phase.name!r} has no feasible winner. fix: {_no_feasible_remedy(experiment, trials, phase.name)}"
-    return "Rerun the same config to resume and publish; completed trials are kept."
+            return UnpublishedWinnerStep(
+                f"Phase {phase.name!r} has no feasible winner.",
+                _no_feasible_remedy(experiment, trials, phase.name),
+            )
+    return UnpublishedWinnerStep(
+        None, "Rerun the same config to resume and publish; completed trials are kept."
+    )
 
 
-def experiment_status(experiment: Experiment, *, generation_id: str | None = None) -> JsonObject:
+def experiment_status(
+    experiment: Experiment,
+    *,
+    generation_id: str | None = None,
+    ledger: ValidatedLedger | None = None,
+) -> JsonObject:
     """Inspect study progress and phase winners without creating or modifying state.
 
     By default each phase uses its latest usable winner, falling back to the validated
@@ -1103,6 +1115,8 @@ def experiment_status(experiment: Experiment, *, generation_id: str | None = Non
 
     :param Experiment experiment: Parsed experiment config to inspect.
     :param str | None generation_id: Optional generation pin, disabling published fallback.
+    :param ValidatedLedger | None ledger: Handle the caller already validated for ``experiment``,
+        so one command validates once; validated here when omitted.
     :raises StudyStorageUnavailableError: No study has started at the configured root.
     :raises ArtifactRootConflictError: The root belongs to another ledger or experiment.
     :raises StudySchemaMismatchError: The stored study format is unsupported.
@@ -1116,6 +1130,7 @@ def experiment_status(experiment: Experiment, *, generation_id: str | None = Non
         trial_generation_id=None,
         comparison_experiment=None,
         latest=True,
+        ledger=ledger,
     )
     integrity = status["publication_integrity"]
     ledger_path = resolved_ledger_path(experiment)

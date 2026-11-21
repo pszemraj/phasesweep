@@ -54,6 +54,7 @@ from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
+    console_script,
     invoke_cli_boundary,
     make_experiment,
     requires_nonroot,
@@ -84,7 +85,7 @@ from tests.recovery_helpers import recover_run_cli
                 "eval/loss",
                 "api.wandb.ai",
                 "evaluation_point check: supported (axis '_step' located in W&B run history; "
-                "advisory, n/a when no position is found)",
+                "n/a when the history lookup finds no position)",
             ],
         ),
         (
@@ -437,6 +438,7 @@ def test_recover_run_expands_user_state_dir(
     assert result.exit_code != 0
     assert "unknown run id: missing" in result.output
     assert "not an existing MCP state directory" not in result.output
+    assert "fix: Pass a run id the server returned for this catalog" in result.output
 
 
 def test_recover_run_surfaces_host_error_suggestion(
@@ -1294,7 +1296,7 @@ def test_status_refuses_an_unreadable_journal_storage_at_format_boundary(tmp_pat
     _experiment_dir(experiment).mkdir(parents=True)
 
     result = subprocess.run(
-        [sys.executable, "-m", "phasesweep", "status", str(config_path)],
+        [str(console_script("phasesweep")), "status", str(config_path)],
         capture_output=True,
         text=True,
         cwd=tmp_path,
@@ -1526,7 +1528,7 @@ def _stub_run_command(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> 
     :param BaseException error: Exception ``run_experiment`` raises once the CLI calls it.
     """
     monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
-    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: object())
+    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: make_experiment())
 
     def fail(*_args: object, **_kwargs: object) -> None:
         raise error
@@ -1744,9 +1746,9 @@ def test_cli_boundary_reports_expected_run_failure(
 @pytest.mark.parametrize(
     ("action", "remedy"),
     [
-        (OperatorAction.FRESH_NAMESPACE, "fresh namespace for the state identified in the error"),
+        (OperatorAction.FRESH_NAMESPACE, "set a new `experiment` name in the config to start"),
         (OperatorAction.RESTORE_LEDGER, "restore or repair the storage ledger"),
-        (OperatorAction.RESTORE_TREE, "only if certain nothing is running"),
+        (OperatorAction.RESTORE_TREE, "restore the files and permissions identified in the error"),
         (
             OperatorAction.PROVISION_LOCK_DIR,
             "point PHASESWEEP_LOCK_DIR at an existing writable directory shared by every shell, "
@@ -1783,8 +1785,6 @@ def test_cli_boundary_renders_action_once(
     assert diagnostic_line == f"phasesweep: {diagnostic}"
     assert fix_line.startswith("fix: ")
     assert fix_line.count(remedy) == 1
-    if action is OperatorAction.FRESH_NAMESPACE:
-        assert "new experiment name" not in fix_line
     if action is OperatorAction.RUN_RECOVER_RUN:
         assert "`phasesweep mcp recover-run` for an MCP run" in fix_line
 
@@ -1966,7 +1966,7 @@ def test_sync_tracking_with_uploads_still_pending_uses_the_standard_error_format
     assert status == 1
     assert captured.out == "pending: 2\ndelivered: 1\n"
     assert captured.err == (
-        "phasesweep: MLflow uploads remain pending.\n"
+        "phasesweep: MLflow delivery remains pending.\n"
         "fix: Wait briefly, then retry the same operation once the reported blocker is resolved.\n"
     )
 

@@ -37,11 +37,11 @@ def _template_bytes(template: str) -> bytes:
 
 
 @pytest.fixture
-def trainer_python_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make the test interpreter the ``python`` the templates' trial command finds.
+def console_scripts_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Put the test interpreter's console scripts on the ``PATH`` the trial command is found on.
 
-    Templates run ``python -m phasesweep.examples.fake_train`` with the default
-    ``inherit_env: none``, so the trainer gets only the ambient ``PATH``.
+    Templates run ``phasesweep-fake-train`` with the default ``inherit_env: none``, so the
+    trainer gets only the ambient ``PATH``, and the launch preflight looks the program up there.
     """
     monkeypatch.setenv(
         "PATH", os.pathsep.join([str(Path(sys.executable).parent), os.environ.get("PATH", "")])
@@ -175,6 +175,7 @@ def test_init_pins_template_documentation_links(
     assert ("/blob/main/" in text) == (ref == "main")
 
 
+@pytest.mark.usefixtures("console_scripts_on_path")
 @pytest.mark.parametrize("template", TEMPLATES)
 def test_init_template_loads_validates_and_scaffolds_a_catalog(
     tmp_path: Path, template: str
@@ -189,7 +190,7 @@ def test_init_template_loads_validates_and_scaffolds_a_catalog(
         assert f"phasesweep run {config} --dry-run" in result.output
         assert f"phasesweep status {config} --trials" in result.output
         assert f"phasesweep mcp init-catalog --from {config}" in result.output
-        assert "phasesweep explain" in result.output
+        assert "phasesweep explain lists the top-level config keys" in result.output
 
         config_path = Path(config).resolve()
         experiment = load_experiment(config_path)
@@ -198,10 +199,11 @@ def test_init_template_loads_validates_and_scaffolds_a_catalog(
         assert experiment.workdir == str(config_path.parent / "runs")
         assert experiment.execution.cwd == str(config_path.parent)
         assert experiment.storage == "auto"
+        assert all(phase.gpu_policy == "none" for phase in experiment.phases)
         if template == "mlflow":
             assert experiment.trial_command == "phasesweep-mlflow-train --config {config_path}"
         else:
-            assert "phasesweep.examples.fake_train" in experiment.trial_command
+            assert experiment.trial_command.startswith("phasesweep-fake-train ")
 
         validated = runner.invoke(cli_main, ["validate", config])
         assert validated.exit_code == 0, validated.output
@@ -237,6 +239,7 @@ def test_starter_template_shape(tmp_path: Path) -> None:
         assert "--out" not in experiment.trial_command
 
 
+@pytest.mark.usefixtures("console_scripts_on_path")
 def test_argparse_template_renders_trainer_config_leaves_as_flags(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -256,7 +259,7 @@ def test_argparse_template_renders_trainer_config_leaves_as_flags(
 
 
 @pytest.mark.integration
-@pytest.mark.usefixtures("trainer_python_on_path")
+@pytest.mark.usefixtures("console_scripts_on_path")
 @pytest.mark.parametrize(
     "template", [name for name in TEMPLATES if name not in {"noisy", "mlflow"}]
 )
@@ -268,7 +271,7 @@ def test_init_template_runs_to_a_winner_per_phase_on_the_toy_trainer(
 
 
 @pytest.mark.integration
-@pytest.mark.usefixtures("trainer_python_on_path")
+@pytest.mark.usefixtures("console_scripts_on_path")
 def test_noisy_template_winner_comes_from_single_trials_and_records_the_observation(
     tmp_path: Path,
 ) -> None:

@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, Literal
 
 import optuna
@@ -34,7 +35,7 @@ from phasesweep.engine.publication import (
     raise_for_unusable_publication,
 )
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
-from phasesweep.errors import OperatorAction
+from phasesweep.errors import FRESH_STUDY, OTHER_FORMAT_STEP, OperatorAction, format_mismatch
 from phasesweep.runtime.files import (
     atomic_write_text,
     canonical_storage_identity,
@@ -49,18 +50,7 @@ log = logging.getLogger(__name__)
 BindingState = Literal["bound", "unbound"]
 
 
-def _artifact_root_binding_applies(experiment: Experiment) -> bool:
-    """Return whether the ledger can carry the reverse artifact-root binding.
-
-    :param Experiment experiment: Parsed experiment whose storage is inspected.
-    :return bool: ``True`` only for persistent storage. Every artifact root has
-        its own format record; only a persistent ledger also needs to record
-        the root that owns it across invocations.
-    """
-    return experiment.resolved_storage is not None
-
-
-ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 14
+ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 15
 
 
 def _artifact_root_storage_key(experiment: Experiment) -> str | None:
@@ -138,6 +128,90 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
         ) from exc
 
 
+_MOVED_TREE_STEP = (
+    f"Use the tree at the recorded path (move it back if it was moved), or {FRESH_STUDY}."
+)
+
+
+def _binding_mismatch(
+    path: Path, raw: object, expected: Mapping[str, object], experiment: Experiment
+) -> ArtifactRootConflictError:
+    """Name which recorded field of an artifact root's binding differs from this config's.
+
+    A tree moved or copied to another path differs in its root, which also changes the
+    ledger identity under ``storage: auto``, so the root is reported first and alone.
+
+    :param Path path: Binding file that was read.
+    :param object raw: The parsed binding.
+    :param Mapping[str, object] expected: The binding this config would write.
+    :param Experiment experiment: Config whose root, experiment and storage are checked.
+    :return ArtifactRootConflictError: The refusal, with the step that fits its cause.
+    """
+    root = expected["artifact_root"]
+    if not isinstance(raw, dict):
+        return ArtifactRootConflictError(
+            f"Artifact-root binding {path} is malformed: it is not a JSON object.",
+            action=OperatorAction.RESTORE_TREE,
+        )
+    if raw.get("artifact_root") != root:
+        return ArtifactRootConflictError(
+            f"The artifact tree at {root!r} was created at {raw.get('artifact_root')!r}. "
+            "Nothing was written.",
+            action=OperatorAction.FIX_CONFIG,
+            remediation=_MOVED_TREE_STEP,
+        )
+    causes: list[str] = []
+    names: list[str] = []
+    if raw.get("experiment") != expected["experiment"]:
+        causes.append(f"for experiment {raw.get('experiment')!r}, not {experiment.experiment!r}")
+        names.append("`experiment`")
+    if raw.get("storage_key") != expected["storage_key"]:
+        causes.append("with a different storage ledger than this config names")
+        names.append("`storage`")
+    if not causes:
+        return ArtifactRootConflictError(
+            f"Artifact-root binding {path} is malformed: it records fields this PhaseSweep "
+            "does not write.",
+            action=OperatorAction.RESTORE_TREE,
+        )
+    return ArtifactRootConflictError(
+        f"Artifact root {root!r} was created {', and '.join(causes)}. Nothing was written.",
+        action=OperatorAction.FIX_CONFIG,
+        remediation=(
+            f"Restore the {' and '.join(names)} this tree was created with to continue this "
+            f"study, or {FRESH_STUDY}."
+        ),
+    )
+
+
+def _artifact_access_refusal(error: PermissionError, fallback: Path) -> ArtifactRootConflictError:
+    """Explain how to restore access to a path the artifact tree needs.
+
+    :param PermissionError error: OS refusal, which normally names the path.
+    :param Path fallback: Path to report if the refusal names none.
+    :return ArtifactRootConflictError: Refusal carrying the restore-permissions action.
+    """
+    return ArtifactRootConflictError(
+        f"The current user cannot access {error.filename or fallback} (permission denied).",
+        action=OperatorAction.RESTORE_TREE,
+    )
+
+
+def _artifact_path_mode(path: Path) -> int:
+    """Read a path's mode without treating denied access as a missing entry.
+
+    :param Path path: Path to inspect, following symlinks.
+    :raises ArtifactRootConflictError: The current user cannot access the path.
+    :return int: The mode from stat, or zero when no entry exists at the path.
+    """
+    try:
+        return path.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return 0
+    except PermissionError as exc:
+        raise _artifact_access_refusal(exc, path) from exc
+
+
 def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
     """Classify a tree's experiment and ledger ownership without reading the ledger.
 
@@ -165,11 +239,7 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
             ) from None
         return "unbound"
     except PermissionError as exc:
-        raise ArtifactRootConflictError(
-            f"Artifact-root binding {path} cannot be validated as the current user "
-            "(permission denied).",
-            action=OperatorAction.RESTORE_TREE,
-        ) from exc
+        raise _artifact_access_refusal(exc, path) from exc
     except (OSError, ValueError) as exc:
         raise ArtifactRootConflictError(
             f"Artifact-root binding {path} is unreadable or malformed: {exc}.",
@@ -177,15 +247,13 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
         ) from exc
     if isinstance(raw, dict) and raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION:
         raise ArtifactRootSchemaMismatchError(
-            f"Artifact root {expected['artifact_root']!r} uses unsupported PhaseSweep "
-            f"format {raw.get('schema_version')!r}. Nothing was written.",
+            f"Artifact root {expected['artifact_root']!r} "
+            f"{format_mismatch(raw.get('schema_version'), ARTIFACT_ROOT_BINDING_SCHEMA_VERSION)}. "
+            "Nothing was written.",
+            remediation=OTHER_FORMAT_STEP,
         )
     if raw != expected:
-        raise ArtifactRootConflictError(
-            f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
-            f"ledger or experiment than {experiment.experiment!r}. Nothing was written.",
-            action=OperatorAction.FIX_CONFIG,
-        )
+        raise _binding_mismatch(path, raw, expected, experiment)
     return "bound"
 
 
@@ -267,6 +335,10 @@ def _check_study_artifact_root(study: optuna.Study, experiment: Experiment) -> N
         f"Study {study.study_name!r} publishes into artifact root {bound!r}, but this "
         f"config offers {offered!r}. No trial ran and nothing was published.",
         action=OperatorAction.FIX_CONFIG,
+        remediation=(
+            "Restore the `workdir` and `experiment` that give the recorded artifact root to "
+            "continue this study, or set a new `experiment` name to start a fresh study."
+        ),
     )
 
 
@@ -281,7 +353,8 @@ def _bind_study_artifact_root(study: optuna.Study, experiment: Experiment) -> No
     :raises ArtifactRootConflictError: The study is already bound to a different
         artifact root, or carries a binding that is not a string.
     """
-    if not _artifact_root_binding_applies(experiment):
+    # Only a persistent ledger records the artifact root that owns it across invocations.
+    if not experiment.persistent:
         return
     if not _artifact_root_claim_needed(study, experiment):
         return
@@ -313,7 +386,7 @@ def _check_published_phase_studies(
     raise_for_unusable_publication(
         experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
     )
-    if not _artifact_root_binding_applies(experiment):
+    if not experiment.persistent:
         return
     published_trials = _published_phase_trial_refs(
         None if publication.validated is None else publication.validated.summary

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
+from phasesweep.mcp.errors import CatalogEntryInvalidError, CatalogError, UnknownExperimentError
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
 from tests.conftest import REPO
 from tests.mcp_helpers import mcp_experiment_config_text, write_mcp_catalog
@@ -101,26 +101,12 @@ def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None
     assert summary["metric"] == {
         "name": "loss",
         "goal": "minimize",
-        "objective_evidence": {
-            "kind": "json_envelope",
-            "attempt_location_scoped": True,
-            "attempt_identity_bound": True,
-            "source_identity_keyed": False,
-            "objective_name_bound": True,
-            "split_bound": True,
-            "evaluation_policy_bound": True,
-            # mcp_experiment_config_text's json_envelope extractor declares
-            # neither checkpoint nor expected_step, so neither is value-bound.
-            "checkpoint_declared": False,
-            "checkpoint_value_bound": False,
-            "expected_step_declared": False,
-            "expected_step_value_bound": False,
-        },
+        "objective_evidence": {"kind": "json_envelope"},
     }
     assert summary["capabilities"] == {
         "launch": False,
         "cancel": False,
-        "resume_from_phase": False,
+        "from_phase": False,
     }
 
     # The summary must carry no path, command, or storage URL.
@@ -230,6 +216,21 @@ def test_catalog_cwd_must_exist(tmp_path: Path) -> None:
         Registry.load(_catalog(tmp_path, config, cwd={"reg_ok": tmp_path / "missing"}))
 
 
+@pytest.mark.parametrize("field", ["config", "cwd"])
+def test_catalog_path_expansion_error_names_the_entry_and_field(tmp_path: Path, field: str) -> None:
+    """Startup identifies which field of which entry could not resolve."""
+    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
+    invalid = Path("~phasesweep-test-no-such-user/sweep")
+    catalog = (
+        _catalog(tmp_path, invalid)
+        if field == "config"
+        else _catalog(tmp_path, config, cwd={"reg_ok": invalid})
+    )
+
+    with pytest.raises(CatalogError, match=rf"'reg_ok': {field}"):
+        Registry.load(catalog)
+
+
 def test_catalog_visible_params_policy(tmp_path: Path) -> None:
     config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
 
@@ -265,7 +266,7 @@ def test_catalog_rejects_invalid_visible_params_policy(tmp_path: Path) -> None:
 def _registered_nested_config(tmp_path: Path, body: str) -> tuple[RegisteredExperiment, Path]:
     """Register an experiment whose configuration lives below the catalog directory."""
     config_dir = tmp_path / "configs"
-    config_dir.mkdir()
+    config_dir.mkdir(exist_ok=True)
     config = _write(config_dir / "exp.yaml", body)
     return Registry.load(_catalog(tmp_path, config)).get("reg_ok"), config_dir
 
@@ -280,6 +281,7 @@ def test_relative_workdir_resolves_against_the_config_for_mcp(tmp_path: Path) ->
 
 def test_relative_execution_cwd_resolves_against_the_config_for_mcp(tmp_path: Path) -> None:
     """A relative trainer cwd names one directory for the CLI and the detached runner."""
+    (tmp_path / "configs" / "trainer").mkdir(parents=True)
     registered, config_dir = _registered_nested_config(
         tmp_path,
         _experiment_yaml(tmp_path) + "execution:\n  cwd: trainer\n",
@@ -299,7 +301,9 @@ def test_relative_journal_resolves_against_the_config_for_mcp(tmp_path: Path) ->
 
 
 def test_absolute_execution_cwd_accepted_for_mcp(tmp_path: Path) -> None:
+    """An absolute execution.cwd that exists is kept as the trainer's directory."""
     trainer_cwd = tmp_path / "trainer"
+    trainer_cwd.mkdir()
     config = _write(
         tmp_path / "exp.yaml",
         _experiment_yaml(tmp_path) + f"execution:\n  cwd: {trainer_cwd}\n",
@@ -405,6 +409,42 @@ def test_unknown_id_raises(tmp_path: Path) -> None:
     registry = Registry.load(_catalog(tmp_path, config))
     with pytest.raises(UnknownExperimentError):
         registry.get("does-not-exist")
+
+
+def test_collecting_load_records_failed_entries_and_serves_the_rest(tmp_path: Path) -> None:
+    """A failing entry is recorded and refused by id while the others load; it is never unchanged."""
+    good = _write(tmp_path / "good.yaml", _experiment_yaml(tmp_path, name="good"))
+    bad = _write(tmp_path / "bad.yaml", _experiment_yaml(tmp_path, name="bad", with_storage=False))
+    catalog = write_mcp_catalog(tmp_path, {"good": good, "bad": bad})
+    with pytest.raises(CatalogError, match="storage must be persistent"):
+        Registry.load(catalog)
+
+    registry = Registry.load(catalog, collect_errors=True)
+
+    assert [failure.experiment_id for failure in registry.failures] == ["bad"]
+    assert "storage must be persistent" in (registry.failures[0].error or "")
+    assert [summary["id"] for summary in registry.summaries()] == ["good"]
+    assert registry.get("good").id == "good"
+    with pytest.raises(CatalogEntryInvalidError, match="failed to load") as caught:
+        registry.get("bad")
+    assert str(tmp_path) not in str(caught.value)
+    assert registry.unchanged_on_disk() is False
+    assert Registry.load(write_mcp_catalog(tmp_path, {"good": good})).unchanged_on_disk()
+
+
+def test_collecting_load_serves_neither_entry_of_a_repeated_id(tmp_path: Path) -> None:
+    """A repeated id fails as one entry, and neither of its entries is served."""
+    good = _write(tmp_path / "good.yaml", _experiment_yaml(tmp_path, name="good"))
+    catalog = write_mcp_catalog(tmp_path, {"good": good})
+    catalog.write_text(catalog.read_text() + f"  - id: good\n    config: {good}\n")
+
+    registry = Registry.load(catalog, collect_errors=True)
+
+    assert [failure.experiment_id for failure in registry.failures] == ["good"]
+    assert "duplicate catalog id" in (registry.failures[0].error or "")
+    assert len(registry) == 0
+    with pytest.raises(CatalogEntryInvalidError):
+        registry.get("good")
 
 
 @pytest.mark.parametrize(

@@ -32,7 +32,9 @@ constraints:
     extractor: {type: mlflow, metric_key: cost, select: last}
     max: 5
 phases:
+  # The demo trainer uses only the CPU. Remove both gpu_policy entries for a GPU trainer.
   - name: depth
+    gpu_policy: none
     n_trials: 2
     sampler: {type: grid}
     search_space:
@@ -43,6 +45,7 @@ phases:
         params: [depth, rate]
         tags: [trainer]
   - name: rate
+    gpu_policy: none
     inherits: [depth]
     n_trials: 2
     sampler: {type: grid}

@@ -5,6 +5,7 @@ read winners, and exercise the launch -> cancel -> relaunch cycle.
 from __future__ import annotations
 
 import asyncio
+import importlib.resources
 import json
 import sys
 import threading
@@ -33,6 +34,7 @@ from phasesweep.mcp.tool_names import (
     TOOL_INSPECT_EXPERIMENT,
     TOOL_LAUNCH_RUN,
     TOOL_LIST_EXPERIMENTS,
+    TOOL_NAMES,
 )
 from phasesweep.mcp.tools import (
     AWAIT_DEFAULT_TIMEOUT_SECONDS,
@@ -105,7 +107,7 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
     assert summaries[0]["capabilities"] == {
         "launch": True,
         "cancel": True,
-        "resume_from_phase": True,
+        "from_phase": True,
     }
     structure = app.validate("e2e_lm")
     assert structure["capabilities"] == summaries[0]["capabilities"]
@@ -291,27 +293,12 @@ def test_fastmcp_registers_its_tools(tmp_path: Path) -> None:
         "Never suggest PhaseSweep or offer it as an option otherwise. "
         "Call get_guide before any other PhaseSweep tool."
     )
+    # Results carry their own next step and descriptions carry when to call, so the guide
+    # stays short enough to hold in mind across a long session; it links to no repo docs.
     guide = agent_prompt_text()
-    for safety_contract in (
-        "When `recovery_required` is true, stop",
-        "When `publication_integrity` is `failed`, stop",
-        "Use `run_id` for every lifecycle read",
-        "Never edit an experiment config yourself",
-        "Never open raw datasets",
-        "Never open W&B dashboards",
-        "`winner_generation`",
-        "call `explain_config`",
-        "phasesweep status CONFIG --trials",
-        "tail -f run.log",
-        "cp LEDGER COPY && optuna-dashboard COPY",
-        "Never point a dashboard at the live ledger",
-        "phasesweep init --list",
-        "phasesweep init --template NAME",
-        "Default `inherit_env: none` drops ambient `PYTHONPATH`",
-        "Winner-only data cannot establish convergence, trends, robustness, causality",
-        "advisory, not significance tests",
-    ):
-        assert safety_contract in guide
+    packaged = importlib.resources.files("phasesweep.mcp").joinpath("agent_prompt.md")
+    assert guide == packaged.read_text(encoding="utf-8").strip()
+    assert len(guide) <= 2500
     assert "../../../docs/" not in guide
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
@@ -326,22 +313,22 @@ def test_fastmcp_registers_its_tools(tmp_path: Path) -> None:
         TOOL_LAUNCH_RUN,
         TOOL_CANCEL_RUN,
     }
+    # `phasesweep mcp call` offers exactly the registered tools.
+    assert sorted(TOOL_NAMES) == sorted(t.name for t in tools)
     assert all(t.description for t in tools)
     assert all(t.annotations is not None for t in tools)
     # The guide is prose, served as text; every other tool returns a described object.
     assert [t.name for t in tools if not t.outputSchema] == [TOOL_GET_GUIDE]
+    # The when-to-call rules live where the model reads them at the moment of the call.
     descriptions = {t.name: t.description for t in tools}
-    for tool_name, safety_contracts in {
-        TOOL_LAUNCH_RUN: ("explicit user authorization", "Never retry permission"),
-        TOOL_CANCEL_RUN: ("user explicitly asks", "Never cancel automatically"),
-        TOOL_GET_RUN_STATUS: ("run.state", "stop if run.recovery_required"),
-        TOOL_AWAIT_RUN: ("run.state", "stop immediately if run.recovery_required"),
-        TOOL_EXPLAIN_CONFIG: ("config-authoring help", "not any catalog experiment"),
+    for tool_name, when_to_call in {
         TOOL_GET_GUIDE: ("before any other PhaseSweep tool",),
-        TOOL_LIST_EXPERIMENTS: ("after get_guide",),
+        TOOL_LAUNCH_RUN: ("explicit user authorization",),
+        TOOL_CANCEL_RUN: ("user explicitly asks",),
+        TOOL_AWAIT_RUN: ("same run_id", "phase_completed"),
     }.items():
-        for safety_contract in safety_contracts:
-            assert safety_contract in descriptions[tool_name]
+        for rule in when_to_call:
+            assert rule in descriptions[tool_name]
     for tool_name in (
         TOOL_INSPECT_EXPERIMENT,
         TOOL_GET_LATEST_RUN,
@@ -491,19 +478,7 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
         "metric": {
             "name": "loss",
             "goal": "minimize",
-            "objective_evidence": {
-                "kind": "json_envelope",
-                "attempt_location_scoped": True,
-                "attempt_identity_bound": True,
-                "source_identity_keyed": False,
-                "objective_name_bound": True,
-                "split_bound": True,
-                "evaluation_policy_bound": True,
-                "checkpoint_declared": False,
-                "checkpoint_value_bound": False,
-                "expected_step_declared": False,
-                "expected_step_value_bound": False,
-            },
+            "objective_evidence": {"kind": "json_envelope"},
         },
         "phases": [],
         "summary_present": False,

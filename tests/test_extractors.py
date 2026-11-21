@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
+    EvidenceUnreadableError,
     ExtractorError,
     evaluate_gates,
     extractor_config_fingerprint,
@@ -151,7 +152,8 @@ def test_wandb_real_sdk_decodes_refreshed_finished_summary(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("status", [401, 403, 429, 503, "connection", "timeout"])
-def test_wandb_real_sdk_error_causes_are_preserved(monkeypatch, status):
+def test_wandb_real_sdk_error_causes_are_preserved(tmp_path, monkeypatch, status):
+    """A denial ends polling as unreadable evidence; a transient fault is retried."""
     public = pytest.importorskip("wandb.apis.public")
     from requests import HTTPError, Response
     from requests.exceptions import ConnectionError as RequestsConnectionError
@@ -188,6 +190,15 @@ def test_wandb_real_sdk_error_causes_are_preserved(monkeypatch, status):
         assert str(status) in caught.value.cause
         assert "secret-token" not in caught.value.cause
         assert len(attempts) == 1
+        # Rejected credentials say nothing about the trial, so its evidence is unreadable.
+        attempts.clear()
+        monkeypatch.setattr(
+            "phasesweep.evidence.evaluation.poll_wandb_summary",
+            lambda trial_dir, environment, **kwargs: _wandb_poll(**kwargs),
+        )
+        extractor = WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss")
+        with pytest.raises(EvidenceUnreadableError, match=str(status)):
+            run_extractor(make_trial_context(tmp_path), extractor)
     else:
         assert _wandb_poll(required_keys=["eval/loss"])["values"] == {"eval/loss": 0.25}
         assert len(attempts) == 2
@@ -227,7 +238,7 @@ def test_wandb_invalid_scalar_is_not_retryable(monkeypatch, value):
 @pytest.mark.parametrize(
     ("name", "arguments"),
     [
-        ("WandbPollTimeout", ("attempt", 1.0)),
+        ("WandbPollTimeout", ("attempt", 1.0, False)),
         ("WandbRunTerminalError", ("attempt", "crashed")),
         ("WandbSetupError", ("attempt", "denied")),
         ("WandbMissingKeysError", ("attempt", ["loss"], ["eval/loss"])),
@@ -593,6 +604,215 @@ def test_wandb_gates_share_failed_capture(tmp_path, monkeypatch):
     assert "ended in 'failed'" in results[0].detail
 
 
+def _wandb_failures() -> dict[str, tuple[Exception, bool]]:
+    """Return each W&B reader failure and whether it leaves the evidence unreadable."""
+    from phasesweep.evidence import wandb as wandb_evidence
+
+    attempt = "attempt-test"
+    return {
+        "transport-timeout": (wandb_evidence.WandbPollTimeout(attempt, 1.0, reached=False), True),
+        "reached-timeout": (wandb_evidence.WandbPollTimeout(attempt, 1.0, reached=True), False),
+        "setup": (wandb_evidence.WandbSetupError(attempt, "HTTPError (HTTP 401)"), True),
+        "sdk": (ImportError("wandb"), True),
+        "worker": (RuntimeError("worker exited"), True),
+        "missing-run": (wandb_evidence.WandbRunMissingError(attempt), False),
+        "terminal": (wandb_evidence.WandbRunTerminalError(attempt, "crashed"), False),
+        "missing-keys": (wandb_evidence.WandbMissingKeysError(attempt, ["loss"], []), False),
+        "invalid": (ValueError("not a finite number"), False),
+    }
+
+
+@pytest.mark.parametrize("failure", list(_wandb_failures()))
+def test_wandb_capture_is_unreadable_only_when_wandb_gave_no_answer(tmp_path, monkeypatch, failure):
+    """The objective and every gate see one cached failure, unreadable only without an answer."""
+    from phasesweep.evidence.models import WandbQuery
+
+    error, unreadable = _wandb_failures()[failure]
+    calls = 0
+
+    def capture(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise error
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
+    extractor = WandbExtractor(type="wandb", entity="e", project="p", metric_key="loss")
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required", entity="e", project="p", keys=["loss"]
+    )
+    ctx = replace(
+        make_trial_context(tmp_path), wandb_query=WandbQuery(extractor, ("loss",), ("loss",))
+    )
+    with pytest.raises(ExtractorError) as refused:
+        run_extractor(ctx, extractor)
+    assert isinstance(refused.value, EvidenceUnreadableError) is unreadable
+    assert not isinstance(refused.value, DeadlineExceededError)
+    (result,) = evaluate_gates(ctx, [gate])
+    assert (result.passed, result.deadline_exhausted) == (False, False)
+    assert result.evidence_unreadable is unreadable
+    assert calls == 1
+
+
+# The capture budget includes the supervised worker's startup, which takes 0.5 to 0.9 s
+# from spawn to its first poll, alone or under ``pytest -n 12`` on this file. A test that
+# needs a poll before its deadline, or polling to continue past startup, gets several
+# times that so a loaded host cannot leave it without one.
+_WORKER_POLL_BUDGET_SECONDS = 6
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("answer", "limit"),
+    [("connection", "source"), ("running", "source"), ("running", "phase")],
+)
+def test_wandb_worker_timeout_says_whether_the_run_answered(
+    wandb_worker_sdk, tmp_path, answer, limit
+):
+    """The source's timeout after transport failures is unreadable and after an unfinished run fails it.
+
+    A phase deadline nearer than the source's timeout ends either poll as the phase interruption,
+    although the worker stops a reserve before it and answers with the clock still short of it.
+    """
+    from phasesweep.evidence.wandb import WandbPollTimeout
+
+    wandb_worker_sdk(f"""
+        class Api:
+            def __init__(self, **kwargs): pass
+            def run(self, path):
+                if {answer!r} == "connection":
+                    raise ConnectionError("tracker unreachable")
+                return type("Run", (), {{"state": "running", "summary_metrics": {{}}}})()
+    """)
+    phase = limit == "phase"
+    source = WandbExtractor(
+        type="wandb",
+        entity="e",
+        project="p",
+        metric_key="loss",
+        poll_seconds=0.01,
+        timeout_seconds=10 * _WORKER_POLL_BUDGET_SECONDS if phase else _WORKER_POLL_BUDGET_SECONDS,
+    )
+    deadline = time.monotonic() + _WORKER_POLL_BUDGET_SECONDS if phase else None
+    with pytest.raises(ExtractorError) as refused:
+        run_extractor(make_trial_context(tmp_path), source, deadline=deadline)
+    assert isinstance(refused.value, DeadlineExceededError) is phase
+    assert isinstance(refused.value, EvidenceUnreadableError) is (
+        answer == "connection" and not phase
+    )
+    timeout = refused.value.__cause__
+    assert isinstance(timeout, WandbPollTimeout)
+    assert timeout.reached is (answer == "running")
+
+
+@pytest.mark.integration
+def test_wandb_worker_polls_until_shortly_before_its_deadline(wandb_worker_sdk, tmp_path):
+    """A run that finishes 3.5 seconds inside a ten-second budget is captured, not timed out.
+
+    The run finishes 6.5 seconds after the extraction starts, timed from the parent rather than
+    from the worker's first lookup, so the worker's start-up time cannot push it past the
+    polling deadline; a five-second reserve stops polling before it.
+    """
+    started = time.monotonic()
+    wandb_worker_sdk(f"""
+        import time
+        class Api:
+            def __init__(self, **kwargs): pass
+            def run(self, path):
+                finished = time.monotonic() - {started!r} >= 6.5
+                return type("Run", (), {{
+                    "state": "finished" if finished else "running",
+                    "summary_metrics": {{"loss": 0.25}},
+                }})()
+    """)
+    source = WandbExtractor(
+        type="wandb",
+        entity="e",
+        project="p",
+        metric_key="loss",
+        poll_seconds=0.2,
+        timeout_seconds=10,
+    )
+    assert run_extractor(make_trial_context(tmp_path), source) == 0.25
+
+
+@pytest.mark.parametrize(
+    ("server", "unreadable"),
+    [("refused", True), ("denied", True), ("failed-run", False), ("deleted-run", False)],
+)
+def test_mlflow_capture_is_unreadable_only_when_mlflow_gave_no_answer(
+    tmp_path, monkeypatch, server, unreadable
+):
+    """A refused connection or denied access leaves the evidence unreadable; a FAILED or deleted run fails it."""
+    import errno
+
+    import mlflow
+    from mlflow.exceptions import MlflowException
+    from mlflow.protos import databricks_pb2
+
+    from phasesweep.evidence.evaluation import _capture_mlflow
+    from tests.tracking_helpers import bind_mlflow_attempt, mlflow_run, run_mlflow_worker_in_process
+
+    binding, ctx = bind_mlflow_attempt(tmp_path)
+
+    def get_run(_run_id):
+        if server == "refused":
+            raise MlflowException("private") from ConnectionRefusedError(
+                errno.ECONNREFUSED, "private"
+            )
+        if server == "denied":
+            raise MlflowException("private", error_code=databricks_pb2.PERMISSION_DENIED)
+        if server == "deleted-run":
+            raise MlflowException("private", error_code=databricks_pb2.RESOURCE_DOES_NOT_EXIST)
+        return mlflow_run(binding, status="FAILED")
+
+    monkeypatch.setattr(
+        mlflow, "MlflowClient", lambda tracking_uri: SimpleNamespace(get_run=get_run)
+    )
+
+    run_mlflow_worker_in_process(monkeypatch)
+    with pytest.raises(ExtractorError) as refused:
+        _capture_mlflow(ctx, deadline=None)
+    assert isinstance(refused.value, EvidenceUnreadableError) is unreadable
+    assert "private" not in str(refused.value)
+
+
+@pytest.mark.parametrize("definite_gate", [False, True], ids=["unreadable-only", "with-definite"])
+def test_a_definite_gate_failure_outranks_an_unreadable_one(tmp_path, monkeypatch, definite_gate):
+    """A result is unreadable only when every failed gate is; one definite failure fails the trial."""
+    from phasesweep.config.models import Metric
+    from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
+    from phasesweep.evidence.models import RequiredFileGate
+    from phasesweep.evidence.wandb import WandbSetupError
+    from phasesweep.runtime.process import ProcessResult
+    from tests.conftest import make_experiment
+
+    def denied(**kwargs):
+        raise WandbSetupError("attempt-test", "HTTPError (HTTP 401)")
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", denied)
+    (tmp_path / "r.json").write_text(json.dumps({"x": 0.5}))
+    experiment = make_experiment(
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x"))
+    )
+    gates = [
+        WandbSummaryRequiredGate(
+            type="wandb_summary_required", entity="e", project="p", keys=["done"]
+        )
+    ]
+    if definite_gate:
+        gates.append(RequiredFileGate(type="required_file", path="checkpoint.pt"))
+    result = extract_trial_result(
+        experiment=experiment,
+        executed=ExecutedTrial(make_trial_context(tmp_path), ProcessResult(0, False, -1, 1.0)),
+        gates=gates,
+    )
+    assert result.failure_reason is not None
+    assert result.gate_results is not None
+    assert [gate.passed for gate in result.gate_results] == [False] * len(gates)
+    assert result.evidence_unreadable is not definite_gate
+    assert not result.deadline_exhausted
+
+
 @pytest.mark.parametrize("failure_kind", ["deadline", "cleanup"])
 def test_wandb_consumers_retry_uncached_failures(tmp_path, monkeypatch, failure_kind):
     from phasesweep.errors import UnsafeProcessCleanupError
@@ -620,9 +840,17 @@ def test_wandb_consumers_retry_uncached_failures(tmp_path, monkeypatch, failure_
     assert calls == 2
 
 
-def test_wandb_consumers_retry_capture_cut_short_by_deadline(tmp_path, monkeypatch):
-    """A deadline-limited capture can be retried with a later deadline."""
-    from phasesweep.evidence.wandb import WandbPollTimeout
+@pytest.mark.parametrize("stopped_at", [1.0, 0.25], ids=["at-deadline", "in-reserve"])
+@pytest.mark.parametrize("answer", ["unanswered", "reached", "missing-run"])
+def test_wandb_consumers_retry_capture_cut_short_by_deadline(
+    tmp_path, monkeypatch, answer, stopped_at
+):
+    """A capture the execution deadline cut short is the phase interruption and can be retried.
+
+    The worker stops polling a reserve before the deadline, so the poll ends with the clock
+    still short of it whatever its last answer was.
+    """
+    from phasesweep.evidence.wandb import WandbPollTimeout, WandbRunMissingError
 
     gate = WandbSummaryRequiredGate(
         type="wandb_summary_required", entity="entity", project="project", keys=["done"]
@@ -635,8 +863,12 @@ def test_wandb_consumers_retry_capture_cut_short_by_deadline(tmp_path, monkeypat
         nonlocal calls
         calls += 1
         if calls == 1:
-            clock.now = 1.0
-            raise WandbPollTimeout(ctx.attempt_id, gate.timeout_seconds)
+            clock.now = stopped_at
+            if answer == "missing-run":
+                raise WandbRunMissingError(ctx.attempt_id)
+            raise WandbPollTimeout(
+                ctx.attempt_id, gate.timeout_seconds, reached=answer == "reached"
+            )
         return {"values": {}, "present_keys": ["done"]}
 
     monkeypatch.setattr("phasesweep.evidence.evaluation.time.monotonic", clock.monotonic)
@@ -644,8 +876,37 @@ def test_wandb_consumers_retry_capture_cut_short_by_deadline(tmp_path, monkeypat
     first = evaluate_gates(ctx, [gate], deadline=1.0)[0]
     assert not first.passed
     assert first.deadline_exhausted
+    assert not first.evidence_unreadable
     assert evaluate_gates(ctx, [gate], deadline=2.0)[0].passed
     assert calls == 2
+
+
+@pytest.mark.parametrize("stopped_at", [118.0, 120.0], ids=["in-reserve", "at-timeout"])
+@pytest.mark.parametrize("answer", ["unanswered", "reached", "missing-run"])
+def test_wandb_capture_stopped_by_the_source_timeout_is_an_ordinary_failure(
+    tmp_path, monkeypatch, answer, stopped_at
+):
+    """A poll that ends under the source's own timeout, before the execution deadline, is no phase stop."""
+    from phasesweep.evidence.wandb import WandbPollTimeout, WandbRunMissingError
+
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required", entity="entity", project="project", keys=["done"]
+    )
+    ctx = make_trial_context(tmp_path)
+    clock = ManualClock()
+
+    def capture(**kwargs):
+        clock.now = stopped_at
+        if answer == "missing-run":
+            raise WandbRunMissingError(ctx.attempt_id)
+        raise WandbPollTimeout(ctx.attempt_id, gate.timeout_seconds, reached=answer == "reached")
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
+    (result,) = evaluate_gates(ctx, [gate], deadline=gate.timeout_seconds + 1.0)
+    assert not result.passed
+    assert not result.deadline_exhausted
+    assert result.evidence_unreadable is (answer == "unanswered")
 
 
 def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monkeypatch):
@@ -677,13 +938,14 @@ def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monk
 
 
 @pytest.mark.parametrize("stage", ["constructor", "lookup"])
-def test_wandb_late_sdk_success_is_rejected(monkeypatch, stage):
-    """SDK success after the deadline remains a timeout."""
+def test_wandb_late_lookup_answer_is_kept_but_no_lookup_starts_late(monkeypatch, stage):
+    """A lookup answered after the polling deadline is used; none starts once it has passed."""
     public = pytest.importorskip("wandb.apis.public")
     from phasesweep.evidence.wandb import WandbPollTimeout
 
     clock = ManualClock()
     monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", clock.monotonic)
+    lookups = []
 
     class Api:
         def __init__(self, **kwargs):
@@ -691,12 +953,17 @@ def test_wandb_late_sdk_success_is_rejected(monkeypatch, stage):
                 clock.now = 2.0
 
         def run(self, path):
+            lookups.append(path)
             clock.now = 2.0
             return SimpleNamespace(state="finished", summary_metrics={"loss": 0.2})
 
     monkeypatch.setattr(public, "Api", Api)
-    with pytest.raises(WandbPollTimeout):
-        _wandb_poll(required_keys=["loss"])
+    if stage == "constructor":
+        with pytest.raises(WandbPollTimeout):
+            _wandb_poll(required_keys=["loss"])
+        assert lookups == []
+    else:
+        assert _wandb_poll(required_keys=["loss"])["values"] == {"loss": 0.2}
 
 
 def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_path, monkeypatch):
@@ -795,7 +1062,7 @@ def test_wandb_missing_summary_key_reports_available_names_after_polling(
         project="p",
         metric_key="eval_loss",
         poll_seconds=0.02,
-        timeout_seconds=2,
+        timeout_seconds=_WORKER_POLL_BUDGET_SECONDS,
     )
 
     with pytest.raises(ExtractorError) as caught:
@@ -830,7 +1097,7 @@ def test_wandb_finished_summary_can_gain_a_required_key(wandb_worker_sdk, tmp_pa
         project="p",
         metric_key="loss",
         poll_seconds=0.01,
-        timeout_seconds=2,
+        timeout_seconds=_WORKER_POLL_BUDGET_SECONDS,
     )
 
     assert run_extractor(make_trial_context(tmp_path), extractor) == 0.25
@@ -881,12 +1148,51 @@ def test_wandb_finished_run_missing_a_key_fails_after_the_settle_window(monkeypa
     assert len(reads) == _FINISH_SETTLE_SECONDS / 5 + 1
 
 
+@pytest.mark.parametrize("recovers", [False, True], ids=["outage", "recovers"])
+def test_wandb_unanswered_lookup_at_settle_boundary_keeps_polling(monkeypatch, recovers):
+    """An incomplete summary does not prove that the keys are missing through an outage."""
+    from phasesweep.evidence.wandb import _FINISH_SETTLE_SECONDS, WandbPollTimeout
+
+    clock = _fake_wandb_clock(monkeypatch)
+    recovered_at = _FINISH_SETTLE_SECONDS + 5
+    timeout = recovered_at + 5
+
+    def summary(read: int) -> dict[str, float]:
+        if read == 0:
+            return _RUNTIME_SUMMARY
+        if recovers and clock.now == recovered_at:
+            return {**_RUNTIME_SUMMARY, "loss": 0.25}
+        raise ConnectionError("tracker offline")
+
+    reads = _wandb_reads(monkeypatch, lambda read: "finished", summary)
+    if recovers:
+        capture = _wandb_poll(required_keys=["loss"], poll_seconds=5, timeout_seconds=timeout)
+        assert capture["values"] == {"loss": 0.25}
+        assert clock.now == recovered_at
+    else:
+        with pytest.raises(WandbPollTimeout) as caught:
+            _wandb_poll(required_keys=["loss"], poll_seconds=5, timeout_seconds=timeout)
+        assert not caught.value.reached
+        assert "ConnectionError" in str(caught.value.last_error)
+        assert clock.now == timeout
+    assert len(reads) == recovered_at / 5 + 1
+
+
 def test_wandb_missing_key_failure_reason_names_missing_and_available_keys(tmp_path, monkeypatch):
-    """Worker failures retain missing-key details and the run URL."""
+    """A settled missing-key reply in the reporting reserve fails the trial with details."""
     from phasesweep.evidence import wandb as wandb_evidence
 
     clock = _fake_wandb_clock(monkeypatch)
-    _wandb_reads(monkeypatch, lambda read: "finished", lambda read: _RUNTIME_SUMMARY)
+    settle_by = wandb_evidence._FINISH_SETTLE_SECONDS
+    poll_cutoff = settle_by + 0.5
+    deadline = poll_cutoff + wandb_evidence._REPORT_SECONDS
+
+    def summary(_read: int) -> dict[str, float]:
+        if clock.now == settle_by:
+            clock.sleep(0.75)
+        return _RUNTIME_SUMMARY
+
+    _wandb_reads(monkeypatch, lambda read: "finished", summary)
 
     def in_process_worker(request, _worker_path, _backend, **_):
         # The worker's own entry point, so the report crosses its JSON response.
@@ -910,14 +1216,14 @@ def test_wandb_missing_key_failure_reason_names_missing_and_available_keys(tmp_p
     )
     ctx = make_trial_context(tmp_path)
     with pytest.raises(ExtractorError) as caught:
-        run_extractor(ctx, extractor)
+        run_extractor(ctx, extractor, deadline=deadline)
     assert type(caught.value) is ExtractorError
     assert str(caught.value) == (
         f"W&B run https://api.wandb.ai/e/p/{ctx.attempt_id} finished without required "
         "summary key(s) ['train/train_runtime']; available summary keys: "
         "['_runtime', 'train_runtime']."
     )
-    assert clock.now < 240
+    assert poll_cutoff < clock.now < deadline
 
 
 @pytest.mark.parametrize("appears_at_read", [3, 6], ids=["mid-window", "window-end"])
@@ -961,6 +1267,8 @@ def test_wandb_missing_keys_without_a_full_window_poll_until_the_deadline(
     with pytest.raises(WandbPollTimeout) as caught:
         _wandb_poll(required_keys=["train/train_runtime"], poll_seconds=5, timeout_seconds=240)
     assert clock.now == 240
+    # The run answered every poll, so the timeout is a verdict on the trial.
+    assert caught.value.reached is True
     if finished_from_read is None:
         assert caught.value.last_error is None
     else:
@@ -1310,25 +1618,29 @@ def test_extractor_config_rejects_unsafe_paths_and_keys() -> None:
     ("select", "line", "expected", "match_count"),
     [
         ("last", "loss=9 loss=1\n", 1.0, 2),
-        ("min", "loss=9 loss=1\n", 1.0, 2),
+        ("min", "loss=0.5, loss=bad loss=9 loss=1\n", 1.0, 2),
         ("max", "loss=1 loss=9\n", 9.0, 2),
-        ("first", "loss=bad loss=1\n", 1.0, 1),
+        ("first", "loss=0.5, loss=1\n", 1.0, 1),
     ],
 )
 def test_log_regex_considers_every_numeric_match_per_line(
-    tmp_path: Path, select: str, line: str, expected: float, match_count: int
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    select: str,
+    line: str,
+    expected: float,
+    match_count: int,
 ) -> None:
     """One log line can contribute multiple numeric candidates."""
     raw = line.encode("utf-8")
     (tmp_path / "stdout.log").write_bytes(raw)
-    cfg = LogRegexExtractor(
-        type="log_regex",
-        pattern=r"loss=(?P<value>[^\s]+)",
-        select=select,
-    )
+    cfg = LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[^\s]+)", select=select)
 
     provenance: dict = {}
     assert run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance) == expected
+    assert len(caplog.messages) == int(select in {"first", "min"})
+    if caplog.messages:
+        assert "capture '0.5,' on line 1" in caplog.messages[0]
     assert provenance["source"] == {
         "kind": "file",
         "path": "stdout.log",
@@ -1339,10 +1651,40 @@ def test_log_regex_considers_every_numeric_match_per_line(
     }
 
 
-def test_log_regex_reports_no_matches(tmp_path):
-    (tmp_path / "stdout.log").write_text("nothing here\n", encoding="utf-8")
-    cfg = LogRegexExtractor(type="log_regex", pattern=r"eval_loss=(?P<value>[0-9.]+)")
-    with pytest.raises(ExtractorError, match="No matches"):
+@pytest.mark.parametrize(
+    ("select", "text", "bad_line"),
+    [
+        ("min", "loss=nan\nloss=0.5\nloss=0.3\n", 1),
+        ("min", "loss=0.5\nloss=0.3\nloss=nan\n", 3),
+        ("min", "loss=0.5\nloss=inf\nloss=0.3\n", 2),
+        ("max", "loss=nan\nloss=0.5\nloss=0.3\n", 1),
+        ("max", "loss=0.5\nloss=0.3\nloss=nan\n", 3),
+        ("max", "loss=0.5\nloss=-inf\n", 2),
+    ],
+)
+def test_log_regex_min_max_fails_on_any_non_finite_match(
+    tmp_path: Path, select: str, text: str, bad_line: int
+) -> None:
+    """A min or max over matches that include nan or inf fails with the offending line and trainer diagnosis."""
+    (tmp_path / "stdout.log").write_text(text, encoding="utf-8")
+    cfg = LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[^\s]+)", select=select)
+    provenance: dict = {}
+    with pytest.raises(
+        ExtractorError,
+        match=rf"line {bad_line}\b.*Check why the trainer reported a non-finite objective",
+    ):
+        run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
+    assert "source" not in provenance
+
+
+@pytest.mark.parametrize(
+    ("line", "message"),
+    [("nothing here", "No matches"), ("eval_loss=0.5,", r"was numeric\..*'0\.5,' on line 1")],
+)
+def test_log_regex_reports_no_matches(tmp_path: Path, line: str, message: str) -> None:
+    (tmp_path / "stdout.log").write_text(line, encoding="utf-8")
+    cfg = LogRegexExtractor(type="log_regex", pattern=r"eval_loss=(?P<value>\S+)")
+    with pytest.raises(ExtractorError, match=message):
         run_extractor(make_trial_context(tmp_path), cfg)
 
 
@@ -1357,7 +1699,7 @@ def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):
     value = run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
 
     assert value == pytest.approx(0.42)
-    assert provenance["schema_version"] == 3
+    assert provenance["schema_version"] == 4
     assert provenance["extractor"]["kind"] == "json"
     assert provenance["extractor"]["config_sha256"] == extractor_config_fingerprint(cfg)
     assert provenance["source"] == {
@@ -1566,6 +1908,8 @@ def test_wandb_missing_run_diagnostic_follows_the_last_observation(
     assert calls >= 2
     assert "private" not in str(refused.value)
     if isinstance(refused.value, WandbPollTimeout):
+        # Only a lookup that failed in transport leaves the run unanswered.
+        assert refused.value.reached is (last_observation != "network")
         detail = str(refused.value.last_error)
         assert "private" not in detail
         assert "Could not find run" not in detail
@@ -1589,16 +1933,66 @@ def test_wandb_missing_run_worker_names_target_and_init_overrides(
         project="project",
         metric_key="loss",
         poll_seconds=0.01,
-        timeout_seconds=2,
+        timeout_seconds=_WORKER_POLL_BUDGET_SECONDS,
     )
     context = make_trial_context(tmp_path)
     with pytest.raises(ExtractorError) as refused:
         run_extractor(context, source)
     message = str(refused.value)
     assert f"No W&B run {context.attempt_id!r} was found in entity/project" in message
-    assert "Call wandb.init() in the trainer" in message
-    assert "If it passes its own project, entity or id" in message
-    assert "remove those overrides" in message
+    assert (
+        "Check that the trainer calls wandb.init() and passes no project, entity or id of its own"
+    ) in message
     assert "set the extractor's project and entity to match" in message
     assert "Last observation: ValueError" not in message
     assert len(message.splitlines()) == 1
+
+
+@pytest.mark.integration
+def test_wandb_worker_reports_a_missing_run_before_the_supervisor_stops_it(
+    wandb_worker_sdk,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A lookup still in flight at the worker's polling deadline leaves time to report the missing run."""
+    from phasesweep.evidence import wandb as wandb_evidence
+
+    # The client's timeout is the whole seconds left to the polling deadline, so a lookup that
+    # begins in the last second is the one a slow link leaves in flight when the deadline passes.
+    wandb_worker_sdk("""
+        import time
+        class Api:
+            def __init__(self, overrides=None, timeout=None):
+                self.slow = timeout <= 1
+            def run(self, path):
+                if self.slow:
+                    time.sleep(1.5)
+                raise ValueError(f"Could not find run {path}")
+    """)
+    launched = []
+    run_worker = wandb_evidence.run_worker
+
+    def recording_worker(*args, **kwargs):
+        outcome = run_worker(*args, **kwargs)
+        launched.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(wandb_evidence, "run_worker", recording_worker)
+    with (
+        caplog.at_level("WARNING", logger="phasesweep.runtime.process"),
+        pytest.raises(wandb_evidence.WandbRunMissingError),
+    ):
+        wandb_evidence.poll_wandb_summary(
+            base_url="https://example.test",
+            entity="e",
+            project="p",
+            run_id="attempt",
+            trial_dir=tmp_path,
+            poll_seconds=0.01,
+            timeout_seconds=_WORKER_POLL_BUDGET_SECONDS,
+        )
+    ((result, response, _),) = launched
+    assert response == {"status": "run_missing"}
+    assert not result.timed_out
+    assert "terminating group" not in caplog.text

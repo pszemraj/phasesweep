@@ -15,8 +15,15 @@ import optuna
 
 import phasesweep.engine.resume as resume_ops
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.config.search import _placeholder_values_for, grid_cardinality, sampler_search_space
-from phasesweep.engine.artifact_roots import _check_published_phase_studies
+from phasesweep.config.search import (
+    _placeholder_values_for,
+    retry_target_ceiling,
+    sampler_search_space,
+)
+from phasesweep.engine.artifact_roots import (
+    _artifact_root_claim_needed,
+    _check_published_phase_studies,
+)
 from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import _phase_fingerprint, _verify_fingerprint
 from phasesweep.engine.guards import _raise_collected_errors
@@ -38,11 +45,13 @@ from phasesweep.engine.phase import (
 )
 from phasesweep.engine.progress import _log_phase_header
 from phasesweep.engine.state import (
+    RecoveredTrialState,
     Winner,
-    _outcome_sequence_counts,
     _recovered_trial_state,
+    _unique_trial_outcomes,
 )
 from phasesweep.engine.study_policy import (
+    _launch_preflight,
     _load_phase_policy_state,
     _pending_rerun_count,
     _validate_fixed_configuration_target,
@@ -121,40 +130,54 @@ def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
     return line
 
 
+def _recovered_running_states(
+    study_name: str, trials: Sequence[optuna.trial.FrozenTrial]
+) -> list[RecoveredTrialState]:
+    """Predict what a launch's recovery settles each RUNNING attempt as.
+
+    :param str study_name: Phase study being previewed.
+    :param Sequence[optuna.trial.FrozenTrial] trials: The same study's trials.
+    :return list[RecoveredTrialState]: One prediction per RUNNING trial, in trial order.
+    """
+    outcomes = _unique_trial_outcomes(study_name, trials)
+    return [
+        _recovered_trial_state(trial, outcomes.get(trial.number))
+        for trial in trials
+        if trial.state == optuna.trial.TrialState.RUNNING
+    ]
+
+
 def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
     """Count one phase's snapshot study the way a launch counts it.
 
     :param Phase phase: The configured phase the study belongs to.
     :param optuna.Study | None study: The phase's snapshot study, or ``None`` when
         the ledger holds no such study, which counts zero attempts.
+    :raises PhaseSweepError: A RUNNING attempt's completed trainer evidence awaits recovery,
+        whose extraction decides the counts.
     :return RecordedPhase: The counts and the study.
     """
     if study is None:
         return RecordedPhase(finished=0, measured=0, running=0, reruns=0, study=None)
     trials = study.get_trials(deepcopy=False)
-    running = [trial for trial in trials if trial.state == optuna.trial.TrialState.RUNNING]
-    sequence_counts = _outcome_sequence_counts(trials)
-    if any(
-        _recovered_trial_state(trial, sequence_counts) == "EVIDENCE_PENDING" for trial in running
-    ):
+    recovered = _recovered_running_states(study.study_name, trials)
+    if "EVIDENCE_PENDING" in recovered:
         raise PhaseSweepError(
             f"Phase {phase.name!r} has completed trainer evidence awaiting recovery; "
             "the trial and rerun counts depend on its extraction.",
             action=OperatorAction.RUN_RECOVER_RUN,
             remediation=(
-                "Run phasesweep run with the same config, without --dry-run, to recover "
-                "completed trainer evidence before requesting a dry-run plan."
+                "Let any active run finish. If the evidence is still pending, run "
+                "phasesweep run with the same config, without --dry-run, to recover it."
             ),
         )
-    recovered_as_failed = sum(
-        1 for trial in running if _recovered_trial_state(trial, sequence_counts) == "FAIL"
-    )
+    recovered_as_failed = recovered.count("FAIL")
     return RecordedPhase(
         finished=_finished_trial_count(trials) + recovered_as_failed,
         measured=_measured_trial_count(trials),
-        running=len(running),
-        reruns=_pending_rerun_count(trials, None if running else phase)
-        + len(running)
+        running=len(recovered),
+        reruns=_pending_rerun_count(trials, None if recovered else phase)
+        + len(recovered)
         - recovered_as_failed,
         study=study,
     )
@@ -184,17 +207,28 @@ def _read_recorded_phases(experiment: Experiment) -> dict[str, RecordedPhase | N
     return {phase.name: _recorded_phase(phase, studies[phase.name]) for phase in experiment.phases}
 
 
-def validate_grid_targets(experiment: Experiment) -> None:
-    """Check oversized persistent grid targets against their recorded failed cells.
+def validate_trial_targets(experiment: Experiment) -> None:
+    """Refuse a fixed-configuration or grid target that ``run`` refuses over the recorded attempts.
 
-    :param Experiment experiment: Config whose grid targets may retry recorded failures.
-    :raises TrialTargetRefusedError: A grid requests more attempts than available cells allow.
+    Only a target above what a fresh study allows (one attempt for a fixed configuration,
+    the matrix size for a grid) needs the ledger, since only recorded failures can justify it.
+    The attempts are counted as a launch counts them after its recovery: a RUNNING attempt
+    that recovery settles as failed counts as finished. One whose completed trainer evidence
+    awaits recovery also counts as a failure, the verdict that allows the most retries,
+    because validation recovers nothing and a launch's extraction may still record one. So a
+    target is refused only when a launch refuses it whatever those verdicts turn out to be,
+    and a launch enforces the real ceiling once it has recovered the evidence.
+
+    :param Experiment experiment: Config whose targets may retry recorded failures.
+    :raises TrialTargetRefusedError: A fixed configuration or grid requests more attempts
+        than its recorded attempts let it retry.
     :raises StudyStorageUnavailableError: The ledger cannot be read to justify a raised target.
     """
     phases = [
         phase
         for phase in experiment.phases
-        if phase.sampler.type == "grid" and phase.n_trials > grid_cardinality(phase)
+        if (fresh := retry_target_ceiling(phase, finished=0, measured=0)) is not None
+        and phase.n_trials > fresh
     ]
     if not phases:
         return
@@ -202,10 +236,14 @@ def validate_grid_targets(experiment: Experiment) -> None:
     for phase in phases:
         study = studies[phase.name]
         trials = [] if study is None else study.get_trials(deepcopy=False)
+        recovered = [] if study is None else _recovered_running_states(study.study_name, trials)
         _validate_fixed_configuration_target(
             phase,
-            finished=_finished_trial_count(trials),
+            finished=_finished_trial_count(trials)
+            + recovered.count("FAIL")
+            + recovered.count("EVIDENCE_PENDING"),
             measured=_measured_trial_count(trials),
+            has_study=study is not None,
         )
 
 
@@ -219,8 +257,9 @@ def _refuse_as_a_launch_would(
 
     Combine per-study refusals as a launch does. For RUNNING studies, apply direction,
     schema, and fixed-target checks using predicted recovery counts; defer target
-    and descendant checks requiring actual recovery. Preview does not verify trainer
-    environment, evidence, or per-study artifact-root claims.
+    and descendant checks requiring actual recovery. Preview inspects each study's
+    artifact-root claim without making it, and does not verify evidence;
+    :func:`_preview_phase` runs each launching phase's launch preflight.
 
     :param Experiment experiment: Parsed experiment being previewed.
     :param Mapping[str, RecordedPhase] recorded: What the ledger holds for each phase.
@@ -229,6 +268,8 @@ def _refuse_as_a_launch_would(
         whose trial is missing from, or below the history boundary of, its study.
     :raises PublicationAccessError: The last publication cannot be read.
     :raises PublicationIntegrityError: The last publication no longer validates.
+    :raises ArtifactRootConflictError: A study publishes into another artifact root, or
+        holds trials without recording one.
     :raises StudySchemaMismatchError: A study's direction differs from the
         config's, or its failure-policy state is malformed.
     :raises TrialTargetRefusedError: A study already accepted a higher target
@@ -239,6 +280,8 @@ def _refuse_as_a_launch_would(
     """
     studies = {name: record.study for name, record in recorded.items() if record.study is not None}
     _check_published_phase_studies(experiment, studies, from_phase=from_phase)
+    for bound_study in studies.values():
+        _artifact_root_claim_needed(bound_study, experiment)
     errors: list[Exception] = []
     reached = from_phase is None
     for phase in experiment.phases:
@@ -253,7 +296,7 @@ def _refuse_as_a_launch_would(
             _validate_study_schema(study)
             if reached and record.running:
                 _validate_fixed_configuration_target(
-                    phase, finished=record.finished, measured=record.measured
+                    phase, finished=record.finished, measured=record.measured, has_study=True
                 )
             elif reached:
                 _validate_trial_target(study, phase)
@@ -310,7 +353,8 @@ def _preview_phase(
         for phases earlier in the chain.
     :param RecordedPhase | None recorded: What the ledger holds for the phase,
         or ``None`` when that could not be read and the phase previews as fresh.
-    :raises PhaseSweepError: A launch would refuse the phase's recorded state.
+    :raises PhaseSweepError: A launch would refuse the phase's recorded state, or its
+        launch preflight (:func:`phasesweep.engine.study_policy._launch_preflight`) refuses.
     :return PhasePreview: The winner a replay would publish or a placeholder, the
         trials a launch would run, and whether the phase replays.
     """
@@ -396,6 +440,8 @@ def _preview_phase(
                 experiment, phase, inherited_winners, study, resume, verify_evidence=False
             )
         return PhasePreview(winner=winner, launches=0, reruns=0, replays=True)
+    # Recovery keeps each RUNNING attempt's environment, so the snapshot's cohort is the launch's.
+    _launch_preflight(experiment, phase.name, None if recorded is None else recorded.study)
     GpuPool.for_phase(phase, cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"))
     winner = _dry_run_phase(
         experiment,

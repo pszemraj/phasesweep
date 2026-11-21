@@ -1,7 +1,8 @@
-"""A refused phase fingerprint names the keys that changed, from the payload the study stored."""
+"""A refused phase fingerprint or artifact-root binding names what changed."""
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -12,7 +13,11 @@ from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import ExecutionContext, Experiment
 from phasesweep.config.search import IntParam
-from phasesweep.engine.errors import StudyFingerprintMismatchError
+from phasesweep.engine.artifact_roots import (
+    _check_artifact_root_binding,
+    _check_study_artifact_root,
+)
+from phasesweep.engine.errors import ArtifactRootConflictError, StudyFingerprintMismatchError
 from phasesweep.engine.fingerprints import (
     _phase_fingerprint,
     _phase_fingerprint_payload,
@@ -21,10 +26,21 @@ from phasesweep.engine.fingerprints import (
     _verify_fingerprint,
 )
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, PHASE_FINGERPRINT_PAYLOAD_ATTR
+from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
+from phasesweep.engine.state import (
+    ARTIFACT_ROOT_ATTR,
+    PHASE_FINGERPRINT_ATTR,
+    PHASE_FINGERPRINT_PAYLOAD_ATTR,
+)
 from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
 from tests.conftest import make_experiment
-from tests.experiments import anchored_phase, project_directory, write_anchored_config
+from tests.experiments import (
+    anchored_phase,
+    phase_payload,
+    project_directory,
+    write_anchored_config,
+)
+from tests.ledger_fixtures import materialize
 
 _CWD_SENTENCE = "The trainer working directory follows the directory phasesweep runs from"
 
@@ -46,7 +62,7 @@ def _refusal(study: optuna.Study, experiment: Experiment) -> StudyFingerprintMis
 
 
 def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
-    """Widening one bound refuses the study and names that key with both values."""
+    """Widening one bound refuses the study, names that key with both values, and offers the phase rename that then runs."""
     project = project_directory(tmp_path)
     config = write_anchored_config(
         project / "exp.yaml",
@@ -70,6 +86,51 @@ def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
     assert "Changed: phase.search_space.x.high: 3 -> 4." in str(caught.value)
     assert "execution.cwd" not in str(caught.value)
     assert caught.value.action is OperatorAction.FRESH_NAMESPACE
+    assert caught.value.remediation is not None
+    assert "give this phase a new `name`" in caught.value.remediation
+
+    write_anchored_config(
+        config,
+        workdir="runs",
+        storage="journal:///study.journal",
+        execution={"cwd": "."},
+        phases=[{**anchored_phase(4), "name": "wider"}],
+    )
+    assert set(run_experiment(load_experiment(config))) == {"wider"}
+
+
+def test_refusal_for_an_inherited_phase_names_the_dependents_to_rename(tmp_path: Path) -> None:
+    """A changed phase that another inherits reruns by renaming both, and the fix line names the dependent."""
+    project = project_directory(tmp_path)
+    fields: dict[str, object] = {
+        "workdir": "runs",
+        "storage": "journal:///study.journal",
+        "execution": {"cwd": "."},
+    }
+    child = phase_payload(
+        name="q", inherits=["p"], search_space={"y": {"type": "int", "low": 0, "high": 3}}
+    )
+    config = write_anchored_config(
+        project / "exp.yaml", phases=[anchored_phase(3), child], **fields
+    )
+    run_experiment(load_experiment(config))
+    write_anchored_config(config, phases=[anchored_phase(4), child], **fields)
+
+    with pytest.raises(StudyFingerprintMismatchError, match="::p'") as caught:
+        run_experiment(load_experiment(config))
+
+    assert caught.value.remediation is not None
+    assert (
+        "give this phase and each phase that inherits it (`q`) a new `name`"
+        in caught.value.remediation
+    )
+
+    renamed = [
+        {**anchored_phase(4), "name": "wider"},
+        {**child, "name": "after", "inherits": ["wider"]},
+    ]
+    write_anchored_config(config, phases=renamed, **fields)
+    assert set(run_experiment(load_experiment(config))) == {"wider", "after"}
 
 
 def test_refusal_names_the_trainer_cwd_when_the_same_config_runs_from_another_directory(
@@ -151,16 +212,21 @@ def test_refusal_lists_ten_changed_keys_then_counts_the_rest() -> None:
     assert "env.K10" not in message
 
 
-def test_refusal_gives_the_step_that_runs_the_changed_config() -> None:
-    """A changed input leaves one way forward, so the message names it beside the routing."""
+def test_refusal_leads_with_restoring_the_recorded_value_it_shows() -> None:
+    """The message shows the old value, so restoring it comes before starting a fresh study."""
     study = _stamped_study(make_experiment(provenance={"revision": "toy-v1"}))
 
     error = _refusal(study, make_experiment(provenance={"revision": "toy-v2"}))
 
     assert 'Changed: provenance.revision: "toy-v1" -> "toy-v2".' in str(error)
     assert str(error) == str(error).rstrip()
-    assert error.remediation == NEW_STUDY_STEP
-    assert _operational_error_text(error).endswith(NEW_STUDY_STEP)
+    assert error.remediation == (
+        "Restore the recorded value(s) to continue this study, or set a new `experiment` name "
+        "in the config to start a fresh study (a new `workdir` also works unless `storage` "
+        "names a ledger); the old study stays readable with its original config."
+    )
+    assert NEW_STUDY_STEP[1:] in error.remediation
+    assert _operational_error_text(error).endswith(error.remediation)
     assert error.action is OperatorAction.FRESH_NAMESPACE
 
 
@@ -193,6 +259,117 @@ def test_refusal_without_a_stored_payload_keeps_the_hash_only_message() -> None:
     )
     assert error.action is OperatorAction.FRESH_NAMESPACE
     assert error.remediation == NEW_STUDY_STEP
+
+
+def _bound_tree(tmp_path: Path, **recorded: object) -> tuple[Experiment, Path]:
+    """Materialize a bound tree, overwrite fields of its binding, and return both."""
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
+    binding_path = _artifact_root_binding_path(experiment)
+    binding = json.loads(binding_path.read_text())
+    binding.update(recorded)
+    binding_path.write_text(json.dumps(binding) + "\n")
+    return experiment, binding_path
+
+
+def test_a_tree_at_another_path_is_refused_as_created_elsewhere(tmp_path: Path) -> None:
+    """A moved or copied tree names the path it was created at, and the fix moves it back."""
+    experiment, _ = _bound_tree(tmp_path, artifact_root="/old/place/runs/t")
+    root = str(_experiment_dir(experiment).resolve())
+
+    with pytest.raises(ArtifactRootConflictError) as caught:
+        _check_artifact_root_binding(experiment)
+
+    assert str(caught.value) == (
+        f"The artifact tree at {root!r} was created at '/old/place/runs/t'. Nothing was written."
+    )
+    assert caught.value.action is OperatorAction.FIX_CONFIG
+    assert caught.value.remediation == (
+        "Use the tree at the recorded path (move it back if it was moved), or set a new "
+        "`experiment` name in the config to start a fresh study (a new `workdir` also works "
+        "unless `storage` names a ledger)."
+    )
+
+
+def test_a_binding_for_another_experiment_names_both_experiments(tmp_path: Path) -> None:
+    """The experiment the tree was created for is shown beside the configured one."""
+    experiment, _ = _bound_tree(tmp_path, experiment="renamed")
+
+    with pytest.raises(ArtifactRootConflictError) as caught:
+        _check_artifact_root_binding(experiment)
+
+    assert f"was created for experiment 'renamed', not {experiment.experiment!r}." in str(
+        caught.value
+    )
+    assert "storage" not in str(caught.value)
+    assert caught.value.remediation is not None
+    assert caught.value.remediation.startswith(
+        "Restore the `experiment` this tree was created with to continue this study"
+    )
+
+
+def test_a_binding_for_another_ledger_names_the_storage(tmp_path: Path) -> None:
+    """A changed ``storage`` is the cause named, not a ledger-or-experiment guess."""
+    experiment, _ = _bound_tree(tmp_path, storage_key="0" * 64)
+
+    with pytest.raises(ArtifactRootConflictError) as caught:
+        _check_artifact_root_binding(experiment)
+
+    assert "was created with a different storage ledger than this config names." in str(
+        caught.value
+    )
+    assert "experiment" not in str(caught.value)
+    assert caught.value.remediation is not None
+    assert caught.value.remediation.startswith(
+        "Restore the `storage` this tree was created with to continue this study"
+    )
+
+
+def test_a_binding_for_another_experiment_and_ledger_names_both(tmp_path: Path) -> None:
+    """Both differing fields are named, in one sentence."""
+    experiment, _ = _bound_tree(tmp_path, experiment="renamed", storage_key=None)
+
+    with pytest.raises(ArtifactRootConflictError) as caught:
+        _check_artifact_root_binding(experiment)
+
+    assert (
+        f"was created for experiment 'renamed', not {experiment.experiment!r}, and with a "
+        "different storage ledger than this config names."
+    ) in str(caught.value)
+    assert caught.value.remediation is not None
+    assert caught.value.remediation.startswith(
+        "Restore the `experiment` and `storage` this tree was created with"
+    )
+
+
+@pytest.mark.parametrize("shape", ["not-an-object", "extra-field"])
+def test_a_binding_of_another_shape_is_malformed_not_a_mismatch(tmp_path: Path, shape: str) -> None:
+    """A binding that is no ownership record is restored, never blamed on the config."""
+    if shape == "extra-field":
+        experiment, _ = _bound_tree(tmp_path, unexpected="field")
+    else:
+        experiment, binding_path = _bound_tree(tmp_path)
+        binding_path.write_text("[1, 2]\n")
+
+    with pytest.raises(ArtifactRootConflictError, match="is malformed") as caught:
+        _check_artifact_root_binding(experiment)
+
+    assert caught.value.action is OperatorAction.RESTORE_TREE
+    assert caught.value.remediation is None
+
+
+def test_a_study_bound_to_another_root_gets_a_step_that_fits(tmp_path: Path) -> None:
+    """A study that publishes elsewhere is told to restore the root's inputs or start fresh."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    study = optuna.create_study(study_name="t::p")
+    study.set_user_attr(ARTIFACT_ROOT_ATTR, "/old/place/runs/t")
+
+    with pytest.raises(ArtifactRootConflictError, match="publishes into artifact root") as caught:
+        _check_study_artifact_root(study, experiment)
+
+    assert caught.value.remediation == (
+        "Restore the `workdir` and `experiment` that give the recorded artifact root to "
+        "continue this study, or set a new `experiment` name to start a fresh study."
+    )
 
 
 def test_long_values_are_windowed_around_their_first_difference() -> None:

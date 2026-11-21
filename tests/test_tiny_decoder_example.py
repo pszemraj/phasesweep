@@ -1,4 +1,4 @@
-"""CPU-only checks for the tiny-decoder trial wrapper's evidence contract."""
+"""CPU-only checks for the tiny-decoder trainer's evidence contract."""
 
 from __future__ import annotations
 
@@ -19,11 +19,11 @@ from phasesweep.evidence.evaluation import evaluate_gates
 from tests.conftest import make_trial_context
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-WRAPPER_PATH = REPO_ROOT / "examples" / "tiny_decoder_enwik8" / "run_trial.py"
+RUN_TRIAL_PATH = REPO_ROOT / "examples" / "tiny_decoder_enwik8" / "run_trial.py"
 
 
-def _load_wrapper() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("tiny_decoder_run_trial", WRAPPER_PATH)
+def _load_run_trial() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("tiny_decoder_run_trial", RUN_TRIAL_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -40,10 +40,10 @@ def trainer_script(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize("device_type", ["cuda", "mps", "cpu"])
-def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(
+def test_run_trial_publishes_attempt_scoped_final_checkpoint_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, device_type: str, trainer_script: Path
 ) -> None:
-    wrapper = _load_wrapper()
+    run_trial = _load_run_trial()
     monkeypatch.setitem(sys.modules, "mlflow", None)
     template_root = trainer_script.parent
     trial_dir = tmp_path / "trial"
@@ -58,16 +58,18 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(
     )
     observed: dict[str, object] = {}
 
-    def fake_run(train_py: Path, config_path: Path) -> None:
-        assert train_py == trainer_script
+    def fake_train(trainer: ModuleType, template_root: Path, config_path: Path) -> None:
+        assert Path(trainer.__file__) == trainer_script
+        assert template_root == trainer_script.parent
         config = yaml.safe_load(config_path.read_text())
         observed["config"] = config
         run_dir = Path(config["run_dir"])
         run_dir.mkdir(parents=True)
         (run_dir / "final.pt").write_bytes(b"checkpoint")
 
-    def fake_evaluate(train_py: Path, run_dir: Path) -> dict[str, object]:
-        assert train_py == trainer_script
+    def fake_evaluate(trainer: ModuleType, template_root: Path, run_dir: Path) -> dict[str, object]:
+        assert Path(trainer.__file__) == trainer_script
+        assert template_root == trainer_script.parent
         assert (run_dir / "final.pt").read_bytes() == b"checkpoint"
         return {
             "checkpoint": "final.pt",
@@ -77,8 +79,8 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(
             "val_loss": 0.25,
         }
 
-    monkeypatch.setattr(wrapper, "_run_template", fake_run)
-    monkeypatch.setattr(wrapper, "_evaluate_final_checkpoint", fake_evaluate)
+    monkeypatch.setattr(run_trial, "_train", fake_train)
+    monkeypatch.setattr(run_trial, "_evaluate_final_checkpoint", fake_evaluate)
     monkeypatch.setenv("PHASESWEEP_GENERATION_ID", "generation-test")
     monkeypatch.setenv("PHASESWEEP_ATTEMPT_ID", "attempt-test")
     config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
@@ -86,7 +88,7 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(
     monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", str(trial_dir / "result.json"))
 
     assert (
-        wrapper.main(
+        run_trial.main(
             [
                 "--template-root",
                 str(template_root),
@@ -115,7 +117,7 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(
         "status": "complete",
     }
     assert list(trial_dir.glob(".result.json.*.tmp")) == []
-    smoke = load_experiment(WRAPPER_PATH.parent / "gpu_smoke.yaml")
+    smoke = load_experiment(RUN_TRIAL_PATH.parent / "gpu_smoke.yaml")
     gates = evaluate_gates(make_trial_context(trial_dir), smoke.phases[0].gates)
     assert len(gates) == 1
     assert gates[0].passed is (device_type != "cpu")
@@ -127,7 +129,7 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(
     [("cuda", False), ("cpu", False), ("cuda", True)],
     ids=["cuda-success", "cpu-success", "trainer-failure"],
 )
-def test_wrapper_logs_native_mlflow_checkpoint_in_both_modes(
+def test_run_trial_logs_native_mlflow_checkpoint_in_both_modes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     managed: bool,
@@ -136,7 +138,7 @@ def test_wrapper_logs_native_mlflow_checkpoint_in_both_modes(
     trainer_script: Path,
 ) -> None:
     """The native run covers training and closes on failure without logging a score."""
-    wrapper = _load_wrapper()
+    run_trial = _load_run_trial()
     config_path = tmp_path / "trainer.yaml"
     config = {"run_dir": str(tmp_path / "trainer"), "learning_rate": 0.001, "num_batches": 10}
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
@@ -156,8 +158,8 @@ def test_wrapper_logs_native_mlflow_checkpoint_in_both_modes(
         finally:
             observed["active"] = False
 
-    def train(train_py: Path, _config: Path) -> None:
-        assert train_py == trainer_script
+    def train(_trainer: ModuleType, template_root: Path, _config: Path) -> None:
+        assert template_root == trainer_script.parent
         assert observed["active"] is True
         assert observed["params"] == config
         if trainer_fails:
@@ -181,9 +183,9 @@ def test_wrapper_logs_native_mlflow_checkpoint_in_both_modes(
         monkeypatch.setenv("MLFLOW_RUN_ID", "managed-run")
     else:
         monkeypatch.delenv("MLFLOW_RUN_ID", raising=False)
-    monkeypatch.setattr(wrapper, "_run_template", train)
+    monkeypatch.setattr(run_trial, "_train", train)
     monkeypatch.setattr(
-        wrapper,
+        run_trial,
         "_evaluate_final_checkpoint",
         lambda *_args: {
             "val_loss": 0.25,
@@ -201,11 +203,11 @@ def test_wrapper_logs_native_mlflow_checkpoint_in_both_modes(
     args = ["--template-root", str(trainer_script.parent), "--config", str(config_path), "--mlflow"]
     if trainer_fails:
         with pytest.raises(RuntimeError, match="trainer failed"):
-            wrapper.main(args)
+            run_trial.main(args)
         assert observed["status"] == "FAILED"
         assert "metrics" not in observed
     else:
-        assert wrapper.main(args) == 0
+        assert run_trial.main(args) == 0
         assert observed["status"] == "FINISHED"
         assert observed["metrics"] == {
             "val_loss": 0.25,
@@ -224,11 +226,11 @@ def test_wrapper_logs_native_mlflow_checkpoint_in_both_modes(
 
 
 @pytest.mark.parametrize("mlflow_mode", [False, True])
-def test_wrapper_rejects_a_config_from_another_attempt(
+def test_run_trial_rejects_a_config_from_another_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mlflow_mode: bool, trainer_script: Path
 ) -> None:
     """Neither reporting mode publishes an evaluation of another attempt's config."""
-    wrapper = _load_wrapper()
+    run_trial = _load_run_trial()
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
     config_path = trial_dir / "trainer_config.yaml"
@@ -247,9 +249,9 @@ def test_wrapper_rejects_a_config_from_another_attempt(
     )
     monkeypatch.setitem(sys.modules, "mlflow", sdk)
     monkeypatch.setenv("MLFLOW_RUN_ID", "managed-run")
-    monkeypatch.setattr(wrapper, "_run_template", lambda *_args: None)
+    monkeypatch.setattr(run_trial, "_train", lambda *_args: None)
     monkeypatch.setattr(
-        wrapper,
+        run_trial,
         "_evaluate_final_checkpoint",
         lambda *_args: {
             "checkpoint": "final.pt",
@@ -266,7 +268,7 @@ def test_wrapper_rejects_a_config_from_another_attempt(
 
     args = ["--template-root", str(trainer_script.parent), "--config", str(config_path)]
     with pytest.raises(ValueError, match="Trainer config does not match"):
-        wrapper.main([*args, "--mlflow"] if mlflow_mode else args)
+        run_trial.main([*args, "--mlflow"] if mlflow_mode else args)
 
     assert scored == []
     assert not (trial_dir / "result.json").exists()
@@ -283,8 +285,25 @@ class _FakeEvaluationModel:
         return None
 
 
-def test_final_evaluator_applies_zero_seed(tmp_path, monkeypatch) -> None:
-    wrapper = _load_wrapper()
+def test_train_runs_the_trainer_from_its_checkout(tmp_path, monkeypatch) -> None:
+    """The trainer opens its relative paths against the checkout, and the caller's directory returns."""
+    run_trial = _load_run_trial()
+    checkout = tmp_path / "upstream"
+    checkout.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    calls: list[tuple[Path, str]] = []
+    trainer = SimpleNamespace(train=lambda config_path: calls.append((Path.cwd(), config_path)))
+
+    run_trial._train(trainer, checkout, tmp_path / "trainer.yaml")
+
+    assert calls == [(checkout.resolve(), str(tmp_path / "trainer.yaml"))]
+    assert Path.cwd() == elsewhere.resolve()
+
+
+def test_final_evaluator_applies_zero_seed(tmp_path) -> None:
+    run_trial = _load_run_trial()
     observed: list[int] = []
 
     fake_torch = SimpleNamespace(
@@ -300,17 +319,16 @@ def test_final_evaluator_applies_zero_seed(tmp_path, monkeypatch) -> None:
         Llama=lambda **_kwargs: _FakeEvaluationModel(),
         load_data=lambda _path: (_ for _ in ()).throw(RuntimeError("evaluation reached data")),
     )
-    monkeypatch.setattr(wrapper, "_load_upstream_trainer", lambda _root: fake_trainer)
 
     with pytest.raises(RuntimeError, match="evaluation reached data"):
-        wrapper._evaluate_final_checkpoint(tmp_path / "train.py", tmp_path)
+        run_trial._evaluate_final_checkpoint(fake_trainer, tmp_path, tmp_path)
 
     assert observed == [0]
 
 
-def test_final_evaluator_rejects_empty_validation_budget(tmp_path, monkeypatch) -> None:
+def test_final_evaluator_rejects_empty_validation_budget(tmp_path) -> None:
     """A zero-batch evaluation cannot publish a data-free validation objective."""
-    wrapper = _load_wrapper()
+    run_trial = _load_run_trial()
 
     fake_torch = SimpleNamespace(
         load=lambda *_args, **_kwargs: {
@@ -332,7 +350,6 @@ def test_final_evaluator_rejects_empty_validation_budget(tmp_path, monkeypatch) 
         DataLoader=lambda *_args, **_kwargs: object(),
         cycle=lambda _loader: iter(()),
     )
-    monkeypatch.setattr(wrapper, "_load_upstream_trainer", lambda _root: fake_trainer)
 
     with pytest.raises(ValueError, match="evaluated no validation tokens"):
-        wrapper._evaluate_final_checkpoint(tmp_path / "train.py", tmp_path)
+        run_trial._evaluate_final_checkpoint(fake_trainer, tmp_path, tmp_path)

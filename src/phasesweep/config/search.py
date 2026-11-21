@@ -284,20 +284,19 @@ def phase_draws(phase: Phase) -> bool:
     return bool(sampler_search_space(phase))
 
 
-def sampler_capability_line(phase: Phase, storage: str | None) -> str:
+def sampler_capability_line(phase: Phase, *, persistent: bool) -> str:
     """Describe a phase's resume and reproduction contract.
 
     Resuming requires persistent storage. Grid and seeded draws are reproducible;
     parallel TPE and CMA-ES draws also depend on trial completion order.
 
     :param Phase phase: Phase whose sampler capability is described.
-    :param str | None storage: The experiment's resolved storage, ``None`` for
-        an in-memory study.
+    :param bool persistent: Whether the experiment's trials outlive the run.
     :return str: One line naming the phase and either its sampler type, seed,
         capability and repeat axis, or that it is a fixed configuration with no
         sampler draws.
     """
-    resume = "not resumable: in-memory storage" if storage is None else "resumable"
+    resume = "resumable" if persistent else "not resumable: in-memory storage"
     if not phase_draws(phase):
         return f"phase {phase.name!r}: fixed configuration, no sampler draws ({resume})"
     sampler = phase.sampler
@@ -307,7 +306,7 @@ def sampler_capability_line(phase: Phase, storage: str | None) -> str:
     )
     if not reproducible:
         capability = resume
-    elif storage is None:
+    elif not persistent:
         capability = f"reproducible, {resume}"
     else:
         capability = f"{resume}, reproducible"
@@ -518,7 +517,9 @@ def grid_cardinality(phase: Phase) -> int:
     )
 
 
-def grid_target_refusal(phase: Phase, *, finished: int, measured: int) -> tuple[str, str] | None:
+def grid_target_refusal(
+    phase: Phase, *, finished: int, measured: int, has_study: bool
+) -> tuple[str, str] | None:
     """Refuse a grid target above the ceiling :func:`retry_target_ceiling` allows.
 
     Finished failures remain spent. Raising the target may retry each failed
@@ -528,20 +529,25 @@ def grid_target_refusal(phase: Phase, *, finished: int, measured: int) -> tuple[
     :param Phase phase: Phase whose target is checked.
     :param int finished: Finished attempts, excluding interruptions.
     :param int measured: Grid cells whose trial is COMPLETE, in bounds or not.
+    :param bool has_study: Whether a recorded study binds the search space, so that
+        enlarging the grid needs a new study; a config that never ran has none.
     :return tuple[str, str] | None: Refusal diagnosis and remedy when the target exceeds the available cells.
     """
     maximum = retry_target_ceiling(phase, finished=finished, measured=measured)
     if phase.sampler.type != "grid" or maximum is None or phase.n_trials <= maximum:
         return None
     cardinality = grid_cardinality(phase)
+    remedy = (
+        f"Set phases[{phase.name}].n_trials to at most {maximum}. "
+        "To enlarge the grid instead, change the search space."
+    )
     return (
         f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid's available "
         f"attempts: {finished} finished attempt{'s' if finished != 1 else ''} and "
         f"{measured} COMPLETE or INFEASIBLE cell{'s' if measured != 1 else ''} "
         f"in a {cardinality}-cell grid allow at most {maximum}. Raising n_trials retries "
         "failed cells once each; COMPLETE and INFEASIBLE cells are never repeated.",
-        f"Set phases[{phase.name}].n_trials to at most {maximum}. "
-        f"To enlarge the grid instead, change the search space. {NEW_STUDY_STEP}",
+        f"{remedy} {NEW_STUDY_STEP}" if has_study else remedy,
     )
 
 

@@ -26,7 +26,7 @@ import yaml
 import phasesweep
 from phasesweep.engine.paths import _experiment_dir, _generation_dir
 from phasesweep.engine.run import run_experiment
-from tests.conftest import make_experiment, write_constant_trainer
+from tests.conftest import console_script, make_experiment, write_constant_trainer
 from tests.ledger_fixtures import published_generation_id
 
 PYPROJECT_PATH = Path(__file__).resolve().parents[1] / "pyproject.toml"
@@ -34,6 +34,7 @@ PYPROJECT_PATH = Path(__file__).resolve().parents[1] / "pyproject.toml"
 CONSOLE_SCRIPTS = {
     "phasesweep": "phasesweep.cli:main",
     "phasesweep-mcp": "phasesweep.mcp.server:main",
+    "phasesweep-fake-train": "phasesweep.examples.fake_train:main",
     "phasesweep-mlflow-train": "phasesweep.examples.mlflow_train:main",
 }
 
@@ -45,7 +46,7 @@ def _pyproject() -> dict:
 
 
 def test_console_scripts_declare_importable_targets() -> None:
-    """The CLI, MCP server and packaged MLflow trainer resolve to real callables."""
+    """The CLI, MCP server and both packaged toy trainers resolve to real callables."""
     assert _pyproject()["project"]["scripts"] == CONSOLE_SCRIPTS
 
     for target in CONSOLE_SCRIPTS.values():
@@ -139,7 +140,7 @@ def test_release_version_uses_event_tag_with_competing_annotated_tag(
     run(*git, "tag", release_tag)
 
     monkeypatch.delenv("SETUPTOOLS_SCM_OVERRIDES_FOR_PHASESWEEP", raising=False)
-    assert run(sys.executable, "-m", "setuptools_scm") == "0.4.0rc1"
+    assert run(str(console_script("setuptools-scm"))) == "0.4.0rc1"
 
     workflow_path = PYPROJECT_PATH.parent / ".github" / "workflows" / "publish.yml"
     workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
@@ -151,7 +152,7 @@ def test_release_version_uses_event_tag_with_competing_annotated_tag(
     for name, value in build_step.get("env", {}).items():
         monkeypatch.setenv(name, value.replace("${{ github.event.release.tag_name }}", release_tag))
 
-    assert run(sys.executable, "-m", "setuptools_scm") == expected_version
+    assert run(str(console_script("setuptools-scm"))) == expected_version
 
 
 def test_ci_installs_the_dev_extra_exact_pins() -> None:

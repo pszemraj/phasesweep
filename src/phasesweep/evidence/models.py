@@ -13,7 +13,6 @@ from urllib.parse import urlsplit
 
 from pydantic import (
     AfterValidator,
-    BaseModel,
     Field,
     field_validator,
     model_validator,
@@ -127,7 +126,7 @@ class LogRegexExtractor(_Frozen):
     pattern: str = Field(
         description=(
             "Python regex with a named group 'value' that captures the metric. "
-            r"Example: r'eval_loss=(?P<value>[0-9.eE+-]+)'."
+            r"Example: r'eval_loss=(?P<value>\S+)'."
         )
     )
     select: Literal["last", "first", "min", "max"] = "last"
@@ -268,71 +267,6 @@ POSITIONED_EXTRACTOR_KINDS: frozenset[ExtractorKind] = frozenset(
 """The kinds whose recorded evidence names where on the evaluation axis the objective was
 measured. ``json`` and ``log_regex`` objectives record no position, so selection's
 ``evaluation_point`` check cannot run on them."""
-
-
-def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str | bool]:
-    """Describe the identity checks enforced by an objective extractor.
-
-    Local extractors are location-scoped. Only json_envelope checks the reported
-    attempt, generation, and override digest, plus the objective name, split,
-    and policy. It requires checkpoint and step metadata, but binds their values
-    only when the corresponding optional configuration fields are declared.
-    Remote extractors key evidence by target and run ID; W&B does not enforce
-    envelope metadata. Other kinds leave envelope assurance flags false.
-
-    :param ObjectiveExtractor extractor: Objective extractor to describe.
-    :return dict[str, str | bool]: Extractor kind and assurance flags.
-        *_declared marks an optional configured value; *_value_bound marks its
-        enforced equality with the envelope.
-    """
-    if isinstance(extractor, JsonEnvelopeExtractor):
-        checkpoint_declared = extractor.checkpoint is not None
-        expected_step_declared = extractor.expected_step is not None
-        return {
-            "kind": extractor.type,
-            "attempt_location_scoped": True,
-            "attempt_identity_bound": True,
-            "source_identity_keyed": False,
-            "objective_name_bound": True,
-            "split_bound": True,
-            "evaluation_policy_bound": True,
-            "checkpoint_declared": checkpoint_declared,
-            "checkpoint_value_bound": checkpoint_declared,
-            "expected_step_declared": expected_step_declared,
-            "expected_step_value_bound": expected_step_declared,
-        }
-    return {
-        "kind": extractor.type,
-        "attempt_location_scoped": not isinstance(extractor, WandbExtractor | MlflowExtractor),
-        "attempt_identity_bound": False,
-        "source_identity_keyed": isinstance(extractor, WandbExtractor | MlflowExtractor),
-        "objective_name_bound": False,
-        "split_bound": False,
-        "evaluation_policy_bound": False,
-        "checkpoint_declared": False,
-        "checkpoint_value_bound": False,
-        "expected_step_declared": False,
-        "expected_step_value_bound": False,
-    }
-
-
-class _ObjectiveEvidenceFields(BaseModel):
-    """Assurance flags for the shared MCP objective-evidence model.
-
-    See :func:`objective_evidence_assurance` for each flag's meaning.
-    """
-
-    kind: ExtractorKind
-    attempt_location_scoped: bool
-    attempt_identity_bound: bool
-    source_identity_keyed: bool
-    objective_name_bound: bool
-    split_bound: bool
-    evaluation_policy_bound: bool
-    checkpoint_declared: bool
-    checkpoint_value_bound: bool
-    expected_step_declared: bool
-    expected_step_value_bound: bool
 
 
 class RequiredFileGate(_Frozen):

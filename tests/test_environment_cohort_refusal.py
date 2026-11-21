@@ -17,14 +17,20 @@ import pytest
 import yaml
 
 from phasesweep import run_experiment
-from phasesweep.config.models import ExecutionContext, Experiment
+from phasesweep.cli import _operational_error_text
+from phasesweep.config.models import ExecutionContext, Experiment, Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.artifacts import _write_trials_csv
-from phasesweep.engine.errors import StudyFingerprintMismatchError
+from phasesweep.engine.errors import StudyFingerprintMismatchError, TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _generation_winner_path, _phase_dir
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import TRAINER_ENV_ATTR, TRAINER_ENV_DIGEST_ATTR
-from phasesweep.engine.study_policy import _validate_environment_cohort
+from phasesweep.engine.study_policy import (
+    _describe_environment_changes,
+    _environment_cohort_remediation,
+    _validate_environment_cohort,
+)
 from phasesweep.engine.trial import (
     EnvironmentIdentity,
     TrialExecutionError,
@@ -33,7 +39,12 @@ from phasesweep.engine.trial import (
 from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import WandbSummaryRequiredGate
 from phasesweep.tracking.models import MlflowSettings
-from tests.conftest import make_experiment, write_constant_trainer
+from tests.conftest import (
+    make_experiment,
+    stamped_environment_attrs,
+    study_with_stamped_environment,
+    write_constant_trainer,
+)
 from tests.ledger_fixtures import published_generation_id
 
 _AMBIENT = {
@@ -63,31 +74,21 @@ def _identity(experiment: Experiment) -> EnvironmentIdentity:
     return _environment_identity(experiment, "p")
 
 
-def _stamped(identity: EnvironmentIdentity, *, mapping: bool = True) -> dict[str, object]:
-    """Return the attributes ``_execute_objective`` stamps on an allocated trial."""
-    attrs: dict[str, object] = {TRAINER_ENV_DIGEST_ATTR: identity.digest}
-    if mapping:
-        attrs[TRAINER_ENV_ATTR] = dict(identity.tracked)
-    return attrs
-
-
-def _record(identity: EnvironmentIdentity, *, mapping: bool = True) -> optuna.Study:
-    """Return a study holding one trial stamped as ``_execute_objective`` stamps it."""
-    study = optuna.create_study(study_name="t::p")
-    study.add_trial(
-        optuna.trial.create_trial(value=1.0, user_attrs=_stamped(identity, mapping=mapping))
-    )
-    return study
-
-
-def _refusal(study: optuna.Study, current: EnvironmentIdentity) -> str:
-    """Return the refusal text for ``current`` against ``study``."""
+def _refused(study: optuna.Study, current: EnvironmentIdentity) -> StudyFingerprintMismatchError:
+    """Return the refusal for ``current`` against ``study``."""
     with pytest.raises(StudyFingerprintMismatchError) as caught:
         _validate_environment_cohort(study, current)
     assert type(caught.value) is StudyFingerprintMismatchError
     assert caught.value.action is OperatorAction.FIX_CONFIG
     assert "No trial was allocated." in str(caught.value)
-    return str(caught.value)
+    assert caught.value.remediation is not None
+    assert caught.value.remediation not in str(caught.value)
+    return caught.value
+
+
+def _refusal(study: optuna.Study, current: EnvironmentIdentity) -> str:
+    """Return the refusal text for ``current`` against ``study``."""
+    return str(_refused(study, current))
 
 
 @pytest.mark.parametrize(
@@ -104,14 +105,16 @@ def _refusal(study: optuna.Study, current: EnvironmentIdentity) -> str:
             {},
             {"PATH": "/opt/second/bin:/usr/bin"},
             [],
-            'PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin".',
+            'PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin" '
+            "(only recorded: /opt/first/bin; only current: /opt/second/bin).",
             id="changed-path",
         ),
         pytest.param(
             {},
             {"TZ": "Asia/Tokyo", "PATH": "/opt/second/bin:/usr/bin"},
             [],
-            'Compared with trial 0: PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin"; '
+            'Compared with trial 0: PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin" '
+            "(only recorded: /opt/first/bin; only current: /opt/second/bin); "
             'TZ "Europe/Berlin" -> "Asia/Tokyo".',
             id="two-changed-variables",
         ),
@@ -153,7 +156,7 @@ def test_environment_mutation_names_each_difference(
     )
     for name, value in initial.items():
         monkeypatch.setenv(name, value)
-    study = _record(_identity(experiment))
+    study = study_with_stamped_environment(_identity(experiment))
     for name, value in changes.items():
         if value is None:
             monkeypatch.delenv(name)
@@ -171,7 +174,7 @@ def test_pass_through_names_are_in_neither_the_mapping_nor_the_refusal(
     monkeypatch.setenv("API_TOKEN", "rotating-first")
     monkeypatch.setenv("TMPDIR", "/scratch/first")
     before = _identity(experiment)
-    study = _record(before)
+    study = study_with_stamped_environment(before)
     assert not {"API_TOKEN", "TMPDIR"} & set(before.tracked)
     assert before.values["API_TOKEN"] == "rotating-first"
     monkeypatch.setenv("API_TOKEN", "rotating-second")
@@ -198,7 +201,7 @@ def test_changed_listed_or_configured_value_is_shown(
     else:
         first = second = make_experiment(execution=ExecutionContext(inherit_env=["API_TOKEN"]))
     monkeypatch.setenv("API_TOKEN", "hunter2-first")
-    study = _record(_identity(first))
+    study = study_with_stamped_environment(_identity(first))
     monkeypatch.setenv("API_TOKEN", "hunter2-second")
 
     message = _refusal(study, _identity(second))
@@ -227,7 +230,7 @@ def test_base_value_pinned_under_env_is_shown_like_an_ambient_one() -> None:
     first = make_experiment(env={"TZ": "Europe/Berlin"})
     second = make_experiment(env={"TZ": "Asia/Tokyo"})
 
-    message = _refusal(_record(_identity(first)), _identity(second))
+    message = _refusal(study_with_stamped_environment(_identity(first)), _identity(second))
 
     assert 'Compared with trial 0: TZ "Europe/Berlin" -> "Asia/Tokyo".' in message
 
@@ -237,13 +240,16 @@ def test_a_trial_that_recorded_no_mapping_gets_the_generic_sentence(
 ) -> None:
     """An allocation that died after its digest and before its mapping landed has nothing to compare."""
     experiment = make_experiment()
-    study = _record(_identity(experiment), mapping=False)
+    study = study_with_stamped_environment(_identity(experiment), mapping=False)
     monkeypatch.setenv("TZ", "Asia/Tokyo")
 
-    message = _refusal(study, _identity(experiment))
+    refusal = _refused(study, _identity(experiment))
 
-    assert _NOT_RECORDED in message
-    assert "Compared with" not in message
+    assert _NOT_RECORDED in str(refusal)
+    assert "Compared with" not in str(refusal)
+    assert refusal.remediation is not None
+    assert refusal.remediation.startswith("Run in the environment that created this study")
+    assert "`TZ`" not in refusal.remediation
 
 
 def test_a_malformed_mapping_gets_the_generic_sentence(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -268,24 +274,29 @@ def test_the_latest_trial_that_recorded_a_mapping_is_the_comparison(
     first = _identity(experiment)
     monkeypatch.setenv("TZ", "Asia/Tokyo")
     second = _identity(experiment)
-    study = _record(first)
-    study.add_trial(optuna.trial.create_trial(value=1.0, user_attrs=_stamped(second)))
+    study = study_with_stamped_environment(first)
     study.add_trial(
-        optuna.trial.create_trial(value=1.0, user_attrs=_stamped(second, mapping=False))
+        optuna.trial.create_trial(value=1.0, user_attrs=stamped_environment_attrs(second))
+    )
+    study.add_trial(
+        optuna.trial.create_trial(
+            value=1.0, user_attrs=stamped_environment_attrs(second, mapping=False)
+        )
     )
     monkeypatch.setenv("PATH", "/opt/second/bin:/usr/bin")
 
     message = _refusal(study, _identity(experiment))
 
     assert (
-        'Compared with trial 1: PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin".'
+        'Compared with trial 1: PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin" '
+        "(only recorded: /opt/first/bin; only current: /opt/second/bin)."
     ) in message
 
 
 def test_a_long_difference_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
     names = [f"PS_COHORT_VAR_{index:02d}" for index in range(12)]
     experiment = make_experiment(execution=ExecutionContext(inherit_env=names))
-    study = _record(_identity(experiment))
+    study = study_with_stamped_environment(_identity(experiment))
     for name in names:
         monkeypatch.setenv(name, "set")
 
@@ -295,36 +306,99 @@ def test_a_long_difference_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "PS_COHORT_VAR_10" not in message
 
 
-def test_a_long_value_is_cut_to_where_the_two_differ(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_refusal_shows_a_long_value_whole_and_the_drift_warning_cuts_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recorded ``PATH`` must be restorable from the refusal; the winner warning keeps its window."""
     shared = ":".join(f"/opt/tool-{index:02d}/bin" for index in range(30))
-    monkeypatch.setenv("PATH", f"{shared}:/opt/a/bin:/usr/bin")
+    recorded_path = f"{shared}:/opt/a/bin:/usr/bin"
+    current_path = f"{shared}:/opt/b/bin:/usr/bin"
+    monkeypatch.setenv("PATH", recorded_path)
     experiment = make_experiment()
-    study = _record(_identity(experiment))
-    monkeypatch.setenv("PATH", f"{shared}:/opt/b/bin:/usr/bin")
+    recorded = _identity(experiment)
+    study = study_with_stamped_environment(recorded)
+    monkeypatch.setenv("PATH", current_path)
+    current = _identity(experiment)
 
-    message = _refusal(study, _identity(experiment))
+    message = _refusal(study, current)
 
-    assert "PATH ..." in message
-    assert "/opt/a/bin" in message
-    assert "/opt/b/bin" in message
-    assert "/opt/tool-00/bin" not in message
+    assert f'PATH "{recorded_path}" -> "{current_path}"' in message
+    cut = _describe_environment_changes(recorded.tracked, current.tracked)
+    assert "PATH ..." in cut
+    assert "/opt/a/bin" in cut
+    assert "/opt/b/bin" in cut
+    assert "/opt/tool-00/bin" not in cut
 
 
-def test_the_message_keeps_environment_classification(monkeypatch: pytest.MonkeyPatch) -> None:
-    experiment = make_experiment()
-    study = _record(_identity(experiment))
+def test_the_remediation_names_the_variables_that_differ(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The way back restores the recorded value of a differing variable and unsets an added one."""
+    names = ["PS_COHORT_ADDED"]
+    experiment = make_experiment(execution=ExecutionContext(inherit_env=names))
+    study = study_with_stamped_environment(_identity(experiment))
+    monkeypatch.setenv("PS_COHORT_ADDED", "new")
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    monkeypatch.setenv("PATH", "/opt/second/bin:/usr/bin")
+
+    refusal = _refused(study, _identity(experiment))
+
+    assert refusal.remediation == (
+        "Run with the recorded `PATH`, `TZ` and without `PS_COHORT_ADDED` to continue this study "
+        "(for an MCP run, do the same in the client's server `env`), or set a new `experiment` "
+        "name to start a fresh study. Pinning a variable under `env` or listing it under "
+        "`execution.passthrough_env` changes the study's identity, so that edit needs the new "
+        "`experiment` name too."
+    )
+    assert "passthrough_env" not in str(refusal)
+    assert "do not split cohorts" not in str(refusal)
+
+
+def test_the_remediation_restores_a_changed_variable_and_unsets_an_added_one_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed variable is run with its recorded value, and an added one is run without."""
+    experiment = make_experiment(execution=ExecutionContext(inherit_env=["PS_COHORT_ADDED"]))
+    study = study_with_stamped_environment(_identity(experiment))
     monkeypatch.setenv("TZ", "Asia/Tokyo")
 
-    message = _refusal(study, _identity(experiment))
+    changed = _refused(study, _identity(experiment))
+    monkeypatch.setenv("TZ", _AMBIENT["TZ"])
+    monkeypatch.setenv("PS_COHORT_ADDED", "new")
+    added = _refused(study, _identity(experiment))
 
-    assert "Values under env are pinned" in message
-    assert "execution.passthrough_env" in message
-    assert "do not split cohorts" in message
+    assert changed.remediation is not None
+    assert changed.remediation.startswith(
+        "Run with the recorded `TZ` to continue this study "
+        "(for an MCP run, do the same in the client's server `env`), or set a new `experiment` name"
+    )
+    assert added.remediation is not None
+    assert added.remediation.startswith(
+        "Run without `PS_COHORT_ADDED` to continue this study "
+        "(for an MCP run, do the same in the client's server `env`), or set a new `experiment` name"
+    )
+
+
+def test_the_remediation_names_every_variable_though_the_message_counts_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cap on shown values never hides a variable the operator must change."""
+    names = [f"PS_COHORT_VAR_{index:02d}" for index in range(12)]
+    experiment = make_experiment(execution=ExecutionContext(inherit_env=names))
+    study = study_with_stamped_environment(_identity(experiment))
+    for name in names:
+        monkeypatch.setenv(name, "set")
+
+    refusal = _refused(study, _identity(experiment))
+
+    assert refusal.remediation is not None
+    for name in names:
+        assert f"`{name}`" in refusal.remediation
 
 
 def test_matching_environment_is_not_refused() -> None:
     experiment = make_experiment()
-    _validate_environment_cohort(_record(_identity(experiment)), _identity(experiment))
+    _validate_environment_cohort(
+        study_with_stamped_environment(_identity(experiment)), _identity(experiment)
+    )
 
 
 def test_inherit_all_does_not_split_the_cohort_on_an_untracked_ambient_variable(
@@ -335,7 +409,7 @@ def test_inherit_all_does_not_split_the_cohort_on_an_untracked_ambient_variable(
     monkeypatch.setenv("SHLVL", "1")
     monkeypatch.setenv("OLDPWD", "/home/alice/earlier")
     before = _identity(experiment)
-    study = _record(before)
+    study = study_with_stamped_environment(before)
     monkeypatch.setenv("SHLVL", "3")
     monkeypatch.setenv("OLDPWD", "/home/alice/later")
     monkeypatch.setenv("PS_COHORT_EXTRA", "only-in-the-second-shell")
@@ -354,7 +428,7 @@ def test_inherit_all_still_refuses_a_differing_base_variable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     experiment = make_experiment(execution=ExecutionContext(inherit_env="all"))
-    study = _record(_identity(experiment))
+    study = study_with_stamped_environment(_identity(experiment))
     monkeypatch.setenv("TZ", "Asia/Tokyo")
     monkeypatch.setenv("SHLVL", "9")
 
@@ -405,7 +479,7 @@ def test_inherit_all_has_the_cohort_of_inherit_none(monkeypatch: pytest.MonkeyPa
 def test_trials_csv_carries_the_digest_but_not_the_mapping(tmp_path: Path) -> None:
     """The mapping is ledger provenance, so ``PATH`` is not a column of the results table."""
     identity = _identity(make_experiment())
-    study = _record(identity)
+    study = study_with_stamped_environment(identity)
     destination = tmp_path / "trials.csv"
 
     _write_trials_csv(study, destination)
@@ -504,3 +578,64 @@ def test_a_real_run_records_the_mapping_and_a_changed_tz_is_refused(
     with pytest.raises(StudyFingerprintMismatchError) as caught:
         run_experiment(topped_up)
     assert 'Compared with trial 0: TZ "Europe/Berlin" -> "Asia/Tokyo".' in str(caught.value)
+
+
+def _two_phase_study(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Experiment:
+    """Run two phases of two trials each, and return the experiment that ran them."""
+    monkeypatch.setenv("PATH", _REAL_PATH)
+    phases = [
+        Phase(
+            name=name,
+            n_trials=2,
+            gpu_policy="none",
+            sampler=Sampler(type="random", seed=0),
+            search_space={f"{name}_x": IntParam(type="int", low=0, high=10)},
+        )
+        for name in ("a", "b")
+    ]
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=write_constant_trainer(tmp_path), phases=phases
+    )
+    run_experiment(experiment)
+    return experiment
+
+
+def _with_targets(experiment: Experiment, n_trials: int) -> Experiment:
+    """Return ``experiment`` with every phase's trial target set to ``n_trials``."""
+    phases = [phase.model_copy(update={"n_trials": n_trials}) for phase in experiment.phases]
+    return experiment.model_copy(update={"phases": phases})
+
+
+@pytest.mark.integration
+def test_two_phases_refused_for_one_cohort_share_one_fix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both topped-up phases name the changed ``TZ`` in the message, and the fix line carries the step once."""
+    experiment = _two_phase_study(tmp_path, monkeypatch)
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+
+    with pytest.raises(StudyFingerprintMismatchError, match="multiple unsafe studies") as caught:
+        run_experiment(_with_targets(experiment, 3))
+
+    refusal = caught.value
+    assert str(refusal).count('TZ "Europe/Berlin" -> "Asia/Tokyo"') == 2
+    assert refusal.remediation == _environment_cohort_remediation(["TZ"], [])
+    assert _operational_error_text(refusal).endswith(f"\nfix: {refusal.remediation}")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_two_lowered_targets_carry_both_steps_in_a_run_and_a_dry_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    """The dry run collapses refused studies as a run does, so it prints the same fix line."""
+    experiment = _two_phase_study(tmp_path, monkeypatch)
+
+    with pytest.raises(TrialTargetRefusedError, match="multiple unsafe studies") as caught:
+        run_experiment(_with_targets(experiment, 1), dry_run=dry_run)
+
+    assert caught.value.remediation == (
+        "Set phases[a].n_trials to at least 2 and rerun. "
+        "Set phases[b].n_trials to at least 2 and rerun."
+    )
+    assert _operational_error_text(caught.value).endswith(f"\nfix: {caught.value.remediation}")

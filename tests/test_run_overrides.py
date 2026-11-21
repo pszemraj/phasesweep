@@ -9,12 +9,14 @@ import yaml
 from click.testing import CliRunner
 
 import phasesweep.cli as cli_module
+import phasesweep.engine.read as read_module
 from phasesweep import run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.run_overrides import SetPathError, apply_set
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudyStorageUnavailableError
+from phasesweep.engine.ledger import ValidatedLedger
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _experiment_dir,
@@ -31,6 +33,7 @@ from phasesweep.runtime.files import file_sha256
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
+    requires_nonroot,
     write_experiment_config,
     write_trainer,
 )
@@ -152,6 +155,33 @@ def test_study_reads_name_the_missing_directory(
     assert str(tmp_path / "absent" / "t") in message
     with pytest.raises(StudyStorageUnavailableError, match="No study directory at"):
         experiment_status(cli_module._load_cli_config(path))
+
+
+@requires_nonroot
+@pytest.mark.parametrize(
+    "command", [("run",), ("run", "--dry-run"), ("status",), ("show-winners",)]
+)
+def test_study_commands_report_denied_access_to_workdir(
+    tmp_path: Path,
+    command: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Name the inaccessible study path and advise restoring its permissions."""
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    config = write_experiment(tmp_path / "sweep.yaml", workdir="blocked/runs")
+    blocked.chmod(0o600)
+    try:
+        assert invoke_cli_boundary([*command, str(config)], monkeypatch) == 1
+    finally:
+        blocked.chmod(0o700)
+
+    message = capsys.readouterr().err
+    assert f"The current user cannot access {blocked / 'runs' / 't'}" in message
+    assert "(permission denied)." in message
+    assert "fix: restore the files and permissions identified in the error" in message
+    assert not (blocked / "runs").exists()
 
 
 @pytest.mark.parametrize(
@@ -440,8 +470,10 @@ def test_run_override_errors_refuse_before_launch(
     assert not (tmp_path / "original").exists()
 
 
-def test_show_winners_reads_unpublished_phase_results(tmp_path: Path) -> None:
-    """Finished phase results remain visible before the run publishes."""
+def test_show_winners_reads_unpublished_phase_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finished phase results remain visible before the run publishes, and status validates the ledger once."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment, config_path = materialized.experiment, materialized.config_path
     generation_id = published_generation_id(experiment)
@@ -469,15 +501,36 @@ def test_show_winners_reads_unpublished_phase_results(tmp_path: Path) -> None:
     status = CliRunner().invoke(cli, ["status", str(config_path)])
     assert status.exit_code == 0, status.output
     assert (
-        "Winner retained but not published; Rerun the same config to resume and publish"
-        in status.output
-    )
+        "# Winner retained but not published.\n"
+        "# fix: Rerun the same config to resume and publish; completed trials are kept.\n"
+    ) in status.output
     assert status.output.count("Winner retained but not published") == 1
     assert yaml.safe_load(status.output)["phases"][0]["winner_is_published"] is False
+
+    validations: list[str] = []
+    real_validate = cli_module.validate_ledger
+
+    def counting_validate(config: Experiment) -> ValidatedLedger:
+        validations.append(config.experiment)
+        return real_validate(config)
+
+    monkeypatch.setattr(cli_module, "validate_ledger", counting_validate)
+    monkeypatch.setattr(read_module, "validate_ledger", counting_validate)
+    assert CliRunner().invoke(cli, ["status", str(config_path)]).exit_code == 0
+    assert validations == [experiment.experiment]
+
     with _experiment_lock(experiment):
         live = CliRunner().invoke(cli, ["status", str(config_path)])
         assert live.exit_code == 0, live.output
         assert "Winner retained but not published" not in live.output
+
+    missing_locks = tmp_path / "missing-locks"
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(missing_locks))
+    unavailable = CliRunner().invoke(cli, ["status", str(config_path)])
+    assert unavailable.exit_code == 0, unavailable.output
+    assert "Winner retained but not published" not in unavailable.output
+    assert yaml.safe_load(unavailable.output) == yaml.safe_load(status.output)
+    assert not missing_locks.exists()
 
 
 @pytest.mark.parametrize("streak_abort", [False, True], ids=["no-feasible", "streak-abort"])
@@ -510,7 +563,8 @@ def test_unpublished_status_prints_the_recorded_failure_remedy_once(
     shown = CliRunner().invoke(cli, ["status", str(config)])
     assert shown.exit_code == 0, shown.output
     assert shown.output.count("Winner retained but not published") == 1
-    assert operator_step(refused.value) in shown.output
+    assert f"\n# fix: {operator_step(refused.value)}\n" in shown.output
+    assert "fix:" not in shown.output.replace("# fix:", "")
     assert "phases[c].n_trials" in shown.output
     authorized = CliRunner().invoke(cli, ["status", str(config), "--set", "phases[2].n_trials=3"])
     assert authorized.exit_code == 0, authorized.output

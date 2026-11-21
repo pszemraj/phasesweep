@@ -13,6 +13,8 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,13 +26,20 @@ from optuna.distributions import IntDistribution
 import phasesweep.engine.attempts as attempts_module
 import phasesweep.runtime.reaper as reaper
 from phasesweep import run_experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine import phase as phase_module
 from phasesweep.engine.attempts import (
     _AttemptRecord,
+    _fail_stale_running_trial,
     _PreflightCleanupReport,
     _record_stale_trial_outcome,
 )
-from phasesweep.engine.errors import StudyStorageUnavailableError
+from phasesweep.engine.errors import (
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+    TrackingTargetUnavailableError,
+    TrialEvidenceMissingError,
+)
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.guards import _reconcile_existing_studies
 from phasesweep.engine.optuna import (
@@ -42,24 +51,28 @@ from phasesweep.engine.paths import (
     _attempts_dir,
     _experiment_dir,
     _generation_config_snapshot_path,
+    _last_successful_generation_path,
     _phase_dir,
 )
 from phasesweep.engine.preview import _preview_ledger
 from phasesweep.engine.read import read_trial_tables
+from phasesweep.engine.run import TerminalReport
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
     DURATION_ATTR,
+    FAILURE_REASON_ATTR,
     FEASIBLE_ATTR,
+    OBJECTIVE_PROVENANCE_ATTR,
     PHASE_FINGERPRINT_ATTR,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
-    _outcome_sequence_counts,
     _parsed_trial_outcome,
     _recovered_trial_state,
-    _stale_recovery_outcome,
     _trial_interrupted,
 )
 from phasesweep.engine.study_policy import (
@@ -69,10 +82,10 @@ from phasesweep.engine.study_policy import (
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import OPERATOR_STEPS, OperatorAction, PhaseSweepError
-from phasesweep.runtime.json import JsonObject, json_object
+from phasesweep.runtime.json import JsonObject, JsonValue, json_object
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
 from phasesweep.runtime.reaper import read_boot_id
-from phasesweep.runtime.shutdown import PhaseSweepShutdown
+from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownLaunchRefusedError
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
@@ -84,9 +97,9 @@ from tests.conftest import (
     write_trainer,
 )
 from tests.recovery_helpers import fabricate_stale_trial, write_trial_identity
+from tests.tracking_helpers import SwitchableWandb, switchable_wandb, wandb_objective_experiment
 
 _STALE_CAUSE = "stale RUNNING trial recovered after its orchestrator stopped"
-_UNCOMMITTED_CAUSE = "orchestrator stopped before Optuna committed the terminal trial state"
 
 
 def _abort(sequence: int) -> JsonObject:
@@ -104,38 +117,33 @@ def _abort(sequence: int) -> JsonObject:
     }
 
 
-@pytest.mark.parametrize(
-    ("recorded", "expected"),
-    [
-        pytest.param(None, "interrupted", id="no-record"),
-        pytest.param(trial_outcome(1, "success"), "interrupted", id="uncommitted-success"),
-        pytest.param(trial_outcome(1, "interrupted"), "interrupted", id="interrupted"),
-        pytest.param(trial_outcome(1, "failure"), "failure", id="failure"),
-        pytest.param(
-            trial_outcome(1, "failure", **{TRIAL_OUTCOME_ABORT_KEY: _abort(1)}),
-            "failure",
-            id="failure-with-abort",
-        ),
-        pytest.param(
-            trial_outcome(1, "fatal", policy="unsafe_process_cleanup"), "fatal", id="fatal"
-        ),
-    ],
-)
-def test_stale_recovery_keeps_failures_and_interrupts_everything_else(
-    recorded: JsonObject | None, expected: str
-) -> None:
-    """Recovery keeps a recorded failure or fatal error and turns anything unproven into an interruption."""
-    parsed = None if recorded is None else _parsed_trial_outcome(recorded)
-    assert recorded is None or parsed is not None
-    assert _stale_recovery_outcome(parsed) == expected
-
-
 def test_the_outcome_parser_rejects_an_unknown_label_and_another_schema_version() -> None:
     """A label outside the outcome vocabulary, such as ``cancelled``, and any other schema version parse as nothing."""
     assert _parsed_trial_outcome(trial_outcome(1, "cancelled")) is None
     previous = trial_outcome(1, "interrupted")
     previous["schema_version"] = TRIAL_OUTCOME_SCHEMA_VERSION - 1
     assert _parsed_trial_outcome(previous) is None
+
+
+@pytest.mark.parametrize("metric", [None, True, "1", float("inf"), float("nan")])
+def test_outcome_parser_requires_a_finite_numeric_success_metric(metric: JsonValue) -> None:
+    """A successful outcome must carry a finite numeric measurement."""
+    payload = trial_outcome(1, "success", metric=metric)
+    assert _parsed_trial_outcome(payload) is None
+    del payload["metric"]
+    assert _parsed_trial_outcome(payload) is None
+
+
+def test_outcome_parser_distinguishes_measured_and_unmeasured_failure() -> None:
+    """Zero is a valid measurement; failures, fatal errors, and interruptions can lack one."""
+    assert _parsed_trial_outcome(trial_outcome(1, "success", metric=0.0)) is not None
+    measured = _parsed_trial_outcome(trial_outcome(2, "failure", metric=0.0))
+    assert measured is not None and measured.metric == 0.0
+    for outcome in ("failure", "fatal", "interrupted"):
+        parsed = _parsed_trial_outcome(trial_outcome(3, outcome))
+        assert parsed is not None and parsed.metric is None
+    for outcome in ("fatal", "interrupted"):
+        assert _parsed_trial_outcome(trial_outcome(3, outcome, metric=1.0)) is None
 
 
 def _running_trial(study: optuna.Study, outcome: JsonObject | None) -> optuna.trial.FrozenTrial:
@@ -171,55 +179,48 @@ def _finished(study: optuna.Study, sequence: int, outcome: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("recorded", "expected"),
+    "recorded",
     [
-        pytest.param(None, trial_outcome(3, "interrupted", cause=_STALE_CAUSE), id="no-record"),
+        pytest.param(None, id="no-record"),
         pytest.param(
-            trial_outcome(3, "success"),
-            trial_outcome(3, "interrupted", cause=_UNCOMMITTED_CAUSE),
-            id="uncommitted-success",
-        ),
-        pytest.param(
-            trial_outcome(3, "interrupted", cause="orchestrator interrupted by signal 2"),
             trial_outcome(3, "interrupted", cause="orchestrator interrupted by signal 2"),
             id="signal",
         ),
+        pytest.param(trial_outcome(3, "failure", cause="exit 1"), id="failure"),
         pytest.param(
-            trial_outcome(3, "failure", cause="exit 1"),
-            trial_outcome(3, "failure", cause="exit 1"),
-            id="failure",
+            trial_outcome(3, "failure", cause="exit 1", abort=_abort(3)),
+            id="failure-with-abort",
         ),
         pytest.param(
-            trial_outcome(2, "interrupted"),
-            trial_outcome(3, "interrupted", cause=_STALE_CAUSE),
-            id="duplicate-sequence",
-        ),
-        pytest.param(
-            trial_outcome(2, "failure", cause="exit 1"),
-            trial_outcome(3, "interrupted", cause=_STALE_CAUSE),
-            id="duplicate-sequence-failure",
+            trial_outcome(3, "fatal", cause="cleanup unconfirmed", policy="unsafe_process_cleanup"),
+            id="fatal",
         ),
     ],
 )
 def test_stale_recovery_records_interrupted_unless_the_objective_recorded_a_failure(
-    recorded: JsonObject | None, expected: JsonObject
+    recorded: JsonObject | None,
 ) -> None:
-    """A stale trial is recorded as interrupted, as the dry run and status predict, and an interruption never extends the streak."""
+    """Settlement keeps the exact recorded verdict or records an interruption for an unknown outcome."""
     study = optuna.create_study()
     _finished(study, 1, "failure")
     _finished(study, 2, "failure")
-    trial = _running_trial(study, recorded)
-    predicted = _recovered_trial_state(trial, _outcome_sequence_counts(study.get_trials()))
+    trial = _running_trial(study, deepcopy(recorded))
+    predicted = _recovered_trial_state(trial, _parsed_trial_outcome(recorded))
+    expected = (
+        recorded if recorded is not None else trial_outcome(3, "interrupted", cause=_STALE_CAUSE)
+    )
 
-    _record_stale_trial_outcome(study, trial)
-    assert predicted == ("INTERRUPTED" if expected["outcome"] == "interrupted" else "FAIL")
-    study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+    assert _fail_stale_running_trial(study, trial, failure_message="could not settle trial")
 
     recovered = study.trials[trial.number]
+    interrupted = expected["outcome"] == "interrupted"
+    assert predicted == ("INTERRUPTED" if interrupted else "FAIL")
+    assert recovered.state == optuna.trial.TrialState.FAIL
     assert recovered.user_attrs[TRIAL_OUTCOME_ATTR] == expected
-    assert _trial_interrupted(recovered) is (expected["outcome"] == "interrupted")
-    streak = 3 if expected["outcome"] == "failure" else 2
-    assert _load_phase_policy_state(study).consecutive_failures == streak
+    assert _trial_interrupted(recovered) is interrupted
+    policy = _load_phase_policy_state(study)
+    assert policy.consecutive_failures == (2 if interrupted else 3)
+    assert policy.abort == expected.get(TRIAL_OUTCOME_ABORT_KEY)
 
 
 def test_an_interruption_between_two_failures_leaves_the_streak_at_two() -> None:
@@ -233,6 +234,25 @@ def test_an_interruption_between_two_failures_leaves_the_streak_at_two() -> None
 
     assert _trial_interrupted(study.trials[stale.number])
     assert _load_phase_policy_state(study).consecutive_failures == 2
+
+
+@pytest.mark.parametrize("holder", ["peer", "itself"])
+def test_recovery_refuses_duplicate_sequences_without_erasing_outcomes(holder: str) -> None:
+    """Disputed completion order leaves both saved measurements and aborts intact."""
+    phase = make_experiment(max_consecutive_failures=2).phases[0]
+    study = optuna.create_study(study_name="example::p")
+    _finished(study, 1, "failure")
+    failed = _running_trial(study, trial_outcome(2, "failure", metric=3.0, abort=_abort(2)))
+    succeeded = _running_trial(study, trial_outcome(2, "success", metric=4.0))
+    pending = _running_trial(study, None) if holder == "peer" else failed
+    before = [trial.user_attrs for trial in study.get_trials()]
+    with pytest.raises(
+        StudySchemaMismatchError,
+        match="study 'example::p', trials 1 and 2 both use completion sequence 2",
+    ):
+        _record_stale_trial_outcome(study, pending, "failure", cause="crashed", policy_phase=phase)
+    assert [trial.user_attrs for trial in study.get_trials()] == before
+    assert all(trial.state == optuna.trial.TrialState.RUNNING for trial in (failed, succeeded))
 
 
 def test_a_running_trial_is_not_interrupted_until_it_is_terminal() -> None:
@@ -504,6 +524,14 @@ def test_a_shutdown_waits_for_parallel_workers_to_record_their_own_trials(
     trials = phase_trials(exp)
     assert [_trial_count_state(trial) for trial in trials] == ["INTERRUPTED", "INTERRUPTED"]
     assert [_cause(trial) for trial in trials] == [_SIGINT_CAUSE, _SIGINT_CAUSE]
+    with (_phase_dir(exp, "p") / "trials.csv").open(newline="") as handle:
+        assert [row[f"user_attr:{FAILURE_REASON_ATTR}"] for row in csv.DictReader(handle)] == [
+            _SIGINT_CAUSE,
+            _SIGINT_CAUSE,
+        ]
+    (table,) = read_trial_tables(exp).phases
+    assert [row["reason"] for row in table.rows] == [_SIGINT_CAUSE, _SIGINT_CAUSE]
+    assert "the trainer exited with code" not in caplog.text
     assert not any("FATAL OBJECTIVE ERROR" in record.getMessage() for record in caplog.records)
 
 
@@ -1093,7 +1121,9 @@ else:
                 )
             if return_code == 0 and not terminated:
                 assert (
-                    _recovered_trial_state(trial, _outcome_sequence_counts([trial]))
+                    _recovered_trial_state(
+                        trial, _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+                    )
                     == "EVIDENCE_PENDING"
                 )
                 with pytest.raises(
@@ -1110,13 +1140,35 @@ else:
                         _reconcile_existing_studies(
                             experiment, cleanup_report=_PreflightCleanupReport()
                         )
-                assert phase_trials(experiment)[0].state.name == "RUNNING"
+                pending = phase_trials(experiment)[0]
+                assert pending.state.name == "RUNNING"
+                assert pending.user_attrs[TRIAL_OUTCOME_ATTR]["metric"] == 1.0
+                saved_outcome = json_object(pending.user_attrs[TRIAL_OUTCOME_ATTR])
+                if recovery_stage == "finished":
+                    objective = directory / "stdout.log"
+                    original = objective.read_bytes()
+                    objective.unlink()
+                    with pytest.raises(TrialEvidenceMissingError, match="missing or unreadable"):
+                        run_experiment(experiment)
+                    objective.write_bytes(original.replace(b"x=1.0", b"x=0.1"))
+                    with pytest.raises(
+                        TrialEvidenceMissingError,
+                        match="bytes behind the published metric have changed",
+                    ) as refused:
+                        run_experiment(experiment)
+                    assert refused.value.remediation is not None
+                    assert "restore the files" in refused.value.remediation
+                    assert "set a new `experiment` name" in refused.value.remediation
+                    unchanged = phase_trials(experiment)[0]
+                    assert unchanged.state.name == "RUNNING"
+                    assert unchanged.user_attrs == pending.user_attrs
+                    assert not _last_successful_generation_path(experiment).exists()
+                    objective.write_bytes(original)
                 if not feasible:
                     interrupted_study = phase_study(experiment)
                     pending = interrupted_study.get_trials()[0]
                     parsed_pending = _parsed_trial_outcome(pending.user_attrs[TRIAL_OUTCOME_ATTR])
                     assert parsed_pending is not None
-                    saved_outcome = json_object(pending.user_attrs[TRIAL_OUTCOME_ATTR])
                     saved_abort = _abort(parsed_pending.sequence)
                     saved_abort["trial_target"] = 1
                     saved_outcome[TRIAL_OUTCOME_ABORT_KEY] = saved_abort
@@ -1171,9 +1223,9 @@ else:
                         )
                 pending = phase_trials(experiment)[0]
                 assert pending.state.name == "RUNNING"
-                assert _recovered_trial_state(pending, _outcome_sequence_counts([pending])) == (
-                    "INTERRUPTED"
-                )
+                assert _recovered_trial_state(
+                    pending, _parsed_trial_outcome(pending.user_attrs.get(TRIAL_OUTCOME_ATTR))
+                ) == ("INTERRUPTED")
                 assert _cause(pending) == _STALE_CAUSE
                 assert reaper._process_group_alive(orphan_identity.pgid) is (
                     recovery_stage == "interrupt-intent"
@@ -1204,11 +1256,15 @@ else:
                 _reconcile_existing_studies(experiment, cleanup_report=cleanup_report)
                 assert cleanup_report.retained_results == int(return_code == 0 and not terminated)
             (recovered,) = phase_trials(experiment)
+            with (_phase_dir(experiment, "p") / "trials.csv").open(newline="") as handle:
+                (row,) = csv.DictReader(handle)
+            assert row["state"] == _trial_count_state(recovered)
             assert recovered.state.name == (
                 "COMPLETE" if return_code == 0 and not terminated else "FAIL"
             )
             if return_code == 0 and not terminated:
                 assert recovered.value == 1.0
+                assert recovered.user_attrs[TRIAL_OUTCOME_ATTR] == saved_outcome
                 assert recovered.user_attrs[FEASIBLE_ATTR] is feasible
                 if feasible:
                     assert _cause(recovered) is None
@@ -1254,6 +1310,604 @@ else:
                 reaper.cleanup_stale_trial_process(orphan_identity, grace_seconds=0.2)
 
 
+def _assert_evidence_pending(experiment: Experiment, trial: optuna.trial.FrozenTrial) -> None:
+    """Assert that ``trial`` keeps its finished training, unrecorded, for a later extraction.
+
+    :param Experiment experiment: Experiment owning the attempt registry.
+    :param optuna.trial.FrozenTrial trial: Trial whose tracker gave no answer.
+    """
+    assert trial.state.name == "RUNNING"
+    assert trial.user_attrs[RETURN_CODE_ATTR] == 0
+    assert trial.user_attrs[DURATION_ATTR] > 0
+    assert FAILURE_REASON_ATTR not in trial.user_attrs
+    assert TRIAL_OUTCOME_ATTR not in trial.user_attrs
+    assert (_attempts_dir(experiment) / f"{trial.user_attrs[ATTEMPT_ID_ATTR]}.json").is_file()
+    assert _recovered_trial_state(trial, None) == "EVIDENCE_PENDING"
+
+
+def _assert_restored_tracker_keeps_training(
+    experiment: Experiment,
+    tracker: SwitchableWandb,
+    launches: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Run again with the tracker answering: every pending result is kept and nothing retrains.
+
+    :param Experiment experiment: Experiment whose trials are all pending.
+    :param SwitchableWandb tracker: The fake W&B server, switched back up here.
+    :param Path launches: Trainer launch log, one line per launch.
+    :param pytest.LogCaptureFixture caplog: Log capture holding the recovery lines.
+    """
+    pending = phase_trials(experiment)
+    tracker.switch("up")
+    assert run_experiment(experiment)["p"].metric == 1.0
+    recovered = phase_trials(experiment)
+    assert [trial.state.name for trial in recovered] == ["COMPLETE"] * len(pending)
+    for trial in pending:
+        assert f"Kept completed trial result: phase='p' trial={trial.number} value=1" in caplog.text
+    assert launches.read_text().splitlines() == ["launch"] * len(pending)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("n_jobs", [1, 2])
+def test_unreadable_tracker_leaves_finished_training_pending_until_it_answers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    wandb_worker_sdk: Callable[[str], None],
+    n_jobs: int,
+) -> None:
+    """A tracker that gives no answer stops the run with each finished trial pending; its next answer is kept.
+
+    The run's reconciliation learns of the outage from the live stop, so it reads no tracker,
+    and its pending evidence names only attempts. Until the tracker answers, the run cannot
+    know whether new trainers are needed and leaves their launch checks to a later pass.
+    """
+    import phasesweep.engine.guards as guards_module
+
+    caplog.set_level(logging.INFO)
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    experiment, launches = wandb_objective_experiment(tmp_path, n_trials=n_jobs, n_jobs=n_jobs)
+    trainer_cwd = tmp_path / "trainer-cwd"
+    trainer_cwd.mkdir()
+    experiment = experiment.model_copy(
+        update={"execution": experiment.execution.model_copy(update={"cwd": str(trainer_cwd)})}
+    )
+    reconciliations: list[_PreflightCleanupReport] = []
+    reconcile = guards_module._reconcile_existing_studies
+
+    def recording_reconcile(
+        *args: object, cleanup_report: _PreflightCleanupReport, **kwargs: object
+    ):
+        reconciliations.append(cleanup_report)
+        return reconcile(*args, cleanup_report=cleanup_report, **kwargs)
+
+    monkeypatch.setattr(guards_module, "_reconcile_existing_studies", recording_reconcile)
+    tracker.switch("denied")
+    with pytest.raises(TrackingTargetUnavailableError) as refused:
+        run_experiment(experiment)
+    assert refused.value.remediation is not None
+    assert "nothing is retrained" in refused.value.remediation
+    trials = phase_trials(experiment)
+    assert len(trials) == n_jobs
+    for trial in trials:
+        _assert_evidence_pending(experiment, trial)
+        retained = f"Trial {trial.number} in phase p finished training; its result is retained."
+        assert caplog.text.count(retained) == 1
+    # Each trial read the tracker once; reconciliation did not spend another read.
+    assert tracker.lookups("denied") == n_jobs
+    (reconciliation,) = reconciliations
+    assert set(reconciliation.unreadable_evidence) == {
+        trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials
+    }
+    assert reconciliation.unreadable_tracker == str(refused.value)
+    trainer_cwd.rmdir()
+    with pytest.raises(TrackingTargetUnavailableError, match="tracker could not be read"):
+        run_experiment(experiment)
+    _assert_restored_tracker_keeps_training(experiment, tracker, launches, caplog)
+    # Only a failed run reconciles.
+    assert len(reconciliations) == 1
+
+
+@pytest.mark.integration
+def test_a_pending_trial_whose_tracker_sdk_is_missing_names_installing_it(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, wandb_worker_sdk: Callable[[str], None]
+) -> None:
+    """A recovery read that finds the tracker SDK missing says the tracker could not be read and gives a step that installs it."""
+    caplog.set_level(logging.INFO)
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    experiment, launches = wandb_objective_experiment(tmp_path, n_trials=1)
+    tracker.switch("denied")
+    with pytest.raises(TrackingTargetUnavailableError):
+        run_experiment(experiment)
+    wandb_worker_sdk("raise ImportError('No module named wandb')")
+    with pytest.raises(TrackingTargetUnavailableError) as refused:
+        run_experiment(experiment)
+    assert str(refused.value) == (
+        "1 completed trial(s) finished training, but the tracker could not be read. First "
+        "failure: metric extractor: W&B evidence requires the optional SDK; install "
+        "phasesweep[wandb]. Their training is kept and no new trial was started."
+    )
+    assert refused.value.remediation is not None
+    assert refused.value.remediation.startswith(
+        "Fix the reported cause (restore access to the tracker, or install its missing SDK), "
+        "then run the same config again: the completed training is kept and nothing is "
+        "retrained."
+    )
+    assert "its tracker could not be read: metric extractor: W&B evidence requires" in caplog.text
+    (trial,) = phase_trials(experiment)
+    _assert_evidence_pending(experiment, trial)
+    # With the SDK back, the next run keeps the training.
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    _assert_restored_tracker_keeps_training(experiment, tracker, launches, caplog)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("path", ["live", "recovered"])
+def test_finished_training_whose_tracker_answers_a_failure_fails_once(
+    tmp_path: Path, wandb_worker_sdk: Callable[[str], None], path: str
+) -> None:
+    """A tracker's failure verdict on finished training records a failure with its reason, whether the trial was live or pending, and nothing trains again."""
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    experiment, launches = wandb_objective_experiment(tmp_path, n_trials=1)
+    if path == "recovered":
+        tracker.switch("denied")
+        with pytest.raises(TrackingTargetUnavailableError):
+            run_experiment(experiment)
+        (pending,) = phase_trials(experiment)
+        _assert_evidence_pending(experiment, pending)
+    tracker.switch("crashed")
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+    (trial,) = phase_trials(experiment)
+    assert trial.state.name == "FAIL"
+    assert not _trial_interrupted(trial)
+    reason = trial.user_attrs[FAILURE_REASON_ATTR]
+    assert "crashed" in reason
+    outcome = trial.user_attrs[TRIAL_OUTCOME_ATTR]
+    assert (outcome["outcome"], outcome["cause"]) == ("failure", reason)
+    assert launches.read_text().splitlines() == ["launch"]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["before-outcome", "after-gate-outcome", "partial-before-failure"],
+)
+def test_recovered_evidence_failure_survives_a_journal_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str
+) -> None:
+    """Keep finished training and its failure-limit abort across a failed recovery write."""
+    from phasesweep.evidence.models import RequiredFileGate
+    from phasesweep.evidence.wandb import WandbRunTerminalError, WandbSetupError
+    from phasesweep.runtime.time import utc_now_iso
+
+    experiment, launches = wandb_objective_experiment(
+        tmp_path, n_trials=1, max_consecutive_failures=1
+    )
+    gate_failure = failure_stage == "after-gate-outcome"
+    partial_success = failure_stage == "partial-before-failure"
+    if gate_failure:
+        (phase,) = experiment.phases
+        gate = RequiredFileGate(type="required_file", path="receipt")
+        experiment = experiment.model_copy(
+            update={"phases": [phase.model_copy(update={"gates": [gate]})]}
+        )
+
+    tracker_down = True
+    reads = 0
+
+    def summary(*, run_id: str, **_options: object) -> JsonObject:
+        nonlocal reads
+        reads += 1
+        if tracker_down:
+            raise WandbSetupError(run_id, "HTTP 503")
+        if not gate_failure and not partial_success:
+            raise WandbRunTerminalError(run_id, "crashed")
+        return {"values": {"x": 4.0}, "present_keys": [], "retrieved_at": utc_now_iso()}
+
+    monkeypatch.setattr("phasesweep.evidence.wandb.require_wandb_sdk", lambda: None)
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", summary)
+    with pytest.raises(TrackingTargetUnavailableError):
+        run_experiment(experiment)
+    tracker_down = False
+
+    original_set = optuna.Trial.set_user_attr
+    writes_failed = False
+    failed_write = TRIAL_OUTCOME_ATTR if failure_stage == "before-outcome" else FAILURE_REASON_ATTR
+
+    def fail_journal(trial: optuna.Trial, key: str, value: JsonValue) -> None:
+        nonlocal writes_failed
+        writes_failed = writes_failed or key == failed_write
+        if writes_failed:
+            raise OSError("journal write failed")
+        original_set(trial, key, value)
+
+    if partial_success:
+        failed_write = TRIAL_OUTCOME_ATTR
+        with monkeypatch.context() as journal:
+            journal.setattr(optuna.Trial, "set_user_attr", fail_journal)
+            with pytest.raises(StudyStorageUnavailableError, match="could not be committed"):
+                run_experiment(experiment)
+        (partial,) = phase_trials(experiment)
+        assert OBJECTIVE_PROVENANCE_ATTR in partial.user_attrs
+        assert TRIAL_OUTCOME_ATTR not in partial.user_attrs
+        partial_success = False
+        writes_failed = False
+        failed_write = FAILURE_REASON_ATTR
+
+    with monkeypatch.context() as journal:
+        journal.setattr(optuna.Trial, "set_user_attr", fail_journal)
+        with pytest.raises(StudyStorageUnavailableError, match="could not be committed"):
+            run_experiment(experiment)
+
+    (pending,) = phase_trials(experiment)
+    assert FAILURE_REASON_ATTR not in pending.user_attrs
+    if failed_write == FAILURE_REASON_ATTR:
+        assert pending.state == optuna.trial.TrialState.FAIL
+        assert OBJECTIVE_PROVENANCE_ATTR in pending.user_attrs
+        assert TRIAL_OUTCOME_ATTR in pending.user_attrs
+        assert pending.user_attrs[TRIAL_OUTCOME_ATTR].get("metric") is None
+    else:
+        assert pending.state == optuna.trial.TrialState.RUNNING
+        assert TRIAL_OUTCOME_ATTR not in pending.user_attrs
+
+    reads_before_retry = reads
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
+        run_experiment(experiment)
+    (failed,) = phase_trials(experiment)
+    outcome = failed.user_attrs[TRIAL_OUTCOME_ATTR]
+    assert failed.state == optuna.trial.TrialState.FAIL
+    assert outcome["outcome"] == "failure"
+    assert outcome.get("metric") is None
+    assert ("receipt is missing" if gate_failure else "crashed") in outcome["cause"]
+    assert outcome[TRIAL_OUTCOME_ABORT_KEY]["consecutive_failures"] == 1
+    # A committed rejection never re-reads its evidence.
+    assert reads == reads_before_retry + (0 if failed_write == FAILURE_REASON_ATTR else 1)
+    assert launches.read_text().splitlines() == ["launch"]
+    assert not _last_successful_generation_path(experiment).exists()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("path", ["live", "recovered"])
+@pytest.mark.parametrize("verdict", ["failure", "infeasible"])
+def test_a_recovered_verdict_trips_the_failure_limit_as_a_live_one_does(
+    tmp_path: Path, wandb_worker_sdk: Callable[[str], None], verdict: str, path: str
+) -> None:
+    """A failure or infeasible value the tracker reports for finished training counts toward max_consecutive_failures whether the trial was live or pending: its outcome carries the same abort, and the phase publishes nothing."""
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    # The second trial's verdict trips the limit: a crashed run after a success, or a second
+    # value above the bound.
+    final_mode = "crashed" if verdict == "failure" else "up"
+    limit = 1 if verdict == "failure" else 2
+    experiment, launches = wandb_objective_experiment(
+        tmp_path,
+        n_trials=2,
+        switch_at_launch=(tracker, 2, "denied" if path == "recovered" else final_mode),
+        max_consecutive_failures=limit,
+        metric_max=None if verdict == "failure" else 0.5,
+    )
+    if path == "recovered":
+        with pytest.raises(TrackingTargetUnavailableError):
+            run_experiment(experiment)
+        _assert_evidence_pending(experiment, phase_trials(experiment)[1])
+        tracker.switch(final_mode)
+    with pytest.raises(PhaseAbortRefusedError if path == "recovered" else NoFeasibleTrialError):
+        run_experiment(experiment)
+    first, second = phase_trials(experiment)
+    assert second.state.name == ("FAIL" if verdict == "failure" else "COMPLETE")
+    outcome = second.user_attrs[TRIAL_OUTCOME_ATTR]
+    assert outcome["outcome"] == "failure"
+    assert outcome.get("metric") == (second.value if verdict == "infeasible" else None)
+    assert outcome[TRIAL_OUTCOME_ABORT_KEY] == {
+        "schema_version": 1,
+        "policy": "max_consecutive_failures",
+        "completion_sequence": 2,
+        "trial_target": 2,
+        "cause": f"{limit} consecutive failed/infeasible trials reached "
+        f"max_consecutive_failures={limit}.",
+        "threshold": limit,
+        "consecutive_failures": limit,
+    }
+    assert TRIAL_OUTCOME_ABORT_KEY not in first.user_attrs[TRIAL_OUTCOME_ATTR]
+    assert not _last_successful_generation_path(experiment).exists()
+    # Either way the next run refuses the recorded abort and trains nothing.
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
+        run_experiment(experiment)
+    assert launches.read_text().splitlines() == ["launch"] * 2
+
+
+@pytest.mark.integration
+def test_tracker_outage_preserves_a_parallel_peers_failure_limit_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A peer's definitive failure trips the limit during a tracker outage and blocks publication after recovery."""
+    from phasesweep.evidence.wandb import WandbRunTerminalError, WandbSetupError
+    from phasesweep.runtime.time import utc_now_iso
+
+    experiment, launches = wandb_objective_experiment(
+        tmp_path, n_trials=2, n_jobs=2, max_consecutive_failures=1
+    )
+    both_reading = threading.Barrier(2)
+    launches_stopped = threading.Event()
+    original_stop_launches = phase_module._PhaseExecution.stop_launches
+
+    def stop_launches(run: phase_module._PhaseExecution) -> None:
+        original_stop_launches(run)
+        launches_stopped.set()
+
+    def outage(*, run_id: str, trial_dir: Path, **_options: object) -> JsonObject:
+        both_reading.wait(10)
+        if trial_dir.name.startswith("trial_00000__"):
+            raise WandbSetupError(run_id, "HTTP 401")
+        # The peer's verdict comes after the outage has already stopped new launches.
+        assert launches_stopped.wait(10)
+        raise WandbRunTerminalError(run_id, "crashed")
+
+    monkeypatch.setattr(phase_module._PhaseExecution, "stop_launches", stop_launches)
+    monkeypatch.setattr("phasesweep.evidence.wandb.require_wandb_sdk", lambda: None)
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", outage)
+    with pytest.raises(TrackingTargetUnavailableError):
+        run_experiment(experiment)
+
+    pending, failed = phase_trials(experiment)
+    _assert_evidence_pending(experiment, pending)
+    assert failed.state == optuna.trial.TrialState.FAIL
+    outcome = failed.user_attrs[TRIAL_OUTCOME_ATTR]
+    abort = outcome[TRIAL_OUTCOME_ABORT_KEY]
+    assert abort["policy"] == "max_consecutive_failures"
+    assert abort["completion_sequence"] == outcome["sequence"] == 1
+
+    monkeypatch.setattr(
+        "phasesweep.evidence.evaluation.poll_wandb_summary",
+        lambda **_options: {
+            "values": {"x": 1.0},
+            "present_keys": [],
+            "retrieved_at": utc_now_iso(),
+        },
+    )
+    monkeypatch.setattr("phasesweep.evidence.evaluation.locate_wandb_position", lambda **_: None)
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
+        run_experiment(experiment)
+
+    settled, failed = phase_trials(experiment)
+    assert settled.state == optuna.trial.TrialState.COMPLETE
+    assert settled.value == 1.0
+    assert settled.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] == 2
+    assert failed.user_attrs[TRIAL_OUTCOME_ATTR][TRIAL_OUTCOME_ABORT_KEY] == abort
+    assert not _last_successful_generation_path(experiment).exists()
+    assert launches.read_text().splitlines() == ["launch"] * 2
+
+
+@pytest.mark.parametrize("first", ["cleanup", "left-running"])
+def test_unconfirmed_cleanup_outranks_a_parallel_trial_left_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: str
+) -> None:
+    """Under n_jobs above 1, a worker's unconfirmed cleanup stops the run whichever worker records first.
+
+    One worker leaves its trial RUNNING for an unreadable tracker and its stop reaches the
+    optimize loop first; the other cannot confirm its trainer group gone. The leaked group
+    may hold the GPU, so the cleanup error is what the run raises.
+    """
+    from phasesweep.engine.errors import tracker_unreadable
+    from phasesweep.errors import UnsafeProcessCleanupError
+
+    experiment = make_experiment(persistent=tmp_path, n_trials=3, n_jobs=2)
+    cleanup_recorded = threading.Event()
+    left_running_raised = threading.Event()
+
+    def stubbed_objective(run: phase_module._PhaseExecution, trial: optuna.Trial) -> float:
+        if trial.number == 0:
+            if first == "cleanup":
+                assert cleanup_recorded.wait(10)
+            left_running = phase_module._TrialLeftRunning(tracker_unreadable("tracker down"))
+            run.record_fatal(left_running)
+            left_running_raised.set()
+            raise left_running
+        cleanup_error = UnsafeProcessCleanupError("trainer group may still be alive")
+        if first == "cleanup":
+            # The launch path records unconfirmed cleanup before it releases the lease.
+            run.record_fatal(cleanup_error)
+            cleanup_recorded.set()
+        assert left_running_raised.wait(10)
+        # The trial left RUNNING finishes first, so the optimize loop surfaces it.
+        time.sleep(0.2)
+        raise cleanup_error
+
+    monkeypatch.setattr(phase_module, "_execute_objective", stubbed_objective)
+    with pytest.raises(UnsafeProcessCleanupError, match="trainer group may still be alive"):
+        run_experiment(experiment)
+    states = {trial.number: trial.state.name for trial in phase_trials(experiment)}
+    assert states[1] == "FAIL"
+
+
+def _in_memory_wandb_sweep(
+    tmp_path: Path, tracker: SwitchableWandb, *, n_trials: int, deny_at_launch: int
+) -> tuple[Experiment, Path]:
+    """Build a ``storage: null`` sweep whose W&B objective answers once each trainer exits.
+
+    :param Path tmp_path: Directory holding the workdir, trainer and launch log.
+    :param SwitchableWandb tracker: The fake W&B server the trainer switches.
+    :param int n_trials: The phase's trial target.
+    :param int deny_at_launch: Launch number at which the trainer switches W&B to ``denied``.
+    :return tuple[Experiment, Path]: The experiment and its trainer launch log.
+    """
+    from phasesweep.config.models import Metric
+    from phasesweep.evidence.models import WandbExtractor
+
+    launches = tmp_path / "launches"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        from pathlib import Path
+        launches = Path({str(launches)!r})
+        with launches.open("a") as log:
+            log.write("launch\\n")
+        if len(launches.read_text().splitlines()) == {deny_at_launch}:
+            Path({str(tracker.mode)!r}).write_text("denied")
+        """,
+    )
+    remote = WandbExtractor(
+        type="wandb",
+        base_url="https://example.test",
+        entity="e",
+        project="p",
+        metric_key="x",
+        poll_seconds=0.01,
+        timeout_seconds=30,
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        metric=Metric(extractor=remote),
+        n_trials=n_trials,
+    )
+    assert not experiment.persistent
+    return experiment, launches
+
+
+@pytest.mark.integration
+def test_in_memory_run_fails_a_trial_whose_tracker_is_unreadable_and_promises_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, wandb_worker_sdk: Callable[[str], None]
+) -> None:
+    """With storage: null nothing outlives the run, so the trial fails with the tracker's reason and no later read is promised."""
+    caplog.set_level(logging.INFO)
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    experiment, launches = _in_memory_wandb_sweep(tmp_path, tracker, n_trials=1, deny_at_launch=1)
+    with pytest.raises(NoFeasibleTrialError) as refused:
+        run_experiment(experiment)
+    assert not isinstance(refused.value, TrackingTargetUnavailableError)
+    assert "state=FAIL" in caplog.text
+    assert "reason=metric extractor: W&B authentication/setup failed" in caplog.text
+    assert "retained" not in caplog.text
+    assert "kept" not in str(refused.value) + str(refused.value.remediation)
+    # The next run starts afresh: nothing was kept, so the trainer runs again.
+    tracker.switch("up")
+    assert run_experiment(experiment)["p"].metric == 1.0
+    assert launches.read_text().splitlines() == ["launch"] * 2
+
+
+@pytest.mark.integration
+def test_in_memory_sweep_keeps_its_finished_trials_when_the_tracker_turns_unreadable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, wandb_worker_sdk: Callable[[str], None]
+) -> None:
+    """An in-memory sweep fails the trials its tracker cannot answer about and still publishes the rest."""
+    caplog.set_level(logging.INFO)
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    experiment, launches = _in_memory_wandb_sweep(tmp_path, tracker, n_trials=6, deny_at_launch=5)
+    winners = run_experiment(experiment)
+    assert winners["p"].metric == 1.0
+    assert launches.read_text().splitlines() == ["launch"] * 6
+    assert _last_successful_generation_path(experiment).is_file()
+    assert caplog.text.count("state=COMPLETE") == 4
+    assert caplog.text.count("reason=metric extractor: W&B authentication/setup failed") == 2
+
+
+@pytest.mark.parametrize("storage", ["journal", "memory"])
+def test_shutdown_during_extraction_promises_kept_training_only_with_persistent_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    storage: str,
+) -> None:
+    """Finished training a shutdown stops before extraction is kept only by a persistent study."""
+    trainer = write_trainer(tmp_path / "trainer.py", "pass\n")
+    experiment = make_experiment(
+        persistent=tmp_path if storage == "journal" else None,
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        n_trials=1,
+    )
+
+    def interrupted(**_kwargs: object) -> None:
+        raise ShutdownLaunchRefusedError(signal.SIGTERM)
+
+    monkeypatch.setattr(phase_module, "extract_trial_result", interrupted)
+    with pytest.raises(PhaseSweepShutdown):
+        run_experiment(experiment)
+    retained = "Trial 0 in phase p finished training; its result is retained."
+    lost = "Trial 0 in phase p finished training, but its result was not extracted"
+    assert (retained in caplog.text) is (storage == "journal")
+    assert (lost in caplog.text) is (storage == "memory")
+    if storage == "memory":
+        assert "storage: null keeps no trials between runs" in caplog.text
+
+
+_RUN_CONFIG = """
+import sys
+from phasesweep import run_experiment
+from phasesweep.config.io import load_experiment
+run_experiment(load_experiment(sys.argv[1]), generation_id="orphan-generation")
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("recovery", ["run", "mcp-recover-run"])
+def test_recovery_defers_a_killed_runs_finished_trial_while_its_tracker_is_unreadable(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    wandb_worker_sdk: Callable[[str], None],
+    recovery: str,
+) -> None:
+    """Recovery leaves the trial pending after one lookup of the unreadable tracker; the next answer is kept."""
+    caplog.set_level(logging.INFO)
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    experiment, launches = wandb_objective_experiment(tmp_path, n_trials=1)
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    tracker.switch("hang")
+    reader = None
+    with (tmp_path / "runner.log").open("w") as output:
+        runner = subprocess.Popen(
+            [sys.executable, "-c", _RUN_CONFIG, str(config)], stdout=output, stderr=output
+        )
+    try:
+        deadline = time.monotonic() + 30
+        while not tracker.hung.exists() and time.monotonic() < deadline:
+            assert runner.poll() is None, (tmp_path / "runner.log").read_text()
+            time.sleep(0.02)
+        assert tracker.hung.exists()
+        (trial,) = phase_trials(experiment)
+        directory = Path(trial.user_attrs[TRIAL_DIR_ATTR])
+        reader = reaper.read_stale_process_identity(
+            directory, expected_attempt_id=trial.user_attrs[ATTEMPT_ID_ATTR]
+        )
+        runner.kill()
+        runner.wait(timeout=5)
+        tracker.switch("denied")
+        if recovery == "run":
+            reports: list[TerminalReport] = []
+            with pytest.raises(
+                TrackingTargetUnavailableError, match="1 completed trial"
+            ) as refused:
+                run_experiment(experiment, terminal_callback=reports.append)
+            assert refused.value.remediation is not None
+            assert "nothing is retrained" in refused.value.remediation
+            (report,) = reports
+            assert report.cleanup_confirmed
+            assert report.failure_stage == "preflight"
+        else:
+            from tests.mcp_helpers import make_mcp_app, stage_dead_run, write_srv_catalog
+            from tests.recovery_helpers import recover_run_cli
+
+            _app, registry, store = make_mcp_app(write_srv_catalog(tmp_path, config))
+            stage_dead_run(store, "orphan-generation", config, "srv", cleanup_uncertain=False)
+            recovered_run = recover_run_cli(registry.state_dir, "orphan-generation", confirm=True)
+            assert recovered_run.exit_code == 0, recovered_run.output
+            assert "kept 0 completed trial result(s)" in recovered_run.output
+            assert "Left 1 completed trial(s) pending" in recovered_run.output
+        assert not reaper._process_group_alive(reader.pgid)
+        (trial,) = phase_trials(experiment)
+        _assert_evidence_pending(experiment, trial)
+        assert tracker.lookups("denied") == 1
+        _assert_restored_tracker_keeps_training(experiment, tracker, launches, caplog)
+    finally:
+        if runner.poll() is None:
+            runner.kill()
+        runner.wait(timeout=5)
+        if reader is not None:
+            reaper.cleanup_stale_trial_process(reader, grace_seconds=0.2)
+
+
 @pytest.mark.parametrize(
     "case",
     ["live", "leader_exited", "group_exited", "prior_boot", "foreign_absent", "reused_group"],
@@ -1296,6 +1950,9 @@ def test_recovery_preview_names_trial_group_liveness(
     assert not signalled
     should_signal = case in {"live", "leader_exited"}
     assert ("--confirm will terminate it if still alive" in caplog.text) is should_signal
+    assert (
+        "wait for the trainer to exit successfully to keep its result" in caplog.text
+    ) is should_signal
     assert "pid=12345 pgid=12345" in caplog.text
     if case == "leader_exited":
         assert "stored PGID fallback" in caplog.text

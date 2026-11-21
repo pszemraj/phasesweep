@@ -17,7 +17,7 @@ import phasesweep.engine.read as engine_read
 from phasesweep import experiment_status, run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Metric, Phase
-from phasesweep.config.search import IntParam, Sampler
+from phasesweep.config.search import CategoricalParam, IntParam, Sampler
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_dir,
@@ -27,8 +27,14 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.read import read_status, read_trial_tables
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.json import JsonValue
-from tests.conftest import make_experiment, write_trainer
+from tests.conftest import (
+    invoke_cli_boundary,
+    make_experiment,
+    write_experiment_config,
+    write_trainer,
+)
 from tests.ledger_fixtures import materialize, published_generation_id
+from tests.recovery_helpers import new_phase_study
 
 EXPERIMENT_STATUS_KEYS = [
     "kind",
@@ -290,6 +296,30 @@ def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
     assert payload["phases"][0]["winner"] is None
 
 
+@pytest.mark.parametrize(("flags", "trial_text"), [((), "RUNNING: 1"), (("--trials",), "RUNNING")])
+def test_status_keeps_running_trials_visible_when_lock_probe_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    flags: tuple[str, ...],
+    trial_text: str,
+) -> None:
+    """Print the readable ledger without idle-run advice when the lock cannot be probed."""
+    experiment = make_experiment(persistent=tmp_path)
+    new_phase_study(experiment, "p").ask()
+    config = write_experiment_config(tmp_path / "config.yaml", experiment)
+    missing_locks = tmp_path / "missing-locks"
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(missing_locks))
+
+    assert invoke_cli_boundary(["status", str(config), *flags], monkeypatch) == 0
+
+    captured = capsys.readouterr()
+    assert trial_text in captured.out
+    assert "No run is active" not in captured.out
+    assert not captured.err
+    assert not missing_locks.exists()
+
+
 def test_in_memory_status_names_no_ledger(tmp_path: Path) -> None:
     """``storage: null`` has no ledger file, so ``ledger_path`` is null."""
     experiment = make_experiment(workdir=tmp_path / "runs", trial_command="echo x=0.5 {overrides}")
@@ -298,3 +328,54 @@ def test_in_memory_status_names_no_ledger(tmp_path: Path) -> None:
 
     assert list(payload) == EXPERIMENT_STATUS_KEYS
     assert payload["ledger_path"] is None
+
+
+def test_in_memory_trial_table_points_at_the_last_runs_csv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With ``storage: null`` the trial table names the ``trials.csv`` the last run wrote."""
+    experiment = make_experiment(workdir=tmp_path / "runs", trial_command="echo x=0.5 {overrides}")
+    run_experiment(experiment)
+    config = write_experiment_config(tmp_path / "config.yaml", experiment)
+
+    assert invoke_cli_boundary(["status", str(config), "--trials"], monkeypatch) == 0
+
+    snapshot = tmp_path / "runs" / experiment.experiment / "p" / "trials.csv"
+    assert snapshot.is_file()
+    assert (
+        f"(storage: null keeps no trial ledger; the trials of this phase's last run are in {snapshot})"
+        in capsys.readouterr().out
+    )
+
+
+def test_trial_table_prints_float_params_of_10000_or_more_in_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Float params from 10000 up print in plain notation, and smaller ones keep four significant digits."""
+    values = [16384.0, 100000.0, 12345.678, 9999.9, 0.0003162, 1.5e22]
+    trainer = write_trainer(tmp_path / "trainer.py", 'print("x=0.5")\n')
+    phase = Phase(
+        name="p",
+        n_trials=len(values),
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"w": CategoricalParam(type="categorical", choices=values)},
+    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
+    run_experiment(experiment)
+    config = write_experiment_config(tmp_path / "config.yaml", experiment)
+
+    assert invoke_cli_boundary(["status", str(config), "--trials"], monkeypatch) == 0
+
+    shown = {
+        line.split("w=")[1].split()[0]
+        for line in capsys.readouterr().out.splitlines()
+        if "w=" in line
+    }
+    assert shown == {
+        "16384",
+        "100000",
+        "12345.678",
+        "9999.9",
+        "0.0003162",
+        "15000000000000000000000",
+    }

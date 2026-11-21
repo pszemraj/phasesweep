@@ -1,23 +1,13 @@
-schema_version: 5
+schema_version: 6
 experiment: t
-generation_id: a9798cd5f98d475a9e0cf5ce3ba88f34
-phasesweep_version: 0.3.11
+generation_id: 366d7e3c20524758b371a5a69e1d20dd
+phasesweep_version: 0.3.14.dev34+g1394e2150.d20261120
 config_fingerprint: 510eb146e62737707cbf637293fedb6a7f213d3715b3bada974b7f90d629f027
 metric:
   name: objective
   goal: minimize
   objective_evidence:
     kind: log_regex
-    attempt_location_scoped: true
-    attempt_identity_bound: false
-    source_identity_keyed: false
-    objective_name_bound: false
-    split_bound: false
-    evaluation_policy_bound: false
-    checkpoint_declared: false
-    checkpoint_value_bound: false
-    expected_step_declared: false
-    expected_step_value_bound: false
 phase_plan:
 - name: p
   comment: null
@@ -38,14 +28,14 @@ phases:
     incomplete: false
     reason: null
     timeout_scope: null
-  generation_id: a9798cd5f98d475a9e0cf5ce3ba88f34
-  attempt_id: 90b83565ecd04a0aa6b7745f455889fc
+  generation_id: 366d7e3c20524758b371a5a69e1d20dd
+  attempt_id: 1448ce9baddb437fbefef08f443612ca
   winner_source:
     kind: phase_trial
     phase: p
     trial_number: 0
-    generation_id: a9798cd5f98d475a9e0cf5ce3ba88f34
-    attempt_id: 90b83565ecd04a0aa6b7745f455889fc
+    generation_id: 366d7e3c20524758b371a5a69e1d20dd
+    attempt_id: 1448ce9baddb437fbefef08f443612ca
   trainer_input:
     schema_version: 1
     format: argparse
@@ -85,8 +75,8 @@ artifacts:
   sha256: 66ca9aa184e8b9780c9695fcc9db655dba75f6b5117ab47144878daca599fc69
 - kind: reproducibility
   path: reproducibility.json
-  sha256: a66f5805fdbc75b9029a0be60e62940685fb87958064f77af33081646df6d126
+  sha256: 9c8a92632c840edca53c3ec338cb687bedb7788188bf3ba83797f4a7860d083b
 - kind: winner
   phase: p
-  sha256: a4d1d6906778ea82f1d44ebfbeaf8502ecbb060cebb4d274ebf72776856a18f4
+  sha256: 479b35d886ffce12b3278199efdf22a43e660d35ab25586a0ce0b453ce5bc1e7
 trainer_config: {}

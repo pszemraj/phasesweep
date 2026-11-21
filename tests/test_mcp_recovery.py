@@ -29,7 +29,6 @@ from phasesweep.engine.attempts import (
     _PreflightCleanupReport,
     _register_active_attempt,
     _register_tracking_operation,
-    _retire_active_attempt,
     _tracking_cleanup_receipts,
 )
 from phasesweep.engine.cleanup import _reap_stale_trials
@@ -47,12 +46,16 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
 )
-from phasesweep.errors import OPERATOR_STEPS, OperatorAction
 from phasesweep.mcp.errors import (
     ExperimentBusyError,
     RunLaunchUnsettledError,
 )
-from phasesweep.mcp.runs import MCP_STATE_FORMAT_VERSION, RunHandle, RunStore
+from phasesweep.mcp.runs import (
+    FRESH_STATE_DIR_STEP,
+    MCP_STATE_FORMAT_VERSION,
+    RunHandle,
+    RunStore,
+)
 from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.files import private_atomic_write_text
@@ -96,7 +99,7 @@ from tests.recovery_helpers import (
 
 
 def test_recovery_cli_renders_state_directory_remedy(tmp_path: Path) -> None:
-    """An unsupported MCP store calls for a fresh state directory."""
+    """An unsupported MCP store calls for pointing the catalog's state_dir at a new directory."""
     write_srv_config, _app, registry, store = side_effect_app(tmp_path)
     marker = store._format_marker_path
     marker.write_text(json.dumps({"schema_version": MCP_STATE_FORMAT_VERSION + 1}))
@@ -106,7 +109,7 @@ def test_recovery_cli_renders_state_directory_remedy(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "use a fresh MCP state directory" in result.output
-    assert f"fix: {OPERATOR_STEPS[OperatorAction.FRESH_NAMESPACE]}." in result.output
+    assert f"fix: {FRESH_STATE_DIR_STEP}" in result.output
     assert "artifact root" not in result.output
     assert marker.read_bytes() == before
 
@@ -422,7 +425,7 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
         "runner exited without writing a final status"
         in unavailable["run"]["failure"]["remediation"]
     )
-    assert "settled process cleanup" in unavailable["run"]["failure"]["remediation"]
+    assert "settled its process cleanup" in unavailable["run"]["failure"]["remediation"]
     assert unavailable["phases"][0]["trial_data_available"] is False
 
     captured = patch_popen_capture(monkeypatch)
@@ -566,10 +569,10 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
         "retryable": False,
         "actor": "operator",
         "remediation": (
-            "The runner ended with an earlier host boot. No process from that boot "
-            "remains, so process cleanup and recover-run are not required. This "
-            "run's historical results are unavailable; do not substitute mutable "
-            "experiment-level results."
+            "The runner ended with an earlier host boot, so no process from that boot "
+            "remains and no recover-run step is needed. This run recorded no results; a new "
+            "run of this experiment keeps its finished trials and reruns its interrupted ones "
+            "first."
         ),
     }
     for payload in (status, awaited):
@@ -1081,58 +1084,6 @@ def test_sync_tracking_leaves_the_originating_runs_recovery_evidence(
     )
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("entry", ["registered", "retired"])
-def test_sync_tracking_finishes_an_attempt_whose_cleanup_recover_run_confirmed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str
-) -> None:
-    """recover-run consumes a failed attempt's uncertainty in the study ledger, and sync honors that.
-
-    A registered attempt is confirmed through the registry pass. Once its entry is gone, only the
-    terminal trial's own record remains, which the terminal-trial pass confirms instead. Neither
-    rewrites the trial, so the ledger is the only place sync can see the confirmation.
-    """
-    pytest.importorskip("mlflow")
-    from tests.tracking_helpers import (
-        leave_cleanup_uncertain_attempt,
-        remote_mlflow_example,
-    )
-
-    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
-    config["storage"] = "journal:///" + str(tmp_path / "study.journal")
-    config["phases"] = config["phases"][:1]
-    config["phases"][0].update(n_trials=1, sampler={"type": "random", "seed": 123})
-    experiment = Experiment.model_validate(config)
-    run_id = "mcp-uncertain-attempt"
-    attempt = leave_cleanup_uncertain_attempt(experiment, monkeypatch, generation_id=run_id)
-    if entry == "retired":
-        _retire_active_attempt(experiment, attempt)
-    config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
-    _, registry, store = make_mcp_app(
-        write_srv_catalog(tmp_path, config_path, allow=ALLOW_SIDE_EFFECTS)
-    )
-    stage_dead_run(store, run_id, config_path, registry.get("srv").id, cleanup_uncertain=True)
-    write_unsafe_cleanup_status(store, run_id)
-    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *a, **k: True)
-    uploads.clear()
-    with pytest.raises(TrackingSyncRefusedError, match="No tracking deliveries exist"):
-        sync_tracking(experiment, run_id)
-    assert uploads == []
-
-    confirmed = recover_run_cli(registry.state_dir, run_id, confirm=True)
-
-    assert confirmed.exit_code == 0, confirmed.output
-    assert _load_phase_trial(config_path, 0).user_attrs[CLEANUP_CONFIRMED_ATTR] is False
-    study = _load_first_phase_study(config_path)
-    assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [0]
-    journal = (tmp_path / "study.journal").read_bytes()
-    assert sync_tracking(experiment, run_id)["pending"] == 0
-    [upload] = [r for r in uploads if r["binding"]["attempt_id"] == attempt]
-    assert upload["finish"] == "FAILED"
-    assert (tmp_path / "study.journal").read_bytes() == journal
-
-
 @pytest.mark.parametrize(
     (
         "causally_reported",
@@ -1517,6 +1468,8 @@ def test_operator_recovery_clears_cleanup_uncertainty(
         # explicit refusal; retry must not repeat process cleanup to repair it.
         assert repeat.exit_code == 1, repeat.output
         assert "no immutable terminal result snapshot" in repeat.output
+        assert "No further cleanup or result repair is available for this run" in repeat.output
+        assert "inspect the PhaseSweep run log" not in repeat.output
     assert store.status_path(run_id).read_bytes() == final_status
     assert store.cleanup_recovery_path(run_id).read_bytes() == final_recovery
     assert runner_cleanup_calls == [(handle.pid, 111, handle.pid)]

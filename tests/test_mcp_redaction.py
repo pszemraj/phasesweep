@@ -47,6 +47,7 @@ def _winners_payload(
         declared_phases=["p"],
         result_source="current_shared_study",
         publication_integrity="ok",
+        current_generation_id=None,
         visible_params=visible_params,  # type: ignore[arg-type]
     )
 
@@ -308,6 +309,7 @@ def test_winners_payload_computes_phase_completeness_and_provenance() -> None:
         declared_phases=["p1", "p2"],
         result_source="frozen_run_snapshot",
         publication_integrity="ok",
+        current_generation_id="generation-new",
         run_id="exp-run",
         represented_generation_id="generation-new",
         result_context="represented_generation",
@@ -315,6 +317,7 @@ def test_winners_payload_computes_phase_completeness_and_provenance() -> None:
     )
 
     assert payload["run_id"] == "exp-run"
+    assert payload["run_wrote_generation"] is False
     assert payload["result_source"] == "frozen_run_snapshot"
     assert payload["represented_generation_id"] == "generation-new"
     # Completeness is measured against the plan the caller supplied, which for
@@ -349,6 +352,7 @@ def test_winners_payload_exposes_observed_values() -> None:
         declared_phases=["p1", "p2"],
         result_source="frozen_run_snapshot",
         publication_integrity="ok",
+        current_generation_id="generation-1",
         run_id="exp-run",
         represented_generation_id="generation-1",
     )
@@ -386,6 +390,7 @@ def test_winner_payload_exposes_repeats_spread_but_not_repeat_key() -> None:
         declared_phases=["p1"],
         result_source="frozen_run_snapshot",
         publication_integrity="ok",
+        current_generation_id="generation-1",
         run_id="exp-run",
         represented_generation_id="generation-1",
     )

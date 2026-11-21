@@ -1,8 +1,13 @@
 """Typed engine failures used for safe orchestration decisions."""
 
-from typing import ClassVar
+from __future__ import annotations
 
-from phasesweep.errors import OperatorAction, PhaseSweepError
+from typing import TYPE_CHECKING, ClassVar
+
+from phasesweep.errors import NEW_STUDY_STEP, OperatorAction, PhaseSweepError
+
+if TYPE_CHECKING:
+    from phasesweep.config.models import Experiment
 
 
 class StudyFingerprintMismatchError(PhaseSweepError):
@@ -33,6 +38,17 @@ class ArtifactRootSchemaMismatchError(ArtifactRootConflictError):
     """Raised when an artifact root records an unsupported PhaseSweep schema."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
+
+
+class LaunchEnvironmentError(PhaseSweepError):
+    """Raised when no trial could start in the configured environment, before one is allocated.
+
+    ``execution.cwd`` is not a directory, the trial command's program cannot be found, or the
+    trainer environment cannot be composed. The configuration or the environment it runs in
+    holds the fix, so every raise routes to ``FIX_CONFIG``.
+    """
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
 
 
 class PublicationIntegrityError(PhaseSweepError):
@@ -128,18 +144,19 @@ class PhaseTimeoutError(PhaseSweepError, TimeoutError):
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
 
 
-def phase_timeout(message: str, *, scope: str | None, persistent: bool) -> PhaseTimeoutError:
+def phase_timeout(message: str, *, scope: str | None, experiment: Experiment) -> PhaseTimeoutError:
     """Attach the budget edit and the storage-appropriate rerun behavior.
 
     :param str message: Diagnostic describing where the deadline stopped work.
     :param str | None scope: ``run`` for the run guard, otherwise the phase guard.
-    :param bool persistent: Whether completed trials persist for the next invocation.
+    :param Experiment experiment: Experiment whose storage decides whether completed trials
+        persist for the next invocation.
     :return PhaseTimeoutError: Routed timeout shared by CLI, run logs, and MCP failures.
     """
     key = "timeout_seconds_per_run" if scope == "run" else "timeout_seconds_per_phase"
     continuation = (
         "resume the phase; completed trials are kept."
-        if persistent
+        if experiment.persistent
         else "start the run again; storage: null keeps no completed trials between runs."
     )
     return PhaseTimeoutError(
@@ -163,9 +180,31 @@ class TrialTargetRefusedError(PhaseSweepError):
 
 
 class TrackingTargetUnavailableError(PhaseSweepError):
-    """Raised before a phase allocates trials when its MLflow target cannot be reached."""
+    """Raised when a tracker gives no answer that new work or completed training needs.
+
+    Before a phase allocates trials, its MLflow target must resolve. In a persistent
+    study, a trial that finished training while its tracker could not be read stays
+    RUNNING, its training kept, and the run stops until the tracker answers.
+    """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
+
+
+_TRACKER_UNREADABLE_STEP = (
+    "Fix the reported cause (restore access to the tracker, or install its missing SDK), "
+    "then run the same config again: the completed training is kept and nothing is "
+    "retrained. If the tracker is gone for good, a fresh study gives up that training. "
+    f"{NEW_STUDY_STEP}"
+)
+
+
+def tracker_unreadable(message: str) -> TrackingTargetUnavailableError:
+    """Attach the step that fixes the tracker read to a stop that keeps finished training pending.
+
+    :param str message: Diagnostic naming the pending trials and the tracker's failure.
+    :return TrackingTargetUnavailableError: Refusal shared by the live run and recovery.
+    """
+    return TrackingTargetUnavailableError(message, remediation=_TRACKER_UNREADABLE_STEP)
 
 
 class TrackingSyncRefusedError(PhaseSweepError):

@@ -14,7 +14,7 @@ Use `golden_publication` or `materialize` from [`ledger_fixtures.py`](../../ledg
 
 | Fixture | Backend | Modes | Binding schema | tree verdict | ledger-only verdict |
 | --- | --- | --- | --- | --- | --- |
-| `current-journal` | journal | tree, ledger-only | 14 | ok | ok |
+| `current-journal` | journal | tree, ledger-only | 15 | ok | ok |
 
 `tree` reads the fixture's own artifact root, so the artifact-root binding is validated first. `ledger-only` points the same ledger at a workdir that has never existed, testing the ledger format scan without a binding. The table reports direct-reader format verdicts; CLI `status`, `status --trials` and `show-winners` instead refuse the missing study directory, which the read-path matrix classifies as `study-absent`.
 
@@ -38,4 +38,4 @@ The generator keeps the fixture tracked and independent of the generating host:
 
 A test that resumes the fixture and allocates trials calls `pin_fixture_environment(monkeypatch)` from [`ledger_fixtures.py`](../../ledger_fixtures.py) to match the recorded environment.
 
-Regenerate when the stored format changes. Generated identities, timestamps, paths and SCM metadata vary between regenerations; the pinned trainer environment and its checksum stay fixed.
+Generated identities, timestamps, paths and SCM metadata vary between regenerations; the pinned trainer environment and its checksum stay fixed.

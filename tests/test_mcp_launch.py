@@ -12,14 +12,17 @@ import sys
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from click.testing import CliRunner
 
 import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.mcp.runs as mcp_runs
 import phasesweep.mcp.tools as mcp_tools
+from phasesweep.cli import cli as cli_main
 from phasesweep.config.io import load_experiment
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import FloatParam, IntParam, Sampler
@@ -33,13 +36,16 @@ from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
     ExperimentBusyError,
     InvalidPhaseError,
+    McpToolError,
     PermissionDeniedError,
     ResumeNotReadyError,
     ResumePublicationUnusableError,
     RunCapacityUnknownError,
+    RunnerExitedBeforeReceiptError,
     UnknownExperimentError,
 )
 from phasesweep.mcp.registry import Registry
+from phasesweep.mcp.runner import RUNNER_SCRIPT_PATH
 from phasesweep.mcp.runs import RunHandle, RunnerView, RunStore
 from phasesweep.mcp.server import (
     _safe_tool,
@@ -458,25 +464,114 @@ def test_resume_gate_applies_the_run_preflight_acceptance_rule(
     assert store.list_handles() == []
 
 
-@pytest.mark.parametrize("record_kind", ["malformed_handle", "orphan_config"])
-def test_launch_refuses_when_persisted_run_capacity_is_unreadable(
+def test_capacity_refusal_notes_runs_files_only_for_the_records_it_lists() -> None:
+    """A handle file past the listing cap gets no note about listed runs/ files."""
+    # Run ids that sort before ``runs/`` fill the listing cap ahead of the handle file.
+    many_runs = {f"run:a-{index}" for index in range(6)}
+
+    unlisted_file = str(RunCapacityUnknownError(many_runs | {"handle:zz bad.json"}))
+    listed_file = str(RunCapacityUnknownError({"run:a-0", "handle:zz bad.json"}))
+
+    assert "and 2 more" in unlisted_file
+    assert "moves out as it is" not in unlisted_file
+    assert "`runs/zz bad.json`" in listed_file
+    assert "; a listed `runs/` file moves out as it is" in listed_file
+
+
+@pytest.mark.parametrize(
+    ("record_kind", "listed", "run_id"),
+    [
+        ("empty_handle", "`srv-broken`", "srv-broken"),
+        ("malformed_handle", "`srv-broken`", "srv-broken"),
+        ("orphan_config", "`srv-orphan`", "srv-orphan"),
+        ("unsafe_handle_name", "`runs/not a run id.json`", None),
+    ],
+)
+def test_launch_names_unreadable_run_records_and_passes_once_they_are_moved_away(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     record_kind: str,
+    listed: str,
+    run_id: str | None,
 ) -> None:
+    """The refusal lists each blocking record and the step that clears it, which a launch then passes."""
     config, app, _registry, store = side_effect_app(tmp_path)
     captured = patch_popen_capture(monkeypatch)
-    if record_kind == "malformed_handle":
-        (tmp_path / "state" / "runs" / "srv-broken.json").write_text("{not valid json")
-    else:
+    state_dir = tmp_path / "state"
+    if record_kind in {"empty_handle", "malformed_handle"}:
+        handle_text = "" if record_kind == "empty_handle" else "{not valid json"
+        (state_dir / "runs" / "srv-broken.json").write_text(handle_text)
+        store.log_path("srv-broken").write_text("runner output\n")
+    elif record_kind == "orphan_config":
         with open_private_text(store.config_snapshot_path("srv-orphan"), "x") as output:
             output.write("experiment: srv\n")
+    else:
+        (state_dir / "runs" / "not a run id.json").write_text("{not valid json")
 
-    with pytest.raises(RunCapacityUnknownError, match="cannot prove available launch capacity"):
+    with pytest.raises(RunCapacityUnknownError) as refused:
         app.launch("srv")
 
+    message = str(refused.value)
+    assert "cannot prove available launch capacity because the MCP state contains 1 unreadable" in (
+        message
+    )
+    assert f"Unreadable or orphaned: {listed}." in message
+    # A trial carries the run id in its arguments only when its command uses {trial_dir}, and
+    # the listing by environment prints PIDs alone, never the environment it matched.
+    assert (
+        "For each run id, ask the operator to run, on the server host as the server's user, "
+        "`pgrep -af <run-id>`, which lists the run's runner, and "
+        "`ps axeww | awk '/[P]HASESWEEP_GENERATION_ID=<run-id>/ {print $1}'`, which prints the "
+        "PID of each of its trials, found by environment, wait for every listed process to "
+        "exit, or stop it, and move `runs/<run-id>.json` and `logs/<run-id>.*` out of the state "
+        "directory only once both print nothing"
+    ) in message
+    assert ("a listed `runs/` file moves out as it is" in message) is (run_id is None)
+    assert "inspect and repair" not in message
     assert "cmd" not in captured
     assert store.list_handles() == []
+
+    check_args = ["mcp", "check", "--catalog", str(tmp_path / "srv.catalog.yaml")]
+    check = CliRunner().invoke(cli_main, check_args)
+    assert check.exit_code == 2, check.output
+    assert f"Unreadable or orphaned: {listed}." in check.output
+    if run_id is not None:
+        for lookup in (app.status, app.cancel):
+            with pytest.raises(McpToolError, match="unreadable or orphaned") as refused:
+                lookup(run_id)
+            assert "`phasesweep mcp check --catalog CATALOG`" in str(refused.value)
+            assert str(state_dir) not in str(refused.value)
+
+    moved = tmp_path / "moved"
+    moved.mkdir()
+    if run_id is None:
+        (state_dir / "runs" / "not a run id.json").rename(moved / "not a run id.json")
+    else:
+        for path in [
+            state_dir / "runs" / f"{run_id}.json",
+            *(state_dir / "logs").glob(f"{run_id}.*"),
+        ]:
+            if path.exists():
+                path.rename(moved / path.name)
+    with store.launch_lock() as acquired:
+        assert acquired
+        assert store.launch_inventory() == ([], set())
+    if run_id is not None:
+        assert store.get(run_id) is None
+
+    check = CliRunner().invoke(cli_main, check_args)
+    assert check.exit_code == 0, check.output
+
+    result = app.launch("srv")
+
+    assert "cmd" in captured
+    assert [handle.run_id for handle in store.list_handles()] == [result["run_id"]]
+    assert sorted(path.name for path in (state_dir / "runs").iterdir()) == [
+        f"{result['run_id']}.json"
+    ]
+    assert all(
+        path.name.startswith(result["run_id"] + ".") for path in (state_dir / "logs").iterdir()
+    )
 
 
 def test_launch_passes_config_snapshot_to_runner(
@@ -640,6 +735,10 @@ def test_launch_retains_recoverable_lease_when_failure_status_cannot_persist(
     assert store.recorded_terminal_status(pending) is None
     assert store.launch_lease_path(pending.run_id).is_file()
     assert store.is_pre_spawn_orphan(pending.run_id)
+    latest = app.latest_run("srv")["run"]
+    assert latest["recovery_required"] is True
+    assert "The next permitted launch clears this preparation" in latest["failure"]["remediation"]
+    assert "without launching" in latest["failure"]["remediation"]
 
     patch_popen_capture(monkeypatch)
     assert app.launch("srv")["state"] == "running"
@@ -855,6 +954,10 @@ def test_missing_runner_receipt_fails_without_reserving_retry_capacity(
 
     class UnreadyProc:
         pid = os.getppid()
+
+        def wait(self, timeout: float | None = None) -> int:
+            """Stay alive: this child sends no receipt, yet has not exited."""
+            raise subprocess.TimeoutExpired("runner", timeout or 0.0)
 
     monkeypatch.setattr(mcp_tools.subprocess, "Popen", lambda *_args, **_kwargs: UnreadyProc())
     monkeypatch.setattr(mcp_tools, "kill_stale_group", lambda *_args, **_kwargs: True)
@@ -1092,15 +1195,24 @@ def test_launch_spawns_runner_in_neutral_dir_and_passes_project_cwd(
     assert cmd[cmd.index("--cwd") + 1] == str(runner_cwd.resolve())
 
 
+@pytest.mark.parametrize("no_user_site", [0, 1], ids=["server-user-site", "server-no-user-site"])
 def test_launch_hardens_runner_interpreter_flags_and_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    no_user_site: int,
 ) -> None:
+    """The runner keeps the server's user-site setting, as ``-s`` or ``-I`` set it, and drops the startup-path overrides."""
+    # Only the module that builds the command sees the server's flags; sys itself stays real.
+    server_sys = SimpleNamespace(
+        executable=sys.executable, flags=SimpleNamespace(no_user_site=no_user_site)
+    )
+    monkeypatch.setattr(mcp_tools, "sys", server_sys)
     config = write_srv_config(tmp_path)
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "attacker"))
     monkeypatch.setenv("PYTHONHOME", str(tmp_path / "attacker"))
     monkeypatch.setenv("PYTHONSTARTUP", str(tmp_path / "attacker" / "startup.py"))
     monkeypatch.setenv("PYTHONEXECUTABLE", str(tmp_path / "attacker" / "python"))
+    monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
     monkeypatch.setenv("PHASESWEEP_KEEP_ME", "kept")
     app, _registry, _store = make_mcp_app(
         write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
@@ -1111,15 +1223,16 @@ def test_launch_hardens_runner_interpreter_flags_and_environment(
 
     cmd = captured["cmd"]
     assert cmd[0] == sys.executable
-    # The flags must precede -m, or the interpreter treats them as module args.
-    assert cmd[1:3] == ["-P", "-s"]
-    assert cmd[3:5] == ["-m", "phasesweep.mcp.runner"]
+    # The flags must precede the script, or the interpreter passes them to the script.
+    flags = ["-s", "-P"] if no_user_site else ["-P"]
+    assert cmd[1 : 2 + len(flags)] == [*flags, str(RUNNER_SCRIPT_PATH)]
     env = captured["env"]
     assert "PYTHONPATH" not in env
     assert "PYTHONHOME" not in env
     assert "PYTHONSTARTUP" not in env
     assert "PYTHONEXECUTABLE" not in env
-    assert env["PYTHONNOUSERSITE"] == "1"
+    # The user site stays as the server has it, so the runner imports what the server did.
+    assert "PYTHONNOUSERSITE" not in env
     assert env["PHASESWEEP_KEEP_ME"] == "kept"
 
 
@@ -1142,7 +1255,7 @@ def test_spawned_runner_cannot_execute_project_local_code(
         "pathlib.Path(sys.argv[1]).write_text(phasesweep.__file__ + '\\n' + repr(sys.path))\n"
     )
     cmd = captured["cmd"]
-    flags = cmd[1 : cmd.index("-m")]
+    flags = cmd[1 : cmd.index(str(RUNNER_SCRIPT_PATH))]
 
     completed = subprocess.run(
         [cmd[0], *flags, "-c", probe, str(resolved)],
@@ -1172,6 +1285,39 @@ def test_launch_records_the_spawned_process_identity(
     assert handle is not None
     assert handle.boot_id == read_boot_id()
     assert handle.pid_namespace == read_pid_namespace()
+
+
+def test_runner_that_exits_before_its_receipt_names_its_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that dies at startup fails the launch with its exit code and the log to read.
+
+    The child here exits as a runner whose interpreter cannot import PhaseSweep would, before
+    it writes the ready byte; the tool error stays path-free, and the launch is recorded as
+    failed with its cleanup confirmed.
+    """
+    _config, app, _registry, store = side_effect_app(tmp_path)
+    real_popen = subprocess.Popen
+    run_ids: list[str] = []
+
+    def exiting_runner(cmd: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        run_ids.append(cmd[cmd.index("--run-id") + 1])
+        return real_popen([sys.executable, "-c", "raise SystemExit(3)"], **kwargs)
+
+    monkeypatch.setattr("phasesweep.mcp.tools.subprocess.Popen", exiting_runner)
+
+    with pytest.raises(RunnerExitedBeforeReceiptError, match="exited with code 3") as caught:
+        app.launch("srv")
+
+    (run_id,) = run_ids
+    message = str(caught.value)
+    assert f"this run's log, `logs/{run_id}.log` under the catalog's `state_dir`" in message
+    assert str(tmp_path) not in message
+    terminal = json.loads(store.status_path(run_id).read_text())
+    assert terminal["returncode"] == 1
+    assert terminal["cleanup_confirmed"] is True
+    assert terminal["error_class"] == "RunnerExitedBeforeReceiptError"
 
 
 def test_launch_refuses_a_runner_receipt_without_boot_identity(
@@ -1206,7 +1352,7 @@ def test_project_local_shadow_package_would_run_under_the_old_spawn_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reproducing the unhardened spawn contract - project cwd, no ``-P``/``-s``,
+    """Reproducing the unhardened spawn contract - project cwd, no ``-P``,
     inherited environment - must import the shadow package.
     """
     _captured, project, markers, parent_env = _launch_with_poison_project(tmp_path, monkeypatch)
@@ -1251,7 +1397,6 @@ def test_audit_log_records_side_effects_without_sensitive_fields(
     assert launched["run_id"] in busy_message
     assert "lost the response" in busy_message
     assert "await_run" in busy_message
-    assert "Cancel it only if the user wants" in busy_message
 
     records = [json.loads(line) for line in audit_path.read_text().splitlines()]
     assert [record["tool"] for record in records] == [

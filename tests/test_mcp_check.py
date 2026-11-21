@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import os
 import tempfile
 from pathlib import Path
 
@@ -11,7 +13,9 @@ from click.testing import CliRunner
 from phasesweep.cli import cli as cli_main
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.registry import Registry, check_catalog
+from phasesweep.mcp.runs import FRESH_STATE_DIR_STEP
 from phasesweep.runtime.files import PlatformCapabilityError
+from tests.conftest import patch_path_method_failure
 from tests.mcp_helpers import mcp_experiment_config_text, write_mcp_config_catalog
 
 
@@ -38,6 +42,7 @@ def test_check_catalog_reports_every_entry_ok(tmp_path: Path) -> None:
     assert report.ok
     assert [entry.experiment_id for entry in report.entries] == ["alpha", "beta"]
     assert all(entry.actions == ("launch", "cancel") for entry in report.entries)
+    assert all(entry.trainer_cwd == tmp_path.resolve() for entry in report.entries)
     assert (tmp_path / "state" / "runs").is_dir()
     assert (tmp_path / "state" / "logs").is_dir()
     Registry.load(catalog)
@@ -104,6 +109,38 @@ def test_check_catalog_collects_failures_past_the_first(tmp_path: Path) -> None:
     # Registry.load stays fail-fast on the same catalog.
     with pytest.raises(CatalogError, match="workdir must be a nonempty path"):
         Registry.load(catalog)
+
+
+@pytest.mark.parametrize("invalid_path", ["inaccessible", "unknown-home"])
+def test_catalog_keeps_healthy_entries_when_a_config_path_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid_path: str
+) -> None:
+    """A failed path inspection gives one entry an operator fix and leaves its sibling readable."""
+    catalog = write_mcp_config_catalog(
+        tmp_path, {name: mcp_experiment_config_text(tmp_path, name=name) for name in ("bad", "ok")}
+    )
+    blocked = tmp_path / "bad.yaml"
+    if invalid_path == "inaccessible":
+        patch_path_method_failure(
+            monkeypatch,
+            blocked,
+            "stat",
+            PermissionError(errno.EACCES, os.strerror(errno.EACCES), blocked),
+        )
+    else:
+        catalog.write_text(
+            catalog.read_text().replace(str(blocked), "~missing-phasesweep-user/bad.yaml")
+        )
+
+    registry = Registry.load(catalog, collect_errors=True)
+    assert [entry.id for entry in registry] == ["ok"]
+    (failed,) = registry.failures
+    assert failed.experiment_id == "bad"
+    assert "bad.yaml" in (failed.error or "")
+    assert failed.suggestion
+    checked, healthy = check_catalog(catalog).entries
+    assert checked == failed
+    assert healthy.ok
 
 
 def test_check_catalog_flags_duplicate_and_missing_config(tmp_path: Path) -> None:
@@ -265,6 +302,7 @@ def test_check_catalog_rejects_unusable_state_layout(tmp_path: Path, blocked_pat
 
 
 def test_check_catalog_refuses_pre_cutover_state_cleanly(tmp_path: Path) -> None:
+    """Unmarked run data refuses the catalog with the fresh state_dir fix, not the writable-path one."""
     catalog = write_mcp_config_catalog(
         tmp_path,
         {"tiny": mcp_experiment_config_text(tmp_path, name="tiny")},
@@ -279,7 +317,7 @@ def test_check_catalog_refuses_pre_cutover_state_cleanly(tmp_path: Path) -> None
 
     with pytest.raises(CatalogError, match="durable run data has no format marker") as exc_info:
         check_catalog(catalog)
-    assert exc_info.value.suggestion is None
+    assert exc_info.value.suggestion == FRESH_STATE_DIR_STEP
     with pytest.raises(CatalogError, match="durable run data has no format marker"):
         Registry.load(catalog)
 
@@ -287,7 +325,7 @@ def test_check_catalog_refuses_pre_cutover_state_cleanly(tmp_path: Path) -> None
 
     assert result.exit_code == 2
     assert "durable run data has no format marker" in result.output
-    assert "use a fresh MCP state directory" in result.output
+    assert f"\nfix: {FRESH_STATE_DIR_STEP}" in result.output
     assert "writable directory path" not in result.output
 
 
@@ -330,6 +368,7 @@ def test_mcp_check_cli_exit_codes_and_table(tmp_path: Path) -> None:
     assert "tiny" in ok_result.output
     assert "ok" in ok_result.output
     assert "(launch)" in ok_result.output
+    assert f"trainer cwd {tmp_path.resolve()}" in ok_result.output
     assert (tmp_path / "state" / "runs").is_dir()
     assert (tmp_path / "state" / "logs").is_dir()
 
@@ -347,6 +386,120 @@ def test_mcp_check_cli_exit_codes_and_table(tmp_path: Path) -> None:
     assert "fix:" in fail_result.output
     # The good entry is still reported ok even though a sibling failed.
     assert "tiny2" in fail_result.output
+
+
+def test_mcp_check_prints_the_trainer_directory_and_refuses_a_missing_one(tmp_path: Path) -> None:
+    """The ok line shows where the trainer starts, its execution.cwd when set, and an entry whose execution.cwd is missing fails with validate's fix."""
+    (tmp_path / "trainer").mkdir()
+    pinned = mcp_experiment_config_text(tmp_path, name="pinned") + "execution:\n  cwd: ./trainer\n"
+    missing = mcp_experiment_config_text(tmp_path, name="missing") + "execution:\n  cwd: ./nope\n"
+    catalog = write_mcp_config_catalog(
+        tmp_path, {"pinned": pinned, "missing": missing}, allow={"launch": True}
+    )
+
+    report = check_catalog(catalog)
+    result = CliRunner().invoke(cli_main, ["mcp", "check", "--catalog", str(catalog)])
+
+    pinned_entry, missing_entry = report.entries
+    assert pinned_entry.trainer_cwd == (tmp_path / "trainer").resolve()
+    assert f"trainer cwd {(tmp_path / 'trainer').resolve()}" in result.output
+    assert not missing_entry.ok
+    assert "which is not a directory on this host" in (missing_entry.error or "")
+    assert (
+        missing_entry.suggestion
+        == "Create that directory, or set execution.cwd to an existing one."
+    )
+    assert "fix: Create that directory, or set execution.cwd to an existing one." in result.output
+    assert result.exit_code == 2
+    registry = Registry.load(catalog, collect_errors=True)
+    assert not registry.failures
+    assert registry.get("pinned").allow_launch
+
+    archive = write_mcp_config_catalog(tmp_path, {"retired": missing})
+    assert check_catalog(archive).ok
+    assert not Registry.load(archive).get("retired").allow_launch
+
+
+@pytest.mark.parametrize(
+    ("field", "error", "refused"),
+    [
+        ("execution.cwd", errno.EACCES, True),
+        ("execution.cwd", errno.EIO, False),
+        ("trial_command", errno.EACCES, False),
+    ],
+)
+def test_catalog_reports_a_definite_trainer_directory_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, error: int, refused: bool
+) -> None:
+    """A denied cwd has a permissions fix, while inconclusive inspections are deferred."""
+    denied = tmp_path / "denied" / "trainer"
+    blocked = mcp_experiment_config_text(tmp_path, name="blocked")
+    if field == "execution.cwd":
+        blocked += f"execution:\n  cwd: {denied}\n"
+    else:
+        blocked = blocked.replace("python train.py", str(denied))
+    catalog = write_mcp_config_catalog(
+        tmp_path,
+        {"blocked": blocked, "healthy": mcp_experiment_config_text(tmp_path, name="healthy")},
+        allow={"launch": True},
+    )
+    patch_path_method_failure(
+        monkeypatch, denied, "stat", OSError(error, os.strerror(error), denied)
+    )
+    blocked_entry, healthy_entry = check_catalog(catalog).entries
+    assert blocked_entry.ok is not refused
+    if refused:
+        assert "Cannot access the trainer directory" in (blocked_entry.error or "")
+        assert str(denied) in (blocked_entry.error or "")
+        assert "Restore access" in (blocked_entry.suggestion or "")
+    assert healthy_entry.ok
+    registry = Registry.load(catalog, collect_errors=True)
+    assert registry.get("healthy").id == "healthy"
+    assert not registry.failures
+
+
+def test_mcp_check_prints_a_fix_for_every_failing_entry(tmp_path: Path) -> None:
+    """Each way an entry can fail to load prints a fix: line under its FAIL line."""
+    config = tmp_path / "one.yaml"
+    config.write_text(mcp_experiment_config_text(tmp_path, name="one"))
+    broken = tmp_path / "broken.yaml"
+    broken.write_text(mcp_experiment_config_text(tmp_path, name="broken") + "bogus_key: 1\n")
+    memory = tmp_path / "memory.yaml"
+    memory.write_text(_in_memory_config(tmp_path, "memory"))
+    catalog = tmp_path / "catalog.yaml"
+    catalog.write_text(
+        f"""\
+state_dir: {tmp_path}/state
+experiments:
+  - id: one
+    config: {config}
+  - id: one
+    config: {config}
+  - id: alias
+    config: {config}
+  - id: ghost
+    config: {tmp_path}/missing.yaml
+  - id: nowhere
+    config: {config}
+    cwd: {tmp_path}/missing-dir
+  - id: broken
+    config: {broken}
+  - id: memory
+    config: {memory}
+"""
+    )
+
+    report = check_catalog(catalog)
+    result = CliRunner().invoke(cli_main, ["mcp", "check", "--catalog", str(catalog)])
+
+    failing = [entry for entry in report.entries if not entry.ok]
+    assert len(failing) == 6
+    assert all(entry.suggestion for entry in failing), failing
+    assert result.exit_code == 2
+    lines = result.output.splitlines()
+    fail_lines = [index for index, line in enumerate(lines) if "  FAIL  " in line]
+    assert len(fail_lines) == 6
+    assert all(lines[index + 1].lstrip().startswith("fix: ") for index in fail_lines), lines
 
 
 def test_mcp_check_cli_catalog_level_failure_exits_2(tmp_path: Path) -> None:

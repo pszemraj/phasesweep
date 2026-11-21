@@ -12,7 +12,7 @@ Install PhaseSweep and its optional MCP dependency in the Python environment tha
 pip install "phasesweep[mcp]"
 ```
 
-Contributor and editable-install setup is in [development](development.md). Install the tracking extra needed by the cataloged experiment in that same environment: `phasesweep[mcp,wandb]` for W&B or `phasesweep[mcp,mlflow]` for MLflow. Config validation and frozen scientific result reads do not authenticate. New work needs the selected SDK and access to its configured account or server. See [native MLflow setup and run ownership](mlflow.md) for MLflow's tracking server and experiment.
+Contributor and editable-install setup is in [development](development.md). Install the tracking extra needed by the cataloged experiment in that same environment: `phasesweep[mcp,wandb]` for W&B or `phasesweep[mcp,mlflow]` for MLflow. A run needs the selected SDK and access to its configured account or server. See [native MLflow setup and run ownership](mlflow.md) for MLflow's tracking server and experiment.
 
 ### 2. Create and review the catalog
 
@@ -24,12 +24,9 @@ Before cataloging a source-checkout trainer, follow the [trainer environment pre
 phasesweep mcp init-catalog --from ./starter.yaml
 ```
 
-The command writes `catalog.yaml`, validates it, and provisions a fresh [private state layout](mcp.md#fresh-mcp-state). Add another `--from` for each experiment; use `-o` for another catalog filename. The scaffold never replaces an existing catalog. Each entry takes its `id` from the config file name, sets `cwd: "."` (the catalog's directory, and the trainer's while `execution.cwd` is unset) and `visible_params: none`, and leaves `description` and the `allow` block commented out, so it is read-only until you grant permissions.
+The command writes `catalog.yaml`, validates it, provisions a fresh [private state layout](mcp.md#fresh-mcp-state), and prints one line per entry with its `trainer cwd`, the directory its trainer starts in: the experiment's `execution.cwd`, or the entry's `cwd` when that is unset. Add another `--from` for each experiment; use `-o` for another catalog filename. The scaffold never replaces an existing catalog. Each entry takes its `id` from the config file name, sets `visible_params: none`, and leaves `description` and the `allow` block commented out, so it is read-only until you grant permissions (see [the catalog fields and permission model](mcp.md#the-catalog)). A config beneath the catalog's directory is written as a relative path with `cwd: "."` (the catalog's directory, and the trainer's while `execution.cwd` is unset). A config elsewhere is written as an absolute path with no `cwd`, so the entry starts in that config's own directory.
 
 The scaffold records an absolute `state_dir` under `PHASESWEEP_HOME/mcp/<catalog-digest>`, or `${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>` when unset; later environment changes do not move it. A missing absolute `PHASESWEEP_HOME` is created mode 0700; relative paths, symlink components and existing directories with another mode are refused. To place state elsewhere, edit `state_dir`. It must be writable by each participating shell, including sandboxes. Give the server and `phasesweep mcp call` the same catalog, and `recover-run` the same `--state-dir`; see [state ownership and format rules](mcp.md#fresh-mcp-state).
-
-> [!IMPORTANT]
-> Review the generated file against [the catalog fields and permission model](mcp.md#the-catalog) before connecting a client.
 
 Validate the reviewed catalog with its absolute path:
 
@@ -37,7 +34,7 @@ Validate the reviewed catalog with its absolute path:
 phasesweep mcp check --catalog /absolute/path/to/catalog.yaml
 ```
 
-This exercises server startup validation and provisions/probes its private state layout without launching a sweep. It prints one line per entry, `ok` with the actions it grants or `(read-only)`, or `FAIL` with the reason and, when one applies, a `fix:` line, and exits 0 only when every entry loads.
+This checks the catalog and its private state, including unreadable or orphaned run records that would block a launch. For launch-enabled entries it also checks trainer paths. A missing trainer can fail this readiness check while the server still serves results and other experiments. Each entry shows `ok` with its permissions and `trainer cwd`, or `FAIL` with the reason and a `fix:` line. The command exits 0 when all checks pass. At startup, the server logs `trainer cwd` for every entry it serves.
 
 ### 3. Configure your client
 
@@ -49,6 +46,12 @@ Configure your client's stdio server with the absolute `phasesweep-mcp` executab
 /absolute/path/to/phasesweep-mcp --catalog /absolute/path/to/catalog.yaml
 ```
 
+To run the stdio server directly instead:
+
+```bash
+phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
+```
+
 For Codex CLI, the [official MCP instructions](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) use:
 
 ```bash
@@ -57,6 +60,8 @@ codex mcp list
 ```
 
 To keep a client from connecting the server at all, disable it in that client's own MCP settings.
+
+The client starts the server with the client's environment, not your shell's, and trainers inherit it, so a `trial_command` program resolves on the `PATH` the client starts the server with, unless the experiment's `env` sets `PATH`, which wins. That `PATH` often lacks the Python environment your shell activates. Give `trial_command` an absolute interpreter path, such as `/absolute/path/to/python train.py --config {config_path}`, or set `PATH` in the client's server entry. A study whose trials ran from your shell continues only under the same tracked environment (`PATH`, `HOME`, `LANG` and the other variables a fingerprint mismatch names), so copy those into the client's server `env`, or start the MCP runs under a new `experiment` name. A run whose program is missing from that `PATH` is refused before any trial starts: its `failure.remediation` gives this fix, and its runner log, `<run-id>.log` under `state_dir/logs/`, names the program and the `PATH` it searched.
 
 ### 4. Verify the connection
 
@@ -76,14 +81,16 @@ Use `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` after a cata
 
 - `MCP support is not installed`: install the MCP extra in the environment that supplies `phasesweep-mcp`.
 - The client cannot start the server: verify its client-owned stdio entry has absolute executable and catalog paths, then run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml`.
-- `action 'launch' is not permitted`, `action 'cancel' is not permitted` or `action 'from_phase' is not permitted`: change the catalog only if that is the authority you intend; the running server applies it on the next call, but a grant never reaches [a run launched without cancel permission](mcp.md#the-catalog).
-- `catalog_status.stale: true`, or a launch or inspection refused because the catalog or a config it lists `no longer validates`: run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` and fix what it reports; the server's stderr log names the file. A refusal for a different `state_dir` requires a server restart. Other reads retain the last valid catalog and saved run snapshots. See [the catalog](mcp.md#the-catalog).
+- `action 'launch' is not permitted`, `action 'cancel' is not permitted` or `action 'from_phase' is not permitted`: check the [catalog permissions](mcp.md#the-catalog). For a refused cancellation, follow the operator step the error gives for that run.
+- `catalog_status.stale: true`, or a launch or inspection refused because a catalog entry `failed to load` or the catalog file `does not validate`: run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` and fix what it reports; the server's stderr log names the file. See [catalog reload behavior](mcp.md#the-catalog), including when a restart is required.
 - `concurrency limit reached` or an experiment that already has a running sweep: [run state and recovery](mcp.md#run-state-and-recovery) says which blockers to await and which need the operator.
-- `cannot prove available launch capacity`: `state_dir` holds unreadable or orphaned run records; run the `phasesweep mcp recover-run` command the refusal names for each pre-spawn orphan, then inspect and repair the rest of `state_dir`.
+- `cannot prove available launch capacity`, or an unreadable or orphaned record for one run ID: `mcp check` lists the records blocking launch. Run the `phasesweep mcp recover-run` command it names for each pre-spawn orphan. For each other listed run ID, run `pgrep -af <run-id>` to list its runner and `ps axeww | awk '/[P]HASESWEEP_GENERATION_ID=<run-id>/ {print $1}'` to print its trial PIDs by environment. Run these on the server host as the server's user so `ps` can see the trial environment. Wait for the listed processes to exit or stop them. Move `runs/<run-id>.json` and `logs/<run-id>.*` out of `state_dir` only once both commands print nothing.
 - `another launch is in progress`: a launch sharing this `state_dir` holds the launch lock; retry in a moment.
 - Lock-directory access failure (`storage_unavailable`): set the same `PHASESWEEP_LOCK_DIR` for every participating shell, MCP server, and sandbox, following the [lock directory rules](runtime.md#storage-and-locks).
 - `recovery_required: true`, unresolved launch, or uncertain cleanup: stop agent activity and follow [run state and recovery](mcp.md#run-state-and-recovery).
-- Unavailable terminal snapshot: follow `failure.remediation`; it distinguishes a runner that exited without final status from one whose host boot ended, for which process cleanup is unnecessary. Other capture failures require inspection of run/server diagnostics. [Historical results](mcp.md#reading-status-responses) cannot be reconstructed from the current ledger.
+- Unavailable terminal snapshot: follow `failure.remediation` and inspect run/server diagnostics when it asks. [Historical results](mcp.md#reading-status-responses) cannot be reconstructed from the current ledger.
 - `runner_observable: false`, alone or with `recovery_required: true`, or a PID-namespace refusal: follow [PID namespace recovery](mcp.md#pid-namespaces).
 - Catalog path, storage, or working-directory rejection: follow [the catalog requirements](mcp.md#the-catalog).
 - Trainer environment cohort mismatch: the [launching server or `mcp call` shell](mcp.md#the-catalog) supplies the trainer's base environment; reconcile it using the [trainer contract](config.md#trainer-contract).
+- A run refused because its trial program is not on the trainer's `PATH`: the client's `PATH` lacks it; [configure the client](#3-configure-your-client) or name the program by absolute path in `trial_command`.
+- `its detached runner exited with code`: the runner failed before it started work; its own error is in `<run-id>.log` under `state_dir/logs/`.

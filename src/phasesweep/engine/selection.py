@@ -53,6 +53,7 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     OBSERVED_PREFIX,
     RERUN_OF_ATTR,
+    TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
     Winner,
@@ -60,8 +61,8 @@ from phasesweep.engine.state import (
     _validate_observed_block,
     constraint_attr,
 )
-from phasesweep.errors import NEW_STUDY_STEP, OperatorAction, PhaseSweepError
-from phasesweep.runtime.json import JsonObject, json_object
+from phasesweep.errors import FRESH_STUDY, NEW_STUDY_STEP, OperatorAction, PhaseSweepError
+from phasesweep.runtime.json import JsonObject, json_object, json_text_map
 
 log = logging.getLogger("phasesweep.engine.selection")
 
@@ -112,7 +113,7 @@ def _no_feasible_remedy(
     :return str: Operator steps appropriate to failures, bounds, and storage.
     """
     evidence = "Inspect the phase's trials.csv and trial_* trainer logs."
-    if experiment.resolved_storage is None:
+    if not experiment.persistent:
         return f"{evidence} Fix the trainer failure or adjust the metric bounds or constraints, then rerun; storage: null starts fresh."
     infeasible = any(_trial_count_state(trial) == "INFEASIBLE" for trial in trials)
     if infeasible:
@@ -124,8 +125,15 @@ def _no_feasible_remedy(
             phase, finished=finished, measured=_measured_trial_count(trials)
         )
         target = f"above {phase.n_trials}" if ceiling is None else f"to {ceiling}"
-        return f"{evidence} Fix the failure, then raise phases[{phase.name}].n_trials {target} in the config and rerun to retry failed attempts. {NEW_STUDY_STEP}"
-    return f"{evidence} Fix the failure, then raise the phase's n_trials and rerun to retry failed attempts. {NEW_STUDY_STEP}"
+        budget = f"phases[{phase.name}].n_trials {target}"
+    else:
+        budget = "the phase's n_trials"
+    return (
+        f"{evidence} Fix the failure, then raise {budget} in the config and rerun to retry "
+        "the failed attempts. Run controls such as `n_jobs` can change on retry. "
+        "If the fix changes study identity "
+        f"(for example `trial_command`, `trainer_config` or `provenance`), {FRESH_STUDY}."
+    )
 
 
 @dataclass
@@ -150,6 +158,9 @@ class SelectedTrial:
     # Advisory verdicts on the population this selection ranked
     # (:mod:`phasesweep.engine.confound`).
     confound: dict[str, Any]
+    # The tracked environment mapping behind ``trainer_env_digest``, or ``None`` when the
+    # trial recorded none. Only the ledger trial holds it; winner.yaml keeps the digest.
+    trainer_env: dict[str, str] | None = None
     constraints: dict[str, float] = field(default_factory=dict)
     gates: list[dict[str, Any]] = field(default_factory=list)
     # Report-only values the selected trial recorded, by observation name; for
@@ -369,7 +380,7 @@ def select_winner(
         )
     if flagged and emit_advisories:
         log.warning(
-            "[%s] potential confounds in the %d ranked trials (advisory; verdicts recorded in the "
+            "[%s] potential confounds in the %d ranked trials (verdicts recorded in the "
             "winner's confound block): %s.",
             phase_name or study.study_name,
             len(survivors),
@@ -405,6 +416,7 @@ def select_winner(
         # Allocation writes both before the trainer can run, so every
         # completed trial carries them.
         trainer_env_digest=str(best.user_attrs[TRAINER_ENV_DIGEST_ATTR]),
+        trainer_env=json_text_map(best.user_attrs.get(TRAINER_ENV_ATTR)),
         trainer_input=dict(best.user_attrs[TRAINER_INPUT_ATTR]),
         confound=confound,
         observed=(
@@ -485,7 +497,7 @@ def _warn_grid_edges(phase: Phase, params: Mapping[str, object]) -> None:
         if edge is not None:
             log.warning(
                 "[%s] winner is at the %s numeric grid boundary for %s=%s (grid %s..%s); "
-                "consider expanding this range if feasible (advisory).",
+                "widen the range to check for a better value beyond it.",
                 phase.name,
                 edge,
                 name,
@@ -522,7 +534,7 @@ def _warn_unsuccessful_grid_cells(phase: Phase, trials: Sequence[optuna.trial.Fr
     if len(missing) > _MAX_LISTED_CELLS:
         listed += f"; and {len(missing) - _MAX_LISTED_CELLS} more"
     log.warning(
-        "[%s] only %d of %d grid cells succeeded (advisory); the winner was chosen without a "
+        "[%s] only %d of %d grid cells succeeded; the winner was chosen without a "
         "successful trial for: %s.",
         phase.name,
         len(cells) - len(missing),
@@ -646,7 +658,7 @@ def _observed_values(trial: optuna.trial.FrozenTrial, *, subject: str) -> dict[s
     recorded = {
         key.removeprefix(OBSERVED_PREFIX): value
         for key, value in sorted(trial.user_attrs.items())
-        if key.startswith(OBSERVED_PREFIX)
+        if key.startswith(OBSERVED_PREFIX) and value is not None
     }
     try:
         return _validate_observed_block(recorded)

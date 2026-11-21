@@ -19,6 +19,7 @@ from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import (
+    ArtifactRootConflictError,
     PublicationIntegrityError,
     PublishedStudyMissingError,
     ResumeWinnerMissingError,
@@ -30,18 +31,23 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import _last_successful_generation_path, _trial_dir_for
-from phasesweep.engine.preview import _placeholder_winner
+from phasesweep.engine.preview import _placeholder_winner, validate_trial_targets
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
     PHASE_FINGERPRINT_ATTR,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
     Winner,
 )
 from phasesweep.engine.trial import _environment_identity
+from phasesweep.errors import PhaseSweepError
+from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     bounded_metric,
     make_experiment,
@@ -160,7 +166,9 @@ def _record(
             state, _OUTCOME.get(state)
         )
         if outcomes and outcome is not None:
-            attrs[TRIAL_OUTCOME_ATTR] = trial_outcome(sequence, outcome, cause=None)
+            attrs[TRIAL_OUTCOME_ATTR] = trial_outcome(
+                sequence, outcome, metric=1.0 if outcome == "success" else None
+            )
         value = 1.0 if state == _STATE.COMPLETE else None
         study.add_trial(optuna.trial.create_trial(state=state, value=value, user_attrs=attrs))
 
@@ -404,6 +412,12 @@ def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
     ]
     (command,) = _commands(caplog)
     assert _PLACEHOLDERS in command
+
+    with _experiment_lock(experiment):
+        _preview(experiment, tmp_path, caplog)
+    assert "another operation is active" in caplog.text
+    assert "In-flight trials can still finish without a rerun" in caplog.text
+    assert "DRY RUN hypothetical restart total:" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -698,6 +712,21 @@ def test_flipped_goal_is_refused_as_a_run_refuses(tmp_path: Path) -> None:
     )
 
 
+def test_study_that_publishes_into_another_workdir_is_refused_as_a_run_refuses(
+    tmp_path: Path,
+) -> None:
+    """A changed ``workdir`` over an explicit ledger is refused, not previewed as a replay."""
+    _record(_persistent(tmp_path, _phase("a", 2)), "a", _STATE.COMPLETE, _STATE.COMPLETE, target=2)
+    moved = make_experiment(
+        persistent=tmp_path,
+        workdir=tmp_path / "elsewhere",
+        phases=[_phase("a", 2)],
+        metric=bounded_metric(),
+    )
+
+    _refusals_match(moved, tmp_path, ArtifactRootConflictError, "publishes into artifact root")
+
+
 def test_malformed_failure_policy_state_in_a_skipped_phase_is_refused_as_a_run_refuses(
     tmp_path: Path,
 ) -> None:
@@ -777,3 +806,84 @@ def test_empty_unstamped_study_previews_as_a_fresh_phase(
         "phase=a study=t::a finished=0 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 2 trials",
     ]
+
+
+def _two_cell_grid(tmp_path: Path, n_trials: int) -> Experiment:
+    """Build a persistent two-cell grid phase ``g`` with the given trial target."""
+    phase = _phase("g", n_trials, sampler=Sampler(type="grid", seed=0)).model_copy(
+        update={"search_space": {"g_x": IntParam(type="int", low=0, high=1)}}
+    )
+    return _persistent(tmp_path, phase)
+
+
+def test_validate_counts_a_running_failure_as_finished_as_a_launch_does(tmp_path: Path) -> None:
+    """A RUNNING attempt that recovery settles as failed buys one more grid retry, in validate too."""
+    _record(
+        _two_cell_grid(tmp_path, 2),
+        "g",
+        _STATE.FAIL,
+        _STATE.RUNNING,
+        target=2,
+        running_outcome="failure",
+    )
+
+    for check in (
+        validate_trial_targets,
+        lambda experiment: run_experiment(experiment, dry_run=True),
+    ):
+        check(_two_cell_grid(tmp_path, 4))
+        with pytest.raises(TrialTargetRefusedError, match="allow at most 4"):
+            check(_two_cell_grid(tmp_path, 5))
+
+
+def _add_pending_evidence(experiment: Experiment, phase: str, directory: Path) -> None:
+    """Add a RUNNING trial whose trainer exited cleanly, so its evidence awaits extraction."""
+    directory.mkdir()
+    write_attempt_lifecycle(
+        directory, attempt_id="pending", state="exited", return_code=0, duration_seconds=1.0
+    )
+    phase_study(experiment, phase).add_trial(
+        optuna.trial.create_trial(
+            state=_STATE.RUNNING,
+            user_attrs={ATTEMPT_ID_ATTR: "pending", TRIAL_DIR_ATTR: str(directory)},
+        )
+    )
+
+
+def test_validate_counts_pending_evidence_as_the_failure_a_run_may_record(tmp_path: Path) -> None:
+    """A grid's pending evidence may settle as a failure, which buys a retry, so validate allows it."""
+    experiment = _two_cell_grid(tmp_path, 2)
+    _record(experiment, "g", _STATE.FAIL, target=2)
+    _add_pending_evidence(experiment, "g", tmp_path / "pending")
+
+    validate_trial_targets(_two_cell_grid(tmp_path, 4))
+    with pytest.raises(TrialTargetRefusedError, match="allow at most 4"):
+        validate_trial_targets(_two_cell_grid(tmp_path, 5))
+    with (
+        _experiment_lock(experiment),
+        pytest.raises(
+            PhaseSweepError, match="completed trainer evidence awaiting recovery"
+        ) as pending,
+    ):
+        run_experiment(_two_cell_grid(tmp_path, 3), dry_run=True)
+    assert pending.value.remediation is not None
+    assert pending.value.remediation.startswith("Let any active run finish.")
+
+
+def test_validate_allows_the_retry_a_fixed_configurations_pending_evidence_may_justify(
+    tmp_path: Path,
+) -> None:
+    """A run recovers the evidence first, and a failure there allows the retry validate must not refuse."""
+
+    def fixed(n_trials: int) -> Experiment:
+        return _persistent(tmp_path, _phase("f", n_trials, fixed=True))
+
+    _record(fixed(1), "f", target=1)
+    _add_pending_evidence(fixed(1), "f", tmp_path / "pending")
+
+    validate_trial_targets(fixed(2))
+    with pytest.raises(TrialTargetRefusedError, match="1 failed attempt") as caught:
+        validate_trial_targets(fixed(3))
+    assert caught.value.remediation == "Use n_trials at most 2, not 3."
+    with pytest.raises(PhaseSweepError, match="completed trainer evidence awaiting recovery"):
+        run_experiment(fixed(2), dry_run=True)

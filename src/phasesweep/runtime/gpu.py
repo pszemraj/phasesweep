@@ -505,7 +505,7 @@ class GpuPool:
             raise GpuConfigurationError(
                 f"n_jobs={n_jobs} but no GPUs detected on this Intel Mac. The device pool "
                 "is discovered automatically on macOS; set allow_no_gpu_isolation: true "
-                "if this is an intentional CPU-only parallel sweep."
+                "for a CPU-only parallel sweep."
             )
 
         # Explicit configuration always wins, even at n_jobs==1.
@@ -599,7 +599,7 @@ class GpuPool:
                 )
                 if not allow_no_gpu:
                     raise GpuConfigurationError(
-                        f"{message} For intentional CPU-only work, set gpu_policy: none "
+                        f"{message} For CPU-only work, set gpu_policy: none "
                         "and disable CUDA in the trainer environment. Set "
                         "allow_no_gpu_isolation: true only to accept running without GPU host locks."
                     )
@@ -642,7 +642,7 @@ class GpuPool:
             raise GpuConfigurationError(
                 f"n_jobs={n_jobs} but no GPUs detected. Set gpu_ids or gpu_devices "
                 "explicitly in the phase config, or set allow_no_gpu_isolation: true "
-                "if this is an intentional CPU-only parallel sweep."
+                "for a CPU-only parallel sweep."
             )
         _log_pool_size(n_jobs, [device.visible_token for device in devices], "available")
         return cls(devices=devices, whole_node=policy == "whole_node")

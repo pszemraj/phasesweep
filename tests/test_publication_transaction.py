@@ -61,7 +61,7 @@ from phasesweep.engine.read import read_result, read_status
 from phasesweep.engine.resume import _preflight_skipped_winners, _published_for_resume
 from phasesweep.engine.run import TerminalReport
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import Winner
+from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.runtime import files as runtime_files
 from phasesweep.runtime import shutdown as runtime_shutdown
@@ -1161,7 +1161,7 @@ def test_summary_semantics_are_pointer_anchored_and_cross_checked(
     summary = yaml.safe_load(summary_path.read_text())
     if tamper == "schema_version":
         summary["schema_version"] = 3
-        semantic_error = "unsupported summary schema_version 3"
+        semantic_error = f"the summary uses format 3; this PhaseSweep reads format {GENERATION_SUMMARY_SCHEMA_VERSION}"
     elif tamper == "phase_plan":
         summary["phase_plan"][0]["name"] = "q"
         semantic_error = "phase plan"
@@ -1169,10 +1169,9 @@ def test_summary_semantics_are_pointer_anchored_and_cross_checked(
         summary["metric"]["goal"] = "maximize"
         semantic_error = "metric semantics"
     elif tamper == "objective_evidence":
-        evidence = summary["metric"]["objective_evidence"]
-        flag = next(key for key, value in evidence.items() if type(value) is bool)
-        evidence[flag] = not evidence[flag]
-        semantic_error = "metric semantics"
+        assert summary["metric"]["objective_evidence"] == {"kind": "log_regex"}
+        summary["metric"]["objective_evidence"]["kind"] = "json"
+        semantic_error = "summary metric semantics disagree with the config_snapshot artifact"
     elif tamper == "config_fingerprint":
         summary["config_fingerprint"] = "0" * 64
         semantic_error = "config fingerprint"

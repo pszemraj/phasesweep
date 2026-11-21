@@ -18,13 +18,11 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, NoReturn
-
-from pydantic import ValidationError
 
 from phasesweep.config.io import load_experiment_snapshot
 from phasesweep.config.models import Experiment
@@ -50,6 +48,7 @@ from phasesweep.engine.read import EngineStatus, PhaseWinnerView, read_result
 from phasesweep.engine.resume import _preflight_skipped_winners
 from phasesweep.mcp.audit import AUDIT_LOG_NAME, AuditLogger
 from phasesweep.mcp.errors import (
+    CatalogEntryInvalidError,
     CatalogError,
     CatalogReloadRefusal,
     CatalogReloadRefusedError,
@@ -65,30 +64,42 @@ from phasesweep.mcp.errors import (
     RunCapacityUnknownError,
     RunLaunchUnsettledError,
     RunNamespaceMismatchError,
+    RunnerExitedBeforeReceiptError,
     RunPersistentStateUnavailableError,
     RunResultSnapshotUnavailableError,
     RunSnapshotUnavailableError,
     StateDirChangedError,
     UnknownExperimentError,
     UnknownRunError,
+    UnreadableRunRecordError,
+    live_runner_step,
+    recover_run_step,
+    runner_stop_step,
 )
+from phasesweep.mcp.failures import operator_failure, response_failure, run_failure_payload
 from phasesweep.mcp.redaction import (
     ResultSource,
     intersect_visible_params,
     status_payload,
     winners_payload,
 )
-from phasesweep.mcp.registry import RegisteredExperiment, Registry, VisibleParamsPolicy
-from phasesweep.mcp.runner import FailurePayload, _cleanup_uncertain_payload
+from phasesweep.mcp.registry import (
+    CatalogCheckEntry,
+    RegisteredExperiment,
+    Registry,
+    VisibleParamsPolicy,
+    without_launch,
+)
+from phasesweep.mcp.runner import RUNNER_SCRIPT_PATH, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import (
     LAUNCH_ACK_BYTE,
     LAUNCH_READY_BYTE,
     PreparedRun,
     RunHandle,
     RunnerView,
-    RunObservation,
     RunState,
     RunStore,
+    decode_unreadable_record,
     write_status_file_if_absent,
 )
 from phasesweep.mcp.snapshots import (
@@ -149,14 +160,15 @@ _PRE_IMPORT_CODE_ENV_VARS = (
 def _runner_env() -> dict[str, str]:
     """Remove interpreter startup hooks while preserving other operator environment variables.
 
-    :return dict[str, str]: Copy of this server's environment with the
-        pre-import code hooks removed and ``PYTHONNOUSERSITE`` forced on.
+    It sets no ``PYTHONNOUSERSITE``, so a runner finds a PhaseSweep this server imported from
+    the user site, and trainers inherit the same site setting as from a shell.
+
+    :return dict[str, str]: Copy of this server's environment with the pre-import code hooks
+        removed.
     """
-    env = {
+    return {
         name: value for name, value in os.environ.items() if name not in _PRE_IMPORT_CODE_ENV_VARS
     }
-    env["PYTHONNOUSERSITE"] = "1"
-    return env
 
 
 def _runner_protocol_argv(
@@ -244,6 +256,16 @@ def _cursor_offset(cursor: str | None) -> int:
     return offset
 
 
+def _unreadable_run_ids(unreadable: set[str]) -> list[str]:
+    """Return the run ids that unreadable launch-inventory records name.
+
+    :param set[str] unreadable: Identities from :meth:`RunStore.launch_inventory`.
+    :return list[str]: Run ids, leaving out handle files that name none.
+    """
+    decoded = (decode_unreadable_record(identity)[0] for identity in unreadable)
+    return [run_id for run_id in decoded if run_id is not None]
+
+
 def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int | None:
     """Compute wall seconds for a run: launch-to-now while running, total when terminal.
 
@@ -312,10 +334,34 @@ def _phase_gained_winner(baseline: tuple[Any, ...], snapshot: tuple[Any, ...]) -
 
 @dataclass(frozen=True)
 class _CatalogReloadRefusal:
-    """The latest refused reread of an edited catalog, kept until a reread succeeds."""
+    """Why launches are refused: a refused reread of an edited catalog, or a start with failed entries.
+
+    Kept until a reread succeeds.
+    """
 
     reason: CatalogReloadRefusal
     detail: str
+    failed_ids: tuple[str, ...]
+
+    @classmethod
+    def from_failures(cls, failures: Sequence[CatalogCheckEntry]) -> _CatalogReloadRefusal:
+        """Refuse launches for a catalog whose file loads but some entries do not.
+
+        :param Sequence[CatalogCheckEntry] failures: Verdicts of the entries that failed.
+        :return _CatalogReloadRefusal: An ``invalid`` refusal naming those entries.
+        """
+        return cls(
+            "invalid",
+            "; ".join(failure.error or "" for failure in failures),
+            tuple(dict.fromkeys(failure.experiment_id for failure in failures)),
+        )
+
+    def error(self) -> CatalogReloadRefusedError:
+        """Return the agent-facing tool error this refusal raises and reports.
+
+        :return CatalogReloadRefusedError: The error, naming the failed entries.
+        """
+        return CatalogReloadRefusedError(self.reason, self.failed_ids)
 
 
 class PhaseSweepMCP:
@@ -338,7 +384,11 @@ class PhaseSweepMCP:
         self._state_dir = registry.state_dir
         # Tool calls run on worker threads; one lock serializes the edit check and swap.
         self._registry_lock = threading.Lock()
-        self._reload_refusal: _CatalogReloadRefusal | None = None
+        # A registry started with failed entries is the refused state: launches stay refused
+        # until a reload validates every entry.
+        self._reload_refusal: _CatalogReloadRefusal | None = (
+            _CatalogReloadRefusal.from_failures(registry.failures) if registry.failures else None
+        )
         self._runs = runs
         self._audit = audit or AuditLogger(registry.state_dir / AUDIT_LOG_NAME)
 
@@ -346,12 +396,14 @@ class PhaseSweepMCP:
         """Reread the catalog when its file or a listed config changed, and return what to serve.
 
         The check hashes the catalog file and every config the held registry lists. An
-        unchanged catalog keeps the held registry. A changed one is reloaded through
-        :meth:`Registry.load`, bound to this server's state directory, and swapped in
-        whole. A reload that fails keeps the held registry, which reads keep serving,
-        and returns the refusal that launch reports. A reload writes nothing, and its
-        failure never escapes this method. Each new refusal and each reload is logged
-        once for the operator, with paths.
+        unchanged catalog keeps the held registry; a registry that started with failed
+        entries is never unchanged, so each call retries the reload. A changed one is
+        reloaded through :meth:`Registry.load`, bound to this server's state directory and
+        collecting every entry's verdict so the refusal can name each failed entry, and is
+        swapped in whole only when every entry loads. A reload with any failure keeps the
+        held registry, which reads keep serving, and returns the refusal that launch
+        reports. A reload writes nothing, and its failure never escapes this method. Each
+        new refusal and each reload is logged once for the operator, with paths.
 
         :return tuple[Registry, _CatalogReloadRefusal | None]: Registry to serve, and
             the refusal of the latest reread or ``None`` when the registry is current.
@@ -366,34 +418,42 @@ class PhaseSweepMCP:
                     )
                     self._reload_refusal = None
                 return registry, None
+            error: Exception | None = None
             try:
-                reloaded = Registry.load(registry.catalog_path, bound_state_dir=self._state_dir)
+                reloaded = Registry.load(
+                    registry.catalog_path, bound_state_dir=self._state_dir, collect_errors=True
+                )
             except Exception as exc:
+                error = exc
                 refusal = _CatalogReloadRefusal(
                     "state_dir_changed" if isinstance(exc, StateDirChangedError) else "invalid",
                     str(exc) if isinstance(exc, CatalogError) else repr(exc),
+                    (),
                 )
-                if refusal != self._reload_refusal:
-                    log.warning(
-                        "catalog reload refused; reads keep the last valid catalog and launches "
-                        "are refused until %s: %s",
-                        "the MCP server restarts"
-                        if refusal.reason == "state_dir_changed"
-                        else f"`phasesweep mcp check --catalog {registry.catalog_path}` passes",
-                        refusal.detail,
-                        exc_info=None if isinstance(exc, CatalogError) else exc,
+            else:
+                if not reloaded.failures:
+                    self._registry = reloaded
+                    self._reload_refusal = None
+                    log.info(
+                        "reloaded catalog %s: %d experiments, max_concurrent_runs=%d",
+                        reloaded.catalog_path,
+                        len(reloaded),
+                        reloaded.max_concurrent_runs,
                     )
-                self._reload_refusal = refusal
-                return registry, refusal
-            self._registry = reloaded
-            self._reload_refusal = None
-            log.info(
-                "reloaded catalog %s: %d experiments, max_concurrent_runs=%d",
-                reloaded.catalog_path,
-                len(reloaded),
-                reloaded.max_concurrent_runs,
-            )
-            return reloaded, None
+                    return reloaded, None
+                refusal = _CatalogReloadRefusal.from_failures(reloaded.failures)
+            if refusal != self._reload_refusal:
+                log.warning(
+                    "catalog reload refused; reads keep the entries already loaded and "
+                    "launches are refused until %s: %s",
+                    "the MCP server restarts"
+                    if refusal.reason == "state_dir_changed"
+                    else f"`phasesweep mcp check --catalog {registry.catalog_path}` passes",
+                    refusal.detail,
+                    exc_info=None if error is None or isinstance(error, CatalogError) else error,
+                )
+            self._reload_refusal = refusal
+            return registry, refusal
 
     def _serving_registry(self) -> Registry:
         """Return the registry read tools serve after the edit check.
@@ -416,9 +476,7 @@ class PhaseSweepMCP:
         return {
             "stale": refusal is not None,
             "reload_refusal": refusal.reason if refusal is not None else None,
-            "remediation": str(CatalogReloadRefusedError(refusal.reason))
-            if refusal is not None
-            else None,
+            "remediation": str(refusal.error()) if refusal is not None else None,
         }
 
     def _audit_success(
@@ -498,7 +556,7 @@ class PhaseSweepMCP:
         experiments = registry.summaries()
         if refusal is not None:
             for experiment in experiments:
-                experiment["capabilities"]["launch"] = False
+                experiment["capabilities"] = without_launch(experiment["capabilities"])
         total_count = len(experiments)
         page = experiments[offset : offset + limit]
         next_offset = offset + len(page)
@@ -582,7 +640,9 @@ class PhaseSweepMCP:
         return {
             "experiment_id": reg.id,
             "metric": reg.metric_payload,
-            "capabilities": {**reg.capabilities, "launch": reg.allow_launch and refusal is None},
+            "capabilities": (
+                reg.capabilities if refusal is None else without_launch(reg.capabilities)
+            ),
             "phases": phases,
             "catalog_status": self._catalog_status(),
         }
@@ -592,12 +652,15 @@ class PhaseSweepMCP:
 
         :param str experiment_id: Catalog id whose latest run should be resolved.
         :return dict[str, Any]: Path-free result with one computed run or ``found=false``.
+        :raises UnknownExperimentError: If ``experiment_id`` is not cataloged.
         """
-        reg = self._serving_registry().get(experiment_id)
-        handle = self._runs.latest_run_for(reg.id)
+        # Only the id and the run store are needed, so an entry that failed to load still answers.
+        with contextlib.suppress(CatalogEntryInvalidError):
+            self._serving_registry().get(experiment_id)
+        handle = self._runs.latest_run_for(experiment_id)
         run = self._run_payload(handle) if handle is not None else None
         return {
-            "experiment_id": reg.id,
+            "experiment_id": experiment_id,
             "found": run is not None,
             "run": run,
             "catalog_status": self._catalog_status(),
@@ -609,6 +672,7 @@ class PhaseSweepMCP:
         view: RunnerView | None = None,
         *,
         force_snapshot_unavailable: bool = False,
+        publication_integrity: McpPublicationState | None = None,
     ) -> JsonObject:
         """Build one agent-visible run state with explicit recovery metadata.
 
@@ -617,6 +681,8 @@ class PhaseSweepMCP:
             ``None`` to derive it here; every field below uses the same one.
         :param bool force_snapshot_unavailable: The result response has already
             reported its terminal snapshot unavailable, so the failure says so too.
+        :param McpPublicationState | None publication_integrity: The response's publication
+            verdict, whose step a run with no failure reports; ``None`` when it reports none.
         :return JsonObject: Run id, state, launch timestamp, and recovery flag.
             ``runner_observable`` is False for a running run whose runner is in
             another PID namespace and cannot be proven gone; ``recovery_required``
@@ -636,124 +702,15 @@ class PhaseSweepMCP:
                 observation.recovery_required or observation.runner_heartbeat_stale
             ),
             "runner_observable": not (state == "running" and view.visibility == "unobservable"),
-            "failure": self._run_failure_payload(
+            "failure": response_failure(
+                self._runs,
                 handle,
                 view=view,
                 observation=observation,
                 force_snapshot_unavailable=force_snapshot_unavailable,
+                publication_integrity=publication_integrity,
             ),
         }
-
-    def _run_failure_payload(
-        self,
-        handle: RunHandle,
-        *,
-        view: RunnerView | None = None,
-        observation: RunObservation | None = None,
-        force_snapshot_unavailable: bool = False,
-    ) -> JsonObject | None:
-        """Return a validated safe terminal failure, never the raw exception text.
-
-        :param RunHandle handle: Run handle whose recorded terminal status
-            should be inspected.
-        :param RunnerView | None view: The read's derivation of the runner, used
-            when a fresh observation must be derived here.
-        :param RunObservation | None observation: State and terminal evidence already read
-            together for this payload; otherwise read a fresh decision here.
-        :param bool force_snapshot_unavailable: The result response has already
-            refused a non-finalized or missing snapshot even if run state stays live.
-        :return JsonObject | None: The run's ``failure`` payload validated
-            against :class:`FailurePayload` and dumped to JSON-safe types. A
-            terminal run with no usable result snapshot receives a generated
-            snapshot-unavailable failure; otherwise returns ``None`` when no
-            valid failure was recorded.
-        """
-        if view is None:
-            view = self._runs.runner_view(handle)
-        if observation is None:
-            observation = self._runs.observe(handle, view=view)
-        terminal: Mapping[str, object] = observation.terminal_status or {}
-        persisted: JsonObject | None = None
-        recorded_failure = terminal.get("failure")
-        if recorded_failure is None and observation.terminal_status is None:
-            recorded_failure = self._runs.cleanup_failure(handle)
-        if recorded_failure is not None:
-            with contextlib.suppress(ValidationError):
-                persisted = json_object(
-                    FailurePayload.model_validate(recorded_failure).model_dump(
-                        mode="json", exclude_none=True
-                    )
-                )
-        if persisted is not None and observation.cleanup_recovery_required:
-            return persisted
-        runner_ended_with_boot = (
-            observation.terminal_status is None
-            and handle.launch_state == "spawned"
-            and view.visibility == "gone"
-        )
-        runner_exited = terminal.get("error_class") == "RunnerExitedWithoutStatus" or (
-            observation.terminal_status is None
-            and handle.launch_state == "spawned"
-            and observation.recovery_required
-            and not observation.runner_heartbeat_stale
-            and not self._runs.runner_may_be_alive(handle, view=view)
-        )
-        if runner_exited or runner_ended_with_boot or observation.runner_heartbeat_stale:
-            recovery_required = observation.recovery_required or observation.runner_heartbeat_stale
-            if runner_ended_with_boot:
-                remedy = (
-                    "The runner ended with an earlier host boot. No process from that boot "
-                    "remains, so process cleanup and recover-run are not required. This "
-                    "run's historical results are unavailable; do not substitute mutable "
-                    "experiment-level results."
-                )
-            elif observation.runner_heartbeat_stale:
-                remedy = (
-                    "The runner is in another PID namespace and its heartbeat is stale; "
-                    "it may have stopped. Stop monitoring and ask the operator to inspect "
-                    "this run with `phasesweep mcp recover-run` from a host shell outside "
-                    "the sandbox. Liveness and trial cleanup must be checked there."
-                )
-            else:
-                remedy = (
-                    "The runner exited without writing a final status; its trial processes may "
-                    "still be alive. Stop monitoring and ask the operator to inspect this run "
-                    "with `phasesweep mcp recover-run` from a host shell, then repeat with "
-                    "`--confirm` after reviewing the process cleanup preview."
-                    if recovery_required
-                    else "The runner exited without writing a final status. Operator recovery "
-                    "settled process cleanup; this run's historical results remain unavailable. "
-                    "Do not substitute mutable experiment-level results."
-                )
-            return {
-                "code": (
-                    "cleanup_uncertain" if recovery_required else "result_snapshot_unavailable"
-                ),
-                "stage": "cleanup",
-                "retryable": False,
-                "actor": "operator",
-                "remediation": remedy,
-            }
-        if force_snapshot_unavailable or (
-            observation.state != "running" and parse_result_snapshot(terminal) is None
-        ):
-            failure: JsonObject = {
-                "code": "result_snapshot_unavailable",
-                "stage": "cleanup",
-                "retryable": False,
-                "actor": "operator",
-                "remediation": (
-                    "Report that this run's historical results are unavailable and ask "
-                    "the operator to inspect the PhaseSweep run or server diagnostics; "
-                    "do not substitute mutable experiment-level results."
-                ),
-            }
-            if persisted is not None:
-                failure["cause"] = persisted
-            return failure
-        # Preserve the terminal diagnosis and remediation after operator recovery;
-        # the live recovery_required field says whether recovery is still needed.
-        return persisted
 
     def status(self, run_id: str) -> dict[str, Any]:
         """Per-phase trial counts and winner presence plus the run process state.
@@ -857,11 +814,27 @@ class PhaseSweepMCP:
             handle,
             view,
             force_snapshot_unavailable=result_source == "terminal_snapshot_unavailable",
+            publication_integrity=status["publication_integrity"],
         )
         delivery = self._tracking_delivery(handle, experiment)
         if delivery is not None:
             status["tracking_delivery"] = delivery
         return target_id, status, run, handle, result_source
+
+    def _require_run_handle(self, run_id: str) -> RunHandle:
+        """Load the exact run or explain why its persisted handle is unavailable.
+
+        :param str run_id: Run id supplied by the caller.
+        :raises UnknownRunError: The run has no persisted records.
+        :raises UnreadableRunRecordError: Persisted records exist but no handle can be read.
+        :return RunHandle: The persisted run handle.
+        """
+        handle = self._runs.get(run_id)
+        if handle is None:
+            if self._runs.has_run_records(run_id):
+                raise UnreadableRunRecordError(run_id)
+            raise UnknownRunError(run_id)
+        return handle
 
     def _read_result_target(
         self, run_id: str
@@ -877,12 +850,11 @@ class PhaseSweepMCP:
         """Read one run's status and winners from the same live or frozen result.
 
         :param str run_id: Persisted run whose immutable configuration selects the read.
-        :raises UnknownRunError: The run id has no persisted handle.
+        :raises UnknownRunError: The run id has no persisted records.
+        :raises UnreadableRunRecordError: The run has no readable handle.
         :return tuple: Target, configuration, status, winners, handle, runner view and source.
         """
-        handle = self._runs.get(run_id)
-        if handle is None:
-            raise UnknownRunError(run_id)
+        handle = self._require_run_handle(run_id)
         target_id = handle.experiment_id
         view = self._runs.runner_view(handle)
         try:
@@ -910,13 +882,13 @@ class PhaseSweepMCP:
     def _tracking_delivery(
         self, handle: RunHandle, experiment: Experiment | None
     ) -> dict[str, int] | None:
-        """Count this run's own MLflow result uploads from its launch config.
+        """Count this run's own MLflow creation and delivery records from its launch config.
 
         Delivery records are mutable, so only status reads them; frozen result
         reads never depend on them. A terminal read loads the run's config
         snapshot just for this and reports no counts when it is unavailable.
 
-        :param RunHandle handle: Run whose generation owns the uploads.
+        :param RunHandle handle: Run whose generation owns the records.
         :param Experiment | None experiment: Launch config, when already loaded.
         :return dict[str, int] | None: Pending and delivered counts, or ``None``
             when the run does not use MLflow or its config is unavailable.
@@ -1110,16 +1082,19 @@ class PhaseSweepMCP:
             declared_phases=status["result_phase_plan"],
             result_source=result_source,
             publication_integrity=publication_integrity,
+            current_generation_id=status["current_generation_id"],
             run_id=run_id,
             represented_generation_id=represented_generation_id,
             visible_params=visible_params,
             result_context=status["result_context"],
             published_config_matches_current=status["published_config_matches_current"],
         )
-        result["failure"] = self._run_failure_payload(
+        result["failure"] = response_failure(
+            self._runs,
             handle,
             view=view,
             force_snapshot_unavailable=result_source == "terminal_snapshot_unavailable",
+            publication_integrity=publication_integrity,
         )
         result["catalog_status"] = self._catalog_status()
         return result
@@ -1249,6 +1224,8 @@ class PhaseSweepMCP:
         :raises ExperimentBusyError: If this experiment already has a live run.
         :raises ConcurrencyLimitError: If the server is at ``max_concurrent_runs``.
         :raises ConfigChangedError: If the cataloged config changed after this call's reread.
+        :raises RunnerExitedBeforeReceiptError: If the spawned runner exited before it
+            recorded its launch receipt.
         :raises RuntimeError: If no unused run id could be minted, or the spawned
             runner has no kernel process start time to make cancellation PID-reuse safe.
         """
@@ -1258,7 +1235,7 @@ class PhaseSweepMCP:
         try:
             registry, refusal = self._refresh_registry()
             if refusal is not None:
-                raise CatalogReloadRefusedError(refusal.reason)
+                raise refusal.error()
             reg = registry.get(experiment_id)
             resolved["experiment_id"] = reg.id
             if not reg.allow_launch:
@@ -1281,11 +1258,10 @@ class PhaseSweepMCP:
                     and self._runs.is_pre_spawn_orphan(handle.run_id)
                 }
                 abandoned.update(
-                    identity.removeprefix("run:")
-                    for identity in unreadable
-                    if identity.startswith("run:")
-                    and self._runs.launch_lease_path(identity.removeprefix("run:")).is_file()
-                    and self._runs.is_pre_spawn_orphan(identity.removeprefix("run:"))
+                    run_id
+                    for run_id in _unreadable_run_ids(unreadable)
+                    if self._runs.launch_lease_path(run_id).is_file()
+                    and self._runs.is_pre_spawn_orphan(run_id)
                 )
                 for abandoned_run_id in sorted(abandoned):
                     recovered_log = self._runs.clear_pre_spawn_orphan(abandoned_run_id)
@@ -1299,12 +1275,11 @@ class PhaseSweepMCP:
                     handles, unreadable = self._runs.launch_inventory()
                 if unreadable:
                     recoverable = sorted(
-                        identity.removeprefix("run:")
-                        for identity in unreadable
-                        if identity.startswith("run:")
-                        and self._runs.is_pre_spawn_orphan(identity.removeprefix("run:"))
+                        run_id
+                        for run_id in _unreadable_run_ids(unreadable)
+                        if self._runs.is_pre_spawn_orphan(run_id)
                     )
-                    raise RunCapacityUnknownError(len(unreadable), recoverable)
+                    raise RunCapacityUnknownError(unreadable, recoverable)
                 live: list[RunHandle] = []
                 recovery_required_run_ids: list[str] = []
                 unobservable_run_ids: list[str] = []
@@ -1418,6 +1393,7 @@ class PhaseSweepMCP:
         :param str run_id: Detached run id to cancel.
         :return JsonObject: Cancellation result containing final state and optional cleanup confirmation.
         :raises UnknownRunError: If ``run_id`` names no persisted run.
+        :raises UnreadableRunRecordError: If persisted records exist but no handle can be read.
         :raises PermissionDeniedError: If the run did not allow cancel at launch, or its
             catalog entry no longer does.
         :raises RunLaunchUnsettledError: If the launch has not yet persisted a
@@ -1434,12 +1410,12 @@ class PhaseSweepMCP:
             # Permission below follows the reread catalog, or the last valid one after a
             # refused reread, so a catalog typo cannot leave a live run unstoppable.
             self._serving_registry()
-            handle = self._runs.get(run_id)
-            if handle is None:
-                raise UnknownRunError(run_id)
+            handle = self._require_run_handle(run_id)
             resolved = {"experiment_id": handle.experiment_id, "run_id": run_id}
             if not self._cancel_allowed(handle):
-                raise PermissionDeniedError("cancel", handle.experiment_id)
+                raise PermissionDeniedError(
+                    "cancel", handle.experiment_id, stop_step=self._runner_stop_step(handle)
+                )
             view = self._runs.runner_view(handle)
             observation = self._runs.observe(handle, view=view)
             before = observation.state
@@ -1451,10 +1427,7 @@ class PhaseSweepMCP:
             if before == "running":
                 with self._runs.transition_lock(handle):
                     # Refresh the durable handle and runner view under the transition lock.
-                    refreshed = self._runs.get(run_id)
-                    if refreshed is None:
-                        raise UnknownRunError(run_id)
-                    handle = refreshed
+                    handle = self._require_run_handle(run_id)
                     view = self._runs.runner_view(handle)
                     observation = self._runs.observe(handle, view=view)
                     before = observation.state
@@ -1474,8 +1447,8 @@ class PhaseSweepMCP:
                             or not self._runs.runner_may_be_alive(handle, view=view)
                         )
                     ):
-                        failure = self._run_failure_payload(
-                            handle, view=view, observation=observation
+                        failure = run_failure_payload(
+                            self._runs, handle, view=view, observation=observation
                         )
                         if failure is not None:
                             if observation.terminal_status is None:
@@ -1535,20 +1508,21 @@ class PhaseSweepMCP:
                     after = observation.state
                     recovery_required = observation.recovery_required
                     if not confirmed:
-                        failure = self._run_failure_payload(
-                            handle, view=view, observation=observation
+                        failure = run_failure_payload(
+                            self._runs, handle, view=view, observation=observation
                         )
                         if failure is None:
-                            failure = json_object(_cleanup_uncertain_payload([]))
+                            failure = json_object(
+                                _cleanup_uncertain_payload([], run_id=handle.run_id)
+                            )
                             if self._runs.runner_may_be_alive(handle, view=view):
+                                live_step = live_runner_step(
+                                    identity.pid, identity.pgid, handle.run_id
+                                )
                                 failure["remediation"] = (
-                                    f"Cancellation could not stop runner PID {identity.pid} "
-                                    f"(process group {identity.pgid}); trial cleanup is unconfirmed. "
-                                    "Stop monitoring and ask the operator: If it is still running "
-                                    "on the host, clear the cause there; a process in "
-                                    "uninterruptible I/O ignores SIGKILL until the I/O ends. "
-                                    "Then run `phasesweep mcp recover-run` from a host shell, "
-                                    "review the preview, and repeat with `--confirm`."
+                                    "Cancellation could not stop the runner; trial cleanup is "
+                                    "unconfirmed. Stop monitoring and ask the operator: "
+                                    f"{live_step} Then {recover_run_step(handle.run_id)}."
                                 )
                         if observation.terminal_status is None:
                             self._runs.mark_cleanup_uncertain(handle, failure=failure)
@@ -1559,6 +1533,10 @@ class PhaseSweepMCP:
                 "cleanup_confirmed": confirmed,
                 "recovery_required": recovery_required,
             }
+            if recovery_required:
+                result["failure"] = response_failure(
+                    self._runs, handle, view=view, observation=observation
+                )
         except Exception as exc:
             self._audit_error(
                 TOOL_CANCEL_RUN,
@@ -1656,7 +1634,7 @@ class PhaseSweepMCP:
             data = None
         if data is None or hashlib.sha256(data).hexdigest() != reg.config_sha256:
             if refusal is not None:
-                raise CatalogReloadRefusedError(refusal.reason)
+                raise refusal.error()
             raise ConfigChangedError(reg.id)
         return data
 
@@ -1713,16 +1691,12 @@ class PhaseSweepMCP:
                     "ended_at": utc_now_iso(),
                     "result_snapshot_state": "failed",
                     "result_snapshot_error": "LaunchDidNotProduceSnapshot",
-                    "failure": {
-                        "code": "internal_error",
-                        "stage": "preflight",
-                        "retryable": False,
-                        "actor": "operator",
-                        "remediation": (
-                            "Ask the operator to inspect the PhaseSweep server diagnostics "
-                            "before retrying."
-                        ),
-                    },
+                    "failure": operator_failure(
+                        "internal_error",
+                        "preflight",
+                        "Ask the operator to inspect the PhaseSweep server diagnostics "
+                        "before retrying.",
+                    ),
                 },
             )
         except Exception:
@@ -1828,11 +1802,12 @@ class PhaseSweepMCP:
         ack_read, ack_write = os.pipe()
         cmd = [
             sys.executable,
-            # Exclude cwd/script paths and user site packages during interpreter startup.
+            # The runner must import the PhaseSweep this server imported, so it keeps or drops
+            # the user site as this server does.
+            *(["-s"] if sys.flags.no_user_site else []),
+            # Keep the script's own directory off sys.path during interpreter startup.
             "-P",
-            "-s",
-            "-m",
-            "phasesweep.mcp.runner",
+            str(RUNNER_SCRIPT_PATH),
             *_runner_protocol_argv(
                 run_id=run_id,
                 config_snapshot_path=config_snapshot_path,
@@ -1902,6 +1877,14 @@ class PhaseSweepMCP:
                     )
                 readable = fd_ready(ready_read, timeout=_RUNNER_READY_TIMEOUT_SECONDS)
                 ready = os.read(ready_read, 1) if readable else b""
+                if ready == b"" and readable:
+                    # End of file before the ready byte: the runner is exiting without a receipt.
+                    try:
+                        returncode: int | None = proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        returncode = None
+                    if returncode is not None:
+                        raise RunnerExitedBeforeReceiptError(run_id, returncode)
                 if ready != LAUNCH_READY_BYTE:
                     raise RuntimeError(
                         "detached runner did not persist its launch receipt before launch"
@@ -1945,19 +1928,59 @@ class PhaseSweepMCP:
         assert handle is not None
         return handle
 
+    def _runner_stop_step(self, handle: RunHandle) -> str | None:
+        """Name the operator's route to stop a running run that cancel_run refuses.
+
+        A signal step is given only while the runner may be alive. A runner that exited
+        leaves a run that reads as running until recovery settles it, as a pending result
+        snapshot does; its group no longer exists and the number may now lead another
+        job's group, so the route is the run's recovery step, never a signal.
+
+        :param RunHandle handle: Run whose cancellation was refused.
+        :return str | None: Where ``RunStore.runner_may_be_alive`` rules the runner out, the
+            remediation a read of the run reports, else its recover-run step. Otherwise the
+            route naming its PID when this server can probe it and its numbers
+            are the host's, else the run id to find the runner by, or the recorded failure's
+            remediation for an unobservable runner whose run requires recovery. ``None``
+            when the run is not running.
+        """
+        view = self._runs.runner_view(handle)
+        observation = self._runs.observe(handle, view=view)
+        if observation.state != "running":
+            return None
+        if not self._runs.runner_may_be_alive(handle, view=view):
+            failure = response_failure(self._runs, handle, view=view, observation=observation)
+            if failure is not None:
+                return str(failure["remediation"])
+            return f"Its runner has exited; ask the operator to {recover_run_step(handle.run_id)}."
+        if view.visibility == "observable":
+            return runner_stop_step(handle.run_id, handle.pid)
+        if observation.recovery_required:
+            failure = run_failure_payload(self._runs, handle, view=view, observation=observation)
+            if failure is not None:
+                return str(failure["remediation"])
+        return runner_stop_step(handle.run_id, None)
+
     def _cancel_allowed(self, handle: RunHandle) -> bool:
         """Require both launch-time and current cancellation permission.
 
         A catalog edit may revoke permission but cannot grant it. Decataloged runs retain their
-        launch-time permission.
+        launch-time permission. An id whose entry failed to load when the server started keeps
+        ``allow.cancel`` only while every catalog entry with that id declares it, because those
+        blocks parsed, so a live run stays stoppable when its config breaks. An edit made while
+        an entry fails applies, like any other, once every entry loads.
 
         :param RunHandle handle: Run handle whose cancellation permission should be checked.
-        :return bool: Whether both launch-time and current permission are true,
-            or the launch-time permission alone when the id is no longer cataloged.
+        :return bool: Whether both launch-time and current permission are true, where the
+            current permission for an id that failed to load is granted only by every entry
+            with that id in the held catalog; or the launch-time permission alone when the id
+            is no longer cataloged.
         """
         if not handle.allow_cancel:
             return False
         try:
             return self._registry.get(handle.experiment_id).allow_cancel
+        except CatalogEntryInvalidError:
+            return self._registry.failed_entry_allows_cancel(handle.experiment_id)
         except UnknownExperimentError:
             return True

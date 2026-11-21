@@ -28,16 +28,24 @@ from phasesweep.engine.repeats import (
     RepeatAxis,
     _check_repeats_axis,
     group_labels_for,
+    repeat_axis,
 )
 from phasesweep.engine.state import (
+    PHASE_FINGERPRINT_PAYLOAD_ATTR,
     TRAINER_ENV_ATTR,
     Winner,
 )
+from phasesweep.engine.study_policy import _describe_environment_changes
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import OperatorAction, PhaseSweepError, operator_step
 from phasesweep.runtime.files import atomic_text_writer
 
 log = logging.getLogger(__name__)
+
+# One log line shape for every destination. The date format differs on purpose: console
+# handlers print clock time (``%H:%M:%S``), while ``run.log`` and the MCP runner's captured
+# log carry the date as well (``%Y-%m-%d %H:%M:%S``) because those files outlive the day.
+LOG_FORMAT = "%(asctime)s %(levelname).1s %(name)s %(message)s"
 
 
 def read_yaml_or_none(path: Path) -> object:
@@ -66,7 +74,7 @@ def _write_yaml_atomic(path: Path, payload: Any) -> None:
 
 @contextlib.contextmanager
 def _file_log_handler(path: Path) -> Iterator[None]:
-    """Capture phasesweep logs and a routed failure's advice in the run log.
+    """Capture phasesweep logs, and a routed failure with its advice, in the run log.
 
     :param Path path: Log file path to append to.
     :raises PhaseSweepError: The operational failure raised inside the context.
@@ -77,7 +85,7 @@ def _file_log_handler(path: Path) -> Iterator[None]:
     handler = logging.FileHandler(path, mode="a", encoding="utf-8")
     handler.setFormatter(
         logging.Formatter(
-            fmt="%(asctime)s %(levelname).1s %(name)s %(message)s",
+            fmt=LOG_FORMAT,
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
@@ -89,11 +97,11 @@ def _file_log_handler(path: Path) -> Iterator[None]:
     try:
         yield
     except PhaseSweepError as exc:
-        handler.handle(
-            logger.makeRecord(
-                logger.name, logging.ERROR, __file__, 0, "fix: %s", (operator_step(exc),), None
+        # The caller prints the error to its own stderr, so the log records it with its step.
+        for line in (str(exc), f"fix: {operator_step(exc)}"):
+            handler.handle(
+                logger.makeRecord(logger.name, logging.ERROR, __file__, 0, "%s", (line,), None)
             )
-        )
         raise
     finally:
         logger.removeHandler(handler)
@@ -157,6 +165,31 @@ def _write_trials_csv(
             for n in attr_names:
                 row[f"user_attr:{n}"] = t.user_attrs.get(n)
             writer.writerow(row)
+
+
+def _refresh_recovered_trials_csv(
+    study: optuna.Study, experiment: Experiment, phase: Phase
+) -> None:
+    """Refresh the recovered study's CSV when the supplied phase matches its semantics.
+
+    :param optuna.Study study: Study whose recovery ran under the experiment lock.
+    :param Experiment experiment: Owner of the phase artifact directory.
+    :param Phase phase: Phase to use for group labels if its semantics agree with the study.
+    """
+    # Recovery can settle earlier work even when the supplied phase will be refused at launch.
+    # Keep the prior projection when that phase cannot supply the study's repeat grouping.
+    try:
+        recorded: object = study.user_attrs.get(PHASE_FINGERPRINT_PAYLOAD_ATTR)
+        if isinstance(recorded, dict) and recorded.get(
+            "phase"
+        ) == fingerprint_ops._semantic_phase_dump(phase):
+            _write_trials_csv(
+                study,
+                path_ops._phase_dir(experiment, phase.name) / "trials.csv",
+                repeats=repeat_axis(phase),
+            )
+    except Exception as exc:
+        log.warning("Could not refresh trials.csv for study %r: %s", study.study_name, exc)
 
 
 def _save_winner(
@@ -233,33 +266,57 @@ def _warn_environment_drift(
     experiment: Experiment,
     phase_name: str,
     stored_digest: str,
+    stored_environment: dict[str, str] | None = None,
 ) -> None:
     """Warn once when result reuse crosses semantic environment cohorts.
 
     Skipped-phase loading and no-work replay reuse results without allocating trials;
-    ordinary top-ups refuse cohort drift before allocation.
+    ordinary top-ups refuse cohort drift before allocation. The warning names the
+    variables that differ when the caller holds the winning trial's recorded mapping,
+    and shows the two digests otherwise.
 
     :param Experiment experiment: Parsed experiment supplying the current contract.
     :param str phase_name: Phase whose winner was reused, used in the warn-once key.
     :param str stored_digest: Digest recorded on the reused winner or its trial.
+    :param dict[str, str] | None stored_environment: Tracked mapping the winning trial
+        recorded, or ``None`` when the caller holds only the digest.
     """
-    current_digest = _environment_identity(
+    current = _environment_identity(
         experiment,
         phase_name,
         require_wandb_online=False,
-    ).digest
-    if stored_digest == current_digest:
+    )
+    if stored_digest == current.digest:
+        return
+    differences = (
+        _describe_environment_changes(stored_environment, current.tracked)
+        if stored_environment is not None
+        else ""
+    )
+    key = ("environment-drift", experiment.experiment, phase_name, stored_digest)
+    if differences:
+        _warn_once(
+            log,
+            key,
+            "[%s] reused winner ran under a different trainer environment: %s "
+            "(execution.inherit_env=%r). The recorded result is being reused across an "
+            "environment change; confirm the difference is irrelevant to the metric, or "
+            "re-run the phase.",
+            phase_name,
+            differences,
+            experiment.execution.inherit_env,
+        )
         return
     _warn_once(
         log,
-        ("environment-drift", experiment.experiment, phase_name, stored_digest),
+        key,
         "[%s] reused winner ran under trainer environment %s..., but this process "
         "composes %s... under execution.inherit_env=%r. The recorded result is being "
         "reused across an environment change; confirm the difference is irrelevant to "
         "the metric, or re-run the phase.",
         phase_name,
         stored_digest[:12],
-        current_digest[:12],
+        current.digest[:12],
         experiment.execution.inherit_env,
     )
 
@@ -299,14 +356,17 @@ def _load_winner(
             if publication is None
             else "The last published generation holds no winner for it."
         )
+        rerun = (
+            "Run without --from-phase so the earlier phases run first (completed trials are reused)"
+            if experiment.persistent
+            else "Run without --from-phase to start every phase again, because storage: null "
+            "keeps no completed trials"
+        )
         raise ResumeWinnerMissingError(
             f"Winner file missing for phase {phase.name!r}: {absent} "
             "Unpublished phase winners can be inspected, but --from-phase requires published "
             "predecessors.",
-            remediation=(
-                "Resume without --from-phase to reuse completed trials, or use the workdir "
-                "that holds the publication."
-            ),
+            remediation=f"{rerun}, or use the workdir that holds the publication.",
         )
     path = path_ops._generation_winner_path(experiment, publication.generation_id, phase.name)
     validated = publication.winners[phase.name]

@@ -28,9 +28,11 @@ from phasesweep.config.models import (
     _metric_semantics_payload,
     experiment_disclosures,
 )
+from phasesweep.engine.artifact_roots import _artifact_path_mode
 from phasesweep.engine.errors import (
     IncompleteJournalRecordError,
     StudyStorageUnavailableError,
+    TrackingTargetUnavailableError,
     phase_timeout,
 )
 from phasesweep.engine.phase import _run_phase
@@ -43,9 +45,14 @@ from phasesweep.engine.preview import (
 )
 from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
-from phasesweep.engine.trial import _environment_identity
+from phasesweep.engine.study_policy import _launch_preflight
 from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
-from phasesweep.runtime.files import ensure_artifact_dir, require_supported_runtime
+from phasesweep.runtime.files import (
+    PlatformCapabilityError,
+    UnsafeLockPathError,
+    ensure_artifact_dir,
+    require_supported_runtime,
+)
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     service_pending_shutdown,
@@ -61,7 +68,7 @@ def _preflight_missing_reached_phase_environments(
     *,
     from_phase: str | None,
 ) -> None:
-    """Validate launch environments for reached phases with no durable study.
+    """Check that each reached phase with no durable study could start its trials.
 
     A phase absent from an otherwise bound tree has no completed trial to
     replay, so it must be able to launch before this invocation tops up an
@@ -71,11 +78,13 @@ def _preflight_missing_reached_phase_environments(
     :param Experiment experiment: Parsed experiment supplying phase environments.
     :param Mapping[str, object] existing_studies: Durable studies found under the lock.
     :param str | None from_phase: Optional first phase this invocation can execute.
-    :raises PhaseSweepError: A missing reached phase has an invalid launch environment.
+    :raises LaunchEnvironmentError: A missing reached phase has an invalid launch environment, a
+        missing trainer directory or a trial program its trainer cannot find; see
+        :func:`phasesweep.engine.study_policy._launch_preflight`.
     """
     for _index, phase in experiment.phases_from(from_phase):
         if phase.name not in existing_studies:
-            _environment_identity(experiment, phase.name)
+            _launch_preflight(experiment, phase.name, None)
 
 
 @dataclass(frozen=True)
@@ -195,8 +204,8 @@ def run_experiment(
     Live runs hold the experiment lock across all phases and install shutdown
     handlers. Dry runs inspect recorded state and render commands without writes
     or trainer subprocesses; GPU checks may read local inventory through nvidia-smi.
-    Dry-run checks omit recovery-dependent checks, trainer
-    environments and trial evidence. Fingerprints with placeholder ancestry
+    A dry run applies each launching phase's launch preflight, cohort check included, and
+    omits recovery-dependent checks and trial evidence. Fingerprints with placeholder ancestry
     remain unknown until the parent publishes a winner.
 
     :param Experiment experiment: Parsed experiment config.
@@ -233,7 +242,8 @@ def run_experiment(
             generation=None,
         )
     # Fresh-tree launch checks precede writes; existing trees defer them until work remains.
-    environments_preflighted = not path_ops._artifact_root_binding_path(experiment).exists()
+    binding_path = path_ops._artifact_root_binding_path(experiment)
+    environments_preflighted = _artifact_path_mode(binding_path) == 0
     if environments_preflighted:
         # A fresh tree holds no publication, so a resume that needs earlier winners cannot
         # succeed; refuse it before the run creates the tree.
@@ -281,6 +291,8 @@ def _run_experiment_outcome(
         writes to a fresh artifact tree.
     :return Mapping[str, Winner]: This invocation's winners, captured under the lock.
     :raises TrialEvidenceMissingError: Candidate evidence failed preflight or winner validation.
+    :raises TrackingTargetUnavailableError: Recovery left completed training pending because
+        its tracker gave no answer, so no new work starts.
     :raises ProcessCleanupUncertainError: Post-failure cleanup was not confirmed;
         the original failure is chained.
     :raises PhaseSweepShutdown: Shutdown during MLflow mirroring; the exception
@@ -320,6 +332,8 @@ def _run_experiment_outcome(
                 action=OperatorAction.RESTORE_LEDGER,
             ) from exc
         if not environments_preflighted:
+            # Checked before recovery, so a launch that a phase with no study would refuse
+            # changes nothing; the next launch that passes recovers the registered attempts.
             _preflight_missing_reached_phase_environments(
                 experiment,
                 claimed.studies,
@@ -348,6 +362,21 @@ def _run_experiment_outcome(
                 cleanup_report=cleanup,
                 from_phase=from_phase,
             )
+            if experiment.mlflow is not None:
+                from phasesweep.tracking.publication import (
+                    generations_left_open,
+                    save_recovered_attempts,
+                )
+
+                # The lock rules out a live invocation and this run has requested no summary,
+                # so every open summary binding or creation belongs to an earlier invocation.
+                cleanup.settled_generations.update(generations_left_open(experiment))
+                # Recovery sends nothing; what it settled waits as pending records until the
+                # run has reached the tracker.
+                save_recovered_attempts(experiment, claimed, cleanup.settled_generations)
+            if cleanup.unreadable_evidence:
+                # New trials would bury finished training the tracker has yet to report.
+                raise attempt_ops._pending_evidence_refusal(cleanup.unreadable_evidence)
             # Validate candidate evidence after recovery and before launching new work.
             evidence_ops._validate_selection_evidence(experiment, existing_studies)
             resume_ops._reject_bound_descendant_topups(
@@ -386,6 +415,10 @@ def _run_experiment_outcome(
             if generation.claimed:
                 # Only a claimed generation launched work whose studies need reconciling.
                 reconciliation = attempt_ops._PreflightCleanupReport()
+                if isinstance(exc, TrackingTargetUnavailableError):
+                    # The run just found its tracker unreadable; keep pending training
+                    # without spending another read's timeout before reporting it.
+                    reconciliation.unreadable_tracker = str(exc)
                 try:
                     guard_ops._reconcile_existing_studies(
                         experiment,
@@ -404,6 +437,7 @@ def _run_experiment_outcome(
                     reconciliation.recovered_attempt_generations
                 )
                 cleanup.uncertain_attempt_ids.update(reconciliation.uncertain_attempt_ids)
+                cleanup.settled_generations.update(reconciliation.settled_generations)
                 cleanup.cleanup_confirmed = reconciliation.cleanup_confirmed
                 cleanup.error = reconciliation.error
             original_cleanup_uncertain = isinstance(exc, ProcessCleanupUncertainError) or (
@@ -434,10 +468,22 @@ def _run_experiment_outcome(
                     ),
                 )
             if experiment.mlflow is not None and cleanup.cleanup_confirmed:
-                from phasesweep.tracking.publication import publish_failed_generation
+                from phasesweep.tracking.publication import (
+                    deliver_recovered_attempts,
+                    publish_failed_generation,
+                )
 
                 try:
                     publish_failed_generation(experiment, generation_id, primary_error, claimed)
+                    deliver_recovered_attempts(
+                        experiment,
+                        claimed,
+                        generation_id,
+                        cleanup.settled_generations,
+                        tracker_unreachable=isinstance(
+                            primary_error, TrackingTargetUnavailableError
+                        ),
+                    )
                 except ProcessCleanupUncertainError as tracking_exc:
                     cleanup.mark_uncertain(tracking_exc)
                     log.exception("MLflow failure delivery cleanup could not be confirmed")
@@ -483,9 +529,16 @@ def _run_experiment_outcome(
             # Outside the except clause: the pointer has committed, so nothing
             # the MLflow mirror raises may enter the failure handling above.
             try:
-                # Success without a claim published nothing: the replay matched the publication.
-                if experiment.mlflow is not None and generation.claimed:
-                    _mirror_publication(experiment, generation_id, cleanup)
+                if experiment.mlflow is not None:
+                    _mirror_publication(
+                        experiment,
+                        generation_id,
+                        cleanup,
+                        ledger=claimed,
+                        # Success without a claim published nothing: the replay matched the
+                        # publication.
+                        published=generation.claimed,
+                    )
             finally:
                 terminal_report = _terminal_report_from_cleanup(
                     generation_id,
@@ -516,31 +569,40 @@ def _mirror_publication(
     experiment: Experiment,
     generation_id: str,
     cleanup: attempt_ops._PreflightCleanupReport,
+    *,
+    ledger: ledger_ops.ValidatedLedger,
+    published: bool,
 ) -> None:
-    """Mirror a committed generation to MLflow without changing the run's outcome.
+    """Mirror a successful run's result to MLflow without changing the run's outcome.
 
-    Once the last-success pointer has committed, nothing may fail the run. An
-    ordinary failure only leaves the mirror for ``phasesweep sync-tracking``,
-    which rebuilds any record this left unsaved. An upload worker whose cleanup
-    is uncertain is recorded as cleanup evidence, and a shutdown still ends the
-    run, marked as arriving after the published result.
+    The mirror sends the published generation's records, then the outcomes this run's
+    recovery committed for earlier attempts. Once the last-success pointer has committed,
+    nothing may fail the run. An ordinary failure only leaves the mirror for ``phasesweep
+    sync-tracking``, which rebuilds any record this left unsaved. A tracking worker whose
+    cleanup is uncertain is recorded as cleanup evidence, and a shutdown still ends the run,
+    marked as arriving after the published result.
 
     :param Experiment experiment: MLflow-backed experiment.
-    :param str generation_id: Generation whose publication just committed.
+    :param str generation_id: This run's generation.
     :param attempt_ops._PreflightCleanupReport cleanup: Cleanup evidence for the
-        terminal report.
+        terminal report, naming the generations recovery settled.
+    :param ledger_ops.ValidatedLedger ledger: The run's ledger, holding the settled trials.
+    :param bool published: Whether this run published ``generation_id``; a replay of an
+        existing publication did not.
     :raises PhaseSweepShutdown: A shutdown signal arrived during the mirror.
     """
-    from phasesweep.tracking.publication import publish_generation
+    from phasesweep.tracking.publication import deliver_recovered_attempts, publish_generation
 
     try:
-        publish_generation(experiment, generation_id)
+        if published:
+            publish_generation(experiment, generation_id)
+        deliver_recovered_attempts(experiment, ledger, generation_id, cleanup.settled_generations)
     except ProcessCleanupUncertainError as exc:
         cleanup.mark_uncertain(exc)
         log.exception(
-            "An MLflow upload worker for published generation %s may still be running; the "
+            "An MLflow tracking worker of generation %s's run may still be running; the "
             "published result is unaffected. Run `phasesweep sync-tracking` with the same "
-            "config to retry its cleanup and the uploads.",
+            "config to retry its cleanup and delivery.",
             generation_id,
         )
     except PhaseSweepShutdown as exc:
@@ -550,9 +612,9 @@ def _mirror_publication(
         raise
     except Exception:
         log.exception(
-            "MLflow delivery records for published generation %s were not all saved; the "
-            "published result is unaffected. `phasesweep sync-tracking` rebuilds them from "
-            "the published generation.",
+            "MLflow delivery records of generation %s's run were not all saved; the published "
+            "result is unaffected. `phasesweep sync-tracking` rebuilds them from the ledger "
+            "and the published generation.",
             generation_id,
         )
 
@@ -594,17 +656,31 @@ def _run_experiment_inner(
     winners: dict[str, Winner] = {}
     recorded: dict[str, RecordedPhase | None] = {}
     previews: list[PhasePreview] = []
+    preview_context = ""
     if run_deadline is None and not dry_run and experiment.timeout_seconds_per_run is not None:
         run_deadline = time.monotonic() + experiment.timeout_seconds_per_run
 
     if dry_run:
+        try:
+            busy = locking_ops.experiment_is_busy(experiment)
+        except (OSError, UnsafeLockPathError, PlatformCapabilityError) as exc:
+            log.warning("DRY RUN could not check whether the experiment is active: %s", exc)
+            busy = None
+        if busy is not False:
+            preview_context = "hypothetical restart "
+        if busy:
+            log.warning(
+                "DRY RUN another operation is active. Counts below assume a restart from this "
+                "snapshot. In-flight trials can still finish without a rerun."
+            )
+        # A tree this PhaseSweep cannot use refuses before the preview, as a launch would.
+        recorded = _preview_ledger(experiment, from_phase=from_phase)
         for _phase, lines in experiment_disclosures(experiment):
             for warning, line in lines:
                 if warning:
                     log.warning("DRY RUN warning: %s", line)
                 else:
                     log.info("DRY RUN %s", line)
-        recorded = _preview_ledger(experiment, from_phase=from_phase)
         preloaded_winners = resume_ops._preflight_skipped_winners(
             experiment, from_phase=from_phase, run_deadline=None
         )
@@ -620,7 +696,7 @@ def _run_experiment_inner(
             raise phase_timeout(
                 f"Run wallclock deadline reached before phase {phase.name!r} could start.",
                 scope="run",
-                persistent=experiment.resolved_storage is not None,
+                experiment=experiment,
             )
         if (
             using_preloaded_winner
@@ -683,7 +759,7 @@ def _run_experiment_inner(
         winners[phase.name] = winner
 
     if generation is None:
-        log.info("DRY RUN %s", _dry_run_total_line(previews))
+        log.info("DRY RUN %s%s", preview_context, _dry_run_total_line(previews))
         log.info("DRY RUN complete. No trials launched, no summary written.")
         return winners
 

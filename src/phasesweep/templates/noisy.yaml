@@ -25,7 +25,7 @@ execution:
   # none: the trainer sees only a minimal environment. See phasesweep explain execution.inherit_env.
   inherit_env: none
 
-trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
+trial_command: "phasesweep-fake-train --config {config_path}"
 
 trainer_config:
   # One fixed seed for every trial. Each learning rate still draws its own noise from the toy
@@ -41,9 +41,9 @@ trainer_config:
 metric:
   name: eval_loss
   goal: minimize
-  # Viability bound: a loss above this means the run diverged. A trial outside the bound completes
-  # with its real value but cannot win, so a diverged run never ranks. Set it above the loss of
-  # ordinary runs, which the trial table shows.
+  # Viability bound: a loss above this means the run diverged. A trial outside the bound is recorded
+  # INFEASIBLE with its real value and cannot win, so a diverged run never ranks. Set it above the
+  # loss of ordinary runs, which the trial table shows.
   max: 0.6
   extractor:
     type: json_envelope
@@ -61,7 +61,9 @@ observe:
     extractor: { type: json, path: result.json, key: param_bytes }
 
 phases:
+  # The toy trainer runs on CPU. For a GPU trainer, remove gpu_policy: none to enable leasing.
   - name: learning_rate
+    gpu_policy: none
     comment: "Eight learning rates evenly spaced on a log scale, one trial each; read the trend across them."
     # Eight values and eight trials: a grid runs every value once. Grid takes explicit values, so
     # the log spacing is in the list (each value is about 1.39 times the one before it). For a

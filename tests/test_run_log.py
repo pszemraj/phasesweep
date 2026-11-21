@@ -6,7 +6,6 @@ import csv
 import logging
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 import optuna
@@ -16,17 +15,28 @@ from phasesweep import run_experiment
 from phasesweep.config.models import Constraint, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Repeats, Sampler
 from phasesweep.engine import phase as phase_ops
+from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.paths import _experiment_dir, _phase_dir
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import FAILURE_REASON_ATTR, FEASIBLE_ATTR, TRIAL_OUTCOME_ATTR
+from phasesweep.engine.state import (
+    DURATION_ATTR,
+    FAILURE_REASON_ATTR,
+    FEASIBLE_ATTR,
+    TRIAL_OUTCOME_ATTR,
+)
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.gpu import GpuPool
 from tests.conftest import (
     bounded_metric,
+    console_script,
+    invoke_cli_boundary,
     make_experiment,
+    patch_rejected_trial_user_attr,
     phase_study,
+    phase_trials,
     trial_outcome,
+    write_experiment_config,
     write_trainer,
 )
 
@@ -61,6 +71,100 @@ def _x_trainer(tmp_path: Path) -> Path:
         print(f"x={args.x * 10.5}")
         """,
     )
+
+
+def test_in_memory_run_snapshots_every_finished_trial_before_optimize_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep each finished in-memory trial in the CSV before the next trial can start."""
+    trainer = write_trainer(tmp_path / "trainer.py", 'print("x=0.5")')
+    experiment = make_experiment(workdir=tmp_path, trainer=trainer, n_trials=2)
+    after_trial = phase_ops._after_trial
+    rows_per_callback: list[int] = []
+
+    def inspect_snapshot(
+        run: phase_ops._PhaseExecution, study: optuna.Study, trial: optuna.trial.FrozenTrial
+    ) -> None:
+        after_trial(run, study, trial)
+        with (_phase_dir(experiment, "p") / "trials.csv").open(newline="") as handle:
+            rows_per_callback.append(
+                sum(row["state"] == "COMPLETE" for row in csv.DictReader(handle))
+            )
+
+    monkeypatch.setattr(phase_ops, "_after_trial", inspect_snapshot)
+    run_experiment(experiment)
+
+    assert rows_per_callback == [1, 2]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("key", "persistent"),
+    [
+        (TRIAL_OUTCOME_ATTR, True),
+        (DURATION_ATTR, True),
+        (FEASIBLE_ATTR, True),
+        pytest.param(FAILURE_REASON_ATTR, True, id="crashed-trainer-diagnostic"),
+        pytest.param(FEASIBLE_ATTR, False, id="in-memory"),
+    ],
+)
+def test_trial_write_error_reports_cause_and_storage_specific_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    key: str,
+    persistent: bool,
+) -> None:
+    """Report the write failure and preserve recoverable failures without retraining."""
+    crashed = key == FAILURE_REASON_ATTR
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import os
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+            if {crashed!r}:
+                raise SystemExit(3)
+            print("missing")
+        else:
+            print("x=0.5")
+        """,
+    )
+    experiment = make_experiment(
+        persistent=tmp_path if persistent else None,
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        sampler=Sampler(type="random", seed=7),
+    )
+    config = write_experiment_config(tmp_path / "exp.yaml", experiment)
+    command = ["run", str(config)]
+    with monkeypatch.context() as writes:
+        patch_rejected_trial_user_attr(writes, key, "injected trial write fault")
+        assert invoke_cli_boundary(command, writes) == 1
+
+    for diagnostic in (
+        capsys.readouterr().err,
+        (_experiment_dir(experiment) / "run.log").read_text(encoding="utf-8"),
+    ):
+        assert "RuntimeError: injected trial write fault" in diagnostic
+        if persistent:
+            assert "the next run recovers the attempt" in diagnostic
+        else:
+            assert "storage: null keeps no study to resume" in diagnostic
+            assert "The trial result was lost" in diagnostic
+            assert "RUNNING" not in diagnostic
+
+    if persistent:
+        (original,) = phase_trials(experiment)
+        if not crashed:
+            assert original.state == optuna.trial.TrialState.RUNNING
+        assert invoke_cli_boundary(command, monkeypatch) == 0
+        failed, winner = phase_trials(experiment)
+        assert failed.state == optuna.trial.TrialState.FAIL
+        assert failed.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "failure"
+        expected_cause = "non-zero exit code 3" if crashed else "No matches"
+        assert expected_cause in failed.user_attrs[TRIAL_OUTCOME_ATTR]["cause"]
+        assert winner.state == optuna.trial.TrialState.COMPLETE
+        assert winner.value == pytest.approx(0.5)
 
 
 def test_run_log_records_one_line_per_finished_trial(tmp_path: Path) -> None:
@@ -162,6 +266,20 @@ def test_run_log_names_the_configuration_and_repeat_value_of_each_trial(tmp_path
     assert [_field(line, r"repeat=seed=(\d+)") for line in lines] == ["0", "1", "0", "1"]
     assert all("params={'x': " in line for line in lines)
     assert all("'seed':" not in line for line in lines)
+    csv_path = _phase_dir(experiment, "p") / "trials.csv"
+    with csv_path.open(newline="") as handle:
+        assert [row["repeat_group"] for row in csv.DictReader(handle)] == ["1", "1", "3", "3"]
+    original = csv_path.read_bytes()
+    csv_path.unlink()
+    run_experiment(experiment)
+    assert csv_path.read_bytes() == original
+    phase = experiment.phase("p").model_copy(
+        update={"repeats": Repeats(key="other_seed", values=[0, 1])}
+    )
+    changed = experiment.model_copy(update={"phases": [phase]})
+    with pytest.raises(StudyFingerprintMismatchError, match="repeats.key"):
+        run_experiment(changed)
+    assert csv_path.read_bytes() == original
 
 
 def _stderr_cause_trainer(tmp_path: Path) -> Path:
@@ -278,7 +396,7 @@ def test_cli_failed_trial_tracebacks_require_verbose(tmp_path: Path, verbose: bo
     config_path.write_text(experiment.model_dump_json())
 
     result = subprocess.run(
-        [sys.executable, "-m", "phasesweep", "run", str(config_path), *(["-v"] if verbose else [])],
+        [str(console_script("phasesweep")), "run", str(config_path), *(["-v"] if verbose else [])],
         capture_output=True,
         text=True,
         cwd=tmp_path,
@@ -320,7 +438,13 @@ def _finish(run: phase_ops._PhaseExecution, outcome: str) -> int:
     trial = run.study.ask()
     trial.set_user_attr(FEASIBLE_ATTR, outcome == "success")
     trial.set_user_attr(
-        TRIAL_OUTCOME_ATTR, trial_outcome(run.completion_sequence + 1, outcome, cause="boom")
+        TRIAL_OUTCOME_ATTR,
+        trial_outcome(
+            run.completion_sequence + 1,
+            outcome,
+            metric=0.5 if outcome == "success" else None,
+            cause="boom",
+        ),
     )
     run.advance(trial.number, outcome)
     return trial.number

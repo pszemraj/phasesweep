@@ -54,11 +54,18 @@ def anchor_relative_path(value: str, info: ValidationInfo) -> str:
 
     :param str value: Configured path before home expansion or filesystem resolution.
     :param ValidationInfo info: Validation context that may name the source config directory.
+    :raises ValueError: A home-relative path names a home directory that cannot be resolved.
     :return str: Path anchored to that directory, or the unchanged input when no anchoring applies.
     """
     context = info.context
     config_dir = context.get(CONFIG_DIR_CONTEXT) if isinstance(context, dict) else None
-    if not isinstance(config_dir, Path) or value.startswith("~") or Path(value).is_absolute():
+    if value.startswith("~"):
+        try:
+            Path(value).expanduser()
+        except RuntimeError as exc:
+            raise ValueError(f"Cannot resolve the home directory in {value!r}.") from exc
+        return value
+    if not isinstance(config_dir, Path) or Path(value).is_absolute():
         return value
     return str(config_dir / value)
 

@@ -17,6 +17,7 @@ from phasesweep.engine.artifact_roots import (
     _check_published_phase_studies,
     _check_study_artifact_root,
 )
+from phasesweep.engine.artifacts import _refresh_recovered_trials_csv
 from phasesweep.engine.attempts import (
     _AttemptRecord,
     _preflight_active_attempts,
@@ -37,6 +38,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.ledger import (
+    ValidatedLedger,
     open_existing_study,
     repair_incomplete_journal_record,
     validate_ledger,
@@ -46,8 +48,10 @@ from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.state import ATTEMPT_ID_ATTR, GENERATION_ID_ATTR, TrialStateName
 from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.mcp.errors import live_runner_step
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
+    FRESH_STATE_DIR_STEP,
     ProcessIdentity,
     RunHandle,
     RunnerView,
@@ -104,7 +108,13 @@ class _CleanupEvidence:
     cleanup_recovered: int = 0
     terminated: int = 0
     retained_results: int = 0
+    # Completed attempts left RUNNING because their tracker gave no answer, with the failure.
+    pending_evidence: dict[str, str] = field(default_factory=dict)
     inspection_messages: dict[_AttemptRecord, str] = field(default_factory=dict)
+    # Generations whose trials a confirmed pass settled, with the recovered run's own, and the
+    # ledger holding them, so their MLflow outcomes go out once the recovery is committed.
+    settled_generations: set[str] = field(default_factory=set)
+    ledger: ValidatedLedger | None = None
 
 
 def recover_run(
@@ -125,10 +135,21 @@ def recover_run(
     try:
         store = RunStore.open_existing(state_dir)
     except UnsupportedStateFormatError as exc:
-        raise RunRecoveryError(str(exc), action=OperatorAction.FRESH_NAMESPACE) from None
+        raise RunRecoveryError(
+            str(exc),
+            action=OperatorAction.FRESH_NAMESPACE,
+            remediation=FRESH_STATE_DIR_STEP,
+        ) from None
     except ValueError as exc:
         # Not a state directory at all: the path given is what needs fixing.
-        raise RunRecoveryError(str(exc), action=OperatorAction.FIX_CONFIG) from None
+        raise RunRecoveryError(
+            str(exc),
+            action=OperatorAction.FIX_CONFIG,
+            remediation=(
+                "Pass that `state_dir` as an absolute path: a relative one in the catalog "
+                "resolves against the catalog's directory, not the shell's."
+            ),
+        ) from None
     except UnsafePrivatePathError as exc:
         raise RunRecoveryError.rewrap(exc, str(exc)) from None
     handle = store.get(run_id)
@@ -160,6 +181,10 @@ def recover_run(
         raise RunRecoveryError(
             f"the runner of {run_id} cannot be inspected from here: {view.reason}",
             action=OperatorAction.FIX_CONFIG,
+            remediation=(
+                "Run this command from a host shell outside any sandbox or container, where "
+                "the runner's processes are visible."
+            ),
         )
     current_boot = read_boot_id()
     if needs.cleanup_needed and (identity.boot_id is None or current_boot is None):
@@ -167,7 +192,7 @@ def recover_run(
             "runner boot id is unavailable; refusing automated process-group cleanup "
             "because PID reuse after reboot cannot be ruled out"
         )
-    _require_dead_runner(identity, view=view, cleanup_needed=needs.cleanup_needed)
+    _require_dead_runner(identity, run_id, view=view, cleanup_needed=needs.cleanup_needed)
     config = _load_recovery_config(store, handle)
     recovery_lock = _experiment_lock(config) if confirm else contextlib.nullcontext()
     transition_lock = store.transition_lock(handle) if confirm else contextlib.nullcontext()
@@ -175,6 +200,7 @@ def recover_run(
         with recovery_lock, transition_lock:
             _cleanup_runner(
                 identity,
+                run_id,
                 needs,
                 confirm=confirm,
                 view=view,
@@ -193,6 +219,7 @@ def recover_run(
                 emit(_preflight_message(run_id, needs, evidence, publication_action))
                 return
 
+            synthesized = terminal_status is None
             if terminal_status is None:
                 terminal_status = {
                     "run_id": run_id,
@@ -203,7 +230,7 @@ def recover_run(
                     "result_snapshot_state": "failed",
                     "result_snapshot_error": "HistoricalSnapshotUnavailable",
                 }
-                write_status_file(store.status_path(run_id), terminal_status)
+            delivering = config.mlflow is not None and evidence.ledger is not None
             if (
                 needs.snapshot_finalize_needed
                 and terminal_status.get("result_snapshot_state") != "complete"
@@ -224,10 +251,12 @@ def recover_run(
                 needs.snapshot_finalize_needed
                 and terminal_status.get("result_snapshot_state") == "complete"
             )
-            if repairing_complete_snapshot:
-                # Keep the recovery reservation while the prior frozen result stays readable.
-                # Reboot proves processes dead, but this marker must still survive until
-                # their trial evidence is reflected in the immutable snapshot.
+            if repairing_complete_snapshot or delivering:
+                # Keep the recovery reservation while the prior frozen result stays readable,
+                # and while tracking workers may start: once the cleanup record below is written,
+                # the marker is all that leaves an unconfirmed status recovery-required. Reboot
+                # proves processes dead, but this marker must still survive until their trial
+                # evidence is reflected in the immutable snapshot.
                 store.mark_cleanup_uncertain(handle)
             if needs.cleanup_needed:
                 _persist_cleanup_recovery(store, handle, config, evidence)
@@ -241,7 +270,30 @@ def recover_run(
                 publication_summary,
                 emit=emit,
             )
-            if needs.cleanup_needed or repairing_complete_snapshot:
+            delivery: dict[str, int] | None = None
+            if delivering:
+                from phasesweep.tracking.publication import deliver_recovered_attempts
+
+                assert evidence.ledger is not None
+                # Sent before the marker clears, so a tracking worker whose cleanup is
+                # unconfirmed fails this command and leaves the run recovery-required, as an
+                # evidence worker's does. The workers are registered under this run, so the
+                # next pass resolves one through its registry entry as this run's evidence.
+                delivery = deliver_recovered_attempts(
+                    config,
+                    evidence.ledger,
+                    run_id,
+                    evidence.settled_generations,
+                    recovering=True,
+                    tracker_unreachable=bool(evidence.pending_evidence),
+                )
+            if synthesized:
+                # A runner that left no status is recovery-required until one exists, and the
+                # status this pass writes reports cleanup confirmed, which a marker cannot
+                # outrank. Written only after the uploads, a failed or interrupted delivery
+                # leaves the run for another pass, which repeats this one.
+                write_status_file(store.status_path(run_id), terminal_status)
+            if needs.cleanup_needed or repairing_complete_snapshot or delivering:
                 store.clear_cleanup_uncertain(handle)
             if needs.cleanup_needed:
                 emit(
@@ -252,6 +304,35 @@ def recover_run(
                     f"{evidence.retained_results} completed trial result(s), and confirmed "
                     f"{evidence.cleanup_recovered} cleanup-uncertain trial(s)."
                 )
+            elif evidence.registered_attempts_reconciled:
+                emit(
+                    f"Reconciled {evidence.registered_attempts_reconciled} registered MLflow "
+                    f"tracking operation(s) for {run_id} and terminated {evidence.terminated} "
+                    "live process group(s). Retry any remaining uploads with "
+                    "`phasesweep sync-tracking CONFIG` using the config this run launched with."
+                )
+            if evidence.pending_evidence:
+                # Cleanup is proven, so recovery succeeds; the next run refuses until
+                # the tracker answers, and nothing here may discard the training.
+                first = next(iter(evidence.pending_evidence.values())).rstrip(".")
+                emit(
+                    f"Left {len(evidence.pending_evidence)} completed trial(s) pending: the "
+                    f"tracker could not be read for their evidence ({first}). Restore access "
+                    "to the tracker, then start the run again; their training is kept and "
+                    "nothing is retrained."
+                )
+            if delivery and any(delivery.values()):
+                message = f"Delivered {delivery['delivered']} MLflow outcome(s) of the recovered trials and generations"
+                uploads = delivery["pending_uploads"]
+                creations = delivery["pending_creations"]
+                if uploads or creations:
+                    emit(
+                        f"{message}. Pending uploads: {uploads}. Unconfirmed run creations: "
+                        f"{creations}. Run `phasesweep sync-tracking CONFIG` with the config "
+                        "this run launched with to retry. Delivery never retrains."
+                    )
+                else:
+                    emit(f"{message}; none stay pending.")
     except RunRecoveryError:
         raise
     except (PhaseSweepError, OSError) as exc:
@@ -314,6 +395,10 @@ def _recover_pre_spawn_orphan(
     raise RunRecoveryError(
         f"unknown run id: {run_id}; pass a run id this MCP state directory records.",
         action=OperatorAction.FIX_CONFIG,
+        remediation=(
+            "Pass a run id the server returned for this catalog; the state directory holds "
+            "one `runs/<run-id>.json` file per run it records."
+        ),
     )
 
 
@@ -419,7 +504,8 @@ def _recovery_needs(
     if not cleanup_needed and snapshot_unavailable and not snapshot_recovery_required:
         raise RunRecoveryError(
             "this run has no immutable terminal result snapshot. Historical results cannot "
-            "be rebuilt from the current shared study because later runs may have changed it."
+            "be rebuilt from the current shared study because later runs may have changed it.",
+            remediation="No further cleanup or result repair is available for this run.",
         )
     return _RecoveryNeeds(
         terminal_status=terminal_status,
@@ -434,8 +520,38 @@ def _recovery_needs(
     )
 
 
+def _surviving_runner_step(identity: ProcessIdentity, run_id: str, *, lead: str = "") -> str:
+    """Return the operator step for a runner recovery found alive, naming its PID and group.
+
+    :param ProcessIdentity identity: Recorded runner PID and process group.
+    :param str run_id: The run, which names the runner when the identity records no PID.
+    :param str lead: Step to take before the shared host step, ending in a space.
+    :return str: The step, ending in the instruction to repeat the command.
+    """
+    return (
+        f"{lead}{live_runner_step(identity.pid, identity.pgid, run_id)} "
+        "Then repeat this recover-run command."
+    )
+
+
+def _live_runner_refusal(identity: ProcessIdentity, run_id: str) -> RunRecoveryError:
+    """Build the refusal for a runner that is still alive.
+
+    :param ProcessIdentity identity: Recorded runner PID and process group.
+    :param str run_id: The run whose runner is alive.
+    :return RunRecoveryError: The refusal, for the caller to raise.
+    """
+    return RunRecoveryError(
+        "runner still appears live",
+        action=OperatorAction.RETRY,
+        remediation=_surviving_runner_step(
+            identity, run_id, lead="Stop it with cancel_run if the run should end. "
+        ),
+    )
+
+
 def _require_dead_runner(
-    identity: ProcessIdentity, *, view: RunnerView, cleanup_needed: bool
+    identity: ProcessIdentity, run_id: str, *, view: RunnerView, cleanup_needed: bool
 ) -> None:
     """Reject live runners and identities without a safe process-visibility proof.
 
@@ -443,6 +559,7 @@ def _require_dead_runner(
     requires a recorded native process start time before checking liveness.
 
     :param ProcessIdentity identity: Recorded runner PID, start time, process group, boot ID, and PID namespace.
+    :param str run_id: The run being recovered, named in a refusal.
     :param RunnerView view: This recovery's one derivation of the runner.
     :param bool cleanup_needed: Whether recovery would need to clean up the runner group.
     :raises RunRecoveryError: The runner is live or PID reuse cannot be excluded.
@@ -459,9 +576,7 @@ def _require_dead_runner(
     # The live runner holds the run: once cancel_run stops it, the same request
     # can proceed, while another recover-run would stop at this same check.
     if is_same_live_process(identity.pid, identity.pid_starttime):
-        raise RunRecoveryError(
-            "runner still appears live; use cancel_run first", action=OperatorAction.RETRY
-        )
+        raise _live_runner_refusal(identity, run_id)
 
 
 def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
@@ -501,6 +616,7 @@ def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
 
 def _cleanup_runner(
     identity: ProcessIdentity,
+    run_id: str,
     needs: _RecoveryNeeds,
     *,
     confirm: bool,
@@ -512,6 +628,7 @@ def _cleanup_runner(
     Ended boots and host-proven absent groups are neither probed nor signalled.
 
     :param ProcessIdentity identity: Recorded runner process identity and process-group ID.
+    :param str run_id: The run being recovered, named in a refusal.
     :param _RecoveryNeeds needs: Decisions indicating whether runner cleanup is required.
     :param bool confirm: Enable liveness checks and any required process-group cleanup.
     :param RunnerView view: This recovery's one derivation of the runner.
@@ -523,9 +640,7 @@ def _cleanup_runner(
     # Keep the lock from this liveness check through every signal, study
     # mutation, and recovery-state write in recover_run.
     if confirm and is_same_live_process(identity.pid, identity.pid_starttime):
-        raise RunRecoveryError(
-            "runner still appears live; use cancel_run first", action=OperatorAction.RETRY
-        )
+        raise _live_runner_refusal(identity, run_id)
     if (
         needs.cleanup_needed
         and confirm
@@ -534,7 +649,10 @@ def _cleanup_runner(
             identity.pid, identity.pid_starttime, pgid=identity.pgid, grace_seconds=30.0
         )
     ):
-        raise RunRecoveryError("runner process-group cleanup is still uncertain")
+        raise RunRecoveryError(
+            "runner process-group cleanup is still uncertain",
+            remediation=_surviving_runner_step(identity, run_id),
+        )
 
 
 def _publication_recovery_action(
@@ -570,7 +688,7 @@ def _publication_recovery_action(
 
 def _load_recovery_studies(
     config: Experiment, needs: _RecoveryNeeds, *, confirm: bool = False
-) -> dict[str, optuna.Study]:
+) -> tuple[ValidatedLedger, dict[str, optuna.Study]]:
     """Validate study ownership and load phases needed for trial cleanup recovery.
 
     Validate before opening or writing. Confirmed recovery holds the experiment lock and
@@ -587,7 +705,8 @@ def _load_recovery_studies(
     :raises RunRecoveryError: The ledger is refused, a phase study belongs to
         another artifact root, or required storage or published studies cannot
         be read.
-    :return dict[str, optuna.Study]: Loadable phase studies keyed by phase name.
+    :return tuple[ValidatedLedger, dict[str, optuna.Study]]: The validated ledger, and its
+        loadable phase studies keyed by phase name.
     """
     # A storage refusal gains a recover-run retry here, but that retry cannot
     # succeed until the ledger is back, so these wraps route to restoring it.
@@ -642,7 +761,7 @@ def _load_recovery_studies(
                 f"{exc}{recovery_step}",
                 action=OperatorAction.RESTORE_LEDGER,
             ) from exc
-    return loaded_studies
+    return ledger, loaded_studies
 
 
 def _recover_trial_evidence(
@@ -658,6 +777,8 @@ def _recover_trial_evidence(
     When cleanup is needed, both modes read run, registry, tracking-receipt, and study evidence
     through the same cleanup helpers. Confirmed recovery lets them signal and write; preflight
     only validates and does not persist the collected run evidence.
+    A pending publication snapshot can precede MLflow uploads, so recover its run's tracking
+    operations before finalizing the snapshot that holds its slot.
 
     :param RunStore store: Existing run store containing prior cleanup evidence and attempt IDs.
     :param RunHandle handle: Durable handle for the run being recovered.
@@ -677,7 +798,7 @@ def _recover_trial_evidence(
     inspected_studies = 0
     loaded_studies: dict[str, optuna.Study] = {}
     if needs.cleanup_needed:
-        loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
+        ledger, loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
         active_report = _PreflightCleanupReport(inspection_messages={} if not confirm else None)
         registered_attempts = _preflight_active_attempts(
             config, active_report, confirm=confirm, retain_recovery_evidence=True
@@ -720,28 +841,45 @@ def _recover_trial_evidence(
             )
             evidence.reaped_attempt_ids.update(previously_recovered)
             evidence.reaped_attempt_locations.update(previously_recovered)
-            evidence.cleanup_recovered += _recover_cleanup_uncertain_trials(
-                study,
-                config,
-                phase.name,
-                confirm=confirm,
-                recovered_attempts=inspected_attempts,
-                process_actions=active_report.process_actions,
-                inspection_messages=active_report.inspection_messages,
-            )
-            evidence.reaped += _reap_stale_trials(
-                study,
-                config,
-                phase.name,
-                confirm=confirm,
-                recovered_attempts=inspected_attempts,
-                process_actions=active_report.process_actions,
-                inspection_messages=active_report.inspection_messages,
-                report=active_report,
-            )
+            try:
+                evidence.cleanup_recovered += _recover_cleanup_uncertain_trials(
+                    study,
+                    config,
+                    phase.name,
+                    confirm=confirm,
+                    recovered_attempts=inspected_attempts,
+                    process_actions=active_report.process_actions,
+                    inspection_messages=active_report.inspection_messages,
+                )
+                evidence.reaped += _reap_stale_trials(
+                    study,
+                    config,
+                    phase.name,
+                    confirm=confirm,
+                    recovered_attempts=inspected_attempts,
+                    process_actions=active_report.process_actions,
+                    inspection_messages=active_report.inspection_messages,
+                    report=active_report,
+                )
+            finally:
+                if confirm:
+                    _refresh_recovered_trials_csv(study, config, phase)
         evidence.terminated = sum(active_report.process_actions.values())
         evidence.retained_results = active_report.retained_results
+        evidence.pending_evidence = active_report.unreadable_evidence
         evidence.inspection_messages = active_report.inspection_messages or {}
+        if confirm:
+            active_report.record_generations(inspected_attempts)
+            # The runner is proven dead, so its own generation has ended even when this pass
+            # settled none of its trials.
+            evidence.settled_generations = active_report.settled_generations | {run_id}
+            evidence.ledger = ledger
+            if config.mlflow is not None:
+                from phasesweep.tracking.publication import save_recovered_attempts
+
+                # As in a run: recovery sends nothing, and what it settled waits as pending
+                # records until the recovery is committed.
+                save_recovered_attempts(config, ledger, evidence.settled_generations)
         for attempt_id, record in inspected_attempts.items():
             if record.generation_id == run_id or attempt_id in causal_attempt_ids:
                 evidence.reaped_attempt_ids.add(attempt_id)
@@ -751,6 +889,27 @@ def _recover_trial_evidence(
                         record.trial_number,
                         record.generation_id,
                     )
+    elif (
+        config.mlflow is not None
+        and needs.snapshot_recovery_required
+        and needs.terminal_status is not None
+        and needs.terminal_status.get("result_publication_state") is not None
+    ):
+        # Publication records trainer cleanup before mirroring. A hard exit during the
+        # mirror can leave a tracking operation registered under this run.
+        validate_ledger(config)
+        tracking_report = _PreflightCleanupReport(inspection_messages={} if not confirm else None)
+        evidence.registered_attempts_reconciled = len(
+            _preflight_active_attempts(
+                config,
+                tracking_report,
+                confirm=confirm,
+                tracking_only=True,
+                generation_id=run_id,
+            )
+        )
+        evidence.terminated = sum(tracking_report.process_actions.values())
+        evidence.inspection_messages = tracking_report.inspection_messages or {}
     if confirm and needs.stored_snapshot is not None:
         pending_ids = {
             attempt.attempt_id
@@ -760,7 +919,7 @@ def _recover_trial_evidence(
         } & evidence.reaped_attempt_ids
         if pending_ids:
             if not loaded_studies:
-                loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
+                _ledger, loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
             for phase_name, study in loaded_studies.items():
                 for trial in study.get_trials(deepcopy=False):
                     trial_attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
@@ -834,6 +993,11 @@ def _preflight_message(
             f"settle {evidence.reaped} stale trial(s), retaining completed results when "
             f"their evidence confirms success, and recover {evidence.cleanup_recovered} "
             "cleanup-uncertain terminal trial(s)"
+        )
+    elif evidence.registered_attempts_reconciled:
+        actions.append(
+            f"reconcile {evidence.registered_attempts_reconciled} registered MLflow tracking "
+            f"operation(s), terminating {evidence.terminated} live process group(s) if still alive"
         )
     if needs.snapshot_finalize_needed:
         if publication_action == "commit":
@@ -952,7 +1116,8 @@ def _finish_result_recovery(
                 actor="agent",
                 remediation=(
                     "Report that recovery could not confirm this run as the current published "
-                    "result. Start a new run only if the user still wants a published result."
+                    "result. A new run of this experiment reuses its finished trials and "
+                    "publishes their winners without training them again."
                 ),
             ).model_dump(mode="json", exclude_none=True)
             terminal_status.pop("result_publication_state", None)

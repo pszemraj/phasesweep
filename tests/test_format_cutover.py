@@ -57,7 +57,12 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_VERSION,
 )
 from phasesweep.engine.study_policy import _initialize_study_schema, _validate_study_schema
-from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
+from phasesweep.errors import (
+    OTHER_FORMAT_STEP,
+    OperatorAction,
+    PhaseSweepError,
+    ProcessCleanupUncertainError,
+)
 from phasesweep.mcp.recovery import (
     _load_recovery_studies,
 )
@@ -124,80 +129,147 @@ def test_unsupported_artifact_binding_version_is_refused_before_mutation(
 
     with pytest.raises(
         ArtifactRootConflictError,
-        match=f"unsupported PhaseSweep format {previous}",
+        match=(
+            f"uses format {previous}; this PhaseSweep reads format "
+            f"{ARTIFACT_ROOT_BINDING_SCHEMA_VERSION}. Nothing was written"
+        ),
     ) as excinfo:
         run_experiment(experiment)
 
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
+    assert excinfo.value.remediation == OTHER_FORMAT_STEP
     assert tree_snapshot(materialized.root) == before
+
+
+def _downgrade_binding(experiment: Experiment) -> None:
+    """Rewrite an artifact-root binding as the previous format left it."""
+    binding_path = _artifact_root_binding_path(experiment)
+    binding = json.loads(binding_path.read_text())
+    binding["schema_version"] -= 1
+    binding_path.write_text(json.dumps(binding) + "\n")
+
+
+def _downgrade_study_stamps(journal: Path) -> None:
+    """Rewrite every study's schema stamp in a journal as the previous format left it."""
+    records = [json.loads(line) for line in journal.read_text().splitlines()]
+    changed = False
+    for record in records:
+        attrs = record.get("user_attr", {})
+        if STUDY_SCHEMA_ATTR in attrs:
+            attrs[STUDY_SCHEMA_ATTR] = STUDY_SCHEMA_VERSION - 1
+            changed = True
+    assert changed
+    journal.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("storage_kind", ["explicit", "auto"])
+def test_artifact_root_format_refusal_names_a_step_that_is_accepted(
+    tmp_path: Path, storage_kind: str
+) -> None:
+    """One pass of the old-format fix line is a fresh start, whichever ledger the config names.
+
+    An explicit ledger keeps the old studies when only the experiment name changes, so the
+    line names a new ledger for a config that names one. Under ``storage: auto`` the ledger
+    lives in the artifact root, so a new experiment name alone starts fresh.
+    """
+    explicit = storage_kind == "explicit"
+    journal = tmp_path / "old.journal"
+    old = _experiment(tmp_path, storage=f"journal:///{journal}" if explicit else "auto")
+    run_experiment(old)
+    _downgrade_binding(old)
+    _downgrade_study_stamps(journal if explicit else _experiment_dir(old) / "study.journal")
+
+    with pytest.raises(ArtifactRootConflictError, match="uses format") as refused:
+        run_experiment(old)
+
+    assert refused.value.remediation == OTHER_FORMAT_STEP
+    if explicit:
+        with pytest.raises(StudySchemaMismatchError, match="unsupported PhaseSweep study state"):
+            run_experiment(old.model_copy(update={"experiment": "fresh"}))
+    followed = {"experiment": "fresh"}
+    if explicit:
+        followed["storage"] = f"journal:///{tmp_path / 'fresh.journal'}"
+
+    run_experiment(old.model_copy(update=followed))
+
+
+def test_artifact_binding_without_a_version_is_refused_as_unversioned(tmp_path: Path) -> None:
+    """A binding that records no format version is worded as unversioned, never as format None."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    binding_path = _artifact_root_binding_path(materialized.experiment)
+    binding = json.loads(binding_path.read_text())
+    del binding["schema_version"]
+    binding_path.write_text(json.dumps(binding) + "\n")
+
+    with pytest.raises(
+        ArtifactRootConflictError,
+        match=(
+            "has no format version; this PhaseSweep reads format "
+            f"{ARTIFACT_ROOT_BINDING_SCHEMA_VERSION}. Nothing was written"
+        ),
+    ):
+        run_experiment(materialized.experiment)
 
 
 @pytest.mark.parametrize("format_record", ["artifact-root", "study"])
 @pytest.mark.parametrize(
-    "command, options, read_only",
+    "command, options",
     [
-        ("status", [], True),
-        ("status", ["--trials"], True),
-        ("show-winners", [], True),
-        ("run", ["--dry-run"], True),
-        ("run", [], False),
+        ("status", []),
+        ("status", ["--trials"]),
+        ("show-winners", []),
+        ("run", ["--dry-run"]),
+        ("run", []),
     ],
 )
-def test_format_refusal_guidance_matches_cli_operation(
+def test_format_refusal_gives_the_same_fix_to_every_command(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
     format_record: str,
     command: str,
     options: list[str],
-    read_only: bool,
 ) -> None:
-    """Unsupported formats give inspection advice on reads and fresh-state advice on runs."""
+    """Data in another format ends in one fix line whichever command meets it, before any preview."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     if format_record == "artifact-root":
-        binding_path = _artifact_root_binding_path(materialized.experiment)
-        binding = json.loads(binding_path.read_text())
-        binding["schema_version"] -= 1
-        binding_path.write_text(json.dumps(binding) + "\n")
+        _downgrade_binding(materialized.experiment)
     else:
-        records = [json.loads(line) for line in materialized.ledger_path.read_text().splitlines()]
-        changed = False
-        for record in records:
-            attrs = record.get("user_attr", {})
-            if STUDY_SCHEMA_ATTR in attrs:
-                attrs[STUDY_SCHEMA_ATTR] = STUDY_SCHEMA_VERSION - 1
-                changed = True
-        assert changed
-        materialized.ledger_path.write_text(
-            "".join(json.dumps(record) + "\n" for record in records)
-        )
+        _downgrade_study_stamps(materialized.ledger_path)
     before = tree_snapshot(materialized.root)
 
     code = invoke_cli_boundary([command, str(materialized.config_path), *options], monkeypatch)
 
     output = capsys.readouterr()
     assert code == 1
-    assert "unsupported" in output.err
+    assert "this PhaseSweep reads format" in output.err
     assert "Traceback" not in output.err
+    assert "checkout" not in output.err
+    assert "format None" not in output.err
+    assert not [record for record in caplog.records if "DRY RUN" in record.getMessage()]
+    assert output.err.endswith(f"\nfix: {OTHER_FORMAT_STEP}\n")
     assert tree_snapshot(materialized.root) == before
-    if read_only:
-        assert "inspect the raw artifacts" in output.err
-        assert "exact checkout that produced" in output.err
-        assert "if available" in output.err
-        assert "fresh namespace" not in output.err
-    else:
-        assert "fresh namespace" in output.err
 
 
 @pytest.mark.parametrize(
-    "schema_version",
-    [2, None, float(STUDY_SCHEMA_VERSION), True],
+    "schema_version, shown",
+    [
+        (2, "uses format 2"),
+        (None, "has no format version"),
+        (float(STUDY_SCHEMA_VERSION), f"uses format {float(STUDY_SCHEMA_VERSION)}"),
+        (True, "uses format True"),
+    ],
     ids=["old-version", "unmarked", "float-version", "bool-version"],
 )
 def test_unsupported_populated_ledger_is_refused_with_a_fresh_output_root(
-    tmp_path: Path, schema_version: int | float | None
+    tmp_path: Path, schema_version: int | float | None, shown: str
 ) -> None:
-    """Changing experiment/workdir cannot reinterpret an old populated ledger as fresh."""
+    """An old populated ledger is refused naming its format and the one this PhaseSweep reads.
+
+    Changing experiment/workdir cannot reinterpret it as fresh, so the fix line names a new ledger.
+    """
     ledger = tmp_path / "old.journal"
     storage = f"journal:///{ledger}"
     old = optuna.create_study(
@@ -218,11 +290,15 @@ def test_unsupported_populated_ledger_is_refused_with_a_fresh_output_root(
 
     with pytest.raises(
         StudySchemaMismatchError,
-        match=r"old_experiment::removed_phase.*Nothing was written",
+        match=(
+            rf"'old_experiment::removed_phase' {shown}; "
+            rf"this PhaseSweep reads format {STUDY_SCHEMA_VERSION}\. Nothing was written"
+        ),
     ) as excinfo:
         run_experiment(experiment)
 
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
+    assert excinfo.value.remediation == OTHER_FORMAT_STEP
     assert not _experiment_dir(experiment).exists()
     assert {
         path.name: path.read_bytes()

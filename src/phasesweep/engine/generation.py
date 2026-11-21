@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -194,18 +195,40 @@ def _log_on_failure(action: Callable[[], None], message: str) -> None:
         log.exception(message)
 
 
-def _recorded_generation_state(record_path: Path) -> str | None:
-    """Read one lifecycle record's state label, or ``None`` when unreadable.
+@dataclass(frozen=True)
+class _RecordedGeneration:
+    """The terminal lifecycle state, or why a record that exists could not be read."""
+
+    state: str | None
+    error_class: str | None
+    problem: str | None = None
+
+
+def _recorded_generation(record_path: Path) -> _RecordedGeneration:
+    """Read one lifecycle record's state label and failure class.
 
     :param Path record_path: Immutable lifecycle record YAML path.
-    :return str | None: The recorded ``state`` string, or ``None`` when the
-        record is missing, unreadable, or malformed.
+    :return _RecordedGeneration: The state and error class, or a result with no state
+        if the file does not exist or it cannot supply a valid terminal state. A missing
+        file has no problem recorded.
     """
-    payload = artifact_io.read_yaml_or_none(record_path)
-    if not isinstance(payload, dict):
-        return None
-    state = payload.get("state")
-    return state if isinstance(state, str) else None
+    try:
+        payload: object = yaml.safe_load(record_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return _RecordedGeneration(None, None)
+    except OSError:
+        return _RecordedGeneration(None, None, "unreadable")
+    except (ValueError, yaml.YAMLError):
+        return _RecordedGeneration(None, None, "malformed")
+    if isinstance(payload, dict) and "error_class" in payload:
+        state, error_class = payload.get("state"), payload["error_class"]
+        if (
+            isinstance(state, str)
+            and state in _TERMINAL_GENERATION_STATES
+            and (error_class is None or isinstance(error_class, str))
+        ):
+            return _RecordedGeneration(state, error_class)
+    return _RecordedGeneration(None, None, "malformed")
 
 
 def _write_generation_state(
@@ -250,7 +273,7 @@ def _write_generation_state(
             log.warning(
                 "Refusing to rewrite terminal generation %s record (existing state %r, attempted %r)",
                 generation_id,
-                _recorded_generation_state(record_path),
+                _recorded_generation(record_path).state,
                 state,
             )
     if publish_current:

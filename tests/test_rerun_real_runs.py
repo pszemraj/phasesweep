@@ -15,18 +15,20 @@ import json
 import os
 import signal
 import subprocess
-import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import optuna
 import pytest
+from click.testing import CliRunner
 
 from phasesweep import run_experiment
+from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, Repeats, Sampler
 from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.optuna import _draw_positions, _finished_trial_count, _trial_count_state
 from phasesweep.engine.read import read_result
 from phasesweep.engine.state import (
@@ -39,6 +41,7 @@ from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE, kill_stale_group
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
+    console_script,
     copy_fake_train,
     make_experiment,
     phase_trials,
@@ -119,7 +122,7 @@ class _Harness:
         """
         with self.log.open("a") as handle:
             proc = subprocess.Popen(
-                [sys.executable, "-m", "phasesweep", "run", str(config)],
+                [str(console_script("phasesweep")), "run", str(config)],
                 stdin=subprocess.DEVNULL,
                 stdout=handle,
                 stderr=subprocess.STDOUT,
@@ -131,12 +134,12 @@ class _Harness:
     def interrupt(self, config: Path, trial: int, sig: signal.Signals) -> None:
         """Run ``config`` until ``trial`` is in flight, then stop the run with ``sig``.
 
-        SIGINT goes to the run's process group, as a terminal's Ctrl-C does;
-        SIGKILL goes to the orchestrator alone, so its trainer survives it.
+        SIGINT, SIGHUP and SIGTERM go to the run's process group, as a terminal's Ctrl-C and
+        hangup do; SIGKILL goes to the orchestrator alone, so its trainer survives it.
 
         :param Path config: Config to run.
         :param int trial: Trial number the trainer holds in flight.
-        :param signal.Signals sig: ``SIGINT`` or ``SIGKILL``.
+        :param signal.Signals sig: ``SIGINT``, ``SIGHUP``, ``SIGTERM`` or ``SIGKILL``.
         """
         (self.gate / f"hold-{trial}").touch()
         proc = self._spawn(config)
@@ -151,10 +154,10 @@ class _Harness:
             if time.monotonic() > deadline:
                 raise AssertionError(f"trial {trial} never started:\n{self.log.read_text()}")
             time.sleep(0.05)
-        if sig == signal.SIGINT:
-            os.killpg(proc.pid, signal.SIGINT)
-        else:
+        if sig == signal.SIGKILL:
             os.kill(proc.pid, signal.SIGKILL)
+        else:
+            os.killpg(proc.pid, sig)
         assert proc.wait(timeout=_WAIT_SECONDS) != 0, self.log.read_text()
 
     def complete(self, config: Path) -> None:
@@ -466,3 +469,84 @@ def test_model_samplers_top_up_real_runs_exactly(
     run_experiment(topped)
 
     assert _assert_matches_control(topped, control) == []
+
+
+_NO_RUN_ACTIVE = (
+    "# No run is active, so the 1 trial recorded RUNNING was left by a run that stopped before "
+    "recording it; rerun the same config to settle it. A trainer still running is stopped and "
+    "its trial rerun, so wait for it to exit to keep its result."
+)
+
+
+def test_status_tells_a_killed_run_from_a_live_one(harness: _Harness) -> None:
+    """After SIGKILL both status views say no run is active; a live lock silences them and a rerun clears them."""
+    phase = Phase(
+        name="p",
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"model.n_layers": CategoricalParam(type="categorical", choices=[4, 8])},
+    )
+    experiment = harness.experiment("killed", phase)
+    config = harness.config(experiment)
+
+    harness.interrupt(config, 0, signal.SIGKILL)
+
+    assert [t.state.name for t in phase_trials(experiment)] == ["RUNNING"]
+    for arguments in (["status"], ["status", "--trials"]):
+        shown = CliRunner().invoke(cli, [*arguments, str(config)])
+        assert shown.exit_code == 0, shown.output
+        assert shown.output.splitlines()[0] == _NO_RUN_ACTIVE
+        assert shown.output.count("No run is active") == 1
+        with _experiment_lock(experiment):
+            live = CliRunner().invoke(cli, [*arguments, str(config)])
+        assert live.exit_code == 0, live.output
+        assert "No run is active" not in live.output
+
+    harness.release()
+    harness.complete(config)
+
+    for arguments in (["status"], ["status", "--trials"]):
+        recovered = CliRunner().invoke(cli, [*arguments, str(config)])
+        assert recovered.exit_code == 0, recovered.output
+        assert "No run is active" not in recovered.output
+
+
+@pytest.mark.parametrize("persistent", [True, False], ids=["persistent", "in-memory"])
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGHUP, signal.SIGTERM])
+def test_a_stopped_run_ends_with_the_next_step_once(
+    harness: _Harness, sig: signal.Signals, persistent: bool
+) -> None:
+    """After SIGINT, SIGHUP or SIGTERM the last line says to rerun, and what that keeps."""
+    phase = Phase(
+        name="p",
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"model.n_layers": CategoricalParam(type="categorical", choices=[4, 8])},
+    )
+    if persistent:
+        experiment = harness.experiment("stopped", phase)
+    else:
+        experiment = make_experiment(
+            workdir=harness.root / "stopped" / "runs",
+            trial_command=f"python {harness.trainer} {{overrides}}",
+            metric=FAKE_TRAIN_METRIC,
+            phases=[phase],
+        )
+    config = harness.config(experiment)
+
+    harness.interrupt(config, 0, sig)
+
+    assert harness.spawned[-1].returncode == 128 + sig
+    expected = (
+        "phasesweep: stopped. Rerun the same command to resume: finished trials are kept "
+        "and interrupted ones rerun first."
+        if persistent
+        else "phasesweep: stopped. Rerun the same command to start over: storage: null keeps "
+        "no completed trials."
+    )
+    lines = harness.log.read_text().splitlines()
+    assert lines[-1] == expected
+    assert lines.count(expected) == 1
+    assert "Aborted." not in lines

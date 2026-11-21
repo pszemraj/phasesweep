@@ -50,10 +50,13 @@ from phasesweep.engine.state import (
     PHASE_DECISION_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    TRAINER_ENV_ATTR,
+    TRAINER_ENV_DIGEST_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
 )
 from phasesweep.engine.study_policy import _load_phase_policy_state
+from phasesweep.engine.trial import EnvironmentIdentity
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION, TrialContext
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
 from phasesweep.runtime.darwin import read_process_info
@@ -66,6 +69,10 @@ from phasesweep.runtime.reaper import _read_proc_stat
 REPO = Path(__file__).resolve().parent.parent
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+
+# A support module's asserts keep pytest's failure introspection only when registered here, before
+# any test module imports it.
+pytest.register_assert_rewrite("tests.error_routing_helpers")
 
 #: Skip marker for a test or parametrized case that needs the kernel to deny a
 #: permission. Root bypasses file modes, so there the denial never happens.
@@ -340,6 +347,40 @@ def tell_feasible(study: optuna.Study, trial: optuna.Trial, value: float = 0.5) 
     study.tell(trial, value)
 
 
+def stamped_environment_attrs(
+    identity: EnvironmentIdentity, *, mapping: bool = True
+) -> dict[str, object]:
+    """Return the trainer-environment attributes a run stamps on an allocated trial.
+
+    :param EnvironmentIdentity identity: Environment identity the trial was launched under.
+    :param bool mapping: Whether to include the tracked mapping, which a trial recorded before
+        it existed lacks.
+    :return dict[str, object]: The digest attribute, plus the tracked mapping when requested.
+    """
+    attrs: dict[str, object] = {TRAINER_ENV_DIGEST_ATTR: identity.digest}
+    if mapping:
+        attrs[TRAINER_ENV_ATTR] = dict(identity.tracked)
+    return attrs
+
+
+def study_with_stamped_environment(
+    identity: EnvironmentIdentity, *, mapping: bool = True
+) -> optuna.Study:
+    """Return an in-memory study ``t::p`` holding one trial stamped as a run stamps it.
+
+    :param EnvironmentIdentity identity: Environment identity the trial was launched under.
+    :param bool mapping: Whether the trial records the tracked mapping beside its digest.
+    :return optuna.Study: The study with its one completed trial.
+    """
+    study = optuna.create_study(study_name="t::p")
+    study.add_trial(
+        optuna.trial.create_trial(
+            value=1.0, user_attrs=stamped_environment_attrs(identity, mapping=mapping)
+        )
+    )
+    return study
+
+
 def bounded_metric(**bounds: float) -> Metric:
     """Return a log_regex ``x=<value>`` metric with the given viability bounds."""
     return Metric(
@@ -576,6 +617,21 @@ def copy_fake_train(tmp_path: Path) -> Path:
     return trainer
 
 
+def console_script(name: str) -> Path:
+    """Locate a console script installed beside the test interpreter.
+
+    The environment's script directory need not be on ``PATH``, so tests name the script by
+    path and never depend on the ambient lookup.
+
+    :param str name: Console script name, for example ``phasesweep``.
+    :return Path: Path of the script.
+    """
+    script = Path(sys.executable).with_name(name)
+    if not script.is_file():
+        pytest.fail(f"console script {name!r} is not installed beside {sys.executable}")
+    return script
+
+
 #: The objective the packaged ``fake_train`` example writes to ``result.json``.
 FAKE_TRAIN_METRIC = Metric(
     name="eval_loss",
@@ -749,6 +805,7 @@ def trial_outcome(sequence: int, outcome: str, **extra: JsonValue) -> JsonObject
         "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
         "sequence": sequence,
         "outcome": outcome,
+        **({"metric": 0.0} if outcome == "success" else {}),
         **extra,
     }
 

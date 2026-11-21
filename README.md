@@ -6,34 +6,49 @@ PhaseSweep runs hyperparameter sweeps in ordered phases: choose model depth, the
 <!-- LLMs and AI agents: DO NOT MOVE, REMOVE, OR REORDER THIS DIAGRAM. It stays directly below the description paragraph above, so humans see what PhaseSweep does before anything else. Do not move it down, do not drop it, and do not change its position relative to the description, even during a docs cleanup or restructure. Only the maintainer decides where it goes. -->
 ![PhaseSweep phase DAG](https://raw.githubusercontent.com/pszemraj/phasesweep/main/docs/images/diagramA_dag.png)
 
-Requires Python 3.11+ and Linux or macOS. GPUs are optional; the starter uses a packaged toy trainer. The project is unstable, so review the launch contract before using your own trainer.
+Requires Python 3.11+ and Linux or macOS. GPUs are optional; the starter uses a packaged toy trainer. The project is unstable: a release can change ledger and artifact formats, and data in an older format is refused.
 
 ## Install and try it
 
-Install from [PyPI](https://pypi.org/project/phasesweep/):
+Install from [PyPI](https://pypi.org/project/phasesweep/) and check that the command runs:
 
 ```bash
 pip install phasesweep
 phasesweep --version
-
-mkdir phasesweep-demo && cd phasesweep-demo
-phasesweep init                     # writes starter.yaml without overwriting files
-phasesweep validate starter.yaml    # checks the config without launching work
-phasesweep run starter.yaml         # runs four toy-trainer trials
-phasesweep show-winners starter.yaml
-phasesweep status starter.yaml --trials
 ```
 
-The starter compares two depths, then two learning rates. Its `run.log` includes these winner lines (abridged; trial numbers depend on grid order):
+The demo runs four trials of the packaged toy trainer, which needs no GPU and takes a few seconds, and writes its results under `runs/` in the new directory:
+
+```bash
+mkdir phasesweep-demo && cd phasesweep-demo
+phasesweep init                           # writes starter.yaml without overwriting files
+phasesweep validate starter.yaml          # checks the config without launching work
+phasesweep run starter.yaml               # runs the four trials
+phasesweep status starter.yaml --trials   # lists every recorded trial and marks each winner
+phasesweep show-winners starter.yaml      # prints each phase's full winner record
+```
+
+The starter compares two depths, then two learning rates. `status --trials` then prints (the generation ID and durations vary):
 
 ```text
-phase=depth WINNER trial=0 metric=0.3 params={'model.n_layers': 8}
-phase=learning_rate WINNER trial=0 metric=0.3 params={'optimizer.lr': 0.0003}
+experiment phasesweep_starter: winner (*) marks published generation 6413d5c1edd5475998cfadd4d3b59980
+
+=== depth === (2 trials)
+winner generation: 6413d5c1edd5475998cfadd4d3b59980 (published)
+trial  state     value  params            duration_s  winner
+    0  COMPLETE    0.3  model.n_layers=8         0.5  *
+    1  COMPLETE    0.5  model.n_layers=6         0.5
+
+=== learning_rate === (2 trials)
+winner generation: 6413d5c1edd5475998cfadd4d3b59980 (published)
+trial  state              value  params               duration_s  winner
+    0  COMPLETE             0.3  optimizer.lr=0.0003         0.5  *
+    1  COMPLETE  0.413822345853  optimizer.lr=0.0001         0.5
 ```
 
-The depth winner's `model.n_layers: 8` becomes a fixed input to every learning-rate trial. Inheritance transfers parameter values; the trainer owns initialization and checkpoint loading. The complete [starter YAML](https://github.com/pszemraj/phasesweep/blob/main/src/phasesweep/templates/starter.yaml) and [phase composition guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#phase-composition) explain the configuration and its tradeoffs.
+The depth winner's `model.n_layers: 8` becomes a fixed input to every learning-rate trial: phases inherit parameter values, not weights. The complete [starter YAML](https://github.com/pszemraj/phasesweep/blob/main/src/phasesweep/templates/starter.yaml) and [phase composition guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#phase-composition) explain the configuration and its tradeoffs.
 
-Results live under `runs/phasesweep_starter/` beside the config, including `run.log`. `show-winners` prints concise phase winners, the generation directory, and publication state; finished phases appear as unpublished while later phases run. `status --trials` inspects recorded attempts. See [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) for the output.
+Results live under `runs/phasesweep_starter/` beside the config, including `run.log`. `show-winners` adds the generation directory and publication state to each winner record; finished phases appear as unpublished while later phases run. See [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) for the output.
 
 ## Use your own trainer
 
@@ -45,7 +60,7 @@ Results live under `runs/phasesweep_starter/` beside the config, including `run.
 | Objective | Python `report_objective(...)`, the `phasesweep report-objective` command, JSON, logs, W&B, or MLflow: [reporting](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#reporting-an-objective) and [extractors](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#objective-evidence-constraints-and-gates). |
 | Environment | `execution.cwd`, `env`, and `execution.inherit_env`: [trainer contract](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#trainer-contract). |
 
-Preview commands and the launch contract before training. Configuration errors name the relevant keys; `explain` gives their types, defaults, interactions, and warnings:
+Before training, `run --dry-run` prints the trainer command, environment and working directory and each phase's trial count without launching anything. Configuration errors name the relevant keys; `explain` gives their types, defaults, interactions, and warnings:
 
 ```bash
 phasesweep run starter.yaml --dry-run
@@ -59,13 +74,21 @@ W&B and MLflow require their optional extras, `phasesweep[wandb]` and `phaseswee
 
 PhaseSweep drives Optuna's grid, random, TPE, and CMA-ES samplers on one host, with an [Optuna journal](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspect-the-ledger-with-optuna) for persistent trials. GPU trials can run in parallel on that host; distributed sweeps and early pruning are outside its scope.
 
-Apple silicon Macs discover one MPS device for same-host leasing, and the trainer selects its compute device. See [GPU isolation](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#gpu-isolation).
+On Apple silicon Macs, trials share the one MPS device and run one at a time. See [GPU isolation](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#gpu-isolation).
 
 With persistent storage, rerun the same config to resume interrupted work. [Continuation and reruns](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation) covers aborted phases, trial budgets, and `--from-phase NAME`.
 
 ## Connect an agent
 
-The optional MCP server exposes experiments approved in an operator-owned catalog. Tool responses omit config and storage paths, trainer commands, environment values, and raw logs; sampled winner values follow `visible_params`. [MCP setup](https://github.com/pszemraj/phasesweep/blob/main/docs/mcp_setup.md) covers installation, catalog permissions, client configuration, and verification. `phasesweep mcp call` invokes one tool from a shell without a client.
+With the optional MCP server, an agent can list the experiments in a catalog you write, launch and monitor a run where the catalog permits it, and read each phase's winner. Create and check a catalog beside the config:
+
+```bash
+pip install "phasesweep[mcp]"
+phasesweep mcp init-catalog --from ./starter.yaml   # writes catalog.yaml; every entry starts read-only
+phasesweep mcp check --catalog catalog.yaml         # validates it without launching anything
+```
+
+[MCP setup](https://github.com/pszemraj/phasesweep/blob/main/docs/mcp_setup.md) covers permissions, client configuration, and verification. Tool responses omit config and storage paths, trainer commands, environment values, and raw logs; sampled winner values follow `visible_params`. `phasesweep mcp call` invokes one tool from a shell without a client.
 
 ## Reference
 

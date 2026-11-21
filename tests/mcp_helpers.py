@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -29,7 +30,7 @@ from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
 from phasesweep.mcp.tools import PhaseSweepMCP, _runner_protocol_argv
-from phasesweep.runtime.files import open_private_text
+from phasesweep.runtime.files import open_private_text, private_atomic_write_text
 from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import REPO, make_experiment, reaped_pid, restored_signal_ownership
@@ -308,7 +309,7 @@ def make_run_handle(
         # group. The autouse ``guard_runner_signals`` fixture in conftest is
         # what fails a test that reaches it. Explicit PID fixtures keep their
         # matching PGID for process-lifecycle tests.
-        process_group_id = 2_000_000_000 if pid is None else process_id
+        process_group_id = UNUSED_RUNNER_PGID if pid is None else process_id
         process_starttime = read_proc_starttime(process_id) if starttime is None else starttime
     return RunHandle(
         run_id=run_id,
@@ -330,6 +331,9 @@ def make_run_handle(
         else None,
     )
 
+
+#: Process group recorded for the default runner, which is pytest itself; no real group has it.
+UNUSED_RUNNER_PGID = 2_000_000_000
 
 #: Start time recorded for a runner that is gone; no live process has it.
 DEAD_RUNNER_STARTTIME = 111
@@ -531,6 +535,26 @@ def write_runner_heartbeat(store: RunStore, run_id: str, *, age_seconds: float =
     return path
 
 
+def record_confirmed_recovery(store: RunStore, handle: RunHandle) -> None:
+    """Write the evidence a confirmed ``recover-run`` leaves, settling the run's process cleanup.
+
+    :param RunStore store: Store owning the run.
+    :param RunHandle handle: Run whose cleanup recovery settled.
+    """
+    private_atomic_write_text(
+        store.cleanup_recovery_path(handle.run_id),
+        json.dumps(
+            {
+                "run_id": handle.run_id,
+                "config_sha256": handle.config_sha256,
+                "cleanup_confirmed": True,
+                "reaped_attempt_ids": [],
+                "reaped_attempt_locations": {},
+            }
+        ),
+    )
+
+
 def _stage_run(
     store: RunStore,
     config: Path,
@@ -566,10 +590,12 @@ def stage_dead_run(
     cleanup_uncertain: bool,
     allow_cancel: bool = False,
     pid_namespace: str | None = None,
+    boot_id: str | None = None,
 ) -> RunHandle:
     """Persist a spawned run of ``config`` whose runner has exited, as recover-run finds it.
 
-    ``pid_namespace`` records another PID namespace, or this process's own when ``None``.
+    ``pid_namespace`` records another PID namespace, or this process's own when ``None``;
+    ``boot_id`` records another host boot, or the current one when ``None``.
     """
     handle = _stage_run(
         store,
@@ -579,6 +605,7 @@ def stage_dead_run(
         experiment_id=experiment_id,
         allow_cancel=allow_cancel,
         pid_namespace=pid_namespace,
+        boot_id=boot_id,
     )
     if cleanup_uncertain:
         store.mark_cleanup_uncertain(handle)
@@ -601,6 +628,20 @@ def stage_live_run(
         run_id=run_id,
         experiment_id=experiment_id,
         visible_params_at_launch=visible_params_at_launch,
+    )
+
+
+def stage_launching_run(
+    store: RunStore, run_id: str, config: Path, experiment_id: str = "srv"
+) -> RunHandle:
+    """Persist the launch handle and config snapshot a server saves before it spawns the runner."""
+    return _stage_run(
+        store,
+        config,
+        make_run_handle,
+        run_id=run_id,
+        experiment_id=experiment_id,
+        launch_state="launching",
     )
 
 

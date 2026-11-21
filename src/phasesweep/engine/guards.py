@@ -7,6 +7,7 @@ from collections.abc import Sequence
 import optuna
 
 from phasesweep.config.models import Experiment
+from phasesweep.engine.artifacts import _refresh_recovered_trials_csv
 from phasesweep.engine.attempts import (
     _AttemptRecord,
     _preflight_active_attempts,
@@ -18,6 +19,7 @@ from phasesweep.engine.cleanup import (
     _recover_cleanup_uncertain_trials,
 )
 from phasesweep.engine.errors import (
+    LaunchEnvironmentError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -27,13 +29,17 @@ from phasesweep.engine.ledger import ClaimedLedger, claim_ledger, validate_ledge
 from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.study_policy import (
     _initialize_study_schema,
+    _launch_preflight,
     _load_accepted_partial_decision,
-    _validate_environment_cohort,
     _validate_study_direction,
     _validate_trial_target,
 )
-from phasesweep.engine.trial import _environment_identity
-from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
+from phasesweep.errors import (
+    OperatorAction,
+    PhaseSweepError,
+    ProcessCleanupUncertainError,
+    operator_step,
+)
 
 
 def _reconcile_existing_studies(
@@ -100,8 +106,12 @@ def _preflight_existing_studies(
         configuration asks for more attempts than its trials let it retry.
     :raises ProcessCleanupUncertainError: Stale-trial cleanup could not be
         confirmed safe for a phase's study.
-    :raises PhaseSweepError: Multiple studies failed preflight for mixed
-        expected reasons not covered by a more specific common exception type.
+    :raises StudyFingerprintMismatchError: A reached phase that needs new trials holds
+        trials from another trainer-environment cohort.
+    :raises PhaseSweepError: A reached phase that needs new trials could not start them
+        (see :func:`phasesweep.engine.study_policy._launch_preflight`), or multiple studies
+        failed preflight for mixed expected reasons not covered by a more specific common
+        exception type.
     :raises RuntimeError: Multiple studies failed and at least one error is an
         unexpected implementation failure that must retain traceback reporting.
     """
@@ -119,14 +129,10 @@ def _preflight_existing_studies(
         if isinstance(exc, (ProcessCleanupUncertainError, StudyStorageUnavailableError)):
             report.mark_uncertain(exc)
         errors.append(exc)
-    reached = from_phase is None
     for phase in experiment.phases:
-        if phase.name == from_phase:
-            reached = True
         study = loaded.get(phase.name)
         if study is None:
             continue
-        studies[phase.name] = study
         try:
             # Each attempt is collected as soon as its trial's durable state
             # changes, so a later trial's refusal must not drop the evidence
@@ -164,10 +170,23 @@ def _preflight_existing_studies(
                 report.mark_uncertain(exc)
             errors.append(exc)
             continue
+        finally:
+            _refresh_recovered_trials_csv(study, experiment, phase)
         try:
             _validate_study_direction(study, experiment.metric.goal)
             _initialize_study_schema(study)
-            if reached:
+        except Exception as exc:
+            errors.append(exc)
+        else:
+            studies[phase.name] = study
+    # An unreadable tracker leaves finished training pending. Until it answers, neither the
+    # retry ceiling nor the need for a trainer is known, and the run reports pending evidence.
+    if not report.unreadable_evidence:
+        for _, phase in experiment.phases_from(from_phase):
+            study = studies.get(phase.name)
+            if study is None:
+                continue
+            try:
                 _validate_trial_target(study, phase)
                 partial_decision = _load_accepted_partial_decision(study)
                 finished_trials = _finished_trial_count(study.get_trials(deepcopy=False))
@@ -175,17 +194,34 @@ def _preflight_existing_studies(
                     partial_decision is not None and phase.n_trials == partial_decision.trial_target
                 )
                 if needs_new_trials:
-                    _validate_environment_cohort(
-                        study, _environment_identity(experiment, phase.name)
-                    )
-        except Exception as exc:
-            errors.append(exc)
+                    _launch_preflight(experiment, phase.name, study)
+            except Exception as exc:
+                errors.append(exc)
     _raise_collected_errors(errors)
     return studies
 
 
+def _collected_remediation(errors: Sequence[Exception]) -> str | None:
+    """Join the steps the collected refusals call for, each distinct step once.
+
+    :param Sequence[Exception] errors: Refusals collected across the studies, in phase order.
+    :return str | None: The steps in order of first appearance, a refusal with no remediation
+        of its own contributing its action's step; ``None`` when no refusal carries a
+        remediation, so the aggregate's action speaks for it.
+    """
+    routed = [error for error in errors if isinstance(error, PhaseSweepError)]
+    if not any(error.remediation for error in routed):
+        return None
+    steps = [operator_step(error) for error in routed]
+    return " ".join(dict.fromkeys(step[:1].upper() + step[1:] for step in steps))
+
+
 def _raise_collected_errors(errors: Sequence[Exception]) -> None:
     """Raise one refusal, or an aggregate preserving the collected studies and remedies.
+
+    A refusal every study reports alike, with the same type and message, as an experiment-wide
+    refusal does, is raised once and unchanged, so its fix line survives. An aggregate carries
+    the remediation every refusal shares, or each distinct step once when they differ.
 
     :param Sequence[Exception] errors: Refusals collected across the studies, in
         phase order; nothing is raised when it is empty.
@@ -193,6 +229,7 @@ def _raise_collected_errors(errors: Sequence[Exception]) -> None:
     :raises StudyFingerprintMismatchError: Every collected refusal is one.
     :raises StudyStorageUnavailableError: Every collected refusal is one.
     :raises TrialTargetRefusedError: Every collected refusal is one.
+    :raises LaunchEnvironmentError: Every collected refusal is one.
     :raises ProcessCleanupUncertainError: Any collected refusal is one.
     :raises PhaseSweepError: The collected refusals are expected but of mixed kinds.
     :raises RuntimeError: At least one collected error is an unexpected
@@ -201,7 +238,8 @@ def _raise_collected_errors(errors: Sequence[Exception]) -> None:
     if not errors:
         return
     first = errors[0]
-    if len(errors) == 1:
+    # An experiment-wide refusal comes once per study; one copy says it all, with its fix line.
+    if all(type(error) is type(first) and str(error) == str(first) for error in errors):
         raise first
     message = "Experiment recovery preflight found multiple unsafe studies: " + "; ".join(
         str(error) for error in errors
@@ -215,24 +253,28 @@ def _raise_collected_errors(errors: Sequence[Exception]) -> None:
         for error in errors
     }
     shared = remediations.pop() if len(remediations) == 1 else OperatorAction.INSPECT_LOGS
+    remediation = _collected_remediation(errors)
     for error_type in (
         StudySchemaMismatchError,
         StudyFingerprintMismatchError,
         StudyStorageUnavailableError,
         TrialTargetRefusedError,
+        LaunchEnvironmentError,
     ):
         if all(isinstance(error, error_type) for error in errors):
-            raise error_type(message, action=shared) from first
+            raise error_type(message, action=shared, remediation=remediation) from first
     cleanup_error = next(
         (error for error in errors if isinstance(error, ProcessCleanupUncertainError)),
         None,
     )
     if cleanup_error is not None:
-        raise ProcessCleanupUncertainError(message, action=shared) from cleanup_error
+        raise ProcessCleanupUncertainError(
+            message, action=shared, remediation=remediation
+        ) from cleanup_error
     unexpected = next(
         (error for error in errors if not isinstance(error, PhaseSweepError)),
         None,
     )
     if unexpected is not None:
         raise RuntimeError(message) from unexpected
-    raise PhaseSweepError(message, action=shared) from first
+    raise PhaseSweepError(message, action=shared, remediation=remediation) from first

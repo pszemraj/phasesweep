@@ -57,7 +57,6 @@ from phasesweep.evidence.models import (
     WandbSummaryRequiredGate,
     _WandbSummarySource,
     compose_wandb_environment,
-    objective_evidence_assurance,
     wandb_gate_identity,
 )
 from phasesweep.runtime.commands import (
@@ -74,6 +73,7 @@ from phasesweep.runtime.files import (
     file_url_path,
     local_storage_url,
 )
+from phasesweep.runtime.json import JsonObject
 from phasesweep.tracking.models import MlflowSettings
 
 OverrideFormat = Literal["yaml_file", "argparse", "hydra", "json_file"]
@@ -127,16 +127,16 @@ class Metric(_Frozen):
         return value
 
 
-def _metric_semantics_payload(metric: Metric) -> dict[str, Any]:
+def _metric_semantics_payload(metric: Metric) -> JsonObject:
     """Return the persisted and agent-visible semantics of one metric.
 
     :param Metric metric: Configured optimization metric.
-    :return dict[str, Any]: Metric name, goal, and objective-evidence assurance.
+    :return JsonObject: Metric name, goal, and the extractor kind under ``objective_evidence``.
     """
     return {
         "name": metric.name,
         "goal": metric.goal,
-        "objective_evidence": objective_evidence_assurance(metric.extractor),
+        "objective_evidence": {"kind": metric.extractor.type},
     }
 
 
@@ -230,7 +230,7 @@ def experiment_disclosures(
         yield (
             phase,
             [
-                (False, sampler_capability_line(phase, experiment.resolved_storage)),
+                (False, sampler_capability_line(phase, persistent=experiment.persistent)),
                 *(
                     [
                         (
@@ -342,7 +342,7 @@ def _evaluation_point_line(metric: Metric) -> str:
     if isinstance(extractor, WandbExtractor):
         return (
             f"{prefix} supported (axis {extractor.evaluation_axis!r} located in W&B run history; "
-            "advisory, n/a when no position is found)"
+            "n/a when the history lookup finds no position)"
         )
     return f"{prefix} supported (position is the step of the selected observation)"
 
@@ -398,7 +398,7 @@ def _environment_contract_line(experiment: Experiment) -> str:
             f" ({', '.join(shadowed)} set under env, so the configured value is digested)"
         )
     parts = [inherited, f"env keys: {', '.join(sorted(configured)) or 'none'}", passthrough]
-    if experiment.storage is not None:
+    if experiment.persistent:
         parts.append("a persistent study refuses to resume when any digested value changes")
     return "environment: " + "; ".join(parts)
 
@@ -548,7 +548,7 @@ class Phase(_Frozen):
             "Numeric sampled parameter whose smaller values cost less. With mean repeats, "
             "advise the cheapest configuration within one standard error of the winner's "
             "mean, preferring better objectives for cost ties. Selection and result reads "
-            "report this without changing the winner. Excluded from study fingerprints."
+            "report this. Excluded from study fingerprints."
         ),
     )
     n_trials: ConfigInt = Field(ge=1)
@@ -682,8 +682,8 @@ class Phase(_Frozen):
             if self.n_jobs > 1 and not self.allow_no_gpu_isolation:
                 raise ValueError(
                     "gpu_policy='none' with n_jobs > 1 can oversubscribe the host. "
-                    "Set allow_no_gpu_isolation=true only when CPU-only or external "
-                    "isolation is intentional."
+                    "Set allow_no_gpu_isolation=true for CPU-only work or isolation "
+                    "handled outside PhaseSweep."
                 )
         return self
 
@@ -700,20 +700,18 @@ class Phase(_Frozen):
         default=False,
         description=(
             "When GPU isolation cannot be established, phasesweep fails by default "
-            "for parallel sweeps. Set True for intentional CPU-only or "
-            "externally-isolated runs."
+            "for parallel sweeps. Set True for CPU-only or externally isolated runs."
         ),
     )
     sampler: Sampler = Field(default_factory=Sampler)
-    timeout_seconds_per_trial: ConfigFloat | None = Field(default=259200.0, ge=0)
+    timeout_seconds_per_trial: ConfigFloat | None = Field(default=259200.0, gt=0)
     allow_unbounded_trials: bool = Field(
         default=False,
         description=(
-            "Set true only when an intentionally unbounded trial is acceptable. "
-            "Otherwise timeout_seconds_per_trial must be finite."
+            "Set true to allow timeout_seconds_per_trial: null; otherwise it must be finite."
         ),
     )
-    timeout_seconds_per_phase: ConfigFloat | None = Field(default=None, ge=0)
+    timeout_seconds_per_phase: ConfigFloat | None = Field(default=None, gt=0)
     allow_incomplete_on_timeout: bool = Field(
         default=False,
         description=(
@@ -1126,7 +1124,7 @@ class Experiment(_Frozen):
             "environment-inheritance contract."
         ),
     )
-    timeout_seconds_per_run: ConfigFloat | None = Field(default=None, ge=0)
+    timeout_seconds_per_run: ConfigFloat | None = Field(default=None, gt=0)
 
     @property
     def resolved_storage(self) -> str | None:
@@ -1141,6 +1139,15 @@ class Experiment(_Frozen):
             artifact_root_path(self.workdir, self.experiment) / "study.journal"
         )
 
+    @property
+    def persistent(self) -> bool:
+        """Report whether trials are recorded in a ledger that outlives the run.
+
+        :return bool: ``True`` when ``storage`` names a journal or is ``auto``,
+            ``False`` for the in-memory default (``storage: null``).
+        """
+        return self.storage is not None
+
     def phase(self, name: str) -> Phase:
         """Look up a configured phase by its unique name.
 
@@ -1148,6 +1155,23 @@ class Experiment(_Frozen):
         :raises StopIteration: No phase has that name.
         """
         return next(phase for phase in self.phases if phase.name == name)
+
+    def phases_inheriting(self, name: str) -> tuple[str, ...]:
+        """Name every phase that inherits ``name``, directly or through another phase.
+
+        A phase inherits only phases declared before it, so one pass in declaration order
+        reaches every dependent.
+
+        :param str name: Phase whose dependents are wanted.
+        :return tuple[str, ...]: Dependent phase names in declaration order, without ``name``.
+        """
+        reached = {name}
+        dependents = []
+        for candidate in self.phases:
+            if candidate.name not in reached and reached.intersection(candidate.inherits):
+                reached.add(candidate.name)
+                dependents.append(candidate.name)
+        return tuple(dependents)
 
     def phases_from(self, from_phase: str | None) -> Iterator[tuple[int, Phase]]:
         """Yield the phases a run resuming at ``from_phase`` reaches, in order.
@@ -1295,7 +1319,7 @@ class Experiment(_Frozen):
         ]
         if invalid:
             raise ValueError(f"provenance keys and values must be nonempty strings: {invalid}")
-        if self.resolved_storage is not None and not self.provenance:
+        if self.persistent and not self.provenance:
             raise ValueError(
                 f"Persistent storage (storage: {self.storage}) requires a nonempty provenance mapping that identifies "
                 "the data and dependency revisions used by this experiment; each generation "
@@ -1479,9 +1503,9 @@ class Experiment(_Frozen):
                     "A key and a sub-key cannot both be overridden across the inheritance chain."
                 )
 
-            _validate_sampler_search_space(phase, persistent=self.resolved_storage is not None)
-            _validate_persistent_sampler_seed(self.resolved_storage, phase)
-            _validate_in_memory_fixed_target(self.resolved_storage, phase)
+            _validate_sampler_search_space(phase, persistent=self.persistent)
+            _validate_persistent_sampler_seed(self, phase)
+            _validate_in_memory_fixed_target(self, phase)
             _validate_cli_override_values(self, phase)
             _validate_trial_command_template(self, phase, frozenset(inherited_origins))
             from phasesweep.evidence.mlflow import compile_query
@@ -1563,18 +1587,18 @@ def _sampled_locked_origins(inherited: Mapping[str, set[str]]) -> dict[str, set[
     return locked
 
 
-def _validate_persistent_sampler_seed(storage: str | None, phase: Phase) -> None:
+def _validate_persistent_sampler_seed(experiment: Experiment, phase: Phase) -> None:
     """Require a seed for persistent phases that draw from stochastic samplers.
 
     Seeded random draws reproduce at any n_jobs; TPE and CMA-ES require n_jobs=1
     and the same trial outcomes. Grid, fixed phases, and in-memory storage are exempt.
 
-    :param str | None storage: Experiment-level storage URL, or ``None``.
+    :param Experiment experiment: Experiment whose storage decides whether it is persistent.
     :param Phase phase: Phase whose sampler contract is checked.
-    :raises ValueError: ``storage`` is persistent and the phase draws from a
+    :raises ValueError: The experiment is persistent and the phase draws from a
         stochastic sampler without an explicit ``seed``.
     """
-    if storage is None or not phase_draws(phase):
+    if not experiment.persistent or not phase_draws(phase):
         return
 
     sampler = phase.sampler
@@ -1588,18 +1612,18 @@ def _validate_persistent_sampler_seed(storage: str | None, phase: Phase) -> None
         )
 
 
-def _validate_in_memory_fixed_target(storage: str | None, phase: Phase) -> None:
+def _validate_in_memory_fixed_target(experiment: Experiment, phase: Phase) -> None:
     """Require one trial for a fixed configuration on in-memory storage.
 
     A fresh study has no failures to retry. Persistent retry targets are checked
     against the existing study at launch.
 
-    :param str | None storage: Experiment-level storage URL, or ``None``.
+    :param Experiment experiment: Experiment whose storage decides whether it is persistent.
     :param Phase phase: Phase whose trial target is checked.
-    :raises ValueError: ``storage`` is in-memory and the phase, a fixed
+    :raises ValueError: The experiment is in-memory and the phase, a fixed
         configuration, asks for more than one trial.
     """
-    if storage is not None:
+    if experiment.persistent:
         return
     refusal = fixed_configuration_target_refusal(phase, finished=0, measured=0)
     if refusal is not None:

@@ -14,6 +14,7 @@ import yaml
 
 import phasesweep.engine.evidence as evidence_ops
 from phasesweep import run_experiment
+from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Constraint, ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialEvidenceMissingError
@@ -33,6 +34,8 @@ from phasesweep.engine.state import (
     OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_INPUT_ATTR,
 )
+from phasesweep.errors import NEW_STUDY_STEP, OTHER_FORMAT_STEP, OperatorAction
+from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from phasesweep.evidence.models import JsonExtractor, WandbExtractor, WandbSummaryRequiredGate
 from tests.conftest import (
     make_experiment,
@@ -588,6 +591,33 @@ def test_present_incomplete_objective_provenance_blocks_selection(
         evidence_ops._verify_winner_evidence(experiment, experiment.phases[0], selected)
 
 
+def test_provenance_in_another_format_names_both_and_routes_to_a_new_study(
+    tmp_path: Path,
+) -> None:
+    """A well-formed record in another format is refused as that format, not as malformed."""
+    experiment = _evidence_experiment(tmp_path)
+    run_experiment(experiment)
+    trial = deepcopy(phase_trials(experiment)[0])
+    record = json.loads(trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR])
+    record["schema_version"] = EVIDENCE_PROVENANCE_SCHEMA_VERSION - 1
+    trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR] = json.dumps(record)
+    study = optuna.create_study(direction="minimize")
+    study.add_trial(trial)
+
+    with pytest.raises(TrialEvidenceMissingError) as excinfo:
+        evidence_ops._validate_selection_evidence(experiment, {"p": study})
+
+    message = str(excinfo.value)
+    assert (
+        f"uses format {EVIDENCE_PROVENANCE_SCHEMA_VERSION - 1}; "
+        f"this PhaseSweep reads format {EVIDENCE_PROVENANCE_SCHEMA_VERSION}"
+    ) in message
+    assert "malformed" not in message
+    assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
+    # The record is a trial attribute, so the step must also leave an explicit ledger.
+    assert excinfo.value.remediation == OTHER_FORMAT_STEP
+
+
 def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:
     """Positive control: the guard costs an intact tree nothing."""
     experiment = _evidence_experiment(tmp_path)
@@ -608,6 +638,7 @@ def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:
 def test_log_regex_evaluation_revision_change_blocks_study_reuse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A changed evaluator revision refuses the resume and sends the reader to a new study."""
     import phasesweep.evidence.evaluation as evaluation_ops
 
     experiment = _evidence_experiment(tmp_path)
@@ -622,9 +653,11 @@ def test_log_regex_evaluation_revision_change_blocks_study_reuse(
     with pytest.raises(
         TrialEvidenceMissingError,
         match="extractor evaluation contract.*evaluator revision",
-    ):
+    ) as excinfo:
         run_experiment(_evidence_experiment(tmp_path, n_trials=2))
 
+    assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
+    assert _operational_error_text(excinfo.value).endswith(f"\nfix: {NEW_STUDY_STEP}")
     assert len(phase_trials(experiment)) == 1
     assert _pointer_bytes(experiment) == pointer_before
 

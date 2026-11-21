@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import logging
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import optuna
@@ -20,18 +21,110 @@ from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _generation_winner_path, _phase_dir
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.read import _winner_view, read_result
+from phasesweep.engine.read import _trial_table, _winner_view, read_result
 from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.selection import select_winner
-from phasesweep.engine.state import observed_attr
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    GATES_ATTR,
+    GENERATION_ID_ATTR,
+    OBJECTIVE_PROVENANCE_ATTR,
+    TRAINER_ENV_ATTR,
+    TRAINER_ENV_DIGEST_ATTR,
+    TRAINER_INPUT_ATTR,
+    constraint_attr,
+    observed_attr,
+)
+from phasesweep.engine.trial import TrialResult, record_trial_result
+from phasesweep.evidence.evaluation import GateResult
 from phasesweep.evidence.models import JsonEnvelopeExtractor, JsonExtractor, LogRegexExtractor
-from tests.conftest import make_experiment, phase_trials, write_experiment_config, write_trainer
+from phasesweep.tracking.publication import _accepted_projection
+from tests.conftest import (
+    log_regex_provenance,
+    make_experiment,
+    phase_trials,
+    write_experiment_config,
+    write_trainer,
+)
 from tests.ledger_fixtures import golden_publication, published_generation_id, reseal_winner
 
 
 def _log_observation(name: str, pattern: str) -> Observation:
     """Return a ``log_regex`` observation reading ``pattern`` from stdout."""
     return Observation(name=name, extractor=LogRegexExtractor(type="log_regex", pattern=pattern))
+
+
+def test_retry_replaces_optional_trial_results(tmp_path: Path) -> None:
+    """A retained extraction retry replaces optional evidence across all result readers."""
+    storage = f"journal:///{tmp_path / 'retry.journal'}"
+    study = optuna.create_study(study_name="retry", storage=_resolve_storage(storage))
+    trial = study.ask()
+    for key, value in {
+        ATTEMPT_ID_ATTR: "attempt",
+        GENERATION_ID_ATTR: "generation",
+        TRAINER_ENV_ATTR: {},
+        TRAINER_ENV_DIGEST_ATTR: "a" * 64,
+        TRAINER_INPUT_ATTR: {"schema_version": 1},
+    }.items():
+        trial.set_user_attr(key, value)
+    original = TrialResult(
+        metric=1.0,
+        constraints={"old": 2.0},
+        return_code=0,
+        duration_seconds=1.0,
+        feasible=True,
+        gate_results=[GateResult("required_file", True, "present")],
+        objective_provenance=log_regex_provenance(),
+        observed={"old": 3.0, "kept": 4.0},
+    )
+    record_trial_result(trial, original, overrides_json="{}")
+
+    study = optuna.load_study(study_name="retry", storage=_resolve_storage(storage))
+    retained = study.get_trials()[0]
+    retried = optuna.Trial(study, retained._trial_id)
+    record_trial_result(
+        retried,
+        replace(original, metric=0.5, constraints={}, gate_results=None, observed={"kept": 5.0}),
+        overrides_json="{}",
+    )
+    study.tell(retried, 0.5)
+    completed = study.get_trials()[0]
+    assert completed.user_attrs[constraint_attr("old")] is None
+    assert completed.user_attrs[observed_attr("old")] is None
+    assert completed.user_attrs[GATES_ATTR] is None
+
+    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
+    assert select_winner(study, experiment, emit_advisories=False).observed == {"kept": 5.0}
+    table = _trial_table(experiment, experiment.phases[0], [completed], None)
+    assert table.rows[0][observed_attr("old")] is None
+    assert table.rows[0][observed_attr("kept")] == 5.0
+    projection = _accepted_projection(completed, {})
+    assert projection["summary"]["observed"] == {"kept": 5.0}
+    assert projection["summary"]["constraints"] == {}
+    assert "phasesweep.observed.old" not in projection["metrics"]
+    assert "phasesweep.constraint.old" not in projection["metrics"]
+
+    failed = study.ask()
+    rejected = TrialResult(
+        metric=None,
+        constraints={},
+        return_code=0,
+        duration_seconds=1.0,
+        feasible=False,
+        failure_reason="missing evidence",
+    )
+    record_trial_result(failed, original, overrides_json="{}")
+    record_trial_result(failed, rejected, overrides_json="{}")
+    assert failed.user_attrs[OBJECTIVE_PROVENANCE_ATTR] is None
+    assert failed.user_attrs[constraint_attr("old")] is None
+    assert failed.user_attrs[observed_attr("old")] is None
+
+    fresh = study.ask()
+    record_trial_result(fresh, rejected, overrides_json="{}")
+    assert OBJECTIVE_PROVENANCE_ATTR not in fresh.user_attrs
+    assert GATES_ATTR not in fresh.user_attrs
+    assert constraint_attr("old") not in fresh.user_attrs
+    assert observed_attr("old") not in fresh.user_attrs
 
 
 def test_observe_failure_records_nothing_and_keeps_trial_complete(

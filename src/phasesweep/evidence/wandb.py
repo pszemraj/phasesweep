@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from phasesweep.runtime.json import json_text, json_text_list, progress_position
-from phasesweep.runtime.remote_worker import run_worker
+from phasesweep.runtime.remote_worker import report_reserve, run_worker
 
 _HistoryRead = Literal["settled", "lagging", "retry"]
 """How one history read ended: an answer, history behind the summary, or a
@@ -31,14 +31,25 @@ _FINISH_SETTLE_SECONDS = 30.0
 _HISTORY_RETRY_SECONDS = 2.0
 # Server row cap for unsampled history requests and scan pages.
 _HISTORY_SAMPLES = 10_000
+# A summary poll stops this long before its deadline. Each lookup's client is made with the
+# polling time left, rounded up to whole seconds and at least one, as its timeout, so a lookup
+# still in flight at the polling deadline ends within about a second of it, and the report
+# follows in what remains.
+_REPORT_SECONDS = 2.0
 
 
 @dataclass(eq=False)
 class WandbPollTimeout(TimeoutError):
-    """The complete worker exhausted its summary visibility budget."""
+    """The complete worker exhausted its summary visibility budget.
+
+    ``reached`` says whether the last poll got an answer about the run: a run seen but
+    never finished, or finished without its keys, is a verdict on the trial, while polls
+    that all failed in transport or setup say nothing about it.
+    """
 
     run_id: str
     timeout_seconds: float
+    reached: bool
     last_error: Exception | None = None
 
 
@@ -212,7 +223,8 @@ def poll_wandb_summary(
     :param Mapping[str, str] | None environment: Actual composed trainer environment.
     :param float | None deadline: Absolute deadline including worker startup.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
-    :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget.
+    :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget; it was
+        reached only when the worker reports that its last poll got an answer about the run.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
@@ -225,7 +237,7 @@ def poll_wandb_summary(
         time.monotonic() + timeout_seconds, deadline if deadline is not None else math.inf
     )
     if time.monotonic() >= deadline:
-        raise WandbPollTimeout(run_id, timeout_seconds)
+        raise WandbPollTimeout(run_id, timeout_seconds, reached=False)
     result, response, diagnostic_path = run_worker(
         {
             "task": "summary",
@@ -283,8 +295,12 @@ def poll_wandb_summary(
     if response.get("status") != "summary":
         if result.timed_out or response.get("status") == "timeout" or time.monotonic() >= deadline:
             detail = response.get("cause")
+            # A worker stopped before it reported never got an answer this side can use.
             raise WandbPollTimeout(
-                run_id, timeout_seconds, RuntimeError(detail) if detail else None
+                run_id,
+                timeout_seconds,
+                reached=response.get("status") == "timeout" and response.get("reached") is True,
+                last_error=RuntimeError(detail) if detail else None,
             )
         diagnostic = f" Diagnostic preserved at {diagnostic_path}." if diagnostic_path else ""
         raise RuntimeError(
@@ -474,11 +490,12 @@ def _poll_wandb_summary(
 ) -> dict[str, Any]:
     """Poll an exact run using refreshed SDK clients within the parent's deadline.
 
-    A finished summary may still gain values while the public API catches up,
-    so missing required keys are polled for ``_FINISH_SETTLE_SECONDS`` from the
-    first finished read that lacked them; once that window passes before the
-    deadline, the latest finished summary's missing and available keys are
-    reported instead of waiting out the deadline.
+    No lookup starts after the deadline, but the answer to one in flight is used. A finished
+    summary may still gain values while the public API catches up,
+    so a finished summary can establish missing required keys only once
+    ``_FINISH_SETTLE_SECONDS`` have passed since the first finished read that
+    lacked them. An unanswered poll at that boundary keeps polling until the
+    tracker answers or the deadline arrives.
 
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
@@ -490,7 +507,8 @@ def _poll_wandb_summary(
     :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
     :param float | None deadline: Absolute ``time.monotonic()`` deadline from the parent.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
-    :raises WandbPollTimeout: The run did not finish with the required keys in time.
+    :raises WandbPollTimeout: The run did not finish with the required keys in time,
+        reached when the last poll got an answer about the run.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
@@ -506,7 +524,8 @@ def _poll_wandb_summary(
 
     deadline = time.monotonic() + timeout_seconds if deadline is None else deadline
     last_error: Exception | None = None
-    missing_keys: WandbMissingKeysError | None = None
+    # Whether the latest poll got an answer about the run rather than failing in transport.
+    reached = False
     settle_by = math.inf
     required = tuple(required_keys)
     while time.monotonic() < deadline:
@@ -519,6 +538,7 @@ def _poll_wandb_summary(
             if not _is_retryable_setup_error(exc):
                 raise WandbSetupError(run_id, _error_detail(exc)) from exc
             last_error = RuntimeError(_error_detail(exc))
+            reached = False
         else:
             if time.monotonic() >= deadline:
                 break
@@ -532,15 +552,16 @@ def _poll_wandb_summary(
                     and not _is_retryable_setup_error(exc)
                 ):
                     raise WandbSetupError(run_id, _error_detail(exc)) from exc
+                # "No such run" answers the lookup; any other failure leaves it unanswered.
+                reached = _is_missing_run_error(exc)
                 last_error = (
-                    WandbRunMissingError(run_id)
-                    if _is_missing_run_error(exc)
-                    else RuntimeError(_error_detail(exc))
+                    WandbRunMissingError(run_id) if reached else RuntimeError(_error_detail(exc))
                 )
             else:
+                # An answer in hand is used even when it arrived after the polling deadline:
+                # the reserve before the supervisor's deadline exists to report it.
                 last_error = None
-                if time.monotonic() >= deadline:
-                    break
+                reached = True
                 if run.state in {"failed", "crashed", "killed", "preempted"}:
                     raise WandbRunTerminalError(run_id, run.state)
                 if run.state == "finished":
@@ -552,30 +573,28 @@ def _poll_wandb_summary(
                             if not math.isfinite(value):
                                 raise ValueError(f"W&B metric {key!r} is non-finite.")
                             values[key] = value
-                        capture: dict[str, Any] = {
+                        return {
                             "values": values,
                             "present_keys": sorted(key for key in presence_keys if key in summary),
                             "retrieved_at": utc_now_iso(timespec="microseconds"),
                         }
-                        if time.monotonic() >= deadline:
-                            break
-                        return capture
                     missing = sorted(key for key in required if key not in summary)
                     available = sorted(summary)
-                    missing_keys = WandbMissingKeysError(run_id, missing, available)
+                    observed_at = time.monotonic()
+                    settle_by = min(settle_by, observed_at + _FINISH_SETTLE_SECONDS)
+                    # An earlier incomplete summary cannot establish absence while reads fail.
+                    if settle_by <= observed_at:
+                        raise WandbMissingKeysError(run_id, missing, available)
                     last_error = RuntimeError(
                         f"Missing required summary keys: {missing!r}; "
                         f"available summary keys: {available!r}."
                     )
-                    settle_by = min(settle_by, time.monotonic() + _FINISH_SETTLE_SECONDS)
-        # A window still open at the deadline ends as a timeout, like any late read.
-        if missing_keys is not None and settle_by <= time.monotonic() < deadline:
-            raise missing_keys
-        wake_by = min(deadline, settle_by)
-        time.sleep(min(poll_seconds, max(0.0, wake_by - time.monotonic())))
+        now = time.monotonic()
+        wake_by = min(deadline, settle_by) if now < settle_by else deadline
+        time.sleep(min(poll_seconds, max(0.0, wake_by - now)))
     if isinstance(last_error, WandbRunMissingError):
         raise last_error
-    raise WandbPollTimeout(run_id, timeout_seconds, last_error)
+    raise WandbPollTimeout(run_id, timeout_seconds, reached=reached, last_error=last_error)
 
 
 def _locate_wandb_position(
@@ -665,9 +684,10 @@ def main(argv: list[str] | None = None) -> int:
         if task == "position":
             response = {"status": "position", "value": _locate_wandb_position(**request)}
         else:
-            # Leave time to report missing keys before the supervisor's deadline.
+            # Stop polling early enough that a lookup in flight and the report of a missing run,
+            # missing keys or a timeout finish before the supervisor's deadline.
             remaining = max(0.0, request["deadline"] - time.monotonic())
-            request["deadline"] -= min(0.1, remaining / 2)
+            request["deadline"] -= report_reserve(remaining, _REPORT_SECONDS)
             response = {"status": "summary", "capture": _poll_wandb_summary(**request)}
     except ImportError:
         response = {"status": "import_error"}
@@ -680,7 +700,11 @@ def main(argv: list[str] | None = None) -> int:
     except WandbRunMissingError:
         response = {"status": "run_missing"}
     except WandbPollTimeout as exc:
-        response = {"status": "timeout", "cause": str(exc.last_error) if exc.last_error else None}
+        response = {
+            "status": "timeout",
+            "cause": str(exc.last_error) if exc.last_error else None,
+            "reached": exc.reached,
+        }
     except ValueError:
         response = {
             "status": "invalid_evidence",

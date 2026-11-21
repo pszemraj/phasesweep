@@ -82,6 +82,7 @@ from phasesweep.runtime.reaper import (
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import (
+    console_script,
     lose_record_writes,
     make_experiment,
     mark_current_format,
@@ -213,8 +214,8 @@ def _spawned_runner(
     )
     cmd = [
         sys.executable,
-        "-m",
-        "phasesweep.mcp.runner",
+        "-P",
+        str(mcp_runner.RUNNER_SCRIPT_PATH),
         *runner_argv(
             store,
             run_id=run_id,
@@ -261,7 +262,7 @@ def _spawned_runner(
         pytest.param(
             ArtifactRootConflictError("bound to /a, offered /b"),
             "artifact_root_conflict",
-            "fresh namespace for the state identified in the error",
+            "set a new `experiment` name in the config to start a fresh study",
             id="artifact_root",
         ),
     ],
@@ -277,7 +278,9 @@ def test_continuation_preflight_failures_have_actionable_mcp_categories(
     toward a new experiment name or archiving a healthy study; falling through to
     ``internal_error`` would report a plain misconfiguration as a bug.
     """
-    failure = mcp_runner._terminal_failure_payload(error, stage="preflight", cleanup_confirmed=True)
+    failure = mcp_runner._terminal_failure_payload(
+        error, run_id="r0", stage="preflight", cleanup_confirmed=True
+    )
 
     assert failure["code"] == code
     assert failure["stage"] == "preflight"
@@ -294,6 +297,7 @@ def test_attempt_registry_failure_routes_the_workdir_repair() -> None:
     """
     failure = mcp_runner._terminal_failure_payload(
         ActiveAttemptPersistenceError("attempt registry is unwritable"),
+        run_id="r0",
         stage="execution",
         cleanup_confirmed=True,
     )
@@ -302,9 +306,9 @@ def test_attempt_registry_failure_routes_the_workdir_repair() -> None:
     assert failure["retryable"] is False
     assert failure["actor"] == "operator"
     assert failure["remediation"] == (
-        "Ask the operator to restore the files and permissions identified in the error, deleting a "
-        "file only if certain nothing is running. The error in the PhaseSweep run log gives "
-        "the details."
+        "Ask the operator to restore the files and permissions identified in the error. The "
+        "error in this run's log, `logs/r0.log` under the catalog's `state_dir`, gives the "
+        "details."
     )
 
 
@@ -343,7 +347,8 @@ def test_missing_published_study_is_an_operator_preflight_failure(
         "actor": "operator",
         "remediation": (
             "Ask the operator to restore or repair the storage ledger and access to it. The "
-            "error in the PhaseSweep run log gives the details."
+            f"error in this run's log, `logs/{run_id}.log` under the catalog's `state_dir`, "
+            "gives the details."
         ),
     }
     assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
@@ -428,7 +433,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
     resume_args = ["--from-phase", from_phase] if from_phase is not None else []
     try:
         refused_run = subprocess.run(
-            [sys.executable, "-m", "phasesweep", "run", str(config_path), *resume_args],
+            [str(console_script("phasesweep")), "run", str(config_path), *resume_args],
             capture_output=True,
             text=True,
             start_new_session=True,
@@ -453,8 +458,8 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         result = subprocess.run(
             [
                 sys.executable,
-                "-m",
-                "phasesweep.mcp.runner",
+                "-P",
+                str(mcp_runner.RUNNER_SCRIPT_PATH),
                 *runner_argv(
                     store,
                     run_id=run_id,
@@ -541,7 +546,13 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
     recovered_status = app.status(run_id=run_id)
     assert recovered_status["run"]["state"] == "failed"
     assert recovered_status["run"]["recovery_required"] is False
-    assert recovered_status["run"]["failure"] == status["failure"]
+    recovered_failure = recovered_status["run"]["failure"]
+    assert recovered_failure == {
+        **status["failure"],
+        "remediation": recovered_failure["remediation"],
+    }
+    assert "settled this run's process cleanup" in recovered_failure["remediation"]
+    assert "before another launch" not in recovered_failure["remediation"]
     assert store.status_path(run_id).read_bytes() == terminal_before
     assert (
         _generation_path(experiment).read_bytes() if _generation_path(experiment).exists() else None
@@ -613,7 +624,7 @@ def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
     assert status["failure"]["stage"] == "preflight"
     assert status["failure"]["retryable"] is True
     assert status["failure"]["actor"] == "agent"
-    assert "Stop it only if the user wants it stopped" in status["failure"]["remediation"]
+    assert "only the interface that started it can stop it" in status["failure"]["remediation"]
     assert "MCP cannot cancel a CLI operation" in status["failure"]["remediation"]
     assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
     assert status["result_snapshot_state"] == "complete"
@@ -746,7 +757,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     # Unsupported state routes to starting fresh, rather than to archiving
     # this study and continuing under the current one.
     remediation = terminal["failure"]["remediation"]
-    assert "fresh namespace for the state identified in the error" in remediation
+    assert "to start a fresh study" in remediation
 
 
 @pytest.mark.integration
@@ -948,7 +959,7 @@ def test_cleanup_uncertainty_outer_failure_controls_a_cancelled_cause() -> None:
         ),
     )
 
-    failure = mcp_runner._cleanup_failure_payload(shutdown, cause_stage="execution")
+    failure = mcp_runner._cleanup_failure_payload(shutdown, run_id="r0", cause_stage="execution")
 
     assert failure["code"] == "cleanup_uncertain"
     assert failure["actor"] == "operator"
@@ -1198,8 +1209,10 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     assert status["failure"]["code"] == "cleanup_uncertain"
     assert status["failure"]["remediation"] == (
         "Ask the operator to restore or repair the storage ledger and access to it, then "
-        "run phasesweep mcp recover-run before another launch. The error in the "
-        "PhaseSweep run log gives the details."
+        f"run `phasesweep mcp recover-run --state-dir STATE_DIR --run-id {run_id}` from a host "
+        "shell, with the catalog's `state_dir` as STATE_DIR, read its preview and repeat it "
+        f"with `--confirm` before another launch. The error in this run's log, `logs/{run_id}.log` "
+        "under the catalog's `state_dir`, gives the details."
     )
 
 
@@ -1568,7 +1581,8 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
             "actor": "agent",
             "remediation": (
                 "Report that recovery could not confirm this run as the current published "
-                "result. Start a new run only if the user still wants a published result."
+                "result. A new run of this experiment reuses its finished trials and "
+                "publishes their winners without training them again."
             ),
         }
 
@@ -1892,10 +1906,8 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
         trial_dir = _wait_for_running_trial(config, proc, log_path)
         trial_pgid = json.loads((trial_dir / PROCESS_IDENTITY_FILE).read_text())["pgid"]
 
-        # SIGTERM the runner's process group. The trial runs in its OWN session,
-        # so this does not reach it directly; the runner's installed shutdown
-        # handler tears the trial group down, then exits 128+SIGTERM = 143.
-        os.killpg(proc.pid, signal.SIGTERM)
+        # The manual stop targets the runner; its handler stops the separate trial group.
+        proc.terminate()
         proc.wait(timeout=30)
 
     assert proc.returncode == 143, (

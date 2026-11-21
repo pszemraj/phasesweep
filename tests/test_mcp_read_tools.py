@@ -34,7 +34,7 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
 )
-from phasesweep.evidence.models import JsonEnvelopeExtractor, objective_evidence_assurance
+from phasesweep.evidence.models import JsonEnvelopeExtractor
 from phasesweep.mcp.errors import (
     McpToolError,
     RunPersistentStateUnavailableError,
@@ -43,7 +43,7 @@ from phasesweep.mcp.errors import (
 )
 from phasesweep.mcp.redaction import ResultSource
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runner import FailurePayload
+from phasesweep.mcp.runner import FailurePayload, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import RunHandle, RunStore, TerminalStatus
 from phasesweep.mcp.server import (
     AwaitRunResult,
@@ -64,6 +64,7 @@ from tests.mcp_helpers import (
     drift_experiment,
     make_mcp_app,
     make_run_handle,
+    record_confirmed_recovery,
     side_effect_app,
     stage_dead_run,
     stage_live_run,
@@ -71,6 +72,7 @@ from tests.mcp_helpers import (
     write_run_status,
     write_srv_catalog,
     write_srv_config,
+    write_unsafe_cleanup_status,
 )
 
 
@@ -403,7 +405,7 @@ def test_mcp_winners_hide_unusable_live_publications(
     monkeypatch: pytest.MonkeyPatch,
     integrity: str,
 ) -> None:
-    """A live publication failure or access denial cannot expose stale winners."""
+    """A live publication failure or access denial cannot expose stale winners, and a run still running reports no failure for it."""
     run_id, _trainer, write_srv_config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, store = make_mcp_app(catalog)
     experiment = app._registry.get("srv").experiment
@@ -426,11 +428,67 @@ def test_mcp_winners_hide_unusable_live_publications(
         )
 
     results = app.winners(run_id=run_id)
+    status = app.status(run_id=run_id)
 
     assert results["result_source"] == "current_shared_study"
     assert results["publication_integrity"] == integrity
     assert results["winner_count"] == 0
     assert results["phases"] == []
+    assert status["run"]["state"] == "running"
+    assert results["failure"] is status["run"]["failure"] is None
+
+
+_PUBLICATION_FAILURES = {
+    "failed": {
+        "code": "publication_corrupt",
+        "stage": "preflight",
+        "retryable": False,
+        "actor": "operator",
+        "remediation": (
+            "The experiment's last published result no longer validates. Ask the operator to "
+            "inspect it with `phasesweep status CONFIG` and restore it; until then a new run of "
+            "this experiment fails before its first trial."
+        ),
+    },
+    "permission_denied": {
+        "code": "publication_unreadable",
+        "stage": "preflight",
+        "retryable": False,
+        "actor": "operator",
+        "remediation": (
+            "This server cannot read the experiment's published result to validate it, which is "
+            "not evidence of corruption. Ask the operator to read it as the publishing user or "
+            "restore the server's read permission; until then a new run of this experiment fails "
+            "before its first trial."
+        ),
+    },
+}
+
+
+@pytest.mark.parametrize("read_tool", ["status", "winners", "await_run"])
+@pytest.mark.parametrize("integrity", ["failed", "permission_denied"])
+@pytest.mark.integration
+def test_unusable_publication_carries_the_operators_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, integrity: str, read_tool: str
+) -> None:
+    """A run with no failure of its own over an unusable publication reports that publication's step, with winners withheld."""
+    app, _registry, store, handle, complete = _published_run_terminal(tmp_path)
+    snapshot = json.loads(json.dumps(complete["result_snapshot"]))
+    snapshot["status"]["publication_integrity"] = integrity
+    write_run_status(store, **{**complete, "result_snapshot": snapshot})
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+
+    payload = _read_run_tool(app, read_tool, handle.run_id)
+
+    assert payload["publication_integrity"] == integrity
+    if read_tool == "winners":
+        assert (payload["winner_count"], payload["phases"]) == (0, [])
+        failure = payload["failure"]
+    else:
+        assert payload["run"]["state"] == "succeeded"
+        failure = payload["run"]["failure"]
+    assert failure == _PUBLICATION_FAILURES[integrity]
+    assert app.latest_run("srv")["run"]["failure"] is None
 
 
 @pytest.mark.parametrize("kind", ["wandb", "json"])
@@ -464,8 +522,6 @@ def test_restored_reader_frozen_mcp_results_need_no_remote_access(
     assert results.publication_integrity == "ok"
     assert results.winner_count == 1
     assert results.metric.objective_evidence.kind == kind
-    assert results.metric.objective_evidence.source_identity_keyed == (kind == "wandb")
-    assert not results.metric.objective_evidence.evaluation_policy_bound
     assert status.metric == results.metric
 
 
@@ -664,6 +720,111 @@ def test_run_scoped_read_keeps_complete_snapshot_under_cleanup_reservation(
     assert payload.publication_integrity == "ok"
     assert payload.represented_generation_id == run_id
     assert tree_snapshot(store.log_path(run_id).parent) == logs_before
+
+
+@pytest.mark.parametrize("read_tool", ["status", "winners", "await_run"])
+@pytest.mark.integration
+def test_run_whose_upload_cleanup_is_unconfirmed_names_the_operator_steps(
+    tmp_path: Path,
+    read_tool: str,
+) -> None:
+    """A succeeded run with no recorded failure and unconfirmed cleanup reads sync-tracking then recover-run, with winners readable until recovery is confirmed.
+
+    The step is unscoped: the worker may have been sending an earlier generation's recovered
+    outcome, whose record a sync scoped to this run's generation leaves pending.
+    """
+    app, _registry, store, handle, terminal = _published_run_terminal(tmp_path)
+    run_id = handle.run_id
+    assert terminal.get("failure") is None
+    write_run_status(store, **{**terminal, "cleanup_confirmed": False})
+    stored_status = store.status_path(run_id).read_bytes()
+
+    payload = _read_run_tool(app, read_tool, run_id)
+
+    if read_tool == "winners":
+        assert payload["winner_count"] == 1
+        failure = payload["failure"]
+    else:
+        assert payload["run"]["state"] == "running"
+        assert payload["run"]["recovery_required"] is True
+        assert payload["phases"][0]["winner_present"] is True
+        failure = payload["run"]["failure"]
+    assert payload["result_source"] == "frozen_run_snapshot"
+    assert payload["publication_integrity"] == "ok"
+    assert payload["represented_generation_id"] == run_id
+    assert failure is not None
+    assert failure["code"] == "cleanup_uncertain"
+    assert failure["actor"] == "operator"
+    assert failure["retryable"] is False
+    remediation = failure["remediation"]
+    assert "`phasesweep sync-tracking CONFIG`" in remediation
+    assert "--generation" not in remediation
+    assert remediation.index("sync-tracking") < remediation.index("phasesweep mcp recover-run")
+    assert store.status_path(run_id).read_bytes() == stored_status
+
+    record_confirmed_recovery(store, handle)
+
+    settled = _read_run_tool(app, read_tool, run_id)
+    if read_tool == "winners":
+        assert settled["winner_count"] == 1
+        assert settled["failure"] is None
+    else:
+        assert settled["run"]["state"] == "succeeded"
+        assert settled["run"]["recovery_required"] is False
+        assert settled["run"]["failure"] is None
+
+
+@pytest.mark.parametrize("snapshot", ["frozen", "unavailable"])
+@pytest.mark.integration
+def test_recorded_cleanup_failure_stops_asking_for_recovery_once_recovery_is_confirmed(
+    tmp_path: Path,
+    snapshot: str,
+) -> None:
+    """A recorded cleanup_uncertain failure asks for recover-run until recovery is confirmed, then says cleanup is settled, in the failure or beneath its snapshot refusal."""
+    if snapshot == "frozen":
+        app, _registry, store, handle, terminal = _published_run_terminal(tmp_path)
+        failure = _cleanup_uncertain_payload([], run_id=handle.run_id)
+        write_run_status(
+            store,
+            **{
+                **terminal,
+                "returncode": 1,
+                "error_class": "UnsafeProcessCleanupError",
+                "cleanup_confirmed": False,
+                "failure": failure,
+            },
+        )
+    else:
+        config, app, registry, store = side_effect_app(tmp_path)
+        handle = stage_dead_run(
+            store, "srv-recorded-cleanup", config, registry.get("srv").id, cleanup_uncertain=False
+        )
+        failure = _cleanup_uncertain_payload([], run_id=handle.run_id)
+        write_unsafe_cleanup_status(store, handle.run_id, failure=failure)
+    run_id = handle.run_id
+    stored_status = store.status_path(run_id).read_bytes()
+
+    before = app.status(run_id=run_id)["run"]
+
+    assert before["recovery_required"] is True
+    assert before["failure"] == failure
+    assert f"recover-run --state-dir STATE_DIR --run-id {run_id}`" in failure["remediation"]
+    assert "`--confirm` before another launch" in before["failure"]["remediation"]
+
+    record_confirmed_recovery(store, handle)
+
+    after = app.status(run_id=run_id)["run"]
+
+    assert after["state"] == "failed"
+    assert after["recovery_required"] is False
+    recorded = after["failure"] if snapshot == "frozen" else after["failure"]["cause"]
+    assert recorded["code"] == "cleanup_uncertain"
+    assert recorded["remediation"] != failure["remediation"]
+    assert "settled this run's process cleanup" in recorded["remediation"]
+    assert "before another launch" not in recorded["remediation"]
+    if snapshot == "unavailable":
+        assert after["failure"]["code"] == "result_snapshot_unavailable"
+    assert store.status_path(run_id).read_bytes() == stored_status
 
 
 @pytest.mark.parametrize("read_tool", ["status", "await_run"])
@@ -871,16 +1032,13 @@ def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
 def test_published_results_keep_their_objective_evidence_after_an_extractor_swap(
     tmp_path: Path,
 ) -> None:
-    """A log-scraped number must not inherit a structured extractor's guarantees.
+    """A published result reports the extractor kind it was produced with, not the current one.
 
-    Reporting the current extractor's assurance beside a historical winner
-    claims evidence properties that run never had - the one field an agent is
-    told to use when deciding how far to trust a metric.
+    A log-scraped winner labeled json_envelope after a config swap would claim a
+    reader that run never used.
     """
     run_id, trainer, config, catalog = _record_published_run_snapshot(tmp_path)
-    published_assurance = objective_evidence_assurance(
-        drift_experiment(tmp_path, trainer).metric.extractor
-    )
+    assert drift_experiment(tmp_path, trainer).metric.extractor.type == "log_regex"
 
     write_experiment_config(
         config,
@@ -899,15 +1057,8 @@ def test_published_results_keep_their_objective_evidence_after_an_extractor_swap
     app, _registry, _store = make_mcp_app(catalog)
 
     results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
-    evidence = results.metric.objective_evidence.model_dump()
 
-    assert evidence == published_assurance
-    assert evidence["kind"] == "log_regex"
-    # The four guarantees the swapped-in extractor would have asserted.
-    assert evidence["objective_name_bound"] is False
-    assert evidence["split_bound"] is False
-    assert evidence["evaluation_policy_bound"] is False
-    assert evidence["source_identity_keyed"] is False
+    assert results.metric.objective_evidence.model_dump() == {"kind": "log_regex"}
     assert results.published_config_matches_current is False
 
 

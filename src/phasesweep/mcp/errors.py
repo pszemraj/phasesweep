@@ -6,19 +6,129 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Literal, TypeAlias
 
+from phasesweep.mcp.runs import decode_unreadable_record
+from phasesweep.runtime.reaper import in_initial_pid_namespace
+
 _MAX_CAPACITY_BLOCKING_RUN_IDS = 5
+_MAX_LISTED_UNREADABLE_RECORDS = 5
 
 CatalogReloadRefusal: TypeAlias = Literal["invalid", "state_dir_changed"]
+
+#: What the next launch does with an experiment whose run ended early, for a run that stopped.
+NEW_RUN_RESUMES = (
+    "a new run of this experiment keeps its finished trials and reruns its interrupted ones first"
+)
+
+
+#: The operator's command for a catalog that does not load. The agent never sees the
+#: catalog's path, and the command refuses to run without it.
+CHECK_CATALOG_COMMAND = (
+    "`phasesweep mcp check --catalog CATALOG` (with this server's catalog file as CATALOG)"
+)
+
+
+def recover_run_step(run_id: str, *, outside_sandbox: bool = False) -> str:
+    """Return the operator's whole ``recover-run`` step for one run, to follow "ask the operator to".
+
+    The command refuses to run without its state directory and run id, and the agent never
+    sees the state directory's path, so the step names it as the catalog's ``state_dir``.
+
+    :param str run_id: Run to recover, or the placeholder ``<run-id>`` for several.
+    :param bool outside_sandbox: The run's processes are in another PID namespace, which only
+        a shell outside every sandbox can prove gone.
+    :return str: A lower-case clause ending without a full stop.
+    """
+    shell = "a host shell outside any sandbox" if outside_sandbox else "a host shell"
+    return (
+        f"run `phasesweep mcp recover-run --state-dir STATE_DIR --run-id {run_id}` from {shell}, "
+        "with the catalog's `state_dir` as STATE_DIR, read its preview and repeat it with "
+        "`--confirm`"
+    )
+
+
+def run_log_reference(run_id: str) -> str:
+    """Name a run's own log, which holds its errors, for an agent that never sees the state path.
+
+    :param str run_id: Run whose runner log is named.
+    :return str: A noun phrase locating the log under the catalog's ``state_dir``.
+    """
+    return f"this run's log, `logs/{run_id}.log` under the catalog's `state_dir`"
+
+
+def _host_runner_numbers(pid: int | None, pgid: int | None) -> tuple[int | None, int | None]:
+    """Keep a recorded PID and process group only where a host shell reads them the same.
+
+    A process in a container or sandbox records the PID numbers of its own namespace, and in
+    a host shell the same number can name an unrelated process group. Only the host's
+    initial namespace numbers its processes as the operator's shell does.
+
+    :param int | None pid: The runner's PID as recorded.
+    :param int | None pgid: The runner's process group as recorded.
+    :return tuple[int | None, int | None]: ``(pid, pgid)`` in the host's initial PID
+        namespace, else ``(None, None)``, which the step wording below answers by naming
+        the run for the shell to resolve.
+    """
+    return (pid, pgid) if in_initial_pid_namespace() else (None, None)
+
+
+def live_runner_step(pid: int | None, pgid: int | None, run_id: str) -> str:
+    """Return the host step for a runner that cancellation or recovery found still alive.
+
+    ``cancel_run`` and ``recover-run`` give the operator this one step, so neither refusal
+    leaves a runner that survived SIGKILL unnamed. It names the recorded numbers only in
+    the host's initial PID namespace, and the run to find the runner by anywhere else.
+
+    :param int | None pid: The runner's recorded PID, if any.
+    :param int | None pgid: The runner's recorded process group, if any.
+    :param str run_id: The run, to find the runner by when no number is named.
+    :return str: One sentence naming the runner and what to clear on the host.
+    """
+    pid, pgid = _host_runner_numbers(pid, pgid)
+    if pid is not None and pgid is not None:
+        who = f"runner PID {pid} (process group {pgid})"
+    else:
+        who = (
+            f"the runner (the `runner.py --run-id {run_id}` line of `pgrep -af {run_id}` "
+            "from a host shell)"
+        )
+    return (
+        f"If {who} is still running on the host, clear the cause there; a process in "
+        "uninterruptible I/O ignores SIGKILL until the I/O ends."
+    )
+
+
+def runner_stop_step(run_id: str, pid: int | None) -> str:
+    """Give the operator a host command that signals the runner handling cancellation.
+
+    :param str run_id: Run id to verify in the runner's command line.
+    :param int | None pid: Recorded runner PID, if observable in this namespace.
+    :return str: The operator's stop instruction.
+    """
+    runner = f"runner.py --run-id {run_id}"
+    if pid is not None and in_initial_pid_namespace():
+        step = f"check that `ps -p {pid} -o args=` shows `{runner}`, then run `kill -TERM {pid}`"
+    else:
+        step = (
+            f"find the PID of `{runner}` in `ps -A -o pid=,args=`, "
+            "then run `kill -TERM PID` with that PID"
+        )
+    return (
+        f"To stop this run, the operator can {step} from a host shell. "
+        "The runner handles SIGTERM as cancellation."
+    )
 
 
 class CatalogError(Exception):
     """Catalog could not be loaded or validated. Operator-facing.
 
-    Fatal at startup; a running server that cannot reload an edited catalog keeps
-    serving reads from the last valid one and refuses launches.
+    A catalog-level error (unreadable or malformed catalog, unusable ``state_dir``,
+    unsupported host) is fatal at startup. An entry error fails only that entry: the
+    server starts on the entries that load and refuses launches, and a running server
+    that cannot reload an edited catalog keeps serving reads from the last valid one and
+    refuses launches.
     """
 
     def __init__(self, message: str, *, suggestion: str | None = None) -> None:
@@ -45,11 +155,42 @@ class UnknownExperimentError(McpToolError):
     def __init__(self, experiment_id: str) -> None:
         """Create an unknown-experiment tool error.
 
-        :param str experiment_id: Agent-supplied catalog id that was not registered.
+        :param str experiment_id: Agent-supplied catalog id that is not served.
         """
-        super().__init__(
+        super().__init__(self._message(experiment_id))
+
+    @staticmethod
+    def _message(experiment_id: str) -> str:
+        """Say why the id is not served and what the agent does next.
+
+        :param str experiment_id: Agent-supplied catalog id.
+        :return str: The tool error text.
+        """
+        return (
             f"unknown experiment id {experiment_id!r}; call "
             "list_experiments and use an id from its response"
+        )
+
+
+class CatalogEntryInvalidError(UnknownExperimentError):
+    """Raised when a tool references a catalog entry that failed to load.
+
+    A subclass of :class:`UnknownExperimentError` so run reads that fall back to a saved
+    snapshot when an id is not served treat a failed entry the same way.
+    """
+
+    @staticmethod
+    def _message(experiment_id: str) -> str:
+        """Say that the entry failed to load, without paths or validation detail.
+
+        :param str experiment_id: Agent-supplied catalog id whose entry failed to load.
+        :return str: The tool error text.
+        """
+        return (
+            f"experiment {experiment_id!r} is in the catalog but its entry failed to load, so "
+            f"this server cannot serve it. Ask the operator to run {CHECK_CATALOG_COMMAND} and "
+            "fix what it reports; the server rereads the catalog on the next call. Do not "
+            "retry until the operator reports the fix."
         )
 
 
@@ -65,6 +206,21 @@ class UnknownRunError(McpToolError):
             f"unknown run id {run_id!r}; use the exact run_id returned by "
             "launch_run. If it was lost, call get_latest_run "
             "with the experiment id instead of launching a replacement."
+        )
+
+
+class UnreadableRunRecordError(McpToolError):
+    """Raised when a requested run has persisted evidence but no readable handle."""
+
+    def __init__(self, run_id: str) -> None:
+        """Direct the agent to the operator's state inventory check.
+
+        :param str run_id: Run whose handle or sibling evidence exists.
+        """
+        super().__init__(
+            f"MCP state has an unreadable or orphaned record for run {run_id!r}. "
+            f"Ask the operator to run {CHECK_CATALOG_COMMAND} and resolve the run record "
+            "before retrying."
         )
 
 
@@ -86,23 +242,29 @@ class InvalidPhaseError(McpToolError):
 class PermissionDeniedError(McpToolError):
     """Raised when the catalog forbids an action (launch/cancel/from_phase)."""
 
-    def __init__(self, action: str, experiment_id: str) -> None:
+    def __init__(self, action: str, experiment_id: str, *, stop_step: str | None = None) -> None:
         """Create a permission-denied tool error.
 
         :param str action: Forbidden action name.
         :param str experiment_id: Catalog id whose permissions denied the action.
+        :param str | None stop_step: For a refused cancel of a running run, the operator's
+            route to stop it from :func:`runner_stop_step`, or the run's recovery step when
+            its runner is gone.
         """
         # Launch-time permission caps cancellation, so a later catalog grant cannot reach
-        # a run launched without it.
+        # a run launched without it. An edit is read only from a catalog whose every entry
+        # loads, so a grant made while another entry fails waits for that entry's fix.
         applies = (
-            "which applies on the next call but never to a run launched without it"
+            "which applies on the next call with a valid catalog but never to a run launched "
+            "without it"
             if action == "cancel"
-            else "which applies on the next call"
+            else "which applies on the next call with a valid catalog"
         )
+        stop = f" {stop_step}" if stop_step is not None else ""
         super().__init__(
             f"action {action!r} is not permitted for experiment {experiment_id!r}; "
             "this is deliberate catalog policy. Report it to the user - only the "
-            f"operator can enable it (allow.{action}: true in the catalog), {applies}. "
+            f"operator can enable it (allow.{action}: true in the catalog), {applies}.{stop} "
             "Do not retry."
         )
 
@@ -124,31 +286,51 @@ class ConfigChangedError(McpToolError):
 
 
 class CatalogReloadRefusedError(McpToolError):
-    """Raised by launch while the server's latest reread of an edited catalog was refused."""
+    """Raised by launch while the catalog or a config it lists does not fully validate.
 
-    def __init__(self, reason: CatalogReloadRefusal) -> None:
+    That is the case for the latest refused reread of an edited catalog, and from startup
+    when an entry failed to load.
+    """
+
+    def __init__(self, reason: CatalogReloadRefusal, failed_ids: Sequence[str]) -> None:
         """Create a refused-reload tool error.
 
-        :param CatalogReloadRefusal reason: ``invalid`` when the edited catalog or a config
-            it lists failed validation; ``state_dir_changed`` when it names another state
+        Launch is refused for every experiment, so the error names the entries that fail;
+        otherwise an agent reads the healthy entries' ``launch: false`` as their own fault.
+
+        :param CatalogReloadRefusal reason: ``invalid`` when the catalog or a config it
+            lists fails validation; ``state_dir_changed`` when it names another state
             directory than the one this server was started with.
+        :param Sequence[str] failed_ids: Catalog ids of the entries that failed to load;
+            empty when the catalog file itself does not validate.
         """
         if reason == "state_dir_changed":
             message = (
                 "the catalog was edited to name a different state_dir than the one this server "
                 "was started with. A running server keeps its run records in one state "
-                "directory, so it refuses launches until the operator restarts it; reads keep "
+                "directory, so it refuses launches, showing `launch: false` for every "
+                "experiment, until the operator restarts it; reads keep "
                 "using the original state directory and the last catalog loaded with it. "
                 "Report this to the operator. Do not retry."
             )
         else:
+            if failed_ids:
+                names = ", ".join(repr(experiment_id) for experiment_id in failed_ids)
+                failing = (
+                    f"catalog entry {names} failed to load"
+                    if len(failed_ids) == 1
+                    else f"catalog entries {names} failed to load"
+                )
+                them = "it" if len(failed_ids) == 1 else "them"
+            else:
+                failing, them = "the catalog file does not validate", "it"
             message = (
-                "the catalog or an experiment config it lists was edited and no longer "
-                "validates, so this server refuses launches and inspection of changed configs "
-                "until it is fixed; other reads keep using the last valid catalog and saved "
-                "run snapshots. Ask the operator to fix it; `phasesweep mcp "
-                "check` shows what fails. The server rereads the catalog on the next call. "
-                "Do not retry until the operator reports the fix."
+                f"{failing}, so this server refuses launches of every experiment, showing "
+                "`launch: false` for each, and inspection of a changed config, until the "
+                f"operator fixes {them}; "
+                f"{CHECK_CATALOG_COMMAND} shows why. Other reads keep using the entries that "
+                "loaded and saved run snapshots, and the server rereads the catalog on the "
+                "next call. Do not retry until the operator reports the fix."
             )
         super().__init__(message)
 
@@ -163,8 +345,8 @@ class RunSnapshotUnavailableError(McpToolError):
         """
         super().__init__(
             f"saved config snapshot for run {run_id!r} is unavailable or invalid; "
-            "the run cannot be monitored safely. Report this to the operator; do not "
-            "substitute experiment-level results."
+            "the run cannot be monitored safely. Report this to the operator, not another "
+            "run's results in its place."
         )
 
 
@@ -181,9 +363,8 @@ class RunResultSnapshotUnavailableError(McpToolError):
         super().__init__(
             f"terminal result snapshot for run {run_id!r} is unavailable or invalid{state}; "
             "retry once after a short delay only if finalization is still pending. "
-            "If the error persists, report it to the operator; a missing historical "
-            "snapshot cannot be rebuilt from mutable shared results; do not substitute "
-            "experiment-level results."
+            "If the error persists, report it to the operator; this run's results cannot be "
+            "rebuilt, so do not report another run's results in their place."
         )
 
 
@@ -198,7 +379,7 @@ class RunPersistentStateUnavailableError(McpToolError):
         super().__init__(
             f"run {run_id!r} cannot be read safely because its persistent study state is "
             "unavailable or incompatible. Report this to the operator; do not retry, "
-            "launch a replacement, or substitute experiment-level results."
+            "launch a replacement, or report another run's results in its place."
         )
 
 
@@ -221,28 +402,23 @@ class ExperimentBusyError(McpToolError):
             including an unobservable runner whose heartbeat is stale.
         :param bool runner_observable: Whether this server can verify runner liveness.
         """
+        step = recover_run_step(run_id, outside_sandbox=not runner_observable)
         if recovery_required:
-            advice = (
-                "Ask the operator to inspect this run with `phasesweep mcp recover-run` "
-                "and complete its reported recovery before retrying the launch."
-            )
+            advice = f"Ask the operator to {step} before retrying the launch."
             if not runner_observable:
                 advice += (
                     " Its runner is in another PID namespace and has probably stopped or left "
-                    "cleanup uncertain; the operator must check and recover it from a host "
-                    "shell outside the sandbox."
+                    "cleanup uncertain."
                 )
         else:
             advice = (
                 "If you just launched and lost the response, this is likely that run; "
-                f"monitor it with await_run using run_id {run_id!r}. "
-                "Cancel it only if the user wants to stop it."
+                f"monitor it with await_run using run_id {run_id!r}."
             )
             if not runner_observable:
                 advice += (
                     " This server cannot verify runner liveness across PID namespaces. "
-                    "Monitor durable progress; if it stops, ask the operator to inspect "
-                    "and recover from a host shell outside the sandbox."
+                    f"Monitor durable progress; if it stops, ask the operator to {step}."
                 )
         super().__init__(
             f"experiment {experiment_id!r} already has a running sweep "
@@ -279,29 +455,27 @@ class ConcurrencyLimitError(McpToolError):
         blockers = ", ".join(repr(run_id) for run_id in shown)
         omitted = max(0, running - len(shown))
         omitted_note = f" ({omitted} more active)" if omitted else ""
+        unobservable_ids = set(unobservable_run_ids)
         if recovery_ids:
             needs_recovery = ", ".join(repr(run_id) for run_id in shown if run_id in recovery_ids)
+            step = recover_run_step(
+                "<run-id>", outside_sandbox=bool(unobservable_ids & recovery_ids)
+            )
             advice = (
                 f"Run_ids requiring operator recovery: {needs_recovery}. Ask the operator to "
-                "inspect these runs with `phasesweep mcp recover-run` and complete the "
-                "reported recovery before retrying the launch."
+                f"{step} for each of them before retrying the launch."
             )
         else:
             advice = (
                 "Call await_run with one of these run_ids, then retry this launch only "
                 "after that run is terminal. Ask the user before cancelling a blocking run."
             )
-        unobservable_ids = set(unobservable_run_ids)
-        if unobservable_ids & recovery_ids:
-            advice += (
-                " The operator must recover blockers whose runner is in another PID "
-                "namespace from a host shell outside the sandbox."
-            )
         if unobservable_ids - recovery_ids:
+            step = recover_run_step("<run-id>", outside_sandbox=True)
             advice += (
                 " This server cannot verify runner liveness for blockers in another PID "
-                "namespace. Monitor durable progress; if it stops, ask the operator to "
-                "inspect and recover from a host shell outside the sandbox."
+                f"namespace. Monitor durable progress; if one stops, ask the operator to {step} "
+                "for it."
             )
         super().__init__(
             f"concurrency limit reached (max_concurrent_runs={limit}); {running} other "
@@ -312,10 +486,13 @@ class ConcurrencyLimitError(McpToolError):
 class RunCapacityUnknownError(McpToolError):
     """Raised when persisted run records cannot prove launch capacity."""
 
-    def __init__(self, unreadable_records: int, recoverable_run_ids: Sequence[str] = ()) -> None:
+    def __init__(
+        self, unreadable: Collection[str], recoverable_run_ids: Sequence[str] = ()
+    ) -> None:
         """Create a fail-closed capacity error without exposing state paths.
 
-        :param int unreadable_records: Distinct malformed or orphaned run identities.
+        :param Collection[str] unreadable: Distinct malformed or orphaned record identities,
+            ``run:<id>`` or ``handle:<file name under runs/>``.
         :param Sequence[str] recoverable_run_ids: Safe run ids whose only
             evidence is a provably pre-spawn config snapshot.
         """
@@ -323,15 +500,44 @@ class RunCapacityUnknownError(McpToolError):
         if recoverable_run_ids:
             ids = ", ".join(repr(run_id) for run_id in recoverable_run_ids)
             recovery = (
-                f" Pre-spawn orphan run id(s): {ids}. Ask the operator to run "
-                "`phasesweep mcp recover-run --state-dir <configured-state-dir> "
-                "--run-id <id>` and then repeat it with `--confirm`."
+                f" Pre-spawn orphan run id(s): {ids}. Ask the operator to "
+                f"{recover_run_step('<run-id>')} for each of them."
+            )
+        decoded = (decode_unreadable_record(identity) for identity in unreadable)
+        # Each label is a run id, or ``runs/<file name>`` for a handle file that names none.
+        listed = sorted(
+            (label, run_id is None)
+            for run_id, label in decoded
+            if run_id is None or run_id not in recoverable_run_ids
+        )
+        remaining = ""
+        if listed:
+            shown_records = listed[:_MAX_LISTED_UNREADABLE_RECORDS]
+            shown = ", ".join(f"`{label}`" for label, _is_file in shown_records)
+            more = len(listed) - _MAX_LISTED_UNREADABLE_RECORDS
+            more_note = f" and {more} more" if more > 0 else ""
+            file_note = (
+                "; a listed `runs/` file moves out as it is"
+                if any(is_file for _label, is_file in shown_records)
+                else ""
+            )
+            # A trial carries the run id in its arguments only when its command uses
+            # {trial_dir}, but always in its environment as PHASESWEEP_GENERATION_ID. The
+            # listing prints PIDs alone: its input holds each process's whole environment,
+            # credentials included, and only for the processes of the user who runs it.
+            remaining = (
+                f" Unreadable or orphaned: {shown}{more_note}. For each run id, ask the operator "
+                "to run, on the server host as the server's user, `pgrep -af <run-id>`, which "
+                "lists the run's runner, and "
+                "`ps axeww | awk '/[P]HASESWEEP_GENERATION_ID=<run-id>/ {print $1}'`, which "
+                "prints the PID of each of its trials, found by environment, wait for every "
+                "listed process to exit, or stop it, and move `runs/<run-id>.json` and "
+                f"`logs/<run-id>.*` out of the state directory only once both print nothing{file_note}."
             )
         super().__init__(
             f"cannot prove available launch capacity because the MCP state contains "
-            f"{unreadable_records} unreadable or orphaned run record(s).{recovery} Do not retry or "
-            "launch a replacement. Ask the operator to inspect and repair the MCP state "
-            "directory first."
+            f"{len(unreadable)} unreadable or orphaned run record(s).{recovery}{remaining} "
+            "Do not retry or launch a replacement."
         )
 
 
@@ -341,6 +547,24 @@ class LaunchInProgressError(McpToolError):
     def __init__(self) -> None:
         """Create a transient launch-in-progress tool error."""
         super().__init__("another launch is in progress on this server; retry in a moment")
+
+
+class RunnerExitedBeforeReceiptError(McpToolError):
+    """Raised when the detached runner exits before it records its launch receipt."""
+
+    def __init__(self, run_id: str, returncode: int) -> None:
+        """Create a path-free launch error naming the runner's exit code.
+
+        :param str run_id: Run id whose runner exited.
+        :param int returncode: The runner's exit code, negative for the signal that ended it.
+        """
+        super().__init__(
+            f"run {run_id!r} did not start: its detached runner exited with code {returncode} "
+            "before it recorded its launch receipt, so no trial ran. Do not retry the launch. "
+            f"Ask the operator to read {run_log_reference(run_id)}, and fix what it reports, "
+            "often a PhaseSweep the server imports only through PYTHONPATH, which the runner "
+            "does not inherit."
+        )
 
 
 class RunLaunchUnsettledError(McpToolError):
@@ -367,16 +591,15 @@ class RunNamespaceMismatchError(McpToolError):
 
         :param str run_id: Run id whose runner this server cannot signal.
         """
+        step = recover_run_step(run_id, outside_sandbox=True)
         super().__init__(
             f"run {run_id!r} was launched in another PID namespace, where its recorded "
             "process ids name unrelated processes for this server, so nothing was "
             "signalled. Do not retry cancellation. If get_run_status reports recovery_required, "
-            "stop monitoring and ask the operator to inspect and recover it with "
-            "phasesweep mcp recover-run from a host shell outside the sandbox. Otherwise "
-            "keep monitoring with await_run and tell the user this server cannot cancel it: "
-            "the operator can cancel it from the "
-            "environment that launched it while that environment runs, or recover it with "
-            "phasesweep mcp recover-run from the host once that environment has ended."
+            f"stop monitoring and ask the operator to {step}. Otherwise keep monitoring with "
+            "await_run and tell the user this server cannot cancel it: the operator can cancel "
+            "it from the environment that launched it while that environment runs, or, once "
+            f"that environment has ended, {step}."
         )
 
 

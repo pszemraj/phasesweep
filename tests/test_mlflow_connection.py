@@ -16,7 +16,7 @@ from phasesweep.tracking import mlflow as worker
 def test_mlflow_refused_connection_is_identified_as_transport_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit_cause: bool
 ) -> None:
-    """A wrapped transport failure names the refused connection without private SDK text."""
+    """A wrapped refused connection is reported unavailable, named without private SDK text."""
     from mlflow.exceptions import MlflowException
     from requests.exceptions import ConnectionError as RequestsConnectionError
 
@@ -34,7 +34,9 @@ def test_mlflow_refused_connection_is_identified_as_transport_failure(
     request, response = tmp_path / "request.json", tmp_path / "response.json"
     request.write_text(json.dumps({"action": "resolve"}))
     assert worker.main([str(request), str(response)]) == 0
-    message = json.loads(response.read_text())["message"]
+    reported = json.loads(response.read_text())
+    assert reported["status"] == "unavailable"
+    message = reported["message"]
     assert "connection" in message.lower()
     assert "refused" in message.lower()
     assert "private" not in message

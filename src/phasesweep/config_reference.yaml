@@ -1,7 +1,7 @@
-# config_reference.yaml: every key of a PhaseSweep experiment, in signature form (key: type = default), so it does not load. Start from https://github.com/pszemraj/phasesweep/blob/main/examples/example.yaml.
+# config_reference.yaml: every key of a PhaseSweep experiment, in signature form (key: type = default), so it does not load. Start from https://github.com/pszemraj/phasesweep/blob/main/examples/example.yaml or a template: phasesweep init --list names them and phasesweep init --template NAME writes one.
 
 # Config file: the CONFIG argument of phasesweep run, validate, status, show-winners and sync-tracking, read once per invocation. No default file is searched.
-# explain and MCP explain_config pin links to the installed release tag or source revision at read time; this file links to development docs.
+# explain and MCP explain_config pin links to the installed release tag at read time, or to main for an editable or development install; this file links to development docs.
 # The MCP server rereads an edited config before its next tool call, and a failed reread refuses launches until fixed: https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md#the-catalog.
 # Precedence, lowest to highest: built-in defaults, the YAML, then CLI --set KEY=VALUE (https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#run-time-overrides). No environment variable sets a key.
 # The file is one UTF-8 YAML mapping. An unknown or duplicate key, or a value that breaks a constraint stated here, fails config load with an error naming it.
@@ -28,6 +28,7 @@ experiment: string (required)
 # {config_path}, {overrides} or {overrides_path} carries the trainer input, as override_format says, for example python train.py --config {config_path}.
 # PhaseSweep shell-quotes every placeholder but {trial_id}. Write {{ and }} for literal braces and $VAR or ${{VAR}} for a shell variable.
 # Unknown placeholders, attribute or index access, format specs such as {trial_id:05d}, conversions such as {phase!r}, or unbalanced braces fail config load.
+# See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#source-checkout-preflight before running a trainer from a source checkout.
 trial_command: string (required)
 
 # ---------- Objective ----------
@@ -64,7 +65,7 @@ metric: object (required)
 # With sampler.type grid, n_trials is at least the grid size, the search_space combinations times the repeat values, unless allow_partial_grid is true.
 # On storage null a grid's n_trials is at most the grid size, and a fixed configuration (empty search_space, no repeats) needs n_trials 1.
 # With repeats under seeded random, n_trials is a multiple of the number of repeat values, and exactly that number when search_space is empty.
-# On persistent storage, launch and dry run refuse an n_trials above the grid size plus the study's failed attempts. A fixed configuration is a one-cell grid.
+# On persistent storage, validate, the dry run and launch refuse an n_trials above the grid size plus the study's failed attempts. A fixed configuration is a one-cell grid.
 # Run-control keys, outside the fingerprint: n_trials, comment, cost_key, n_jobs, gpu_ids, gpu_devices, max_consecutive_failures, timeout_seconds_per_phase, allow_*.
 # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#phase-composition
 
@@ -78,6 +79,7 @@ phases: list[object] (required)
     # When the target is reached with no eligible feasible attempt, the phase fails.
     # On persistent storage a raised target runs the remaining attempts in the same study, and a lowered one is refused.
     # While a phase that inherits from this one, even indirectly, has trials, a run that would add trials here is refused. Use a new experiment name then.
+    # Recommended: one trial per configuration, spending the budget on more distinct values, such as 7 to 8 log-spaced learning rates.
     # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation for retries, aborts and partial results.
     n_trials: int (required)
 
@@ -85,7 +87,7 @@ phases: list[object] (required)
     comment: string | null = null
 
     # Numeric sampled parameter whose smaller values cost less, for example model.depth.
-    # With mean repeats, advise the cheapest configuration within the winner's standard error; the selected winner never changes.
+    # With mean repeats, advise the cheapest configuration within the winner's standard error.
     # Requires: repeats.reduce mean and a numeric search_space parameter of this phase; numeric categorical choices may not include booleans.
     # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#repeats for selection, result reads and replay.
     cost_key: string | null = null
@@ -104,7 +106,7 @@ phases: list[object] (required)
 
     # Map from a dotted trainer key, under the fixed_overrides key rules, to the parameter sampled for it. The sampled value reaches the trainer like a fixed one.
     # Empty without repeats: a fixed configuration, which draws nothing and runs fixed_overrides as they are. n_trials above 1 then only retries failed attempts.
-    # validate and run --dry-run warn about such an n_trials above 1, because only a launch can count the failed attempts it would retry.
+    # validate and run --dry-run warn about such an n_trials above 1, and refuse, as a launch does, one above the recorded failed attempts plus one.
     # Empty with repeats: a seed audit, one configuration run once per repeat value.
     # A key whose last component is seed, data_seed or random_state, matched case-sensitively, fails config load, because a searched seed lets noise win.
     search_space: map[string, categorical | float | int] = {}
@@ -152,7 +154,7 @@ phases: list[object] (required)
         step: int = 1
 
     # Run every configuration once per repeat value, typically seeds, and rank configurations by a reducer over their members instead of by single trials.
-    # Warning: R repeat values multiply the phase's cost by R. For a continuous hyperparameter, more distinct values with one trial each cover the same ground.
+    # Warning: R repeat values multiply the phase's cost by R.
     # Recommended: keep repeats for a few discrete finalists whose gap is near the noise, a one-off seed audit, or a final configuration's spread.
     # Requires: sampler.type grid, or random with sampler.seed on any storage, and allow_partial_grid false.
     # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#repeats and https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#repeat-groups
@@ -231,7 +233,7 @@ phases: list[object] (required)
     # It does nothing when GPUs are detected, when a device list is set, or under whole_node. With no GPU found, n_jobs above 1 needs it.
     # Any n_jobs needs it when the driver lists hardware but nvidia-smi cannot enumerate it or resolve the ambient CUDA_VISIBLE_DEVICES tokens.
     # A CUDA_VISIBLE_DEVICES of "" or -1, from env or the ambient environment, disables CUDA for single_per_trial trainers and needs no opt-in.
-    # Warning: true can let trainers see every GPU without host locks. It does not turn a CUDA model into a CPU model.
+    # Warning: true can let trainers see every GPU without host locks.
     allow_no_gpu_isolation: bool = false
 
     # ---------- Phase limits ----------
@@ -247,7 +249,7 @@ phases: list[object] (required)
     # Recommended: when repeats compares multiple configurations, keep it above the repeat count so one failing configuration cannot abort the phase. validate and run --dry-run warn.
     max_consecutive_failures: int = 5
 
-    # Wallclock limit for one trainer process, in seconds, >= 0. null means no limit, and 0 expires at once, so every attempt fails.
+    # Wallclock limit for one trainer process, in seconds, > 0. null means no limit.
     # Its clock starts at the supervised launch, after the GPU lease is held, so it excludes the lease wait and the evidence reads.
     # A trainer it kills fails the attempt. A trainer that a phase or run deadline stops first is interrupted instead, and it reruns.
     # Requires: phases[].allow_unbounded_trials true for null.
@@ -256,12 +258,12 @@ phases: list[object] (required)
     # Permit timeout_seconds_per_trial null. true alone changes nothing, because the 72-hour default applies until that key is null.
     allow_unbounded_trials: bool = false
 
-    # Wallclock budget for the phase, in seconds, >= 0. Its clock starts after the resume checks and GPU discovery, before the first trial.
-    # A phase with no work left never starts the clock. 0 makes a phase with work fail before any trial starts, which allow_incomplete_on_timeout cannot rescue.
+    # Wallclock budget for the phase, in seconds, > 0. Its clock starts after the resume checks and GPU discovery, before the first trial.
+    # A phase with no work left never starts the clock.
     timeout_seconds_per_phase: float | null = null
 
     # Accept a feasible winner from fewer than n_trials attempts when a phase or run deadline leaves the phase incomplete, and persist that decision.
-    # false fails the run as a timeout. A per-trial timeout alone never enables it, and it never lets missing or infeasible evidence win.
+    # false fails the run as a timeout. A per-trial timeout alone never enables it.
     # Reusing a stored partial result, on a replay or through --from-phase, needs it true as well.
     allow_incomplete_on_timeout: bool = false
 
@@ -401,7 +403,7 @@ provenance: map[string, string] = {}
 
 # ---------- Constraints ----------
 # A measured value outside a constraint's bounds makes the attempt infeasible: it keeps its real objective value for the sampler but cannot win.
-# An infeasible attempt counts toward phases[].max_consecutive_failures. Every constraint is read even after one is violated.
+# Every constraint is read even after one is violated.
 # A read that fails, or a value that is not a finite number, fails the attempt at once, before later constraints and gates are read.
 
 # Feasibility bounds on additional scalars, separate from metric ranking. Each item is one constraint.
@@ -487,7 +489,7 @@ env: map[string, string] = {}
 # Trainer working directory and environment-selection contract. Nested defaults apply when the block is omitted.
 execution: object = {}
   # Working directory of every trainer process. Write . for the config file's directory; "" fails config load.
-  # It is not checked at config load. A missing directory fails each attempt before the trainer starts, and the failures count toward max_consecutive_failures.
+  # validate checks the trainer directory. Launch and run --dry-run check it for phases that would start trials, before any phase starts. A replay requires no trainer directory.
   # Unset: the directory phasesweep was started from, or the catalog entry's cwd under MCP. A study with trials then refuses a run from another directory.
   # Recommended: set it, or use absolute interpreter and script paths in trial_command, so the command resolves the same way from every invocation.
   cwd: string | null = null
@@ -513,9 +515,8 @@ execution: object = {}
 
 # ---------- Run deadline ----------
 
-# Wallclock budget for one phasesweep run invocation, in seconds, >= 0. Its clock starts once the ledger is claimed and restarts at every invocation.
+# Wallclock budget for one phasesweep run invocation, in seconds, > 0. Its clock starts once the ledger is claimed and restarts at every invocation.
 # It also caps W&B evidence reads and MLflow resolution, run creation and capture, but not MLflow result uploads.
-# 0 fails the first phase before it starts, even a replay of finished work.
 # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation
 timeout_seconds_per_run: float | null = null
 
@@ -551,34 +552,33 @@ JsonEnvelopeExtractor:
   # Exact nonempty evaluation.policy the envelope must report, for example final or best. It checks metadata and never selects a checkpoint.
   policy: string (required)
 
-  # Exact nonempty evaluation.checkpoint the envelope must report. It never loads weights.
+  # Exact nonempty evaluation.checkpoint the envelope must report.
   checkpoint: string | null = null
 
-  # Exact evaluation.step the envelope must report, an integer >= 0. It does not schedule evaluation.
+  # Exact evaluation.step the envelope must report, an integer >= 0.
   expected_step: int | null = null
 
-  # Nonempty progress axis the sweep holds fixed, which the evaluation_point verdict compares. step is the envelope's own evaluation.step.
+  # Nonempty progress axis the sweep holds fixed, such as tokens for a fixed-token sweep, which the evaluation_point verdict compares. step is the envelope's own evaluation.step.
   # Any other name is read from evaluation.progress, and a missing position, or one that is not a finite number >= 0, fails the read.
   # Only used when: this is metric.extractor. A constraint or observation reader must leave it at its default, or config load fails.
-  # Recommended: the axis the comparison holds fixed, such as tokens for a fixed-token sweep.
   # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#training-length-comparison
   evaluation_axis: string = "step"
 
 LogRegexExtractor:
   # Variant log_regex: extract numbers from a log file in the attempt directory with a regular expression.
-  # A missing or unreadable file, a searched line that is not valid UTF-8, no numeric match, or a selected value that is not finite fails the read.
+  # A missing or unreadable file, a searched line that is not valid UTF-8, or no numeric match fails the read.
   type: "log_regex" (required)
 
   # Log file, for example stdout.log. stdout.log and stderr.log hold the trainer's two streams, and Python logging writes to stderr by default.
   file: string = "stdout.log"
 
-  # Python regular expression whose named group (?P<value>...) captures the number, such as loss=(?P<value>[0-9.eE+-]+). Without that group, config load fails.
+  # Python regular expression whose required group (?P<value>...) captures the whole metric token. Use loss=(?P<value>\S+) for whitespace delimiters or loss=(?P<value>[^\s,]+) when a comma can follow.
   # Lines split at \n, \r\n and bare \r and are searched one at a time, so a match cannot span lines. Inline flags such as (?i) work.
-  # Each match in a line is one observation. float() parsing skips bad captures but accepts nan, inf and 1_0, so a loose capture can select a non-finite value.
+  # Each numeric match is an observation. The reader skips captures that float() cannot parse and accepts nan, inf and 1_0. On a persistent study a changed pattern needs a new experiment name, because the pattern is part of the study identity.
   pattern: string (required)
 
   # Which observation is used: last or first by position in the file, min or max by value, the first of equal extremes. first decodes no line after its match.
-  # Warning: with min or max a NaN capture is order dependent: a NaN seen first is never replaced, and a NaN seen after a number is ignored.
+  # min and max fail the read on any non-finite match, selected or not.
   select: "last" | "first" | "min" | "max" = "last"
 
 # Requires: the top-level mlflow block.

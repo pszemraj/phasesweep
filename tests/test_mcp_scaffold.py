@@ -39,10 +39,15 @@ def test_derive_experiment_id_sanitizes_stem(tmp_path: Path) -> None:
 
 
 def test_scaffold_rejects_duplicate_ids(tmp_path: Path) -> None:
+    """Two configs with one file name write no catalog, and the fix names only steps that need none."""
     first = tmp_path / "a" / "srv.yaml"
     second = tmp_path / "b" / "srv.yaml"
-    with pytest.raises(CatalogError, match="both derive"):
+    with pytest.raises(CatalogError, match="both derive") as refused:
         scaffold_catalog_text(tmp_path / "catalog.yaml", [first, second])
+    assert refused.value.suggestion == (
+        "rename one of the config files, since each entry's id comes from its file name, or "
+        "leave one out and add its entry to the written catalog by hand with another id"
+    )
 
 
 def test_init_catalog_writes_read_only_catalog(tmp_path: Path) -> None:
@@ -85,6 +90,36 @@ def test_init_catalog_pins_runner_cwd_to_catalog_directory(tmp_path: Path) -> No
     text = output.read_text()
     assert 'cwd: "."' in text
     assert f"phasesweep mcp check --catalog {output}" in text
+
+
+def test_init_catalog_leaves_cwd_to_each_config_outside_the_catalog_directory(
+    tmp_path: Path,
+) -> None:
+    """A catalog kept apart from its projects must not start their trainers in its own directory."""
+    projects = [tmp_path / "projects" / name for name in ("alpha", "beta")]
+    configs = []
+    for project in projects:
+        project.mkdir(parents=True)
+        configs.append(_write_config(project, f"{project.name}.yaml", name=project.name))
+    catalogs = tmp_path / "catalogs"
+    catalogs.mkdir()
+    output = catalogs / "catalog.yaml"
+
+    result = CliRunner().invoke(
+        cli_main,
+        ["mcp", "init-catalog", "-o", str(output)]
+        + [arg for config in configs for arg in ("--from", str(config))],
+    )
+
+    assert result.exit_code == 0, result.output
+    text = output.read_text()
+    assert "\n    cwd:" not in text
+    assert text.count("# cwd unset: the detached runner starts in the config's directory") == 2
+    assert text.count("# absolute; a relative path resolves against this catalog file") == 2
+    registry = Registry.load(output)
+    for project in projects:
+        assert registry.get(project.name).cwd == project.resolve()
+        assert f"ok    (read-only)  trainer cwd {project.resolve()}\n" in result.output
 
 
 def test_init_catalog_honors_umask(tmp_path: Path) -> None:

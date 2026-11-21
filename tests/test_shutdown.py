@@ -474,7 +474,10 @@ def test_defer_shutdown_signals_blocks_and_restores() -> None:
             "signal.signal(signal.SIGTERM, lambda *_: print('host-handler', flush=True))\n"
             "signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))\n"
             "print('queued', flush=True)\n"
-            "os.kill(os.getpid(), signal.SIGTERM)\n"
+            # Thread-directed, so the signal stays pending on the masked main thread. A
+            # process-directed one goes to an unmasked library pool thread, and the host
+            # handler then runs if the main thread is slow to reach the installation.
+            "signal.pthread_kill(threading.get_ident(), signal.SIGTERM)\n"
             "install_signal_handlers()\n",
             "queued",
             id="pending-before-installation",
@@ -510,7 +513,7 @@ def test_defer_shutdown_signals_blocks_and_restores() -> None:
 def test_deferred_sigterm_exits_without_deadlocking(body: str, marker: str) -> None:
     """Queued shutdown uses installed handlers before unblocking or leaving critical locks."""
     code = (
-        "import os, signal\n"
+        "import os, signal, threading\n"
         "from phasesweep.runtime.shutdown import (install_signal_handlers, "
         "defer_shutdown_signals, _launch_lock, _lock)\n"
         + body

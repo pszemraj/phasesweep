@@ -15,7 +15,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Annotated, Literal, NotRequired, TypeAlias, TypeGuard, cast
+from typing import IO, Annotated, Literal, NotRequired, TypeAlias, TypeGuard
 from uuid import UUID, uuid4
 
 from pydantic import Field, TypeAdapter, ValidationError
@@ -87,10 +87,33 @@ _RUN_EVIDENCE_SUFFIXES = (
     ".transition.lock",
     ".heartbeat",
 )
-MCP_STATE_FORMAT_VERSION = 8
+#: Prefixes of the identities :meth:`RunStore.launch_inventory` gives records it cannot
+#: read: ``run:<id>`` names a run id, and ``handle:<file name>`` a handle file under
+#: ``runs/`` whose stem is no safe run id.
+_UNREADABLE_RUN = "run:"
+_UNREADABLE_HANDLE_FILE = "handle:"
+#: The operator's step for a state directory in another format, which nothing migrates.
+FRESH_STATE_DIR_STEP = (
+    "Point the catalog's `state_dir` at a new directory; the PhaseSweep version that wrote "
+    "this one still reads it."
+)
+MCP_STATE_FORMAT_VERSION = 9
 CLEANUP_UNCERTAINTY_SCHEMA_VERSION = 1
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
 _STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}
+
+
+def decode_unreadable_record(identity: str) -> tuple[str | None, str]:
+    """Decode an unreadable-record identity from :meth:`RunStore.launch_inventory`.
+
+    :param str identity: ``run:<id>`` or ``handle:<file name under runs/>``.
+    :return tuple[str | None, str]: The run id it names, or ``None`` for a handle file, and
+        how the operator finds it: the run id, or ``runs/<file name>``.
+    """
+    if identity.startswith(_UNREADABLE_RUN):
+        run_id = identity.removeprefix(_UNREADABLE_RUN)
+        return run_id, run_id
+    return None, f"runs/{identity.removeprefix(_UNREADABLE_HANDLE_FILE)}"
 
 
 class UnsupportedStateFormatError(ValueError):
@@ -395,10 +418,11 @@ class RunStore:
             payload = json.loads(raw)
         except ValueError:
             payload = None
+        keys = set(payload) if isinstance(payload, dict) else set()
         version = payload.get("schema_version") if isinstance(payload, dict) else None
         if type(version) is int and version != MCP_STATE_FORMAT_VERSION:
-            raise self._format_refusal(f"format marker declares unsupported format {version}")
-        if type(version) is not int or set(cast(dict[str, object], payload)) != {"schema_version"}:
+            raise self._marker_version_refusal(version)
+        if type(version) is not int or keys != {"schema_version"}:
             raise UnsafePrivatePathError(
                 f"MCP state directory {marker.parent} format marker {marker} is malformed. "
                 "Restore it before retrying recovery."
@@ -478,16 +502,15 @@ class RunStore:
     def _require_supported_format_marker(self) -> None:
         """Require the exact current private namespace marker without writing it.
 
-        :raises ValueError: The marker is malformed or declares another format.
+        :raises UnsupportedStateFormatError: The marker is unreadable, malformed, or
+            declares another format.
         """
         payload = _read_json_object(self._format_marker_path)
-        if (
-            payload is None
-            or set(payload) != {"schema_version"}
-            or type(payload["schema_version"]) is not int
-            or payload["schema_version"] != MCP_STATE_FORMAT_VERSION
-        ):
-            raise self._format_refusal("format marker is malformed or unsupported")
+        version = None if payload is None else payload.get("schema_version")
+        if type(version) is int and version != MCP_STATE_FORMAT_VERSION:
+            raise self._marker_version_refusal(version)
+        if payload is None or set(payload) != {"schema_version"} or type(version) is not int:
+            raise self._format_refusal("format marker is unreadable or malformed")
 
     def _create_format_marker(self) -> None:
         """Atomically claim the current format for a verified fresh namespace.
@@ -510,6 +533,17 @@ class RunStore:
         return UnsupportedStateFormatError(
             f"MCP state directory {self._format_marker_path.parent} {detail}; "
             "use a fresh MCP state directory."
+        )
+
+    def _marker_version_refusal(self, version: int) -> UnsupportedStateFormatError:
+        """Build the refusal for a well-formed marker that declares another format.
+
+        :param int version: Format the marker declares.
+        :return UnsupportedStateFormatError: Refusal naming both formats and the fresh-directory step.
+        """
+        return self._format_refusal(
+            f"format marker declares format {version}; "
+            f"this PhaseSweep reads format {MCP_STATE_FORMAT_VERSION}"
         )
 
     @contextlib.contextmanager
@@ -747,7 +781,7 @@ class RunStore:
         private_atomic_write_text(target, payload + "\n", strict_dir_fsync=True)
 
     def get(self, run_id: str) -> RunHandle | None:
-        """Load a run handle, returning ``None`` for absent or path-unsafe IDs.
+        """Load a run handle, returning ``None`` for missing, unreadable or path-unsafe IDs.
 
         :param str run_id: Agent-supplied run id to look up.
         :return RunHandle | None: Persisted handle when present and well-shaped, otherwise ``None``.
@@ -758,6 +792,20 @@ class RunStore:
         if not path.is_file():
             return None
         return self._load_handle(path, expected_run_id=run_id)
+
+    def has_run_records(self, run_id: str) -> bool:
+        """Distinguish an absent run id from one with unreadable or orphaned evidence.
+
+        :param str run_id: Looked-up run id with no readable handle.
+        :return bool: Whether a handle entry or sibling launch evidence exists.
+        """
+        if not SAFE_NAME_PATTERN.fullmatch(run_id):
+            return False
+        paths = (
+            self._runs_dir / f"{run_id}.json",
+            *(self._logs_dir / f"{run_id}{suffix}" for suffix in _RUN_EVIDENCE_SUFFIXES),
+        )
+        return any(self._path_entry_exists(path) for path in paths)
 
     def _scan_handles(self) -> tuple[list[RunHandle], set[str]]:
         """Load persisted handles and identify malformed handle records.
@@ -772,9 +820,9 @@ class RunStore:
             handle = self._load_handle(path, expected_run_id=path.stem)
             if handle is None:
                 unreadable.add(
-                    f"run:{path.stem}"
+                    f"{_UNREADABLE_RUN}{path.stem}"
                     if SAFE_NAME_PATTERN.fullmatch(path.stem)
-                    else f"handle:{path.name}"
+                    else f"{_UNREADABLE_HANDLE_FILE}{path.name}"
                 )
                 continue
             handles.append(handle)
@@ -806,7 +854,7 @@ class RunStore:
                     continue
                 run_id = path.name[: -len(suffix)]
                 if SAFE_NAME_PATTERN.fullmatch(run_id) and run_id not in readable_ids:
-                    unreadable.add(f"run:{run_id}")
+                    unreadable.add(f"{_UNREADABLE_RUN}{run_id}")
                 break
         return handles, unreadable
 
@@ -1256,10 +1304,11 @@ class RunStore:
         :param RunHandle handle: Persisted runner identity.
         :param RunnerView | None view: The caller's derivation of the runner,
             or ``None`` to derive it here.
-        :return bool: True when PID and starttime still identify a non-zombie
-            process of the boot and PID namespace the handle was written under,
-            or when the runner lives in a PID namespace this process cannot
-            observe. False when it is provably gone or absent, or observably dead.
+        :return bool: True when PID and starttime still identify a process that has
+            not exited, by :func:`phasesweep.runtime.reaper._has_exited`, in the boot
+            and PID namespace the handle was written under, or when the runner lives
+            in a PID namespace this process cannot observe. False when it is provably
+            gone or absent, or observably exited.
         """
         if handle.launch_state != "spawned" or handle.pid is None or handle.pid_starttime is None:
             return False

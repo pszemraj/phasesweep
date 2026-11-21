@@ -10,14 +10,16 @@ from pathlib import Path
 import pytest
 
 from phasesweep.mcp.errors import (
+    CatalogEntryInvalidError,
     CatalogReloadRefusedError,
     ConcurrencyLimitError,
     ConfigChangedError,
     ExperimentBusyError,
     PermissionDeniedError,
+    UnknownExperimentError,
 )
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunHandle
+from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.tool_names import TOOL_LAUNCH_RUN, TOOL_LIST_EXPERIMENTS
 from phasesweep.mcp.tools import PhaseSweepMCP
 from tests.mcp_helpers import (
@@ -26,13 +28,17 @@ from tests.mcp_helpers import (
     make_mcp_app,
     patch_popen_capture,
     side_effect_app,
+    stage_dead_run,
     stage_live_run,
     write_mcp_catalog,
+    write_run_status,
     write_srv_catalog,
     write_srv_config,
 )
 
 LOGGER = "phasesweep.mcp.server"
+#: The refusal of a catalog whose ``broken`` entry fails, which names it and every launch.
+BROKEN_NAMED = r"catalog entry 'broken' failed to load, so this server refuses launches of every"
 
 
 def _listed_ids(app: PhaseSweepMCP) -> list[str]:
@@ -134,13 +140,20 @@ def _break_catalog(tmp_path: Path, catalog: Path, config: Path, damage: str) -> 
         )
 
 
-@pytest.mark.parametrize(
-    "damage", ["catalog_yaml", "invalid_config", "namespace_alias", "missing_config"]
-)
+#: How the refusal of each damaging edit begins: it names the entries that fail to load.
+REFUSALS = {
+    "catalog_yaml": "the catalog file does not validate, so this server refuses launches of every",
+    "invalid_config": "catalog entry 'srv' failed to load, so this server refuses launches of every",
+    "namespace_alias": "catalog entry 'alias' failed to load, so this server refuses launches of",
+    "missing_config": "catalog entry 'srv' failed to load, so this server refuses launches of every",
+}
+
+
+@pytest.mark.parametrize("damage", REFUSALS)
 def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, damage: str
 ) -> None:
-    """Reads serve the last valid catalog, launch refuses path-free, and the refusal logs once."""
+    """Reads serve the last valid catalog, launch refuses path-free naming the failed entries, and the refusal logs once."""
     caplog.set_level(logging.INFO, logger=LOGGER)
     config, app, _registry, store = side_effect_app(tmp_path)
     catalog = tmp_path / "srv.catalog.yaml"
@@ -151,12 +164,17 @@ def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
 
     assert _listed_ids(app) == ["srv"]
     listed = app.list_experiments()
-    assert listed["experiments"][0]["capabilities"]["launch"] is False
-    assert listed["experiments"][0]["capabilities"]["cancel"] is True
+    # A refused launch takes its from_phase option with it; cancel still covers the live run.
+    assert listed["experiments"][0]["capabilities"] == {
+        "launch": False,
+        "cancel": True,
+        "from_phase": False,
+    }
     catalog_status = listed["catalog_status"]
     assert catalog_status["stale"] is True
     assert catalog_status["reload_refusal"] == "invalid"
-    assert "phasesweep mcp check" in catalog_status["remediation"]
+    assert catalog_status["remediation"].startswith(REFUSALS[damage])
+    assert "`phasesweep mcp check --catalog CATALOG`" in catalog_status["remediation"]
     latest = app.latest_run("srv")
     assert latest["run"] is not None and latest["run"]["run_id"] == "srv-live"
     assert latest["catalog_status"] == catalog_status
@@ -165,22 +183,26 @@ def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
     assert status["catalog_status"] == catalog_status
     if damage == "invalid_config":
         # The served entry no longer describes the file, so inspection refuses too.
-        with pytest.raises(CatalogReloadRefusedError, match="no longer validates"):
+        with pytest.raises(CatalogReloadRefusedError, match=REFUSALS[damage]):
             app.validate("srv")
         refused_inspection = call_mcp_tool(app, "inspect_experiment", {"experiment_id": "srv"})
         assert refused_inspection.isError
-        assert "inspection of changed configs" in str(refused_inspection.content)
+        assert "inspection of a changed config" in str(refused_inspection.content)
     else:
         inspected = call_mcp_tool(app, "inspect_experiment", {"experiment_id": "srv"})
         assert not inspected.isError
         assert inspected.structuredContent["experiment_id"] == "srv"
-        assert inspected.structuredContent["capabilities"]["launch"] is False
-        assert inspected.structuredContent["capabilities"]["cancel"] is True
-    with pytest.raises(CatalogReloadRefusedError, match="no longer validates") as excinfo:
+        assert inspected.structuredContent["capabilities"] == {
+            "launch": False,
+            "cancel": True,
+            "from_phase": False,
+        }
+    with pytest.raises(CatalogReloadRefusedError, match=REFUSALS[damage]) as excinfo:
         app.launch("srv")
     refused = call_mcp_tool(app, TOOL_LAUNCH_RUN, {"experiment_id": "srv"})
     assert refused.isError
     refusal_text = " ".join(getattr(item, "text", "") for item in refused.content)
+    assert str(excinfo.value) in refusal_text
     assert "phasesweep mcp check" in refusal_text
     for message in (str(excinfo.value), refusal_text):
         assert str(tmp_path) not in message
@@ -195,6 +217,71 @@ def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
     assert app.list_experiments()["catalog_status"]["stale"] is False
     assert app.list_experiments()["experiments"][0]["capabilities"]["launch"] is True
     assert len(_messages(caplog, "again matches the loaded catalog")) == 1
+
+
+def test_startup_with_a_failed_entry_serves_the_rest_and_refuses_launch_until_fixed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One entry failing at startup leaves the others readable, refuses launches, and clears with the fix."""
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    healthy = write_srv_config(tmp_path)
+    failing = write_srv_config(tmp_path, name="broken")
+    missing_cwd = tmp_path / "missing-cwd"
+    catalog = write_mcp_catalog(
+        tmp_path,
+        {"srv": healthy, "broken": failing},
+        allow=ALLOW_SIDE_EFFECTS,
+        cwd={"broken": missing_cwd},
+        filename="srv.catalog.yaml",
+    )
+    registry = Registry.load(catalog, collect_errors=True)
+    store = RunStore(registry.state_dir)
+    app = PhaseSweepMCP(registry, store)
+    assert [failure.experiment_id for failure in registry.failures] == ["broken"]
+    patch_popen_capture(monkeypatch)
+
+    # Launch is the first call: an unchanged-looking registry would clear the refusal here.
+    with pytest.raises(CatalogReloadRefusedError, match=BROKEN_NAMED) as refused:
+        app.launch("srv")
+    listed = app.list_experiments()
+    assert _listed_ids(app) == ["srv"]
+    assert listed["experiments"][0]["capabilities"]["launch"] is False
+    assert listed["catalog_status"]["stale"] is True
+    assert listed["catalog_status"]["reload_refusal"] == "invalid"
+    assert listed["catalog_status"]["remediation"] == str(refused.value)
+    with pytest.raises(CatalogEntryInvalidError, match="failed to load") as invalid:
+        app.validate("broken")
+    assert call_mcp_tool(app, "inspect_experiment", {"experiment_id": "broken"}).isError
+    with pytest.raises(UnknownExperimentError) as unknown:
+        app.validate("nope")
+    assert type(unknown.value) is UnknownExperimentError
+    for message in (str(refused.value), str(invalid.value)):
+        assert str(tmp_path) not in message
+    # The refusal the server started in carries the same text a reload would, so it logs once.
+    assert _messages(caplog, "catalog reload refused") == []
+
+    stage_dead_run(store, "srv-done", healthy, "srv", cleanup_uncertain=False)
+    stage_dead_run(store, "broken-done", failing, "broken", cleanup_uncertain=False)
+    for run_id in ("srv-done", "broken-done"):
+        write_run_status(
+            store,
+            run_id,
+            returncode=1,
+            error_class="RuntimeError",
+            result_snapshot_state="failed",
+        )
+    assert app.latest_run("broken")["run"]["run_id"] == "broken-done"
+    assert app.latest_run("srv")["run"]["run_id"] == "srv-done"
+    assert app.status(run_id="srv-done")["run"]["state"] == "failed"
+    assert app.status(run_id="broken-done")["run"]["state"] == "failed"
+
+    # Creating the directory changes no file the registry hashes; the next call still notices.
+    missing_cwd.mkdir()
+    assert app.list_experiments()["catalog_status"]["stale"] is False
+    assert _listed_ids(app) == ["srv", "broken"]
+    assert app.validate("broken")["experiment_id"] == "broken"
+    assert app.launch("srv")["experiment_id"] == "srv"
+    assert len(_messages(caplog, "reloaded catalog")) == 1
 
 
 def test_changed_state_dir_refuses_launch_and_keeps_the_original_store(tmp_path: Path) -> None:
@@ -261,9 +348,13 @@ def test_concurrent_calls_share_one_reload(tmp_path: Path, monkeypatch: pytest.M
     original_load = Registry.load
     loads: list[Path] = []
 
-    def counting_load(catalog_path: Path, *, bound_state_dir: Path | None = None) -> Registry:
+    def counting_load(
+        catalog_path: Path, *, bound_state_dir: Path | None = None, collect_errors: bool = False
+    ) -> Registry:
         loads.append(catalog_path)
-        return original_load(catalog_path, bound_state_dir=bound_state_dir)
+        return original_load(
+            catalog_path, bound_state_dir=bound_state_dir, collect_errors=collect_errors
+        )
 
     monkeypatch.setattr(Registry, "load", staticmethod(counting_load))
     barrier = threading.Barrier(8)

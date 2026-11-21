@@ -14,7 +14,7 @@ import optuna
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, PHASE_FINGERPRINT_PAYLOAD_ATTR, Winner
-from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
+from phasesweep.errors import FRESH_STUDY, NEW_STUDY_STEP, OperatorAction
 from phasesweep.runtime.json import JsonObject, json_object
 
 log = logging.getLogger(__name__)
@@ -207,6 +207,11 @@ _ABSENT = object()
 _MAX_REPORTED_CHANGES = 10
 _MAX_REPORTED_VALUE_CHARS = 80
 _REPORTED_VALUE_LEAD_CHARS = 24
+#: The refusal shows each recorded value, so restoring it is the first way out.
+_RESTORE_OR_NEW_STUDY_STEP = (
+    f"Restore the recorded value(s) to continue this study, or {FRESH_STUDY}; "
+    "the old study stays readable with its original config."
+)
 _CWD_FOLLOWS_INVOCATION = (
     "The trainer working directory follows the directory phasesweep runs from when "
     "execution.cwd is unset; run from the original directory or set execution.cwd in the "
@@ -238,6 +243,17 @@ def _changed_payload_keys(
     return [] if old == new else [(path, old, new)]
 
 
+def _render_value(value: object) -> str:
+    """Render one side of a changed key as compact JSON.
+
+    :param object value: Payload value, or ``_ABSENT``.
+    :return str: The JSON text; ``<absent>`` stands for a missing key.
+    """
+    if value is _ABSENT:
+        return "<absent>"
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
 def _render_changed_values(old: object, new: object) -> tuple[str, str]:
     """Render both sides of a changed key as compact JSON, cut to a readable length.
 
@@ -249,12 +265,7 @@ def _render_changed_values(old: object, new: object) -> tuple[str, str]:
     :param object new: Current payload value, or ``_ABSENT``.
     :return tuple[str, str]: The old and new text; ``<absent>`` stands for a missing key.
     """
-    old_text, new_text = (
-        "<absent>"
-        if value is _ABSENT
-        else json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        for value in (old, new)
-    )
+    old_text, new_text = _render_value(old), _render_value(new)
     if max(len(old_text), len(new_text)) <= _MAX_REPORTED_VALUE_CHARS:
         return old_text, new_text
     shared = next(
@@ -295,6 +306,32 @@ def _describe_changed_keys(changes: list[tuple[str, object, object]]) -> str:
     if len(changes) > _MAX_REPORTED_CHANGES:
         shown.append(f"and {len(changes) - _MAX_REPORTED_CHANGES} more")
     return f"Changed: {'; '.join(shown)}."
+
+
+def _restore_or_rename_step(experiment: Experiment, phase: Phase) -> str:
+    """Offer the rename that reruns a phase whose own keys changed, beside restoring them.
+
+    A phase's study is named after the phase, so a new name starts a new study and leaves
+    the other phases' studies valid. A phase that inherits the renamed one records that
+    name in its own study identity, so it needs a new name as well.
+
+    :param Experiment experiment: Experiment whose phases may inherit ``phase``.
+    :param Phase phase: Phase whose own configuration differs from its study's.
+    :return str: The operator's step.
+    """
+    dependents = experiment.phases_inheriting(phase.name)
+    if dependents:
+        named = ", ".join(f"`{name}`" for name in dependents)
+        rename = (
+            f"give this phase and each phase that inherits it ({named}) a new `name`, "
+            "updating every `inherits` to match, to rerun only those phases"
+        )
+    else:
+        rename = "give this phase a new `name` to rerun only this phase"
+    return (
+        f"Restore the recorded value(s) to continue this study, or {rename}. "
+        f"To rerun every phase, {FRESH_STUDY}."
+    )
 
 
 def _stamp_fingerprint(study: optuna.Study, fingerprint: str, payload: JsonObject) -> None:
@@ -359,11 +396,18 @@ def _verify_fingerprint(
         cwd_unset = experiment.execution.cwd is None and any(
             path == "execution.cwd" for path, _old, _new in changes
         )
+        # The message shows the recorded values only when the study kept the payload they came from.
+        if not changes:
+            way_forward = NEW_STUDY_STEP
+        elif all(path.startswith("phase.") for path, _old, _new in changes):
+            way_forward = _restore_or_rename_step(experiment, phase)
+        else:
+            way_forward = _RESTORE_OR_NEW_STUDY_STEP
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} was created with a different phase config "
             f"(fingerprint {existing} != {fp}). {_describe_changed_keys(changes)}",
             # Running from the original directory keeps the study; a new name does not.
             action=OperatorAction.FIX_CONFIG if cwd_unset else None,
-            remediation=_CWD_FOLLOWS_INVOCATION if cwd_unset else NEW_STUDY_STEP,
+            remediation=_CWD_FOLLOWS_INVOCATION if cwd_unset else way_forward,
         )
     return fp

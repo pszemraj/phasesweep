@@ -394,6 +394,22 @@ def test_tie_between_distinct_params_is_heterogeneous() -> None:
     assert "phases[].repeats" in _describe_flagged(block)[0]
 
 
+def test_noise_remedy_accompanies_only_a_flagged_tie() -> None:
+    """A winner clear of every other configuration carries no tie remedy; a flagged tie does."""
+    clear = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.9, 2))
+    tied = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.5, 2))
+
+    clear_tie = _confound_summary(
+        _assess(clear, clear), winner_trial=0, extractor_kind="json_envelope"
+    )["tie"]
+    tied_tie = _confound_summary(
+        _assess(tied, tied), winner_trial=0, extractor_kind="json_envelope"
+    )["tie"]
+
+    assert (clear_tie["verdict"], clear_tie["remedy"]) == ("ok", None)
+    assert (tied_tie["verdict"], tied_tie["remedy"]) == ("heterogeneous", _noise_remedy())
+
+
 @pytest.mark.parametrize("values", [(0.5, 0.5), (0.5, 0.6, 0.7)])
 def test_tie_between_repeats_of_one_config_is_unchecked(values: tuple[float, ...]) -> None:
     """Multiple trials of one configuration carry no configuration gap or noise advice."""

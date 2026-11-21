@@ -156,6 +156,45 @@ def same_pid_namespace(pid_namespace: str) -> bool:
     return current is not None and current == pid_namespace
 
 
+def ps_inspect_command(pids: str) -> str:
+    """Render the ``ps`` command that lists named processes with their groups and sessions.
+
+    :param str pids: Comma-separated PIDs of processes that were seen alive.
+    :return str: The command, in backticks, for a refusal's remedy.
+    """
+    return f"`ps -o pid,pgid,sid,cmd -p {pids}`"
+
+
+def group_members_command(pgid: str) -> str:
+    """Render the ``pgrep`` command that lists every live member of a process group.
+
+    A group outlives its leader while any child remains, and ``ps -p`` on the leader's PID
+    and the group number then prints nothing, so the group is listed by its number.
+
+    :param str pgid: The recorded process group, or a placeholder for the reader to fill in.
+    :return str: The command, in backticks, for a refusal's remedy.
+    """
+    return f"`pgrep -a -g {pgid}`"
+
+
+def recorded_process_check(identity_location: str) -> str:
+    """Word the manual check of a recorded trial process and the deletion it makes safe.
+
+    The recorded group number means something only where the sweep ran: from a host shell,
+    a number a container recorded names another group or none.
+
+    :param str identity_location: Where the ``process_identity.json`` to read is, as a
+        path or a description of the directory holding it.
+    :return str: The step naming the file to read, where to run the command that lists
+        every member of the recorded process group, and the entry deletion that follows.
+    """
+    return (
+        f"Look up pgid in {identity_location} and, on the host or in the container the sweep "
+        f"ran in, list that process group's members with {group_members_command('<pgid>')}; "
+        "once it lists none, delete the entry file."
+    )
+
+
 def recorded_process_blocker(
     pid_namespace: str, *, pids: Collection[int], pgids: Collection[int]
 ) -> str | None:
@@ -198,7 +237,7 @@ def recorded_process_blocker(
     named = ",".join(sorted(blockers, key=int))
     return (
         f"host process(es) {named} may be among its recorded processes; inspect them with "
-        f"`ps -o pid,pgid,sid,cmd -p {named}` and retry once they have exited"
+        f"{ps_inspect_command(named)} and retry once they have exited"
     )
 
 
@@ -321,6 +360,40 @@ def _read_proc_stat(proc_entry: Path) -> _ProcStat | None:
     return stat
 
 
+def _has_exited(pid: int, state: str) -> bool:
+    """Return whether a process whose ``stat`` reads ``state`` can no longer run.
+
+    ``X`` always means exited. ``Z`` means exited only once no other thread is
+    left: a thread-group leader that ends with ``pthread_exit``, as a C or C++
+    trainer can, reads ``Z`` while its other threads keep running, and
+    ``/proc/<pid>/task`` lists them beside the leader's own entry. A dead,
+    unreaped zombie lists only itself. An exiting thread leaves that listing
+    without ever reading ``Z``, so the other entries' own states are not read.
+    A vanished entry has exited; an unreadable listing cannot rule out a live
+    thread. macOS reports no per-thread process information, so its ``Z``
+    keeps meaning exited there.
+
+    ``runtime.supervisor._has_exited`` is a stdlib-only copy of this rule,
+    because the lease guardian runs without the package; change both together.
+
+    :param int pid: Process whose ``stat`` was read.
+    :param str state: Its one-letter state from procfs or macOS process info.
+    :return bool: Whether every thread of the process has exited.
+    """
+    if state == "X":
+        return True
+    if state != "Z":
+        return False
+    if sys.platform == "darwin":
+        return True
+    try:
+        return all(task.name == str(pid) for task in (_PROC / str(pid) / "task").iterdir())
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    except OSError:
+        return False
+
+
 def read_proc_starttime(pid: int) -> int | None:
     """Read the kernel's exact start time for a process on Linux or macOS.
 
@@ -353,18 +426,19 @@ def is_pid_alive(pid: int) -> bool:
 
 
 def is_same_live_process(pid: int | None, saved_starttime: int | None) -> bool:
-    """Return whether a PID identifies the same live, non-zombie process.
+    """Return whether a PID identifies the same process, which has not exited.
 
     :param int | None pid: Process identifier, if one was recorded.
     :param int | None saved_starttime: Recorded kernel process start time.
-    :return bool: Whether the identity still names a live non-zombie process.
+    :return bool: Whether the identity still names a process that can run, by
+        :func:`_has_exited`.
     """
     if pid is None or not is_pid_alive(pid):
         return False
     stat = read_process_info(pid) if sys.platform == "darwin" else _read_proc_stat(_PROC / str(pid))
     if saved_starttime is not None and (stat is None or stat.starttime != saved_starttime):
         return False
-    return stat is None or stat.state != "Z"
+    return stat is None or not _has_exited(pid, stat.state)
 
 
 def reap_child(pid: int) -> bool:
@@ -701,16 +775,16 @@ def _terminate_process_groups(
 
 
 def _process_group_alive(pgid: int) -> bool:
-    """Check whether any non-zombie member of ``pgid`` is alive.
+    """Check whether any member of ``pgid`` can still run.
 
     Without a mounted ``/proc`` (a chroot or container), fall back to ``killpg(0)``
     existence checks. When the ``/proc`` scan is incomplete or the kernel-visible group has
     no inspectable members, liveness cannot be ruled out and the group counts as alive.
 
     :param int pgid: Process-group ID to probe.
-    :return bool: ``True`` if at least one non-zombie member of the group exists or liveness
-        cannot be ruled out. ``False`` if the group is gone, or every remaining member is a
-        zombie (state ``Z``/``X``).
+    :return bool: ``True`` if at least one member of the group has not exited or liveness
+        cannot be ruled out. ``False`` if the group is gone, or every remaining member has
+        exited by :func:`_has_exited`.
     """
     return _process_group_alive_with_members(pgid, None)
 
@@ -759,7 +833,8 @@ def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -
 
     :param int pgid: Process-group ID to probe.
     :param set[int] | None member_pids: Cached group members, or ``None`` to scan once.
-    :return bool: ``True`` when a non-zombie member of the group is still alive.
+    :return bool: ``True`` when a member of the group has not exited, or that cannot be
+        ruled out.
     """
     if not _process_group_exists(pgid):
         return False
@@ -786,8 +861,8 @@ def _group_member_pids(pgid: int) -> _GroupMemberScan:
 
     :param int pgid: Process-group ID to find under ``/proc``.
     :return _GroupMemberScan: PIDs reporting membership, whether every proc
-        entry was inspectable, and whether all observed members were zombies
-        or exited.
+        entry was inspectable, and whether every observed member has exited
+        by :func:`_has_exited`.
     """
     if sys.platform == "darwin":
         # macOS has no procfs scan; killpg(0) remains the conservative proof.
@@ -820,7 +895,7 @@ def _group_member_pids(pgid: int) -> _GroupMemberScan:
             if stat is None or stat.pgrp != pgid:
                 continue
             member_pids.append(pid)
-            if stat.state not in {"Z", "X"}:
+            if not _has_exited(pid, stat.state):
                 all_members_terminal = False
     except OSError:
         complete = False
@@ -836,7 +911,7 @@ def _member_pids_alive(pgid: int, member_pids: Collection[int]) -> bool:
 
     :param int pgid: Process-group ID each PID must still belong to.
     :param Collection[int] member_pids: Candidate member PIDs to inspect.
-    :return bool: ``True`` when any candidate is a live, non-zombie member.
+    :return bool: ``True`` when any candidate is a member that has not exited.
     """
     for pid in member_pids:
         stat = _read_proc_stat(_PROC / str(pid))
@@ -844,7 +919,7 @@ def _member_pids_alive(pgid: int, member_pids: Collection[int]) -> bool:
             continue
         if stat.pgrp != pgid:
             continue
-        if stat.state in {"Z", "X"}:
+        if _has_exited(pid, stat.state):
             continue
         return True
     return False

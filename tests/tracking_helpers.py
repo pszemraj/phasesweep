@@ -5,8 +5,10 @@ from __future__ import annotations
 import dataclasses
 import errno
 import json
+import os
 import shlex
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,15 +18,20 @@ from optuna.trial import TrialState
 
 import phasesweep.engine.attempts as attempts_module
 import phasesweep.engine.cleanup as cleanup_module
+import phasesweep.engine.generation as generation_module
+import phasesweep.engine.guards as guards_module
 import phasesweep.engine.phase as phase_module
 from phasesweep.config.models import Experiment
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
+from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.state import ATTEMPT_ID_ATTR, CLEANUP_CONFIRMED_ATTR
 from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
+from phasesweep.evidence.evaluation import TrialContext
+from phasesweep.evidence.mlflow import compile_query
 from phasesweep.runtime import process
 from phasesweep.tracking import mlflow as worker
-from phasesweep.tracking import session
+from phasesweep.tracking import publication, session
 from phasesweep.tracking.mlflow import _capture
 
 
@@ -83,13 +90,64 @@ def attempt_identity(generation_id="a" * 32, attempt_id="b" * 32):
     return {k: v for k, v in binding.items() if k != "run_id"}
 
 
-def native_experiment(tmp_path):
-    """Build the complete native example in an isolated artifact namespace."""
+def native_experiment(tmp_path, *, storage=None):
+    """Build the complete native example in an isolated artifact namespace, in memory unless ``storage`` names a ledger."""
     config = yaml.safe_load(
         (Path(__file__).parents[1] / "src/phasesweep/templates/mlflow.yaml").read_text()
     )
-    config.update(workdir=str(tmp_path), storage=None)
+    config.update(workdir=str(tmp_path), storage=storage)
     return Experiment.model_validate(config)
+
+
+def mlflow_trial_context(tmp_path: Path) -> TrialContext:
+    """Build the context of the native example's one attempt, with its directory at ``tmp_path``.
+
+    :param Path tmp_path: The attempt directory, also the example's workdir.
+    :return TrialContext: Context carrying the MLflow settings and compiled query of a capture.
+    """
+    experiment = native_experiment(tmp_path)
+    return TrialContext(
+        experiment="test",
+        phase="p",
+        trial_id=0,
+        generation_id="a" * 32,
+        attempt_id="b" * 32,
+        overrides_sha256="c" * 64,
+        trial_dir=tmp_path,
+        run_name="test",
+        return_code=0,
+        duration_seconds=1,
+        mlflow_settings=experiment.mlflow.model_dump(),
+        mlflow_query=compile_query(experiment, []),
+    )
+
+
+def bind_mlflow_attempt(tmp_path: Path) -> tuple[dict[str, str | int], TrialContext]:
+    """Write the expected record and the binding of the native example's attempt.
+
+    :param Path tmp_path: The attempt directory.
+    :return tuple[dict[str, str | int], TrialContext]: The binding and the attempt's context.
+    """
+    binding = mlflow_binding()
+    session.write_record(
+        tmp_path / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
+    )
+    session.write_record(tmp_path / "mlflow-binding.json", binding)
+    return binding, mlflow_trial_context(tmp_path)
+
+
+def run_mlflow_worker_in_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer each supervised MLflow worker launch by running its entry point in this process.
+
+    :param pytest.MonkeyPatch monkeypatch: Replaces ``process.run_supervised`` for the test.
+    """
+
+    def run_in_process(command, **kwargs):
+        request_path, response_path = shlex.split(command)[-2:]
+        assert worker.main([request_path, response_path]) == 0
+        return process.ProcessResult(return_code=0, timed_out=False, pid=0, duration_seconds=0)
+
+    monkeypatch.setattr(process, "run_supervised", run_in_process)
 
 
 def scripted_response(script, request):
@@ -101,12 +159,11 @@ def scripted_response(script, request):
 
 
 def mlflow_binder(tmp_path, slot, *, experiment=None, identity=None, directory=None):
-    """Return the binding path and a ``_create_bound`` call for one creation in either slot."""
+    """Return the binding path and a ``_create_bound`` call for one attempt or generation binding."""
     experiment = experiment or native_experiment(tmp_path)
     identity = identity or attempt_identity()
     if slot == "attempt":
-        directory = directory or tmp_path
-        path, slot_arguments = directory / "mlflow-binding.json", {"attempt_directory": directory}
+        path = (directory or tmp_path) / "mlflow-binding.json"
     else:
         path = (
             session.tracking_root(experiment)
@@ -114,11 +171,10 @@ def mlflow_binder(tmp_path, slot, *, experiment=None, identity=None, directory=N
             / "generation-binding.json"
         )
         path.parent.mkdir(parents=True)
-        slot_arguments = {}
 
     def bind(deadline=None):
         return session._create_bound(
-            experiment, identity, path, {}, run_name="r", deadline=deadline, **slot_arguments
+            experiment, identity, path, {}, run_name="r", deadline=deadline
         )
 
     return bind, path
@@ -232,3 +288,264 @@ def remote_mlflow_example(tmp_path, monkeypatch):
     monkeypatch.setattr(session, "request_operation", respond)
     monkeypatch.setattr(worker, "request_operation", respond)
     return config, uploads
+
+
+def leak_tracking_worker(monkeypatch, *, action="publish", name=None):
+    """Leave the first MLflow worker of one request with its cleanup unconfirmed.
+
+    The worker's process group really runs and exits, but its lifecycle stays ``terminating`` and
+    its attempt-registry entry stays, as for a worker the controller lost track of, so a later pass
+    resolves it from its recorded identity. Every other request reaches the request operation
+    already in place.
+
+    :param pytest.MonkeyPatch monkeypatch: Replaces ``request_operation`` for the test.
+    :param str action: Worker action to leave unconfirmed: ``publish`` for an upload, ``resolve``
+        for a target check.
+    :param str | None name: Upload name to match, such as ``attempt-<id>``; any request of
+        ``action`` when ``None``.
+    :return list[str]: The operation id of the worker left unconfirmed, once one has been.
+    """
+    respond = session.request_operation
+    leaked = []
+
+    def leaky(request, *, operation_id, directory, environment, deadline):
+        matches = request["action"] == action and name in {None, request.get("name")}
+        if not matches or leaked:
+            return respond(
+                request,
+                operation_id=operation_id,
+                directory=directory,
+                environment=environment,
+                deadline=deadline,
+            )
+        leaked.append(operation_id)
+        with Path(os.devnull).open("w") as sink:
+            process.run_supervised(
+                "true",
+                env=dict(os.environ),
+                stdout=sink,
+                stderr=sink,
+                timeout=10,
+                trial_dir=directory,
+                attempt_id=operation_id,
+            )
+        process.write_attempt_lifecycle(
+            directory,
+            attempt_id=operation_id,
+            state="terminating",
+            return_code=-15,
+            cleanup_confirmed=False,
+        )
+        raise UnsafeProcessCleanupError(
+            f"mlflow worker cleanup is uncertain for attempt {operation_id!r}; recover {directory}."
+        )
+
+    monkeypatch.setattr(session, "request_operation", leaky)
+    monkeypatch.setattr(worker, "request_operation", leaky)
+    return leaked
+
+
+class RunnerKilled(BaseException):
+    """Stands in for the orchestrator dying, which no handler of the run may observe."""
+
+
+def killed_sweep(
+    tmp_path, monkeypatch, *, n_jobs, generation_id=None, in_flight=True, persistent=True
+):
+    """Kill a sweep of ``n_jobs`` managed attempts outright, by default with all of them in flight.
+
+    Each attempt's managed run and the generation's summary run exist. With the attempts in
+    flight, the trainers never start, no outcome is recorded and every trial stays RUNNING.
+    None of the run's failure handling or reconciliation runs, so it records no failed state
+    and finishes no MLflow run of its own failure.
+
+    :param str | None generation_id: The killed run's generation, as an MCP runner names it.
+    :param bool in_flight: Kill the run with its trials in flight; ``False`` lets every trial
+        finish, its accepted outcome sent, and kills the run before it publishes, so no trial is
+        left for recovery to settle.
+    :param bool persistent: Record the trials in a journal; ``False`` keeps them in memory, so
+        they are gone with the killed run and only their bound attempt directories remain.
+    :return tuple[Experiment, list, list[str]]: The experiment, the upload log, and the attempt ids.
+    """
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    if persistent:
+        config["storage"] = f"journal:///{tmp_path}/study.journal"
+    config["phases"] = config["phases"][:1]
+    config["phases"][0].update(
+        n_trials=n_jobs,
+        n_jobs=n_jobs,
+        allow_no_gpu_isolation=True,
+        sampler={"type": "random", "seed": 1},
+        search_space={"model.depth": {"type": "categorical", "choices": [1, 2, 3]}},
+    )
+    experiment = Experiment.model_validate(config)
+    launched = threading.Barrier(n_jobs)
+
+    def dies(*args, **kwargs):
+        launched.wait(10)
+        raise RunnerKilled()
+
+    def dies_unpublished(*args, **kwargs):
+        raise RunnerKilled()
+
+    with monkeypatch.context() as patch:
+        if in_flight:
+            patch.setattr(phase_module, "launch_trial", dies)
+            patch.setattr(phase_module, "_record_outcome", lambda *args, **kwargs: None)
+        else:
+            patch.setattr(generation_module, "_publish_generation", dies_unpublished)
+        patch.setattr(guards_module, "_reconcile_existing_studies", lambda *args, **kwargs: None)
+        patch.setattr(
+            generation_module, "_persist_failed_state_unless_recorded", lambda *args: None
+        )
+        patch.setattr(publication, "publish_failed_generation", lambda *args: None)
+        patch.setattr(publication, "deliver_recovered_attempts", lambda *args, **kwargs: None)
+        with pytest.raises(RunnerKilled):
+            run_experiment(experiment, generation_id=generation_id)
+    assert not any(session.tracking_root(experiment).glob("*/delivery/generation.json"))
+    if not persistent:
+        bindings = sorted(_experiment_dir(experiment).glob(f"*/trial_*/{session.BINDING_FILE}"))
+        assert len(bindings) == n_jobs
+        return experiment, uploads, [session.read_binding(b.parent)["attempt_id"] for b in bindings]
+    trials = read_phase_trials(validate_ledger(experiment), "depth").trials
+    state = TrialState.RUNNING if in_flight else TrialState.COMPLETE
+    assert [trial.state for trial in trials] == [state] * n_jobs
+    return experiment, uploads, [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials]
+
+
+@dataclasses.dataclass(frozen=True)
+class SwitchableWandb:
+    """A fake W&B server the real supervised reader polls, switched by a mode file.
+
+    ``up`` answers a finished run whose summary holds ``x=1.0``, ``crashed`` answers a run
+    that crashed, ``denied`` rejects the credentials with HTTP 401, and ``hang`` touches
+    ``hung`` and blocks. Every run lookup appends the mode it saw to ``polls``.
+    """
+
+    mode: Path
+    polls: Path
+    hung: Path
+
+    def switch(self, mode: str) -> None:
+        """Answer every later run lookup in ``mode``.
+
+        :param str mode: ``up``, ``crashed``, ``denied`` or ``hang``.
+        """
+        self.mode.write_text(mode)
+
+    def lookups(self, mode: str) -> int:
+        """Count the run lookups answered in ``mode`` so far.
+
+        :param str mode: Mode to count.
+        :return int: Lookups that saw ``mode``.
+        """
+        if not self.polls.exists():
+            return 0
+        return self.polls.read_text().splitlines().count(mode)
+
+
+def switchable_wandb(install_sdk, tmp_path: Path) -> SwitchableWandb:
+    """Install a fake ``wandb.apis.public`` for the real reader worker, starting ``up``.
+
+    :param install_sdk: The ``wandb_worker_sdk`` fixture's installer.
+    :param Path tmp_path: Directory holding the mode, lookup and hang files.
+    :return SwitchableWandb: The switch and its lookup log.
+    """
+    tracker = SwitchableWandb(
+        tmp_path / "wandb-mode", tmp_path / "wandb-lookups", tmp_path / "wandb-hung"
+    )
+    tracker.switch("up")
+    install_sdk(f"""
+        import time
+        from pathlib import Path
+
+        class _Denied(Exception):
+            response = type("Response", (), {{"status_code": 401}})()
+
+        class Api:
+            def __init__(self, **kwargs):
+                pass
+
+            def run(self, path):
+                mode = Path({str(tracker.mode)!r}).read_text()
+                with Path({str(tracker.polls)!r}).open("a") as polls:
+                    polls.write(mode + "\\n")
+                if mode == "hang":
+                    Path({str(tracker.hung)!r}).touch()
+                    time.sleep(60)
+                if mode == "denied":
+                    raise _Denied("credentials rejected")
+                state = "crashed" if mode == "crashed" else "finished"
+                return type("Run", (), {{"state": state, "summary_metrics": {{"x": 1.0}}}})()
+    """)
+    return tracker
+
+
+def wandb_objective_experiment(
+    tmp_path: Path,
+    *,
+    n_trials: int,
+    n_jobs: int = 1,
+    switch_at_launch: tuple[SwitchableWandb, int, str] | None = None,
+    max_consecutive_failures: int = 5,
+    metric_max: float | None = None,
+) -> tuple[Experiment, Path]:
+    """Build a persistent sweep whose objective W&B reports once its trainer exits cleanly.
+
+    Each trainer launch appends a line to the returned log and waits until ``n_jobs``
+    trainers have launched, so parallel trials finish training together.
+
+    :param Path tmp_path: Directory holding the ledger, workdir, trainer and launch log.
+    :param int n_trials: The phase's trial target.
+    :param int n_jobs: The phase's parallel workers.
+    :param tuple[SwitchableWandb, int, str] | None switch_at_launch: The fake W&B server, a
+        launch number and a mode: that launch's trainer switches the server to the mode, so
+        its own evidence and every later lookup see it.
+    :param int max_consecutive_failures: The phase's failure limit.
+    :param float | None metric_max: Upper bound above which the objective is infeasible.
+    :return tuple[Experiment, Path]: The experiment and its trainer launch log.
+    """
+    from phasesweep.config.models import Metric
+    from phasesweep.evidence.models import WandbExtractor
+    from tests.conftest import make_experiment, write_trainer
+
+    launches = tmp_path / "launches"
+    switch = (
+        None
+        if switch_at_launch is None
+        else (switch_at_launch[1], str(switch_at_launch[0].mode), switch_at_launch[2])
+    )
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import time
+        from pathlib import Path
+        launches = Path({str(launches)!r})
+        with launches.open("a") as log:
+            log.write("launch\\n")
+        switch = {switch!r}
+        if switch is not None and len(launches.read_text().splitlines()) == switch[0]:
+            Path(switch[1]).write_text(switch[2])
+        deadline = time.monotonic() + 15
+        while len(launches.read_text().splitlines()) < {n_jobs} and time.monotonic() < deadline:
+            time.sleep(0.02)
+        """,
+    )
+    remote = WandbExtractor(
+        type="wandb",
+        base_url="https://example.test",
+        entity="e",
+        project="p",
+        metric_key="x",
+        poll_seconds=0.01,
+        timeout_seconds=30,
+    )
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        metric=Metric(extractor=remote, max=metric_max),
+        n_trials=n_trials,
+        n_jobs=n_jobs,
+        max_consecutive_failures=max_consecutive_failures,
+    )
+    return experiment, launches

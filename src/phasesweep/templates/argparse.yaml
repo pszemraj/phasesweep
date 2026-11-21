@@ -21,7 +21,7 @@ execution:
 #   --model.n_layers=8 --model.dropout=0.1 --optimizer.lr=0.0003 --optimizer.weight_decay=0.05
 # For your own trainer, for example: "python train.py {overrides}".
 override_format: argparse
-trial_command: "python -m phasesweep.examples.fake_train {overrides}"
+trial_command: "phasesweep-fake-train {overrides}"
 
 # The trainer's base flags, written here as nested keys. Each leaf becomes one flag, and a phase
 # replaces a flag by its dotted key. Put what stays fixed across trials here: data, batch size,
@@ -49,7 +49,9 @@ metric:
     expected_step: 100
 
 phases:
+  # The toy trainer runs on CPU. For a GPU trainer, remove gpu_policy: none to enable leasing.
   - name: learning_rate
+    gpu_policy: none
     comment: "Search the learning rate on a log scale, with a fixed seed so the draws repeat."
     n_trials: 4
     # Each draw derives from this seed and the draw position, so a resumed phase draws the same set as an uninterrupted one.

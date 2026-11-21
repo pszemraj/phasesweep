@@ -25,6 +25,7 @@ from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.read import read_result, read_status
 from phasesweep.engine.run import run_experiment
 from phasesweep.tracking.publication import delivery_status, sync_tracking
+from tests.conftest import console_script
 
 pytestmark = pytest.mark.integration
 
@@ -42,9 +43,7 @@ def _server(tmp_path):
     with (tmp_path / "server.log").open("w") as log:
         process = subprocess.Popen(
             [
-                sys.executable,
-                "-m",
-                "mlflow",
+                str(console_script("mlflow")),
                 "server",
                 "--host",
                 "127.0.0.1",
@@ -305,7 +304,7 @@ def test_two_phases_native_http_then_offline(offline_server, tmp_path, monkeypat
         workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'study.journal'}"
     )
     config["trial_command"] = (
-        f"{Path(sys.executable).with_name('phasesweep-mlflow-train')} --config {{config_path}}"
+        f"{console_script('phasesweep-mlflow-train')} --config {{config_path}}"
     )
     config["mlflow"].update(tracking_uri=uri, run_mode=mode, timeout_seconds=15, poll_seconds=0.05)
     if mode == "trainer":
@@ -520,34 +519,14 @@ def test_failed_trainer_http_summary_delivery_and_sync(local_server, tmp_path, m
     assert read_status(experiment)["phases"] == status["phases"]
 
 
-@pytest.mark.parametrize(
-    "trainer_outcome", ["bare_crash", "ended_crash", "no_objective", "ended_then_logged"]
-)
-def test_managed_failed_trial_overrides_the_trainer_run_status(
-    local_server, tmp_path: Path, caplog: pytest.LogCaptureFixture, trainer_outcome: str
-) -> None:
-    """A failed managed trial closes its bound run as FAILED, including a trainer's FINISHED run."""
-    import csv
+_OBJECTIVE_HINT = "logged under another key or logging went to another run"
 
-    from click.testing import CliRunner
 
-    from phasesweep.cli import cli
-    from phasesweep.engine.paths import _experiment_dir
-    from phasesweep.engine.selection import NoFeasibleTrialError
-    from phasesweep.engine.state import FAILURE_REASON_ATTR
-    from phasesweep.tracking.session import read_binding
-    from tests.conftest import phase_trials, write_experiment_config
-
-    uri, client, experiment_id, _process = local_server
-    programs = {
-        "bare_crash": "mlflow.log_metric('loss', 0.01)\nraise RuntimeError('trainer failed')\n",
-        "ended_crash": "mlflow.log_metric('loss', 0.01)\nmlflow.end_run()\nraise RuntimeError('trainer failed')\n",
-        "no_objective": "with mlflow.start_run():\n    mlflow.log_metric('other', 1.0)\n",
-        "ended_then_logged": "with mlflow.start_run():\n    mlflow.log_metric('other', 1.0)\nmlflow.log_metric('loss', 0.01)\n",
-    }
-    trainer = tmp_path / "trainer.py"
-    trainer.write_text("import mlflow\n" + programs[trainer_outcome], encoding="utf-8")
-    experiment = Experiment.model_validate(
+def _managed_loss_experiment(
+    tmp_path: Path, uri: str, experiment_id: str, trainer: Path, *, n_trials: int
+) -> Experiment:
+    """Return a one-phase managed-MLflow experiment whose objective is the run's last ``loss``."""
+    return Experiment.model_validate(
         {
             "experiment": "managed-contract",
             "workdir": str(tmp_path / "runs"),
@@ -570,15 +549,50 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
             "phases": [
                 {
                     "name": "p",
-                    "n_trials": 1,
+                    "n_trials": n_trials,
                     "gpu_policy": "none",
-                    "max_consecutive_failures": 1,
+                    "max_consecutive_failures": n_trials,
                     "sampler": {"type": "random", "seed": 0},
                     "search_space": {"x": {"type": "int", "low": 0, "high": 1}},
                 }
             ],
         }
     )
+
+
+@pytest.mark.parametrize(
+    "trainer_outcome", ["bare_crash", "ended_crash", "no_objective", "ended_then_logged"]
+)
+def test_managed_failed_trial_overrides_the_trainer_run_status(
+    local_server,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    trainer_outcome: str,
+) -> None:
+    """A failed managed trial closes its bound run as FAILED, including a trainer's FINISHED run."""
+    import csv
+
+    from click.testing import CliRunner
+
+    from phasesweep.cli import cli
+    from phasesweep.engine.paths import _experiment_dir
+    from phasesweep.engine.selection import NoFeasibleTrialError
+    from phasesweep.engine.state import FAILURE_REASON_ATTR
+    from phasesweep.tracking.session import read_binding
+    from tests.conftest import phase_trials, write_experiment_config
+
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
+    uri, client, experiment_id, _process = local_server
+    programs = {
+        "bare_crash": "mlflow.log_metric('loss', 0.01)\nraise RuntimeError('trainer failed')\n",
+        "ended_crash": "mlflow.log_metric('loss', 0.01)\nmlflow.end_run()\nraise RuntimeError('trainer failed')\n",
+        "no_objective": "with mlflow.start_run():\n    mlflow.log_metric('other', 1.0)\n",
+        "ended_then_logged": "with mlflow.start_run():\n    mlflow.log_metric('other', 1.0)\nmlflow.log_metric('loss', 0.01)\n",
+    }
+    trainer = tmp_path / "trainer.py"
+    trainer.write_text("import mlflow\n" + programs[trainer_outcome], encoding="utf-8")
+    experiment = _managed_loss_experiment(tmp_path, uri, experiment_id, trainer, n_trials=1)
 
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(experiment)
@@ -590,7 +604,7 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     assert "phasesweep.objective" not in remote.data.metrics
     assert read_status(experiment)["phases"][0]["trials"]["FAIL"] == 1
     if trainer_outcome in {"no_objective", "ended_then_logged"}:
-        assert "logged under another key or logging went to another run" in caplog.text
+        assert caplog.text.count(_OBJECTIVE_HINT) == 1
         assert "read MLFLOW_RUN_ID before any MLflow call" in caplog.text
         assert "loss" not in remote.data.metrics
     else:
@@ -607,3 +621,47 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     assert shown.output.count(reason) == 1
     header = next(line for line in shown.output.splitlines() if line.startswith("trial"))
     assert header.index("reason") < 100
+
+
+def test_managed_missing_objective_hint_is_logged_once_per_phase(
+    local_server,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A phase of managed trials that never log the objective states the one-run hint once in the log, and each stored reason keeps only the key diagnostic."""
+    from click.testing import CliRunner
+
+    from phasesweep.cli import cli
+    from phasesweep.engine.paths import _experiment_dir
+    from phasesweep.engine.selection import NoFeasibleTrialError
+    from phasesweep.engine.state import FAILURE_REASON_ATTR
+    from tests.conftest import phase_trials, write_experiment_config
+
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
+    uri, _client, experiment_id, _process = local_server
+    trainer = tmp_path / "trainer.py"
+    trainer.write_text(
+        "import mlflow\nwith mlflow.start_run():\n    mlflow.log_metric('other', 1.0)\n",
+        encoding="utf-8",
+    )
+    experiment = _managed_loss_experiment(tmp_path, uri, experiment_id, trainer, n_trials=2)
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+
+    reasons = [str(t.user_attrs[FAILURE_REASON_ATTR]) for t in phase_trials(experiment, "p")]
+    config = tmp_path / "sweep.yaml"
+    write_experiment_config(config, experiment)
+    shown = CliRunner().invoke(cli, ["status", str(config), "--trials"])
+    assert shown.exit_code == 0, shown.output
+    run_log = (_experiment_dir(experiment) / "run.log").read_text(encoding="utf-8")
+    assert {
+        "captured log": caplog.text.count(_OBJECTIVE_HINT),
+        "run.log": run_log.count(_OBJECTIVE_HINT),
+        "stored reasons": sum(reason.count(_OBJECTIVE_HINT) for reason in reasons),
+        "status table": shown.output.count(_OBJECTIVE_HINT),
+    } == {"captured log": 1, "run.log": 1, "stored reasons": 0, "status table": 0}
+    assert len(reasons) == 2
+    for reason in reasons:
+        assert reason.endswith("finished without metric 'loss'; available metric keys: ['other'].")

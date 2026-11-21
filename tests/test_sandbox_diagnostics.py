@@ -17,7 +17,7 @@ def test_mcp_lock_access_failure_has_operator_remediation() -> None:
     )
     # The lock is taken before the engine can report, so the runner has no report to read.
     primary, stage = _terminal_error(None, error)
-    failure = _terminal_failure_payload(primary, stage=stage, cleanup_confirmed=True)
+    failure = _terminal_failure_payload(primary, run_id="r0", stage=stage, cleanup_confirmed=True)
 
     assert failure["code"] == "storage_unavailable"
     assert failure["stage"] == "preflight"
@@ -26,7 +26,7 @@ def test_mcp_lock_access_failure_has_operator_remediation() -> None:
     assert failure["remediation"] == (
         "Ask the operator to point PHASESWEEP_LOCK_DIR at an existing writable directory shared "
         "by every shell, MCP server, and sandbox on the host, or run on the host. The error in "
-        "the PhaseSweep run log gives the details."
+        "this run's log, `logs/r0.log` under the catalog's `state_dir`, gives the details."
     )
     assert "/private/host/locks" not in str(failure)
 

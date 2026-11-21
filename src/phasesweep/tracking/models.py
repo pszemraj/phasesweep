@@ -71,13 +71,15 @@ class MlflowSettings(_Frozen):
             "run_mode": self.run_mode,
         }
 
-    def target(self) -> MlflowTarget:
+    def target(self, *, polling: MlflowSettings | None = None) -> MlflowTarget:
         """Return the full target a supervised worker receives.
 
+        :param MlflowSettings | None polling: Override the polling controls when retrying a recorded source.
         :return MlflowTarget: Source identity plus the polling budgets.
         """
+        controls = polling or self
         return {
             **self.evidence_identity(),
-            "poll_seconds": self.poll_seconds,
-            "timeout_seconds": self.timeout_seconds,
+            "poll_seconds": controls.poll_seconds,
+            "timeout_seconds": controls.timeout_seconds,
         }

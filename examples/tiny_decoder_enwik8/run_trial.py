@@ -9,8 +9,6 @@ import hashlib
 import importlib.util
 import math
 import os
-import subprocess
-import sys
 from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
@@ -41,33 +39,45 @@ def _read_yaml_mapping(path: Path) -> tuple[dict[str, Any], str]:
     return data, hashlib.sha256(raw).hexdigest()
 
 
-def _load_upstream_trainer(train_py: Path) -> ModuleType:
-    """Load the pinned trainer module so final evaluation reuses its data utilities.
+def _load_trainer(train_py: Path) -> ModuleType:
+    """Load the pinned trainer module, which imports ``decoder_pytorch`` from the environment.
 
     :param Path train_py: Validated path to the checkout's trainer script.
+    :raises ImportError: The script cannot be loaded as a module.
     :return ModuleType: Loaded trainer module.
     """
-    template_root = train_py.parent
     spec = importlib.util.spec_from_file_location("_phasesweep_decoder_trainer", train_py)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load decoder trainer from {train_py}")
     module = importlib.util.module_from_spec(spec)
-    sys.path.insert(0, str(template_root))
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        sys.path.remove(str(template_root))
+    spec.loader.exec_module(module)
     return module
 
 
-def _evaluate_final_checkpoint(train_py: Path, trainer_run_dir: Path) -> dict[str, object]:
+def _train(trainer: ModuleType, template_root: Path, config_path: Path) -> None:
+    """Train in this process, as ``train.py --config`` would from the checkout.
+
+    The trainer opens its relative ``data_path`` and ``run_dir`` against the working directory,
+    so it runs with the checkout as that directory.
+
+    :param ModuleType trainer: Loaded trainer module.
+    :param Path template_root: Checkout directory the trainer's relative paths resolve against.
+    :param Path config_path: Complete per-trial trainer YAML.
+    """
+    with contextlib.chdir(template_root):
+        trainer.train(str(config_path))
+
+
+def _evaluate_final_checkpoint(
+    trainer: ModuleType, template_root: Path, trainer_run_dir: Path
+) -> dict[str, object]:
     """Evaluate the saved final checkpoint with the trainer's validation semantics.
 
-    :param Path train_py: Validated path to the checkout's trainer script.
+    :param ModuleType trainer: Loaded trainer module, whose data utilities the evaluation reuses.
+    :param Path template_root: Checkout directory a relative ``data_path`` resolves against.
     :param Path trainer_run_dir: Directory containing the saved final checkpoint.
     :return dict[str, object]: Final-checkpoint metric and evaluation metadata.
     """
-    trainer = _load_upstream_trainer(train_py)
     torch = trainer.torch
     checkpoint_path = trainer_run_dir / "final.pt"
     device, device_type, amp_dtype = trainer.get_optimal_device()
@@ -100,7 +110,7 @@ def _evaluate_final_checkpoint(train_py: Path, trainer_run_dir: Path) -> dict[st
         torch.manual_seed(config["seed"])
     data_path = Path(config["data_path"])
     if not data_path.is_absolute():
-        data_path = train_py.parent / data_path
+        data_path = template_root / data_path
     _, val_data = trainer.load_data(str(data_path))
     val_dataset = trainer.SequenceDataset(val_data, config["seq_len"])
     val_loader = trainer.cycle(
@@ -193,20 +203,6 @@ def _write_result(metric_record: Mapping[str, Any]) -> None:
     )
 
 
-def _run_template(train_py: Path, config_path: Path) -> None:
-    """Run the upstream decoder trainer with the composed YAML config.
-
-    :param Path train_py: Validated path to the checkout's trainer script.
-    :param Path config_path: Complete per-trial trainer YAML.
-    """
-    subprocess.run(
-        [sys.executable, str(train_py), "--config", str(config_path)],
-        cwd=train_py.parent,
-        env=os.environ.copy(),
-        check=True,
-    )
-
-
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line parser."""
     parser = argparse.ArgumentParser(
@@ -261,8 +257,9 @@ def main(argv: list[str] | None = None) -> int:
                 bind_mlflow_run(run.info.run_id)
             mlflow.log_params(config)
 
-        _run_template(train_py, config_path)
-        metric_record = _evaluate_final_checkpoint(train_py, trainer_run_dir)
+        trainer = _load_trainer(train_py)
+        _train(trainer, template_root, config_path)
+        metric_record = _evaluate_final_checkpoint(trainer, template_root, trainer_run_dir)
         _validate_final_evaluation(config_sha256, metric_record)
         if args.mlflow:
             mlflow.log_metrics(

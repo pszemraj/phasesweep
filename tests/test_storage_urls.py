@@ -46,6 +46,24 @@ def test_auto_storage_resolves_without_writing(
     assert _run_lock_paths(experiment) == _run_lock_paths(explicit)
 
 
+@pytest.mark.parametrize(
+    ("storage", "persistent"),
+    [(None, False), ("auto", True), ("journal:///tmp/x.journal", True)],
+    ids=["memory", "auto", "journal"],
+)
+def test_persistent_follows_storage_and_is_not_configuration(
+    storage: str | None, persistent: bool
+) -> None:
+    """The persistence predicate answers from ``storage`` alone and never enters the config model."""
+    experiment = make_experiment(storage=storage)
+
+    assert experiment.persistent is persistent
+    assert (experiment.resolved_storage is not None) is persistent
+    assert "persistent" not in Experiment.model_fields
+    assert "persistent" not in experiment.model_dump()
+    assert "persistent" not in Experiment.model_json_schema()["properties"]
+
+
 @pytest.mark.parametrize("invalid", ["provenance", "seed"])
 def test_auto_storage_requires_persistent_contract(invalid: str) -> None:
     payload = make_experiment(storage="auto").model_dump()

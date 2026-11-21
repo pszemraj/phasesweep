@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import stat
@@ -50,10 +51,12 @@ if TYPE_CHECKING:
     from phasesweep.runtime.json import JsonObject
     from phasesweep.tracking.records import MlflowCapture, MlflowQuery, MlflowTarget
 
+log = logging.getLogger(__name__)
+
 # Objective-evidence provenance schema version.
-EVIDENCE_PROVENANCE_SCHEMA_VERSION = 3
+EVIDENCE_PROVENANCE_SCHEMA_VERSION = 4
 # Log-regex evaluation revision included in the extractor contract.
-LOG_REGEX_EVALUATION_REVISION = 2
+LOG_REGEX_EVALUATION_REVISION = 3
 
 
 def extractor_config_fingerprint(cfg: ObjectiveExtractor) -> str:
@@ -141,6 +144,18 @@ class ExtractorError(RuntimeError):
 
 class DeadlineExceededError(ExtractorError):
     """Raised when the phase/run deadline directly prevents extraction."""
+
+
+class EvidenceUnreadableError(ExtractorError):
+    """Raised when the tracker gave no answer about the trial's remote evidence.
+
+    An outage, rejected credentials, a missing SDK or a failed reader worker says nothing
+    about the trial, so its finished training waits for a later read instead of failing.
+    """
+
+
+class MlflowObjectiveMissingError(ExtractorError):
+    """Raised when a finished managed MLflow run lacks the configured objective metric."""
 
 
 @contextmanager
@@ -339,14 +354,16 @@ def _extract_log_regex(
 ) -> float:
     """Select a numeric regex match and digest the complete log file.
 
-    First selection stops matching after its first hit but continues reading for
-    the digest. Provenance includes the selected 1-based line and numeric match count.
+    First selection stops matching after its first numeric hit but continues reading for
+    the digest. Warn when a numeric result leaves unparseable captures behind.
+    Provenance includes the selected 1-based line and numeric match count.
 
     :param TrialContext ctx: Trial identity; the log is read from its ``trial_dir``.
     :param LogRegexExtractor cfg: Log path, named value group, and first/last/min/max selector.
     :param dict | None provenance: Optional source-evidence sink.
     :raises ExtractorError: The log is missing, unreadable, has no numeric match,
-        or a line eligible for matching is invalid UTF-8.
+        has a non-finite match under ``min`` or ``max``, or a line eligible for
+        matching is invalid UTF-8.
     :return float: Selected match value.
     """
     import re
@@ -364,6 +381,7 @@ def _extract_log_regex(
     result: float | None = None
     result_line: int | None = None
     count = 0
+    first_unparseable: str | None = None
     line_no = 0
     try:
         with target.open("r", encoding="utf-8", errors="surrogateescape", newline="") as fh:
@@ -382,14 +400,28 @@ def _extract_log_regex(
                     line = line[:-1] + "\n"
                 line_no += 1
                 for match in pattern.finditer(line):
+                    captured = match.group("value")
                     try:
-                        v = float(match.group("value"))
+                        v = float(captured)
                     except (TypeError, ValueError):
+                        if first_unparseable is None:
+                            first_unparseable = (
+                                f"First unparseable capture {captured!r} on line {line_no}. "
+                                "Adjust the capture to exclude delimiters around the number."
+                            )
                         continue
                     count += 1
                     if cfg.select in ("first", "last"):
                         result = v
                         result_line = line_no
+                    elif not math.isfinite(v):
+                        # Float ordering puts nan and inf anywhere, so a diverged
+                        # run would be scored on whichever side of them it landed.
+                        raise ExtractorError(
+                            f"Log file {target} has a non-finite match on line {line_no}, "
+                            f"so select: {cfg.select} cannot score this trial. "
+                            "Check why the trainer reported a non-finite objective."
+                        )
                     elif cfg.select == "min":
                         if result is None or v < result:
                             result, result_line = v, line_no
@@ -403,9 +435,20 @@ def _extract_log_regex(
     except OSError as exc:
         raise ExtractorError(f"Could not read log file at {target}: {exc}") from exc
 
-    if count == 0:
+    if first_unparseable is not None:
+        if result is None:
+            raise ExtractorError(
+                f"Pattern {cfg.pattern!r} matched in {target}, but no 'value' capture was "
+                f"numeric. {first_unparseable}"
+            )
+        log.warning(
+            "Pattern %r skipped nonnumeric 'value' captures in %s. %s",
+            cfg.pattern,
+            target,
+            first_unparseable,
+        )
+    if result is None:
         raise ExtractorError(f"No matches for {cfg.pattern!r} in {target}.")
-    assert result is not None  # count > 0 guarantees this
     if provenance is not None:
         provenance["source"] = {
             "kind": "file",
@@ -427,7 +470,9 @@ def _capture_wandb(
     :param _WandbSummarySource cfg: Source for a one-off query if needed.
     :param float | None deadline: Absolute monotonic deadline, also bounded by the source timeout.
     :raises DeadlineExceededError: The execution deadline prevents capture.
-    :raises ExtractorError: Polling, authentication, SDK setup, or run state fails, the
+    :raises EvidenceUnreadableError: W&B gave no answer: authentication or setup failed, the
+        SDK is missing, the reader worker failed, or every poll failed in transport.
+    :raises ExtractorError: The run is missing, ended unsuccessfully or never finished, the
         finished summary lacks required keys, or evidence is invalid.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     :return dict: Finished run identity, numeric values, present keys, and retrieval time.
@@ -463,26 +508,37 @@ def _capture_wandb(
                 deadline=poll_deadline,
             )
         except (WandbPollTimeout, WandbRunMissingError) as exc:
-            error = (
+            unanswered = isinstance(exc, WandbPollTimeout) and not exc.reached
+            # The worker stops polling a reserve before its deadline so that its report arrives
+            # in time, so the clock is usually still short of that deadline here. A poll that
+            # ended before the evidence was complete while the execution deadline was the
+            # binding limit was cut short by it, whether or not the clock has passed it.
+            error: type[ExtractorError] = (
                 DeadlineExceededError
-                if capped and time.monotonic() >= poll_deadline
+                if capped
+                else EvidenceUnreadableError
+                if unanswered
                 else ExtractorError
             )
             if isinstance(exc, WandbRunMissingError):
                 message = (
                     f"No W&B run {ctx.attempt_id!r} was found in {source.entity}/{source.project} "
-                    "at the evidence deadline. Call wandb.init() in the trainer. If it passes "
-                    "its own project, entity or id, remove those overrides, or set the "
-                    "extractor's project and entity to match."
+                    "at the evidence deadline. Check that the trainer calls wandb.init() and "
+                    "passes no project, entity or id of its own, or set the extractor's "
+                    "project and entity to match."
                 )
             else:
-                message = (
-                    f"W&B evidence deadline expired for {target}; required summary keys: {query.numeric_keys!r}."
-                    + (f" Last observation: {exc.last_error}" if exc.last_error else "")
+                expired = (
+                    f"W&B gave no answer for {target} before the evidence deadline"
+                    if unanswered
+                    else f"W&B evidence deadline expired for {target}"
+                )
+                message = f"{expired}; required summary keys: {query.numeric_keys!r}." + (
+                    f" Last observation: {exc.last_error}" if exc.last_error else ""
                 )
             raise error(message) from exc
         except WandbSetupError as exc:
-            raise ExtractorError(
+            raise EvidenceUnreadableError(
                 f"W&B authentication/setup failed for {target}: {exc.cause}. Check account access and endpoint settings."
             ) from exc
         except WandbRunTerminalError as exc:
@@ -495,7 +551,7 @@ def _capture_wandb(
                 f"available summary keys: {exc.available!r}."
             ) from exc
         except ImportError as exc:
-            raise ExtractorError(
+            raise EvidenceUnreadableError(
                 "W&B evidence requires the optional SDK; install phasesweep[wandb]."
             ) from exc
         except ValueError as exc:
@@ -503,7 +559,7 @@ def _capture_wandb(
         except (ExtractorError, UnsafeProcessCleanupError):
             raise
         except RuntimeError as exc:
-            raise ExtractorError(f"W&B evidence worker failed for {target}.") from exc
+            raise EvidenceUnreadableError(f"W&B evidence worker failed for {target}.") from exc
     except DeadlineExceededError:
         raise
     except ExtractorError as exc:
@@ -605,10 +661,19 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
     :param TrialContext ctx: Attempt and configured capture contract.
     :param float | None deadline: Existing execution deadline.
     :return MlflowCapture: Shared frozen evidence.
+    :raises DeadlineExceededError: The execution deadline stopped the capture.
+    :raises EvidenceUnreadableError: MLflow gave no answer: it was unreachable, refused
+        access, lacked its SDK, timed out, or the reader's outcome is unknown.
+    :raises MlflowObjectiveMissingError: A finished managed run lacks the objective metric.
     :raises ExtractorError: Binding or remote evidence cannot be accepted.
     """
     from phasesweep.evidence.mlflow import validate_capture
-    from phasesweep.tracking.mlflow import request_operation
+    from phasesweep.tracking.mlflow import (
+        ManagedObjectiveMissingError,
+        OperationOutcomeUnknownError,
+        OperationUnavailableError,
+        request_operation,
+    )
     from phasesweep.tracking.session import BINDING_FILE, read_binding, read_record
 
     if ctx.mlflow_capture:
@@ -649,7 +714,11 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
     except TimeoutError as exc:
         if deadline is not None and time.monotonic() >= deadline:
             raise DeadlineExceededError(str(exc)) from exc
-        raise ExtractorError(str(exc)) from exc
+        raise EvidenceUnreadableError(str(exc)) from exc
+    except (OperationUnavailableError, OperationOutcomeUnknownError) as exc:
+        raise EvidenceUnreadableError(str(exc)) from exc
+    except ManagedObjectiveMissingError as exc:
+        raise MlflowObjectiveMissingError(str(exc)) from exc
     except (OSError, ValueError, RuntimeError) as exc:
         if isinstance(exc, UnsafeProcessCleanupError):
             raise
@@ -757,6 +826,8 @@ class GateResult:
     passed: bool
     detail: str
     deadline_exhausted: bool = False
+    # The tracker gave no answer about the evidence this gate reads; never persisted.
+    evidence_unreadable: bool = False
 
 
 def _required_file(ctx: TrialContext, gate: RequiredFileGate) -> GateResult:
@@ -910,12 +981,19 @@ def _mlflow_required(
     :param TrialContext ctx: Bound attempt.
     :param MlflowRequiredGate gate: Required namespaces.
     :param float | None deadline: Existing execution deadline.
-    :return GateResult: Presence result.
+    :return GateResult: Presence result; a failed capture fails the gate, marked as the
+        deadline or an unreadable tracker when either caused it.
     """
     try:
         _capture_mlflow(ctx, deadline=deadline)
     except ExtractorError as exc:
-        return GateResult(gate.type, False, str(exc), isinstance(exc, DeadlineExceededError))
+        return GateResult(
+            gate.type,
+            False,
+            str(exc),
+            deadline_exhausted=isinstance(exc, DeadlineExceededError),
+            evidence_unreadable=isinstance(exc, EvidenceUnreadableError),
+        )
     return GateResult(gate.type, True, "MLflow metrics, parameters, and tags are present")
 
 
@@ -929,14 +1007,20 @@ def _wandb_summary_required(
     :param float | None deadline: Optional absolute ``time.monotonic()`` phase/run
         deadline for obtaining the capture.
     :return GateResult: Pass/fail result and human-readable detail; a failed capture
-        fails the gate, marked ``deadline_exhausted`` when the deadline expired.
+        fails the gate, marked ``deadline_exhausted`` when the deadline expired and
+        ``evidence_unreadable`` when W&B gave no answer.
     """
     try:
         capture = _capture_wandb(ctx, gate, deadline=deadline)
     except DeadlineExceededError as exc:
         return GateResult(gate.type, False, str(exc), deadline_exhausted=True)
     except ExtractorError as exc:
-        return GateResult(gate.type, False, str(exc))
+        return GateResult(
+            gate.type,
+            False,
+            str(exc),
+            evidence_unreadable=isinstance(exc, EvidenceUnreadableError),
+        )
     missing = sorted(set(gate.keys) - set(capture["present_keys"]))
     return GateResult(
         gate.type,

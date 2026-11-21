@@ -9,7 +9,7 @@ from typing import ClassVar, Self
 class OperatorAction(StrEnum):
     """Operator remediation category for routing expected failures.
 
-    FRESH_NAMESPACE starts a separate namespace for the affected state;
+    FRESH_NAMESPACE starts a fresh study under a new ``experiment`` name;
     RESTORE_LEDGER repairs storage; RESTORE_TREE repairs files or permissions;
     PROVISION_LOCK_DIR points PHASESWEEP_LOCK_DIR at an existing writable
     directory every launching context shares, or moves the work to the host.
@@ -91,21 +91,61 @@ RERUN_CLEANUP_RECOVERY = (
 )
 
 
-NEW_STUDY_STEP = (
-    "Set a new `experiment` name in the config to start a fresh "
-    "study (with `storage: auto`, a new `workdir` also works); the old study stays readable "
-    "with its original config."
+_FRESH_STUDY_TAIL = (
+    " a new `experiment` name in the config to start a fresh study "
+    "(a new `workdir` also works unless `storage` names a ledger)"
 )
+
+#: The one way to start over, worded as a clause for a step that offers it second.
+FRESH_STUDY = f"set{_FRESH_STUDY_TAIL}"
+
+NEW_STUDY_STEP = f"Set{_FRESH_STUDY_TAIL}; the old study stays readable with its original config."
+
+#: The way out of an artifact root or ledger another PhaseSweep version wrote, on every
+#: command and under every `storage`. A ledger the config names holds every experiment's
+#: studies: a new `experiment` name leaves the unsupported study in it, and a new ledger alone
+#: leaves the artifact root bound to the old one, so there both change. "Version" covers a
+#: source checkout between releases, which no release can stand in for.
+OTHER_FORMAT_STEP = (
+    f"Set{_FRESH_STUDY_TAIL}, and a new `storage` ledger too if the config names one. "
+    "The PhaseSweep version that wrote the old data still reads it."
+)
+
+
+def format_found(version: object) -> str:
+    """Word the format version a record carries.
+
+    :param object version: The version the record holds, or ``None`` when it holds none.
+    :return str: ``uses format 14``, or ``has no format version`` for ``None``.
+    """
+    return "has no format version" if version is None else f"uses format {version!r}"
+
+
+def format_reads(current: int) -> str:
+    """Word the format version this PhaseSweep reads.
+
+    :param int current: The format version this PhaseSweep reads.
+    :return str: ``this PhaseSweep reads format 15``.
+    """
+    return f"this PhaseSweep reads format {current}"
+
+
+def format_mismatch(version: object, current: int) -> str:
+    """Word how a record's format differs from the one this PhaseSweep reads.
+
+    :param object version: The version the record holds, or ``None`` when it holds none.
+    :param int current: The format version this PhaseSweep reads.
+    :return str: A clause for the record's subject to lead, such as
+        ``uses format 14; this PhaseSweep reads format 15``.
+    """
+    return f"{format_found(version)}; {format_reads(current)}"
 
 
 # Path-free action phrases; boundary renderers supply framing and diagnostic details.
 OPERATOR_STEPS: dict[OperatorAction, str] = {
-    OperatorAction.FRESH_NAMESPACE: "use a fresh namespace for the state identified in the error",
+    OperatorAction.FRESH_NAMESPACE: FRESH_STUDY,
     OperatorAction.RESTORE_LEDGER: "restore or repair the storage ledger and access to it",
-    OperatorAction.RESTORE_TREE: (
-        "restore the files and permissions identified in the error, deleting a file only if "
-        "certain nothing is running"
-    ),
+    OperatorAction.RESTORE_TREE: "restore the files and permissions identified in the error",
     OperatorAction.PROVISION_LOCK_DIR: (
         "point PHASESWEEP_LOCK_DIR at an existing writable directory shared by every shell, "
         "MCP server, and sandbox on the host, or run on the host"

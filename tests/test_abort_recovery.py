@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -32,8 +34,10 @@ from phasesweep.engine.study_policy import (
     _load_phase_policy_state,
     _PhasePolicyState,
 )
+from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import OperatorAction, PhaseSweepError, operator_step
 from phasesweep.mcp import runner as mcp_runner
+from phasesweep.runtime.gpu import GpuPool
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     invoke_cli_boundary,
@@ -45,6 +49,85 @@ from tests.conftest import (
     write_trainer,
     write_trial_zero_trainer,
 )
+
+
+@pytest.mark.parametrize("readback_available", [True, False])
+def test_parallel_outcome_write_with_lost_acknowledgment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, readback_available: bool
+) -> None:
+    """A peer writes after the durable abort only when the outcome can be read back."""
+    from phasesweep.engine import phase as phase_module
+
+    experiment = make_experiment(
+        persistent=tmp_path,
+        n_trials=2,
+        n_jobs=2,
+        gpu_policy="none",
+        allow_no_gpu_isolation=True,
+        max_consecutive_failures=1,
+    )
+    phase = experiment.phases[0]
+    storage_url = experiment.resolved_storage
+    assert storage_url is not None
+    storage = _resolve_storage(storage_url)
+    study = optuna.create_study(storage=storage)
+    first, peer = study.ask(), study.ask()
+    run = phase_module._PhaseExecution(
+        experiment=experiment,
+        phase=phase,
+        study=study,
+        inherited_winners={},
+        generation_id="generation",
+        environment_identity=_environment_identity(experiment, phase.name),
+        gpu_pool=GpuPool.for_phase(phase),
+        optimize_deadline=None,
+        timeout_source=None,
+    )
+    committed = threading.Event()
+    peer_ready = threading.Event()
+    real_write = first.set_user_attr
+    real_read = storage.get_trial
+
+    def write_without_acknowledgment(key: str, value: object) -> None:
+        real_write(key, value)
+        committed.set()
+        assert peer_ready.wait(timeout=10)
+        raise OSError("outcome write lost its acknowledgment")
+
+    def read_trial(trial_id: int) -> optuna.trial.FrozenTrial:
+        if trial_id == first._trial_id and not readback_available:
+            raise OSError("outcome readback unavailable")
+        return real_read(trial_id)
+
+    def record_peer_outcome() -> None:
+        assert committed.wait(timeout=10)
+        peer_ready.set()
+        phase_module._record_outcome(run, peer, "success", metric=0.5)
+
+    monkeypatch.setattr(first, "set_user_attr", write_without_acknowledgment)
+    monkeypatch.setattr(storage, "get_trial", read_trial)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        later = workers.submit(record_peer_outcome)
+        earlier = workers.submit(phase_module._record_outcome, run, first, "failure")
+        for worker in (earlier, later):
+            if readback_available:
+                worker.result(timeout=10)
+            else:
+                with pytest.raises(phase_module._TrialLeftRunning, match="readback unavailable"):
+                    worker.result(timeout=10)
+
+    replay = optuna.load_study(study_name=study.study_name, storage=_resolve_storage(storage_url))
+    state = _load_phase_policy_state(replay)
+    assert state.abort is not None
+    assert state.abort["completion_sequence"] == 1
+    assert state.abort_streak == (first.number,)
+    attrs = replay.trials[peer.number].user_attrs
+    if readback_available:
+        assert attrs[TRIAL_OUTCOME_ATTR] == trial_outcome(2, "success", metric=0.5)
+        assert state.consecutive_failures == 0
+    else:
+        assert TRIAL_OUTCOME_ATTR not in attrs
+        assert state.consecutive_failures == 1
 
 
 def test_cli_abort_advice_is_logged_once_per_invocation(
@@ -77,6 +160,8 @@ def test_cli_abort_advice_is_logged_once_per_invocation(
         assert len(fixes) == 1
         advice = fixes[0]
         assert "phases[p].n_trials above 1 in the config" in advice
+        assert "fix changes trial_command or the trainer's PATH" in advice
+        assert "new `experiment` name" in advice
         assert (output.err + output.out + caplog.text).count(advice) == 1
         assert run_log.read_text(encoding="utf-8").count(advice) == invocation + 1
     assert len(phase_study(experiment).trials) == 1
@@ -104,8 +189,10 @@ def test_evidence_pending_preview_routes_to_resume(tmp_path: Path) -> None:
     assert "phasesweep run with the same config, without --dry-run" in advice
     assert "correct the experiment configuration" not in _operational_error_text(error)
     assert _operational_error_text(error).count(advice) == 1
-    failure = mcp_runner._terminal_failure_payload(error, stage="preflight", cleanup_confirmed=True)
-    assert failure["remediation"] == f"Ask the operator: {advice}"
+    failure = mcp_runner._terminal_failure_payload(
+        error, run_id="r0", stage="preflight", cleanup_confirmed=True
+    )
+    assert failure["remediation"].startswith(f"Ask the operator: {advice} ")
 
 
 @pytest.mark.integration

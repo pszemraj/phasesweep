@@ -1,5 +1,8 @@
 """Toy training script used by phasesweep examples and tests.
 
+Installing phasesweep provides it as the ``phasesweep-fake-train`` console script, the command
+the packaged templates and examples run.
+
 The loss is a deterministic formula of the model, optimizer and regularization values. An
 optional integer ``seed`` (a top-level ``seed`` in the config YAML, or a ``seed=N`` /
 ``--seed=N`` token) adds a Gaussian term of scale ``SEED_NOISE_SCALE``, drawn deterministically

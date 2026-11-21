@@ -5,10 +5,12 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import shlex
 import textwrap
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import optuna
@@ -65,7 +67,7 @@ from phasesweep.engine.state import (
     _parsed_trial_outcome,
 )
 from phasesweep.engine.study_policy import (
-    _consecutive_failure_threshold_tripped,
+    _launch_preflight,
     _load_phase_policy_state,
     _record_recovery_boundary,
 )
@@ -89,6 +91,8 @@ from phasesweep.evidence.models import (
     LogRegexExtractor,
     WandbSummaryRequiredGate,
 )
+from phasesweep.runtime import process as process_module
+from phasesweep.runtime import remote_worker
 from phasesweep.runtime.process import (
     ProcessResult,
     read_attempt_lifecycle,
@@ -575,12 +579,15 @@ def test_terminal_callback_reports_success_evidence(
     captured: list[TerminalReport] = []
     validated_environments: list[str] = []
 
-    def validate_environment(_experiment: Experiment, phase_name: str) -> EnvironmentIdentity:
+    def validate_environment(
+        _experiment: Experiment, phase_name: str, study: optuna.Study | None
+    ) -> EnvironmentIdentity:
         assert not _artifact_root_binding_path(experiment).exists()
+        assert study is None
         validated_environments.append(phase_name)
-        return _environment_identity(_experiment, phase_name)
+        return _launch_preflight(_experiment, phase_name, study)
 
-    monkeypatch.setattr("phasesweep.engine.run._environment_identity", validate_environment)
+    monkeypatch.setattr("phasesweep.engine.run._launch_preflight", validate_environment)
 
     def preflight(_ledger, *, cleanup_report, from_phase):
         del from_phase
@@ -1033,6 +1040,7 @@ def test_transient_trial_outcome_write_failure_is_retried(
     assert [trial.state.name for trial in trials] == ["COMPLETE", "COMPLETE"]
     assert [trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials] == [1, 2]
     assert all(trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "success" for trial in trials)
+    assert all(trial.user_attrs[TRIAL_OUTCOME_ATTR]["metric"] == 0.5 for trial in trials)
 
 
 @pytest.mark.integration
@@ -1558,7 +1566,7 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
         if abort is not None:
             payload[TRIAL_OUTCOME_ABORT_KEY] = abort
         trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
-        tripped = run.advance(trial.number, outcome)
+        run.advance(trial.number, outcome)
         if abort is not None:
             run.abort_recorded = True
             first_abort = abort
@@ -1567,10 +1575,6 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
         assert run.completion_sequence == replayed.max_sequence
         assert run.consecutive_failures == replayed.consecutive_failures
         assert replayed.abort_streak == abort_streak
-        assert tripped == (
-            outcome == "fatal"
-            or _consecutive_failure_threshold_tripped(replayed.consecutive_failures, phase)
-        )
         assert replayed.abort == first_abort
     assert first_abort is not None
 
@@ -1946,3 +1950,26 @@ def test_required_constraint_failure_preserves_prior_values(
         if failure == "nonfinite"
         else "constraint extractor 'second': stopped"
     )
+
+
+@pytest.mark.parametrize("no_user_site", [0, 1])
+def test_sdk_worker_ignores_the_user_site_exactly_when_its_controller_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_user_site: int
+) -> None:
+    """A worker is launched with ``-s`` only under a controller that ignores the user site."""
+    worker = tmp_path / "worker.py"
+
+    def launch(cmd: str, **_kwargs: object) -> ProcessResult:
+        raise InterruptedError(cmd)
+
+    flags = SimpleNamespace(no_user_site=no_user_site)
+    monkeypatch.setattr(remote_worker, "sys", SimpleNamespace(executable="python", flags=flags))
+    monkeypatch.setattr(process_module, "run_supervised", launch)
+    with pytest.raises(InterruptedError) as launched:
+        run_worker(
+            {}, worker, "sdk", statuses=frozenset(), run_id="a", trial_dir=tmp_path,
+            environment={}, deadline=time.monotonic() + 10,
+        )  # fmt: skip
+    # The flags must precede the script, or the interpreter passes them to the script.
+    expected = ["python", *(["-s"] if no_user_site else []), "-P", str(worker)]
+    assert shlex.split(str(launched.value))[: len(expected)] == expected

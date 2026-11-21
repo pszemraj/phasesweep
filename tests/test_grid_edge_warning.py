@@ -24,7 +24,7 @@ from phasesweep.config.search import (
     sampler_warnings,
 )
 from phasesweep.engine.paths import _generation_winner_path
-from phasesweep.engine.read import read_result
+from phasesweep.engine.read import read_result, read_trial_tables
 from phasesweep.engine.repeats import ranked_group, repeat_axis
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
@@ -41,7 +41,7 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_ATTR,
 )
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
-from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.mcp.snapshots import RESULT_SNAPSHOT_SCHEMA_VERSION, capture_result_snapshot
 from phasesweep.runtime.json import JsonValue
 from tests.conftest import (
     log_regex_provenance,
@@ -116,7 +116,7 @@ def test_grid_endpoint_warning_uses_the_concrete_numeric_axis(
     else:
         assert len(warnings) == 1
         assert "[p]" in warnings[0] and "x" in warnings[0] and edge in warnings[0]
-        assert str(value) in warnings[0] and "expand" in warnings[0].lower()
+        assert str(value) in warnings[0] and "widen the range" in warnings[0]
 
 
 @pytest.mark.parametrize(
@@ -260,7 +260,7 @@ def test_cost_key_added_after_publication_is_visible_on_reads_and_replay(
         changed, generation_id=generation, engine_winners={"epochs": replayed}
     )
     assert "epochs=8" in snapshot["winners"][0]["cost_advisory"]
-    assert snapshot["schema_version"] == 1
+    assert snapshot["schema_version"] == RESULT_SNAPSHOT_SCHEMA_VERSION
     assert snapshot["winners"][0]["tie_groups"][0]["params"] == {"epochs": 8}
     assert snapshot["winners"][0]["cost_advisory_status"] == "available"
     assert path.read_bytes() == saved
@@ -354,7 +354,7 @@ def test_repeat_advisories_keep_the_selected_population_after_failed_top_up(tmp_
 def test_float_displays_share_precision_without_changing_recorded_values(
     tmp_path: Path, value: float, displayed: float
 ) -> None:
-    """Winner YAML and trial tables share twelve-digit precision; stored values stay exact."""
+    """Winner YAML keeps twelve digits and the trial table shortens params and durations; stored values stay exact."""
     trainer = write_trainer(tmp_path / "trainer.py", f"print('x={value!r}')")
     experiment = make_experiment(
         persistent=tmp_path,
@@ -367,20 +367,30 @@ def test_float_displays_share_precision_without_changing_recorded_values(
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>\S+)"),
         ),
         trainer_config={"precise": value},
+        search_space={"lr": FloatParam(type="float", low=0.0001, high=0.001)},
     )
     winner = run_experiment(experiment)["p"]
+    sampled = phase_trials(experiment)[0].params["lr"]
+    assert f"{sampled:.4g}" != f"{sampled:.12g}"
     config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
     result = CliRunner().invoke(cli, ["show-winners", str(config)])
     assert result.exit_code == 0, result.exception
     base_text, phase_text = result.output.split("=== p ===", 1)
     payload = yaml.safe_load(phase_text)
     assert payload["metric"]["x"] == displayed
+    assert payload["params"]["lr"] == float(f"{sampled:.12g}")
     assert yaml.safe_load(base_text)["trainer_config"]["precise"] == displayed
     assert winner.metric == value
     assert capture_result_snapshot(experiment)["winners"][0]["metric"] == value
     table = CliRunner().invoke(cli, ["status", str(config), "--trials"])
     assert table.exit_code == 0, table.output
     assert f"{value:.12g}" in table.output
+    assert f"lr={sampled:.4g}" in table.output
+    assert f"{sampled:.12g}" not in table.output
+    duration = read_trial_tables(experiment, latest=True).phases[0].rows[0]["duration_s"]
+    assert isinstance(duration, float) and f"{duration:.12g}" != f"{duration:.1f}"
+    assert f" {duration:.1f} " in table.output
+    assert f"{duration:.12g}" not in table.output
 
 
 @pytest.mark.integration

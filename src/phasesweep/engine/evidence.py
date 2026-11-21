@@ -28,6 +28,12 @@ from phasesweep.engine.state import (
     Winner,
     constraint_attr,
 )
+from phasesweep.errors import (
+    NEW_STUDY_STEP,
+    OTHER_FORMAT_STEP,
+    OperatorAction,
+    format_mismatch,
+)
 from phasesweep.evidence.evaluation import (
     EVIDENCE_PROVENANCE_SCHEMA_VERSION,
     extractor_config_fingerprint,
@@ -134,7 +140,15 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
         )
 
     if provenance.get("schema_version") != EVIDENCE_PROVENANCE_SCHEMA_VERSION:
-        fail("unsupported schema version")
+        found = format_mismatch(
+            provenance.get("schema_version"), EVIDENCE_PROVENANCE_SCHEMA_VERSION
+        )
+        raise TrialEvidenceMissingError(
+            f"{subject} has {OBJECTIVE_PROVENANCE_ATTR!r} evidence that {found}.",
+            action=OperatorAction.FRESH_NAMESPACE,
+            # The evidence is a trial attribute, so it stays in an explicit ledger.
+            remediation=OTHER_FORMAT_STEP,
+        )
     extractor = provenance.get("extractor")
     if not isinstance(extractor, Mapping):
         fail("missing extractor identity")
@@ -412,11 +426,46 @@ class _EvidenceVerification:
         :param Experiment experiment: Configured primary extractor and remote target.
         :param Phase phase: Exposed phase supplying its constraint and gate requirements.
         """
+        self.constraint_names = [constraint.name for constraint in experiment.constraints]
         self.extractor = experiment.metric.extractor
         self.wandb_query = _wandb_query(experiment, phase.gates)
         self.mlflow_query = compile_mlflow_query(experiment, phase.gates)
         self.mlflow_target = (
             None if experiment.mlflow is None else experiment.mlflow.evidence_identity()
+        )
+
+    def verify_trial(
+        self,
+        trial: optuna.trial.FrozenTrial,
+        trial_dir: Path,
+        attempt_id: str,
+        metric: float,
+        *,
+        subject: str,
+        verify_digest: bool,
+    ) -> None:
+        """Verify a ledger measurement against the attempt's retained evidence.
+
+        :param optuna.trial.FrozenTrial trial: Trial holding the input, provenance and constraints.
+        :param Path trial_dir: Evidence directory for the producing attempt.
+        :param str attempt_id: Attempt whose evidence is required.
+        :param float metric: Recorded objective.
+        :param str subject: Trial description for a refusal.
+        :param bool verify_digest: Whether to hash the primary objective file.
+        :raises TrialEvidenceMissingError: Evidence for the measurement is absent or changed.
+        """
+        _verify_trial_evidence_dir(
+            trial_dir,
+            subject=subject,
+            attempt_id=attempt_id,
+            provenance=_trial_objective_provenance(trial),
+            trainer_input=trial.user_attrs.get(TRAINER_INPUT_ATTR),
+            verify_objective_digest=verify_digest,
+            verification=self,
+            metric_value=metric,
+            constraints={
+                name: trial.user_attrs.get(constraint_attr(name)) for name in self.constraint_names
+            },
         )
 
 
@@ -483,7 +532,9 @@ def _verify_trial_evidence_dir(
         raise TrialEvidenceMissingError(
             f"{subject} objective evidence no longer matches its configured extractor "
             "evaluation contract. The extractor configuration or evaluator revision "
-            "changed after this trial ran, or the saved provenance was altered."
+            "changed after this trial ran, or the saved provenance was altered.",
+            action=OperatorAction.FRESH_NAMESPACE,
+            remediation=NEW_STUDY_STEP,
         )
     capture = provenance.get("remote_capture")
     if capture is not None and capture.get("kind") == "wandb" and capture["run_id"] != attempt_id:
@@ -634,19 +685,13 @@ def _validate_selection_evidence(
                     f"not name this trial's own generation/attempt identity (expected "
                     f"{expected_name!r})."
                 )
-            _verify_trial_evidence_dir(
+            verification.verify_trial(
+                trial,
                 phase_dir / expected_name,
+                attempt_id,
+                float(trial.value),
                 subject=subject,
-                attempt_id=attempt_id,
-                provenance=_trial_objective_provenance(trial),
-                trainer_input=trial.user_attrs.get(TRAINER_INPUT_ATTR),
-                verify_objective_digest=False,
-                verification=verification,
-                metric_value=float(trial.value),
-                constraints={
-                    c.name: trial.user_attrs.get(constraint_attr(c.name))
-                    for c in experiment.constraints
-                },
+                verify_digest=False,
             )
 
 

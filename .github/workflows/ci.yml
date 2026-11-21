@@ -18,19 +18,18 @@ jobs:
       # with the same tools; raise ruff, mypy and types-PyYAML in both places together.
       - name: Install static-check dependencies
         run: >-
-          python -m pip install
+          pip install
           'ruff==0.15.21' 'mypy==2.3.0' 'types-PyYAML==6.0.12.20260518'
           'optuna==4.9.0' 'cmaes==0.13.0'
           'pydantic==2.13.4' 'pyyaml==6.0.3' 'click==8.4.2' 'mcp==1.27.2'
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy src
-      # Keep collection and in-process contracts within the approved test budget.
+      # Pytest collects the whole suite before selecting the tests marked
+      # `contract`; keep this step within the approved test budget.
+      # CI stays static and has no install step, so PYTHONPATH=src makes pytest import the checkout.
       - name: Contract tests
         run: |
           bash scripts/check_module_size.sh
-          python -m pip install 'pytest==9.1.1'
-          PYTHONPATH=src python -m pytest --collect-only -q -p no:cacheprovider
-          PYTHONPATH=src python -m pytest -p no:cacheprovider \
-            tests/test_ledger_contract.py tests/test_error_routing.py \
-            tests/test_ledger_read_paths.py
+          pip install 'pytest==9.1.1'
+          PYTHONPATH=src pytest -p no:cacheprovider -m "contract and not live"

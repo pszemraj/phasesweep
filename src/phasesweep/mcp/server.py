@@ -29,6 +29,7 @@ if typing.TYPE_CHECKING:
 
 from phasesweep import __version__
 from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.engine.artifacts import LOG_FORMAT
 from phasesweep.engine.read import CostAdvisoryStatus
 from phasesweep.engine.read import ResultContext as ResultContextLiteral
 from phasesweep.engine.state import TrialStateName, WinnerSourceKind
@@ -76,7 +77,7 @@ CATALOG_RESOURCE_URI = "phasesweep://catalog"
 PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 
 # Clients may load this into every session and may show only its first line, cut at 250
-# characters, so it is one short line; the workflow rules load on demand through get_guide.
+# characters, so it is one short line; the guide loads on demand through get_guide.
 SERVER_INSTRUCTIONS = (
     "PhaseSweep runs hyperparameter sweeps on the MCP server host. "
     "Use these tools only when the user asks for PhaseSweep in this conversation. Never suggest "
@@ -85,9 +86,9 @@ SERVER_INSTRUCTIONS = (
 )
 
 DESCRIPTION_GET_GUIDE = (
-    "Return the rules for using the PhaseSweep tools: when to launch or cancel, how to monitor "
-    "a run, when to stop for the operator, and what to report with results. Call it once, before "
-    "any other PhaseSweep tool."
+    "Return the PhaseSweep guide: who owns the catalog and configs, the call loop, when to stop, "
+    "what to report with a winner, and where per-trial data lives. Call it once, before any "
+    "other PhaseSweep tool."
 )
 DESCRIPTION_LIST_EXPERIMENTS = (
     "List the operator-approved experiments and their permitted actions. Call it after get_guide "
@@ -105,35 +106,36 @@ DESCRIPTION_EXPLAIN_CONFIG = (
 )
 DESCRIPTION_INSPECT_EXPERIMENT = (
     "Inspect one approved experiment's metric, permissions, phases, trial targets, samplers, "
-    "inheritance, and search-space keys. Call after list_experiments and before launch_run. "
-    "Read-only: the server rereads an edited catalog or config before each call, so this "
-    "describes what launch_run would start now."
+    "inheritance, and search-space keys. Call after list_experiments, before launch_run or "
+    "advising on the experiment. Read-only: the server rereads an edited catalog or config "
+    "before each call, so this describes what launch_run would start now."
 )
 DESCRIPTION_GET_LATEST_RUN = (
     "Return the most recently launched run for one experiment. Call only to recover a lost "
-    "run_id; then use that run_id with await_run, get_run_status, or get_run_results. "
-    "Read-only: found=false never authorizes launching a replacement."
+    "run_id; then use run.run_id with await_run, get_run_status, or get_run_results. "
+    "Read-only: when found is false, stop; it never authorizes launching a replacement."
 )
 DESCRIPTION_LAUNCH_RUN = (
     "Launch one approved experiment as a detached run and return its run_id. Call only after "
-    "inspection and explicit user authorization; monitor with the returned run_id. "
+    "inspection and explicit user authorization for that experiment, and keep the returned "
+    "run_id for every later call. Never launch a replacement run on your own. "
     "Never retry permission refusals. Retry a config-changed refusal once; report an "
     "invalid-catalog or changed-state_dir refusal to the operator and wait for the fix. For "
     "capacity refusals, await healthy named blockers; report blockers requiring recovery to the "
-    "operator before retrying. "
-    "When runner liveness is unobservable, monitor durable progress and notify the operator "
-    "if it stops."
+    "operator before retrying."
 )
 DESCRIPTION_GET_RUN_STATUS = (
     "Read process state and per-phase progress for exactly one run_id. Use as a single status "
-    "check when await_run is unsuitable. State is run.state; stop if run.recovery_required is "
-    "true. Read-only: reuse the run_id returned by launch_run or get_latest_run."
+    "check when await_run is unsuitable, never in a polling loop. State is run.state; stop if "
+    "run.recovery_required is true. Read-only: reuse the run_id returned by launch_run or "
+    "get_latest_run."
 )
 DESCRIPTION_GET_RUN_RESULTS = (
     "Return terminal per-phase winners, completeness, metrics, gates, and "
     "policy-filtered sampled parameters. Call after a run becomes terminal; this ends the normal "
-    "workflow. Read-only: treat redaction as policy and never infer trends or convergence from "
-    "winner-only data."
+    "workflow. Say when a winner comes from an earlier generation (winner_generation "
+    "prior_generation), when its labels are historical (published_config_matches_current "
+    "false), and that a confound check reading n/a was not run. Read-only."
 )
 DESCRIPTION_CANCEL_RUN = (
     "Request bounded cancellation of one launched run. Call only when the user explicitly asks; "
@@ -142,11 +144,12 @@ DESCRIPTION_CANCEL_RUN = (
 )
 DESCRIPTION_AWAIT_RUN = (
     "Wait up to timeout_seconds for a launched run to change, become terminal, or require "
-    "recovery. Call after launch_run and repeat while running; omit timeout_seconds for a "
-    "client-safe 20-second wait, and request longer waits only when the client permits them. "
-    "State is run.state; stop immediately if run.recovery_required is true. Call "
-    "get_run_results when terminal. Read-only: always reuse "
-    "the run_id, including after a client disconnect."
+    "recovery. Call after launch_run and repeat with the same run_id while run.state is "
+    "running, including after reason phase_completed and after a client disconnect; omit "
+    "timeout_seconds for a client-safe 20-second wait, and request longer waits only when the "
+    "client permits them. Stop immediately if run.recovery_required is true. When "
+    "run.runner_observable is false, monitor durable progress and notify the operator if it "
+    "stops. Call get_run_results when terminal. Read-only."
 )
 
 ExperimentId = Annotated[
@@ -173,14 +176,10 @@ PublicationIntegrity = Annotated[
             "'ok': the publication passed validation. 'absent': no publication was "
             "recorded in this view, which is normal before the first publication. "
             "'failed': a publication was recorded but failed validation, so result fields read as "
-            "if nothing published. On 'failed', report the corruption to the operator and do "
-            "not launch a run against this experiment: a successful run advances the "
-            "publication pointer past the corrupt result and nothing reports it afterwards. "
-            "'permission_denied': the publication may be healthy, but the server could not "
-            "validate its owner-only evidence; expose no winners and ask the operator to "
-            "re-read it as the publishing user or restore read permission. 'unknown': the "
-            "terminal placeholder could not inspect publication state; expose no winners "
-            "and report the run's snapshot-unavailable failure."
+            "if nothing published. 'permission_denied': the publication may be healthy, but the "
+            "server could not validate its owner-only evidence. 'unknown': the terminal "
+            "placeholder could not inspect publication state. The last three withhold every "
+            "winner, and the response's failure names the operator's step."
         )
     ),
 ]
@@ -194,10 +193,7 @@ ResultContext = Annotated[
             "config has since been edited. 'current_config': the represented result "
             "recorded no semantics of its own - nothing has published yet, or the "
             "represented generation's summary is absent or records another summary "
-            "schema version - so the currently loaded config describes it. Under "
-            "'represented_generation', objective_evidence still "
-            "falls back to the current extractor's assurance when the recorded summary "
-            "carries none: treat evidence flags as unproven for such a result."
+            "schema version - so the currently loaded config describes it."
         )
     ),
 ]
@@ -208,7 +204,7 @@ PublishedConfigMatchesCurrent = Annotated[
             "Whether the producing configuration matches the corresponding prefix of the "
             "current phase plan. Appended phases do not invalidate that agreement. False "
             "means the producing semantics differ and these result labels are historical. "
-            "Null when no producing fingerprint is available. Never treat null as 'no drift'."
+            "Null when no producing fingerprint is available; null does not establish a match."
         )
     ),
 ]
@@ -271,7 +267,7 @@ class CapabilitiesPayload(_ToolPayload):
 
     launch: bool = Field(description="Whether the agent may launch this experiment.")
     cancel: bool = Field(description="Whether the agent may cancel its launched runs.")
-    resume_from_phase: bool = Field(
+    from_phase: bool = Field(
         description="Whether launch may use from_phase after earlier winners exist."
     )
 
@@ -407,19 +403,15 @@ class RunPayload(_ToolPayload):
     started_at: str = Field(description="UTC ISO-8601 launch timestamp.")
     recovery_required: bool = Field(
         description=(
-            "True when the agent must stop monitoring and report to the operator an unresolved "
-            "launch, uncertain cleanup, interrupted snapshot finalization, or a runner in "
-            "another PID namespace whose heartbeat stopped. A launch handoff observed "
-            "mid-transition, or a heartbeat paused by a host suspend, can still settle."
+            "True when the run needs operator recovery: an unresolved launch, uncertain "
+            "cleanup, interrupted snapshot finalization, or a runner in another PID namespace "
+            "whose heartbeat stopped. failure then names the operator's step."
         )
     )
     runner_observable: bool = Field(
         description=(
-            "False for a running runner in another PID namespace: liveness and cancellation "
-            "are unavailable. Monitor durable trial counts, do not call cancel_run, and "
-            "notify the user if counts stop advancing. With recovery_required also true, the "
-            "runner has probably stopped or left cleanup uncertain: ask the operator to check "
-            "and recover it from a host shell."
+            "False for a running runner in another PID namespace, where liveness and "
+            "cancellation are unavailable."
         )
     )
     failure: FailurePayload | None = Field(
@@ -508,10 +500,13 @@ class PhaseStatusPayload(_ToolPayload):
 
 
 class TrackingDeliveryPayload(_ToolPayload):
-    """Mutable path-free upload counts, separate from accepted scientific facts."""
+    """Mutable path-free tracking counts, separate from accepted scientific facts."""
 
     pending: int
     delivered: int
+    remedy: str | None = Field(
+        description="The operator's retry step once the run has ended with records pending, otherwise null."
+    )
 
 
 class GetRunStatusResult(_ToolPayload):
@@ -575,9 +570,9 @@ class GetRunStatusResult(_ToolPayload):
     tracking_delivery: TrackingDeliveryPayload | None = Field(
         default=None,
         description=(
-            "This run's live MLflow upload counts, including after termination; null without "
-            "MLflow or launch config. Pending uploads do not change scores or winners: "
-            "report them to the operator instead of launching another run."
+            "This run's live MLflow counts, including after termination. Pending counts include "
+            "run creations and uploads. Scores and winners are independent of delivery. "
+            "Null when the launch config has no mlflow block or is unreadable."
         ),
     )
     elapsed_seconds: int | None = Field(
@@ -660,11 +655,7 @@ class WinnerPhasePayload(_ToolPayload):
         description="Other repeat configurations within two combined standard errors, with params, gap, combined_se and threshold; null when retained trials are unavailable. Parameter values follow visible_params."
     )
     confound: ConfoundSummary = Field(
-        description=(
-            "Advisory verdicts on the population this winner was selected from. Report every "
-            "flagged check with its counts before relying on the winner or on phases that "
-            "inherit it."
-        )
+        description="Verdicts on the population this winner was selected from, frozen at selection."
     )
     observed: dict[str, float] = Field(
         description=(
@@ -677,8 +668,7 @@ class WinnerPhasePayload(_ToolPayload):
         description=(
             "For a phase with repeats: the reducer, the spread of the member metrics and the "
             "member trial numbers of the winning group, whose last member is "
-            "winner_source.trial_number. Report the spread with the metric. Null for a phase "
-            "without repeats."
+            "winner_source.trial_number. Null for a phase without repeats."
         )
     )
 
@@ -708,6 +698,12 @@ class GetRunResultsResult(_ToolPayload):
             "Generation whose winners and completeness this payload represents. This is the "
             "in-flight run generation during a live run; null when there is no represented "
             "generation."
+        )
+    )
+    run_wrote_generation: bool | None = Field(
+        description=(
+            "Whether this run wrote its own generation. When false, the run launched no trials "
+            "and its winners are an earlier generation's; null for an unavailable placeholder."
         )
     )
     publication_integrity: PublicationIntegrity
@@ -747,6 +743,10 @@ class CancelRunResult(_ToolPayload):
     )
     recovery_required: bool = Field(
         description="Whether successful cancellation still needs operator result repair."
+    )
+    failure: FailurePayload | None = Field(
+        default=None,
+        description="The operator's recovery step when recovery_required is true; otherwise null.",
     )
 
 
@@ -889,7 +889,7 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
     mcp._mcp_server.version = __version__
 
     def get_guide() -> str:
-        """Return the packaged workflow rules.
+        """Return the packaged agent guide.
 
         :return str: The guide text.
         """
@@ -1084,7 +1084,7 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
         description="Safe workflow for launching, monitoring, and summarizing a phasesweep run.",
     )
     def run_and_monitor_prompt() -> str:
-        """Return the packaged workflow rules.
+        """Return the packaged agent guide.
 
         :return str: Prompt text.
         """
@@ -1106,8 +1106,24 @@ def _open_app(registry: Registry, transport: AuditTransport) -> PhaseSweepMCP:
     return PhaseSweepMCP(registry, RunStore(registry.state_dir), audit=audit)
 
 
+def _report_startup_failure(error: str, suggestion: str | None) -> None:
+    """Print one catalog failure for the operator, with its fix when there is one.
+
+    :param str error: Failure description; may reference paths.
+    :param str | None suggestion: Concrete fix, printed on its own ``fix:`` line.
+    """
+    print(f"phasesweep mcp: {error}", file=sys.stderr)
+    if suggestion:
+        print(f"fix: {suggestion}", file=sys.stderr)
+
+
 def _load_server_registry(catalog: Path, *, log_level: int) -> Registry | None:
     """Configure stderr logging and load a catalog when MCP support is installed.
+
+    An entry that fails to load does not stop startup: it is reported on stderr and the
+    server serves the entries that load, with launches refused until the catalog fully
+    validates. Each served entry's trainer directory is logged at info level, so ``serve``
+    shows it and ``call`` stays quiet. A catalog-level failure stops startup.
 
     :param Path catalog: Operator-authored catalog file.
     :param int log_level: Logging level for the selected server transport.
@@ -1116,7 +1132,7 @@ def _load_server_registry(catalog: Path, *, log_level: int) -> Registry | None:
     logging.basicConfig(
         level=log_level,
         stream=sys.stderr,
-        format="%(asctime)s %(levelname).1s %(name)s %(message)s",
+        format=LOG_FORMAT,
         datefmt="%H:%M:%S",
     )
 
@@ -1129,10 +1145,19 @@ def _load_server_registry(catalog: Path, *, log_level: int) -> Registry | None:
         return None
 
     try:
-        return Registry.load(catalog)
+        registry = Registry.load(catalog, collect_errors=True)
     except CatalogError as exc:
-        print(f"phasesweep mcp: {exc}", file=sys.stderr)
+        _report_startup_failure(str(exc), exc.suggestion)
         return None
+    for failure in registry.failures:
+        _report_startup_failure(failure.error or "", failure.suggestion)
+    for experiment in registry:
+        log.info(
+            "serving experiment %s: trainer cwd %s",
+            experiment.id,
+            experiment.experiment.execution.resolved_cwd(),
+        )
+    return registry
 
 
 def serve(catalog: Path) -> int:
@@ -1143,7 +1168,7 @@ def serve(catalog: Path) -> int:
 
     :param Path catalog: Operator-authored catalog file.
     :return int: Process exit code, where 2 means a startup prerequisite or
-        catalog validation failed before the server could run.
+        catalog-level validation failed before the server could run.
     """
     registry = _load_server_registry(catalog, log_level=logging.INFO)
     if registry is None:
@@ -1161,7 +1186,7 @@ def call(catalog: Path, tool: str, arguments: JsonObject) -> int:
     :param JsonObject arguments: Tool arguments, validated by the tool's own schema.
     :return int: Process exit code: 0 after the result is printed on stdout (JSON, or
         the text of ``get_guide``), 1 after a tool error is printed on stderr, and 2 when
-        a startup prerequisite or the catalog failed before the tool could run.
+        a startup prerequisite or the catalog as a whole failed before the tool could run.
     """
     registry = _load_server_registry(catalog, log_level=logging.WARNING)
     if registry is None:
