@@ -189,12 +189,14 @@ def _records(experiment: Experiment, scope: str | None, *, skip: str | None = No
     """List the delivery records in scope in sending order, each summary run's last.
 
     A summary run ends last, so a summary run MLflow shows ended had the attempt outcomes and
-    winner references it summarizes sent before it.
+    winner references it summarizes sent before it. Generations are taken by ID, which says
+    nothing of when each ran, so no order among earlier runs is promised; nothing on this path
+    reads when a generation started.
 
     :param Experiment experiment: Configured experiment.
     :param str | None scope: One generation, or ``None`` for every generation.
     :param str | None skip: Generation left out, a live invocation's own.
-    :return list[Path]: Records in generation order.
+    :return list[Path]: Records grouped by generation, sorted by generation ID.
     """
     records = tracking_root(experiment).glob(f"{scope or '*'}/delivery/*.json")
     return sorted(
@@ -860,7 +862,7 @@ def _target_recorded(experiment: Experiment) -> bool:
 
 
 def _bound_generations(experiment: Experiment, scope: str | None, skip: str | None) -> list[str]:
-    """Name the generations in scope whose summary run is bound, in generation order.
+    """Name the generations in scope whose summary run is bound, sorted by generation ID.
 
     :param Experiment experiment: Configured experiment.
     :param str | None scope: One generation, or ``None`` for every generation.
