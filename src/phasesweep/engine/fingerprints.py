@@ -308,12 +308,13 @@ def _describe_changed_keys(changes: list[tuple[str, object, object]]) -> str:
     return f"Changed: {'; '.join(shown)}."
 
 
-def _restore_or_rename_step(experiment: Experiment, phase: Phase) -> str:
+def restore_or_rename_step(experiment: Experiment, phase: Phase) -> str:
     """Offer the rename that reruns a phase whose own keys changed, beside restoring them.
 
     A phase's study is named after the phase, so a new name starts a new study and leaves
     the other phases' studies valid. A phase that inherits the renamed one records that
-    name in its own study identity, so it needs a new name as well.
+    name in its own study identity, so it needs a new name as well. A persistent study's
+    refusals share this step, whether the recorded identity is the study's or its winner's.
 
     :param Experiment experiment: Experiment whose phases may inherit ``phase``.
     :param Phase phase: Phase whose own configuration differs from its study's.
@@ -394,7 +395,7 @@ def _verify_fingerprint(
         if not changes:
             way_forward = NEW_STUDY_STEP
         elif all(path.startswith("phase.") for path, _old, _new in changes):
-            way_forward = _restore_or_rename_step(experiment, phase)
+            way_forward = restore_or_rename_step(experiment, phase)
         else:
             way_forward = _RESTORE_OR_NEW_STUDY_STEP
         raise StudyFingerprintMismatchError(

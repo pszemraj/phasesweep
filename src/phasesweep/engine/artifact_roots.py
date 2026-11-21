@@ -337,7 +337,7 @@ def _check_study_artifact_root(study: optuna.Study, experiment: Experiment) -> N
         action=OperatorAction.FIX_CONFIG,
         remediation=(
             "Restore the `workdir` and `experiment` that give the recorded artifact root to "
-            "continue this study, or set a new `experiment` name to start a fresh study."
+            f"continue this study, or {FRESH_STUDY}."
         ),
     )
 

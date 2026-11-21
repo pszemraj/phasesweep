@@ -8,10 +8,10 @@ from phasesweep import run_experiment
 from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler
-from phasesweep.engine.errors import ResumeWinnerMissingError
+from phasesweep.engine.errors import ResumeWinnerMissingError, StudyFingerprintMismatchError
 from phasesweep.engine.read import _read_generation_selection, read_result
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.errors import OperatorAction
+from phasesweep.errors import FRESH_STUDY, OperatorAction
 from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import after_banner, invoke_cli_boundary, make_experiment
 from tests.experiments import phase_payload, write_experiment
@@ -122,6 +122,37 @@ def test_from_phase_without_publication_in_memory_does_not_promise_reused_trials
         "fix: Run without --from-phase to start every phase again, because storage: null keeps "
         "no completed trials between runs, or use the workdir that holds the publication."
     ) in message
+
+
+@pytest.mark.parametrize("persistent", [False, True], ids=["memory", "persistent"])
+def test_from_phase_after_a_changed_parent_names_the_step_its_storage_allows(
+    tmp_path: Path, persistent: bool
+) -> None:
+    """A rename keeps the other phases' results only where a study persists; in memory the run restarts."""
+    original = _chained_experiment(tmp_path / "runs")
+    if not persistent:
+        original = original.model_copy(update={"storage": None})
+    run_experiment(original)
+    parent = original.phases[0].model_copy(update={"fixed_overrides": {"width": 64}})
+    changed = original.model_copy(update={"phases": [parent, original.phases[1]]})
+
+    with pytest.raises(StudyFingerprintMismatchError) as refused:
+        run_experiment(changed, from_phase="child")
+
+    message = _operational_error_text(refused.value)
+    assert "was produced by a different phase config" in message
+    assert "Re-run phase" not in message
+    assert refused.value.action is OperatorAction.FIX_CONFIG
+    if persistent:
+        assert (
+            "fix: Restore the recorded value(s) to continue this study. To rerun only " in message
+        )
+        assert f"To rerun every phase, {FRESH_STUDY}." in message
+    else:
+        assert (
+            "fix: Restore the config that produced it, or run without --from-phase to start "
+            "every phase again, because storage: null keeps no completed trials between runs."
+        ) in message
 
 
 def test_from_phase_names_the_phase_a_published_generation_lacks(tmp_path: Path) -> None:

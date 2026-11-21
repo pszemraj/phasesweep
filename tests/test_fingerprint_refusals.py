@@ -386,7 +386,8 @@ def test_a_study_bound_to_another_root_gets_a_step_that_fits(tmp_path: Path) -> 
 
     assert caught.value.remediation == (
         "Restore the `workdir` and `experiment` that give the recorded artifact root to "
-        "continue this study, or set a new `experiment` name to start a fresh study."
+        "continue this study, or set a new `experiment` name in the config to start a fresh study "
+        "(a new `workdir` also works unless `storage` names a ledger)."
     )
 
 

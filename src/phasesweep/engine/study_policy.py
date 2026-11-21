@@ -1156,7 +1156,7 @@ def _environment_cohort_remediation(restore: Sequence[str], unset: Sequence[str]
             "(for an MCP run, start the MCP server in that environment)"
         )
     return (
-        f"{way_back}, or set a new `experiment` name to start a fresh study. "
+        f"{way_back}, or {FRESH_STUDY}. "
         "Pinning a variable under `env` or listing it under `execution.passthrough_env` changes "
         "the study's identity, so that edit needs the new `experiment` name too."
     )

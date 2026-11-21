@@ -52,6 +52,11 @@ log = logging.getLogger(__name__)
 # prints its own clock-time layout (``phasesweep.runtime.console``).
 LOG_FORMAT = "%(asctime)s %(levelname).1s %(name)s %(message)s"
 
+# The only way past a skipped phase's published winner when no study outlives the run.
+_WITHOUT_FROM_PHASE_IN_MEMORY = (
+    f"without --from-phase to start every phase again, because {STORAGE_NULL_KEEPS_NOTHING}"
+)
+
 
 def read_yaml_or_none(path: Path) -> object:
     """Read optional YAML without propagating read or decoding failures.
@@ -371,8 +376,7 @@ def _load_winner(
         rerun = (
             "Run without --from-phase so the earlier phases run first (completed trials are reused)"
             if experiment.persistent
-            else "Run without --from-phase to start every phase again, because "
-            f"{STORAGE_NULL_KEEPS_NOTHING}"
+            else f"Run {_WITHOUT_FROM_PHASE_IN_MEMORY}"
         )
         raise ResumeWinnerMissingError(
             f"Winner file missing for phase {phase.name!r}: {absent} "
@@ -389,10 +393,13 @@ def _load_winner(
     if stored_fp != current_fp:
         raise StudyFingerprintMismatchError(
             f"Winner file {path} was produced by a different phase config "
-            f"(stored fingerprint {stored_fp[:16]}... != current "
-            f"{current_fp[:16]}...). Re-run phase {phase.name!r}, change the "
-            f"experiment name, or restore the matching config before resuming.",
+            f"(stored fingerprint {stored_fp[:16]}... != current {current_fp[:16]}...).",
             action=OperatorAction.FIX_CONFIG,
+            remediation=(
+                fingerprint_ops.restore_or_rename_step(experiment, phase)
+                if experiment.persistent
+                else f"Restore the config that produced it, or run {_WITHOUT_FROM_PHASE_IN_MEMORY}."
+            ),
         )
 
     completion = data["completion"]

@@ -64,7 +64,12 @@ from phasesweep.engine.state import (
     WinnerSource,
 )
 from phasesweep.engine.trial import _environment_identity
-from phasesweep.errors import FRESH_STUDY, OperatorAction, ProcessCleanupUncertainError
+from phasesweep.errors import (
+    FRESH_STUDY,
+    OperatorAction,
+    ProcessCleanupUncertainError,
+    operator_step,
+)
 from phasesweep.evidence.models import JsonEqualsGate, LogRegexExtractor, WandbExtractor
 from phasesweep.runtime.files import (
     atomic_text_writer,
@@ -1611,7 +1616,8 @@ def test_from_phase_rejects_stale_parent_winner(
         run_experiment(exp_v2, from_phase="lr")
     assert type(excinfo.value) is StudyFingerprintMismatchError
     assert excinfo.value.action is OperatorAction.FIX_CONFIG
-    assert "or restore the matching config before resuming." in str(excinfo.value)
+    assert operator_step(excinfo.value).startswith("Restore the config that produced it, or run ")
+    assert "Re-run phase" not in str(excinfo.value)
 
 
 @pytest.mark.integration
@@ -1699,7 +1705,7 @@ def test_from_phase_preflight_consumes_run_deadline(
 
     with pytest.raises(TimeoutError, match="before phase 'lr' could start") as refused:
         run_experiment(resumed, from_phase="lr")
-    from phasesweep.errors import PhaseSweepError, operator_step
+    from phasesweep.errors import PhaseSweepError
 
     assert isinstance(refused.value, PhaseSweepError)
     assert "Raise timeout_seconds_per_run" in operator_step(refused.value)
