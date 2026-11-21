@@ -222,16 +222,24 @@ def _tracking_delivery_payload(counts: Mapping[str, int], run: Mapping[str, obje
     :return JsonObject: Counts plus ``remedy``, the retry step when records are pending after
         the run ended, otherwise ``None``.
     """
+    from phasesweep.tracking.publication import refusal_rule
+
     pending = counts["pending"]
     remedy = None
     if pending and run["state"] != "running":
+        # The payload is path-free, so the warning is placed by the log the run wrote and by
+        # the retry, whose every pass warns again.
         remedy = (
             f"{pending} MLflow record(s) of this run are pending. Its scores and winners are "
             "unaffected. The next launch with this config sends them, or ask the operator "
             f"to retry them with `phasesweep sync-tracking CONFIG --generation {run['run_id']}` "
-            "using the config this run launched with; delivery never retrains. A record MLflow "
-            "refused, as for a run deleted in MLflow, stays pending until the operator fixes "
-            "the cause its warning gives in MLflow."
+            "using the config this run launched with; delivery never retrains. If MLflow "
+            "refused a record, such as for a run deleted in MLflow, that record "
+            + refusal_rule(
+                " in the engine's `run.log` in the experiment workdir, or on the console of the "
+                "operator's retry,"
+            )
+            + "."
         )
     return {"pending": pending, "delivered": counts["delivered"], "remedy": remedy}
 

@@ -48,6 +48,10 @@ from tests.tracking_helpers import (
 _PENDING_STEP = (
     "results are saved locally. The next run or `phasesweep sync-tracking CONFIG` sends them."
 )
+_REFUSAL = (
+    "a refused record stays pending until the cause given in its warning is fixed in MLflow, for "
+    "example by restoring a deleted run or its experiment."
+)
 
 
 @pytest.mark.integration
@@ -92,8 +96,7 @@ def test_pending_mlflow_uploads_get_final_closeout_without_failing_publication(
     assert final.levelno == logging.WARNING
     message = final.getMessage()
     refused = (
-        " MLflow refused 7 of them; a refused record stays pending until the cause its warning "
-        "gives is fixed in MLflow."
+        f" MLflow refused 7 records; {_REFUSAL}"
         if isinstance(failure, OperationRejectedError)
         and not isinstance(failure, OperationUnavailableError)
         else ""
@@ -555,8 +558,7 @@ def test_each_delivery_pass_sends_earlier_records_first_and_stops_at_the_first_u
         creations = " and 1 unconfirmed run creation" if creation else ""
         assert (
             f"MLflow: 1 record{creations} pending ({pending} from earlier runs); {_PENDING_STEP} "
-            "MLflow refused 1 of them; a refused record stays pending until the cause its warning "
-            "gives is fixed in MLflow." in caplog.text
+            f"MLflow refused 1 record; {_REFUSAL}" in caplog.text
         )
         assert (
             f"MLflow: attempt record {attempt} of generation {sweep.generation} is pending "
@@ -743,10 +745,8 @@ def test_sync_tracking_names_what_keeps_its_records_pending(
         assert sweep.summaries() == []
     else:
         assert error == (
-            "phasesweep: MLflow delivery remains pending: MLflow refused 1 record(s), each for "
-            "the cause its warning gives.\n"
-            "fix: Fix the cause MLflow gave for each refused record, for example by restoring a "
-            "deleted run or its experiment in MLflow, then run `phasesweep sync-tracking` again.\n"
+            f"phasesweep: MLflow delivery remains pending: MLflow refused 1 record; {_REFUSAL}\n"
+            "fix: Fix each such cause, then run `phasesweep sync-tracking` again.\n"
         )
         assert (
             f"MLflow: attempt record {stem} of generation {sweep.generation} is pending (MLflow "

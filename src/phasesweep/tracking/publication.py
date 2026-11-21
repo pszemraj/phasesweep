@@ -1287,17 +1287,27 @@ def delivered_text(delivered: int, settled: int) -> str:
 def refused_text(refused: int) -> str:
     """Say how many pending records MLflow refused, and what keeps them pending.
 
-    A refused record is retried like any other, so it stays pending until its cause, which the
-    record's own warning names, is fixed in MLflow.
-
     :param int refused: Records MLflow refused in this delivery.
     :return str: A sentence with a leading space, or an empty string when none were refused.
     """
     if not refused:
         return ""
+    return f" MLflow refused {plural(refused, 'record')}; a refused record {refusal_rule()}."
+
+
+def refusal_rule(where: str = "") -> str:
+    """Say what keeps a record MLflow refused pending, in the words every surface uses.
+
+    A refused record is retried like any other, so a retry alone meets the same refusal; only
+    fixing its cause in MLflow helps.
+
+    :param str where: Where the record's warning is, with a leading space, for a reader who
+        never saw the console, defaults to the console's own warning.
+    :return str: A clause that follows the record it is about, without a final period.
+    """
     return (
-        f" MLflow refused {refused} of them; a refused record stays pending until the cause its "
-        "warning gives is fixed in MLflow."
+        f"stays pending until the cause given in its warning{where} is fixed in MLflow, for "
+        "example by restoring a deleted run or its experiment"
     )
 
 

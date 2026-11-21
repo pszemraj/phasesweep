@@ -1333,6 +1333,7 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
     :raises PhaseSweepError: Nothing matching can be synchronized, or records remain pending;
         its step is a retry when MLflow gave no answer, and fixing the causes when it refused.
     """
+    from phasesweep.tracking.publication import refused_text
     from phasesweep.tracking.publication import sync_tracking as sync
     from phasesweep.tracking.session import DeliveryTally
 
@@ -1351,16 +1352,10 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
             f"MLflow delivery remains pending: {tally.unanswered}", action=OperatorAction.RETRY
         )
     if tally.refused:
-        # A refused record is retried like any other, so only fixing its cause in MLflow helps.
         raise PhaseSweepError(
-            f"MLflow delivery remains pending: MLflow refused {len(tally.refused)} record(s), each "
-            "for the cause its warning gives.",
+            "MLflow delivery remains pending:" + refused_text(len(tally.refused)),
             action=OperatorAction.FIX_CONFIG,
-            remediation=(
-                "Fix the cause MLflow gave for each refused record, for example by restoring a "
-                "deleted run or its experiment in MLflow, then run `phasesweep sync-tracking` "
-                "again."
-            ),
+            remediation="Fix each such cause, then run `phasesweep sync-tracking` again.",
         )
     raise PhaseSweepError("MLflow delivery remains pending.", action=OperatorAction.RETRY)
 
