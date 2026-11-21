@@ -414,13 +414,15 @@ def _shell_reported_signal(return_code: int) -> signal.Signals | None:
 
     The trial command runs under ``/bin/sh -c``, and a shell that does not exec its
     command survives the command's death and exits with that code. A trainer may also
-    exit with such a code on purpose, so a caller words the reading as a report.
+    exit with such a code on purpose, so a caller words the reading as a report. Only the
+    standard signals 1 to 31 count: Python names just the first and last real-time signals,
+    so reading further would call 162 and 192 signal deaths and the codes between them not.
 
     :param int return_code: Trainer return code.
     :return signal.Signals | None: The signal ``return_code - 128`` names, or ``None`` when
-        the code is outside 129 to 192 or that number is no signal on this host.
+        the code is outside 129 to 159 or that number is no signal on this host.
     """
-    if not 129 <= return_code <= 192:
+    if not 129 <= return_code <= 159:
         return None
     try:
         return signal.Signals(return_code - 128)
@@ -433,7 +435,7 @@ def _nonzero_exit_reason(return_code: int) -> str:
 
     :param int return_code: Nonzero trainer return code. A negative value is ``-N`` for a
         process killed by signal ``N``, which is how the trial shell reports its own death.
-        A value from 129 to 192 naming a signal is the shell's report of its command's death.
+        A value from 129 to 159 naming a signal is the shell's report of its command's death.
     :return str: The failure reason without any stderr quote.
     """
     if return_code < 0:
