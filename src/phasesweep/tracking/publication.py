@@ -1293,9 +1293,8 @@ def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryT
         its closeout.
     """
     try:
-        pending = delivery_status(experiment)["pending"]
-        earlier = pending - delivery_status(experiment, generation_id)["pending"]
-        creations = len(pending_creation_records(experiment))
+        counts = delivery_counts(experiment)
+        earlier = counts.pending - delivery_counts(experiment, generation_id).pending
     except (OSError, ValueError) as exc:
         log.warning("MLflow: pending records could not be counted (%s).", exc)
         return
@@ -1305,10 +1304,10 @@ def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryT
         logging.getLogger(REPORT_LOGGER).info(
             ReportText(f"MLflow: {done} left pending by earlier runs.")
         )
-    if pending:
+    if counts.pending:
         log.warning(
             "MLflow: %s pending%s; results are saved locally. The next run or %s sends them.%s",
-            count_text(pending - creations, creations),
+            count_text(counts.records, counts.creations),
             f" ({earlier} from earlier runs)" if earlier else "",
             SYNC_TRACKING_STEP,
             refused_text(tally.refused),
@@ -1380,17 +1379,52 @@ def refusal_rule(where: str = "") -> str:
     )
 
 
-def delivery_status(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
+class DeliveryCounts(NamedTuple):
+    """What a scope still owes MLflow, records and creations apart, and what it delivered."""
+
+    records: int
+    """Delivery records still to be sent."""
+    creations: int
+    """Unconfirmed run creations still to be settled by a search."""
+    delivered: int
+    """Delivery records MLflow accepted."""
+
+    @property
+    def pending(self) -> int:
+        """Return everything still owed: the pending records and creations together."""
+        return self.records + self.creations
+
+
+def delivery_counts(experiment: Experiment, generation_id: str | None = None) -> DeliveryCounts:
     """Count pending run creations and delivery records without importing the tracking SDK.
 
     :param Experiment experiment: Local namespace.
     :param str | None generation_id: Optional generation filter.
+    :raises OSError: A record cannot be read.
+    :raises ValueError: A record is malformed.
+    :return DeliveryCounts: Pending records and creations, and delivered records.
+    """
+    records = delivered = 0
+    for path in _records(experiment, generation_id):
+        if _read_delivery(path).delivered:
+            delivered += 1
+        else:
+            records += 1
+    creations = len(pending_creation_records(experiment, generation_id))
+    return DeliveryCounts(records, creations, delivered)
+
+
+def delivery_status(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
+    """Count what is pending and delivered, for the status surfaces that report both.
+
+    :param Experiment experiment: Local namespace.
+    :param str | None generation_id: Optional generation filter.
+    :raises OSError: A record cannot be read.
+    :raises ValueError: A record is malformed.
     :return dict[str, int]: Path-free pending and delivered counts.
     """
-    counts = {"pending": len(pending_creation_records(experiment, generation_id)), "delivered": 0}
-    for path in _records(experiment, generation_id):
-        counts["delivered" if _read_delivery(path).delivered else "pending"] += 1
-    return counts
+    counts = delivery_counts(experiment, generation_id)
+    return {"pending": counts.pending, "delivered": counts.delivered}
 
 
 def sync_tracking(

@@ -324,24 +324,22 @@ def recover_run(
                 from phasesweep.tracking.publication import (
                     count_text,
                     delivered_text,
-                    delivery_status,
+                    delivery_counts,
                     refused_text,
                 )
-                from phasesweep.tracking.session import pending_creation_records
 
                 # Counted after the uploads across every generation, as delivery covered them all.
                 try:
-                    pending = delivery_status(config)["pending"]
-                    creations = len(pending_creation_records(config))
+                    counts = delivery_counts(config)
                 except (OSError, ValueError) as exc:
                     emit(f"MLflow pending records could not be counted ({exc}).")
                 else:
                     done = delivered_text(tally.delivered, tally.settled)
                     sent = f"MLflow: {done}" if done else ""
-                    if pending:
+                    if counts.pending:
                         emit(
                             (f"{sent}. " if sent else "")
-                            + f"MLflow: {count_text(pending - creations, creations)} pending. "
+                            + f"MLflow: {count_text(counts.records, counts.creations)} pending. "
                             f"The next launch with this config, or {SYNC_TRACKING_STEP}, sends "
                             "them; delivery never retrains." + refused_text(tally.refused)
                         )

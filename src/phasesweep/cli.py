@@ -1515,6 +1515,8 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
                 else f"That window has closed since the search, so {again}"
             ),
         )
+    # The counts printed above, less the creations the window check just listed, so the line
+    # agrees with them without reading the records again.
     records = counts["pending"] - len(creations)
     raise PhaseSweepError(
         f"MLflow delivery remains pending: {count_text(records, len(creations))} could not be "
@@ -1532,18 +1534,18 @@ def _sync_stopped_text(config: Experiment, generation_id: str | None, command: s
     :param str command: The shell-quoted command that repeats it.
     :return str: The sentence, wrapped to the terminal, then the command on a line of its own.
     """
-    from phasesweep.tracking.publication import count_text, delivery_status
-    from phasesweep.tracking.session import pending_creation_records
+    from phasesweep.tracking.publication import count_text, delivery_counts
 
     try:
-        pending = delivery_status(config, generation_id)["pending"]
-        creations = len(pending_creation_records(config, generation_id))
+        counts = delivery_counts(config, generation_id)
     except (OSError, ValueError) as exc:
         stopped = f"phasesweep: stopped; what stays pending could not be counted ({exc})."
     else:
-        if not pending:
+        if not counts.pending:
             return "phasesweep: stopped with nothing pending."
-        stopped = f"phasesweep: stopped with {count_text(pending - creations, creations)} pending."
+        stopped = (
+            f"phasesweep: stopped with {count_text(counts.records, counts.creations)} pending."
+        )
     sentence = f"{stopped} Rerun the same command to send what is left:"
     return "\n".join([*wrap(sentence, terminal_width(sys.stderr)), command])
 
