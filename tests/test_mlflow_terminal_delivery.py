@@ -69,7 +69,7 @@ from phasesweep.tracking.session import (
     tracking_root,
     write_record,
 )
-from tests.conftest import lose_record_writes, trial_outcome
+from tests.conftest import lose_record_writes, patch_path_method_failure, trial_outcome
 from tests.tracking_helpers import (
     FakeWorkerProcess,
     RunnerKilled,
@@ -1346,7 +1346,7 @@ def test_only_an_in_memory_generation_ends_an_attempt_its_ledger_lost(
 def test_unusable_generation_record_leaves_mlflow_outcomes_unresolved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, problem: str
 ) -> None:
-    """Recovery leaves an unusable lifecycle's outcomes unsaved until its record is restored."""
+    """Recovery defers an unusable lifecycle's outcomes while sync delivers readable generations."""
     from phasesweep.engine.generation import _write_generation_state
 
     generation = "failed-run"
@@ -1364,24 +1364,33 @@ def test_unusable_generation_record_leaves_mlflow_outcomes_unresolved(
     lifecycle = _generation_record_path(experiment, generation)
     original = lifecycle.read_bytes()
     delivery = tracking_root(experiment) / generation / "delivery"
-    read_text = Path.read_text
+    healthy = "healthy-run"
 
-    def unreadable(path: Path, *args, **kwargs) -> str:
-        if path == lifecycle:
-            raise PermissionError("read refused")
-        return read_text(path, *args, **kwargs)
+    def offline(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated upload outage")
 
     with monkeypatch.context() as fault:
         if problem == "unreadable":
-            fault.setattr(Path, "read_text", unreadable)
+            patch_path_method_failure(
+                fault, lifecycle, "read_text", PermissionError("read refused")
+            )
         else:
             lifecycle.write_text("state: [", encoding="utf-8")
 
-        assert run_experiment(experiment)["depth"].metric == 1.0
+        with fault.context() as unavailable:
+            unavailable.setattr(publication, "call_tracking", offline)
+            assert run_experiment(experiment, generation_id=healthy)["depth"].metric == 1.0
         assert f"{lifecycle} is {problem}" in caplog.text
         assert not delivery.exists()
+        assert publication.delivery_status(experiment, healthy)["pending"] > 0
         with pytest.raises(TrackingSyncRefusedError, match=f"generation record .* is {problem}"):
             publication.sync_tracking(experiment, generation)
+        assert not delivery.exists()
+        uploads.clear()
+        with pytest.raises(TrackingSyncRefusedError, match=f"generation record .* is {problem}"):
+            publication.sync_tracking(experiment)
+        assert _summaries(uploads) == [(healthy, "FINISHED")]
+        assert publication.delivery_status(experiment, healthy)["pending"] == 0
         assert not delivery.exists()
 
     lifecycle.write_bytes(original)

@@ -623,7 +623,11 @@ def publish_failed_generation(
 
 
 def _rebuild_attempt_intents(
-    experiment: Experiment, ledger: ValidatedLedger, generation_ids: Iterable[str]
+    experiment: Experiment,
+    ledger: ValidatedLedger,
+    generation_ids: Iterable[str],
+    *,
+    unresolved: dict[str, TrackingSyncRefusedError] | None = None,
 ) -> None:
     """Save the attempt records an interrupted or failed invocation never saved.
 
@@ -634,6 +638,8 @@ def _rebuild_attempt_intents(
     :param ValidatedLedger ledger: The experiment's validated ledger, holding the attempts' trials.
     :param Iterable[str] generation_ids: Ended generations whose attempts are checked; never a
         live invocation's.
+    :param dict[str, TrackingSyncRefusedError] | None unresolved: Collect per-generation lifecycle
+        errors when rebuilding across generations. Raise on the first such error by default.
     """
     unrecorded = {
         generation_id: attempts
@@ -647,13 +653,22 @@ def _rebuild_attempt_intents(
     for generation_id, attempts in unrecorded.items():
         # A persistent ledger still holds the trials, and a published generation is not ended
         # by its lifecycle record.
-        ended = None if experiment.persistent else _ended_status(experiment, generation_id)
+        ended = (
+            None
+            if experiment.persistent
+            else _ended_status(experiment, generation_id, unresolved=unresolved)
+        )
         _save_attempt_intents(
             experiment, generation_id, attempts, trials, ended=None if ended is None else ended[0]
         )
 
 
-def _ended_status(experiment: Experiment, generation_id: str) -> tuple[str, str | None] | None:
+def _ended_status(
+    experiment: Experiment,
+    generation_id: str,
+    *,
+    unresolved: dict[str, TrackingSyncRefusedError] | None = None,
+) -> tuple[str, str | None] | None:
     """Name the status and failure that end a generation's runs, if unpublished.
 
     It is the status the failure in the generation's lifecycle record maps to, or KILLED
@@ -661,18 +676,22 @@ def _ended_status(experiment: Experiment, generation_id: str) -> tuple[str, str 
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Ended generation.
-    :raises TrackingSyncRefusedError: An unreadable or malformed record cannot supply a status.
+    :param dict[str, TrackingSyncRefusedError] | None unresolved: Collect unreadable or malformed
+        records so the caller can finish other generations. Each broken record is read once.
+    :raises TrackingSyncRefusedError: The record cannot supply a status and no collector is set.
     :return tuple[str, str | None] | None: ``FAILED`` or ``KILLED`` and the failure class when
-        recorded, or ``None`` for a published generation.
+        recorded. ``None`` for a published or unresolved generation.
     """
     from phasesweep.engine.paths import _generation_record_path
 
+    if unresolved is not None and generation_id in unresolved:
+        return None
     recorded = _generation_publication_record(experiment, generation_id)
     if recorded.state == "published":
         return None
     if recorded.problem is not None:
         path = _generation_record_path(experiment, generation_id)
-        raise TrackingSyncRefusedError(
+        error = TrackingSyncRefusedError(
             f"MLflow terminal outcome is unresolved: generation record {path} "
             f"is {recorded.problem}.",
             action=OperatorAction.RESTORE_TREE,
@@ -681,12 +700,21 @@ def _ended_status(experiment: Experiment, generation_id: str) -> tuple[str, str 
                 "the same config."
             ),
         )
+        if unresolved is None:
+            raise error
+        unresolved[generation_id] = error
+        return None
     if recorded.state in {"failed", "publication_failed"}:
         return _failure_status(recorded.error_class), recorded.error_class
     return "KILLED", None
 
 
-def _save_ended_summaries(experiment: Experiment, generation_ids: Iterable[str]) -> list[Path]:
+def _save_ended_summaries(
+    experiment: Experiment,
+    generation_ids: Iterable[str],
+    *,
+    unresolved: dict[str, TrackingSyncRefusedError] | None = None,
+) -> list[Path]:
     """Save the summary-run record each ended, unpublished generation's invocation never saved.
 
     An invocation killed outright saves none, so its summary run would stay open. It ends with
@@ -697,6 +725,8 @@ def _save_ended_summaries(experiment: Experiment, generation_ids: Iterable[str])
 
     :param Experiment experiment: Configured experiment.
     :param Iterable[str] generation_ids: Ended generations to check.
+    :param dict[str, TrackingSyncRefusedError] | None unresolved: Collect per-generation lifecycle
+        errors when rebuilding across generations. Raise on the first such error by default.
     :raises OSError: A record or binding cannot be written or the binding cannot be read.
     :raises TrackingSyncRefusedError: The generation's lifecycle record is unreadable or malformed.
     :return list[Path]: The summary-run record of each of those generations that is unpublished
@@ -712,7 +742,7 @@ def _save_ended_summaries(experiment: Experiment, generation_ids: Iterable[str])
             if _published(experiment, generation_id):
                 continue
         else:
-            ended = _ended_status(experiment, generation_id)
+            ended = _ended_status(experiment, generation_id, unresolved=unresolved)
             if ended is None:
                 continue
             _save_failure_summary(experiment, generation_id, *ended)
@@ -778,9 +808,7 @@ def save_recovered_attempts(
     :param Iterable[str] generation_ids: Ended generations: those whose trials recovery settled,
         those left open by an invocation killed outright, and for recover-run the run it
         recovers; never the caller's own.
-    :return list[Path]: Those generations' attempt and summary-run records not yet delivered, in
-        generation order, or none when they could not all be saved and read or the target is
-        not the recorded one.
+    :return list[Path]: Readable pending attempt and summary-run records, in generation order.
     """
     root = tracking_root(experiment)
     generations = sorted(
@@ -796,8 +824,11 @@ def save_recovered_attempts(
                 "`phasesweep sync-tracking` with the config the sweep ran with."
             )
             return []
-        _rebuild_attempt_intents(experiment, ledger, generations)
-        summaries = set(_save_ended_summaries(experiment, generations))
+        unresolved: dict[str, TrackingSyncRefusedError] = {}
+        _rebuild_attempt_intents(experiment, ledger, generations, unresolved=unresolved)
+        summaries = set(_save_ended_summaries(experiment, generations, unresolved=unresolved))
+        for error in unresolved.values():
+            log.warning("%s %s", error, error.remediation)
         records: list[Path] = []
         for generation_id in generations:
             delivery = root / generation_id / "delivery"
@@ -930,6 +961,8 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
     reconcile unresolved creations, rebuild missing attempt records from Optuna,
     the summary-run record of each ended unpublished generation from its lifecycle
     record, and winner records from committed generation artifacts.
+    When syncing all generations, defer an unreadable lifecycle record's error until
+    the other generations have been processed.
 
     :param Experiment experiment: Matching source experiment configuration.
     :param str | None generation_id: Generation whose deliveries should be
@@ -979,16 +1012,21 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
         parents = sorted(root.glob(f"{generation_id or '*'}/{GENERATION_BINDING_FILE}"))
         # The lock rules out a live invocation, so every unpublished generation here has ended.
         generations = [parent.parent.name for parent in parents]
-        _rebuild_attempt_intents(experiment, ledger, generations)
-        _save_ended_summaries(experiment, generations)
+        unresolved: dict[str, TrackingSyncRefusedError] = {}
+        collect = unresolved if generation_id is None else None
+        _rebuild_attempt_intents(experiment, ledger, generations, unresolved=collect)
+        _save_ended_summaries(experiment, generations, unresolved=collect)
         for parent in parents:
-            if (parent.parent / "delivery" / "generation.json").exists() or not _published(
-                experiment, parent.parent.name
+            generation = parent.parent.name
+            if (
+                generation in unresolved
+                or (parent.parent / "delivery" / "generation.json").exists()
+                or not _published(experiment, generation)
             ):
                 continue
-            _save_generation_intents(experiment, parent.parent.name)
+            _save_generation_intents(experiment, generation)
         paths = sorted(root.glob(f"{generation_id or '*'}/delivery/*.json"))
-        if not paths and not pending_creation_records(experiment, generation_id):
+        if not paths and not unresolved and not pending_creation_records(experiment, generation_id):
             raise TrackingSyncRefusedError("No tracking deliveries exist for this scope.")
         for path in paths:
             record = read_record(path)
@@ -1001,4 +1039,10 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
                 )
         for path in paths:
             _deliver(experiment, path, environment)
+        if unresolved:
+            first = next(iter(unresolved.values()))
+            if len(unresolved) == 1:
+                raise first
+            detail = "\n".join(str(error) for error in unresolved.values())
+            raise TrackingSyncRefusedError.rewrap(first, detail) from first
     return delivery_status(experiment, generation_id)
