@@ -152,18 +152,17 @@ def response_failure(
     )
     failure = diagnosis.failure
     if observation.recovery_required and not diagnosis.names_recover_run:
-        failure = _recovery_failure(runs, handle, observation, diagnosis.recorded)
+        failure = _recovery_failure(handle, observation, diagnosis.recorded)
     elif failure is None and publication_integrity is not None and observation.state != "running":
         failure = _PUBLICATION_FAILURES.get(publication_integrity)
     return _validated(failure)
 
 
 def _recovery_failure(
-    runs: RunStore, handle: RunHandle, observation: RunObservation, recorded: JsonObject | None
+    handle: RunHandle, observation: RunObservation, recorded: JsonObject | None
 ) -> JsonObject:
     """Name the recovery step for a run whose diagnosis carries none.
 
-    :param RunStore runs: Store that can verify a launch preparation was abandoned.
     :param RunHandle handle: Run that requires recovery.
     :param RunObservation observation: The read's observation of the run.
     :param JsonObject | None recorded: The run's own recorded failure, kept as the cause.
@@ -171,19 +170,13 @@ def _recovery_failure(
         cleanup, or ``result_snapshot_unavailable`` for an unfinished result snapshot.
     """
     if handle.launch_state == "launching" and observation.terminal_status is None:
-        if runs.is_pre_spawn_orphan(handle.run_id):
-            return operator_failure(
-                "cleanup_uncertain",
-                "cleanup",
-                "Stop monitoring this abandoned launch. The next permitted launch clears this "
-                "preparation automatically. To remove it without launching, ask the operator "
-                f"to {recover_run_step(handle.run_id)}.",
-            )
         return operator_failure(
             "cleanup_uncertain",
             "cleanup",
             "The server saved this run's launch but never recorded whether its runner "
-            f"started. {_stop_for_recovery(handle.run_id)}",
+            "started. Stop monitoring. The next permitted launch clears this preparation "
+            "automatically if the launch lease proves it was abandoned. To check or remove it "
+            f"without launching, ask the operator to {recover_run_step(handle.run_id)}.",
         )
     if observation.snapshot_recovery_required and not observation.cleanup_recovery_required:
         snapshot_unfinished = operator_failure(
