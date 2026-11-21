@@ -23,7 +23,7 @@ import pytest
 
 from phasesweep.runtime import reaper, supervisor
 from phasesweep.runtime.process import read_attempt_lifecycle, run_supervised
-from tests.conftest import is_pid_zombie
+from tests.conftest import is_pid_zombie, use_guardian_timing
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux", reason="reads Linux procfs thread listings"
@@ -115,8 +115,11 @@ def test_leader_exited_group_is_signalled_then_reported_gone(
 
 
 @pytest.mark.integration
-def test_guardian_terminates_a_leader_exited_descendant(tmp_path: Path) -> None:
+def test_guardian_terminates_a_leader_exited_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A leftover descendant whose main thread ended fails the trial and is terminated."""
+    use_guardian_timing(monkeypatch, tmp_path, settle_seconds=0.2, term_grace_seconds=5.0)
     marker = tmp_path / "descendant_pid"
     root = (
         "import subprocess, sys, time\n"
@@ -146,7 +149,7 @@ def test_guardian_terminates_a_leader_exited_descendant(tmp_path: Path) -> None:
             )
 
         assert result.failure_reason is not None
-        assert "still had live descendants" in result.failure_reason
+        assert "still had live descendants 0.2s later" in result.failure_reason
         assert result.cleanup_confirmed
         lifecycle = read_attempt_lifecycle(
             trial_dir, expected_attempt_id="leader-exited-descendant"

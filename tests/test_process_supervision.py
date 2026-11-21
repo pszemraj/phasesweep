@@ -52,7 +52,12 @@ from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     _shutdown_handler,
 )
-from tests.conftest import is_pid_zombie, make_experiment, raise_after_first_successful_call
+from tests.conftest import (
+    assert_descendant_dies,
+    is_pid_zombie,
+    make_experiment,
+    raise_after_first_successful_call,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -871,29 +876,6 @@ _SIGTERM_IGNORING_CHILD_SCRIPT = (
 )
 
 
-def _assert_descendant_dies(
-    pid: int, *, deadline_seconds: float = 5.0, on_timeout_msg: str
-) -> None:
-    """Poll until ``pid`` is gone; if it outlives the deadline, SIGKILL it and fail.
-
-    :param int pid: Descendant PID expected to be reaped by supervisor cleanup.
-    :param float deadline_seconds: How long to poll before giving up.
-    :param str on_timeout_msg: ``pytest.fail`` message used if still alive at the deadline.
-    """
-    deadline = time.time() + deadline_seconds
-    while time.time() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return  # success
-        time.sleep(0.05)
-
-    # Cleanup before failing so we don't leak a python process across the test run.
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGKILL)
-    pytest.fail(on_timeout_msg)
-
-
 def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) -> None:
     """Timeout cleanup kills a SIGTERM-ignoring child after its root shell exits."""
     trial_dir = tmp_path / "trial"
@@ -921,7 +903,7 @@ def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) 
 
     # The child must be dead within a reasonable window after run_supervised returns.
     # If _kill_group only waited for the root, the child would still be alive here.
-    _assert_descendant_dies(
+    assert_descendant_dies(
         child_pid, on_timeout_msg=f"timeout left descendant process {child_pid} alive"
     )
 
@@ -1322,94 +1304,12 @@ def test_deadline_expiring_during_launch_preparation_prevents_trainer_start(
     assert not marker.exists()
 
 
-def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
-    """Root exits 0 while a child ignores SIGTERM."""
-    trial_dir = tmp_path / "trial"
-    marker = tmp_path / "child_pid.txt"
-
-    parent_script = (
-        "import os, subprocess, sys; "
-        f"p = subprocess.Popen([sys.executable, '-c', {_SIGTERM_IGNORING_CHILD_SCRIPT!r}]); "
-        f"open({str(marker)!r}, 'w').write(str(p.pid)); "
-        "sys.stdout.flush(); "
-        "os._exit(0)"
-    )
-
-    cmd = f"python -c {parent_script!r}"
-
-    result = _run_supervised(trial_dir, cmd, timeout=10.0, attempt_id="descendant-attempt")
-
-    # Must be flagged as a lifecycle failure, not a clean exit.
-    assert result.failure_reason is not None
-    assert "still had live descendants" in result.failure_reason
-    assert "Make the trainer wait for its children before exiting" in result.failure_reason
-
-    # The atomic identity must be preserved for forensics.
-    assert (trial_dir / PROCESS_IDENTITY_FILE).exists()
-
-    # Descendant must be dead.
-    assert marker.exists(), "child PID marker was never written; test setup broken"
-    child_pid = int(marker.read_text().strip())
-    _assert_descendant_dies(
-        child_pid, on_timeout_msg=f"background descendant {child_pid} survived root exit"
-    )
-
-
-def test_descendant_reaping_grace_is_outside_trial_wallclock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An in-budget root exit remains a lifecycle failure, not a timeout."""
-    import phasesweep.runtime.process as process
-
-    trial_dir = tmp_path / "trial"
-    ready = tmp_path / "descendant_ready"
-    root_pid = tmp_path / "root_pid"
-    budget = 5.0
-    child_script = (
-        "import os, pathlib, signal, time; "
-        "signal.signal(signal.SIGTERM, "
-        f"lambda *_: (time.sleep({budget + 0.5}), os._exit(0))); "
-        f"pathlib.Path({str(ready)!r}).touch(); "
-        "time.sleep(60)"
-    )
-    parent_script = (
-        "import os, pathlib, subprocess, sys, time; "
-        f"subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
-        f"ready = pathlib.Path({str(ready)!r}); "
-        "\nwhile not ready.exists(): time.sleep(0.005)\n"
-        f"pathlib.Path({str(root_pid)!r}).write_text(str(os.getpid())); "
-        "os._exit(0)"
-    )
-
-    real_wait = process._wait_for_guardian_exit
-
-    def wait_for_cleanup(proc: subprocess.Popen[bytes]) -> bool:
-        # The root-exit status has already arrived; the guardian still owns cleanup.
-        assert root_pid.exists()
-        assert not is_pid_alive(int(root_pid.read_text()))
-        assert proc.poll() is None
-        assert time.monotonic() - started < budget, "root exit did not precede the deadline"
-        return real_wait(proc)
-
-    monkeypatch.setattr(process, "_wait_for_guardian_exit", wait_for_cleanup)
-    started = time.monotonic()
-    result = _run_supervised(
-        trial_dir,
-        shlex.join([sys.executable, "-c", parent_script]),
-        timeout=budget,
-        attempt_id="post-root-grace-attempt",
-    )
-
-    assert result.timed_out is False
-    assert result.return_code == 0
-    assert result.cleanup_confirmed is True
-    assert result.failure_reason is not None
-    assert "still had live descendants" in result.failure_reason
-    assert result.duration_seconds > budget, "test did not exercise cleanup beyond the budget"
-
-
 def test_in_band_guardian_wait_reports_uncertainty_instead_of_hanging() -> None:
-    """A fail-closed detached guardian cannot park the orchestrator forever."""
+    """A fail-closed detached guardian cannot park the orchestrator forever.
+
+    The bounded wait still outlasts a healthy guardian's worst case after its root
+    exits: the helper settle, then the SIGTERM grace.
+    """
     guardian = Mock(pid=4242)
     guardian.wait.side_effect = subprocess.TimeoutExpired("guardian", 0.0)
 
@@ -1417,7 +1317,7 @@ def test_in_band_guardian_wait_reports_uncertainty_instead_of_hanging() -> None:
     guardian.wait.assert_called_once()
     timeout = guardian.wait.call_args.kwargs["timeout"]
     assert timeout is not None
-    assert timeout > supervisor._GROUP_TERM_GRACE_SECONDS
+    assert timeout > supervisor._HELPER_SETTLE_SECONDS + supervisor._GROUP_TERM_GRACE_SECONDS
 
 
 @pytest.mark.parametrize("state", ["Z", "X"])

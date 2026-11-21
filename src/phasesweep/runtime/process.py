@@ -50,8 +50,11 @@ from phasesweep.runtime.shutdown import (
 log = logging.getLogger("phasesweep.runtime.process")
 
 _DIRECT_CHILD_REAP_TIMEOUT_SECONDS = 5.0
+# After the root exits the guardian waits out the helper settle, then the SIGTERM grace.
 _GUARDIAN_EXIT_TIMEOUT_SECONDS = (
-    _supervisor._GROUP_TERM_GRACE_SECONDS + _DIRECT_CHILD_REAP_TIMEOUT_SECONDS
+    _supervisor._HELPER_SETTLE_SECONDS
+    + _supervisor._GROUP_TERM_GRACE_SECONDS
+    + _DIRECT_CHILD_REAP_TIMEOUT_SECONDS
 )
 _SUPERVISOR_READY_TIMEOUT_SECONDS = 10.0
 # poll() takes its timeout as a C int of milliseconds, about 24.8 days, and a
@@ -567,8 +570,9 @@ def _spawn_blocked_supervisor(
         status_read)``: guardian process, registered trainer group, launch pipe and status
         pipe. The caller owns both descriptors; after persisting trainer identity, send the
         framed payload and close ``ack_write``. ``status_read`` yields ``b"X"`` when the
-        trainer root exits, then ``b"D"`` if descendants were reaped or EOF otherwise.
-        Cleanup after ``b"X"`` is outside the trainer wallclock budget.
+        trainer root exits, then ``b"D"`` and the survivors' descriptions in one write if
+        group members outlived the helper settle and were terminated, or EOF otherwise.
+        The settle and cleanup after ``b"X"`` are outside the trainer wallclock budget.
     """
     ready_read, ready_write = os.pipe()
     ack_read, ack_write = os.pipe()
@@ -661,9 +665,10 @@ def run_supervised(
     """Launch a shell command in its own process group with durable ownership.
 
     Persist identity before delivering the trainer payload; earlier EOF prevents execution.
-    Identity files remain; ``exited`` requires confirmed cleanup. Surviving descendants cause
-    failure and termination even if their root succeeded. The guardian holds GPU leases
-    until the entire group is gone, independently of the trainer's file descriptors.
+    Identity files remain; ``exited`` requires confirmed cleanup. Descendants still running
+    once the helper settle after root exit ends cause failure and termination even if their
+    root succeeded. The guardian holds GPU leases until the entire group is gone,
+    independently of the trainer's file descriptors.
 
     The earlier timeout or absolute deadline covers launch and execution; cleanup is
     outside that budget. Expected post-spawn deadline, identity-write and payload failures
@@ -888,14 +893,15 @@ def run_supervised(
             log.warning("Process PID %d (pgid %d) timed out — terminating group", pgid, pgid)
             cleanup_confirmed = _kill_group(pgid, proc)
         else:
-            # The trainer root exited within its budget. Descendant cleanup is
-            # lifecycle teardown, so the guardian's SIGTERM/SIGKILL grace must
-            # not retroactively turn this into a wallclock timeout.
+            # The trainer root exited within its budget. The helper settle and
+            # descendant cleanup are lifecycle teardown, so the guardian's waits
+            # must not retroactively turn this into a wallclock timeout.
             guardian_exited = _wait_for_guardian_exit(proc)
             guardian_status = None
             if guardian_exited:
+                # The guardian has exited, so its one survivor frame is complete.
                 guardian_status = (
-                    os.read(status_read, 1)
+                    os.read(status_read, 4096)
                     if root_status == _supervisor._TRAINER_ROOT_EXITED
                     else root_status
                 )
@@ -907,16 +913,25 @@ def run_supervised(
                     f"trainer root exited, but lease guardian {proc.pid} could not "
                     "confirm descendant cleanup within its bounded allowance"
                 )
-            if guardian_status == _supervisor._DESCENDANTS_REAPED:
+            if guardian_status is not None and guardian_status.startswith(
+                _supervisor._DESCENDANTS_REAPED
+            ):
+                settle = _supervisor._HELPER_SETTLE_SECONDS
+                survivors = guardian_status[1:].decode("ascii", "replace")
+                named = f": {survivors}" if survivors else ""
                 failure_reason = (
-                    f"trainer root exited, but process group {pgid} still had live descendants. "
-                    "Make the trainer wait for its children before exiting"
+                    f"trainer root exited with code {proc.returncode}, but process group "
+                    f"{pgid} still had live descendants {settle:g}s later{named}. They were "
+                    "terminated. Make the trainer wait for its children before exiting"
                 )
                 log.warning(
-                    "Trainer root PID %d exited but process group %d "
-                    "still had live descendants; the lease guardian terminated them",
+                    "Trainer root PID %d exited with code %s but process group %d still had "
+                    "live descendants %gs later (%s); the lease guardian terminated them",
                     pgid,
+                    proc.returncode,
                     pgid,
+                    settle,
+                    survivors or "members could not be named",
                 )
             # Root exit is insufficient: surviving descendants still require group cleanup.
             if failure_reason is None and _process_group_alive(pgid):

@@ -220,7 +220,7 @@ The principal test groups and what each covers:
 - `tests/test_run_overrides.py`: shared `--set` key syntax, created-key notes, derived-config validation and study inspection with overrides.
 - `tests/test_config_reference.py` and `tests/test_explain.py`: the configuration reference against the schema, its parser's shared blocks and section rules, and `phasesweep explain`.
 - `tests/test_extractors.py`, `tests/test_trial_evidence.py`, and `tests/test_trial_launch.py`: scalar evidence, shared W&B captures, gates, supervised trials, and durable input verification.
-- `tests/test_attempt_lifecycle.py` and `tests/test_process_supervision.py`: lifecycle parsing, process identity and launch ordering, descendant cleanup, and guardian completion evidence.
+- `tests/test_attempt_lifecycle.py`, `tests/test_process_supervision.py` and `tests/test_guardian_settle.py`: lifecycle parsing, process identity and launch ordering, descendant cleanup and the helper settle after a trainer root exits, and guardian completion evidence.
 - `tests/test_mlflow.py` and `tests/test_mlflow_terminal_delivery.py`: native history selection, run bindings, shared captures, and terminal delivery retries.
 - `tests/test_mlflow_integration.py`: both ownership modes against a temporary HTTP server, stopped-server replay, worker cleanup, and delivery retries.
 - Storage, publication, recovery, interrupted trials and sampler resume: owning code and representative tests are listed by [durability invariant](invariants.md).
@@ -234,7 +234,7 @@ The principal test groups and what each covers:
 - TODO(runtime): Design an explicit completion-budget mode only if its attempt accounting, failure cap, and timeout semantics are specified separately.
 - TODO(runtime): Add a deliberately scoped generation-pruning command only if it preserves the current last-successful pointer and all cited winner provenance.
 - TODO(runtime): Distinguish independent trainer failure from guardian cancellation or a failed launch before counting a recovered nonzero exit toward the phase budget and failure limit. The lifecycle exit code alone can represent any of these cases. Track with the lifecycle recovery work in [issue 33](https://github.com/pszemraj/phasesweep/issues/33).
-- TODO(runtime): Decide whether shutdown should briefly wait for a trainer that has reported an objective but is still in teardown. Recovery requires a successful exit before accepting the result. Track with [issue 33](https://github.com/pszemraj/phasesweep/issues/33).
+- TODO(runtime): Decide whether shutdown should briefly wait for a trainer root that has reported an objective but not yet exited. Once the root has exited, the guardian already finishes its helper settle regardless of shutdown. Recovery requires a successful exit before accepting the result. Track with [issue 33](https://github.com/pszemraj/phasesweep/issues/33).
 - TODO(runtime): During a live run, a dry run can encounter an ongoing extraction and refuse to predict a trial count. Show the phase as awaiting evidence and label its remaining work as an estimate.
 - TODO(runtime): Use the recorded phase's repeat grouping to rebuild its `trials.csv` after recovery with a renamed or incompatible phase. An interrupted in-memory run also needs its final CSV snapshot taken while the settled study is still available.
 - TODO(runtime): Recover draws whose bookkeeping failed before the trainer started. A fatal pre-launch write can currently spend the draw and require a top-up.

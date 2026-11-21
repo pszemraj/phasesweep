@@ -26,6 +26,15 @@ _DESCENDANTS_REAPED = b"D"
 _GROUP_POLL_SECONDS = 0.05
 _GROUP_MAX_POLL_SECONDS = 0.5
 _GROUP_TERM_GRACE_SECONDS = 10.0
+# Helpers that watch for their parent's death exit within milliseconds (CPython's
+# resource tracker and forkserver exit on pipe end-of-file) or within one 5 s poll
+# (an orphaned PyTorch DataLoader worker checks getppid() every
+# MP_STATUS_CHECK_INTERVAL). Ten seconds is twice the slowest of them.
+_HELPER_SETTLE_SECONDS = 10.0
+# The survivor list follows the D byte in one write, kept under the POSIX minimum
+# PIPE_BUF of 512 bytes: at most four ASCII entries of 100 characters each.
+_SURVIVOR_ENTRY_CHARS = 100
+_SURVIVOR_ENTRIES = 4
 ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 3
 
 
@@ -164,7 +173,7 @@ def _has_exited(pid: int, state: bytes) -> bool:
         return False
 
 
-def _trainer_group_alive(pgid: int) -> bool:
+def _trainer_group_alive(pgid: int, members: list[int] | None = None) -> bool:
     """Return whether ``pgid`` still has a member that can run.
 
     ``killpg(..., 0)`` is the primary existence probe. On Linux a procfs scan
@@ -172,6 +181,9 @@ def _trainer_group_alive(pgid: int) -> bool:
     Unreadable possible members keep the lease.
 
     :param int pgid: Trainer process-group identifier.
+    :param list[int] | None members: When given, the scan continues past the first
+        live member and appends every live or unreadable member's PID here; the
+        verdict is the same either way.
     :return bool: ``True`` while a live member exists or absence is uncertain.
     """
     try:
@@ -188,10 +200,12 @@ def _trainer_group_alive(pgid: int) -> bool:
 
     complete = True
     found_member = False
+    live_member = False
     with entries:
         for entry in entries:
             if not entry.name.isdigit():
                 continue
+            pid = int(entry.name)
             try:
                 with open(f"/proc/{entry.name}/stat", "rb") as stat_file:
                     data = stat_file.read()
@@ -204,7 +218,7 @@ def _trainer_group_alive(pgid: int) -> bool:
             except (IndexError, OSError, ValueError):
                 # Only an unreadable possible group member must retain the lease.
                 try:
-                    unreadable_pgid = os.getpgid(int(entry.name))
+                    unreadable_pgid = os.getpgid(pid)
                 except ProcessLookupError:
                     continue
                 except OSError:
@@ -212,16 +226,60 @@ def _trainer_group_alive(pgid: int) -> bool:
                     continue
                 if unreadable_pgid != pgid:
                     continue
+            else:
+                if member_pgid != pgid:
+                    continue
+                found_member = True
+                if _has_exited(pid, state):
+                    continue
+            live_member = True
+            if members is None:
                 return True
-            if member_pgid != pgid:
-                continue
-            found_member = True
-            if not _has_exited(int(entry.name), state):
-                return True
+            members.append(pid)
 
     # A group that exists but had no readable member, or a scan with missing
     # evidence, is not enough proof to release a host-wide GPU lock.
-    return not (found_member and complete)
+    return live_member or not (found_member and complete)
+
+
+def _describe_members(pids: list[int]) -> str:
+    """Name surviving group members for the trial's failure reason.
+
+    Each entry is the PID and its ``/proc/<pid>/cmdline`` with NUL separators read as
+    spaces, or its ``comm`` when the command line is empty or unreadable, cut to
+    ``_SURVIVOR_ENTRY_CHARS``. Control bytes read as spaces and non-ASCII bytes as
+    ``?``, so each character is one byte of the status frame. Without procfs the scan
+    that produced ``pids`` finds none, so the result is empty.
+
+    :param list[int] pids: Live or unreadable members found by :func:`_trainer_group_alive`.
+    :return str: Up to ``_SURVIVOR_ENTRIES`` entries joined by ``", "``, then ``+N more``
+        for the rest, or ``""`` when ``pids`` is empty.
+    """
+    entries: list[str] = []
+    for pid in pids[:_SURVIVOR_ENTRIES]:
+        command = ""
+        for name in ("cmdline", "comm"):
+            try:
+                with open(f"/proc/{pid}/{name}", "rb") as source:
+                    raw = source.read(_SURVIVOR_ENTRY_CHARS * 4)
+            except OSError:
+                continue
+            text = "".join(
+                " " if byte < 0x20 else chr(byte) if byte < 0x7F else "?" for byte in raw
+            )
+            command = " ".join(text.split())
+            if command:
+                break
+        entry = str(pid)
+        if command:
+            room = _SURVIVOR_ENTRY_CHARS - len(entry) - len(" ()")
+            if len(command) > room:
+                command = command[: room - 3] + "..."
+            entry = f"{entry} ({command})"
+        entries.append(entry)
+    if len(pids) > _SURVIVOR_ENTRIES:
+        entries.append(f"+{len(pids) - _SURVIVOR_ENTRIES} more")
+    return ", ".join(entries)
 
 
 def _wait_for_group_exit(pgid: int, timeout: float | None) -> bool:
@@ -245,29 +303,33 @@ def _wait_for_group_exit(pgid: int, timeout: float | None) -> bool:
         poll_seconds = min(poll_seconds * 2, _GROUP_MAX_POLL_SECONDS)
 
 
-def _reap_remaining_group(pgid: int) -> bool:
+def _reap_remaining_group(pgid: int) -> str | None:
     """Terminate a trainer group while retaining inherited leases.
 
     :param int pgid: Trainer process group being cancelled or surviving its root.
-    :return bool: Whether at least one group member needed termination.
+    :return str | None: ``None`` when no member was left; otherwise the members as
+        :func:`_describe_members` named them before SIGTERM, which is ``""`` when none
+        could be named.
     """
-    if not _trainer_group_alive(pgid):
-        return False
+    members: list[int] = []
+    if not _trainer_group_alive(pgid, members):
+        return None
+    survivors = _describe_members(members)
 
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
-        return True
+        return survivors
     except OSError:
         pass
 
     if _wait_for_group_exit(pgid, _GROUP_TERM_GRACE_SECONDS):
-        return True
+        return survivors
 
     try:
         os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
-        return True
+        return survivors
     except OSError:
         pass
 
@@ -275,7 +337,7 @@ def _reap_remaining_group(pgid: int) -> bool:
     # orchestrator hard exit. If SIGKILL cannot be confirmed,
     # wait without a deadline rather than reopening the GPU to another run.
     _wait_for_group_exit(pgid, None)
-    return True
+    return survivors
 
 
 def _close_trainer_fds() -> None:
@@ -358,8 +420,9 @@ def main(argv: list[str] | None = None) -> int:
         ``{"cmd": str, "env": {str: str}}`` payload before EOF or a shape
         violation; ``76`` if the payload's optional working directory cannot
         be entered. On success, the supervisor remains outside the trainer's
-        process group, holds inherited GPU leases until every group member is
-        gone, and returns the trainer root's exit status or terminating signal.
+        process group, gives members that outlive the root ``_HELPER_SETTLE_SECONDS``
+        to exit before terminating them, holds inherited GPU leases until every group
+        member is gone, and returns the trainer root's exit status or terminating signal.
         Guardian cancellation preserves SIGTERM as the result even if the trainer handles it by exiting zero.
     """
     args = sys.argv[1:] if argv is None else argv
@@ -393,12 +456,16 @@ def main(argv: list[str] | None = None) -> int:
     # process group. Group-directed SIGKILL can therefore never release its
     # inherited GPU leases before every trainer descendant is confirmed gone.
     os.close(ack_fd)
+    cancelled = False
     try:
         try:
             signal.pthread_sigmask(signal.SIG_SETMASK, set())
             _, status = os.waitpid(child_pid, 0)
+            # Once the root has exited, cancellation no longer applies: the settle
+            # and the verdict below run to completion, keeping a finished result.
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
         except SystemExit:
+            cancelled = True
             try:
                 if len(args) == 5:
                     write_lifecycle_record(
@@ -420,16 +487,21 @@ def main(argv: list[str] | None = None) -> int:
                 status = signal.SIGTERM
         with contextlib.suppress(OSError):
             os.write(ready_fd, _TRAINER_ROOT_EXITED)
-        descendants_reaped = _reap_remaining_group(child_pid)
-        if descendants_reaped:
+        if not cancelled:
+            # Helpers that watch for their parent's death exit by themselves; only a
+            # member still running after the settle is the trainer's leak. The settle
+            # follows a nonzero exit too, so a crash keeps its own failure reason.
+            _wait_for_group_exit(child_pid, _HELPER_SETTLE_SECONDS)
+        survivors = _reap_remaining_group(child_pid)
+        if survivors is not None:
             with contextlib.suppress(OSError):
-                os.write(ready_fd, _DESCENDANTS_REAPED)
+                os.write(ready_fd, _DESCENDANTS_REAPED + survivors.encode("ascii", "replace"))
             # A closed pipe is expected after an orchestrator hard exit: there
             # is no parent left to consume the diagnostic, but cleanup continues.
         if len(args) == 5:
             return_code = os.waitstatus_to_exitcode(status)
             # Descendant cleanup is a failed trial even when its root returned zero.
-            if descendants_reaped and return_code == 0:
+            if survivors is not None and return_code == 0:
                 return_code = 1
             with contextlib.suppress(OSError):
                 write_lifecycle_record(

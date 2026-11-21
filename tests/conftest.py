@@ -11,6 +11,7 @@ import signal
 import stat
 import sys
 import textwrap
+import time
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from types import SimpleNamespace
@@ -854,6 +855,72 @@ def write_trainer(path: Path, body: str) -> Path:
     path.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body))
     path.chmod(0o755)
     return path
+
+
+def assert_descendant_dies(pid: int, *, deadline_seconds: float = 5.0, on_timeout_msg: str) -> None:
+    """Poll until ``pid`` is gone; if it outlives the deadline, SIGKILL it and fail.
+
+    :param int pid: Descendant PID expected to be reaped by supervisor cleanup.
+    :param float deadline_seconds: How long to poll before giving up.
+    :param str on_timeout_msg: ``pytest.fail`` message used if still alive at the deadline.
+    """
+    deadline = time.monotonic() + deadline_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    # Kill before failing so the test run does not leak the process.
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    pytest.fail(on_timeout_msg)
+
+
+def use_guardian_timing(
+    monkeypatch: pytest.MonkeyPatch,
+    directory: Path,
+    *,
+    settle_seconds: float,
+    term_grace_seconds: float,
+    patch: str = "",
+) -> Path:
+    """Run every lease guardian this test spawns with shortened post-root timing.
+
+    The guardian runs under ``python -I -S`` without the package, so the wrapper loads
+    the real supervisor by file path, sets its helper settle and SIGTERM grace, runs
+    ``patch`` (dedented statements that see the loaded module as ``guardian``), and
+    calls its ``main``. This process's supervisor module takes the same two values, so
+    the controller's reason text and settle-aware shutdown window match the guardian.
+
+    :param pytest.MonkeyPatch monkeypatch: Undoes both overrides after the test.
+    :param Path directory: Where the wrapper script is written.
+    :param float settle_seconds: Replacement for ``_HELPER_SETTLE_SECONDS``.
+    :param float term_grace_seconds: Replacement for ``_GROUP_TERM_GRACE_SECONDS``.
+    :param str patch: Extra statements run against ``guardian`` before ``main``.
+    :return Path: The wrapper script the guardian now runs.
+    """
+    from phasesweep.runtime import process, supervisor
+
+    wrapper = directory / "guardian_timing.py"
+    loader = textwrap.dedent(
+        f"""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "phasesweep_guardian", {process._supervisor_script_path()!r}
+        )
+        assert spec is not None and spec.loader is not None
+        guardian = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guardian)
+        guardian._HELPER_SETTLE_SECONDS = {settle_seconds!r}
+        guardian._GROUP_TERM_GRACE_SECONDS = {term_grace_seconds!r}
+        """
+    )
+    wrapper.write_text(loader + textwrap.dedent(patch) + "\nraise SystemExit(guardian.main())\n")
+    monkeypatch.setattr(supervisor, "_HELPER_SETTLE_SECONDS", settle_seconds)
+    monkeypatch.setattr(supervisor, "_GROUP_TERM_GRACE_SECONDS", term_grace_seconds)
+    monkeypatch.setattr(process, "_SUPERVISOR_SCRIPT_PATH", str(wrapper))
+    return wrapper
 
 
 def write_flaky_trainer(tmp_path: Path, *, failures: int, value: float = 1.0) -> tuple[Path, Path]:

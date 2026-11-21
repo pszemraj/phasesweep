@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Literal, TypeGuard
 
 from phasesweep.errors import ForeignPidNamespaceError
+from phasesweep.runtime import supervisor as _supervisor
 from phasesweep.runtime.darwin import read_boot_session_uuid, read_process_info
 from phasesweep.runtime.json import strict_json_loads
 
@@ -637,6 +638,9 @@ def _terminate_process_groups(
     All groups share one grace period and one final confirmation window. Unguarded
     groups receive direct SIGKILL after the grace period; live guardians own escalation
     for their groups. If a guardian exits, its trainer group receives direct termination.
+    While a guardian still runs after the grace period, the confirmation window grows by
+    the guardian's helper settle: a guardian whose trainer root already exited ignores
+    cancellation, waits out the settle, then gives survivors its own SIGTERM grace.
 
     :param tuple[int, ...] pgids: Target process-group IDs.
     :param float grace_seconds: Shared wait after requesting cancellation, before direct SIGKILL for unguarded groups or continued observation of guardians.
@@ -743,8 +747,13 @@ def _terminate_process_groups(
             survivors.append(pgid)
 
     # Wait briefly for the kernel to actually reap descendants so the reaper's
-    # "marked FAIL" state means cleanup completed, not requested.
-    kill_deadline = time.monotonic() + 2.0
+    # "marked FAIL" state means cleanup completed, not requested. A guardian
+    # whose trainer root had already exited ignores the request and first gives
+    # helpers their settle, so a group it still guards gets that much longer.
+    kill_window = 2.0
+    if any(pgid in active_guardians for pgid in survivors):
+        kill_window += _supervisor._HELPER_SETTLE_SECONDS
+    kill_deadline = time.monotonic() + kill_window
     while survivors and time.monotonic() < kill_deadline:
         still_alive = []
         for pgid in survivors:
