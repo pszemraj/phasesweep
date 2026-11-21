@@ -28,7 +28,7 @@ from typing import Literal, TypeGuard
 
 from phasesweep.errors import ForeignPidNamespaceError
 from phasesweep.runtime import supervisor as _supervisor
-from phasesweep.runtime.darwin import read_boot_session_uuid, read_process_info
+from phasesweep.runtime.darwin import ProcessInfo, read_boot_session_uuid, read_process_info
 from phasesweep.runtime.json import strict_json_loads
 
 # Process supervision logs on one channel, whichever module does the work.
@@ -370,6 +370,16 @@ def _read_proc_stat(proc_entry: Path) -> _ProcStat | None:
     return stat
 
 
+def _process_stat(pid: int) -> _ProcStat | ProcessInfo | None:
+    """Read the state, process group and start time of one process on Linux or macOS.
+
+    :param int pid: Process to inspect.
+    :return _ProcStat | ProcessInfo | None: Its ``/proc/<pid>/stat`` fields on Linux or its
+        native process information on macOS, or ``None`` when unreadable.
+    """
+    return read_process_info(pid) if sys.platform == "darwin" else _read_proc_stat(_PROC / str(pid))
+
+
 def _has_exited(pid: int, state: str) -> bool:
     """Return whether a process whose ``stat`` reads ``state`` can no longer run.
 
@@ -412,7 +422,7 @@ def read_proc_starttime(pid: int) -> int | None:
     :return int | None: Clock ticks on Linux (``/proc/<pid>/stat`` field 22),
         microseconds since the epoch on macOS, or unknown when unreadable.
     """
-    stat = read_process_info(pid) if sys.platform == "darwin" else _read_proc_stat(_PROC / str(pid))
+    stat = _process_stat(pid)
     return None if stat is None else stat.starttime
 
 
@@ -442,7 +452,7 @@ def is_same_live_process(pid: int | None, saved_starttime: int | None) -> bool:
     """
     if pid is None or not is_pid_alive(pid):
         return False
-    stat = read_process_info(pid) if sys.platform == "darwin" else _read_proc_stat(_PROC / str(pid))
+    stat = _process_stat(pid)
     if saved_starttime is not None and (stat is None or stat.starttime != saved_starttime):
         return False
     return stat is None or not _has_exited(pid, stat.state)
@@ -860,9 +870,7 @@ def _stored_pgid_is_reused_group_leader(pgid: int, saved_starttime: int) -> bool
         leader exists or its identity is compatible, and ``None`` when a live
         leader's proc identity is unreadable.
     """
-    stat = (
-        read_process_info(pgid) if sys.platform == "darwin" else _read_proc_stat(_PROC / str(pgid))
-    )
+    stat = _process_stat(pgid)
     if stat is None:
         return None if is_pid_alive(pgid) else False
     return stat.pgrp == pgid and stat.starttime != saved_starttime
