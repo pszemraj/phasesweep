@@ -155,6 +155,7 @@ def _assess_population(
     groups: Sequence[RankedGroup] | None = None,
     incomplete_group: Collection[int] = (),
     untried_cells: Sequence[Mapping[str, object]] = (),
+    best_value_select: str | None = None,
 ) -> ConfoundBlock:
     """Classify the population one winner selection compared.
 
@@ -177,6 +178,8 @@ def _assess_population(
     :param Sequence[Mapping[str, object]] untried_cells: The cells, repeat key included,
         that no trial reached in a grid whose finished target covers every cell
         (:func:`phasesweep.engine.selection._untried_grid_cells`), defaults to none.
+    :param str | None best_value_select: The MLflow selector, ``min`` or ``max``, when the
+        objective is the best value of its history, defaults to None.
     :return ConfoundBlock: The ``confound`` block persisted on the winner.
     """
     ordered = sorted(ranked, key=lambda trial: trial.number)
@@ -188,7 +191,9 @@ def _assess_population(
             None if ordered_groups is None else [list(group.numbers) for group in ordered_groups]
         ),
         "checks": {
-            "evaluation_point": _evaluation_point(ordered, provenance),
+            "evaluation_point": _evaluation_point(
+                ordered, provenance, best_value_select=best_value_select
+            ),
             "survivorship": _survivorship(
                 trials,
                 {trial.number for trial in ordered},
@@ -206,21 +211,32 @@ def _assess_population(
 def _evaluation_point(
     ranked: Sequence[optuna.trial.FrozenTrial],
     provenance: Mapping[int, Mapping[str, object]],
+    *,
+    best_value_select: str | None,
 ) -> EvaluationCheck:
     """Compare ranked objectives on their declared training-progress axis.
 
     JSON envelopes record the position; W&B uses its selected history position and
     MLflow the selected observation's step. Record all positions and flag those
     more than ``_POSITION_TOLERANCE`` short of the furthest. Other axes, including
-    checkpoint labels, are excluded from this comparison.
+    checkpoint labels, are excluded from this comparison. An MLflow ``select: min`` or
+    ``max`` objective is not checked: its step is where the best value fell, which says
+    nothing about how far the trial trained.
 
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials by number.
     :param Mapping[int, Mapping[str, object]] provenance: Their readable objective
         provenance.
+    :param str | None best_value_select: The MLflow selector, ``min`` or ``max``, when the
+        objective is the best value of its history, otherwise ``None``.
     :return EvaluationCheck: The check record.
     """
     if len(ranked) < 2:
         return _not_checked("only one trial was ranked")
+    if best_value_select is not None:
+        return _not_checked(
+            f"mlflow select: {best_value_select} records the step where the best value fell, "
+            "not how far each trial trained"
+        )
     unreadable = [str(trial.number) for trial in ranked if trial.number not in provenance]
     if unreadable:
         return _not_checked(
@@ -231,7 +247,8 @@ def _evaluation_point(
     if len(kinds) != 1 or kinds[0] not in POSITIONED_EXTRACTOR_KINDS:
         return _not_checked(
             f"{', '.join(kinds)} objectives report no evaluation position; json_envelope "
-            "(report_objective), wandb (evaluation_axis) or mlflow (selected step) would bind one"
+            "(report_objective), wandb (evaluation_axis) or mlflow (select: last or step) "
+            "would bind one"
         )
     positions = [(number, _recorded_position(record)) for number, record in records]
     axes = sorted({axis for _, (axis, _) in positions})

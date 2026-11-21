@@ -51,6 +51,7 @@ from phasesweep.evidence.models import (
     JsonEnvelopeExtractor,
     JsonExtractor,
     LocalExtractor,
+    MlflowExtractor,
     ObjectiveExtractor,
     WandbExtractor,
     WandbQuery,
@@ -343,6 +344,11 @@ def _evaluation_point_line(metric: Metric) -> str:
         return (
             f"{prefix} supported (axis {extractor.evaluation_axis!r} located in W&B run history; "
             "n/a when the history lookup finds no position)"
+        )
+    if isinstance(extractor, MlflowExtractor) and extractor.select in ("min", "max"):
+        return (
+            f"{prefix} n/a (mlflow select: {extractor.select} records the step where the best "
+            "value fell, not how far each trial trained)"
         )
     return f"{prefix} supported (position is the step of the selected observation)"
 

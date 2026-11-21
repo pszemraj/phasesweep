@@ -326,7 +326,7 @@ These scoring decisions are separate:
 
 For example, in a fixed-token batch-size sweep each trial's optimizer `step` count depends on its batch size, so trials differ by design in both `step` and any step-named checkpoint. Declaring `evaluation_axis: tokens` and reporting `progress={"tokens": total_tokens}` compares trials on tokens instead: the check stays `ok` when every trial reached the token budget, and flags one that stopped short. The check's 1% tolerance absorbs each batch size stopping within a batch of the budget. Likewise, a trainer that reports its best checkpoint reports a step that differs between trials by nature; report how far it trained on a declared axis instead, such as `progress={"trained_steps": total_steps}` with `evaluation_axis: trained_steps`.
 
-The `evaluation_point` position is the step the metric was logged at, so a trainer that scores a reloaded earlier checkpoint should log the result at that checkpoint's step (for W&B, log it as the `evaluation_axis` value in the metric's `log()` call, since `wandb.log(step=)` cannot go backwards).
+The `evaluation_point` check compares how far each trial trained, so a trainer that scores a reloaded earlier checkpoint reports the same thing as one that reports its best checkpoint: how far it trained, on a declared axis such as `trained_steps` (for W&B, log it under the `evaluation_axis` key in the metric's `wandb.log()` call). An MLflow objective with `select: min` or `select: max` records the step where the best value fell, not how far the trial trained, so its `evaluation_point` is `n/a`.
 
 `validate` and `run --dry-run` print an `evaluation_point check:` line that says whether the configured extractor supports this check.
 

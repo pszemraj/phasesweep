@@ -140,6 +140,13 @@ from tests.recovery_helpers import recover_run_cli
                 "observation)",
             ],
         ),
+        (
+            {"type": "mlflow", "metric_key": "eval/loss", "select": "min"},
+            [
+                "evaluation_point check: n/a (mlflow select: min records the step where the "
+                "best value fell, not how far each trial trained)",
+            ],
+        ),
     ],
 )
 def test_validate_and_dry_run_explain_scoring_without_sdk(

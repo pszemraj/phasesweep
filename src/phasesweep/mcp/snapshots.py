@@ -159,7 +159,8 @@ class EvaluationPointSummary(_SnapshotModel):
     verdict: ConfoundVerdict = Field(
         description=(
             f"{_VERDICT_DESCRIPTION} Always n/a for json and log_regex objectives, which "
-            "record no evaluation position; only json_envelope, wandb and mlflow bind one."
+            "record no evaluation position, and for mlflow select: min or max, whose step is "
+            "where the best value fell; json_envelope, wandb and other mlflow selectors bind one."
         )
     )
     distinct_values: NonNegativeInt | None = Field(

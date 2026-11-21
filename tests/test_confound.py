@@ -45,6 +45,7 @@ from phasesweep.engine.state import (
     Winner,
 )
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
+from phasesweep.evidence.models import MlflowExtractor
 from phasesweep.runtime.json import JsonObject
 from tests.conftest import log_regex_provenance, make_experiment, write_constant_trainer
 from tests.ledger_fixtures import published_generation_id, winner_payload
@@ -261,7 +262,7 @@ def test_evaluation_point_disagreement_is_heterogeneous(
 
 
 _BINDING_TEXT = (
-    "json_envelope (report_objective), wandb (evaluation_axis) or mlflow (selected step) "
+    "json_envelope (report_objective), wandb (evaluation_axis) or mlflow (select: last or step) "
     "would bind one"
 )
 
@@ -295,6 +296,41 @@ def test_evaluation_point_is_not_checked_without_every_position(
     check = block["checks"]["evaluation_point"]
     assert check["verdict"] == "n/a"
     assert reason in check["reason"]
+
+
+@pytest.mark.parametrize("select", ["min", "max", "last"])
+def test_mlflow_best_value_objective_leaves_evaluation_point_unchecked(select: str) -> None:
+    """The step of a best value says where it fell, not how far the trial trained."""
+    experiment = make_experiment(phases=[_seeded_phase(n_trials=2)])
+    experiment = experiment.model_copy(
+        update={
+            "metric": experiment.metric.model_copy(
+                update={"extractor": MlflowExtractor(type="mlflow", metric_key="x", select=select)}
+            )
+        }
+    )
+    study = optuna.create_study(direction="minimize")
+    for number, (value, step) in enumerate([(0.2, 1000), (0.3, 400)]):
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=_COMPLETE,
+                value=value,
+                params={"x": number},
+                distributions={"x": optuna.distributions.IntDistribution(0, 10)},
+                user_attrs=_candidate_attrs(number, _envelope(step=step)),
+            )
+        )
+
+    check = select_winner(study, experiment, phase_name="p").confound["checks"]["evaluation_point"]
+
+    if select == "last":
+        assert check["verdict"] == "heterogeneous"
+    else:
+        assert check == {
+            "verdict": "n/a",
+            "reason": f"mlflow select: {select} records the step where the best value fell, "
+            "not how far each trial trained",
+        }
 
 
 def test_evaluation_point_heterogeneous_line_mentions_training_length() -> None:

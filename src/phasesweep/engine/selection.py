@@ -70,6 +70,7 @@ from phasesweep.errors import (
     timeout_step,
     unreadable_objective_step,
 )
+from phasesweep.evidence.models import MlflowExtractor
 from phasesweep.runtime.json import JsonObject, json_object, json_text_map
 from phasesweep.runtime.terminal import display_path, objective_text
 
@@ -382,6 +383,7 @@ def select_winner(
                 provenance[t.number] = _trial_objective_provenance(t)
     phase = next((phase for phase in experiment.phases if phase.name == phase_name), None)
     untried_cells = _untried_grid_cells(phase, trials)
+    extractor = experiment.metric.extractor
     confound = _assess_population(
         trials,
         survivors,
@@ -391,6 +393,11 @@ def select_winner(
         groups=None if ranking is None else ranking.groups,
         incomplete_group=() if ranking is None else ranking.incomplete_group,
         untried_cells=untried_cells,
+        best_value_select=(
+            extractor.select
+            if isinstance(extractor, MlflowExtractor) and extractor.select in ("min", "max")
+            else None
+        ),
     )
     survivorship = confound["checks"]["survivorship"]
     flagged = _describe_flagged(
