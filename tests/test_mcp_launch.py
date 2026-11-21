@@ -716,6 +716,10 @@ def test_launch_retains_recoverable_lease_when_failure_status_cannot_persist(
     assert store.recorded_terminal_status(pending) is None
     assert store.launch_lease_path(pending.run_id).is_file()
     assert store.is_pre_spawn_orphan(pending.run_id)
+    latest = app.latest_run("srv")["run"]
+    assert latest["recovery_required"] is True
+    assert "The next permitted launch clears this preparation" in latest["failure"]["remediation"]
+    assert "without launching" in latest["failure"]["remediation"]
 
     patch_popen_capture(monkeypatch)
     assert app.launch("srv")["state"] == "running"

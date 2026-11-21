@@ -152,17 +152,18 @@ def response_failure(
     )
     failure = diagnosis.failure
     if observation.recovery_required and not diagnosis.names_recover_run:
-        failure = _recovery_failure(handle, observation, diagnosis.recorded)
+        failure = _recovery_failure(runs, handle, observation, diagnosis.recorded)
     elif failure is None and publication_integrity is not None and observation.state != "running":
         failure = _PUBLICATION_FAILURES.get(publication_integrity)
     return _validated(failure)
 
 
 def _recovery_failure(
-    handle: RunHandle, observation: RunObservation, recorded: JsonObject | None
+    runs: RunStore, handle: RunHandle, observation: RunObservation, recorded: JsonObject | None
 ) -> JsonObject:
-    """Name the operator's recover-run step for a run whose diagnosis carries none.
+    """Name the recovery step for a run whose diagnosis carries none.
 
+    :param RunStore runs: Store that can verify a launch preparation was abandoned.
     :param RunHandle handle: Run that requires recovery.
     :param RunObservation observation: The read's observation of the run.
     :param JsonObject | None recorded: The run's own recorded failure, kept as the cause.
@@ -170,6 +171,14 @@ def _recovery_failure(
         cleanup, or ``result_snapshot_unavailable`` for an unfinished result snapshot.
     """
     if handle.launch_state == "launching" and observation.terminal_status is None:
+        if runs.is_pre_spawn_orphan(handle.run_id):
+            return operator_failure(
+                "cleanup_uncertain",
+                "cleanup",
+                "Stop monitoring this abandoned launch. The next permitted launch clears this "
+                "preparation automatically. To remove it without launching, ask the operator "
+                f"to {recover_run_step(handle.run_id)}.",
+            )
         return operator_failure(
             "cleanup_uncertain",
             "cleanup",
