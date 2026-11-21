@@ -491,7 +491,9 @@ def test_crashed_trials_remedy_names_the_next_attempt_budget(
     if persistent:
         assert "raise phases[p].n_trials above 2" in remedy
         assert "Fix the failure" in remedy
-        assert "the study refuses the changed config, so set a new `experiment` name" in remedy
+        assert "`n_jobs` can change on retry" in remedy
+        assert "changes study identity" in remedy
+        assert "set a new `experiment` name" in remedy
     else:
         assert "storage: null starts fresh" in remedy
         assert "raise" not in remedy

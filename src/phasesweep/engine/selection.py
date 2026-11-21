@@ -128,12 +128,10 @@ def _no_feasible_remedy(
         budget = f"phases[{phase.name}].n_trials {target}"
     else:
         budget = "the phase's n_trials"
-    # Only the trial budget may change under a recorded study; any other config edit is refused.
     return (
-        f"{evidence} Fix the failure. If the fix needs no other config edit, raise {budget} "
-        "in the config and rerun to retry the failed attempts. If it edits the config (such as "
-        "`trial_command`, `trainer_config` or a `provenance` value), the study refuses the "
-        f"changed config, so {FRESH_STUDY}."
+        f"{evidence} Fix the failure, then raise {budget} and rerun to retry the failed attempts. "
+        "Run controls such as `n_jobs` can change on retry. If the fix changes study identity "
+        f"(for example `trial_command`, `trainer_config` or `provenance`), {FRESH_STUDY}."
     )
 
 
