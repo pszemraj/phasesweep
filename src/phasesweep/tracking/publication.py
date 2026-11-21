@@ -31,6 +31,7 @@ from phasesweep.tracking.session import (
     BINDING_FILE,
     GENERATION_BINDING_FILE,
     NO_ANSWER,
+    SYNC_TRACKING_STEP,
     DeliveryTally,
     call_tracking,
     pending_creation_records,
@@ -1153,9 +1154,9 @@ def deliver_ended_generations(
     except (OSError, ValueError, PhaseSweepError) as exc:
         tally.sending = False
         log.warning(
-            "MLflow: records were not all sent (%s). The next run or `phasesweep sync-tracking "
-            "CONFIG` rebuilds and sends them.",
+            "MLflow: records were not all sent (%s). The next run or %s rebuilds and sends them.",
             exc,
+            SYNC_TRACKING_STEP,
         )
     finally:
         for error in errors:
@@ -1245,10 +1246,10 @@ def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryT
         )
     if pending:
         log.warning(
-            "MLflow: %s pending%s; results are saved locally. The next run or "
-            "`phasesweep sync-tracking CONFIG` sends them.%s",
+            "MLflow: %s pending%s; results are saved locally. The next run or %s sends them.%s",
             count_text(pending - creations, creations),
             f" ({earlier} from earlier runs)" if earlier else "",
+            SYNC_TRACKING_STEP,
             refused_text(len(tally.refused)),
         )
 

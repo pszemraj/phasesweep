@@ -1927,7 +1927,7 @@ def test_sync_tracking_without_an_mlflow_block_uses_the_standard_error_format(
 def test_sync_tracking_with_uploads_still_pending_uses_the_standard_error_format(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Counts print first, then the failure is a `phasesweep:` line with a retry step."""
+    """Counts print first, then the failure is a `phasesweep:` line with a retry step naming the command as typed."""
     monkeypatch.setattr(
         "phasesweep.tracking.publication.sync_tracking",
         lambda *_args, **_kwargs: {"pending": 2, "delivered": 1},
@@ -1940,8 +1940,10 @@ def test_sync_tracking_with_uploads_still_pending_uses_the_standard_error_format
     assert status == 1
     assert captured.out == "pending: 2\ndelivered: 1\n"
     assert captured.err == (
-        "phasesweep: MLflow delivery remains pending.\n"
-        "fix: Wait briefly, then retry the same operation once the reported blocker is resolved.\n"
+        "phasesweep: MLflow delivery remains pending: 2 records could not be sent or settled; "
+        "the warnings above give each cause.\n"
+        "fix: Once those causes are resolved, run this command again:\n"
+        f"phasesweep sync-tracking {config}\n"
     )
 
 

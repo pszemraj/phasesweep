@@ -628,6 +628,7 @@ def _mirror_publication(
     :raises PhaseSweepShutdown: A shutdown signal arrived during the mirror.
     """
     from phasesweep.tracking.publication import deliver_closeout
+    from phasesweep.tracking.session import SYNC_TRACKING_STEP
 
     try:
         deliver_closeout(experiment, ledger, generation_id, published=published, tally=tally)
@@ -635,9 +636,9 @@ def _mirror_publication(
         cleanup.mark_uncertain(exc)
         log.exception(
             "An MLflow tracking worker of generation %s's run may still be running; the "
-            "published result is unaffected. Run `phasesweep sync-tracking` with the same "
-            "config to retry its cleanup and delivery.",
+            "published result is unaffected. Run %s to retry its cleanup and delivery.",
             generation_id,
+            SYNC_TRACKING_STEP,
         )
     except PhaseSweepShutdown as exc:
         if not exc.report.cleanup_confirmed:
@@ -647,9 +648,10 @@ def _mirror_publication(
     except Exception:
         log.exception(
             "MLflow delivery records of generation %s's run were not all saved; the published "
-            "result is unaffected. The next run or `phasesweep sync-tracking` rebuilds them "
-            "from the ledger and the published generation.",
+            "result is unaffected. The next run or %s rebuilds them from the ledger and the "
+            "published generation.",
             generation_id,
+            SYNC_TRACKING_STEP,
         )
 
 

@@ -68,6 +68,9 @@ NO_ANSWER: tuple[type[Exception], ...] = (
     OperationUnavailableError,
     OperationOutcomeUnknownError,
 )
+# The step that sends what a run left pending, as every line a run logs names it. A run's lines
+# cannot quote the command line it was started with, so they name CONFIG and say what it is.
+SYNC_TRACKING_STEP = "`phasesweep sync-tracking CONFIG` with this run's config file as CONFIG"
 
 
 @dataclass
@@ -365,7 +368,7 @@ def _create_bound(
         raise RuntimeError(
             f"MLflow run creation for attempt {identity['attempt_id']} of generation "
             f"{identity['generation_id']} is unresolved: an earlier request may still create "
-            "the run, so it is not sent again. Run sync-tracking to reconcile the intent."
+            f"the run, so it is not sent again. Run {SYNC_TRACKING_STEP} to reconcile the intent."
         ) from cause
 
     if pending.exists():
@@ -458,6 +461,22 @@ def pending_creation_records(
     )
 
 
+def creation_window_end(experiment: Experiment, pending: Path) -> float:
+    """Say when the lost request of a pending creation can no longer create its run.
+
+    Until then a search that finds no run leaves the intent pending; one started after it
+    retires the intent.
+
+    :param Experiment experiment: MLflow-backed experiment, whose ``timeout_seconds`` bounds
+        the request.
+    :param Path pending: Pending creation intent, written as the request was sent.
+    :return float: The window's end, as a ``time.time()`` value.
+    """
+    settings = experiment.mlflow
+    assert settings is not None
+    return pending.stat().st_mtime + settings.timeout_seconds
+
+
 def resolve_pending_creations(
     experiment: Experiment,
     environment: Mapping[str, str],
@@ -536,12 +555,9 @@ def _reconcile_creation(
     if path.exists():
         _settle_creation(pending, tally)
         return
-    settings = experiment.mlflow
-    assert settings is not None
     identity = validate_identity(read_record(pending).get("identity"))
-    expires_at = pending.stat().st_mtime + settings.timeout_seconds
     # A search started inside the window may see absence even if it returns after the window.
-    expired = time.time() >= expires_at
+    expired = time.time() >= creation_window_end(experiment, pending)
     try:
         binding = _find_bound(
             experiment,

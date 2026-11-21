@@ -46,7 +46,8 @@ from tests.tracking_helpers import (
 )
 
 _PENDING_STEP = (
-    "results are saved locally. The next run or `phasesweep sync-tracking CONFIG` sends them."
+    "results are saved locally. The next run or `phasesweep sync-tracking CONFIG` with this "
+    "run's config file as CONFIG sends them."
 )
 _REFUSAL = (
     "a refused record stays pending until the cause given in its warning is fixed in MLflow, for "
@@ -709,8 +710,10 @@ def test_sync_tracking_names_what_keeps_its_records_pending(
     """sync-tracking ends with the step that clears what is left: a retry or a fix in MLflow.
 
     A tracker that gives no answer is named with its tracking URI, and the step is a retry. A
-    record MLflow refuses, as for a run deleted in MLflow, is named in its warning, and the
-    step is to fix that cause in MLflow, since a retry alone meets the same refusal.
+    record MLflow refuses, as for a run deleted in MLflow, is named in its warning, printed on
+    the console under a ``warning:`` label, and the step is to fix that cause in MLflow, since
+    a retry alone meets the same refusal. Either step ends with the command as typed, on a line
+    of its own.
     """
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
     experiment = sweep.experiment
@@ -730,29 +733,166 @@ def test_sync_tracking_names_what_keeps_its_records_pending(
     config = write_experiment_config(Path.cwd() / "experiment.yaml", experiment)
     capsys.readouterr()
 
-    assert invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch) == 1
+    assert (
+        invoke_cli_boundary(
+            ["sync-tracking", str(config), "--set", "phases.0.n_trials=2"], monkeypatch
+        )
+        == 1
+    )
 
     error = capsys.readouterr().err
+    command = f"phasesweep sync-tracking {config} --set phases.0.n_trials=2\n"
     if failure == "no-answer":
-        assert error == (
+        assert error.endswith(
             "phasesweep: MLflow delivery remains pending: MLflow tracking target "
             f"experiment_name={experiment.mlflow.experiment_name!r} at "
             f"{experiment.mlflow.tracking_uri!r} is not ready: it did not answer within "
             "timeout_seconds; check that the server is reachable.\n"
-            "fix: Wait briefly, then retry the same operation once the reported blocker is "
-            "resolved.\n"
+            f"fix: Once the server answers, run this command again:\n{command}"
         )
         assert sweep.summaries() == []
     else:
-        assert error == (
+        assert error.endswith(
             f"phasesweep: MLflow delivery remains pending: MLflow refused 1 record; {_REFUSAL}\n"
-            "fix: Fix each such cause, then run `phasesweep sync-tracking` again.\n"
+            f"fix: Once each such cause is fixed, run this command again:\n{command}"
         )
         assert (
             f"MLflow: attempt record {stem} of generation {sweep.generation} is pending (MLflow "
             "run is deleted; restore it, or its experiment.)." in caplog.text
         )
+        [warning] = [line for line in error.splitlines() if "MLflow: attempt record" in line]
+        assert re.fullmatch(r"\d\d:\d\d:\d\d  warning: MLflow: attempt record\b.*", warning)
         assert sweep.summaries() == ["KILLED"]
+
+
+@pytest.mark.integration
+@pytest.mark.signals_own_pid
+def test_a_ctrl_c_during_sync_tracking_says_what_stays_pending_and_exits_130(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A real SIGINT while sync-tracking uploads prints the interrupt, what stays pending and the command.
+
+    The shutdown handler kills the upload worker in flight and the command exits 130, after
+    the interrupt line and a line counting what stays pending, followed by the command as
+    typed on a line of its own. Nothing is delivered.
+    """
+    sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
+    respond = session.request_operation
+    uploading: list[str] = []
+
+    def upload_until_killed(
+        request: Mapping[str, object],
+        *,
+        operation_id: str,
+        directory: Path,
+        environment: Mapping[str, str],
+        deadline: float,
+    ) -> JsonObject:
+        if request["action"] != "publish":
+            return respond(
+                request,
+                operation_id=operation_id,
+                directory=directory,
+                environment=environment,
+                deadline=deadline,
+            )
+        uploading.append(str(request["name"]))
+        with Path(os.devnull).open("w") as sink:
+            result = process.run_supervised(
+                "sleep 30",
+                env=dict(os.environ),
+                stdout=sink,
+                stderr=sink,
+                timeout=60,
+                trial_dir=directory,
+                attempt_id=operation_id,
+            )
+        raise OperationOutcomeUnknownError(f"MLflow worker failed (exit {result.return_code}).")
+
+    def interrupt_once_the_upload_runs() -> None:
+        deadline = time.monotonic() + 30.0
+        while (not uploading or not shutdown._active_children) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    monkeypatch.setattr(session, "request_operation", upload_until_killed)
+    monkeypatch.setattr(worker, "request_operation", upload_until_killed)
+    config = write_experiment_config(Path.cwd() / "experiment.yaml", sweep.experiment)
+    capsys.readouterr()
+    sender = threading.Thread(target=interrupt_once_the_upload_runs, daemon=True)
+    sender.start()
+
+    status = invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch)
+    sender.join(timeout=5)
+
+    error = capsys.readouterr().err
+    assert status == 130
+    assert len(uploading) == 1
+    assert re.search(r"^\d\d:\d\d:\d\d  Interrupted \(SIGINT\): ", error, re.MULTILINE)
+    lines = error.splitlines()
+    # The sentence wraps to the terminal; the command stays whole on the last line.
+    assert lines[-1] == f"phasesweep sync-tracking {config}"
+    stopped = next(i for i, line in enumerate(lines) if line.startswith("phasesweep: stopped"))
+    assert " ".join(lines[stopped:-1]) == (
+        "phasesweep: stopped with 2 records pending. Rerun the same command to send what is left:"
+    )
+    assert publication.delivery_status(sweep.experiment) == {"pending": 2, "delivered": 0}
+    for blame in ("did not answer", "is not ready", "is pending ("):
+        assert blame not in error
+
+
+@pytest.mark.integration
+def test_sync_tracking_says_when_a_creation_inside_its_window_can_be_settled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A creation MLflow has no run for yet, inside its window, gets its cause and when to retry.
+
+    The search answers that no run carries the identity, so the lost request may still create
+    one until timeout_seconds after it was sent; the step names that time and the command.
+    """
+    sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
+    experiment = sweep.experiment.model_copy(
+        update={"mlflow": sweep.experiment.mlflow.model_copy(update={"timeout_seconds": 600.0})}
+    )
+    respond = session.request_operation
+
+    def killed_at_summary_creation(request: dict[str, object], **kwargs: object) -> JsonObject:
+        if request["action"] == "create":
+            raise RunnerKilled()
+        return respond(request, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(session, "request_operation", killed_at_summary_creation)
+        patch.setattr(publication, "deliver_closeout", lambda *args, **kwargs: None)
+        with pytest.raises(RunnerKilled):
+            run_experiment(experiment)
+    [intent] = session.pending_creation_records(experiment)
+
+    def no_run_yet(request: dict[str, object], **kwargs: object) -> JsonObject:
+        if request["action"] == "find":
+            return {"found": False}
+        return respond(request, **kwargs)
+
+    monkeypatch.setattr(session, "request_operation", no_run_yet)
+    monkeypatch.setattr(worker, "request_operation", no_run_yet)
+    config = write_experiment_config(Path.cwd() / "experiment.yaml", experiment)
+    capsys.readouterr()
+
+    assert invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch) == 1
+
+    error = capsys.readouterr().err
+    until = time.strftime("%H:%M:%S", time.localtime(intent.stat().st_mtime + 600.0))
+    match = re.search(
+        r"phasesweep: MLflow delivery remains pending: MLflow has no run yet for 1 unconfirmed "
+        r"run creation, and the request whose answer was lost may still create one until "
+        r"timeout_seconds \(600 s\) after it was sent\.\n"
+        rf"fix: Wait until {until}, about (\d+) s from now, then run this command again:\n"
+        rf"phasesweep sync-tracking {re.escape(str(config))}\n$",
+        error,
+    )
+    assert match is not None, error
+    assert 0 < int(match.group(1)) <= 600
+    assert intent.exists()
 
 
 def test_a_run_whose_target_gives_no_answer_ends_with_the_retry_step(

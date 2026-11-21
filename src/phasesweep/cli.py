@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 import shlex
 import sys
@@ -1326,38 +1327,113 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
 def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[str, ...]) -> None:
     """Reconcile pending native MLflow runs and retry result delivery.
 
+    Warnings print on the console as a run's do. Every step that ends with something pending
+    names this command as typed, on a line of its own; a shutdown signal prints how much is
+    still pending before the command exits with the signal's status.
+
     :param Path config_path: Matching experiment configuration.
     :param str | None generation_id: Generation to synchronize, or ``None`` for all.
     :param tuple[str, ...] settings: The same config overrides used by the run.
     :raises ClickException: The generation name or a delivery record is malformed.
     :raises PhaseSweepError: Nothing matching can be synchronized, or records remain pending;
-        its step is a retry when MLflow gave no answer, and fixing the causes when it refused.
+        its step is a retry when MLflow gave no answer or a creation's window is still open,
+        and fixing the causes when it refused.
     """
-    from phasesweep.tracking.publication import refused_text
+    from phasesweep.tracking.publication import count_text, refused_text
     from phasesweep.tracking.publication import sync_tracking as sync
-    from phasesweep.tracking.session import DeliveryTally
+    from phasesweep.tracking.session import (
+        DeliveryTally,
+        creation_window_end,
+        pending_creation_records,
+    )
 
-    config = _command_config(config_path, settings=settings)
-    require_study(config)
+    command = shlex.join(
+        [
+            "phasesweep",
+            "sync-tracking",
+            *_config_arguments(config_path, settings),
+            *(() if generation_id is None else ("--generation", generation_id)),
+        ]
+    )
     tally = DeliveryTally()
-    try:
-        counts = sync(config, generation_id, tally=tally)
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    with _console_logging(verbose=False):
+        config = _command_config(config_path, settings=settings)
+        require_study(config)
+        try:
+            counts = sync(config, generation_id, tally=tally)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+        except PhaseSweepShutdown:
+            click.echo(_sync_stopped_text(config, generation_id, command), err=True)
+            raise
     click.echo(yaml.safe_dump(counts, sort_keys=False).rstrip())
     if not counts["pending"]:
         return
+    again = f"run this command again:\n{command}"
     if tally.unanswered is not None:
         raise PhaseSweepError(
-            f"MLflow delivery remains pending: {tally.unanswered}", action=OperatorAction.RETRY
+            f"MLflow delivery remains pending: {tally.unanswered}",
+            action=OperatorAction.RETRY,
+            remediation=f"Once the server answers, {again}",
         )
     if tally.refused:
         raise PhaseSweepError(
             "MLflow delivery remains pending:" + refused_text(len(tally.refused)),
             action=OperatorAction.FIX_CONFIG,
-            remediation="Fix each such cause, then run `phasesweep sync-tracking` again.",
+            remediation=f"Once each such cause is fixed, {again}",
         )
-    raise PhaseSweepError("MLflow delivery remains pending.", action=OperatorAction.RETRY)
+    creations = pending_creation_records(config, generation_id)
+    now = time.time()
+    open_windows = [
+        end for end in (creation_window_end(config, path) for path in creations) if end > now
+    ]
+    if open_windows:
+        assert config.mlflow is not None
+        # MLflow answered that no run carries the identity yet, and the lost request may still
+        # make one, so only a search after the window can settle the creation.
+        until = max(open_windows)
+        raise PhaseSweepError(
+            f"MLflow delivery remains pending: MLflow has no run yet for "
+            f"{count_text(0, len(open_windows))}, and the request whose answer was lost may "
+            f"still create one until timeout_seconds ({config.mlflow.timeout_seconds:g} s) "
+            "after it was sent.",
+            action=OperatorAction.RETRY,
+            remediation=(
+                f"Wait until {time.strftime('%H:%M:%S', time.localtime(until))}, about "
+                f"{math.ceil(until - now)} s from now, then {again}"
+            ),
+        )
+    records = counts["pending"] - len(creations)
+    raise PhaseSweepError(
+        f"MLflow delivery remains pending: {count_text(records, len(creations))} could not be "
+        "sent or settled; the warnings above give each cause.",
+        action=OperatorAction.RETRY,
+        remediation=f"Once those causes are resolved, {again}",
+    )
+
+
+def _sync_stopped_text(config: Experiment, generation_id: str | None, command: str) -> str:
+    """Say what a shutdown left pending in sync-tracking's scope, and how to send it.
+
+    :param Experiment config: The config sync-tracking ran with.
+    :param str | None generation_id: Its ``--generation`` value, if given.
+    :param str command: The shell-quoted command that repeats it.
+    :return str: The sentence, wrapped to the terminal, then the command on a line of its own.
+    """
+    from phasesweep.tracking.publication import count_text, delivery_status
+    from phasesweep.tracking.session import pending_creation_records
+
+    try:
+        pending = delivery_status(config, generation_id)["pending"]
+        creations = len(pending_creation_records(config, generation_id))
+    except (OSError, ValueError) as exc:
+        stopped = f"phasesweep: stopped; what stays pending could not be counted ({exc})."
+    else:
+        if not pending:
+            return "phasesweep: stopped with nothing pending."
+        stopped = f"phasesweep: stopped with {count_text(pending - creations, creations)} pending."
+    sentence = f"{stopped} Rerun the same command to send what is left:"
+    return "\n".join([*wrap(sentence, terminal_width(sys.stderr)), command])
 
 
 @cli.group(

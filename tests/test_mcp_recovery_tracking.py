@@ -394,7 +394,7 @@ def test_recover_run_and_mcp_status_say_what_keeps_a_refused_record_pending(
     assert read_record(run.record)["state"] == "pending"
     assert (
         "MLflow: delivered 1 record. MLflow: 1 record pending. The next launch with this config, "
-        "or `phasesweep sync-tracking CONFIG` with the config this run launched with, sends "
+        "or `phasesweep sync-tracking CONFIG` with this run's config file as CONFIG, sends "
         "them; delivery never retrains. MLflow refused 1 record; a refused record stays pending "
         "until the cause given in its warning is fixed in MLflow, for example by restoring a "
         "deleted run or its experiment." in confirmed.output.splitlines()

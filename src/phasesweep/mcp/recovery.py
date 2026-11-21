@@ -270,7 +270,7 @@ def recover_run(
                 publication_summary,
                 emit=emit,
             )
-            from phasesweep.tracking.session import DeliveryTally
+            from phasesweep.tracking.session import SYNC_TRACKING_STEP, DeliveryTally
 
             tally: DeliveryTally | None = None
             if delivering:
@@ -308,8 +308,7 @@ def recover_run(
                     f"Reconciled {evidence.registered_attempts_reconciled} registered MLflow "
                     f"tracking operation(s) for {run_id} and terminated {evidence.terminated} "
                     "live process group(s). The next launch with this config, or "
-                    "`phasesweep sync-tracking CONFIG` with the config this run launched with, "
-                    "sends any records still pending."
+                    f"{SYNC_TRACKING_STEP}, sends any records still pending."
                 )
             if evidence.pending_evidence:
                 # Cleanup is proven, so recovery succeeds; the next run refuses until
@@ -343,9 +342,8 @@ def recover_run(
                         emit(
                             (f"{sent}. " if sent else "")
                             + f"MLflow: {count_text(pending - creations, creations)} pending. "
-                            "The next launch with this config, or `phasesweep sync-tracking "
-                            "CONFIG` with the config this run launched with, sends them; "
-                            "delivery never retrains." + refused_text(len(tally.refused))
+                            f"The next launch with this config, or {SYNC_TRACKING_STEP}, sends "
+                            "them; delivery never retrains." + refused_text(len(tally.refused))
                         )
                     elif sent:
                         emit(f"{sent}; none stay pending.")
