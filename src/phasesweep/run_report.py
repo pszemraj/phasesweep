@@ -742,12 +742,11 @@ def summary(
     :param str next_command: The command that reads the result.
     :return Summary: The block to log.
     """
-    names = [phase.name for phase in experiment.phases]
-    skipped = set(names[: names.index(from_phase)]) if from_phase in names else set()
+    reached = {phase.name for _index, phase in experiment.phases_from(from_phase)}
     phases = []
     for phase in experiment.phases:
         winner = winners.get(phase.name)
-        if phase.name in skipped:
+        if phase.name not in reached:
             clauses: tuple[str, ...] = ("skipped",)
         elif phase.name in counts:
             clauses = _count_clauses(counts[phase.name])
@@ -765,16 +764,25 @@ def summary(
     return Summary(headline, tuple(phases), written_root, tuple(written), next_command)
 
 
+def _trial_total(counts: Mapping[str, PhaseCounts]) -> int:
+    """Sum the trials of every phase in a reported state.
+
+    :param Mapping[str, PhaseCounts] counts: Trial counts of each phase.
+    :return int: The trials the phases hold in all.
+    """
+    return sum(item.total for item in counts.values())
+
+
 def run_totals(counts: Mapping[str, PhaseCounts]) -> str:
     """Count the phases and trials a run covered, as the summary headline and ``run.log`` say it.
 
     :param Mapping[str, PhaseCounts] counts: Trial counts of each phase the run executed.
     :return str: For example ``2 phases, 6 trials, 4 from a previous run``.
     """
-    trials = sum(item.total for item in counts.values())
     earlier = sum(item.earlier for item in counts.values())
     return (
-        f"{plural(len(counts), 'phase')}, {plural(trials, 'trial')}, {earlier} from a previous run"
+        f"{plural(len(counts), 'phase')}, {plural(_trial_total(counts), 'trial')}, "
+        f"{earlier} from a previous run"
     )
 
 
@@ -789,5 +797,4 @@ def nothing_to_run(
     :param str next_command: The command that reads the result.
     :return NothingToRun: The block to log.
     """
-    trials = sum(item.total for item in counts.values())
-    return NothingToRun(duration_text(elapsed), trials, generation_id, next_command)
+    return NothingToRun(duration_text(elapsed), _trial_total(counts), generation_id, next_command)

@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeGuard
 
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import CategoricalParam, SearchParam, sampler_search_space
@@ -21,11 +22,10 @@ from phasesweep.engine.read import (
     TrialTables,
 )
 from phasesweep.engine.state import OBSERVED_PREFIX
-from phasesweep.runtime.json import JsonObject, JsonValue
+from phasesweep.runtime.json import JsonObject, JsonValue, json_integer
 from phasesweep.runtime.terminal import (
     GAP,
     INDENT,
-    directory_lines,
     display_path,
     objective_text,
     paint,
@@ -56,11 +56,11 @@ class _Column:
     numeric: bool
 
 
-def _is_number(value: JsonValue) -> bool:
+def _is_number(value: JsonValue) -> TypeGuard[int | float]:
     """Say whether a JSON value is an int or a float, booleans excluded.
 
     :param JsonValue value: Value to test.
-    :return bool: ``True`` for an int or float.
+    :return TypeGuard[int | float]: ``True`` for an int or float.
     """
     return isinstance(value, int | float) and not isinstance(value, bool)
 
@@ -71,7 +71,7 @@ def _number_text(value: JsonValue) -> str:
     :param JsonValue value: The row's value, ``None`` when no number was recorded.
     :return str: Terminal text for the cell.
     """
-    if isinstance(value, bool) or not isinstance(value, int | float):
+    if not _is_number(value):
         return "-"
     return objective_text(float(value))
 
@@ -102,20 +102,6 @@ def _optional_text(value: JsonValue) -> str:
     :return str: Terminal text for the cell.
     """
     return "-" if value is None else str(value)
-
-
-def _integer(row: JsonObject, column: str) -> int:
-    """Read an integer column of a trial row.
-
-    :param JsonObject row: A trial-table row.
-    :param str column: Column whose value is an integer.
-    :raises TypeError: The column holds anything else.
-    :return int: The column's value.
-    """
-    value = row[column]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"Trial table column {column!r} must hold an integer.")
-    return value
 
 
 def _params(row: JsonObject) -> JsonObject:
@@ -170,7 +156,7 @@ def _sort_key(
         if isinstance(param, CategoricalParam):
             listed = value in param.choices
             ordered.append((0, float(param.choices.index(value)), "") if listed else (1, 0.0, ""))
-        elif isinstance(value, int | float) and not isinstance(value, bool):
+        elif _is_number(value):
             ordered.append((0, float(value), ""))
         else:
             ordered.append((0, 0.0, str(value)))
@@ -263,16 +249,16 @@ def _trial_lines(
     :return list[str]: The table, with a trial's reason under its row.
     """
     space = sampler_search_space(phase)
-    recorded = {_integer(row, "trial"): _params(row) for row in table.rows}
+    recorded = {json_integer(row, "trial"): _params(row) for row in table.rows}
     keys = _param_keys(space, list(recorded.values()))
     rows = sorted(
         table.rows,
         key=lambda row: (
-            _sort_key(recorded[_integer(row, "trial")], keys, space),
-            _integer(row, "trial"),
+            _sort_key(recorded[json_integer(row, "trial")], keys, space),
+            json_integer(row, "trial"),
         ),
     )
-    params = [recorded[_integer(row, "trial")] for row in rows]
+    params = [recorded[json_integer(row, "trial")] for row in rows]
     columns = [
         _Column("trial", tuple(str(row["trial"]) for row in rows), numeric=True),
         _Column(metric_name, tuple(_number_text(row["value"]) for row in rows), numeric=True),
@@ -318,13 +304,13 @@ def _winner_dir_lines(rows: Sequence[JsonObject], *, width: int, color: bool) ->
     :return list[str]: One line per winning trial with a recorded directory, two when it is wide.
     """
     lines: list[str] = []
-    for row in sorted(rows, key=lambda row: _integer(row, "trial")):
+    for row in sorted(rows, key=lambda row: json_integer(row, "trial")):
         directory = row["trial_dir"]
         if row["winner"] != "*" or not isinstance(directory, str):
             continue
         label = f"{INDENT}winner trial {row['trial']} directory:"
         shown = display_path(Path(directory))
-        (drawn,) = directory_lines([shown], width=None, color=color)
+        drawn = paint(shown, "path", color=color)
         if len(label) + 1 + len(shown) <= width:
             lines.append(f"{label} {drawn}")
         else:
@@ -512,14 +498,12 @@ def unsettled_running_comment(running: int, width: int | None = None) -> str:
         the comment on one line.
     :return str: The ``#`` comment.
     """
-    if running == 1:
-        subject, verb, pronoun = "the 1 trial", "was", "it"
-    else:
-        subject, verb, pronoun = f"the {running} trials", "were", "them"
+    verb, pronoun = ("was", "it") if running == 1 else ("were", "them")
     text = (
-        f"No run is active, so {subject} recorded RUNNING {verb} left by a run that stopped "
-        f"before recording {pronoun}; rerun the same config to settle {pronoun}. A trainer "
-        "still running is stopped and its trial rerun, so wait for it to exit to keep its result."
+        f"No run is active, so the {plural(running, 'trial')} recorded RUNNING {verb} left by a "
+        f"run that stopped before recording {pronoun}; rerun the same config to settle {pronoun}. "
+        "A trainer still running is stopped and its trial rerun, so wait for it to exit to keep "
+        "its result."
     )
     if width is None:
         return f"# {text}"
