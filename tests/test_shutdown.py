@@ -584,14 +584,15 @@ def test_a_scope_entered_with_sighup_ignored_restores_the_host_and_never_takes_s
 
 @pytest.mark.integration
 @pytest.mark.skipif(sys.platform != "linux", reason="reads Linux procfs SigIgn and SigCgt")
-def test_trainer_starts_with_sighup_at_default_when_the_run_ignores_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("ignored", [True, False], ids=["nohup", "terminal"])
+def test_trainer_inherits_the_runs_sighup_disposition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ignored: bool
 ) -> None:
-    """A trainer launched by a run that keeps SIGHUP ignored starts with SIGHUP at its default, as under a run that handles it."""
+    """A trainer launched by a run that keeps SIGHUP ignored, as under ``nohup``, starts with it ignored; under a run that handles SIGHUP it starts at the default."""
     monkeypatch.setattr(runtime_shutdown, "_owned_signals", None)
-    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN if ignored else signal.SIG_DFL)
     install_signal_handlers()
-    assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+    assert (signal.getsignal(signal.SIGHUP) is signal.SIG_IGN) is ignored
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
     status_out = tmp_path / "status.txt"
@@ -611,7 +612,7 @@ def test_trainer_starts_with_sighup_at_default_when_the_run_ignores_it(
     assert result.return_code == 0
     fields = dict(line.split(":", 1) for line in status_out.read_text().splitlines())
     sighup_bit = 1 << (signal.SIGHUP - 1)
-    assert not int(fields["SigIgn"], 16) & sighup_bit
+    assert bool(int(fields["SigIgn"], 16) & sighup_bit) is ignored
     assert not int(fields["SigCgt"], 16) & sighup_bit
 
 

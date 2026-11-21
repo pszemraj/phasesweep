@@ -618,10 +618,6 @@ def main(argv: list[str] | None = None) -> int:
     ready_fd = int(args[0])
     ack_fd = int(args[1])
     adopts = _become_subreaper()
-    # An orchestrator under nohup keeps SIGHUP ignored, and exec would pass that on. The
-    # guardian and trainer start with it at its default however the sweep was started;
-    # their own sessions keep a terminal hangup away from them either way.
-    signal.signal(signal.SIGHUP, signal.SIG_DFL)
 
     # A cancellation request must wait until the guardian can preserve its intent.
     signal.pthread_sigmask(signal.SIG_SETMASK, {signal.SIGTERM})
