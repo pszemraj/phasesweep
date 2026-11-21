@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import signal
 import sys
@@ -15,6 +16,8 @@ import yaml
 from optuna.trial import TrialState, create_trial
 
 from phasesweep.config.models import Experiment
+from phasesweep.engine import guards
+from phasesweep.engine import phase as phase_module
 from phasesweep.engine.errors import TrackingSyncRefusedError
 from phasesweep.engine.generation import _recorded_generation
 from phasesweep.engine.ledger import (
@@ -40,9 +43,11 @@ from phasesweep.engine.state import (
     FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     OVERRIDES_ATTR,
+    RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     _trial_interrupted,
     constraint_attr,
@@ -52,6 +57,7 @@ from phasesweep.errors import (
     ProcessCleanupUncertainError,
     UnsafeProcessCleanupError,
 )
+from phasesweep.runtime import process
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
@@ -108,6 +114,74 @@ def test_trainer_owned_run_is_never_terminated():
     client = SimpleNamespace(get_run=lambda _: mlflow_run(binding, status="RUNNING"))
     with pytest.raises(ValueError, match="Only runs PhaseSweep created"):
         _publish(client, {"binding": binding, "projection": {}, "finish": "FAILED"})
+
+
+@pytest.mark.parametrize("outcome", ["completed", "uncertain"])
+def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
+    tmp_path, monkeypatch, outcome
+):
+    """Creation workers never become trainer evidence, and an unlaunched draw is retried."""
+    config, _ = remote_mlflow_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    config["phases"] = config["phases"][:1]
+    config["phases"][0].update(n_trials=1, sampler={"type": "random", "seed": 123})
+    experiment = Experiment.model_validate(config)
+    respond = session.request_operation
+    created = {}
+
+    def create_before_trainer(request, *, operation_id, directory, environment, deadline):
+        binding = request.get("binding", {})
+        if request["action"] == "find" and binding.get("attempt_id") == created.get("attempt_id"):
+            return {"found": True, "binding": created}
+        if request["action"] == "create" and binding.get("phase") != "generation" and not created:
+            created.update(respond(request))
+            with Path(os.devnull).open("w") as sink:
+                process.run_supervised(
+                    "true",
+                    env=dict(os.environ),
+                    stdout=sink,
+                    stderr=sink,
+                    timeout=10,
+                    trial_dir=directory,
+                    attempt_id=operation_id,
+                )
+            if outcome == "uncertain":
+                process.write_attempt_lifecycle(
+                    directory,
+                    attempt_id=operation_id,
+                    state="terminating",
+                    return_code=-15,
+                    cleanup_confirmed=False,
+                )
+                raise UnsafeProcessCleanupError("creation worker cleanup is uncertain")
+            raise RunnerKilled()
+        return respond(
+            request,
+            operation_id=operation_id,
+            directory=directory,
+            environment=environment,
+            deadline=deadline,
+        )
+
+    monkeypatch.setattr(session, "request_operation", create_before_trainer)
+    with monkeypatch.context() as stopped:
+        stopped.setattr(guards, "_reconcile_existing_studies", lambda *args, **kwargs: None)
+        if outcome == "completed":
+            stopped.setattr(phase_module, "_record_outcome", lambda *args, **kwargs: None)
+        with pytest.raises(RunnerKilled if outcome == "completed" else UnsafeProcessCleanupError):
+            run_experiment(experiment)
+    (original,) = read_phase_trials(validate_ledger(experiment), "depth").trials
+    assert original.state == TrialState.RUNNING
+    trial_dir = Path(original.user_attrs[TRIAL_DIR_ATTR])
+    lifecycle = process.read_attempt_lifecycle(trial_dir, expected_attempt_id=created["attempt_id"])
+    assert lifecycle is not None and lifecycle.state == "allocated"
+
+    run_experiment(experiment)
+    original, retried = read_phase_trials(validate_ledger(experiment), "depth").trials
+    assert _trial_interrupted(original)
+    assert retried.state == TrialState.COMPLETE
+    assert retried.params == original.params
+    assert retried.user_attrs[RERUN_OF_ATTR] == original.number
 
 
 def test_failed_trial_finishes_its_managed_run(tmp_path, monkeypatch):

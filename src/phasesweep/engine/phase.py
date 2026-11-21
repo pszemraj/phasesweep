@@ -113,7 +113,12 @@ from phasesweep.engine.trial import (
     trial_run_name,
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
-from phasesweep.errors import OperatorAction, PhaseSweepError, UnsafeProcessCleanupError
+from phasesweep.errors import (
+    OperatorAction,
+    PhaseSweepError,
+    ProcessCleanupUncertainError,
+    UnsafeProcessCleanupError,
+)
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
@@ -214,7 +219,8 @@ class _TrialLeftRunning(BaseException):
     """Keep a trial RUNNING for evidence or journal recovery and stop the phase with ``error``.
 
     Optuna does not catch this BaseException subclass, so it commits no terminal
-    state. After workers drain, ``_run_phase`` raises ``error``, unless a worker's
+    state. A preparation worker with unresolved cleanup leaves its unlaunched trial for recovery.
+    After workers drain, ``_run_phase`` raises ``error``, unless a worker's
     unconfirmed process cleanup outranks it. Stale recovery
     then settles the trial: it records an outcome that could not be persisted
     before committing the terminal state, or extracts finished training once
@@ -851,7 +857,7 @@ class _PhaseExecution:
         with self.fatal_lock:
             recorded = self.fatal_error is None or (
                 isinstance(self.fatal_error, _TrialLeftRunning)
-                and isinstance(error, UnsafeProcessCleanupError)
+                and isinstance(error, ProcessCleanupUncertainError)
             )
             if recorded:
                 self.fatal_error = error
@@ -1115,8 +1121,10 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     environment=run.environment_identity.values,
                     deadline=run.optimize_deadline,
                 )
-            except UnsafeProcessCleanupError:
-                raise
+            except ProcessCleanupUncertainError as exc:
+                # The registered tracking worker owns its cleanup. This trainer never launched.
+                run.record_fatal(exc)
+                raise _TrialLeftRunning(exc) from exc
             except (OSError, ValueError, RuntimeError) as exc:
                 reason = f"MLflow run preparation: {exc}"
                 log.warning("[%s/trial_%d] %s", phase.name, trial.number, reason)

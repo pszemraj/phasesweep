@@ -255,7 +255,6 @@ def _create_bound(
     *,
     run_name: str,
     deadline: float | None,
-    attempt_directory: Path | None = None,
 ) -> RunBinding:
     """Bind or create an identity's run, persisting intent before sending creation.
 
@@ -269,7 +268,6 @@ def _create_bound(
     :param Mapping[str, str] environment: Composed credentials and transport.
     :param str run_name: Display name for a newly created run.
     :param float | None deadline: Existing execution deadline.
-    :param Path | None attempt_directory: Existing process slot for managed attempt creation.
     :raises OperationRejectedError: The worker reported that the request failed.
     :raises RuntimeError: The creation outcome is unresolved.
     :return RunBinding: Bound native run identity.
@@ -292,7 +290,6 @@ def _create_bound(
                 environment,
                 timeout_at=operation_deadline(experiment, deadline),
                 deadline=deadline,
-                attempt_directory=attempt_directory,
             )
             if found is not None:
                 return found
@@ -309,7 +306,9 @@ def _create_bound(
         write_record(pending, record)
         request: CreateAction = {"action": "create", "binding": identity, "run_name": run_name}
         try:
-            created = _send(experiment, identity, request, environment, deadline, attempt_directory)
+            created = call_tracking(
+                experiment, identity["generation_id"], request, environment, deadline
+            )
         except OperationRejectedError:
             # A refused or unsent request created nothing, so a later call may send it afresh.
             pending.unlink(missing_ok=True)
@@ -323,37 +322,6 @@ def _create_bound(
     return binding
 
 
-def _send(
-    experiment: Experiment,
-    identity: RunIdentity,
-    request: TrackingAction,
-    environment: Mapping[str, str],
-    deadline: float | None,
-    attempt_directory: Path | None,
-) -> JsonObject:
-    """Send one request through the process slot the identity's creation uses.
-
-    :param Experiment experiment: Configured experiment.
-    :param RunIdentity identity: Creation identity owning the slot.
-    :param TrackingAction request: Trusted SDK action.
-    :param Mapping[str, str] environment: Composed credentials and transport.
-    :param float | None deadline: Existing execution deadline.
-    :param Path | None attempt_directory: A managed attempt's directory; ``None`` for the
-        generation run, which takes a registered tracking operation.
-    :return JsonObject: Successful worker response.
-    """
-    assert experiment.mlflow is not None
-    if attempt_directory is None:
-        return call_tracking(experiment, identity["generation_id"], request, environment, deadline)
-    return request_operation(
-        {"settings": experiment.mlflow.target(), **request},
-        operation_id=identity["attempt_id"],
-        directory=attempt_directory,
-        environment=environment,
-        deadline=operation_deadline(experiment, deadline),
-    )
-
-
 def _find_bound(
     experiment: Experiment,
     identity: RunIdentity,
@@ -361,7 +329,6 @@ def _find_bound(
     *,
     timeout_at: float,
     deadline: float | None,
-    attempt_directory: Path | None,
 ) -> RunBinding | None:
     """Search an identity's run read-only, polling until ``timeout_at``.
 
@@ -370,11 +337,10 @@ def _find_bound(
     :param Mapping[str, str] environment: Composed credentials and transport.
     :param float timeout_at: Absolute monotonic time the search stops polling at.
     :param float | None deadline: Existing execution deadline.
-    :param Path | None attempt_directory: A managed attempt's directory, if it owns the slot.
     :return RunBinding | None: The verified binding, or ``None`` when no run carries the identity.
     """
     request: FindAction = {"action": "find", "binding": identity, "timeout_at": timeout_at}
-    found = _send(experiment, identity, request, environment, deadline, attempt_directory)
+    found = call_tracking(experiment, identity["generation_id"], request, environment, deadline)
     return validate_binding(found["binding"]) if found.get("found") is True else None
 
 
@@ -414,7 +380,6 @@ def resolve_pending_creations(
                     environment,
                     timeout_at=time.monotonic(),
                     deadline=None,
-                    attempt_directory=None,
                 )
             except (OSError, ValueError, RuntimeError) as exc:
                 if isinstance(exc, UnsafeProcessCleanupError):
@@ -640,6 +605,5 @@ def prepare_attempt(
             environment,
             run_name=run_name,
             deadline=deadline,
-            attempt_directory=directory,
         )
     return identity

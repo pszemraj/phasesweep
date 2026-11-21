@@ -159,12 +159,11 @@ def scripted_response(script, request):
 
 
 def mlflow_binder(tmp_path, slot, *, experiment=None, identity=None, directory=None):
-    """Return the binding path and a ``_create_bound`` call for one creation in either slot."""
+    """Return the binding path and a ``_create_bound`` call for one attempt or generation binding."""
     experiment = experiment or native_experiment(tmp_path)
     identity = identity or attempt_identity()
     if slot == "attempt":
-        directory = directory or tmp_path
-        path, slot_arguments = directory / "mlflow-binding.json", {"attempt_directory": directory}
+        path = (directory or tmp_path) / "mlflow-binding.json"
     else:
         path = (
             session.tracking_root(experiment)
@@ -172,11 +171,10 @@ def mlflow_binder(tmp_path, slot, *, experiment=None, identity=None, directory=N
             / "generation-binding.json"
         )
         path.parent.mkdir(parents=True)
-        slot_arguments = {}
 
     def bind(deadline=None):
         return session._create_bound(
-            experiment, identity, path, {}, run_name="r", deadline=deadline, **slot_arguments
+            experiment, identity, path, {}, run_name="r", deadline=deadline
         )
 
     return bind, path
