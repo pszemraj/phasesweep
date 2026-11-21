@@ -380,6 +380,13 @@ def test_lock_dir_rejects_missing_or_unsafe_override(
         runtime_files.lock_dir()
     assert not override.exists()
 
+    override.write_text("")
+    with pytest.raises(runtime_files.UnsafeLockPathError) as caught:
+        runtime_files.lock_dir()
+    assert f"{override} is not a real directory" in str(caught.value)
+    assert caught.value.action.value == "provision_lock_dir"
+    override.unlink()
+
     override.mkdir()
     override.chmod(0o750)
     with pytest.raises(runtime_files.UnsafeLockPathError, match="Unsafe lock directory"):

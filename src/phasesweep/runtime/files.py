@@ -254,7 +254,10 @@ def _lock_policy(path: Path) -> _LockPolicy:
             action=OperatorAction.PROVISION_LOCK_DIR,
         ) from exc
     except UnsafePrivatePathError as exc:
-        raise UnsafeLockPathError(f"Lock directory {path} has an unsafe path component.") from exc
+        raise UnsafeLockPathError(
+            f"Lock directory {path} has an unsafe path component: {exc}",
+            action=OperatorAction.PROVISION_LOCK_DIR,
+        ) from exc
     try:
         return _lock_policy_for_info(path, os.fstat(fd))
     finally:
