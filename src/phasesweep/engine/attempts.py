@@ -23,7 +23,7 @@ from phasesweep.engine.errors import (
     tracker_unreadable,
 )
 from phasesweep.engine.ledger import open_registry_study
-from phasesweep.engine.paths import _attempts_dir
+from phasesweep.engine.paths import _attempts_dir, _experiment_dir
 from phasesweep.engine.progress import _warn_deferred_extraction
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.state import (
@@ -773,6 +773,7 @@ def _registry_attempt_fail_stale_trial(
     entry: dict[str, Any],
     entry_path: Path,
     report: _PreflightCleanupReport,
+    experiment: Experiment,
 ) -> str:
     """Settle the entry's Optuna trial through its saved storage locator.
 
@@ -781,6 +782,7 @@ def _registry_attempt_fail_stale_trial(
     :param dict[str, Any] entry: Validated registry entry payload.
     :param Path entry_path: Entry file, used only for diagnostics.
     :param _PreflightCleanupReport report: Counts newly recorded trial cleanup actions.
+    :param Experiment experiment: Current artifact namespace and polling settings.
     :return str: ``"reaped"`` when the stale RUNNING trial became terminal,
         ``"recovered"`` when an interrupted pass already recorded that
         transition in the study ledger or the entry is a tracking operation
@@ -909,7 +911,7 @@ def _registry_attempt_fail_stale_trial(
         study,
         trial,
         record=_registry_attempt_record(entry, entry_path),
-        artifact_root=entry_path.parent.parent,
+        experiment=experiment,
         report=report,
         failure_message=(
             f"Process cleanup completed for registered attempt {entry['attempt_id']}, "
@@ -975,7 +977,7 @@ def _preflight_active_attempts(
                         inspection_messages=report.inspection_messages,
                     )
                     continue
-                outcome = _registry_attempt_fail_stale_trial(entry, entry_path, report)
+                outcome = _registry_attempt_fail_stale_trial(entry, entry_path, report, experiment)
             except ProcessCleanupUncertainError as exc:
                 report.uncertain_attempt_ids.add(attempt_id)
                 report.mark_uncertain(exc)
@@ -1156,7 +1158,7 @@ def _recover_completed_trial(
     trial: optuna.trial.FrozenTrial,
     *,
     record: _AttemptRecord,
-    artifact_root: Path,
+    current: Experiment,
     report: _PreflightCleanupReport | None = None,
 ) -> bool | None:
     """Accept a finished orphan through the producing configuration's extraction path.
@@ -1174,7 +1176,7 @@ def _recover_completed_trial(
     :param optuna.Study study: Owning study whose trial is still RUNNING.
     :param optuna.trial.FrozenTrial trial: Stale trial with retained trainer evidence.
     :param _AttemptRecord record: Attempt identity and original trial directory.
-    :param Path artifact_root: Owning artifact root containing generation snapshots.
+    :param Experiment current: Recovery invocation supplying the artifact root and MLflow polling controls.
     :param _PreflightCleanupReport | None report: Collector for newly recovered completed
         results and for evidence the tracker gave no answer about.
     :return bool | None: True once the finished trainer's evidence settled the trial as
@@ -1225,7 +1227,7 @@ def _recover_completed_trial(
             record.attempt_id, record.phase_name, trial.number, persistent=True
         )
         return None
-    experiment = _load_generation_experiment(artifact_root, record.generation_id)
+    experiment = _load_generation_experiment(_experiment_dir(current), record.generation_id)
     phase = experiment.phase(record.phase_name)
     environment = _environment_identity(
         experiment, record.phase_name, require_wandb_online=False
@@ -1251,7 +1253,9 @@ def _recover_completed_trial(
         run_name=trial_run_name(experiment, record.phase_name, trial.number, record.attempt_id),
         return_code=0,
         duration_seconds=trainer_duration,
-        mlflow_settings=None if experiment.mlflow is None else experiment.mlflow.target(),
+        mlflow_settings=(
+            None if experiment.mlflow is None else experiment.mlflow.target(polling=current.mlflow)
+        ),
         mlflow_query=compile_mlflow_query(experiment, phase.gates),
         wandb_environment=environment,
         mlflow_environment=environment,
@@ -1350,22 +1354,21 @@ def _fail_stale_running_trial(
     *,
     failure_message: str,
     record: _AttemptRecord | None = None,
-    artifact_root: Path | None = None,
+    experiment: Experiment | None = None,
     report: _PreflightCleanupReport | None = None,
 ) -> bool:
     """Settle a resolved RUNNING trial using completed evidence when available.
 
     Re-extract a confirmed successful trainer through its producing configuration.
     Otherwise preserve failures or record an interruption. The outcome and cleanup
-    ledger precede Optuna's terminal transition. Recovery contacts no tracker: the
-    settled generation goes on ``report``, and the run delivers its attempts' MLflow
-    outcomes from the ledger once it has reached the tracker.
+    ledger precede Optuna's terminal transition. Recovery may read tracker evidence.
+    The run delivers MLflow outcomes for settled generations from the ledger.
 
     :param optuna.Study study: Study containing ``trial``.
     :param optuna.trial.FrozenTrial trial: Stale RUNNING trial whose attempt
         can no longer leak a process.
     :param _AttemptRecord | None record: Attempt record for recovering completed evidence.
-    :param Path | None artifact_root: Artifact root containing the producing config snapshot.
+    :param Experiment | None experiment: Recovery invocation supplying the artifact root and MLflow polling controls.
     :param _PreflightCleanupReport | None report: Collector for newly recovered completed
         results and for the generations whose trials were settled.
     :param str failure_message: The refusal to raise when Optuna cannot
@@ -1385,9 +1388,9 @@ def _fail_stale_running_trial(
             f"Recovery of stale RUNNING trial {trial.number} in study {study.study_name!r} could not reload its durable outcome before settlement. The trial remains RUNNING for retry."
         ) from exc
     recovered = False
-    if record is not None and artifact_root is not None:
+    if record is not None and experiment is not None:
         extracted = _recover_completed_trial(
-            study, trial, record=record, artifact_root=artifact_root, report=report
+            study, trial, record=record, current=experiment, report=report
         )
         if extracted is None:
             return False

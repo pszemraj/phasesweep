@@ -990,15 +990,16 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     config["storage"] = f"journal:///{tmp_path}/study.journal"
     config["phases"] = config["phases"][:1]
     config["phases"][0].update(n_trials=1, sampler={"type": "random", "seed": 123})
+    config["mlflow"].update(timeout_seconds=6, poll_seconds=1)
     experiment = Experiment.model_validate(config)
     respond = session.request_operation
-    reachable = {"capture": False}
     refused_upload: dict[str, str] = {}
 
     def capture_after_outage(request, **kwargs):
         if request["action"] == "capture":
-            if not reachable["capture"]:
-                raise OperationUnavailableError("tracking server unreachable")
+            if request["settings"]["timeout_seconds"] < 10:
+                raise OperationUnavailableError("tracking server did not answer in time")
+            assert request["settings"]["poll_seconds"] == 3
             if answer == "objective-missing":
                 run = mlflow_run(request["binding"], metrics={"cost": 1.0})
                 return worker._capture(SimpleNamespace(get_run=lambda _: run), request)
@@ -1015,7 +1016,8 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     attempt = pending.user_attrs[ATTEMPT_ID_ATTR]
     generation = pending.user_attrs[GENERATION_ID_ATTR]
 
-    reachable["capture"] = True
+    config["mlflow"].update(timeout_seconds=30, poll_seconds=3)
+    experiment = Experiment.model_validate(config)
     if upload == "offline":
         refused_upload["name"] = f"attempt-{attempt}"
     delivery = tracking_root(experiment) / generation / "delivery"

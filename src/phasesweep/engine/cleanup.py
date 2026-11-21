@@ -21,7 +21,7 @@ from phasesweep.engine.attempts import (
     _trial_dir_from_attr,
     _trial_requires_cleanup_recovery,
 )
-from phasesweep.engine.paths import _experiment_dir, _trial_dir_for
+from phasesweep.engine.paths import _trial_dir_for
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
@@ -119,7 +119,7 @@ def _reap_stale_trials(
                 study,
                 trial,
                 record=record,
-                artifact_root=_experiment_dir(experiment),
+                experiment=experiment,
                 report=report,
                 failure_message=(
                     f"Stale process cleanup completed for RUNNING trial {trial.number}, "
