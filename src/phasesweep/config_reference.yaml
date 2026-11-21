@@ -489,7 +489,7 @@ env: map[string, string] = {}
 # Trainer working directory and environment-selection contract. Nested defaults apply when the block is omitted.
 execution: object = {}
   # Working directory of every trainer process. Write . for the config file's directory; "" fails config load.
-  # validate, run --dry-run and every launch refuse a directory that does not exist, before any trial starts. One that disappears during a run fails each later attempt, and those failures count toward max_consecutive_failures.
+  # validate checks the trainer directory. Launch and run --dry-run check it for phases that would start trials, before any phase starts. A replay requires no trainer directory.
   # Unset: the directory phasesweep was started from, or the catalog entry's cwd under MCP. A study with trials then refuses a run from another directory.
   # Recommended: set it, or use absolute interpreter and script paths in trial_command, so the command resolves the same way from every invocation.
   cwd: string | null = null
@@ -572,7 +572,7 @@ LogRegexExtractor:
   # Log file, for example stdout.log. stdout.log and stderr.log hold the trainer's two streams, and Python logging writes to stderr by default.
   file: string = "stdout.log"
 
-  # Python regular expression whose named group (?P<value>...) captures the metric token, such as loss=(?P<value>\S+) for whitespace-delimited output. Without that group, config load fails.
+  # Python regular expression whose required group (?P<value>...) captures the whole metric token. Use loss=(?P<value>\S+) for whitespace delimiters or loss=(?P<value>[^\s,]+) when a comma can follow.
   # Lines split at \n, \r\n and bare \r and are searched one at a time, so a match cannot span lines. Inline flags such as (?i) work.
   # Each numeric match is an observation. The reader skips captures that float() cannot parse and accepts nan, inf and 1_0. On a persistent study a changed pattern needs a new experiment name, because the pattern is part of the study identity.
   pattern: string (required)

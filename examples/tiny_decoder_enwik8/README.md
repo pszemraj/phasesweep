@@ -112,7 +112,7 @@ The `--mlflow` option of `run_trial.py` logs the evaluated `final.pt` loss as na
 
 The smoke uses [managed run ownership](../../docs/mlflow.md#choose-run-ownership). To exercise trainer ownership, copy the config, set `mlflow.run_mode: trainer`, and choose a fresh `experiment` and `workdir`. Open `http://127.0.0.1:5000` to inspect the native metrics and `phasesweep.*` results.
 
-When copying the MLflow config outside the checkout, set `execution.cwd` to the absolute PhaseSweep repository path. To use another server, set `mlflow.tracking_uri` and provision `mlflow.experiment_name` there first.
+The MLflow smoke uses persistent storage. Rerunning the same configuration reuses completed trials. When copying the config outside the checkout, set `execution.cwd` to the absolute PhaseSweep repository path. To use another server, set `mlflow.tracking_uri` and provision `mlflow.experiment_name` there first.
 
 ## MCP smoke
 

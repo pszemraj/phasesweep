@@ -34,7 +34,7 @@ Validate the reviewed catalog with its absolute path:
 phasesweep mcp check --catalog /absolute/path/to/catalog.yaml
 ```
 
-This checks the catalog and its private state layout. For launch-enabled entries it also checks trainer paths. A missing trainer can fail this readiness check while the server still serves results and other experiments. Each entry shows `ok` with its permissions and `trainer cwd`, or `FAIL` with the reason and a `fix:` line. The command exits 0 when all checks pass.
+This checks the catalog and its private state layout. For launch-enabled entries it also checks trainer paths. A missing trainer can fail this readiness check while the server still serves results and other experiments. Each entry shows `ok` with its permissions and `trainer cwd`, or `FAIL` with the reason and a `fix:` line. The command exits 0 when all checks pass. At startup, the server logs `trainer cwd` for every entry it serves.
 
 ### 3. Configure your client
 
@@ -81,7 +81,7 @@ Use `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` after a cata
 
 - `MCP support is not installed`: install the MCP extra in the environment that supplies `phasesweep-mcp`.
 - The client cannot start the server: verify its client-owned stdio entry has absolute executable and catalog paths, then run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml`.
-- If a launch, cancellation or `from_phase` is refused for lack of permission, check the [catalog permissions](mcp.md#the-catalog). For a refused cancellation, follow the operator step the error gives for that run.
+- `action 'launch' is not permitted`, `action 'cancel' is not permitted` or `action 'from_phase' is not permitted`: check the [catalog permissions](mcp.md#the-catalog). For a refused cancellation, follow the operator step the error gives for that run.
 - `catalog_status.stale: true`, or a launch or inspection refused because a catalog entry `failed to load` or the catalog file `does not validate`: run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` and fix what it reports; the server's stderr log names the file. See [catalog reload behavior](mcp.md#the-catalog), including when a restart is required.
 - `concurrency limit reached` or an experiment that already has a running sweep: [run state and recovery](mcp.md#run-state-and-recovery) says which blockers to await and which need the operator.
 - `cannot prove available launch capacity`: `state_dir` holds unreadable or orphaned run records, which the refusal lists. Run the `phasesweep mcp recover-run` command it names for each pre-spawn orphan; for each other listed run id, run `pgrep -af <run-id>`, which lists the run's runner, and `ps axeww | awk '/[P]HASESWEEP_GENERATION_ID=<run-id>/ {print $1}'`, which prints the PID of each of its trials, found by environment (a trial's arguments carry the run id only when its command uses `{trial_dir}`), on the server host as the server's user, since `ps` shows another user's processes no environment, wait for every listed process to exit, or stop it, and move `runs/<run-id>.json` and `logs/<run-id>.*` out of `state_dir` only once both print nothing.
