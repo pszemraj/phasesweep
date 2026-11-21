@@ -932,6 +932,7 @@ def _preflight_active_attempts(
     confirm: bool,
     retain_recovery_evidence: bool = False,
     tracking_only: bool = False,
+    generation_id: str | None = None,
 ) -> dict[str, str]:
     """Resolve registered attempts independently of the current phase graph and storage URL.
 
@@ -942,6 +943,7 @@ def _preflight_active_attempts(
         durable cleanup receipt before retirement.
     :param bool retain_recovery_evidence: Keep uncommitted cleanup evidence for operator retries.
     :param bool tracking_only: Resolve only controller operations without Optuna trials.
+    :param str | None generation_id: Limit recovery to entries registered under this generation, if given.
     :return dict[str, str]: Attempt ids mapped to producing generation ids.
     :raises ProcessCleanupUncertainError: A registered attempt could not be proven safe.
     """
@@ -952,6 +954,8 @@ def _preflight_active_attempts(
         for entry_path in entry_paths:
             entry = _load_attempt_entry(entry_path, directory_fd=directory_fd)
             if tracking_only and entry["kind"] != "tracking":
+                continue
+            if generation_id is not None and entry["generation_id"] != generation_id:
                 continue
             attempt_id = entry["attempt_id"]
             inspected[attempt_id] = entry["generation_id"]

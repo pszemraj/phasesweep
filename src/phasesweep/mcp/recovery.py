@@ -303,6 +303,13 @@ def recover_run(
                     f"{evidence.retained_results} completed trial result(s), and confirmed "
                     f"{evidence.cleanup_recovered} cleanup-uncertain trial(s)."
                 )
+            elif evidence.registered_attempts_reconciled:
+                emit(
+                    f"Reconciled {evidence.registered_attempts_reconciled} registered MLflow "
+                    f"tracking operation(s) for {run_id} and terminated {evidence.terminated} "
+                    "live process group(s). Retry any remaining uploads with "
+                    "`phasesweep sync-tracking CONFIG` using the config this run launched with."
+                )
             if evidence.pending_evidence:
                 # Cleanup is proven, so recovery succeeds; the next run refuses until
                 # the tracker answers, and nothing here may discard the training.
@@ -769,6 +776,8 @@ def _recover_trial_evidence(
     When cleanup is needed, both modes read run, registry, tracking-receipt, and study evidence
     through the same cleanup helpers. Confirmed recovery lets them signal and write; preflight
     only validates and does not persist the collected run evidence.
+    A pending publication snapshot can precede MLflow uploads, so recover its run's tracking
+    operations before finalizing the snapshot that holds its slot.
 
     :param RunStore store: Existing run store containing prior cleanup evidence and attempt IDs.
     :param RunHandle handle: Durable handle for the run being recovered.
@@ -875,6 +884,27 @@ def _recover_trial_evidence(
                         record.trial_number,
                         record.generation_id,
                     )
+    elif (
+        config.mlflow is not None
+        and needs.snapshot_recovery_required
+        and needs.terminal_status is not None
+        and needs.terminal_status.get("result_publication_state") is not None
+    ):
+        # Publication records trainer cleanup before mirroring. A hard exit during the
+        # mirror can leave a tracking operation registered under this run.
+        validate_ledger(config)
+        tracking_report = _PreflightCleanupReport(inspection_messages={} if not confirm else None)
+        evidence.registered_attempts_reconciled = len(
+            _preflight_active_attempts(
+                config,
+                tracking_report,
+                confirm=confirm,
+                tracking_only=True,
+                generation_id=run_id,
+            )
+        )
+        evidence.terminated = sum(tracking_report.process_actions.values())
+        evidence.inspection_messages = tracking_report.inspection_messages or {}
     if confirm and needs.stored_snapshot is not None:
         pending_ids = {
             attempt.attempt_id
@@ -958,6 +988,11 @@ def _preflight_message(
             f"settle {evidence.reaped} stale trial(s), retaining completed results when "
             f"their evidence confirms success, and recover {evidence.cleanup_recovered} "
             "cleanup-uncertain terminal trial(s)"
+        )
+    elif evidence.registered_attempts_reconciled:
+        actions.append(
+            f"reconcile {evidence.registered_attempts_reconciled} registered MLflow tracking "
+            f"operation(s), terminating {evidence.terminated} live process group(s) if still alive"
         )
     if needs.snapshot_finalize_needed:
         if publication_action == "commit":

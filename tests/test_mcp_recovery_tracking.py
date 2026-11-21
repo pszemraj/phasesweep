@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -12,10 +14,11 @@ from phasesweep.engine.attempts import _retire_active_attempt
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
 from phasesweep.engine.paths import _attempts_dir
 from phasesweep.engine.state import CLEANUP_CONFIRMED_ATTR
-from phasesweep.errors import ProcessCleanupUncertainError
+from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
+from phasesweep.runtime.json import JsonObject
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
 from phasesweep.tracking.mlflow import OperationUnavailableError
@@ -498,3 +501,103 @@ def test_the_printed_steps_clear_a_run_whose_worker_sent_an_earlier_outcome(
     publication.sync_tracking(experiment)
     publication.sync_tracking(experiment)
     assert [r["finish"] for r in uploads if r["name"] == f"attempt-{attempt}"] == [finish]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("target", ["published-winner", "recovered-attempt"])
+def test_recover_run_cleans_worker_before_finalizing_pending_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """A runner killed during mirroring holds its slot until its registered worker is reaped."""
+    experiment, uploads, [attempt] = killed_sweep(
+        tmp_path, monkeypatch, n_jobs=1, generation_id=_RUN_ID
+    )
+    config = write_experiment_config(Path.cwd() / "experiment.yaml", experiment)
+    app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
+    store.config_snapshot_path(_SENDING_RUN_ID).write_bytes(config.read_bytes())
+    name = "winner-depth" if target == "published-winner" else f"attempt-{attempt}"
+    target_generation = _SENDING_RUN_ID if target == "published-winner" else _RUN_ID
+    pending = tracking_root(experiment) / target_generation / "delivery" / f"{name}.json"
+    crash_code = 74
+
+    with monkeypatch.context() as crash:
+        leak_tracking_worker(crash, name=name)
+        request_operation = session.request_operation
+
+        def die_during_upload(
+            request: Mapping[str, object],
+            *,
+            operation_id: str,
+            directory: Path,
+            environment: Mapping[str, str],
+            deadline: float,
+        ) -> JsonObject:
+            try:
+                return request_operation(
+                    request,
+                    operation_id=operation_id,
+                    directory=directory,
+                    environment=environment,
+                    deadline=deadline,
+                )
+            except UnsafeProcessCleanupError:
+                os._exit(crash_code)
+
+        crash.setattr(session, "request_operation", die_during_upload)
+        crash.setattr(worker, "request_operation", die_during_upload)
+        child = os.fork()
+        if child == 0:
+            os._exit(run_claimed_runner(store, _SENDING_RUN_ID, config, cwd=Path.cwd()))
+        _pid, wait_status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(wait_status) == crash_code
+
+    store = RunStore.open_existing(registry.state_dir)
+    handle = store.get(_SENDING_RUN_ID)
+    assert handle is not None
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    assert terminal["cleanup_confirmed"] is True
+    assert terminal["result_snapshot_state"] == "pending"
+    assert terminal["result_publication_state"] == "committed"
+    assert store.observe(handle).recovery_required
+    before = store.status_path(_SENDING_RUN_ID).read_bytes()
+    journal = tmp_path / "study.journal"
+    journal_before = journal.read_bytes()
+    worker_generation = tracking_root(experiment) / _SENDING_RUN_ID
+    [entry] = _attempts_dir(experiment).glob("*.json")
+    assert (worker_generation / "operations" / entry.stem).is_dir()
+    receipt = worker_generation / "cleanup-receipts" / entry.name
+    assert read_record(pending)["state"] == "pending"
+
+    preview = recover_run_cli(registry.state_dir, _SENDING_RUN_ID)
+    assert preview.exit_code == 0, preview.output
+    assert "reconcile 1 registered MLflow tracking operation" in preview.output
+    assert entry.is_file() and not receipt.exists()
+    assert store.status_path(_SENDING_RUN_ID).read_bytes() == before
+
+    with monkeypatch.context() as refusal:
+        refusal.setattr(
+            "phasesweep.engine.attempts.cleanup_stale_trial_process", lambda *a, **k: False
+        )
+        failed = recover_run_cli(registry.state_dir, _SENDING_RUN_ID, confirm=True)
+    assert failed.exit_code != 0
+    assert "process cleanup could not be confirmed" in failed.output
+    assert entry.is_file() and not receipt.exists()
+    assert store.status_path(_SENDING_RUN_ID).read_bytes() == before
+    assert store.observe(handle).recovery_required
+
+    recovered = recover_run_cli(registry.state_dir, _SENDING_RUN_ID, confirm=True)
+    assert recovered.exit_code == 0, recovered.output
+    assert not entry.exists()
+    assert read_record(receipt)["generation_id"] == _SENDING_RUN_ID
+    assert store.observe(handle).state == "succeeded"
+    assert not store.observe(handle).recovery_required
+    assert app.winners(_SENDING_RUN_ID)["winner_count"] == 1
+    assert journal.read_bytes() == journal_before
+    assert read_record(pending)["state"] == "pending"
+    publication.sync_tracking(experiment)
+    publication.sync_tracking(experiment)
+    assert read_record(pending)["state"] == "delivered"
+    assert sum(request["name"] == name for request in uploads) == 1
