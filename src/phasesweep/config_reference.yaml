@@ -212,8 +212,10 @@ phases: list[object] (required)
     # Device lease policy. single_per_trial leases one device per attempt, with a same-host lock held until the trainer's process group exits.
     # MPS leases use gpu_mps.lock without assigning CUDA_VISIBLE_DEVICES; the trainer selects its device.
     # whole_node gives the one running attempt every listed CUDA device, comma-joined, or the discovered MPS device; its device count is fingerprinted.
+    # A torchrun or accelerate launch trainer uses whole_node: the launcher sets the rank variables, and it must wait for its ranks and exit nonzero when one fails.
     # none binds no device and takes no lock. Set CUDA_VISIBLE_DEVICES in env, or name it in execution.inherit_env, when the trainer needs a restriction.
     # Warning: the trainer sees a leased GPU as its local cuda:0, so index devices locally.
+    # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#multi-process-and-multi-gpu-trainers for the objective report and for ranks a killed launcher leaves.
     gpu_policy: "single_per_trial" | "whole_node" | "none" = "single_per_trial"
 
     # Explicit CUDA device indices, each an integer >= 0, used instead of discovery. An empty list is rejected.
