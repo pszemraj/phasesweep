@@ -11,7 +11,7 @@ demo/
   .gitignore
   .ignore
   artifact_root_binding.json
-  run.log                         # PhaseSweep's log: phase headers, RERUN, TRIAL, ABORTED and WINNER lines, warnings
+  run.log                         # PhaseSweep's log: the console's report lines, warnings, errors and debug messages, with timestamps and logger names
   study.journal                   # storage: auto
   generation.yaml
   last_successful_generation.yaml
@@ -70,25 +70,65 @@ The two files are owner-only while their directories keep ordinary permissions. 
 
 ## Following a run
 
-The CLI shows PhaseSweep's trial outcomes and causes by default, while Optuna logs only errors. `run --verbose` adds PhaseSweep's debug logs and Optuna's per-trial diagnostics and tracebacks. A failure-policy `ABORTED` line, such as `ABORTED: 3 consecutive failed/infeasible trials reached max_consecutive_failures=3.`, follows the `TRIAL` line that triggered it.
+`phasesweep run` prints a report on stderr and leaves stdout empty. It opens with a banner naming the config, each phase's trial count, sampler, parallelism and GPU policy, the storage, tracker and workdir, and the absolute path of `run.log`, and it closes with a summary of each phase's trial counts and winner, the files the run wrote and the command that reads the result. In between, every phase start, trial, rerun, skipped phase and winner prints on a line of its own with the time, and so does each warning or error, wrapped to the terminal under a `warning:` or `error:` label. The last line is `log: <path>`, printed after the summary, after a failure's `fix:` line and after an interrupt's resume hint whenever `run.log` exists. The console shows the report and warnings while `run.log` holds everything, with timestamps and logger names: the trainer command of each trial, GPU and storage notes, and every report line below. Optuna logs only errors in both. `run --verbose` records PhaseSweep's debug messages and the traceback of a failure in `run.log` and leaves the console as it is. A failure-policy `ABORTED` line, such as `ABORTED: 3 consecutive failed/infeasible trials reached max_consecutive_failures=3.`, follows the trial line that triggered it.
 
-`run.log` is the process-free progress stream. `tail -f <workdir>/<experiment>/run.log` follows a run from any shell, with no MCP server, no lock, and no PhaseSweep process of its own. Each phase that runs logs a header line, and every trial that ends adds one `TRIAL` line, in the order trials end:
+On a 100-column terminal the starter prints:
 
 ```text
-2026-01-01 12:00:02 I phasesweep.engine.phase phase=lr study=demo::lr finished=2 remaining=4 reruns=1 n_jobs=1
-2026-01-01 12:00:02 I phasesweep.engine.phase phase=lr RERUN trial=3 of=2 reason=orchestrator interrupted by signal 2
-2026-01-01 12:00:03 I phasesweep.engine.phase phase=lr TRIAL trial=3 state=COMPLETE value=0.3 duration=0.4s params={'lr': 0.0003} rerun_of=2 (3/6 finished)
-2026-01-01 12:00:04 I phasesweep.engine.phase phase=lr TRIAL trial=4 state=FAIL value=none duration=0.5s params={'lr': 0.001} (4/6 finished) reason=non-zero exit code 1; stderr: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB
-2026-01-01 12:00:09 I phasesweep.engine.run phase=lr WINNER trial=3 metric=0.3 params={'lr': 0.0003}
+phasesweep run  phasesweep_starter
+
+  config    starter.yaml
+  phases    depth          2 trials  grid  1 at a time  gpu none
+            learning_rate  2 trials  grid  1 at a time  gpu none
+  storage   auto
+  tracker   none
+  workdir   runs/phasesweep_starter
+  log       /home/you/project/runs/phasesweep_starter/run.log
+
+09:17:33  depth          2 trials to run, 1 at a time
+09:17:34  depth          trial 0  COMPLETE  eval_loss 0.3  0.7s  1/2  model.n_layers=8
+09:17:35  depth          trial 1  COMPLETE  eval_loss 0.5  0.7s  2/2  model.n_layers=6
+09:17:35  depth          winner: trial 0  eval_loss 0.3  model.n_layers=8
+09:17:35  learning_rate  2 trials to run, 1 at a time
+09:17:35  learning_rate  trial 0  COMPLETE  eval_loss 0.3  0.7s  1/2  optimizer.lr=0.0003
+09:17:36  learning_rate  trial 1  COMPLETE  eval_loss 0.413822  0.7s  2/2  optimizer.lr=0.0001
+09:17:36  learning_rate  winner: trial 0  eval_loss 0.3  optimizer.lr=0.0003
+
+Finished in 3.0s: 2 phases, 4 trials, 0 from a previous run
+
+  depth          2 complete
+                 winner  trial 0  eval_loss 0.3  model.n_layers=8
+  learning_rate  2 complete
+                 winner  trial 0  eval_loss 0.3  optimizer.lr=0.0003
+
+Written under runs/phasesweep_starter
+  generations/6229a49778944c71962d380f57919759/summary.yaml
+  depth/trials.csv
+  learning_rate/trials.csv
+
+Next: phasesweep status starter.yaml --trials
+log: /home/you/project/runs/phasesweep_starter/run.log
 ```
 
-The header counts the phase's `finished` trials, the trials still `remaining` to its `n_trials`, and the `reruns` it schedules: [interrupted trials](#interrupted-trials-rerun) and the failed grid cells a raised `n_trials` retries. Reruns are among the `remaining` trials and run before any new draw. Each one the run schedules gets a `RERUN` line naming the trial it reruns and the first line of that trial's cause, and the rerun's `TRIAL` line carries its `rerun_of`; a rerun an earlier run queued but never started counts in `reruns` without a new `RERUN` line.
+A run that launches nothing and republishes nothing closes with one sentence instead of the summary: `Finished in 0.1s: nothing to run, 4 trials already finished, and generation <id> already publishes these winners.` A run that resumes a study counts the trials an earlier run recorded in its headline, such as `2 phases, 6 trials, 4 from a previous run`.
 
-`state` reads as in [`status --trials`](#inspection-commands). In `(N/M finished)`, `M` is `n_trials` and `N` is the trial's own place in the phase's completion order: the trials counting toward `n_trials` when its outcome was recorded, itself included unless it was interrupted. With `n_jobs` above 1 every finished trial therefore gets a distinct `N`, though the lines may print out of order. `FAIL` and `INFEASIBLE` trials count toward the phase's `max_consecutive_failures`, a `COMPLETE` one resets that count, and an `INTERRUPTED` one leaves it unchanged. `value` is the metric, or `none` when the trial produced none. `params` names the sampled configuration, excluding the repeat key. A phase with [`repeats`](config.md#repeats) adds `repeat=<key>=<value>`, which names the seed or other repeat value that trial ran. The `WINNER` line closing each phase gives the winning `trial`, `metric` and params. In a repeats phase it adds the reducer, repeat count, `sd`, range and member trials, and an accepted partial result adds `INCOMPLETE <finished>/<requested> finished timeout_scope=<scope>`.
+`run.log` is the process-free progress stream. `tail -f <workdir>/<experiment>/run.log` follows a run from any shell, with no MCP server, no lock, and no PhaseSweep process of its own. Each report line is one record on the `phasesweep.report` logger, in the order things happen:
 
-A trial whose outcome recorded a cause adds `reason=` with its first line. A trainer that exits nonzero records `non-zero exit code N`, followed by `; stderr: ` and the last non-empty line of the trial's `stderr.log` when it has one, so a crash is named without opening the trial directory. The line is read from the last few KiB of the file, stripped of control characters and cut at 200 characters with a trailing `...`. A reason the supervisor records itself replaces that text, such as `timeout after Ns`, or processes the trainer started that are still running 10 seconds after the trainer root exits, which it terminates and, on Linux, names by PID and command line. The same text is the `user_attr:phasesweep_failure_reason` column of `trials.csv` and the `cause` of the trial's recorded outcome. It is whatever the trainer printed, so it stays in these operator-owned records and no MCP tool returns it.
+```text
+2026-01-01 12:00:02 I phasesweep.report lr  4 trials to run, 1 of them a rerun, 1 at a time, 2 already finished
+2026-01-01 12:00:02 I phasesweep.report lr  trial 3  RERUN of trial 2  reason: orchestrator interrupted by signal 2
+2026-01-01 12:00:03 I phasesweep.report lr  trial 3  COMPLETE  eval_loss 0.3  0.4s  3/6  lr=0.0003  rerun of 2
+2026-01-01 12:00:04 I phasesweep.report lr  trial 4  FAIL  0.5s  4/6  lr=0.001  reason: non-zero exit code 1; stderr: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB
+2026-01-01 12:00:09 I phasesweep.report lr  winner: trial 3  eval_loss 0.3  lr=0.0003
+```
 
-A fatal objective error logs `FATAL OBJECTIVE ERROR` and skips the trial's `TRIAL` line. A trainer interrupted by a shutdown signal under `n_jobs: 1` also skips that line; its next `RERUN` line names the cause.
+The phase start line counts the trials still to run, the parallelism, the trials already finished and the reruns it schedules, the last two only when nonzero. Reruns are [interrupted trials](#interrupted-trials-rerun) and the failed grid cells a raised `n_trials` retries; they are among the trials to run and run before any new draw. A phase with nothing left says `nothing to run` and that it replays its recorded result. Each rerun the run schedules gets a `RERUN` line naming the trial it reruns and the first line of that trial's cause, and the rerun's trial line ends with `rerun of N`; a rerun an earlier run queued but never started counts in the phase start line without a new `RERUN` line.
+
+A trial line gives the trial number, its `state`, the objective under the metric's name, the trainer's duration, `N/M` and the sampled configuration. `state` reads as in [`status --trials`](#inspection-commands). In `N/M`, `M` is `n_trials` and `N` is the trial's own place in the phase's completion order: the trials counting toward `n_trials` when its outcome was recorded, itself included unless it was interrupted. With `n_jobs` above 1 every finished trial therefore gets a distinct `N`, though the lines may print out of order. `FAIL` and `INFEASIBLE` trials count toward the phase's `max_consecutive_failures`, a `COMPLETE` one resets that count, and an `INTERRUPTED` one leaves it unchanged. The objective is left out when the trial produced none. The configuration excludes the repeat key and shares the line with the trial when the whole line fits the terminal, and otherwise moves to a line under it. A phase with [`repeats`](config.md#repeats) adds `repeat <key>=<value>`, which names the seed or other repeat value that trial ran. The winner line closing each phase gives the winning trial, its objective and its params. In a repeats phase it adds the reducer, repeat count, `sd`, range and member trials, and an accepted partial result adds `INCOMPLETE <finished>/<requested> finished` and the timeout scope.
+
+A trial whose outcome recorded a cause adds `reason:` with its first line, wrapped under the trial on the console. A trainer that exits nonzero records `non-zero exit code N`, followed by `; stderr: ` and the last non-empty line of the trial's `stderr.log` when it has one, so a crash is named without opening the trial directory. The line is read from the last few KiB of the file, stripped of control characters and cut at 200 characters with a trailing `...`. A reason the supervisor records itself replaces that text, such as `timeout after Ns`, or processes the trainer started that are still running 10 seconds after the trainer root exits, which it terminates and, on Linux, names by PID and command line. The same text is the `user_attr:phasesweep_failure_reason` column of `trials.csv` and the `cause` of the trial's recorded outcome. It is whatever the trainer printed, so it stays in these operator-owned records and no MCP tool returns it.
+
+A fatal objective error logs `FATAL OBJECTIVE ERROR` and skips the trial's line. A trainer interrupted by a shutdown signal under `n_jobs: 1` also skips that line; its next `RERUN` line names the cause.
 
 `phasesweep` exits 0 on success, including an accepted incomplete winner and MLflow uploads left pending after a published result; 2 when the config does not load or the arguments are invalid, including a refused `init` overwrite and an unknown `--from-phase`; 1 when a command is refused or fails, including `sync-tracking` with uploads still pending; 70 on an internal error; and 128 plus the signal number after an [interrupt](#interrupted-trials-rerun). A refusal or failure that exits 1 ends with a `fix:` line naming the operator step; a config or argument error that exits 2 names what to change in its message. [`mcp call`](mcp.md#calling-a-tool-from-a-shell) has its own exit codes.
 

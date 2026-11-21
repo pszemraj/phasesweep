@@ -155,6 +155,7 @@ Versions already uploaded to PyPI cannot be replaced; duplicate uploads fail vis
 - `phasesweep.mcp`: catalog registry, stdio server, detached runner, durable run handles, frozen snapshots, the failure payload a run read returns (`mcp/failures.py`), and operator recovery.
 - `phasesweep.cli`: Click command surface.
 - `phasesweep.trial_table`: the plain-text trial tables of `status --trials`, rendered from the engine's trial tables with the width and colour decision passed in.
+- `phasesweep.run_report`: the live run's report as log messages on the `phasesweep.report` logger, one block per fact (banner, phase start, trial, rerun, skipped phase, winner, closing summary), each with a one-line `str()` for `run.log` and `render(width)` for the console. `runtime/console.py` holds the handler that prints them with the time, and warnings with a `warning:` label, on stderr.
 - `phasesweep.errors`: the shared operator-facing error taxonomy and the operator steps behind the `fix:` lines.
 - `phasesweep.examples`: the toy trainers `fake_train` and `mlflow_train`, which the templates and examples run as the `phasesweep-fake-train` and `phasesweep-mlflow-train` console scripts.
 - Packaged data: `templates/` (the `init` templates), `config_reference.yaml` (parsed by `config/reference.py`, which expands its shared blocks into every key path for `explain`, `explain_config`, typo suggestions and validation hints), and `mcp/agent_prompt.md` (the agent guide that the MCP `get_guide` tool and `phasesweep_run_and_monitor` prompt return).
@@ -173,7 +174,7 @@ Within `phasesweep.engine`, responsibilities map to modules as follows:
 | Trial launch, objective extraction and worker threads | `trial`, `workers` |
 | Samplers and trial identity | `optuna` |
 | Winner selection and repeat groups | `selection`, `repeats` |
-| Dry-run planning and run.log progress lines | `preview`, `progress` |
+| Dry-run planning and the live progress report | `preview`, `progress` |
 | Artifact serialization and generation provenance | `artifacts`, `provenance` |
 | Typed engine failures | `errors` |
 | Resume selection and continuation preflight | `resume`, `study_policy`, `guards` |
@@ -226,6 +227,7 @@ The principal test groups and what each covers:
 - Storage, publication, recovery, interrupted trials and sampler resume: owning code and representative tests are listed by [durability invariant](invariants.md).
 - `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots, detached launch, status, cancellation, and recovery.
 - `tests/test_terminal.py`, `tests/test_trial_table.py` and `tests/test_cli_help.py`: the terminal primitives (the colour decision per stream, width, wrapping, display paths), the exact plain-text output of `status --trials`, command help text, and the quiet exit on a closed output pipe.
+- `tests/test_run_report.py`: what `phasesweep run` prints, as exact text at 80 and 60 columns for each report block (banner, phase start, trial, rerun, skipped, winner, summary), the console handler (time prefix, warning wrapping, styling, contiguous records from threads) and the CLI around it (`-v`, the closing `log:` line, a replay and a resume).
 - `tests/test_init.py`, `tests/test_fake_train.py` and `tests/test_reporting.py`: template creation and runs, the toy trainer's seed noise, catalog scaffolding, and the objective-envelope writer (`report_objective` and `report-objective`).
 
 ## Tracked TODOs
