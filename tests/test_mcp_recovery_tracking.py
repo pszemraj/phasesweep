@@ -202,6 +202,37 @@ def _logged_requests(monkeypatch: pytest.MonkeyPatch, *, down: bool) -> list[str
     return requests
 
 
+def _recover_after_a_silent_preview(
+    run: _RecoveredRun, monkeypatch: pytest.MonkeyPatch, *, delivered: str
+) -> list[str]:
+    """Preview recover-run, then confirm it, and check what the confirmation leaves behind.
+
+    A preview writes and sends nothing. The confirmed run delivers ``delivered`` and leaves
+    nothing pending, no recovery required and no delivery remedy.
+
+    :param str delivered: The record count the confirmed run reports, such as ``1 record``.
+    :return list[str]: The MLflow request actions of the confirmed run, in order.
+    """
+    requests = _logged_requests(monkeypatch, down=False)
+    root = tracking_root(run.experiment)
+    before = sorted(root.rglob("*"))
+
+    preview = run.recover(confirm=False)
+
+    assert preview.exit_code == 0, preview.output
+    assert (requests, sorted(root.rglob("*"))) == ([], before)
+
+    confirmed = run.recover()
+
+    assert confirmed.exit_code == 0, confirmed.output
+    assert f"MLflow: delivered {delivered}; none stay pending." in confirmed.output
+    assert _PENDING_STEP not in confirmed.output
+    assert not run.store.observe(run.handle).recovery_required
+    delivery = run.app.status(_RUN_ID)["tracking_delivery"]
+    assert (delivery["pending"], delivery["remedy"]) == (0, None)
+    return requests
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("source", ["running", "uncertain-registered", "uncertain-retired"])
 def test_recover_run_finishes_the_mlflow_run_of_each_trial_it_settles(
@@ -225,27 +256,14 @@ def test_recover_run_finishes_the_mlflow_run_of_each_trial_it_settles(
         run.uploads.clear()
         assert publication.sync_tracking(run.experiment, _RUN_ID) == {"pending": 0, "delivered": 1}
         assert (run.sent(), run.summaries()) == ([], [finish])
-    requests = _logged_requests(monkeypatch, down=False)
-    root = tracking_root(run.experiment)
-    before = sorted(root.rglob("*"))
-
-    preview = run.recover(confirm=False)
-
-    assert preview.exit_code == 0, preview.output
-    assert (requests, sorted(root.rglob("*"))) == ([], before)
-
-    confirmed = run.recover()
-
-    assert confirmed.exit_code == 0, confirmed.output
     sends = 2 if source == "running" else 1
+
+    requests = _recover_after_a_silent_preview(
+        run, monkeypatch, delivered="1 record" if sends == 1 else f"{sends} records"
+    )
+
     assert requests == ["resolve"] + ["publish"] * sends
     assert (run.sent(), run.summaries()) == ([finish], [finish])
-    delivered = "1 record" if sends == 1 else f"{sends} records"
-    assert f"MLflow: delivered {delivered}; none stay pending." in confirmed.output
-    assert _PENDING_STEP not in confirmed.output
-    assert not run.store.observe(run.handle).recovery_required
-    delivery = run.app.status(_RUN_ID)["tracking_delivery"]
-    assert (delivery["pending"], delivery["remedy"]) == (0, None)
     read = read_phase_trials(validate_ledger(run.experiment), "depth")
     [trial] = read.trials
     assert read.cleanup_recovered == {trial.number}
@@ -270,24 +288,11 @@ def test_recover_run_ends_the_summary_run_of_a_run_killed_between_trials(
     """
     run = _killed_run(tmp_path, monkeypatch, in_flight=False)
     run.uploads.clear()
-    requests = _logged_requests(monkeypatch, down=False)
-    root = tracking_root(run.experiment)
-    before = sorted(root.rglob("*"))
 
-    preview = run.recover(confirm=False)
+    requests = _recover_after_a_silent_preview(run, monkeypatch, delivered="1 record")
 
-    assert preview.exit_code == 0, preview.output
-    assert (requests, sorted(root.rglob("*"))) == ([], before)
-
-    confirmed = run.recover()
-
-    assert confirmed.exit_code == 0, confirmed.output
     assert requests == ["resolve", "publish"]
     assert (run.sent(), run.summaries()) == ([], ["KILLED"])
-    assert "MLflow: delivered 1 record; none stay pending." in confirmed.output
-    assert not run.store.observe(run.handle).recovery_required
-    delivery = run.app.status(_RUN_ID)["tracking_delivery"]
-    assert (delivery["pending"], delivery["remedy"]) == (0, None)
     publication.sync_tracking(run.experiment)
     assert (run.sent(), run.summaries()) == ([], ["KILLED"])
 
