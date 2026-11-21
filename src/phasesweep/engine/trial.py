@@ -441,14 +441,14 @@ def _nonzero_exit_reason(return_code: int) -> str:
         except ValueError:
             return f"killed by signal {-return_code}"
         reason = f"killed by signal {killer.value} ({killer.name})"
-    else:
-        killer = _shell_reported_signal(return_code)
-        if killer is None:
-            return f"non-zero exit code {return_code}"
+    elif (reported := _shell_reported_signal(return_code)) is not None:
+        killer = reported
         reason = (
             f"non-zero exit code {return_code}: the shell's report of a command "
-            f"killed by {killer.name}"
+            f"killed by {reported.name}"
         )
+    else:
+        return f"non-zero exit code {return_code}"
     if killer == signal.SIGKILL:
         reason += f"; {_OOM_KILLER_CLAUSE}"
     return reason
