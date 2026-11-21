@@ -28,21 +28,25 @@ phasesweep status starter.yaml --trials   # lists every recorded trial and marks
 phasesweep show-winners starter.yaml      # prints each phase's full winner record
 ```
 
-The starter compares two depths, then two learning rates. `status --trials` then prints (the generation ID and durations vary):
+The starter compares two depths, then two learning rates. `status --trials` then prints (the generation and attempt IDs and the durations vary):
 
 ```text
 phasesweep_starter
-published generation 6d329b580fb14334aee52952b09db99c
+published generation 344606b50f8940bd8b81f4ae3e838bd4
 
 depth: 2 trials, eval_loss (lower is better)
           trial  eval_loss  model.n_layers  state     time
-              1        0.5               6  COMPLETE  0.6s
+              1        0.5               6  COMPLETE  0.5s
   winner      0        0.3               8  COMPLETE  0.5s
+  winner trial 0 directory:
+    runs/phasesweep_starter/depth/trial_00000__generation_344606b50f8940bd8b81f4ae3e838bd4__attempt_d5a3153f2a1049998f24289fa2136e7d
 
 learning_rate: 2 trials, eval_loss (lower is better)
           trial  eval_loss  optimizer.lr  state     time
-              1   0.413822        0.0001  COMPLETE  0.6s
+              1   0.413822        0.0001  COMPLETE  0.5s
   winner      0        0.3        0.0003  COMPLETE  0.5s
+  winner trial 0 directory:
+    runs/phasesweep_starter/learning_rate/trial_00000__generation_344606b50f8940bd8b81f4ae3e838bd4__attempt_e762c86f3ffa4f6a95bcfc07fc77388b
 ```
 
 The depth winner's `model.n_layers: 8` becomes a fixed input to every learning-rate trial: phases inherit parameter values, not weights. The complete [starter YAML](https://github.com/pszemraj/phasesweep/blob/main/src/phasesweep/templates/starter.yaml) and [phase composition guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#phase-composition) explain the configuration and its tradeoffs.
