@@ -75,7 +75,8 @@ class DeliveryTally:
     """What the requests of one delivery met: a run's closeout, recover-run or sync-tracking.
 
     Every pass of one closeout shares it. Once ``sending`` is False the later passes only save
-    their records: a later request would meet the same silent tracker, or a shutdown.
+    their records: a later request would meet the same silent tracker, or a shutdown, which
+    refuses every worker launch.
     """
 
     sending: bool = True
@@ -86,19 +87,6 @@ class DeliveryTally:
     """Records of ended generations delivered."""
     refused: int = 0
     """Records MLflow answered with a refusal, such as for a deleted run; they stay pending."""
-
-    def stop_for_shutdown(self) -> bool:
-        """Stop sending, without blaming MLflow, once a shutdown is being serviced.
-
-        A shutdown refuses every worker launch and kills running workers, so a failure seen
-        while one is under way says nothing about MLflow, and nothing more is sent.
-
-        :return bool: Whether a shutdown is under way, in which case sending has stopped.
-        """
-        if servicing_shutdown_signal() is None:
-            return False
-        self.sending = False
-        return True
 
 
 def record_name(path: Path) -> str:
@@ -478,8 +466,9 @@ def resolve_pending_creations(
     The caller holds the experiment lock and has confirmed cleanup of registered workers for
     the generations it reconciles. Persist each found binding before retiring its intent.
     Retire an unmatched intent only after a successful lookup started outside its request window.
-    A search MLflow gives no answer to, or a shutdown, ends the pass and stops ``tally``
-    sending, leaving the later intents and every upload for the next pass.
+    A search MLflow gives no answer to, or one that fails during a shutdown, ends the pass and
+    stops ``tally`` sending, leaving the later intents and every upload for the next pass. On the
+    main thread a shutdown raises out of the search in flight instead.
 
     :param Experiment experiment: Configured experiment with a verified tracking target.
     :param Mapping[str, str] environment: Composed credentials and transport.
@@ -504,7 +493,7 @@ def resolve_pending_creations(
     ]
     tally = DeliveryTally() if tally is None else tally
     for pending in records:
-        if not tally.sending or tally.stop_for_shutdown():
+        if not tally.sending:
             return
         try:
             _reconcile_creation(experiment, pending, environment, worker_generation, tally)
@@ -557,7 +546,10 @@ def _reconcile_creation(
     except PhaseSweepError:
         raise
     except (TimeoutError, ValueError, RuntimeError) as exc:  # every NO_ANSWER error included
-        if tally.stop_for_shutdown():
+        if servicing_shutdown_signal() is not None:
+            # A shutdown refuses every worker launch and kills running workers, so this failure
+            # says nothing about MLflow; nothing more is sent, and nothing blames it.
+            tally.sending = False
             return
         if not isinstance(exc, NO_ANSWER):
             if isinstance(exc, OperationRejectedError):

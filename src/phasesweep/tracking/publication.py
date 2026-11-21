@@ -23,7 +23,7 @@ from phasesweep.runtime.json import (
     json_optional_text,
     json_text,
 )
-from phasesweep.runtime.shutdown import PhaseSweepShutdown
+from phasesweep.runtime.shutdown import PhaseSweepShutdown, servicing_shutdown_signal
 from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText
 from phasesweep.tracking.mlflow import OperationRejectedError
 from phasesweep.tracking.records import validate_binding
@@ -134,8 +134,10 @@ def _send(
     A failure MLflow answered, such as a deleted run, concerns its record alone, so it costs a
     warning and the rest go on. A request MLflow gives no answer to would meet the same tracker
     for every later record, so one such request ends the pass and stops ``tally`` sending,
-    leaving the rest pending for the next run or sync-tracking. A shutdown ends the pass too,
-    without a warning, as MLflow was not what failed.
+    leaving the rest pending for the next run or sync-tracking. A failure during a shutdown
+    ends the pass too, without a warning, as MLflow was not what failed: on a trial's worker
+    thread that is a launch the shutdown refused or a worker it killed, while on the main thread
+    the shutdown raises out of the request in flight.
 
     :param Experiment experiment: Configured target.
     :param list[Path] paths: Delivery records, in sending order.
@@ -148,14 +150,17 @@ def _send(
     :raises ProcessCleanupUncertainError: An upload worker's cleanup is uncertain.
     """
     for index, path in enumerate(paths):
-        if not tally.sending or tally.stop_for_shutdown():
+        if not tally.sending:
             break
         try:
             _deliver(experiment, path, environment, worker_generation=worker_generation)
         except ProcessCleanupUncertainError:
             raise
         except (OSError, ValueError, RuntimeError) as exc:  # every NO_ANSWER error included
-            if tally.stop_for_shutdown():
+            if servicing_shutdown_signal() is not None:
+                # A shutdown refuses every worker launch and kills running workers, so this
+                # failure says nothing about MLflow.
+                tally.sending = False
                 break
             unanswered = isinstance(exc, NO_ANSWER)
             if isinstance(exc, OperationRejectedError) and not unanswered:
@@ -964,11 +969,7 @@ def _deliver_outstanding(
         creations = _pending_creations(experiment, scope, skip)
         own_pending = [path for path in own or [] if read_record(path)["state"] != "delivered"]
         pending = _pending_records(experiment, scope, skip=skip)
-        if (
-            not tally.sending
-            or tally.stop_for_shutdown()
-            or not (creations or pending or own_pending)
-        ):
+        if not tally.sending or not (creations or pending or own_pending):
             return
         # A report line, so the console shows what the seconds before the last lines are for.
         earlier = len(creations) + len(pending)

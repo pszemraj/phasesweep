@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import signal
+import threading
+import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import NamedTuple
 
@@ -17,7 +21,7 @@ from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
-from phasesweep.runtime import shutdown
+from phasesweep.runtime import process, shutdown
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
@@ -27,7 +31,11 @@ from phasesweep.runtime.shutdown import (
 from phasesweep.runtime.terminal import REPORT_LOGGER, ReportBlock
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
-from phasesweep.tracking.mlflow import OperationRejectedError, OperationUnavailableError
+from phasesweep.tracking.mlflow import (
+    OperationOutcomeUnknownError,
+    OperationRejectedError,
+    OperationUnavailableError,
+)
 from phasesweep.tracking.session import read_record, tracking_root
 from tests.conftest import invoke_cli_boundary, write_experiment_config
 from tests.tracking_helpers import (
@@ -288,6 +296,85 @@ def test_a_shutdown_requests_nothing_more_and_still_counts_what_stays_pending(
     assert "launch refused" not in caplog.text
     in_parentheses = f" ({earlier} from earlier runs)" if earlier else ""
     assert f"MLflow: {pending} record(s) pending{in_parentheses}; {_PENDING_STEP}" in caplog.text
+
+
+@pytest.mark.integration
+@pytest.mark.signals_own_pid
+@pytest.mark.parametrize("n_jobs", [1, 2])
+def test_a_ctrl_c_while_trials_upload_stops_delivery_without_blaming_mlflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, n_jobs: int
+) -> None:
+    """A real SIGINT while each trial's outcome is uploading stops MLflow delivery quietly.
+
+    The shutdown handler kills every upload worker in flight. On the main thread the shutdown
+    raises out of the upload; on each parallel trial's worker thread the killed upload ends its
+    pass. No request follows, no line blames MLflow, and the closing line counts every record
+    left pending: each trial's accepted outcome and the summary run's KILLED end.
+    """
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    config["phases"] = config["phases"][:1]
+    # With one job the signal arrives during the first trial's upload, so the second never runs.
+    config["phases"][0].update(n_jobs=n_jobs, allow_no_gpu_isolation=True)
+    experiment = Experiment.model_validate(config)
+    respond = session.request_operation
+    requests: list[str] = []
+
+    def upload_until_killed(
+        request: Mapping[str, object],
+        *,
+        operation_id: str,
+        directory: Path,
+        environment: Mapping[str, str],
+        deadline: float,
+    ) -> JsonObject:
+        if request["action"] != "publish":
+            return respond(
+                request,
+                operation_id=operation_id,
+                directory=directory,
+                environment=environment,
+                deadline=deadline,
+            )
+        requests.append(str(request["name"]))
+        # A real supervised worker, so the handler sees and kills it as an MLflow upload's.
+        with Path(os.devnull).open("w") as sink:
+            result = process.run_supervised(
+                "sleep 30",
+                env=dict(os.environ),
+                stdout=sink,
+                stderr=sink,
+                timeout=60,
+                trial_dir=directory,
+                attempt_id=operation_id,
+            )
+        raise OperationOutcomeUnknownError(f"MLflow worker failed (exit {result.return_code}).")
+
+    def interrupt_once_every_upload_runs() -> None:
+        # A trial uploads once its trainer has exited, so then the registered children are the
+        # upload workers alone.
+        deadline = time.monotonic() + 30.0
+        while (
+            len(requests) < n_jobs or len(shutdown._active_children) < n_jobs
+        ) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    monkeypatch.setattr(session, "request_operation", upload_until_killed)
+    monkeypatch.setattr(worker, "request_operation", upload_until_killed)
+    sender = threading.Thread(target=interrupt_once_every_upload_runs, daemon=True)
+    caplog.set_level(logging.INFO)
+    sender.start()
+    with pytest.raises(PhaseSweepShutdown):
+        run_experiment(experiment)
+    sender.join(timeout=5.0)
+
+    assert sorted(requests) == sorted({name for name in requests if name.startswith("attempt-")})
+    assert (len(requests), uploads) == (n_jobs, [])
+    assert publication.delivery_status(experiment) == {"pending": n_jobs + 1, "delivered": 0}
+    for blame in ("did not answer", "is not ready", "launch refused", "is pending ("):
+        assert blame not in caplog.text
+    assert f"MLflow: {n_jobs + 1} record(s) pending; {_PENDING_STEP}" in caplog.text
 
 
 @pytest.mark.integration
