@@ -179,6 +179,77 @@ def _listing(root: Path) -> dict[str, tuple[int, int]]:
     }
 
 
+def _hang_uploads_until_killed(monkeypatch: pytest.MonkeyPatch, started: list[str]) -> None:
+    """Make every MLflow upload run a real supervised worker that only a signal ends.
+
+    The worker registers as ``runtime.remote_worker.run_worker`` registers a real one, so the
+    shutdown handler names and kills it as an MLflow request. Every other request is answered
+    as before.
+
+    :param pytest.MonkeyPatch monkeypatch: Replaces the request function for the test.
+    :param list[str] started: Receives the record name of each upload as it starts.
+    """
+    respond = session.request_operation
+
+    def upload_until_killed(
+        request: Mapping[str, object],
+        *,
+        operation_id: str,
+        directory: Path,
+        environment: Mapping[str, str],
+        deadline: float,
+    ) -> JsonObject:
+        if request["action"] != "publish":
+            return respond(
+                request,
+                operation_id=operation_id,
+                directory=directory,
+                environment=environment,
+                deadline=deadline,
+            )
+        started.append(str(request["name"]))
+        with Path(os.devnull).open("w") as sink:
+            result = process.run_supervised(
+                "sleep 30",
+                env=dict(os.environ),
+                stdout=sink,
+                stderr=sink,
+                timeout=60,
+                trial_dir=directory,
+                attempt_id=operation_id,
+                label="MLflow request",
+            )
+        raise OperationOutcomeUnknownError(f"MLflow worker failed (exit {result.return_code}).")
+
+    monkeypatch.setattr(session, "request_operation", upload_until_killed)
+    monkeypatch.setattr(worker, "request_operation", upload_until_killed)
+
+
+def _kill_at_summary_creation(monkeypatch: pytest.MonkeyPatch, experiment: Experiment) -> Path:
+    """Run ``experiment`` as a run killed outright while it creates its summary run.
+
+    The creation is left unconfirmed and no closeout runs, as with ``killed_sweep``.
+
+    :param pytest.MonkeyPatch monkeypatch: Replaces the request function for this run only.
+    :param Experiment experiment: The experiment to start and kill.
+    :return Path: The creation record the killed run left pending.
+    """
+    respond = session.request_operation
+
+    def killed_at_summary_creation(request: dict[str, object], **kwargs: object) -> JsonObject:
+        if request["action"] == "create":
+            raise RunnerKilled()
+        return respond(request, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(session, "request_operation", killed_at_summary_creation)
+        patch.setattr(publication, "deliver_closeout", lambda *args, **kwargs: None)
+        with pytest.raises(RunnerKilled):
+            run_experiment(experiment)
+    [intent] = session.pending_creation_records(experiment)
+    return intent
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("persistent", [True, False], ids=["journal", "in-memory"])
 def test_the_next_run_delivers_an_interrupted_runs_pending_records(
@@ -342,38 +413,7 @@ def test_a_ctrl_c_while_trials_upload_stops_delivery_without_blaming_mlflow(
     # With one job the signal arrives during the first trial's upload, so the second never runs.
     config["phases"][0].update(n_jobs=n_jobs, allow_no_gpu_isolation=True)
     experiment = Experiment.model_validate(config)
-    respond = session.request_operation
     requests: list[str] = []
-
-    def upload_until_killed(
-        request: Mapping[str, object],
-        *,
-        operation_id: str,
-        directory: Path,
-        environment: Mapping[str, str],
-        deadline: float,
-    ) -> JsonObject:
-        if request["action"] != "publish":
-            return respond(
-                request,
-                operation_id=operation_id,
-                directory=directory,
-                environment=environment,
-                deadline=deadline,
-            )
-        requests.append(str(request["name"]))
-        # A real supervised worker, so the handler sees and kills it as an MLflow upload's.
-        with Path(os.devnull).open("w") as sink:
-            result = process.run_supervised(
-                "sleep 30",
-                env=dict(os.environ),
-                stdout=sink,
-                stderr=sink,
-                timeout=60,
-                trial_dir=directory,
-                attempt_id=operation_id,
-            )
-        raise OperationOutcomeUnknownError(f"MLflow worker failed (exit {result.return_code}).")
 
     def interrupt_once_every_upload_runs() -> None:
         # A trial uploads once its trainer has exited, so then the registered children are the
@@ -385,8 +425,7 @@ def test_a_ctrl_c_while_trials_upload_stops_delivery_without_blaming_mlflow(
             time.sleep(0.02)
         os.kill(os.getpid(), signal.SIGINT)
 
-    monkeypatch.setattr(session, "request_operation", upload_until_killed)
-    monkeypatch.setattr(worker, "request_operation", upload_until_killed)
+    _hang_uploads_until_killed(monkeypatch, requests)
     sender = threading.Thread(target=interrupt_once_every_upload_runs, daemon=True)
     caplog.set_level(logging.INFO)
     sender.start()
@@ -394,6 +433,8 @@ def test_a_ctrl_c_while_trials_upload_stops_delivery_without_blaming_mlflow(
         run_experiment(experiment)
     sender.join(timeout=5.0)
 
+    stopping = "1 MLflow request" if n_jobs == 1 else f"{n_jobs} MLflow requests"
+    assert f"Interrupted (SIGINT): no trial is running; stopping {stopping}." in caplog.text
     assert sorted(requests) == sorted({name for name in requests if name.startswith("attempt-")})
     assert (len(requests), uploads) == (n_jobs, [])
     assert publication.delivery_status(experiment) == {"pending": n_jobs + 1, "delivered": 0}
@@ -431,21 +472,8 @@ def test_each_delivery_pass_sends_earlier_records_first_and_stops_at_the_first_u
     respond = session.request_operation
     intents: list[Path] = []
     if creation:
-        # A run killed outright while creating its summary run leaves that creation unconfirmed
-        # and runs no closeout, as with `killed_sweep`.
-        def killed_at_summary_creation(request: dict[str, object], **kwargs: object) -> JsonObject:
-            if request["action"] == "create":
-                raise RunnerKilled()
-            return respond(request, **kwargs)
-
-        with monkeypatch.context() as patch:
-            patch.setattr(session, "request_operation", killed_at_summary_creation)
-            patch.setattr(publication, "deliver_closeout", lambda *args, **kwargs: None)
-            with pytest.raises(RunnerKilled):
-                run_experiment(sweep.experiment)
+        intents = [_kill_at_summary_creation(monkeypatch, sweep.experiment)]
         assert sweep.uploads == []
-        intents = session.pending_creation_records(sweep.experiment)
-        assert len(intents) == 1
     closing: list[bool] = []
     delivering: list[bool] = []
     requested: list[list[str]] = []
@@ -581,18 +609,7 @@ def test_the_closing_lines_account_for_every_creation_and_record_the_sending_lin
     """
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
     respond = session.request_operation
-
-    def killed_at_summary_creation(request: dict[str, object], **kwargs: object) -> JsonObject:
-        if request["action"] == "create":
-            raise RunnerKilled()
-        return respond(request, **kwargs)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(session, "request_operation", killed_at_summary_creation)
-        patch.setattr(publication, "deliver_closeout", lambda *args, **kwargs: None)
-        with pytest.raises(RunnerKilled):
-            run_experiment(sweep.experiment)
-    [intent] = session.pending_creation_records(sweep.experiment)
+    intent = _kill_at_summary_creation(monkeypatch, sweep.experiment)
     killed = intent.parent.name
 
     def late_run(request: dict[str, object], **kwargs: object) -> JsonObject:
@@ -777,37 +794,7 @@ def test_a_ctrl_c_during_sync_tracking_says_what_stays_pending_and_exits_130(
     typed on a line of its own. Nothing is delivered.
     """
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
-    respond = session.request_operation
     uploading: list[str] = []
-
-    def upload_until_killed(
-        request: Mapping[str, object],
-        *,
-        operation_id: str,
-        directory: Path,
-        environment: Mapping[str, str],
-        deadline: float,
-    ) -> JsonObject:
-        if request["action"] != "publish":
-            return respond(
-                request,
-                operation_id=operation_id,
-                directory=directory,
-                environment=environment,
-                deadline=deadline,
-            )
-        uploading.append(str(request["name"]))
-        with Path(os.devnull).open("w") as sink:
-            result = process.run_supervised(
-                "sleep 30",
-                env=dict(os.environ),
-                stdout=sink,
-                stderr=sink,
-                timeout=60,
-                trial_dir=directory,
-                attempt_id=operation_id,
-            )
-        raise OperationOutcomeUnknownError(f"MLflow worker failed (exit {result.return_code}).")
 
     def interrupt_once_the_upload_runs() -> None:
         deadline = time.monotonic() + 30.0
@@ -815,8 +802,7 @@ def test_a_ctrl_c_during_sync_tracking_says_what_stays_pending_and_exits_130(
             time.sleep(0.02)
         os.kill(os.getpid(), signal.SIGINT)
 
-    monkeypatch.setattr(session, "request_operation", upload_until_killed)
-    monkeypatch.setattr(worker, "request_operation", upload_until_killed)
+    _hang_uploads_until_killed(monkeypatch, uploading)
     config = write_experiment_config(Path.cwd() / "experiment.yaml", sweep.experiment)
     capsys.readouterr()
     sender = threading.Thread(target=interrupt_once_the_upload_runs, daemon=True)
@@ -828,7 +814,12 @@ def test_a_ctrl_c_during_sync_tracking_says_what_stays_pending_and_exits_130(
     error = capsys.readouterr().err
     assert status == 130
     assert len(uploading) == 1
-    assert re.search(r"^\d\d:\d\d:\d\d  Interrupted \(SIGINT\): ", error, re.MULTILINE)
+    assert re.search(
+        r"^\d\d:\d\d:\d\d  Interrupted \(SIGINT\): no trial is running; "
+        r"stopping 1 MLflow request\.$",
+        error,
+        re.MULTILINE,
+    )
     lines = error.splitlines()
     # The sentence wraps to the terminal; the command stays whole on the last line.
     assert lines[-1] == f"phasesweep sync-tracking {config}"
@@ -855,18 +846,7 @@ def test_sync_tracking_says_when_a_creation_inside_its_window_can_be_settled(
         update={"mlflow": sweep.experiment.mlflow.model_copy(update={"timeout_seconds": 600.0})}
     )
     respond = session.request_operation
-
-    def killed_at_summary_creation(request: dict[str, object], **kwargs: object) -> JsonObject:
-        if request["action"] == "create":
-            raise RunnerKilled()
-        return respond(request, **kwargs)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(session, "request_operation", killed_at_summary_creation)
-        patch.setattr(publication, "deliver_closeout", lambda *args, **kwargs: None)
-        with pytest.raises(RunnerKilled):
-            run_experiment(experiment)
-    [intent] = session.pending_creation_records(experiment)
+    intent = _kill_at_summary_creation(monkeypatch, experiment)
 
     def no_run_yet(request: dict[str, object], **kwargs: object) -> JsonObject:
         if request["action"] == "find":
