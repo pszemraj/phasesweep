@@ -43,7 +43,7 @@ from phasesweep.tracking.mlflow import (
     OperationRejectedError,
     OperationUnavailableError,
 )
-from phasesweep.tracking.session import read_record, tracking_root
+from phasesweep.tracking.session import SYNC_TRACKING_STEP, read_record, tracking_root
 from tests.conftest import invoke_cli_boundary, write_experiment_config
 from tests.tracking_helpers import (
     RunnerKilled,
@@ -53,14 +53,8 @@ from tests.tracking_helpers import (
     remote_mlflow_example,
 )
 
-_PENDING_STEP = (
-    "results are saved locally. The next run or `phasesweep sync-tracking` with this run's "
-    "config file and `--set` overrides sends them."
-)
-_REFUSAL = (
-    "a refused record stays pending until the cause given in its warning is fixed in MLflow, for "
-    "example by restoring a deleted run or its experiment."
-)
+_PENDING_STEP = f"results are saved locally. Send them with {SYNC_TRACKING_STEP}."
+_REFUSAL = "its cause is in its warning above."
 
 
 @pytest.mark.integration
@@ -105,7 +99,7 @@ def test_pending_mlflow_uploads_get_final_closeout_without_failing_publication(
     assert final.levelno == logging.WARNING
     message = final.getMessage()
     refused = (
-        f" MLflow refused 7 records; {_REFUSAL}"
+        " MLflow refused 7 records; each cause is in its warning above."
         if isinstance(failure, OperationRejectedError)
         and not isinstance(failure, OperationUnavailableError)
         else ""
@@ -852,7 +846,7 @@ def test_a_pass_whose_target_resolve_gets_no_answer_never_says_it_is_sending(
 
     assert not tally.sending
     assert [r.getMessage() for r in caplog.records if r.name == REPORT_LOGGER] == []
-    assert "is not ready: it did not answer within timeout_seconds" in caplog.text
+    assert "did not answer within timeout_seconds" in caplog.text
     assert publication.delivery_status(sweep.experiment)["pending"] == 2
 
 
@@ -893,9 +887,9 @@ def test_a_run_warns_once_about_what_mlflow_refuses_in_both_its_passes(
     assert caplog.text.count(warned) == 1
     # A refused creation search is counted as a creation, never as a record.
     counted = (
-        "MLflow refused 1 record; a refused record stays pending until"
+        "MLflow refused 1 record; its cause is in its warning above"
         if refused == "record"
-        else "MLflow refused the search for 1 unconfirmed run creation; it stays pending until"
+        else "MLflow refused the search for 1 unconfirmed run creation; its cause is in its warning"
     )
     assert caplog.text.count(counted) == 1
 
@@ -949,7 +943,7 @@ def test_what_mlflow_refuses_once_and_accepts_later_in_a_run_is_not_counted_refu
     assert len(refusals) == 1
     assert publication.delivery_status(sweep.experiment)["pending"] == 1
     assert caplog.text.count("MLflow refused") == 1
-    assert "MLflow refused 1 record; a refused record stays pending until" in caplog.text
+    assert "MLflow refused 1 record; its cause is in its warning above" in caplog.text
 
 
 @pytest.mark.integration
@@ -1031,15 +1025,14 @@ def test_sync_tracking_names_what_keeps_its_records_pending(
         assert error.endswith(
             "phasesweep: MLflow delivery remains pending: MLflow tracking target "
             f"experiment_name={experiment.mlflow.experiment_name!r} at "
-            f"{experiment.mlflow.tracking_uri!r} is not ready: it did not answer within "
-            "timeout_seconds; check that the server is reachable.\n"
+            f"{experiment.mlflow.tracking_uri!r} did not answer within timeout_seconds.\n"
             f"fix: Once the server answers, run this command again:\n{command}"
         )
         assert sweep.summaries() == []
     else:
         assert error.endswith(
             f"phasesweep: MLflow delivery remains pending: MLflow refused 1 record; {_REFUSAL}\n"
-            f"fix: Once each such cause is fixed, run this command again:\n{command}"
+            f"fix: Fix the cause in MLflow, then run this command again:\n{command}"
         )
         assert (
             f"MLflow: attempt record {stem} of generation {sweep.generation} is pending (MLflow "
@@ -1202,9 +1195,9 @@ def test_sync_tracking_says_when_a_creation_inside_its_window_can_be_settled(
         else "That window has closed since the search, so"
     )
     match = re.search(
-        r"phasesweep: MLflow delivery remains pending: MLflow has no run yet for 1 unconfirmed "
-        r"run creation, and the request whose answer was lost may still create one until "
-        rf"timeout_seconds \({timeout:g} s\) after it was sent\.\n"
+        r"phasesweep: MLflow delivery remains pending: no run yet for 1 unconfirmed "
+        r"run creation, which may still be created until "
+        rf"timeout_seconds \({timeout:g} s\) after the request was sent\.\n"
         rf"fix: {step} run this command again:\n"
         rf"phasesweep sync-tracking {re.escape(str(config))}\n$",
         error,
@@ -1243,8 +1236,8 @@ def test_a_run_whose_target_gives_no_answer_ends_with_the_retry_step(
     assert uploads == []
     assert (
         f"phasesweep: MLflow tracking target experiment_name={experiment.mlflow.experiment_name!r} "
-        f"at {experiment.mlflow.tracking_uri!r} is not ready: it did not answer within "
-        "timeout_seconds; check that the server is reachable. No trial was started.\n"
+        f"at {experiment.mlflow.tracking_uri!r} did not answer within "
+        "timeout_seconds. No trial was started.\n"
         "fix: Retry once the reported blocker clears.\n"
     ) in capsys.readouterr().err
 

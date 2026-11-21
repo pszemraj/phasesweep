@@ -79,15 +79,16 @@ NO_ANSWER: tuple[type[Exception], ...] = (
 )
 # What one failed request of a delivery was, as DeliveryTally.note_failure classifies it.
 RequestFailure = Literal["shutdown", "no answer", "refused", "refused again", "other"]
-# The step that sends what a run left pending, as every line a run logs names it. These lines
-# also reach run.log and an MCP runner's log, where no command follows them, so they say in words
-# what the command needs; the CLI prints the command as typed after a run that leaves work pending.
-SYNC_TRACKING_STEP = "`phasesweep sync-tracking` with this run's config file and `--set` overrides"
+# The command that sends what a run left pending, as every line a run logs names it. These lines
+# also reach run.log and an MCP runner's log, where the config path is not known, so they write
+# CONFIG; the CLI prints the command as typed, overrides included, after a run that leaves work
+# pending. Without the overrides a run used, sync-tracking's own refusals name them.
+SYNC_TRACKING_STEP = "`phasesweep sync-tracking CONFIG`"
 # The step for a config whose MLflow target is not the one the tree's runs used, as a run's
-# warning and sync-tracking's refusal both give it, in words for the same reason.
+# warning and sync-tracking's refusal both give it. A ``--set`` override can move the target.
 ORIGINAL_TARGET_STEP = (
-    "Run `phasesweep sync-tracking`, or the sweep, with the config file and `--set` overrides "
-    "the sweep ran with; that sends what earlier runs left pending."
+    "Run `phasesweep sync-tracking CONFIG`, or the sweep, with the config and `--set` "
+    "overrides the sweep ran with."
 )
 
 
@@ -225,7 +226,10 @@ def delivered_text(delivered: int, settled: int) -> str:
 
 
 def refused_text(refused: Collection[Path]) -> str:
-    """Say what MLflow refused, records and creation searches apart, and what keeps them pending.
+    """Say what MLflow refused, records and creation searches apart, and where its cause is.
+
+    A refused record stays pending: a retry alone meets the same refusal, so the warning each
+    one logged at its first refusal, above on the console, is where its cause is.
 
     :param Collection[Path] refused: The records and creation intents MLflow refused in this
         delivery.
@@ -238,24 +242,21 @@ def refused_text(refused: Collection[Path]) -> str:
     parts = [plural(records, "record")] if records else []
     if creations:
         parts.append(f"the search for {plural(creations, 'unconfirmed run creation')}")
-    subject = "a refused record" if not creations else "it" if len(refused) == 1 else "each"
-    return f" MLflow refused {' and '.join(parts)}; {subject} {refusal_rule()}."
+    where = "its cause is in its warning" if len(refused) == 1 else "each cause is in its warning"
+    return f" MLflow refused {' and '.join(parts)}; {where} above."
 
 
 def refusal_rule(where: str = "") -> str:
-    """Say what keeps a record MLflow refused pending, in the words every surface uses.
+    """Say what keeps a record MLflow refused pending, for a reader who never saw the console.
 
     A refused record is retried like any other, so a retry alone meets the same refusal; only
     fixing its cause in MLflow helps.
 
-    :param str where: Where the record's warning is, with its leading separator, for a reader
-        who never saw the console, defaults to the console's own warning.
+    :param str where: Where the record's warning is, with its leading separator, defaults to
+        none.
     :return str: A clause that follows the record it is about, without a final period.
     """
-    return (
-        f"stays pending until the cause given in its warning{where} is fixed in MLflow, for "
-        "example by restoring a deleted run or its experiment"
-    )
+    return f"stays pending until the cause given in its warning{where} is fixed in MLflow"
 
 
 def tracking_root(experiment: Experiment) -> Path:
@@ -428,9 +429,10 @@ def tracking_operation(experiment: Experiment, generation_id: str) -> Iterator[t
                 entry_path = _attempts_dir(experiment) / f"{operation_id}.json"
                 raise ProcessCleanupUncertainError(
                     f"Tracking operation {operation_id} has an unreadable lifecycle record in "
-                    f"{directory} ({exc}), so its worker may still be running. Its attempt "
-                    f"registry entry {entry_path} is kept. "
-                    + recorded_process_check(str(directory / PROCESS_IDENTITY_FILE)),
+                    f"{directory} ({exc}); its worker may still be running. "
+                    + recorded_process_check(
+                        str(directory / PROCESS_IDENTITY_FILE), entry=str(entry_path)
+                    ),
                     action=OperatorAction.RESTORE_TREE,
                 ) from exc
             log.warning(
@@ -524,7 +526,7 @@ def _create_bound(
         raise RuntimeError(
             f"MLflow run creation for attempt {identity['attempt_id']} of generation "
             f"{identity['generation_id']} is unresolved: an earlier request may still create "
-            f"the run, so it is not sent again. Run {SYNC_TRACKING_STEP} to reconcile the intent."
+            f"the run. Run {SYNC_TRACKING_STEP} to reconcile it."
         ) from cause
 
     if pending.exists():
@@ -913,17 +915,15 @@ def unready_target_text(experiment: Experiment, exc: BaseException) -> str:
     """
     settings = experiment.mlflow
     assert settings is not None
-    cause = (
-        "it did not answer within timeout_seconds; check that the server is reachable"
-        if isinstance(exc, TimeoutError)
-        else str(exc).rstrip(".")
-    )
     selector = (
         f"experiment_id={settings.experiment_id!r}"
         if settings.experiment_id is not None
         else f"experiment_name={settings.experiment_name!r}"
     )
-    return f"MLflow tracking target {selector} at {settings.tracking_uri!r} is not ready: {cause}."
+    target = f"MLflow tracking target {selector} at {settings.tracking_uri!r}"
+    if isinstance(exc, TimeoutError):
+        return f"{target} did not answer within timeout_seconds."
+    return f"{target} is not ready: {str(exc).rstrip('.')}."
 
 
 def prepare_attempt(

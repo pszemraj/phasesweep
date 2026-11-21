@@ -858,10 +858,7 @@ def _ended_status(
             f"MLflow terminal outcome is unresolved: generation record {path} "
             f"is {recorded.problem}.",
             action=OperatorAction.RESTORE_TREE,
-            remediation=(
-                "Restore the generation record, then run phasesweep sync-tracking with "
-                "the same config and --set overrides."
-            ),
+            remediation=f"Restore the generation record, then run {SYNC_TRACKING_STEP}.",
         )
         if unresolved is None:
             raise error
@@ -1218,9 +1215,8 @@ def deliver_ended_generations(
     except (OSError, ValueError, PhaseSweepError) as exc:
         tally.sending = False
         log.warning(
-            "MLflow: records were not all sent (%s). Once that is resolved, the next run or %s "
-            "rebuilds and sends them.",
-            exc,
+            "MLflow: records were not all sent (%s). Once that is resolved, run %s.",
+            str(exc).rstrip("."),
             SYNC_TRACKING_STEP,
         )
     finally:
@@ -1305,7 +1301,7 @@ def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryT
         report.info(ReportText(f"MLflow: {done} left pending by earlier runs."))
     if counts.pending:
         log.warning(
-            "MLflow: %s pending%s; results are saved locally. The next run or %s sends them.%s",
+            "MLflow: %s pending%s; results are saved locally. Send them with %s.%s",
             count_text(counts.records, counts.creations),
             f" ({earlier} from earlier runs)" if earlier else "",
             SYNC_TRACKING_STEP,
@@ -1406,8 +1402,7 @@ def sync_tracking(
         raise TrackingSyncRefusedError(
             "sync-tracking needs an `mlflow` block, and this config has none.",
             remediation=(
-                "Pass the config the sweep ran with, which has its `mlflow` block; "
-                "`phasesweep explain mlflow` describes the block."
+                "Pass the config the sweep ran with; `phasesweep explain mlflow` describes the block."
             ),
         )
     require_mlflow_sdk()
@@ -1439,8 +1434,7 @@ def sync_tracking(
             raise TrackingSyncRefusedError(
                 "No tracking deliveries exist for this scope.",
                 remediation=(
-                    f"Check the generation ID {generation_id!r}, such as an MCP run ID, or omit "
-                    "--generation to sync every generation of this experiment."
+                    f"Check --generation {generation_id!r}; an MCP run's ID is its generation ID."
                     if generation_id is not None
                     else "Pass the config the sweep ran with; no run of this experiment has "
                     "saved an MLflow record yet."

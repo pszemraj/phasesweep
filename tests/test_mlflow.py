@@ -1655,7 +1655,7 @@ def test_missing_sdk_is_refused_before_any_trial(tmp_path, monkeypatch):
             "publish",
             _server_error("PERMISSION_DENIED"),
             "unavailable",
-            "(MlflowException: PERMISSION_DENIED); check tracking access and credentials.",
+            "MLflow publish failed (MlflowException: PERMISSION_DENIED).",
         ),
         (
             "publish",
@@ -1679,7 +1679,7 @@ def test_missing_sdk_is_refused_before_any_trial(tmp_path, monkeypatch):
             "publish",
             _upload_forbidden,
             "error",
-            "(HTTPError: 403); check tracking access and credentials.",
+            "MLflow publish failed (HTTPError: 403).",
         ),
         ("capture", _connection_lost, "unavailable", "(ConnectionError)"),
     ],
@@ -1866,7 +1866,7 @@ def test_run_preparation_failure_never_acquires_gpu(tmp_path, monkeypatch, failu
     "error,expected",
     [
         (ValueError("MLflow experiment is missing or deleted."), "missing or deleted"),
-        (TimeoutError("MLflow operation exceeded its deadline."), "check that the server is"),
+        (TimeoutError("MLflow operation exceeded its deadline."), "did not answer within timeout_"),
     ],
     ids=["deleted", "unreachable"],
 )
