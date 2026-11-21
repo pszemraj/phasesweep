@@ -223,8 +223,10 @@ def _trial_json_read_errors(target: Path, *, noun: str, trainer_step: str) -> It
 
     :param Path target: Trial-relative file being read.
     :param str noun: ``JSON`` or ``JSON envelope`` diagnostic label.
-    :param str trainer_step: What the trainer must do for the file to exist, appended to a
-        missing-file diagnostic, since a trainer that exits 0 without it fails here.
+    :param str trainer_step: What the trainer must do for the file to exist, a clause without
+        a final period that follows a missing-file diagnostic in parentheses, since a trainer
+        that exits 0 without it fails here. The path ends the diagnostic's own words, so no
+        punctuation sticks to it when a reader copies it.
     :raises ExtractorError: The file is missing, unreadable, malformed, or outside the
         attempt; the last carries the refusal's own text as the trial's failure reason.
     :return Iterator[None]: Context covering the read and parse of the same bytes.
@@ -239,7 +241,7 @@ def _trial_json_read_errors(target: Path, *, noun: str, trainer_step: str) -> It
             if noun == "JSON"
             else f"{noun} not found: {target}"
         )
-        raise ExtractorError(f"{missing}. {trainer_step}") from exc
+        raise ExtractorError(f"{missing} ({trainer_step})") from exc
     except UnicodeError as exc:
         raise ExtractorError(f"{noun} at {target} is not valid UTF-8: {exc}") from exc
     except NonFiniteJsonConstantError as exc:
@@ -296,8 +298,8 @@ def _extract_json(
             target,
             noun="JSON",
             trainer_step=(
-                f"The trainer must write `{cfg.path}` under PHASESWEEP_TRIAL_DIR before it exits, "
-                f"with the numeric key `{cfg.key}`."
+                f"the trainer must write `{cfg.path}` under PHASESWEEP_TRIAL_DIR before it exits, "
+                f"with the numeric key `{cfg.key}`"
             ),
         ):
             _, cur = load_json_value(ctx.trial_dir, cfg.path, cfg.key, digest=digest)
@@ -336,8 +338,8 @@ def _extract_json_envelope(
         target,
         noun="JSON envelope",
         trainer_step=(
-            "The trainer must call `phasesweep.report_objective(...)` before it exits, from rank "
-            f"0 only; it writes `{cfg.path}` under PHASESWEEP_TRIAL_DIR."
+            "the trainer must call `phasesweep.report_objective(...)` before it exits, from rank "
+            f"0 only; it writes `{cfg.path}` under PHASESWEEP_TRIAL_DIR"
         ),
     ):
         raw = attempt_file(ctx.trial_dir, cfg.path).read_bytes()
@@ -453,8 +455,8 @@ def _extract_log_regex(
         raise ExtractorError(str(exc)) from exc
     if not target.is_file():
         raise ExtractorError(
-            f"Log file not found: {target}. The trainer must write `{cfg.file}` under "
-            "PHASESWEEP_TRIAL_DIR; `stdout.log` and `stderr.log` are written automatically."
+            f"Log file not found: {target} (the trainer must write `{cfg.file}` under "
+            "PHASESWEEP_TRIAL_DIR; `stdout.log` and `stderr.log` are written automatically)"
         )
 
     pattern = re.compile(cfg.pattern)
@@ -533,7 +535,7 @@ def _extract_log_regex(
             first_unparseable,
         )
     if result is None:
-        raise ExtractorError(f"No matches for {cfg.pattern!r} in {target}.")
+        raise ExtractorError(f"No matches for {cfg.pattern!r} in {target}")
     if provenance is not None:
         provenance["source"] = {
             "kind": "file",

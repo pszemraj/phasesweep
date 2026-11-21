@@ -95,34 +95,57 @@ def test_a_gate_reading_a_diverged_file_says_it_holds_a_non_finite_number(
 
 
 @pytest.mark.parametrize(
-    ("extractor", "step"),
+    ("extractor", "file", "step"),
     [
         pytest.param(
             JsonExtractor(type="json", path="result.json", key="loss"),
-            "The trainer must write `result.json` under PHASESWEEP_TRIAL_DIR before it exits, "
-            "with the numeric key `loss`.",
+            "result.json",
+            "the trainer must write `result.json` under PHASESWEEP_TRIAL_DIR before it exits, "
+            "with the numeric key `loss`",
             id="json",
         ),
         pytest.param(
             _envelope(),
-            "The trainer must call `phasesweep.report_objective(...)` before it exits, from "
-            "rank 0 only; it writes `result.json` under PHASESWEEP_TRIAL_DIR.",
+            "result.json",
+            "the trainer must call `phasesweep.report_objective(...)` before it exits, from "
+            "rank 0 only; it writes `result.json` under PHASESWEEP_TRIAL_DIR",
             id="json-envelope",
         ),
         pytest.param(
             LogRegexExtractor(type="log_regex", file="train.log", pattern=r"loss=(?P<value>\S+)"),
-            "The trainer must write `train.log` under PHASESWEEP_TRIAL_DIR; `stdout.log` and "
-            "`stderr.log` are written automatically.",
+            "train.log",
+            "the trainer must write `train.log` under PHASESWEEP_TRIAL_DIR; `stdout.log` and "
+            "`stderr.log` are written automatically",
             id="log-regex",
         ),
     ],
 )
 def test_a_missing_objective_file_says_what_the_trainer_must_write(
-    tmp_path: Path, extractor: JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor, step: str
+    tmp_path: Path,
+    extractor: JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor,
+    file: str,
+    step: str,
 ) -> None:
-    """A trainer that exits 0 without its objective file is told which file, where, and how."""
+    """A trainer that exits 0 without its objective file is told which file, where and how.
+
+    The path is followed by a space, so a copied path carries no punctuation, and the trainer's
+    step comes after it in parentheses.
+    """
     with pytest.raises(ExtractorError) as missing:
         run_extractor(make_trial_context(tmp_path), extractor)
 
-    assert str(missing.value).endswith(f" {step}")
-    assert "not found: " in str(missing.value)
+    assert str(missing.value).endswith(f" ({step})")
+    assert str(missing.value).split(" not found: ")[1].startswith(f"{tmp_path / file} (")
+
+
+def test_no_log_match_ends_on_the_path_it_searched(tmp_path: Path) -> None:
+    """The log path ends the message, so nothing sticks to it when a reader copies it."""
+    (tmp_path / "train.log").write_text("nothing here\n")
+    extractor = LogRegexExtractor(
+        type="log_regex", file="train.log", pattern=r"loss=(?P<value>\S+)"
+    )
+
+    with pytest.raises(ExtractorError) as missing:
+        run_extractor(make_trial_context(tmp_path), extractor)
+
+    assert str(missing.value).endswith(f" in {tmp_path / 'train.log'}")
