@@ -1,4 +1,4 @@
-"""Advisory warnings when a numeric grid selects an endpoint."""
+"""Selection advisories: a winner no trial ran beyond, and a cheaper configuration within noise."""
 
 from __future__ import annotations
 
@@ -39,6 +39,7 @@ from phasesweep.engine.state import (
     OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
+    TRIAL_OUTCOME_ATTR,
 )
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
 from phasesweep.mcp.snapshots import RESULT_SNAPSHOT_SCHEMA_VERSION, capture_result_snapshot
@@ -48,76 +49,208 @@ from tests.conftest import (
     log_regex_provenance,
     make_experiment,
     phase_trials,
+    trial_outcome,
     write_experiment_config,
     write_trainer,
 )
 from tests.ledger_fixtures import published_generation_id
 
+Row = tuple[dict[str, JsonValue], float | str]
+"""One trial: its params, and its metric or the state ``fail``, ``infeasible`` or ``interrupted``."""
 
-@pytest.mark.parametrize("sampler_type", ["grid", "random"])
+
+def _edge_warnings(
+    caplog: pytest.LogCaptureFixture,
+    search_space: dict[str, SearchParam],
+    rows: list[Row],
+    *,
+    sampler_type: str = "random",
+    repeats: Repeats | None = None,
+) -> list[str]:
+    """Select a winner over ``rows`` in phase ``p`` and return its untried-beyond warnings."""
+    phase = Phase(
+        name="p",
+        n_trials=len(rows),
+        sampler=Sampler.model_validate({"type": sampler_type, "seed": 0}),
+        search_space=search_space,
+        repeats=repeats,
+        allow_partial_grid=sampler_type == "grid" and repeats is None,
+    )
+    experiment = make_experiment(phases=[phase])
+    study = optuna.create_study(direction="minimize")
+    for number, (params, outcome) in enumerate(rows):
+        distributions = {
+            name: optuna.distributions.CategoricalDistribution([value])
+            for name, value in params.items()
+        }
+        attrs: dict[str, JsonValue] = {
+            FEASIBLE_ATTR: outcome != "infeasible",
+            GENERATION_ID_ATTR: "generation-a",
+            ATTEMPT_ID_ATTR: f"attempt-{number}",
+            OBJECTIVE_PROVENANCE_ATTR: json.dumps(log_regex_provenance()),
+            TRAINER_ENV_DIGEST_ATTR: "a" * 64,
+            TRAINER_INPUT_ATTR: {"schema_version": 1},
+        }
+        if isinstance(outcome, float) or outcome == "infeasible":
+            value = outcome if isinstance(outcome, float) else 9.0
+            study.add_trial(
+                optuna.trial.create_trial(
+                    value=value, params=params, distributions=distributions, user_attrs=attrs
+                )
+            )
+            continue
+        failure = {TRIAL_OUTCOME_ATTR: trial_outcome(number + 1, "interrupted")}
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=optuna.trial.TrialState.FAIL,
+                params=params,
+                distributions=distributions,
+                user_attrs=failure if outcome == "interrupted" else {},
+            )
+        )
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        select_winner(study, experiment, phase_name="p", repeats=repeat_axis(phase))
+    return [record.getMessage() for record in caplog.records if "no trial ran" in record.message]
+
+
+@pytest.mark.parametrize("sampler_type", ["grid", "random", "tpe"])
 @pytest.mark.parametrize(
-    ("param", "value", "edge"),
+    ("param", "value", "warning"),
     [
-        (IntParam(type="int", low=0, high=9, step=3), 0, "lower"),
-        (IntParam(type="int", low=0, high=9, step=3), 9, "upper"),
-        (FloatParam(type="float", low=0.1, high=0.3, step=0.1), 0.3, "upper"),
-        (CategoricalParam(type="categorical", choices=[0.3, 0.1, 0.2]), 0.1, "lower"),
-        (CategoricalParam(type="categorical", choices=[0.3, 0.1, 0.2]), 0.3, "upper"),
+        (
+            IntParam(type="int", low=0, high=9, step=3),
+            0,
+            "below the winner's x=0 (tried 0..9, at the configured lower bound)",
+        ),
+        (
+            IntParam(type="int", low=0, high=9, step=3),
+            9,
+            "above the winner's x=9 (tried 0..9, at the configured upper bound)",
+        ),
+        (
+            FloatParam(type="float", low=0.1, high=0.3, step=0.1),
+            0.3,
+            "above the winner's x=0.3 (tried 0.1..0.3, at the configured upper bound)",
+        ),
+        (
+            CategoricalParam(type="categorical", choices=[0.3, 0.1, 0.2]),
+            0.1,
+            "below the winner's x=0.1 (tried 0.1..0.3, at the configured lower bound)",
+        ),
+        (
+            CategoricalParam(type="categorical", choices=[0.3, 0.1, 0.2]),
+            0.3,
+            "above the winner's x=0.3 (tried 0.1..0.3, at the configured upper bound)",
+        ),
         (IntParam(type="int", low=0, high=2), 1, None),
-        (CategoricalParam(type="categorical", choices=["small", "large"]), "small", None),
+        (CategoricalParam(type="categorical", choices=["small", "large", "huge"]), "small", None),
         (CategoricalParam(type="categorical", choices=[True, False]), True, None),
-        (CategoricalParam(type="categorical", choices=[1, "large"]), 1, None),
+        (CategoricalParam(type="categorical", choices=[1, 2, "large"]), 1, None),
         (CategoricalParam(type="categorical", choices=[0.1]), 0.1, None),
         (CategoricalParam(type="categorical", choices=[8, 16]), 16, None),
         (IntParam(type="int", low=8, high=16, step=8), 16, None),
     ],
 )
-def test_grid_endpoint_warning_uses_the_concrete_numeric_axis(
+def test_edge_warning_uses_the_ordered_numeric_values_tried(
     caplog: pytest.LogCaptureFixture,
     param: SearchParam,
     value: JsonValue,
-    edge: str | None,
+    warning: str | None,
     sampler_type: str,
 ) -> None:
-    """Only ordered numeric grid axes have edges, including stepped axes."""
-    grid = grid_search_space({"x": param})
-    phase = Phase(
-        name="p",
-        n_trials=len(grid["x"]),
-        sampler=Sampler.model_validate({"type": sampler_type, "seed": 0}),
-        search_space={"x": param},
-    )
-    experiment = make_experiment(phases=[phase])
-    study = optuna.create_study(direction="minimize")
-    study.add_trial(
-        optuna.trial.create_trial(
-            value=0.5,
-            params={"x": value},
-            distributions={"x": optuna.distributions.CategoricalDistribution(grid["x"])},
-            user_attrs={
-                FEASIBLE_ATTR: True,
-                GENERATION_ID_ATTR: "generation-a",
-                ATTEMPT_ID_ATTR: "attempt-a",
-                OBJECTIVE_PROVENANCE_ATTR: json.dumps(log_regex_provenance()),
-                TRAINER_ENV_DIGEST_ATTR: "a" * 64,
-                TRAINER_INPUT_ATTR: {"schema_version": 1},
-            },
-        )
-    )
+    """Every sampler gets the one rule; only numeric axes with three values tried have edges."""
+    values = grid_search_space({"x": param})["x"]
+    rows: list[Row] = [({"x": item}, 0.1 if item == value else 0.5) for item in values]
+    warnings = _edge_warnings(caplog, {"x": param}, rows, sampler_type=sampler_type)
+    assert warnings == ([] if warning is None else [f"[p] no trial ran {warning}"])
 
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
-        selected = select_winner(study, experiment, phase_name="p")
 
-    warnings = [
-        record.getMessage() for record in caplog.records if "grid boundary" in record.message
+@pytest.mark.parametrize("sampler_type", ["random", "tpe", "grid"])
+def test_edge_warning_says_the_configured_range_extends_past_an_untried_edge(
+    caplog: pytest.LogCaptureFixture, sampler_type: str
+) -> None:
+    """A random or TPE best at its highest draw, or a grid whose edge cell never ran, can be beaten inside the range."""
+    param: SearchParam = (
+        CategoricalParam(type="categorical", choices=[1, 2, 3, 4, 5])
+        if sampler_type == "grid"
+        else IntParam(type="int", low=1, high=5)
+    )
+    rows: list[Row] = [({"x": 1}, 0.9), ({"x": 2}, 0.7), ({"x": 4}, 0.5), ({"x": 3}, 0.6)]
+    assert _edge_warnings(caplog, {"x": param}, rows, sampler_type=sampler_type) == [
+        "[p] no trial ran above the winner's x=4 (tried 1..4, configured range extends to 5)"
     ]
-    assert selected.trial_number == 0 and selected.metric == 0.5
-    if edge is None or sampler_type != "grid":
-        assert warnings == []
-    else:
-        assert len(warnings) == 1
-        assert "[p]" in warnings[0] and "x" in warnings[0] and edge in warnings[0]
-        assert str(value) in warnings[0] and "widen the range" in warnings[0]
+
+
+def test_edge_warning_reads_log_float_ranges_and_names_every_parameter_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A continuous float reaches its bound only by equalling it; one warning covers both params."""
+    space: dict[str, SearchParam] = {
+        "lr": FloatParam(type="float", low=1e-4, high=1e-2, log=True),
+        "width": IntParam(type="int", low=64, high=512, step=64),
+        "depth": IntParam(type="int", low=1, high=64, log=True),
+    }
+    rows: list[Row] = [
+        ({"lr": 0.0002, "width": 512, "depth": 8}, 0.9),
+        ({"lr": 0.001, "width": 256, "depth": 2}, 0.8),
+        ({"lr": 0.0081, "width": 64, "depth": 4}, 0.1),
+    ]
+    assert _edge_warnings(caplog, space, rows) == [
+        "[p] no trial ran above the winner's lr=0.0081 (tried 0.0002..0.0081, configured range "
+        "extends to 0.01) or below the winner's width=64 (tried 64..512, at the configured lower "
+        "bound)"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("beyond", "silenced"),
+    [("fail", True), ("infeasible", True), ("interrupted", False)],
+)
+def test_a_finished_trial_beyond_the_winner_counts_as_tried(
+    caplog: pytest.LogCaptureFixture, beyond: str, silenced: bool
+) -> None:
+    """A diverged run above the best value is a worse value on that side; an interrupted one tried nothing."""
+    param = FloatParam(type="float", low=1e-4, high=1e-1, log=True)
+    rows: list[Row] = [
+        ({"lr": 0.001}, 0.9),
+        ({"lr": 0.002}, 0.7),
+        ({"lr": 0.004}, 0.5),
+        ({"lr": 0.008}, beyond),
+    ]
+    warnings = _edge_warnings(caplog, {"lr": param}, rows)
+    assert warnings == (
+        []
+        if silenced
+        else [
+            "[p] no trial ran above the winner's lr=0.004 (tried 0.001..0.004, configured range "
+            "extends to 0.1)"
+        ]
+    )
+
+
+def test_fewer_than_three_distinct_values_tried_have_no_edge(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    param = IntParam(type="int", low=0, high=10)
+    rows: list[Row] = [({"x": 1}, 0.9), ({"x": 2}, 0.1), ({"x": 2}, 0.3), ({"x": 1}, 0.8)]
+    assert _edge_warnings(caplog, {"x": param}, rows) == []
+
+
+def test_repeats_edge_warning_uses_the_winning_group_and_skips_the_repeat_axis(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The winning configuration is a group; its seeds are no searched axis."""
+    param = CategoricalParam(type="categorical", choices=[1, 2, 3])
+    rows: list[Row] = [
+        ({"x": x, "seed": seed}, 0.1 * x + 0.01 * seed) for x in (1, 2, 3) for seed in (0, 1, 2)
+    ]
+    assert _edge_warnings(
+        caplog,
+        {"x": param},
+        rows,
+        sampler_type="grid",
+        repeats=Repeats(key="seed", values=[0, 1, 2]),
+    ) == ["[p] no trial ran below the winner's x=1 (tried 1..3, at the configured lower bound)"]
 
 
 @pytest.mark.parametrize(

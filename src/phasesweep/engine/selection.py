@@ -17,6 +17,8 @@ import optuna
 from phasesweep.config.common import check_bounds
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import (
+    CategoricalParam,
+    SearchParam,
     grid_search_space,
     phase_draws,
     sampler_search_space,
@@ -50,6 +52,7 @@ from phasesweep.engine.repeats import (
 )
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    FINISHED_TRIAL_STATES,
     GATES_ATTR,
     GENERATION_ID_ATTR,
     OBSERVED_PREFIX,
@@ -72,7 +75,7 @@ from phasesweep.errors import (
 )
 from phasesweep.evidence.models import MlflowExtractor
 from phasesweep.runtime.json import JsonObject, json_object, json_text_map
-from phasesweep.runtime.terminal import display_path, objective_text
+from phasesweep.runtime.terminal import display_path, objective_text, param_text
 
 log = logging.getLogger("phasesweep.engine.selection")
 
@@ -281,7 +284,7 @@ def select_winner(
         (minimize/maximize), the metric bounds, and the constraint definitions used to
         filter trials.
     :param str | None phase_name: Phase label used in log messages and to find the phase for
-        the grid-edge advisory, a grid's untried cells and the survivorship retry step. Log
+        the edge advisory, a grid's untried cells and the survivorship retry step. Log
         messages fall back to the study name when ``None``, and the others are skipped.
     :param RepeatAxis | None repeats: The phase's repeat axis
         (:func:`phasesweep.engine.repeats.repeat_axis`), or ``None`` for a phase without repeats.
@@ -440,7 +443,9 @@ def select_winner(
             remedy,
         )
     if phase is not None and emit_advisories:
-        _warn_grid_edges(phase, best.params)
+        edge = _edge_advisory(phase, trials, best.params if winning is None else winning.params)
+        if edge is not None:
+            log.warning("[%s] %s", phase.name, edge)
         if winning is not None and ranking is not None and phase.cost_key is not None:
             advisory = _cost_advisory(phase, winning, ranking.groups, goal=experiment.metric.goal)
             if advisory is not None:
@@ -524,39 +529,97 @@ def _cost_advisory(
     return None
 
 
-def _warn_grid_edges(phase: Phase, params: Mapping[str, object]) -> None:
-    """Warn when selected params touch an endpoint of a numeric grid axis.
+def _number(value: object) -> float | None:
+    """Return a recorded param as a number, or ``None`` when it is not a non-boolean number.
 
-    Numeric categorical choices are ordered by value. Mixed, boolean and
-    axes with fewer than three values have no reported boundary; the repeat axis is not searched.
-
-    :param Phase phase: Configured search space and sampler.
-    :param Mapping[str, object] params: Selected configuration's sampled values.
+    :param object value: A sampled value or a configured choice.
+    :return float | None: The value, or ``None`` for booleans, strings and nulls.
     """
-    if phase.sampler.type != "grid":
-        return
-    for name, choices in grid_search_space(phase.search_space, phase_name=phase.name).items():
-        values = [
-            value
-            for value in choices
-            if isinstance(value, int | float) and not isinstance(value, bool)
-        ]
-        if len(values) != len(choices) or len(set(values)) < 3:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
+
+
+def _configured_end(param: SearchParam, *, upper: bool) -> float | None:
+    """Return the most extreme value a numeric parameter's configuration allows on one side.
+
+    :param SearchParam param: A searched parameter.
+    :param bool upper: Whether to return the highest value rather than the lowest.
+    :return float | None: ``high`` or ``low`` of a range, the largest or smallest choice of an
+        all-numeric categorical, or ``None`` for choices that are not all numbers.
+    """
+    if isinstance(param, CategoricalParam):
+        choices = [_number(choice) for choice in param.choices]
+        numbers = [choice for choice in choices if choice is not None]
+        if len(numbers) != len(choices):
+            return None
+        return max(numbers) if upper else min(numbers)
+    return float(param.high if upper else param.low)
+
+
+def _at_configured_end(param: SearchParam, value: float, end: float) -> bool:
+    """Say whether no configured value lies beyond ``value`` on the side of ``end``.
+
+    A stepped range allows values one step apart, so within half a step of the end is at it;
+    a continuous float reaches its end only by equalling it.
+
+    :param SearchParam param: The parameter ``end`` came from (:func:`_configured_end`).
+    :param float value: The winner's value.
+    :param float end: The configured end on the side the winner is extreme on.
+    :return bool: Whether the winner sits on the configured end.
+    """
+    if isinstance(param, CategoricalParam):
+        return value == end
+    step = param.step or 0
+    return abs(end - value) <= step / 2
+
+
+def _edge_advisory(
+    phase: Phase, trials: Sequence[optuna.trial.FrozenTrial], params: Mapping[str, object]
+) -> str | None:
+    """Say which searched numeric parameters no finished trial tried beyond the winner's value.
+
+    A best value is located only once worse values lie on both sides of it. Every sampler gets
+    the one rule, stated in terms of what was tried: a numeric parameter (an int or float range,
+    or all-numeric categorical choices) with at least three distinct values across the trials
+    that finished, COMPLETE, INFEASIBLE or FAIL, whose winning value is the lowest or highest of
+    them. A failed or infeasible trial beyond the winner counts as tried, and an interrupted one
+    tried nothing. Boolean and mixed choices have no order; the repeat axis is not searched.
+
+    :param Phase phase: Configured search space.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
+    :param Mapping[str, object] params: The winning configuration's params; for a repeats
+        phase, the winning group's.
+    :return str | None: One clause per such parameter, naming the values tried and whether the
+        winner sits on the configured end; ``None`` when no parameter qualifies.
+    """
+    finished = [trial for trial in trials if _trial_count_state(trial) in FINISHED_TRIAL_STATES]
+    clauses: list[str] = []
+    for name, param in phase.search_space.items():
+        value = _number(params.get(name))
+        tried = sorted(
+            {
+                number
+                for trial in finished
+                if (number := _number(trial.params.get(name))) is not None
+            }
+        )
+        if value is None or len(tried) < 3 or value not in (tried[0], tried[-1]):
             continue
-        value = params.get(name)
-        lower, upper = min(values), max(values)
-        edge = "lower" if value == lower else "upper" if value == upper else None
-        if edge is not None:
-            log.warning(
-                "[%s] winner is at the %s numeric grid boundary for %s=%s (grid %s..%s); "
-                "widen the range to check for a better value beyond it.",
-                phase.name,
-                edge,
-                name,
-                value,
-                lower,
-                upper,
-            )
+        upper = value == tried[-1]
+        end = _configured_end(param, upper=upper)
+        if end is None:
+            continue
+        place = (
+            f"at the configured {'upper' if upper else 'lower'} bound"
+            if _at_configured_end(param, value, end)
+            else f"configured range extends to {param_text(end)}"
+        )
+        clauses.append(
+            f"{'above' if upper else 'below'} the winner's {name}={param_text(params.get(name))} "
+            f"(tried {param_text(tried[0])}..{param_text(tried[-1])}, {place})"
+        )
+    return None if not clauses else "no trial ran " + " or ".join(clauses)
 
 
 def _untried_grid_cells(
