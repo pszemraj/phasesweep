@@ -238,11 +238,11 @@ def test_infeasible_and_interrupted_trials_keep_what_was_recorded(experiment: Ex
         params={"model.n_layers": 8},
         repeat=None,
         rerun_of=None,
-        reason="orchestrator interrupted by signal 2",
+        reason="orchestrator interrupted by SIGINT",
     )
     assert str(interrupted) == (
         "depth  trial 4  INTERRUPTED  3/4  model.n_layers=8  "
-        "reason: orchestrator interrupted by signal 2"
+        "reason: orchestrator interrupted by SIGINT"
     )
 
 
@@ -250,15 +250,14 @@ def test_rerun_and_skipped_lines(experiment: Experiment) -> None:
     """A rerun names its source and that trial's cause; a skipped phase says where its winner is."""
     depth = experiment.phases[0]
     rerun = rerun_line(
-        experiment, depth, number=4, source=2, reason="orchestrator interrupted by signal 2"
+        experiment, depth, number=4, source=2, reason="orchestrator interrupted by SIGINT"
     )
     assert console(rerun) == [
         "12:00:00  depth          trial 4  RERUN of trial 2",
-        "                         reason: orchestrator interrupted by signal 2",
+        "                         reason: orchestrator interrupted by SIGINT",
     ]
     assert (
-        str(rerun)
-        == "depth  trial 4  RERUN of trial 2  reason: orchestrator interrupted by signal 2"
+        str(rerun) == "depth  trial 4  RERUN of trial 2  reason: orchestrator interrupted by SIGINT"
     )
     assert console(rerun_line(experiment, depth, number=5, source=3, reason=None)) == [
         "12:00:00  depth          trial 5  RERUN of trial 3"

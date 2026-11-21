@@ -184,7 +184,7 @@ def _finished(study: optuna.Study, sequence: int, outcome: str) -> None:
     [
         pytest.param(None, id="no-record"),
         pytest.param(
-            trial_outcome(3, "interrupted", cause="orchestrator interrupted by signal 2"),
+            trial_outcome(3, "interrupted", cause="orchestrator interrupted by SIGINT"),
             id="signal",
         ),
         pytest.param(trial_outcome(3, "failure", cause="exit 1"), id="failure"),
@@ -367,7 +367,7 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
     ]
 
 
-_SIGINT_CAUSE = f"orchestrator interrupted by signal {int(signal.SIGINT)}"
+_SIGINT_CAUSE = "orchestrator interrupted by SIGINT"
 
 
 def _cause(trial: optuna.trial.FrozenTrial) -> str | None:

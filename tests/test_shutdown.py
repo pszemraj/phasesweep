@@ -32,6 +32,7 @@ from phasesweep.runtime.shutdown import (
     _shutdown_handler,
     defer_shutdown_signals,
     install_signal_handlers,
+    interruption_cause,
     signal_handler_scope,
 )
 from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText
@@ -856,6 +857,17 @@ def test_interrupt_text_names_the_signal_and_the_trials_it_stops(
 
 
 @pytest.mark.parametrize(
+    ("signum", "name"), [(signal.SIGINT, "SIGINT"), (signal.SIGHUP, "SIGHUP"), (99, "signal 99")]
+)
+def test_the_recorded_cause_names_the_signal_as_the_interrupt_line_does(
+    signum: int, name: str
+) -> None:
+    """A stopped trial's cause, shown by ``status --trials`` and a rerun's reason, names its signal like the line beside it."""
+    assert interruption_cause(signum) == f"orchestrator interrupted by {name}"
+    assert _interrupt_text(signum, []).startswith(f"Interrupted ({name}): ")
+
+
+@pytest.mark.parametrize(
     ("labels", "text"),
     [
         (["trial"], "Interrupted (SIGINT): stopping 1 trial and waiting for it to exit."),
@@ -966,7 +978,10 @@ def test_a_launch_while_a_shutdown_is_serviced_starts_no_process(
     with (
         (trial_dir / "stdout.log").open("w") as stdout,
         (trial_dir / "stderr.log").open("w") as stderr,
-        pytest.raises(ShutdownLaunchRefusedError, match="interrupted by signal 15"),
+        pytest.raises(
+            ShutdownLaunchRefusedError,
+            match="^trainer launch refused: orchestrator interrupted by SIGTERM$",
+        ),
     ):
         run_supervised(
             f"{sys.executable} -c 'open({str(ran)!r}, \"w\")'",

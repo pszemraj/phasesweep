@@ -133,13 +133,25 @@ _servicing_signum: int | None = None
 _shutdown_wakers: list[Callable[[], None]] = []
 
 
+def _signal_name(signum: int) -> str:
+    """Name a shutdown signal as the interrupt line and the recorded cause both show it.
+
+    :param int signum: Signal number.
+    :return str: Its name, such as ``SIGINT``, or ``signal N`` for a number with none.
+    """
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return f"signal {signum}"
+
+
 def interruption_cause(signum: int) -> str:
     """Return the cause text recorded for a trial the orchestrator's shutdown signal stopped.
 
     :param int signum: The shutdown signal being serviced.
-    :return str: The trial outcome cause for that signal.
+    :return str: The trial outcome cause for that signal, such as ``orchestrator interrupted by SIGINT``.
     """
-    return f"orchestrator interrupted by signal {signum}"
+    return f"orchestrator interrupted by {_signal_name(signum)}"
 
 
 def launch_refusal_text(signum: int) -> str:
@@ -190,10 +202,7 @@ def _interrupt_text(signum: int, running: Sequence[str]) -> str:
         registration order; :data:`TRAINER_LABEL` marks a trainer.
     :return str: For example ``Interrupted (SIGINT): stopping 2 trials and waiting for them to exit.``
     """
-    try:
-        name = signal.Signals(signum).name
-    except ValueError:
-        name = f"signal {signum}"
+    name = _signal_name(signum)
     counts = Counter(running)
     trials = counts.pop(TRAINER_LABEL, 0)
     others = [plural(count, label) for label, count in counts.items()]
