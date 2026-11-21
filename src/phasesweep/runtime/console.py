@@ -12,10 +12,12 @@ import sys
 import time
 
 from phasesweep.runtime.terminal import (
+    GAP,
     REPORT_LOGGER,
     ReportBlock,
     Style,
-    paint,
+    hang,
+    paint_word,
     terminal_width,
     use_color,
     wrap,
@@ -86,7 +88,7 @@ class ConsoleHandler(logging.Handler):
         :return list[str]: The lines to print, the time before the first.
         """
         block = record.msg
-        stamp = time.strftime("%H:%M:%S", time.localtime(record.created)) + "  "
+        stamp = time.strftime("%H:%M:%S", time.localtime(record.created)) + GAP
         room = width - len(stamp)
         if isinstance(block, ReportBlock):
             body = block.render(room, color=color)
@@ -94,10 +96,7 @@ class ConsoleHandler(logging.Handler):
             body = _plain_lines(record.getMessage(), room)
         else:
             body = _diagnostic(record, room, color)
-        return [
-            ((stamp if index == 0 else " " * len(stamp)) + line).rstrip()
-            for index, line in enumerate(body)
-        ]
+        return [line.rstrip() for line in hang(stamp, body)]
 
 
 def _plain_lines(message: str, width: int) -> list[str]:
@@ -134,5 +133,5 @@ def _diagnostic(record: logging.LogRecord, width: int, color: bool) -> list[str]
     lines = wrap(f"{label}: {paragraphs[0]}", width)
     for paragraph in paragraphs[1:]:
         lines.extend(wrap(paragraph, width) or [""])
-    lines[0] = paint(f"{label}:", style, color=color) + lines[0].removeprefix(f"{label}:")
+    lines[0] = paint_word(lines[0], f"{label}:", style, color=color)
     return lines

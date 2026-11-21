@@ -15,7 +15,9 @@ import pytest
 from phasesweep.runtime.terminal import (
     directory_lines,
     display_path,
+    hang,
     paint,
+    paint_word,
     plural,
     terminal_width,
     use_color,
@@ -69,6 +71,26 @@ def test_paint_returns_plain_text_without_color_and_escapes_with_it() -> None:
     assert paint("x", "label", color=True) == "\x1b[1mx\x1b[0m"
     assert paint("x", "path", color=True) == "\x1b[2mx\x1b[0m"
     assert paint("", "winner", color=True) == ""
+
+
+def test_paint_word_styles_the_first_match_from_the_start_column_only() -> None:
+    """The phase name is skipped by the start column, a missing word and no colour change nothing."""
+    line = "depth  depth FAIL FAIL"
+
+    assert paint_word(line, "depth", "label", start=2, color=True) == (
+        "depth  \x1b[1mdepth\x1b[0m FAIL FAIL"
+    )
+    assert paint_word(line, "FAIL", "error", color=True) == "depth  depth \x1b[31mFAIL\x1b[0m FAIL"
+    assert paint_word(line, "absent", "error", color=True) == line
+    assert paint_word(line, "FAIL", "error", color=False) == line
+
+
+def test_hang_puts_the_lead_on_the_first_line_and_blanks_under_it() -> None:
+    """A styled lead hangs later lines by its visible width, and no lines stays empty."""
+    assert hang("lead  ", ["one", "two", "three"]) == ["lead  one", "      two", "      three"]
+    styled = paint("log:", "label", color=True) + " "
+    assert hang(styled, ["a", "b"], visible=5) == [f"{styled}a", "     b"]
+    assert hang("lead", []) == []
 
 
 def test_terminal_width_prefers_columns_then_the_stream_then_eighty(

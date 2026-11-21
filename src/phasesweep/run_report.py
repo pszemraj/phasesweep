@@ -22,15 +22,18 @@ from phasesweep.evidence.models import WandbExtractor
 from phasesweep.runtime.terminal import (
     GAP,
     INDENT,
+    MIN_TEXT_WIDTH,
     REPORT_LOGGER,
     ReportBlock,
     Style,
     break_path,
     directory_lines,
     display_path,
+    hang,
     objective_text,
     pack,
     paint,
+    paint_word,
     param_text,
     plural,
     significant,
@@ -38,6 +41,9 @@ from phasesweep.runtime.terminal import (
 )
 
 report = logging.getLogger(REPORT_LOGGER)
+
+#: The word that marks a winner's line, and so the width of the column its facts hang under.
+_WINNER_WORD = "winner"
 
 #: How the console styles a trial state that needs attention; other states print plain.
 _STATE_STYLES: dict[str, Style] = {"FAIL": "error", "INFEASIBLE": "error", "INTERRUPTED": "warning"}
@@ -69,14 +75,10 @@ def _lay_out(
     :return list[str]: The lines, the label column blank after the first.
     """
     lead = f"{label:<{label_width}}{GAP}"
-    pad = " " * len(lead)
     if len(lead + GAP.join([*head, *tail])) <= width:
         return [(lead + GAP.join([*head, *tail])).rstrip()]
-    if len(lead + GAP.join(head)) <= width:
-        return [lead + GAP.join(head), *pack(tail, width, indent=pad)]
-    lines = [*pack(head, width, indent=pad), *pack(tail, width, indent=pad)]
-    lines[0] = lead + lines[0].removeprefix(pad)
-    return lines
+    room = width - len(lead)
+    return hang(lead, [*pack(head, room), *pack(tail, room)])
 
 
 def _lay_out_clauses(label: str, label_width: int, clauses: Sequence[str], width: int) -> list[str]:
@@ -89,26 +91,7 @@ def _lay_out_clauses(label: str, label_width: int, clauses: Sequence[str], width
     :return list[str]: The lines, the label column blank after the first.
     """
     lead = f"{label:<{label_width}}{GAP}"
-    pad = " " * len(lead)
-    lines = pack(clauses, width, indent=pad, separator=", ")
-    lines[0] = lead + lines[0].removeprefix(pad)
-    return lines
-
-
-def _paint_word(line: str, word: str, style: Style, *, start: int, color: bool) -> str:
-    """Style the first ``word`` found at or after column ``start`` of an already laid-out line.
-
-    :param str line: Plain text of one line.
-    :param str word: Text to style.
-    :param Style style: Style to apply.
-    :param int start: Column to search from, so a phase name never matches.
-    :param bool color: Whether styling is on.
-    :return str: The line with ``word`` styled, or unchanged when absent or colour is off.
-    """
-    index = line.find(word, start)
-    if not color or index < 0:
-        return line
-    return line[:index] + paint(word, style, color=True) + line[index + len(word) :]
+    return hang(lead, pack(clauses, width - len(lead), separator=", "))
 
 
 def _reason_lines(reason: str, label_width: int, width: int) -> list[str]:
@@ -197,7 +180,7 @@ class FactLine(ReportBlock):
         lines = _lay_out(self.phase, self.label_width, self.head, self.tail, width)
         if self.marked is not None:
             word, style = self.marked
-            lines[0] = _paint_word(
+            lines[0] = paint_word(
                 lines[0], word, style, start=self.label_width + len(GAP), color=color
             )
         if self.reason:
@@ -377,10 +360,10 @@ def winner_line(experiment: Experiment, phase: Phase, winner: Winner) -> FactLin
     return FactLine(
         phase.name,
         phase_label_width(experiment),
-        head=(f"winner: {head[0]}", *head[1:]),
+        head=(f"{_WINNER_WORD}: {head[0]}", *head[1:]),
         tail=tuple(tail),
         reason=None,
-        marked=("winner", "winner"),
+        marked=(_WINNER_WORD, "winner"),
     )
 
 
@@ -415,32 +398,22 @@ def _label_column(label: str, *, color: bool) -> str:
     return INDENT + paint(label, "label", color=color) + " " * (_BANNER_LABEL_WIDTH - len(label))
 
 
-def _value_lines(row: BannerRow, room: int, *, color: bool) -> list[str]:
+def _value_lines(text: str, room: int, *, is_path: bool, color: bool) -> list[str]:
     """Fit one banner value to ``room`` columns, a path broken at slashes and prose wrapped.
 
-    :param BannerRow row: The row whose value is drawn.
+    :param str text: The value to draw.
     :param int room: Columns left after the label column.
+    :param bool is_path: Whether the value is a path, which is dim and breaks only at slashes.
     :param bool color: Whether to style a path.
     :return list[str]: The value's lines, without the label column.
     """
-    if len(row.text) <= room:
-        lines = [row.text]
-    elif row.is_path:
-        lines = break_path(row.text, room)
+    if len(text) <= room:
+        lines = [text]
+    elif is_path:
+        lines = break_path(text, room)
     else:
-        lines = wrap(row.text, room)
-    return [paint(line, "path", color=color) if row.is_path else line for line in lines]
-
-
-def _hanging(lead: str, visible: int, values: Sequence[str]) -> list[str]:
-    """Put ``lead`` before the first value and blanks as wide as it before each later one.
-
-    :param str lead: Text before the first value, possibly styled.
-    :param int visible: Columns ``lead`` takes on screen, its escape sequences not counted.
-    :param Sequence[str] values: The value's lines, without the lead.
-    :return list[str]: The lines, every later one hanging under the first value.
-    """
-    return [(lead if index == 0 else " " * visible) + value for index, value in enumerate(values)]
+        lines = wrap(text, room)
+    return [paint(line, "path", color=color) if is_path else line for line in lines]
 
 
 @dataclass(frozen=True)
@@ -460,18 +433,17 @@ class Banner:
         :return list[str]: The lines, ending with a blank line that separates the progress.
         """
         indent = len(INDENT) + _BANNER_LABEL_WIDTH
-        room = max(width - indent, 20)
+        room = max(width - indent, MIN_TEXT_WIDTH)
         lines = [f"{paint('phasesweep run', 'label', color=color)}{GAP}{self.experiment}", ""]
         for row in self.head:
             lines.extend(self._row(row, room, color=color))
-        label = _label_column("phases", color=color)
         name_width = max((len(phase.name) for phase in self.phases), default=0)
-        for number, phase in enumerate(self.phases):
-            drawn = _lay_out(phase.name, name_width, phase.facts[:1], phase.facts[1:], room)
-            lines.extend(
-                (label if number == 0 and index == 0 else " " * indent) + line
-                for index, line in enumerate(drawn)
-            )
+        plans = [
+            line
+            for phase in self.phases
+            for line in _lay_out(phase.name, name_width, phase.facts[:1], phase.facts[1:], room)
+        ]
+        lines.extend(hang(_label_column("phases", color=color), plans, visible=indent))
         for row in self.tail:
             lines.extend(self._row(row, room, color=color))
         return [*lines, ""]
@@ -485,10 +457,10 @@ class Banner:
         :param bool color: Whether to style the label and a path.
         :return list[str]: The row's lines.
         """
-        return _hanging(
+        return hang(
             _label_column(row.label, color=color),
-            len(INDENT) + _BANNER_LABEL_WIDTH,
-            _value_lines(row, room, color=color),
+            _value_lines(row.text, room, is_path=row.is_path, color=color),
+            visible=len(INDENT) + _BANNER_LABEL_WIDTH,
         )
 
 
@@ -637,11 +609,14 @@ class Summary:
             )
             lines.extend(INDENT + line for line in drawn_counts)
             if phase.winner:
-                lead = f"{pad}winner{GAP}"
-                drawn = pack(phase.winner, width, indent=" " * len(lead))
-                drawn[0] = lead + drawn[0].removeprefix(" " * len(lead))
-                lines.append(_paint_word(drawn[0], "winner", "winner", start=len(pad), color=color))
-                lines.extend(drawn[1:])
+                drawn = [
+                    pad + line
+                    for line in _lay_out(
+                        _WINNER_WORD, len(_WINNER_WORD), phase.winner, (), width - len(pad)
+                    )
+                ]
+                drawn[0] = paint_word(drawn[0], _WINNER_WORD, "winner", start=len(pad), color=color)
+                lines.extend(drawn)
                 lines.extend(
                     pad + line
                     for line in directory_lines(
@@ -661,8 +636,7 @@ class Summary:
         :return list[str]: The headline's lines.
         """
         lines = wrap(self.headline, width)
-        opening = self.headline.split(":")[0]
-        lines[0] = paint(opening, "label", color=color) + lines[0].removeprefix(opening)
+        lines[0] = paint_word(lines[0], self.headline.split(":")[0], "label", color=color)
         return lines
 
     def _written_lines(self, width: int, *, color: bool) -> list[str]:
@@ -680,9 +654,7 @@ class Summary:
             ]
         else:
             drawn = [head]
-        drawn[0] = paint("Written under", "label", color=color) + drawn[0].removeprefix(
-            "Written under"
-        )
+        drawn[0] = paint_word(drawn[0], "Written under", "label", color=color)
         return [
             *drawn,
             *(INDENT + paint(path, "path", color=color) for path in self.written),
@@ -716,8 +688,7 @@ class NothingToRun:
         :return list[str]: A blank line, the sentence, a blank line and the ``Next:`` line.
         """
         lines = wrap(self._text(), width)
-        opening = f"Finished in {self.elapsed}"
-        lines[0] = paint(opening, "label", color=color) + lines[0].removeprefix(opening)
+        lines[0] = paint_word(lines[0], f"Finished in {self.elapsed}", "label", color=color)
         return ["", *lines, "", _next_line(self.next_command, color=color)]
 
 
@@ -737,9 +708,9 @@ class LogLine:
         label = "log:"
         taken = len(label) + 1
         values = _value_lines(
-            BannerRow("log", self.path, is_path=True), max(width - taken, 20), color=color
+            self.path, max(width - taken, MIN_TEXT_WIDTH), is_path=True, color=color
         )
-        return _hanging(paint(label, "label", color=color) + " ", taken, values)
+        return hang(paint(label, "label", color=color) + " ", values, visible=taken)
 
 
 def _count_clauses(counts: PhaseCounts) -> tuple[str, ...]:

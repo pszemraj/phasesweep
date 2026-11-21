@@ -39,7 +39,7 @@ GAP = "  "
 _DEFAULT_WIDTH = 80
 
 #: Columns kept for text after an indent, so a very narrow terminal wraps instead of failing.
-_MIN_TEXT_WIDTH = 20
+MIN_TEXT_WIDTH = 20
 
 
 class _SupportsIsatty(Protocol):
@@ -77,6 +77,22 @@ def paint(text: str, style: Style, *, color: bool) -> str:
     return f"\x1b[{_SGR[style]}m{text}\x1b[0m"
 
 
+def paint_word(line: str, word: str, style: Style, *, color: bool, start: int = 0) -> str:
+    """Style the first ``word`` found at or after column ``start`` of an already laid-out line.
+
+    :param str line: Plain text of one line.
+    :param str word: Text to style.
+    :param Style style: Style to apply.
+    :param bool color: Whether styling is on.
+    :param int start: Column to search from, so a phase name never matches, defaults to 0.
+    :return str: The line with ``word`` styled, or unchanged when absent or colour is off.
+    """
+    index = line.find(word, start)
+    if not color or index < 0:
+        return line
+    return line[:index] + paint(word, style, color=True) + line[index + len(word) :]
+
+
 def terminal_width(stream: TextIO) -> int:
     """Return the column count to fit prose to: ``COLUMNS``, then the stream's own size, then 80.
 
@@ -107,7 +123,7 @@ def wrap(text: str, width: int, *, indent: str = "", subsequent_indent: str = ""
     :param str subsequent_indent: Prefix of every later line, the hanging indent.
     :return list[str]: The wrapped lines, empty when ``text`` has no words.
     """
-    limit = max(width, len(indent) + _MIN_TEXT_WIDTH, len(subsequent_indent) + _MIN_TEXT_WIDTH)
+    limit = max(width, len(indent) + MIN_TEXT_WIDTH, len(subsequent_indent) + MIN_TEXT_WIDTH)
     return textwrap.wrap(
         " ".join(text.split()),
         limit,
@@ -135,6 +151,19 @@ def wrap_labeled(label: str, text: str, width: int) -> list[str]:
     for paragraph in paragraphs[1:]:
         lines.extend(wrap(paragraph, width, indent=hanging, subsequent_indent=hanging) or [""])
     return lines
+
+
+def hang(lead: str, lines: Sequence[str], *, visible: int | None = None) -> list[str]:
+    """Put ``lead`` before the first of ``lines`` and blanks as wide as it before each later one.
+
+    :param str lead: Text before the first line, possibly styled.
+    :param Sequence[str] lines: The lines, with nothing reserved in front of them for the lead.
+    :param int | None visible: Columns ``lead`` takes on screen when its escape sequences are
+        not counted, defaults to its length.
+    :return list[str]: The lines, every later one hanging under the first.
+    """
+    pad = " " * (len(lead) if visible is None else visible)
+    return [(lead if index == 0 else pad) + line for index, line in enumerate(lines)]
 
 
 def display_path(path: Path) -> str:
@@ -197,7 +226,7 @@ def param_text(value: object) -> str:
     return significant(value, 4) if isinstance(value, float) else str(value)
 
 
-def pack(items: Sequence[str], width: int, *, indent: str = "", separator: str = "  ") -> list[str]:
+def pack(items: Sequence[str], width: int, *, indent: str = "", separator: str = GAP) -> list[str]:
     """Fill lines of ``width`` columns with whole items joined by ``separator``.
 
     An item is never split, so ``key=value`` pairs stay readable; one wider than the line gets a
