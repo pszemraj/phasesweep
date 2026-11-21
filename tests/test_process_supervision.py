@@ -831,6 +831,8 @@ def test_supervisor_main_rejects_malformed_payload(
     """EOF or any payload-shape violation must return 75 without execing."""
     exec_calls: list[tuple[object, ...]] = []
     monkeypatch.setattr(supervisor.os, "execve", lambda *a: exec_calls.append(a))
+    # As a subreaper this pytest process would adopt every orphan for the rest of its session.
+    monkeypatch.setattr(supervisor, "_become_subreaper", lambda: False)
 
     ready_read, ready_write = os.pipe()
     ack_read, ack_write = os.pipe()
@@ -1403,6 +1405,51 @@ def test_guardian_proc_scan_ignores_only_proven_unrelated_entries(
     monkeypatch.setattr(builtins, "open", fake_open)
 
     assert supervisor._trainer_group_alive(1234) is expected_alive
+
+
+@pytest.mark.parametrize(
+    ("pid", "adopts", "group_exists", "waitpid_result", "pgid_result", "expected"),
+    [
+        pytest.param(22, True, False, (0, 0), OSError, True, id="live-adopted-child"),
+        pytest.param(22, True, False, (22, 0), OSError, False, id="exited-child-is-reaped"),
+        pytest.param(22, True, False, ChildProcessError, OSError, False, id="gone-group"),
+        pytest.param(22, True, True, ChildProcessError, 1234, True, id="group-member"),
+        pytest.param(22, True, True, ChildProcessError, OSError, None, id="unknown-group"),
+        pytest.param(22, False, True, (0, 0), 99, False, id="no-adoption-asks-only-the-group"),
+        pytest.param(1234, True, True, (1234, 0), 1234, True, id="root-is-never-reaped"),
+    ],
+)
+def test_guardian_decides_an_unreadable_process_by_waitpid_then_getpgid(
+    monkeypatch: pytest.MonkeyPatch,
+    pid: int,
+    adopts: bool,
+    group_exists: bool,
+    waitpid_result: tuple[int, int] | type[OSError],
+    pgid_result: int | type[OSError],
+    expected: bool | None,
+) -> None:
+    """Without ``stat``, ``waitpid`` settles an adopted child and ``getpgid`` the trainer group."""
+    waited: list[int] = []
+
+    def fake_waitpid(target: int, options: int) -> tuple[int, int]:
+        assert options == os.WNOHANG
+        waited.append(target)
+        if isinstance(waitpid_result, tuple):
+            return waitpid_result
+        raise waitpid_result(target)
+
+    def fake_getpgid(target: int) -> int:
+        if isinstance(pgid_result, int):
+            return pgid_result
+        raise pgid_result(target)
+
+    monkeypatch.setattr("phasesweep.runtime.supervisor.os.waitpid", fake_waitpid)
+    monkeypatch.setattr("phasesweep.runtime.supervisor.os.getpgid", fake_getpgid)
+
+    verdict = supervisor._unreadable_member(pid, 1234, adopts=adopts, group_exists=group_exists)
+
+    assert verdict is expected
+    assert waited == ([pid] if adopts and pid != 1234 else [])
 
 
 def test_terminate_process_groups_shares_grace_across_groups(tmp_path: Path) -> None:

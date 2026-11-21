@@ -54,6 +54,7 @@ SUPERVISOR_IMPORT_ALLOWLIST = frozenset(
     {
         "__future__",
         "contextlib",
+        "ctypes",
         "json",
         "os",
         "pathlib",

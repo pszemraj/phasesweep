@@ -2,7 +2,8 @@
 
 Run directly under ``python -I -S`` with a minimal pre-ACK environment and stdlib
 imports only. The blocked child becomes the trainer group leader; the guardian
-stays outside that group and retains GPU leases until cleanup.
+stays outside that group, adopts the trainer's orphaned descendants where Linux
+allows, and retains GPU leases until cleanup.
 """
 
 from __future__ import annotations
@@ -35,6 +36,8 @@ _HELPER_SETTLE_SECONDS = 10.0
 # PIPE_BUF of 512 bytes: at most four ASCII entries of 100 characters each.
 _SURVIVOR_ENTRY_CHARS = 100
 _SURVIVOR_ENTRIES = 4
+# prctl(2) option from <linux/prctl.h>.
+_PR_SET_CHILD_SUBREAPER = 36
 ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 3
 
 
@@ -53,7 +56,7 @@ def write_lifecycle_record(
     :param str attempt_id: Immutable attempt identity.
     :param str state: Allocated, launching, terminating, or exited lifecycle state.
     :param int | None return_code: Supervised process exit code, when known.
-    :param bool | None cleanup_confirmed: Whether the whole group has exited.
+    :param bool | None cleanup_confirmed: Whether the whole group and every adopted descendant have exited.
     :param float | None duration_seconds: Supervised elapsed time, when known.
     :raises OSError: The record could not be durably replaced.
     """
@@ -173,31 +176,75 @@ def _has_exited(pid: int, state: bytes) -> bool:
         return False
 
 
-def _trainer_group_alive(pgid: int, members: list[int] | None = None) -> bool:
-    """Return whether ``pgid`` still has a member that can run.
+def _unreadable_member(pid: int, pgid: int, *, adopts: bool, group_exists: bool) -> bool | None:
+    """Decide whether a process whose ``stat`` could not be read is a live trainer member.
 
-    ``killpg(..., 0)`` is the primary existence probe. On Linux a procfs scan
-    checks for group members that have not exited, by :func:`_has_exited`.
-    Unreadable possible members keep the lease.
+    ``waitpid`` answers exactly whether it is a live adopted child, without procfs or
+    permission checks, and reaps it if it has exited. The root is left to its group test,
+    because ``main`` collects its status. ``getpgid`` then answers whether it is in the
+    trainer group, which cannot gain members once it is gone.
 
-    :param int pgid: Trainer process-group identifier.
+    :param int pid: Process whose ``stat`` was unreadable.
+    :param int pgid: Trainer process group, which is also the root's PID.
+    :param bool adopts: Whether this process adopts the trainer's orphaned descendants.
+    :param bool group_exists: Whether ``killpg(pgid, 0)`` found the group.
+    :return bool | None: ``True`` for a live member, ``False`` for none, ``None`` when unknown.
+    """
+    if adopts and pid != pgid:
+        try:
+            reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        else:
+            return reaped_pid == 0
+    if not group_exists:
+        return False
+    try:
+        return os.getpgid(pid) == pgid
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return None
+
+
+def _trainer_group_alive(
+    pgid: int, members: list[int] | None = None, *, adopts: bool = False
+) -> bool:
+    """Return whether anything the trainer started can still run.
+
+    The trainer's processes are the members of ``pgid`` and, when the guardian ``adopts``
+    as a child subreaper, its own children: the root and every descendant whose parent
+    died first, such as a rank its launcher started in a session of its own.
+    ``killpg(..., 0)`` is the primary probe of the group; without adoption a missing
+    group ends the check. On Linux a procfs scan finds members that have not exited, by
+    :func:`_has_exited`, and reaps exited adopted children other than the root, which
+    ``main`` reaps. Unreadable possible members keep the lease, as
+    :func:`_unreadable_member` decides.
+
+    :param int pgid: Trainer process-group identifier, which is also the root's PID.
     :param list[int] | None members: When given, the scan continues past the first
         live member and appends every live or unreadable member's PID here; the
         verdict is the same either way.
+    :param bool adopts: Whether this process adopts the trainer's orphaned descendants.
     :return bool: ``True`` while a live member exists or absence is uncertain.
     """
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
-        return False
+        if not adopts:
+            return False
+        group_exists = False
     except OSError:
         return True
+    else:
+        group_exists = True
 
     try:
         entries = os.scandir("/proc")
     except OSError:
         return True
 
+    guardian = os.getpid()
     complete = True
     found_member = False
     live_member = False
@@ -212,25 +259,26 @@ def _trainer_group_alive(pgid: int, members: list[int] | None = None) -> bool:
                 right_paren = data.rfind(b")")
                 fields = data[right_paren + 2 :].split()
                 state = fields[0]
+                parent = int(fields[1])
                 member_pgid = int(fields[2])
             except FileNotFoundError:
                 continue
             except (IndexError, OSError, ValueError):
-                # Only an unreadable possible group member must retain the lease.
-                try:
-                    unreadable_pgid = os.getpgid(pid)
-                except ProcessLookupError:
-                    continue
-                except OSError:
+                verdict = _unreadable_member(pid, pgid, adopts=adopts, group_exists=group_exists)
+                if verdict is None:
                     complete = False
-                    continue
-                if unreadable_pgid != pgid:
+                if not verdict:
                     continue
             else:
-                if member_pgid != pgid:
+                adopted = adopts and parent == guardian and pid != pgid
+                if member_pgid == pgid:
+                    found_member = True
+                elif not adopted:
                     continue
-                found_member = True
                 if _has_exited(pid, state):
+                    if adopted:
+                        with contextlib.suppress(ChildProcessError):
+                            os.waitpid(pid, os.WNOHANG)
                     continue
             live_member = True
             if members is None:
@@ -239,7 +287,7 @@ def _trainer_group_alive(pgid: int, members: list[int] | None = None) -> bool:
 
     # A group that exists but had no readable member, or a scan with missing
     # evidence, is not enough proof to release a host-wide GPU lock.
-    return live_member or not (found_member and complete)
+    return live_member or (group_exists and not (found_member and complete))
 
 
 def _describe_members(pids: list[int]) -> str:
@@ -282,61 +330,84 @@ def _describe_members(pids: list[int]) -> str:
     return ", ".join(entries)
 
 
-def _wait_for_group_exit(pgid: int, timeout: float | None) -> bool:
-    """Reap the trainer root while waiting for its whole group to disappear.
+def _signal_members(pgid: int, members: list[int], signum: int, signalled: set[int]) -> None:
+    """Send ``signum`` once to the trainer group and to each member's own group.
+
+    A member outside the trainer group, such as a rank its launcher started in a new
+    session, belongs to a group of its own, and signalling that group reaches the rank's
+    children too. The guardian's own group is never signalled: no trainer process can
+    join it, because the root's session is a different one.
+
+    :param int pgid: Trainer process group.
+    :param list[int] members: Live members found by :func:`_trainer_group_alive`.
+    :param int signum: Signal to send.
+    :param set[int] signalled: Groups already sent ``signum``, extended here.
+    """
+    groups = {pgid}
+    for pid in members:
+        with contextlib.suppress(OSError):
+            groups.add(os.getpgid(pid))
+    for group in groups - signalled - {os.getpgrp()}:
+        signalled.add(group)
+        with contextlib.suppress(OSError):
+            os.killpg(group, signum)
+
+
+def _wait_for_group_exit(
+    pgid: int, timeout: float | None, *, adopts: bool, signum: int | None = None
+) -> bool:
+    """Reap the trainer root while waiting for everything the trainer started to exit.
 
     :param int pgid: Group led by the guardian's child, which may already be reaped.
     :param float | None timeout: Maximum seconds to wait, or ``None`` for no deadline.
-    :return bool: ``True`` once the group is gone, or ``False`` when the deadline expires.
+    :param bool adopts: Whether this process adopts the trainer's orphaned descendants.
+    :param int | None signum: Signal sent once to the trainer group and to the group of
+        every member outside it, including members adopted while waiting; ``None`` only waits.
+    :return bool: ``True`` once nothing the trainer started is left, or ``False`` when the
+        deadline expires.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
     poll_seconds = _GROUP_POLL_SECONDS
+    signalled: set[int] = set()
     while True:
         # Without procfs, killpg still sees our exited child until it is reaped.
         with contextlib.suppress(ChildProcessError):
             os.waitpid(pgid, os.WNOHANG)
-        if not _trainer_group_alive(pgid):
+        members: list[int] | None = None if signum is None else []
+        if not _trainer_group_alive(pgid, members, adopts=adopts):
             return True
+        if signum is not None and members is not None:
+            _signal_members(pgid, members, signum, signalled)
         if deadline is not None and time.monotonic() >= deadline:
             return False
         time.sleep(poll_seconds)
         poll_seconds = min(poll_seconds * 2, _GROUP_MAX_POLL_SECONDS)
 
 
-def _reap_remaining_group(pgid: int) -> str | None:
-    """Terminate a trainer group while retaining inherited leases.
+def _reap_remaining_group(pgid: int, *, adopts: bool) -> str | None:
+    """Terminate everything the trainer started while retaining inherited leases.
+
+    SIGTERM and SIGKILL share one grace, so a member adopted only once its launcher dies
+    is killed at first sight rather than given a grace of its own.
 
     :param int pgid: Trainer process group being cancelled or surviving its root.
+    :param bool adopts: Whether this process adopts the trainer's orphaned descendants.
     :return str | None: ``None`` when no member was left; otherwise the members as
         :func:`_describe_members` named them before SIGTERM, which is ``""`` when none
         could be named.
     """
     members: list[int] = []
-    if not _trainer_group_alive(pgid, members):
+    if not _trainer_group_alive(pgid, members, adopts=adopts):
         return None
     survivors = _describe_members(members)
 
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
+    if _wait_for_group_exit(pgid, _GROUP_TERM_GRACE_SECONDS, adopts=adopts, signum=signal.SIGTERM):
         return survivors
-    except OSError:
-        pass
-
-    if _wait_for_group_exit(pgid, _GROUP_TERM_GRACE_SECONDS):
-        return survivors
-
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        return survivors
-    except OSError:
-        pass
 
     # There is nobody left upstream to protect this lease after an
     # orchestrator hard exit. If SIGKILL cannot be confirmed,
     # wait without a deadline rather than reopening the GPU to another run.
-    _wait_for_group_exit(pgid, None)
+    _wait_for_group_exit(pgid, None, adopts=adopts, signum=signal.SIGKILL)
     return survivors
 
 
@@ -410,6 +481,32 @@ def _return_child_status(status: int) -> int:
     return 70
 
 
+def _become_subreaper() -> bool:
+    """Make the trainer's orphaned descendants re-parent to this process.
+
+    A launcher such as torchrun starts each rank in a session of its own, outside the
+    trainer's group; if the launcher dies first, its ranks would re-parent to init and
+    outlive the lease. A child subreaper adopts them instead, and the procfs scan finds
+    them by parent. The standard library has no ``prctl`` binding, so the call goes
+    through ``ctypes``. Without that scan the adopted processes could not be seen and a
+    gone group would never read as gone, so adoption is skipped when ``/proc`` cannot be
+    listed.
+
+    :return bool: Whether the kernel accepted ``PR_SET_CHILD_SUBREAPER``.
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        with os.scandir("/proc"):
+            pass
+        import ctypes
+
+        result = ctypes.CDLL(None).prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+    except (AttributeError, ImportError, OSError):
+        return False
+    return isinstance(result, int) and result == 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Fork a blocked trainer and guard its whole process group.
 
@@ -420,9 +517,10 @@ def main(argv: list[str] | None = None) -> int:
         ``{"cmd": str, "env": {str: str}}`` payload before EOF or a shape
         violation; ``76`` if the payload's optional working directory cannot
         be entered. On success, the supervisor remains outside the trainer's
-        process group, gives members that outlive the root ``_HELPER_SETTLE_SECONDS``
-        to exit before terminating them, holds inherited GPU leases until every group
-        member is gone, and returns the trainer root's exit status or terminating signal.
+        process group, adopts the trainer's orphaned descendants where the kernel allows,
+        gives members that outlive the root ``_HELPER_SETTLE_SECONDS`` to exit before
+        terminating them, holds inherited GPU leases until every group member and adopted
+        descendant is gone, and returns the trainer root's exit status or terminating signal.
         Guardian cancellation preserves SIGTERM as the result even if the trainer handles it by exiting zero.
     """
     args = sys.argv[1:] if argv is None else argv
@@ -430,6 +528,7 @@ def main(argv: list[str] | None = None) -> int:
         return 64
     ready_fd = int(args[0])
     ack_fd = int(args[1])
+    adopts = _become_subreaper()
 
     # A cancellation request must wait until the guardian can preserve its intent.
     signal.pthread_sigmask(signal.SIG_SETMASK, {signal.SIGTERM})
@@ -464,7 +563,7 @@ def main(argv: list[str] | None = None) -> int:
         if reaped_pid == child_pid:
             reaped_root_status = wait_status
             return
-        if _trainer_group_alive(child_pid):
+        if _trainer_group_alive(child_pid, adopts=adopts):
             raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, cancel)
@@ -502,9 +601,9 @@ def main(argv: list[str] | None = None) -> int:
             except OSError:
                 # Without durable intent, retain the lease and let the trainer finish.
                 _, status = os.waitpid(child_pid, 0)
-                _wait_for_group_exit(child_pid, None)
+                _wait_for_group_exit(child_pid, None, adopts=adopts)
             else:
-                _reap_remaining_group(child_pid)
+                _reap_remaining_group(child_pid, adopts=adopts)
                 with contextlib.suppress(ChildProcessError):
                     os.waitpid(child_pid, 0)
                 status = signal.SIGTERM
@@ -514,8 +613,8 @@ def main(argv: list[str] | None = None) -> int:
             # Helpers that watch for their parent's death exit by themselves; only a
             # member still running after the settle is the trainer's leak. The settle
             # follows a nonzero exit too, so a crash keeps its own failure reason.
-            _wait_for_group_exit(child_pid, _HELPER_SETTLE_SECONDS)
-        survivors = _reap_remaining_group(child_pid)
+            _wait_for_group_exit(child_pid, _HELPER_SETTLE_SECONDS, adopts=adopts)
+        survivors = _reap_remaining_group(child_pid, adopts=adopts)
         if survivors is not None:
             with contextlib.suppress(OSError):
                 os.write(ready_fd, _DESCENDANTS_REAPED + survivors.encode("ascii", "replace"))

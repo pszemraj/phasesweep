@@ -571,7 +571,8 @@ def _spawn_blocked_supervisor(
         pipe. The caller owns both descriptors; after persisting trainer identity, send the
         framed payload and close ``ack_write``. ``status_read`` yields ``b"X"`` when the
         trainer root exits, then ``b"D"`` and the survivors' descriptions in one write if
-        group members outlived the helper settle and were terminated, or EOF otherwise.
+        group members or adopted descendants outlived the helper settle and were
+        terminated, or EOF otherwise.
         The settle and cleanup after ``b"X"`` are outside the trainer wallclock budget.
     """
     ready_read, ready_write = os.pipe()
@@ -667,8 +668,8 @@ def run_supervised(
     Persist identity before delivering the trainer payload; earlier EOF prevents execution.
     Identity files remain; ``exited`` requires confirmed cleanup. Descendants still running
     once the helper settle after root exit ends cause failure and termination even if their
-    root succeeded. The guardian holds GPU leases until the entire group is gone,
-    independently of the trainer's file descriptors.
+    root succeeded. The guardian holds GPU leases until the entire group and every
+    descendant it adopted are gone, independently of the trainer's file descriptors.
 
     The earlier timeout or absolute deadline covers launch and execution; cleanup is
     outside that budget. Expected post-spawn deadline, identity-write and payload failures
@@ -920,16 +921,15 @@ def run_supervised(
                 survivors = guardian_status[1:].decode("ascii", "replace")
                 named = f": {survivors}" if survivors else ""
                 failure_reason = (
-                    f"trainer root exited with code {proc.returncode}, but process group "
-                    f"{pgid} still had live descendants {settle:g}s later{named}. They were "
+                    f"trainer root exited with code {proc.returncode}, but the trainer "
+                    f"still had live descendants {settle:g}s later{named}. They were "
                     "terminated. Make the trainer wait for its children before exiting"
                 )
                 log.warning(
-                    "Trainer root PID %d exited with code %s but process group %d still had "
+                    "Trainer root PID %d exited with code %s but the trainer still had "
                     "live descendants %gs later (%s); the lease guardian terminated them",
                     pgid,
                     proc.returncode,
-                    pgid,
                     settle,
                     survivors or "members could not be named",
                 )

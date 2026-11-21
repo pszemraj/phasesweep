@@ -5,6 +5,8 @@ DataLoader worker does, costs nothing: the trial keeps its root's exit code and 
 A member still running when the settle ends is terminated, named in the failure reason, and
 fails the trial even after a zero exit. Once the root has exited, a cancellation request no
 longer cuts the settle short, and every wait that covers the guardian grows by the settle.
+On Linux the guardian adopts descendants that left the root's group, such as ranks torchrun
+starts in sessions of their own, and the same rules hold for them.
 """
 
 from __future__ import annotations
@@ -39,7 +41,8 @@ from tests.conftest import (
 pytestmark = pytest.mark.integration
 
 #: Forks a helper that waits for the root to exit, lingers ``sys.argv[2]`` seconds and exits;
-#: the root exits with ``sys.argv[3]``. The helper records a SIGTERM instead of dying of it.
+#: the root exits with ``sys.argv[3]``. The helper records a SIGTERM instead of dying of it,
+#: and leaves the root's session first when ``sys.argv[4]`` is ``session``.
 _HELPER_TRAINER = """
 import os, signal, sys, time
 from pathlib import Path
@@ -47,6 +50,8 @@ marks = Path(sys.argv[1])
 linger = float(sys.argv[2])
 parent = os.getpid()
 if os.fork() == 0:
+    if sys.argv[4:] == ["session"]:
+        os.setsid()
     signal.signal(signal.SIGTERM, lambda *_: (marks / "helper_sigterm").touch())
     while os.getppid() == parent:
         time.sleep(0.005)
@@ -63,7 +68,8 @@ import pathlib, signal, sys, time, os
 marks = pathlib.Path(sys.argv[1])
 signal.signal(signal.SIGTERM, lambda *_: (marks / "child_sigterm").write_text(repr(time.monotonic())))
 (marks / "child_cmdline").write_bytes(pathlib.Path("/proc/self/cmdline").read_bytes() if sys.platform == "linux" else b"")
-(marks / "child_pid").write_text(str(os.getpid()))
+(marks / "child_pid.tmp").write_text(str(os.getpid()))
+(marks / "child_pid.tmp").replace(marks / "child_pid")
 time.sleep(60)
 """
 
@@ -78,6 +84,47 @@ while not (marks / "child_pid").exists():
 (marks / "root_exit").write_text(repr(time.monotonic()))
 """
 
+#: Starts ``_PERSISTENT_CHILD`` in a session of its own, as torchrun starts a rank, records
+#: when it dies, and SIGKILLs itself, as a killed launcher ends.
+_KILLED_LAUNCHER = f"""
+import os, signal, subprocess, sys, time
+from pathlib import Path
+marks = Path(sys.argv[1])
+subprocess.Popen([sys.executable, "-c", {_PERSISTENT_CHILD!r}, str(marks)], start_new_session=True)
+while not (marks / "child_pid").exists():
+    time.sleep(0.005)
+(marks / "root_exit").write_text(repr(time.monotonic()))
+os.kill(os.getpid(), signal.SIGKILL)
+"""
+
+#: Ignores SIGTERM, starts ``_PERSISTENT_CHILD`` in a session of its own, records its own PID
+#: once the child is up, and runs until killed.
+_STUBBORN_LAUNCHER = f"""
+import os, signal, subprocess, sys, time
+from pathlib import Path
+marks = Path(sys.argv[1])
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+subprocess.Popen([sys.executable, "-c", {_PERSISTENT_CHILD!r}, str(marks)], start_new_session=True)
+while not (marks / "child_pid").exists():
+    time.sleep(0.005)
+(marks / "root_pid.tmp").write_text(str(os.getpid()))
+(marks / "root_pid.tmp").replace(marks / "root_pid")
+time.sleep(60)
+"""
+
+#: ``use_guardian_timing`` patch under which the kernel refuses ``PR_SET_CHILD_SUBREAPER``.
+_REFUSED_SUBREAPER_PATCH = """
+import ctypes
+class _RefusingLibc:
+    def prctl(self, *_args):
+        return -1
+ctypes.CDLL = lambda *_args, **_kwargs: _RefusingLibc()
+"""
+
+_LINUX_ADOPTION = pytest.mark.skipif(
+    sys.platform != "linux", reason="adoption needs a Linux child subreaper"
+)
+
 
 def _trainer(tmp_path: Path, body: str) -> tuple[Path, Path]:
     """Write a trainer script and the directory it leaves its marks in.
@@ -91,12 +138,15 @@ def _trainer(tmp_path: Path, body: str) -> tuple[Path, Path]:
     return write_trainer(tmp_path / "trainer.py", body), marks
 
 
-def _supervise(trial_dir: Path, argv: list[str], *, timeout: float) -> ProcessResult:
+def _supervise(
+    trial_dir: Path, argv: list[str], *, timeout: float, gpu_lease_fds: tuple[int, ...] = ()
+) -> ProcessResult:
     """Run ``argv`` as a supervised trial in ``trial_dir``.
 
     :param Path trial_dir: Attempt directory, created here.
     :param list[str] argv: Trainer command, run through ``exec`` so it is the group root.
     :param float timeout: Trial wallclock budget.
+    :param tuple[int, ...] gpu_lease_fds: Descriptors the guardian inherits as its leases.
     :return ProcessResult: The supervision result.
     """
     trial_dir.mkdir()
@@ -109,7 +159,29 @@ def _supervise(trial_dir: Path, argv: list[str], *, timeout: float) -> ProcessRe
             timeout=timeout,
             trial_dir=trial_dir,
             attempt_id=trial_dir.name,
+            gpu_lease_fds=gpu_lease_fds,
         )
+
+
+def _parent_of(pid: int) -> int:
+    """Return the parent PID that ``/proc/<pid>/stat`` records.
+
+    :param int pid: Live process.
+    :return int: Its parent's PID.
+    """
+    stat = Path(f"/proc/{pid}/stat").read_bytes()
+    return int(stat[stat.rfind(b")") + 2 :].split()[1])
+
+
+def _wait_for_mark(mark: Path) -> None:
+    """Wait up to ten seconds for a trainer to create ``mark``.
+
+    :param Path mark: File the trainer creates.
+    """
+    deadline = time.monotonic() + 10.0
+    while not mark.exists():
+        assert time.monotonic() < deadline, f"{mark.name} never appeared"
+        time.sleep(0.01)
 
 
 def _assert_exited(trial_dir: Path, return_code: int) -> None:
@@ -170,8 +242,7 @@ def test_a_persistent_child_is_terminated_after_the_settle_and_named(
     assert result.cleanup_confirmed
     assert result.failure_reason is not None
     assert result.failure_reason.startswith(
-        f"trainer root exited with code 0, but process group {result.pid} still had live "
-        "descendants 0.5s later"
+        "trainer root exited with code 0, but the trainer still had live descendants 0.5s later"
     )
     assert result.failure_reason.endswith(
         ". They were terminated. Make the trainer wait for its children before exiting"
@@ -239,13 +310,115 @@ def test_descendant_termination_is_outside_the_trial_budget(
     assert result.duration_seconds > budget, "test did not exercise cleanup beyond the budget"
 
 
-def _spawn_guardian(tmp_path: Path, argv: list[str]) -> tuple[subprocess.Popen[bytes], int, int]:
-    """Start a guardian for ``argv`` and wait until it reports the trainer root's exit.
+@_LINUX_ADOPTION
+def test_a_killed_launchers_session_escaped_child_holds_the_lease_until_terminated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guardian adopts a child its SIGKILLed root started in a new session, holds the lease while it runs, then terminates and names it."""
+    use_guardian_timing(monkeypatch, tmp_path, settle_seconds=0.5, term_grace_seconds=0.5)
+    trainer, marks = _trainer(tmp_path, _KILLED_LAUNCHER)
+    lease_read, lease_write = os.pipe()
+    real_wait = process._wait_for_guardian_exit
+
+    def wait_for_cleanup(proc: subprocess.Popen[bytes]) -> bool:
+        # The root is dead and its child still runs, now as the guardian's own child.
+        child_pid = int((marks / "child_pid").read_text())
+        assert reaper.is_pid_alive(child_pid)
+        assert _parent_of(child_pid) == proc.pid
+        assert proc.poll() is None
+        lease = os.readlink(f"/proc/self/fd/{lease_write}")
+        assert os.readlink(f"/proc/{proc.pid}/fd/{lease_write}") == lease
+        return real_wait(proc)
+
+    monkeypatch.setattr(process, "_wait_for_guardian_exit", wait_for_cleanup)
+    trial_dir = tmp_path / "launcher"
+    try:
+        result = _supervise(
+            trial_dir,
+            [sys.executable, str(trainer), str(marks)],
+            timeout=30.0,
+            gpu_lease_fds=(lease_write,),
+        )
+    finally:
+        os.close(lease_write)
+        os.close(lease_read)
+
+    child_pid = int((marks / "child_pid").read_text())
+    assert_descendant_dies(child_pid, on_timeout_msg=f"child {child_pid} survived the guardian")
+    assert (result.return_code, result.cleanup_confirmed) == (-signal.SIGKILL, True)
+    assert result.failure_reason is not None
+    command = (marks / "child_cmdline").read_bytes().replace(b"\0", b" ").decode()
+    assert result.failure_reason.startswith(
+        "trainer root exited with code -9, but the trainer still had live descendants "
+        f"0.5s later: {child_pid} ({command[:40]}"
+    )
+    _assert_exited(trial_dir, -signal.SIGKILL)
+    root_exit = float((marks / "root_exit").read_text())
+    assert float((marks / "child_sigterm").read_text()) - root_exit >= 0.5
+
+
+@_LINUX_ADOPTION
+@pytest.mark.parametrize("code", [0, 3])
+def test_a_session_escaped_helper_that_exits_within_the_settle_keeps_the_roots_exit(
+    tmp_path: Path, code: int
+) -> None:
+    """A helper in a session of its own is waited for, not signalled, and the root's exit stands."""
+    trainer, marks = _trainer(tmp_path, _HELPER_TRAINER)
+    trial_dir = tmp_path / f"escaped-{code}"
+
+    result = _supervise(
+        trial_dir,
+        [sys.executable, str(trainer), str(marks), "0.3", str(code), "session"],
+        timeout=30.0,
+    )
+
+    assert (result.return_code, result.failure_reason, result.cleanup_confirmed) == (
+        code,
+        None,
+        True,
+    )
+    assert (marks / "helper_done").exists(), "the guardian did not wait for the adopted helper"
+    assert not (marks / "helper_sigterm").exists()
+    _assert_exited(trial_dir, code)
+
+
+@_LINUX_ADOPTION
+def test_a_refused_subreaper_leaves_only_the_roots_group_watched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the kernel refuses ``PR_SET_CHILD_SUBREAPER``, a helper in its own session is not waited for."""
+    use_guardian_timing(
+        monkeypatch,
+        tmp_path,
+        settle_seconds=5.0,
+        term_grace_seconds=0.5,
+        patch=_REFUSED_SUBREAPER_PATCH,
+    )
+    trainer, marks = _trainer(tmp_path, _HELPER_TRAINER)
+    trial_dir = tmp_path / "refused"
+
+    result = _supervise(
+        trial_dir,
+        [sys.executable, str(trainer), str(marks), "1.0", "0", "session"],
+        timeout=30.0,
+    )
+
+    assert (result.return_code, result.failure_reason, result.cleanup_confirmed) == (0, None, True)
+    assert not (marks / "helper_done").exists(), "the guardian waited for a helper it cannot adopt"
+    _assert_exited(trial_dir, 0)
+    _wait_for_mark(marks / "helper_done")
+
+
+def _spawn_guardian(
+    tmp_path: Path, argv: list[str], *, until_root_exit: bool = True
+) -> tuple[subprocess.Popen[bytes], int, int]:
+    """Start a guardian for ``argv`` and, by default, wait until it reports the root's exit.
 
     :param Path tmp_path: Attempt directory, whose lifecycle the guardian writes.
     :param list[str] argv: Trainer command.
+    :param bool until_root_exit: Whether to read the ``X`` byte before returning.
     :return tuple[subprocess.Popen[bytes], int, int]: Guardian, trainer group and the
-        status pipe, already past its ``X`` byte.
+        status pipe, past its ``X`` byte when ``until_root_exit`` is set.
     """
     process.write_attempt_lifecycle(tmp_path, attempt_id="settle", state="launching")
     with (tmp_path / "guardian.log").open("w") as output:
@@ -261,7 +434,8 @@ def _spawn_guardian(tmp_path: Path, argv: list[str]) -> tuple[subprocess.Popen[b
         )
     finally:
         os.close(ack_write)
-    assert os.read(status_read, 1) == supervisor._TRAINER_ROOT_EXITED
+    if until_root_exit:
+        assert os.read(status_read, 1) == supervisor._TRAINER_ROOT_EXITED
     return guardian, pgid, status_read
 
 
@@ -399,6 +573,42 @@ def test_the_guarded_shutdown_window_covers_the_settle(
     )
 
 
+@_LINUX_ADOPTION
+def test_cancellation_kills_a_session_escaped_child_once_its_launcher_is_killed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancelled launcher that ignores SIGTERM is killed after the grace; its child in a new session is then adopted and killed at once, before cleanup is confirmed."""
+    use_guardian_timing(monkeypatch, tmp_path, settle_seconds=5.0, term_grace_seconds=0.5)
+    trainer, marks = _trainer(tmp_path, _STUBBORN_LAUNCHER)
+
+    guardian, pgid, status_read = _spawn_guardian(
+        tmp_path, [sys.executable, str(trainer), str(marks)], until_root_exit=False
+    )
+    sent = time.monotonic()
+    try:
+        _wait_for_mark(marks / "root_pid")
+        sent = time.monotonic()
+    finally:
+        guardian.send_signal(signal.SIGTERM)
+        rest = _finish_guardian(guardian, pgid, status_read)
+    elapsed = time.monotonic() - sent
+
+    root_pid = int((marks / "root_pid").read_text())
+    child_pid = int((marks / "child_pid").read_text())
+    assert not reaper.is_pid_alive(root_pid)
+    assert not reaper.is_pid_alive(child_pid), "cleanup was confirmed while the child ran"
+    assert not (marks / "child_sigterm").exists(), "the adopted child got a grace of its own"
+    assert (guardian.returncode, rest) == (-signal.SIGTERM, supervisor._TRAINER_ROOT_EXITED)
+    lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="settle")
+    assert lifecycle is not None
+    assert (lifecycle.state, lifecycle.return_code, lifecycle.cleanup_confirmed) == (
+        "exited",
+        -signal.SIGTERM,
+        True,
+    )
+    assert 0.5 <= elapsed < 5.0
+
+
 #: Logs one line per launch, prints the objective, and leaves a helper that outlives
 #: the root by 0.2 s, or by ``LINGER`` seconds when set; exits with ``EXIT_CODE``.
 _ENGINE_TRAINER = """
@@ -489,6 +699,73 @@ def test_a_shutdown_during_the_settle_keeps_the_finished_result_for_the_next_run
     assert (trial.state, trial.value) == (optuna.trial.TrialState.COMPLETE, 0.5)
     assert winners["p"].metric == 0.5
     assert (marks / "calls").read_text().splitlines() == ["run"]
+
+
+#: A rank its launcher starts in a session of its own: records its PID, then on SIGTERM
+#: records the time and exits.
+_ENGINE_RANK = """
+import os, pathlib, signal, sys, time
+marks = pathlib.Path(sys.argv[1])
+def stop(*_):
+    (marks / "rank_stopped").write_text(repr(time.monotonic()))
+    os._exit(0)
+signal.signal(signal.SIGTERM, stop)
+(marks / "rank_pid.tmp").write_text(str(os.getpid()))
+(marks / "rank_pid.tmp").replace(marks / "rank_pid")
+time.sleep(60)
+"""
+
+#: Logs each launch's start time and prints the objective; the first launch starts
+#: ``_ENGINE_RANK`` in a new session and SIGKILLs itself, as a killed launcher ends.
+_ENGINE_LAUNCHER = """
+import os, signal, subprocess, sys, time
+from pathlib import Path
+marks = Path({marks!r})
+with (marks / "calls").open("a") as calls:
+    calls.write(repr(time.monotonic()) + "\\n")
+print("x=0.5", flush=True)
+if not (marks / "rank_pid").exists():
+    subprocess.Popen([sys.executable, "-c", {rank!r}, str(marks)], start_new_session=True)
+    while not (marks / "rank_pid").exists():
+        time.sleep(0.005)
+    os.kill(os.getpid(), signal.SIGKILL)
+"""
+
+
+@_LINUX_ADOPTION
+def test_the_next_trial_waits_for_the_rank_a_killed_launcher_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A trial whose launcher is killed fails naming its rank, and the next trial starts only once that rank is gone."""
+    use_guardian_timing(monkeypatch, tmp_path, settle_seconds=0.3, term_grace_seconds=0.3)
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    trainer = write_trainer(
+        tmp_path / "trainer.py", _ENGINE_LAUNCHER.format(marks=str(marks), rank=_ENGINE_RANK)
+    )
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        n_trials=2,
+        gpu_policy="none",
+        max_consecutive_failures=5,
+    )
+
+    winners = run_experiment(experiment)
+
+    first, second = sorted(phase_trials(experiment), key=lambda trial: trial.number)
+    rank_pid = int((marks / "rank_pid").read_text())
+    assert first.state == optuna.trial.TrialState.FAIL
+    # The shell that runs the trainer command is the root; it reports the killed launcher.
+    assert f"but the trainer still had live descendants 0.3s later: {rank_pid} (" in str(
+        first.user_attrs[FAILURE_REASON_ATTR]
+    )
+    assert (second.state, second.value) == (optuna.trial.TrialState.COMPLETE, 0.5)
+    assert winners["p"].metric == 0.5
+    starts = [float(line) for line in (marks / "calls").read_text().splitlines()]
+    assert len(starts) == 2
+    assert starts[1] > float((marks / "rank_stopped").read_text())
+    assert not reaper.is_pid_alive(rank_pid)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="reads Linux procfs command lines")
