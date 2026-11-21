@@ -9,7 +9,12 @@ from collections.abc import Collection, Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
-from phasesweep.engine.errors import TrackingSyncRefusedError
+from phasesweep.engine.errors import (
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+    TrackingSyncRefusedError,
+    TrackingTargetUnavailableError,
+)
 from phasesweep.errors import (
     OperatorAction,
     PhaseSweepError,
@@ -21,7 +26,7 @@ from phasesweep.runtime.json import (
     json_number,
     json_object,
 )
-from phasesweep.runtime.shutdown import PhaseSweepShutdown
+from phasesweep.runtime.shutdown import PhaseSweepShutdown, signal_handler_scope
 from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText, plural
 from phasesweep.tracking.records import validate_binding
 from phasesweep.tracking.session import (
@@ -57,6 +62,8 @@ if TYPE_CHECKING:
     from phasesweep.tracking.records import DeliveryRecord, Projection, PublishAction, RunBinding
 
 log = logging.getLogger(__name__)
+# Lines the console shows as the run's own report, not as warnings.
+report = logging.getLogger(REPORT_LOGGER)
 
 
 def _projection(
@@ -473,7 +480,6 @@ def _attempt_trials(ledger: ValidatedLedger, phases: Iterable[str]) -> dict[str,
     :param Iterable[str] phases: Phase names whose studies are read.
     :return dict[str, _AttemptTrial]: Trials that carry an attempt id.
     """
-    from phasesweep.engine.errors import StudySchemaMismatchError, StudyStorageUnavailableError
     from phasesweep.engine.ledger import read_phase_trials
     from phasesweep.engine.state import ATTEMPT_ID_ATTR
 
@@ -710,8 +716,6 @@ def _failure_status(error_class: str | None) -> str:
     :param str | None error_class: Class name of the invocation's failure, if it recorded one.
     :return str: ``KILLED`` or ``FAILED``.
     """
-    from phasesweep.runtime.shutdown import PhaseSweepShutdown
-
     return (
         "KILLED"
         if error_class in {PhaseSweepShutdown.__name__, KeyboardInterrupt.__name__}
@@ -1060,7 +1064,7 @@ def _deliver_outstanding(
         # run whose record is then rebuilt, so the records are counted for their line only once
         # the searches are done.
         if creations:
-            logging.getLogger(REPORT_LOGGER).info(
+            report.info(
                 ReportText(
                     f"MLflow: checking {count_text(0, len(creations))} left by earlier runs."
                 )
@@ -1114,9 +1118,7 @@ def _report_sending(pending: list[Path], own: list[Path]) -> None:
         from_earlier = " left pending by earlier runs"
     else:
         from_earlier = f", {len(pending)} of them left pending by earlier runs"
-    logging.getLogger(REPORT_LOGGER).info(
-        ReportText(f"MLflow: sending {count_text(total, 0)}{from_earlier}.")
-    )
+    report.info(ReportText(f"MLflow: sending {count_text(total, 0)}{from_earlier}."))
 
 
 def _owed(experiment: Experiment, skip: str | None) -> bool:
@@ -1182,8 +1184,6 @@ def deliver_ended_generations(
         before a run's first trial never outlasts ``timeout_seconds_per_run``, defaults to none.
     :raises ProcessCleanupUncertainError: A search or upload worker's cleanup is uncertain.
     """
-    from phasesweep.engine.errors import TrackingTargetUnavailableError
-
     skip = None if recovering else generation_id
     checked = not recovering and summary_binding_path(experiment, generation_id).is_file()
     errors: list[TrackingSyncRefusedError] = []
@@ -1259,8 +1259,6 @@ def deliver_closeout(
     :raises OSError: A record of the run's own cannot be read or written.
     :raises ProcessCleanupUncertainError: An upload worker's cleanup is uncertain.
     """
-    from phasesweep.engine.errors import TrackingTargetUnavailableError
-
     # A run binds its summary run in its first target check.
     checked = summary_binding_path(experiment, generation_id).is_file()
     tally = DeliveryTally() if tally is None else tally
@@ -1302,9 +1300,7 @@ def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryT
     done = delivered_text(tally.delivered, tally.settled)
     if done:
         # A report line, so the console shows that an earlier interruption was made good.
-        logging.getLogger(REPORT_LOGGER).info(
-            ReportText(f"MLflow: {done} left pending by earlier runs.")
-        )
+        report.info(ReportText(f"MLflow: {done} left pending by earlier runs."))
     if counts.pending:
         log.warning(
             "MLflow: %s pending%s; results are saved locally. The next run or %s sends them.%s",
@@ -1465,7 +1461,6 @@ def sync_tracking(
     from phasesweep.engine.attempts import _preflight_active_attempts, _PreflightCleanupReport
     from phasesweep.engine.ledger import validate_ledger
     from phasesweep.engine.locking import _experiment_lock
-    from phasesweep.runtime.shutdown import signal_handler_scope
     from phasesweep.tracking.mlflow import require_mlflow_sdk
 
     if generation_id is not None:

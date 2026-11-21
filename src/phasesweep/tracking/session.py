@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
+from phasesweep.engine.errors import TrackingSyncRefusedError, TrackingTargetUnavailableError
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
@@ -41,7 +42,6 @@ from phasesweep.tracking.records import validate_binding, validate_identity
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Experiment
-    from phasesweep.engine.errors import TrackingSyncRefusedError
     from phasesweep.engine.state import Winner
     from phasesweep.tracking.mlflow import _SdkClient
     from phasesweep.tracking.records import (
@@ -607,8 +607,6 @@ def resolve_pending_creations(
     :raises ProcessCleanupUncertainError: A search worker's cleanup is uncertain.
     :raises TrackingSyncRefusedError: A local creation record could not be read or updated.
     """
-    from phasesweep.engine.errors import TrackingSyncRefusedError
-
     tally = DeliveryTally() if tally is None else tally
     for pending in pending_creation_records(experiment, generation_id, skip=skip):
         if not tally.sending:
@@ -805,8 +803,6 @@ def require_tracking_target(
     :return bool: Whether this check bound the generation's summary run, which only a run's
         first successful check does.
     """
-    from phasesweep.engine.errors import TrackingTargetUnavailableError
-
     settings = experiment.mlflow
     assert settings is not None
     try:

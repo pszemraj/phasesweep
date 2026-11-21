@@ -146,8 +146,8 @@ DESCRIPTION_AWAIT_RUN = (
     "Wait up to timeout_seconds for a launched run to change, become terminal, or require "
     "recovery. Call after launch_run and repeat with the same run_id while run.state is "
     "running, including after reason phase_completed and after a client disconnect; omit "
-    "timeout_seconds for a client-safe 20-second wait, and request longer waits only when the "
-    "client permits them. Stop immediately if run.recovery_required is true. When "
+    f"timeout_seconds for a client-safe {AWAIT_DEFAULT_TIMEOUT_SECONDS}-second wait, and request "
+    "longer waits only when the client permits them. Stop immediately if run.recovery_required is true. When "
     "run.runner_observable is false, monitor durable progress and notify the operator if it "
     "stops. Call get_run_results when terminal. Read-only."
 )
