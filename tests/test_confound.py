@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,7 @@ from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.read import read_status
 from phasesweep.engine.repeats import ReduceName, RepeatAxis, ranked_group
-from phasesweep.engine.selection import select_winner
+from phasesweep.engine.selection import select_winner, tie_group_comparisons
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
@@ -518,18 +519,10 @@ def test_tie_between_distinct_params_is_heterogeneous() -> None:
 
     assert block["checks"]["tie"] == {
         "verdict": "heterogeneous",
-        "detail": {"tied_trials": [1], "within_noise": None},
+        "detail": {"tied_trials": [1], "within_noise": None, "pooled_sd": None, "df": None},
     }
     (line,) = _describe_flagged(block, winner_trial=0)
-    assert line == (
-        "tie: trial(s) 1 matched the winner's value exactly with different params. The tied "
-        "configurations scored identically, so draw order chose the winner that later phases "
-        "inherit. First compare more distinct values and inspect trends across neighboring "
-        "configurations. Use phases[].repeats for a few discrete finalists or an explicit "
-        "noise check."
-    )
-    # Distinct values come before seeds.
-    assert line.index("distinct values") < line.index("phases[].repeats")
+    assert line == "tie: trial 1 matched the winner's value exactly with different params"
 
 
 def test_noise_remedy_accompanies_only_a_flagged_tie() -> None:
@@ -564,6 +557,8 @@ def test_tie_between_repeats_of_one_config_is_unchecked(values: tuple[float, ...
         "remedy": None,
         "tied_trials": None,
         "within_noise": None,
+        "pooled_sd": None,
+        "df": None,
     }
 
 
@@ -599,32 +594,93 @@ def _assess_groups(
     )
 
 
-def test_repeats_tie_flags_groups_within_noise() -> None:
-    """A group whose mean sits within two standard errors of the winner's is flagged."""
-    trials = _trials(
-        (_COMPLETE, 0.50, 1, 0),
-        (_COMPLETE, 0.60, 1, 1),
-        (_COMPLETE, 0.52, 2, 0),
-        (_COMPLETE, 0.62, 2, 1),
-        (_COMPLETE, 0.90, 3, 0),
-        (_COMPLETE, 0.91, 3, 1),
-    )
-    block = _assess_groups(trials, [[0, 1], [2, 3], [4, 5]])
-
-    assert block["ranked_groups"] == [[0, 1], [2, 3], [4, 5]]
-    assert block["checks"]["tie"] == {
-        "verdict": "heterogeneous",
-        "detail": {"tied_trials": [], "within_noise": [3]},
+def _noise_gaps(
+    trials: list[optuna.trial.FrozenTrial], groups: list[list[int]]
+) -> dict[int, tuple[float, float]]:
+    """Return what selection hands the tie line: each group within noise's gap and threshold."""
+    by_number = {trial.number: trial for trial in trials}
+    ranked = [
+        ranked_group(
+            [(number, float(by_number[number].value or 0.0)) for number in members],
+            {"x": by_number[members[0]].params["x"]},
+            "mean",
+        )
+        for members in groups
+    ]
+    best = min(ranked, key=lambda group: (group.aggregate, group.numbers[0]))
+    return {
+        comparison["trial_number"]: (comparison["gap"], comparison["threshold"])
+        for comparison in tie_group_comparisons(best, ranked)
     }
+
+
+def test_repeats_tie_pools_the_spread_of_every_ranked_group() -> None:
+    """Three groups of two seeds share one noise band, worked by hand.
+
+    Variances 0.02, 0.02 and 0.005 pool to 0.015 on df = 3, so pooled_sd = sqrt(0.015) =
+    0.122474. Student's t at 3 df is 3.182446 and the standard error of a difference of two
+    two-seed means is pooled_sd * sqrt(1/2 + 1/2), so the threshold is 0.389768: the 0.1 gap to
+    group 3 is within noise and the 0.55 gap to group 5 is not.
+    """
+    trials = _trials(
+        (_COMPLETE, 1.0, 1, 0),
+        (_COMPLETE, 1.2, 1, 1),
+        (_COMPLETE, 1.1, 2, 0),
+        (_COMPLETE, 1.3, 2, 1),
+        (_COMPLETE, 1.6, 3, 0),
+        (_COMPLETE, 1.7, 3, 1),
+    )
+    groups = [[0, 1], [2, 3], [4, 5]]
+    block = _assess_groups(trials, groups)
+
+    assert block["ranked_groups"] == groups
+    tie = block["checks"]["tie"]
+    assert tie["verdict"] == "heterogeneous"
+    assert tie["detail"] == {
+        "tied_trials": [],
+        "within_noise": [3],
+        "pooled_sd": pytest.approx(math.sqrt(0.015)),
+        "df": 3,
+    }
+    gaps = _noise_gaps(trials, groups)
+    assert gaps == {3: (pytest.approx(0.1), pytest.approx(3.182446 * math.sqrt(0.015)))}
     assert _validate_confound_block(block, winner_trial=1) == block
-    (line,) = _describe_flagged(block, winner_trial=1)
-    assert "repeat group(s) ending at trial(s) 3 are within two standard errors" in line
+    (line,) = _describe_flagged(block, winner_trial=1, noise_gaps=gaps)
+    assert line == (
+        "tie: 1 group is within noise of the winner, threshold 0.389768 (sd 0.122474 pooled "
+        "over 3 groups, df 3): group 3 at gap 0.1"
+    )
     assert _confound_summary(block, winner_trial=1, extractor_kind="json_envelope")["tie"] == {
         "verdict": "heterogeneous",
         "remedy": None,
         "tied_trials": 0,
         "within_noise": 1,
+        "pooled_sd": pytest.approx(math.sqrt(0.015)),
+        "df": 3,
     }
+
+
+def test_pooled_band_holds_a_quiet_pair_the_per_pair_rule_called_clear() -> None:
+    """Two zero-spread groups 0.05 apart are within the spread a third group shows.
+
+    Each group's own sd is 0, so comparing the pair on their own spreads gives a threshold of 0
+    and calls the 0.05 gap clear. Pooled with the third group's variance of 0.08 the band is
+    sqrt(0.08 / 3) = 0.163299 on df 3, a threshold of 3.182446 * 0.163299 = 0.519691.
+    """
+    trials = _trials(
+        (_COMPLETE, 1.00, 1, 0),
+        (_COMPLETE, 1.00, 1, 1),
+        (_COMPLETE, 1.05, 2, 0),
+        (_COMPLETE, 1.05, 2, 1),
+        (_COMPLETE, 2.00, 3, 0),
+        (_COMPLETE, 2.40, 3, 1),
+    )
+    groups = [[0, 1], [2, 3], [4, 5]]
+    block = _assess_groups(trials, groups)
+
+    assert block["checks"]["tie"]["detail"]["within_noise"] == [3]
+    assert block["checks"]["tie"]["detail"]["pooled_sd"] == pytest.approx(math.sqrt(0.08 / 3))
+    assert _noise_gaps(trials, groups)[3][1] == pytest.approx(0.519691, abs=1e-6)
 
 
 def test_repeats_exact_group_tie_is_within_noise_and_clear_groups_are_ok() -> None:
@@ -634,9 +690,16 @@ def test_repeats_exact_group_tie_is_within_noise_and_clear_groups_are_ok() -> No
         (_COMPLETE, 0.5, 2, 0),
         (_COMPLETE, 0.5, 2, 1),
     )
-    tied = _assess_groups(trials, [[0, 1], [2, 3]])
-    assert tied["checks"]["tie"]["detail"] == {"tied_trials": [3], "within_noise": [3]}
-    assert "lowest draw position won" in _describe_flagged(tied, winner_trial=1)[0]
+    groups = [[0, 1], [2, 3]]
+    tied = _assess_groups(trials, groups)
+    assert tied["checks"]["tie"]["detail"] == {
+        "tied_trials": [3],
+        "within_noise": [3],
+        "pooled_sd": 0.0,
+        "df": 2,
+    }
+    (line,) = _describe_flagged(tied, winner_trial=1, noise_gaps=_noise_gaps(trials, groups))
+    assert line.endswith("(sd 0 pooled over 2 groups, df 2): group 3 at gap 0")
 
     clear = _trials(
         (_COMPLETE, 0.50, 1, 0),
@@ -644,15 +707,25 @@ def test_repeats_exact_group_tie_is_within_noise_and_clear_groups_are_ok() -> No
         (_COMPLETE, 0.90, 2, 0),
         (_COMPLETE, 0.91, 2, 1),
     )
-    block = _assess_groups(clear, [[0, 1], [2, 3]])
+    block = _assess_groups(clear, groups)
     assert block["checks"]["tie"] == {
         "verdict": "ok",
-        "detail": {"tied_trials": [], "within_noise": []},
+        "detail": {
+            "tied_trials": [],
+            "within_noise": [],
+            "pooled_sd": pytest.approx(0.01 / math.sqrt(2)),
+            "df": 2,
+        },
     }
 
 
-def test_repeats_median_reducer_ties_equal_medians_and_still_flags_by_standard_error() -> None:
-    """Equal medians are an exact tie under the median reducer, and the SD still sets within_noise."""
+def test_repeats_median_reducer_flags_only_an_exact_tie_and_judges_no_noise() -> None:
+    """A median's sampling spread is unknown at a few seeds, so median groups get no band.
+
+    Equal medians are still an exact tie and flag the check. Without one the check is n/a,
+    never ok, because seed noise was not judged. The same members ranked by mean compare
+    against the pooled band.
+    """
     trials = _trials(
         (_COMPLETE, 1.0, 1, 0),
         (_COMPLETE, 1.0, 1, 1),
@@ -664,10 +737,38 @@ def test_repeats_median_reducer_ties_equal_medians_and_still_flags_by_standard_e
     groups = [[0, 1, 2], [3, 4, 5]]
 
     median = _assess_groups(trials, groups, reduce="median")
-    assert median["checks"]["tie"]["detail"] == {"tied_trials": [5], "within_noise": [5]}
+    assert median["checks"]["tie"] == {
+        "verdict": "heterogeneous",
+        "detail": {"tied_trials": [5], "within_noise": None, "pooled_sd": None, "df": None},
+    }
     assert _validate_confound_block(median, winner_trial=2) == median
+    assert _describe_flagged(median, winner_trial=2) == [
+        "tie: group 5 matched the winner's median exactly"
+    ]
+    assert _confound_summary(median, winner_trial=2, extractor_kind="json_envelope")["tie"] == {
+        "verdict": "heterogeneous",
+        "remedy": None,
+        "tied_trials": 1,
+        "within_noise": None,
+        "pooled_sd": None,
+        "df": None,
+    }
+    apart = _trials(
+        (_COMPLETE, 1.0, 1, 0),
+        (_COMPLETE, 1.0, 1, 1),
+        (_COMPLETE, 1.0, 1, 2),
+        (_COMPLETE, 1.0, 2, 0),
+        (_COMPLETE, 2.0, 2, 1),
+        (_COMPLETE, 3.0, 2, 2),
+    )
+    assert _assess_groups(apart, groups, reduce="median")["checks"]["tie"] == {
+        "verdict": "n/a",
+        "reason": "reduce: median has no noise band, and no group matched the winner's median "
+        "exactly",
+    }
     mean = _assess_groups(trials, groups)
-    assert mean["checks"]["tie"]["detail"] == {"tied_trials": [], "within_noise": [5]}
+    assert mean["checks"]["tie"]["detail"]["within_noise"] == [5]
+    assert mean["checks"]["tie"]["detail"]["df"] == 4
 
 
 def test_repeats_single_group_leaves_tie_unchecked() -> None:
@@ -685,6 +786,8 @@ def test_repeats_single_group_leaves_tie_unchecked() -> None:
         "remedy": None,
         "tied_trials": None,
         "within_noise": None,
+        "pooled_sd": None,
+        "df": None,
     }
 
 
@@ -840,6 +943,11 @@ def _mutated(
             ("checks", "survivorship", "detail", "failed_trials"), [3, 1], id="unsorted-failures"
         ),
         pytest.param(("checks", "tie", "detail", "tied_trials"), ["1"], id="string-trial"),
+        pytest.param(("checks", "tie", "detail", "pooled_sd"), ..., id="tie-without-pooled-sd"),
+        pytest.param(("checks", "tie", "detail", "pooled_sd"), -0.1, id="negative-pooled-sd"),
+        pytest.param(("checks", "tie", "detail", "pooled_sd"), True, id="bool-pooled-sd"),
+        pytest.param(("checks", "tie", "detail", "df"), 0, id="zero-df"),
+        pytest.param(("checks", "tie", "detail", "df"), 2.0, id="float-df"),
         pytest.param(
             ("checks", "evaluation_point"),
             {"verdict": "ok", "detail": {"step": [{"value": 1000, "trials": [0, 1]}]}},
@@ -944,6 +1052,8 @@ def test_summary_exposes_the_evaluation_axis_without_checkpoint_paths() -> None:
             "remedy": _noise_remedy(),
             "tied_trials": 1,
             "within_noise": None,
+            "pooled_sd": None,
+            "df": None,
         },
     }
     rendered = json.dumps(summary)
@@ -972,6 +1082,8 @@ def test_summary_reports_unchecked_counts_as_null() -> None:
         "remedy": None,
         "tied_trials": None,
         "within_noise": None,
+        "pooled_sd": None,
+        "df": None,
     }
 
 
@@ -1176,7 +1288,7 @@ def test_published_block_is_manifest_covered(tmp_path: Path) -> None:
 
     payload["confound"]["checks"]["tie"] = {
         "verdict": "ok",
-        "detail": {"tied_trials": [], "within_noise": None},
+        "detail": {"tied_trials": [], "within_noise": None, "pooled_sd": None, "df": None},
     }
     path.write_text(yaml.safe_dump(payload, sort_keys=False))
 
@@ -1203,6 +1315,8 @@ def test_top_up_reselection_publishes_a_fresh_block_for_its_larger_population(
     assert second["confound"]["checks"]["tie"]["detail"] == {
         "tied_trials": [1, 2],
         "within_noise": None,
+        "pooled_sd": None,
+        "df": None,
     }
 
 

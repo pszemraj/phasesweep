@@ -1,6 +1,6 @@
 schema_version: 6
 experiment: t
-generation_id: ce85f5abe2ff48bebb5818e3bc986d5f
+generation_id: b365e57a2a5c4257bdc07bf2dd0caa25
 phasesweep_version: 0.3.14
 config_fingerprint: 510eb146e62737707cbf637293fedb6a7f213d3715b3bada974b7f90d629f027
 metric:
@@ -28,14 +28,14 @@ phases:
     incomplete: false
     reason: null
     timeout_scope: null
-  generation_id: ce85f5abe2ff48bebb5818e3bc986d5f
-  attempt_id: 13edf6580c11401ebc353cd9a49e85f9
+  generation_id: b365e57a2a5c4257bdc07bf2dd0caa25
+  attempt_id: 1ae3ea25a9204f0ca86f9c76bd3e998c
   winner_source:
     kind: phase_trial
     phase: p
     trial_number: 0
-    generation_id: ce85f5abe2ff48bebb5818e3bc986d5f
-    attempt_id: 13edf6580c11401ebc353cd9a49e85f9
+    generation_id: b365e57a2a5c4257bdc07bf2dd0caa25
+    attempt_id: 1ae3ea25a9204f0ca86f9c76bd3e998c
   trainer_input:
     schema_version: 1
     format: argparse
@@ -43,7 +43,7 @@ phases:
     size_bytes: 13
     sha256: 5e36b6560513586ced65eca0e8b025fe88edbcab82ba2cb67a5fcb2d7b202383
   confound:
-    schema_version: 4
+    schema_version: 5
     ranked_trials:
     - 0
     - 1
@@ -51,9 +51,9 @@ phases:
     checks:
       evaluation_point:
         verdict: n/a
-        reason: log_regex objectives report no evaluation position; json_envelope
-          (report_objective), wandb (evaluation_axis) or mlflow (selected step) would
-          bind one
+        reason: 'log_regex objectives report no evaluation position; json_envelope
+          (report_objective), wandb (evaluation_axis) or mlflow (select: last or step)
+          would bind one'
       survivorship:
         verdict: ok
         detail:
@@ -68,16 +68,18 @@ phases:
           tied_trials:
           - 1
           within_noise: null
+          pooled_sd: null
+          df: null
   observed: {}
   repeats: null
 artifacts:
 - kind: config_snapshot
   path: config.snapshot.yaml
-  sha256: 305c3b162d112d29c28d53fd895ce85eccb0752a6b2da8e29583b455fba67772
+  sha256: 861aea020dceff029d246a56a7697e56b98f0f1e95332c72aeda5598cfe57d42
 - kind: reproducibility
   path: reproducibility.json
-  sha256: 6395423ae7d15975ba1a0299c68b3a88dc60be44d696edcf90b76d730a0f621f
+  sha256: 4df6994a64982b362077e538d116fb8345bdb4aa25302e7c2d2e84a8175da1a4
 - kind: winner
   phase: p
-  sha256: 37f5894cc4bde5e512ddbe04d0539915d0685681b1438d7f29ce386a195c31ad
+  sha256: 4f6562774301784f81f03fd11651dc409277bc714f6f4486781bb05387fd6218
 trainer_config: {}

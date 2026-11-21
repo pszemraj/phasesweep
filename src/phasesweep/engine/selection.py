@@ -40,15 +40,13 @@ from phasesweep.engine.optuna import (
 )
 from phasesweep.engine.paths import _phase_dir
 from phasesweep.engine.repeats import (
-    _NOISE_STANDARD_ERRORS,
     RankedGroup,
     RepeatAxis,
     RepeatsRecord,
-    combined_standard_error,
     group_key,
+    noise_band,
     observed_means,
     ranked_group,
-    within_noise,
 )
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -93,22 +91,27 @@ class TieGroupComparison(typing.TypedDict):
 def tie_group_comparisons(
     winner: RankedGroup, groups: Sequence[RankedGroup]
 ) -> list[TieGroupComparison]:
-    """Describe other configurations within two combined standard errors.
+    """Describe the other configurations whose mean is within the phase's noise band of the winner's.
 
     :param RankedGroup winner: Selected repeat group.
-    :param Sequence[RankedGroup] groups: Groups from the same ranked population.
-    :return list[TieGroupComparison]: Parameters, objective gap and noise threshold for each overlap.
+    :param Sequence[RankedGroup] groups: Every group of the same ranked population, which the
+        band pools (:func:`phasesweep.engine.repeats.noise_band`).
+    :return list[TieGroupComparison]: Parameters, objective gap, standard error of the difference
+        and threshold for each overlap; empty for groups ranked by median, which have no band.
     """
+    band = noise_band(groups)
+    if band is None:
+        return []
     return [
         {
             "trial_number": group.representative,
             "params": json_object(group.params),
             "gap": abs(group.aggregate - winner.aggregate),
-            "combined_se": combined_standard_error(winner, group),
-            "threshold": _NOISE_STANDARD_ERRORS * combined_standard_error(winner, group),
+            "combined_se": band.standard_error(winner, group),
+            "threshold": band.threshold(winner, group),
         }
         for group in groups
-        if dict(group.params) != dict(winner.params) and within_noise(winner, group)
+        if dict(group.params) != dict(winner.params) and band.within(winner, group)
     ]
 
 
@@ -413,17 +416,15 @@ def select_winner(
             if phase is not None and survivorship["verdict"] == "heterogeneous"
             else None
         ),
+        noise_gaps=(
+            None
+            if winning is None or ranking is None
+            else {
+                comparison["trial_number"]: (comparison["gap"], comparison["threshold"])
+                for comparison in tie_group_comparisons(winning, ranking.groups)
+            }
+        ),
     )
-    if winning is not None and ranking is not None:
-        for comparison in tie_group_comparisons(winning, ranking.groups):
-            flagged.append(
-                f"group {comparison['trial_number']} params={comparison['params']} versus "
-                f"winner params={dict(winning.params)}, "
-                f"gap={objective_text(comparison['gap'])}, "
-                f"combined_se={objective_text(comparison['combined_se'])}, "
-                f"threshold={_NOISE_STANDARD_ERRORS:g}*combined_se="
-                f"{objective_text(comparison['threshold'])}"
-            )
     evaluation = confound["checks"]["evaluation_point"]
     remedy = (
         " "
@@ -493,16 +494,24 @@ def _cost_advisory(
 ) -> str | None:
     """Describe a cheaper configuration within one standard error of the winner's mean.
 
+    The standard error is the phase's pooled run-to-run sd over the square root of the
+    winner's group size, from the same noise band the tie check uses
+    (:func:`phasesweep.engine.repeats.noise_band`), so a phase has one noise estimate.
+
     :param Phase phase: Phase declaring a numeric sampled cost key and mean repeats.
     :param RankedGroup winner: Configuration selected by the objective.
     :param Sequence[RankedGroup] groups: Complete feasible configuration groups.
     :param typing.Literal["minimize", "maximize"] goal: Objective direction for breaking cost ties.
+    :raises ValueError: The groups rank by median, which the cost-key validator refuses.
     :return str | None: Advisory text, or ``None`` without a cheaper eligible group or cost key.
     """
     key = phase.cost_key
     if key is None:
         return None
-    winner_se = winner.spread["sd"] / math.sqrt(winner.spread["n"])
+    band = noise_band(groups)
+    if band is None:
+        raise ValueError(f"cost_key {key!r} needs repeats with reduce: mean.")
+    winner_se = band.pooled_sd / math.sqrt(winner.spread["n"])
     eligible = [group for group in groups if abs(group.aggregate - winner.aggregate) <= winner_se]
 
     def cost(group: RankedGroup) -> float:
@@ -520,11 +529,10 @@ def _cost_advisory(
     cheapest = min(eligible, key=lambda group: (cost(group), sign * group.aggregate, group.numbers))
     if cost(cheapest) < cost(winner):
         return (
-            f"one-standard-error cost advisory: params={dict(cheapest.params)} has "
-            f"{key}={cost(cheapest):g} versus winner {key}={cost(winner):g}, "
-            f"gap={objective_text(abs(cheapest.aggregate - winner.aggregate))} <= "
-            f"winner_se={objective_text(winner_se)}. "
-            "The selected winner is unchanged."
+            f"cost advisory: params={dict(cheapest.params)} has {key}={cost(cheapest):g} against "
+            f"the winner's {cost(winner):g} and a mean within one standard error of the "
+            f"winner's (gap {objective_text(abs(cheapest.aggregate - winner.aggregate))}, "
+            f"standard error {objective_text(winner_se)})"
         )
     return None
 

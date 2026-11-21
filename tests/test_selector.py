@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -433,7 +434,12 @@ def test_repeats_tie_goes_to_lowest_group_and_highest_member_names_it() -> None:
     assert winner.confound["ranked_groups"] == [[0, 2, 5], [1, 3, 4]]
     tie = winner.confound["checks"]["tie"]
     assert tie["verdict"] == "heterogeneous"
-    assert tie["detail"] == {"tied_trials": [4], "within_noise": [4]}
+    assert tie["detail"] == {
+        "tied_trials": [4],
+        "within_noise": [4],
+        "pooled_sd": pytest.approx(math.sqrt(0.005)),
+        "df": 4,
+    }
 
 
 def test_repeats_tie_goes_to_the_group_with_the_lowest_member_draw_position() -> None:
@@ -453,6 +459,11 @@ def test_repeats_tie_goes_to_the_group_with_the_lowest_member_draw_position() ->
 
 
 def test_repeats_within_noise_flags_a_close_runner_up_and_clears_a_distant_one() -> None:
+    """Variances 0.0025, 0.0025 and 0.0001 on 2 df each pool to 0.0017 on 6 df.
+
+    The threshold is t(6) * sqrt(0.0017) * sqrt(2/3) = 2.446912 * 0.0336650 = 0.0823753, so the
+    0.02 gap is within noise and the 0.37 gap is not.
+    """
     study = _make_study()
     _add_group(study, 1, [0.50, 0.60, 0.55])
     _add_group(study, 2, [0.52, 0.62, 0.57])
@@ -463,7 +474,12 @@ def test_repeats_within_noise_flags_a_close_runner_up_and_clears_a_distant_one()
     assert winner.params == {"x": 1}
     assert winner.confound["checks"]["tie"] == {
         "verdict": "heterogeneous",
-        "detail": {"tied_trials": [], "within_noise": [5]},
+        "detail": {
+            "tied_trials": [],
+            "within_noise": [5],
+            "pooled_sd": pytest.approx(math.sqrt(0.0017)),
+            "df": 6,
+        },
     }
 
 
@@ -479,7 +495,13 @@ def test_seeded_random_duplicate_configs_rank_as_separate_slots() -> None:
     assert slotted.metric == pytest.approx(0.3)
     assert slotted.confound["ranked_groups"] == [[0, 1, 2], [3, 4, 5]]
     # The other slot repeats the winner's configuration, so it is not a tie candidate.
-    assert slotted.confound["checks"]["tie"]["detail"] == {"tied_trials": [], "within_noise": []}
+    # The band still pools both slots' spread.
+    assert slotted.confound["checks"]["tie"]["detail"] == {
+        "tied_trials": [],
+        "within_noise": [],
+        "pooled_sd": 0.0,
+        "df": 4,
+    }
     with pytest.raises(NoFeasibleTrialError, match="1 group\\(s\\) were incomplete"):
         select_winner(study, _make_exp(), repeats=_axis())
 

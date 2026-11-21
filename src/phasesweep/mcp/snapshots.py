@@ -46,11 +46,12 @@ from phasesweep.runtime.json import JsonObject, dump_json
 log = logging.getLogger("phasesweep.mcp.snapshots")
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
+PositiveInt = Annotated[int, Field(ge=1)]
 NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 McpPublicationState = PublicationState | Literal["unknown"]
 """Engine publication verdict plus the MCP snapshot-unavailable state."""
 
-RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[3] = 3
+RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[4] = 4
 
 
 class _SnapshotModel(BaseModel):
@@ -218,12 +219,17 @@ class TieSummary(_SnapshotModel):
     """Whether draw order or seed noise could have decided the winner.
 
     Without repeats, ok only means no other configuration matched the winner's value
-    exactly; it says nothing about the margin. With repeats, it also flags groups within
-    two standard errors of the winning group. A unit is a trial, or a complete repeat group
-    in a repeats phase.
+    exactly; it says nothing about the margin. With mean repeats, it also flags groups whose
+    mean is within the noise band pooled over every ranked group. A unit is a trial, or a
+    complete repeat group in a repeats phase.
     """
 
-    verdict: ConfoundVerdict = Field(description=_VERDICT_DESCRIPTION)
+    verdict: ConfoundVerdict = Field(
+        description=(
+            f"{_VERDICT_DESCRIPTION} With reduce: median, n/a unless a group matched the "
+            "winner's median exactly, since medians have no noise band."
+        )
+    )
     remedy: str | None = Field(
         description=(
             "For a flagged exact tie between single trials, what draw order decided and how to "
@@ -237,9 +243,19 @@ class TieSummary(_SnapshotModel):
     )
     within_noise: NonNegativeInt | None = Field(
         description=(
-            "Repeat groups whose aggregate is within two standard errors of the winning "
-            "group's, exact ties included. Null without repeats or when not checked."
+            "Repeat groups whose mean differs from the winning group's by at most the "
+            "two-sided 5% Student-t value at df times pooled_sd * sqrt(1/n_winner + 1/n_other), "
+            "exact ties included. Null without repeats, with reduce: median, or when not checked."
         )
+    )
+    pooled_sd: NonNegativeFloat | None = Field(
+        description=(
+            "Run-to-run standard deviation pooled over every ranked repeat group, assuming the "
+            "noise is about the same size at each configuration. Null when within_noise is."
+        )
+    )
+    df: PositiveInt | None = Field(
+        description="Degrees of freedom of pooled_sd: the sum of n - 1 over the ranked groups."
     )
 
 
@@ -279,7 +295,11 @@ class RepeatsSpread(_SnapshotModel):
 
 
 class TieGroupSnapshot(_SnapshotModel):
-    """Configuration overlapping the winner within two combined standard errors."""
+    """Configuration whose mean is within the phase's pooled noise band of the winner's.
+
+    ``combined_se`` is the pooled standard error of the difference between the two means and
+    ``threshold`` the Student-t critical value times it.
+    """
 
     trial_number: NonNegativeInt
     params: dict[str, bool | int | float | str | None]
@@ -395,7 +415,7 @@ def _winner_snapshot(
 class RunResultSnapshot(_SnapshotModel):
     """Terminal status and winners frozen for one MCP run id."""
 
-    schema_version: Literal[3]
+    schema_version: Literal[4]
     status: StatusSnapshot
     winners: list[WinnerSnapshot]
     represented_config_fingerprint: str | None = None

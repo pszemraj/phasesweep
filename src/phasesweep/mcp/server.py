@@ -652,7 +652,7 @@ class WinnerPhasePayload(_ToolPayload):
         description="Whether cost_key is unset, comparison unavailable, no cheaper configuration qualifies, or advice is available."
     )
     tie_groups: list[TieGroupSnapshot] | None = Field(
-        description="Other repeat configurations within two combined standard errors, with params, gap, combined_se and threshold; null when retained trials are unavailable. Parameter values follow visible_params."
+        description="Other repeat configurations whose mean is within the phase's pooled noise band of the winner's, with params, gap, combined_se and threshold; null when retained trials are unavailable. Parameter values follow visible_params."
     )
     confound: ConfoundSummary = Field(
         description="Verdicts on the population this winner was selected from, frozen at selection."

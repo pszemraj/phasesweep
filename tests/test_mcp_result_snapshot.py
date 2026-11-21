@@ -755,6 +755,40 @@ def test_snapshot_freezes_the_repeats_summary_without_config_strings(tmp_path: P
     assert phase["repeats"] == expected
 
 
+def test_snapshot_carries_the_pooled_noise_band_of_a_group_tie(tmp_path: Path) -> None:
+    """An agent reads the band a within-noise count was judged against: pooled sd and its df."""
+    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
+    winner = _engine_winner(1)
+    winner.confound = {
+        **single_trial_confound(1),
+        "ranked_trials": [0, 1, 2, 3],
+        "ranked_groups": [[0, 1], [2, 3]],
+        "checks": {
+            **single_trial_confound(1)["checks"],
+            "tie": {
+                "verdict": "heterogeneous",
+                "detail": {"tied_trials": [], "within_noise": [3], "pooled_sd": 0.05, "df": 2},
+            },
+        },
+    }
+
+    snapshot = mcp_runner.capture_result_snapshot(
+        experiment, generation_id="engine-generation", engine_winners={"p": winner}
+    )
+
+    (frozen,) = snapshot["winners"]
+    assert frozen["confound"]["tie"] == {
+        "verdict": "heterogeneous",
+        "remedy": None,
+        "tied_trials": 0,
+        "within_noise": 1,
+        "pooled_sd": 0.05,
+        "df": 2,
+    }
+    stored = RunResultSnapshot.model_validate(snapshot)
+    assert stored.winners[0].confound.tie.df == 2
+
+
 @pytest.mark.parametrize("from_phase", [None, "b"])
 @pytest.mark.integration
 def test_failed_fingerprint_preflight_preserves_published_results(

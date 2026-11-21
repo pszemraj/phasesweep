@@ -18,11 +18,12 @@ from phasesweep.engine.repeats import (
     _validate_repeats_block,
     group_key,
     group_labels_for,
+    noise_band,
     observed_means,
     ranked_group,
     reduce_values,
     spread,
-    within_noise,
+    t_critical,
 )
 from phasesweep.engine.state import RERUN_OF_ATTR
 from phasesweep.runtime.json import JsonObject
@@ -145,17 +146,47 @@ def test_group_labels_put_a_seeded_random_rerun_in_its_source_slot() -> None:
     assert group_labels_for(recorded, axis) == {0: 3, 1: 3, 2: 4, 3: 3, 4: 4}
 
 
-def test_within_noise_compares_aggregates_against_two_standard_errors() -> None:
+def test_noise_band_pools_every_group_and_compares_means_against_student_t() -> None:
+    """Three groups of two seeds: variances 0.005, 0.005 and 0.00005 pool to 0.00335 on 3 df."""
     winner = ranked_group([(1, 0.50), (0, 0.60)], {"lr": 0.1}, "mean")
     close = ranked_group([(2, 0.52), (3, 0.62)], {"lr": 0.2}, "mean")
     far = ranked_group([(4, 0.90), (5, 0.91)], {"lr": 0.3}, "mean")
 
+    band = noise_band([winner, close, far])
+
     assert winner.numbers == (0, 1)
     assert winner.representative == 1
     assert math.isclose(winner.aggregate, 0.55)
-    assert within_noise(winner, close)
-    assert not within_noise(winner, far)
-    assert within_noise(winner, winner)
+    assert band is not None
+    assert band.df == 3
+    assert band.pooled_sd == pytest.approx(math.sqrt(0.00335))
+    assert band.standard_error(winner, close) == pytest.approx(math.sqrt(0.00335))
+    assert band.threshold(winner, close) == pytest.approx(3.182446 * math.sqrt(0.00335))
+    assert band.within(winner, close)
+    assert not band.within(winner, far)
+    assert band.within(winner, winner)
+
+
+@pytest.mark.parametrize(
+    ("df", "critical"),
+    [(1, 12.706205), (2, 4.302653), (30, 2.042272), (31, 1.959964), (500, 1.959964)],
+)
+def test_t_critical_reads_the_table_and_the_normal_value_past_it(df: int, critical: float) -> None:
+    assert t_critical(df) == critical
+
+
+def test_t_critical_refuses_zero_degrees_of_freedom() -> None:
+    with pytest.raises(ValueError, match="at least one degree of freedom"):
+        t_critical(0)
+
+
+def test_median_groups_have_no_noise_band() -> None:
+    """A median's sampling spread is not the mean's, so no band compares medians."""
+    groups = [
+        ranked_group([(0, 1.0), (1, 1.0), (2, 3.0)], {"lr": 0.1}, "median"),
+        ranked_group([(3, 2.0), (4, 2.0), (5, 2.0)], {"lr": 0.2}, "median"),
+    ]
+    assert noise_band(groups) is None
 
 
 def test_observed_means_average_only_the_members_that_recorded_a_name() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 
 import optuna
@@ -254,13 +255,18 @@ def test_repeats_edge_warning_uses_the_winning_group_and_skips_the_repeat_axis(
 
 
 @pytest.mark.parametrize(
-    ("gap", "half_range", "advised"),
-    [(0.005, 0.02, True), (0.025, 0.02, False), (0.05, 0.1, False)],
+    ("gap", "half_range", "standard_error"),
+    [(0.005, 0.02, "0.02"), (0.025, 0.02, None), (0.05, 0.1, "0.072111")],
 )
-def test_cost_advisory_uses_winner_error_and_keeps_the_winner(
-    gap: float, half_range: float, advised: bool
+def test_cost_advisory_uses_the_pooled_standard_error_and_keeps_the_winner(
+    gap: float, half_range: float, standard_error: str | None
 ) -> None:
-    """Candidate noise cannot widen the winner's one-standard-error window."""
+    """The window is the phase's pooled sd over the root of the winner's group size.
+
+    Both groups' spread sets it, as it sets the tie band: variances 0.0008 and 0.0008 pool to
+    sd 0.0282843 and a window of 0.02, while a candidate with variance 0.02 widens the pool to
+    sd 0.10198 and the window to 0.072111.
+    """
     phase = Phase(
         name="epochs",
         n_trials=4,
@@ -274,14 +280,16 @@ def test_cost_advisory_uses_winner_error_and_keeps_the_winner(
         [(2, 0.5 - half_range + gap), (3, 0.5 + half_range + gap)], {"epochs": 8}, "mean"
     )
     advisory = _cost_advisory(phase, winner, [winner, cheaper], goal="minimize")
-    assert (advisory is not None) == advised
     assert winner.params == {"epochs": 16}
     assert winner.aggregate == 0.5
-    if advised:
-        assert advisory is not None
-        assert "epochs=8" in advisory
-        assert "winner_se=0.02" in advisory
-        assert "selected winner is unchanged" in advisory
+    if standard_error is None:
+        assert advisory is None
+    else:
+        assert advisory == (
+            "cost advisory: params={'epochs': 8} has epochs=8 against the winner's 16 and a mean "
+            f"within one standard error of the winner's (gap {gap:g}, standard error "
+            f"{standard_error})"
+        )
 
 
 @pytest.mark.parametrize("maximize", [False, True])
@@ -366,7 +374,8 @@ def test_cost_key_added_after_publication_is_visible_on_reads_and_replay(
     assert comparisons is not None and len(comparisons) == 1
     assert comparisons[0]["params"] == {"epochs": 8}
     assert comparisons[0]["gap"] == pytest.approx(0.005)
-    assert comparisons[0]["threshold"] == 2 * comparisons[0]["combined_se"]
+    # Two groups of two seeds pool to df 2, whose two-sided 5% t value is 4.302653.
+    assert comparisons[0]["threshold"] == pytest.approx(4.302653 * comparisons[0]["combined_se"])
     drifted = changed.model_copy(
         update={"metric": changed.metric.model_copy(update={"goal": "maximize"})}
     )
@@ -385,7 +394,8 @@ def test_cost_key_added_after_publication_is_visible_on_reads_and_replay(
     write_experiment_config(config_path, changed)
     displayed = CliRunner().invoke(cli, ["show-winners", str(config_path)])
     assert displayed.exit_code == 0, displayed.exception
-    assert "one-standard-error cost advisory" in displayed.output
+    shown = yaml.safe_load(displayed.output.split("=== epochs ===", 1)[1])
+    assert shown["cost_advisory"].startswith("cost advisory: params={'epochs': 8} has epochs=8")
     assert "tie_groups:" in displayed.output
     assert "cost_advisory_status: available" in displayed.output
     replayed = run_experiment(changed)["epochs"]
@@ -531,7 +541,11 @@ def test_float_displays_share_precision_without_changing_recorded_values(
 def test_overlap_warning_keeps_threshold_with_groups_before_evaluation_remedy(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The two-SE threshold stays beside group gaps, followed by evaluation guidance."""
+    """The pooled threshold stays beside the group's gap, followed by evaluation guidance.
+
+    Both groups have sd 0.02 over three seeds, so the band is sd 0.02 on 4 df and the threshold
+    2.776445 * 0.02 * sqrt(2/3) = 0.0453392 holds the 0.03 gap.
+    """
     trainer = write_trainer(
         tmp_path / "trainer.py",
         """
@@ -579,7 +593,11 @@ def test_overlap_warning_keeps_threshold_with_groups_before_evaluation_remedy(
         for record in caplog.records
         if "potential confounds" in record.getMessage()
     )
-    assert "threshold=2*combined_se=" in warning
+    assert re.search(
+        r"tie: 1 group is within noise of the winner, threshold 0\.0453392 \(sd 0\.02 pooled "
+        r"over 2 groups, df 4\): group \d+ at gap 0\.03\. ",
+        warning,
+    )
     assert warning.index("group ") < warning.index(
         ". For a phase that searches training length, report progress="
     )

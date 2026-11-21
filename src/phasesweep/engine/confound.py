@@ -1,8 +1,9 @@
 """Advisory confound verdicts over a phase's ranked population.
 
 Without repeats, ranked units are individual trials. With repeats, they are complete groups,
-whose aggregates are also compared using combined standard errors as a noise heuristic.
-Survivorship counts configurations instead: a trial's params, or a repeat group.
+whose means are also compared against a noise band pooled over every ranked group
+(:func:`phasesweep.engine.repeats.noise_band`). Survivorship counts configurations instead: a
+trial's params, or a repeat group.
 
 Verdicts are frozen at selection, carried unchanged with the winner, and excluded from
 fingerprints. Readers validate the block's shape and never re-judge a verdict. They never
@@ -11,6 +12,7 @@ block selection, publication, or top-ups.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Literal, TypeAlias, TypedDict, get_args
 
@@ -22,13 +24,13 @@ from phasesweep.engine.repeats import (
     RepeatAxis,
     configuration_slot,
     configuration_slots,
-    within_noise,
+    noise_band,
 )
 from phasesweep.engine.state import _unreplaced_attempts
 from phasesweep.errors import FRESH_STUDY
 from phasesweep.evidence.models import POSITIONED_EXTRACTOR_KINDS
 from phasesweep.runtime.json import progress_position
-from phasesweep.runtime.terminal import param_text
+from phasesweep.runtime.terminal import objective_text, param_text
 
 ConfoundVerdict = Literal["ok", "heterogeneous", "n/a"]
 """Outcome of one check. ``ok``: the check ran and found nothing.
@@ -45,7 +47,7 @@ ConfoundCheck = Literal["evaluation_point", "survivorship", "tie"]
 
 CONFOUND_CHECKS: tuple[ConfoundCheck, ...] = get_args(ConfoundCheck)
 
-CONFOUND_SCHEMA_VERSION = 4
+CONFOUND_SCHEMA_VERSION = 5
 
 
 class PositionGroup(TypedDict):
@@ -76,10 +78,17 @@ class SurvivorshipDetail(TypedDict):
 
 
 class TieDetail(TypedDict):
-    """Units that tied the winner exactly, and repeat groups within noise of it."""
+    """Units that tied the winner exactly, and repeat groups within noise of it.
+
+    ``pooled_sd`` and ``df`` are the noise band the groups' means were compared with
+    (:class:`phasesweep.engine.repeats.NoiseBand`). All three noise fields are ``None`` when
+    no band was judged: for single trials, and for groups ranked by median.
+    """
 
     tied_trials: list[int]
     within_noise: list[int] | None
+    pooled_sd: float | None
+    df: int | None
 
 
 class NotChecked(TypedDict):
@@ -440,7 +449,7 @@ def _tie(
     ]
     return {
         "verdict": "heterogeneous" if tied else "ok",
-        "detail": {"tied_trials": tied, "within_noise": None},
+        "detail": {"tied_trials": tied, "within_noise": None, "pooled_sd": None, "df": None},
     }
 
 
@@ -452,10 +461,13 @@ def _group_tie(
 
     ``tied_trials`` names the groups whose aggregate equals the winner's
     exactly; the lowest member draw position broke that tie. ``within_noise``
-    names the groups whose aggregate lies within two combined standard errors
-    of the winner's, exact ties included. Each group is named by its last
-    member. A group with the winner's params is another slot of the same
-    configuration and is skipped.
+    names the groups whose mean lies within the noise band pooled over every
+    ranked group (:func:`phasesweep.engine.repeats.noise_band`), exact ties
+    included. Each group is named by its last member. A group with the winner's
+    params is another slot of the same configuration and is skipped.
+
+    Groups ranked by median have no band. An exact tie still flags the check; without one
+    the check is ``n/a``, because seed noise was not judged and ``ok`` would claim it was.
 
     :param Sequence[RankedGroup] groups: Ranked groups ordered by their members.
     :param optuna.trial.FrozenTrial winner: The last member of the winning group.
@@ -468,10 +480,25 @@ def _group_tie(
         group for group in groups if group is not best and dict(group.params) != dict(best.params)
     ]
     tied = sorted(group.representative for group in others if group.aggregate == best.aggregate)
-    noisy = sorted(group.representative for group in others if within_noise(best, group))
+    band = noise_band(groups)
+    if band is None:
+        if not tied:
+            return _not_checked(
+                "reduce: median has no noise band, and no group matched the winner's median exactly"
+            )
+        return {
+            "verdict": "heterogeneous",
+            "detail": {"tied_trials": tied, "within_noise": None, "pooled_sd": None, "df": None},
+        }
+    noisy = sorted(group.representative for group in others if band.within(best, group))
     return {
         "verdict": "heterogeneous" if tied or noisy else "ok",
-        "detail": {"tied_trials": tied, "within_noise": noisy},
+        "detail": {
+            "tied_trials": tied,
+            "within_noise": noisy,
+            "pooled_sd": band.pooled_sd,
+            "df": band.df,
+        },
     }
 
 
@@ -664,20 +691,33 @@ def _count(value: object, *, label: str) -> int:
 
 
 def _validate_tie_detail(detail: object) -> TieDetail:
-    """Validate tie evidence: exact ties with other params, and groups within noise.
+    """Validate tie evidence: exact ties with other params, groups within noise, and the band.
 
     :param object detail: Parsed evidence.
-    :raises ValueError: A list is missing or malformed.
+    :raises ValueError: A field is missing or extra, a list is malformed, ``pooled_sd`` is
+        not null or a finite non-negative number, or ``df`` is not null or a positive int.
     :return TieDetail: The validated evidence.
     """
-    if not isinstance(detail, Mapping) or set(detail) != {"tied_trials", "within_noise"}:
-        raise ValueError("confound tie evidence must list tied_trials and within_noise")
-    noisy = detail["within_noise"]
+    fields = set(TieDetail.__annotations__)
+    if not isinstance(detail, Mapping) or set(detail) != fields:
+        raise ValueError(f"confound tie evidence must hold {', '.join(sorted(fields))}")
+    noisy, pooled_sd, df = detail["within_noise"], detail["pooled_sd"], detail["df"]
+    if pooled_sd is not None and (
+        isinstance(pooled_sd, bool)
+        or not isinstance(pooled_sd, int | float)
+        or not math.isfinite(pooled_sd)
+        or pooled_sd < 0
+    ):
+        raise ValueError("confound tie pooled_sd is not a finite non-negative number")
+    if df is not None and (type(df) is not int or df < 1):
+        raise ValueError("confound tie df is not a positive count")
     return {
         "tied_trials": _trial_numbers(detail["tied_trials"], label="tie tied_trials"),
         "within_noise": (
             None if noisy is None else _trial_numbers(noisy, label="tie within_noise")
         ),
+        "pooled_sd": None if pooled_sd is None else float(pooled_sd),
+        "df": df,
     }
 
 
@@ -723,6 +763,7 @@ def _describe_flagged(
     trials: Sequence[optuna.trial.FrozenTrial] = (),
     untried_cells: Sequence[Mapping[str, object]] = (),
     retry_step: str | None = None,
+    noise_gaps: Mapping[int, tuple[float, float]] | None = None,
 ) -> list[str]:
     """Describe each flagged check with the numbers behind it, for operator logs.
 
@@ -735,6 +776,12 @@ def _describe_flagged(
     :param str | None retry_step: The raised ``n_trials`` that retries the failed
         configurations (:func:`phasesweep.engine.study_policy._raised_target_step`), defaults
         to None.
+    :param Mapping[int, tuple[float, float]] | None noise_gaps: The gap and threshold of each
+        group within noise of the winning group, by the group's last member
+        (:func:`phasesweep.engine.selection.tie_group_comparisons`), which a repeats phase's
+        flagged tie needs; defaults to None.
+    :raises ValueError: A repeats phase's tie flags groups within noise without ``noise_gaps``
+        for them.
     :return list[str]: One sentence per flagged check; empty when none flagged.
     """
     checks = block["checks"]
@@ -755,14 +802,14 @@ def _describe_flagged(
     tie = checks["tie"]
     if tie["verdict"] == "heterogeneous":
         detail = tie["detail"]
-        if detail["within_noise"] is None:
-            tied = ", ".join(str(number) for number in detail["tied_trials"])
+        groups = block["ranked_groups"]
+        if groups is None:
             lines.append(
-                f"tie: trial(s) {tied} matched the winner's value exactly with different "
-                "params. " + _noise_remedy()
+                f"tie: {_numbered('trial', detail['tied_trials'])} matched the winner's value "
+                "exactly with different params"
             )
         else:
-            lines.extend(_describe_group_tie(detail["tied_trials"], detail["within_noise"]))
+            lines.append(_describe_group_tie(detail, groups=len(groups), noise_gaps=noise_gaps))
     return lines
 
 
@@ -891,29 +938,50 @@ def _noise_remedy() -> str:
     )
 
 
-def _describe_group_tie(tied: Sequence[int], noisy: Sequence[int]) -> list[str]:
+def _numbered(noun: str, numbers: Sequence[int]) -> str:
+    """Name trials or groups by number, the noun in the plural for more than one.
+
+    :param str noun: ``trial`` or ``group``.
+    :param Sequence[int] numbers: Their trial numbers, at least one.
+    :return str: Such as ``group 5`` or ``groups 5, 8``.
+    """
+    return f"{noun}{'' if len(numbers) == 1 else 's'} {', '.join(map(str, numbers))}"
+
+
+def _describe_group_tie(
+    detail: TieDetail, *, groups: int, noise_gaps: Mapping[int, tuple[float, float]] | None
+) -> str:
     """Describe a flagged tie between repeat groups, each named by its last member.
 
-    :param Sequence[int] tied: Groups that matched the winning group's aggregate exactly.
-    :param Sequence[int] noisy: Groups within noise of it, exact ties included.
-    :return list[str]: A sentence for exact ties and one for the other groups within noise.
+    Exact ties are within noise too, so with a band they are listed among those groups at a
+    gap of 0. Groups ranked by median have no band and flag only on an exact tie.
+
+    :param TieDetail detail: Flagged tie evidence of a repeats phase.
+    :param int groups: How many groups were ranked, which the band pools.
+    :param Mapping[int, tuple[float, float]] | None noise_gaps: Gap and threshold by group.
+    :raises ValueError: A group within noise has no entry in ``noise_gaps``.
+    :return str: The warning fragment.
     """
-    lines: list[str] = []
-    if tied:
-        lines.append(
-            f"tie: the repeat group(s) ending at trial(s) {', '.join(map(str, tied))} matched "
-            "the winning group's aggregate exactly with different params, and the group "
-            "with the lowest draw position won"
+    noisy, pooled_sd, df = detail["within_noise"], detail["pooled_sd"], detail["df"]
+    if noisy is None or pooled_sd is None or df is None:
+        return (
+            f"tie: {_numbered('group', detail['tied_trials'])} matched the winner's median exactly"
         )
-    untied = [number for number in noisy if number not in tied]
-    if untied:
-        lines.append(
-            ("tie: " if not lines else "")
-            + f"the repeat group(s) ending at trial(s) {', '.join(map(str, untied))} are "
-            "within two standard errors of the winning group's aggregate, so their order "
-            "may be seed noise"
-        )
-    return lines
+    if noise_gaps is None or any(number not in noise_gaps for number in noisy):
+        raise ValueError("every repeat group within noise needs its gap and threshold")
+    # Complete groups all hold one member per repeat value, so every pair shares a threshold.
+    threshold = noise_gaps[noisy[0]][1]
+    listed = ", ".join(
+        f"group {number} at gap {objective_text(noise_gaps[number][0])}"
+        for number in noisy[:_LOGGED_VALUES]
+    )
+    if len(noisy) > _LOGGED_VALUES:
+        listed += f" and {len(noisy) - _LOGGED_VALUES} more"
+    return (
+        f"tie: {len(noisy)} {'group is' if len(noisy) == 1 else 'groups are'} within noise of "
+        f"the winner, threshold {objective_text(threshold)} (sd {objective_text(pooled_sd)} "
+        f"pooled over {groups} groups, df {df}): {listed}"
+    )
 
 
 def _confound_summary(
@@ -973,5 +1041,7 @@ def _confound_summary(
                 if tie_detail is None or tie_detail["within_noise"] is None
                 else len(tie_detail["within_noise"])
             ),
+            "pooled_sd": None if tie_detail is None else tie_detail["pooled_sd"],
+            "df": None if tie_detail is None else tie_detail["df"],
         },
     }
