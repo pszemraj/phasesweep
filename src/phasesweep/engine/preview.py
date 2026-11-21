@@ -68,6 +68,15 @@ from phasesweep.runtime.terminal import REPORT_LOGGER
 log = logging.getLogger(REPORT_LOGGER)
 
 
+def warn_dry_run(message: str, *args: object) -> None:
+    """Log a dry-run warning under the one label that readers and tests scan for.
+
+    :param str message: Logging format string, without the label.
+    :param object args: Values substituted into the format string.
+    """
+    log.warning(f"DRY RUN warning: {message}", *args)
+
+
 @dataclass(frozen=True, slots=True)
 class RecordedPhase:
     """What a ledger already holds for one phase, counted as a launch would count it."""
@@ -200,9 +209,8 @@ def _read_recorded_phases(experiment: Experiment) -> dict[str, RecordedPhase | N
     try:
         studies = read_phase_studies(validate_ledger(experiment))
     except StudyStorageUnavailableError as exc:
-        log.warning(
-            "DRY RUN warning: the ledger could not be inspected, and a real run refuses "
-            "a ledger it cannot read: %s",
+        warn_dry_run(
+            "the ledger could not be inspected, and a real run refuses a ledger it cannot read: %s",
             exc,
         )
         return {phase.name: None for phase in experiment.phases}
@@ -382,8 +390,8 @@ def _preview_phase(
                 recorded.study, experiment, phase, inherited_winners
             )
         else:
-            log.warning(
-                "DRY RUN warning: phase=%s fingerprint comparison awaits the inherited "
+            warn_dry_run(
+                "phase=%s fingerprint comparison awaits the inherited "
                 "winner whose values are placeholders",
                 phase.name,
             )
@@ -419,14 +427,14 @@ def _preview_phase(
         logger=log,
     )
     if recorded is None:
-        log.warning(
-            "DRY RUN warning: phase=%s recorded trials could not be read, so it is "
+        warn_dry_run(
+            "phase=%s recorded trials could not be read, so it is "
             "previewed as a fresh phase; a real run refuses a ledger it cannot read",
             phase.name,
         )
     elif recorded.running:
-        log.warning(
-            "DRY RUN warning: phase=%s has %d RUNNING attempt(s) that a real run recovers "
+        warn_dry_run(
+            "phase=%s has %d RUNNING attempt(s) that a real run recovers "
             "before it checks the phase, as failed where the trial recorded a failure and "
             "otherwise as interrupted, which reruns; they are counted that way, and its "
             "accepted target, abort state and partial decision are not checked",

@@ -418,8 +418,28 @@ def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
 
     with _experiment_lock(experiment):
         _preview(experiment, tmp_path, caplog)
-    assert "another operation is active" in caplog.text
+    assert "DRY RUN warning: another operation is active" in caplog.text
     assert "In-flight trials can still finish without a rerun" in caplog.text
+    assert "DRY RUN hypothetical restart total:" in caplog.text
+
+
+def test_dry_run_labels_the_warning_that_it_could_not_check_for_an_active_run(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every dry-run warning carries the `DRY RUN warning:` label a reader scans for."""
+    experiment = _persistent(tmp_path, _phase("a", 2))
+
+    def unreadable_lock(_experiment: Experiment) -> bool:
+        raise OSError("lock directory is unreadable")
+
+    monkeypatch.setattr("phasesweep.engine.run.locking_ops.experiment_is_busy", unreadable_lock)
+    _preview(experiment, tmp_path, caplog)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == [
+        "DRY RUN warning: could not check whether the experiment is active: "
+        "lock directory is unreadable"
+    ]
     assert "DRY RUN hypothetical restart total:" in caplog.text
 
 

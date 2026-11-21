@@ -45,6 +45,7 @@ from phasesweep.engine.preview import (
     _dry_run_total_line,
     _preview_ledger,
     _preview_phase,
+    warn_dry_run,
 )
 from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import (
@@ -729,13 +730,13 @@ def _run_experiment_inner(
         try:
             busy = locking_ops.experiment_is_busy(experiment)
         except (OSError, UnsafeLockPathError, PlatformCapabilityError) as exc:
-            report.warning("DRY RUN could not check whether the experiment is active: %s", exc)
+            warn_dry_run("could not check whether the experiment is active: %s", exc)
             busy = None
         if busy is not False:
             preview_context = "hypothetical restart "
         if busy:
-            report.warning(
-                "DRY RUN another operation is active. Counts below assume a restart from this "
+            warn_dry_run(
+                "another operation is active. Counts below assume a restart from this "
                 "snapshot. In-flight trials can still finish without a rerun."
             )
         # A tree this PhaseSweep cannot use refuses before the preview, as a launch would.
@@ -743,7 +744,7 @@ def _run_experiment_inner(
         for _phase, lines in experiment_disclosures(experiment):
             for warning, line in lines:
                 if warning:
-                    report.warning("DRY RUN warning: %s", line)
+                    warn_dry_run("%s", line)
                 else:
                     report.info("DRY RUN %s", line)
         preloaded_winners = resume_ops._preflight_skipped_winners(
