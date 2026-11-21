@@ -521,7 +521,7 @@ def test_failed_trainer_http_summary_delivery_and_sync(local_server, tmp_path, m
     assert read_status(experiment)["phases"] == status["phases"]
 
 
-_OBJECTIVE_HINT = "logged under another key or logging went to another run"
+_OBJECTIVE_HINT = "run finished without the objective metric"
 
 
 def _managed_loss_experiment(
@@ -607,7 +607,7 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     assert read_status(experiment)["phases"][0]["trials"]["FAIL"] == 1
     if trainer_outcome in {"no_objective", "ended_then_logged"}:
         assert caplog.text.count(_OBJECTIVE_HINT) == 1
-        assert "read MLFLOW_RUN_ID before any MLflow call" in caplog.text
+        assert "run PhaseSweep supplies (MLFLOW_RUN_ID)" in caplog.text
         assert "loss" not in remote.data.metrics
     else:
         assert remote.data.metrics["loss"] == 0.01

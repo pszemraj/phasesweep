@@ -348,11 +348,9 @@ def _warn_dropped_cuda_visibility(
     _warn_once(
         log,
         ("dropped-cuda-visibility", experiment.experiment, phase_name, ambient),
-        "[%s] ambient CUDA_VISIBLE_DEVICES=%r is outside the "
-        "execution.inherit_env=%r contract and this phase leases no device, so trials "
-        "will see every host GPU and hold no GPU host lock. Set a top-level "
-        "env.CUDA_VISIBLE_DEVICES to bind trainer visibility — it is fingerprinted and "
-        "also drives GPU pool discovery, so lock set and trainer visibility stay in step.",
+        "[%s] ambient CUDA_VISIBLE_DEVICES=%r is dropped by execution.inherit_env=%r and "
+        "this phase leases no device, so trials see every host GPU. Set a top-level "
+        "env.CUDA_VISIBLE_DEVICES to bind them.",
         phase_name,
         ambient,
         experiment.execution.inherit_env,
@@ -484,17 +482,15 @@ def _warn_narrowed_environment_exit(
         log,
         ("narrowed-environment-exit", experiment.experiment, phase_name),
         "[%s/trial_%d] the trainer exited with code %d under execution.inherit_env=%r, "
-        "so it received only %s plus env and passthrough_env values. If it needs another "
-        "ambient variable (PYTHONPATH, a virtualenv or conda setting, a cache path, a "
-        "credential), name it in execution.inherit_env: [NAME], set it under env:, or set "
-        "execution.inherit_env: all.%s The trainer's own error is in stderr.log in the "
-        "trial directory. This hint is shown once per phase.",
+        "so it received only %s plus env and passthrough_env values.%s If it needs another "
+        "ambient variable, name it in execution.inherit_env: [NAME]; see `phasesweep "
+        "explain execution.inherit_env`.",
         phase_name,
         trial_id,
         return_code,
         experiment.execution.inherit_env,
         ", ".join(admitted),
-        "" if stderr_line is None else f' Its last stderr line was "{stderr_line}".',
+        "" if stderr_line is None else f' Last stderr line: "{stderr_line}".',
     )
 
 
@@ -510,12 +506,9 @@ def _warn_managed_objective_missing(
     _warn_once(
         log,
         ("mlflow-objective-missing", experiment.experiment, phase_name),
-        "[%s/trial_%d] the managed MLflow run finished without the objective metric. Check "
-        "whether the objective was logged under another key or logging went to another run. "
-        "Log the configured metric key into the supplied run; after end_run() or another "
-        "start_run(), resume its saved ID. Give a logger the supplied run ID: read "
-        "MLFLOW_RUN_ID before any MLflow call, or use mlflow.active_run().info.run_id while "
-        "the run is active. This hint is shown once per phase.",
+        "[%s/trial_%d] the managed MLflow run finished without the objective metric. Log the "
+        "configured metric key into the run PhaseSweep supplies (MLFLOW_RUN_ID); see "
+        "`phasesweep explain mlflow.run_mode`.",
         phase_name,
         trial_id,
     )
@@ -857,8 +850,7 @@ def extract_trial_result(
             rc=rc,
             duration=duration,
             failure_reason=(
-                f"phase/run wallclock deadline exceeded before {stage}; the trainer "
-                "finished but its evidence could not be evaluated within the budget"
+                f"phase/run wallclock deadline exceeded before {stage}; the trainer finished"
             ),
             deadline_exhausted=True,
         )

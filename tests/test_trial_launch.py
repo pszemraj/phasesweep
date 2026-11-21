@@ -663,7 +663,7 @@ def test_nonzero_exit_under_narrowed_environment_warns_once_per_phase(
     assert len(hints) == 2
     assert hints[0].startswith("[p/trial_0] the trainer exited with code 3 under ")
     assert hints[1].startswith("[other/trial_0] the trainer exited with code 4 under ")
-    for fix in ("execution.inherit_env: [NAME]", "env:", "execution.inherit_env: all"):
+    for fix in ("execution.inherit_env: [NAME]", "phasesweep explain execution.inherit_env"):
         assert fix in hints[0]
     assert "PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, TZ" in hints[0]
     assert ("HF_HOME" in hints[0]) == isinstance(execution.inherit_env, list)
@@ -829,8 +829,8 @@ def test_stderr_naming_a_missing_environment_input_keeps_the_hint(
 
     assert result.failure_reason == f"non-zero exit code 1; stderr: {line}"
     (hint,) = _environment_hints(caplog)
-    assert f'Its last stderr line was "{line}".' in hint
-    assert "execution.inherit_env: all" in hint
+    assert f'Last stderr line: "{line}".' in hint
+    assert "name it in execution.inherit_env: [NAME]" in hint
 
 
 @pytest.mark.parametrize(
@@ -899,9 +899,11 @@ def test_missing_managed_objective_warns_once_per_phase_and_each_reason_keeps_th
         ]
 
     assert [result.failure_reason for result in results] == [f"metric extractor: {diagnostic}"] * 3
-    hints = [r.getMessage() for r in caplog.records if "logged under another key" in r.getMessage()]
+    hints = [
+        r.getMessage() for r in caplog.records if "finished without the objective" in r.getMessage()
+    ]
     assert [hint.split()[0] for hint in hints] == ["[p/trial_0]", "[other/trial_0]"]
-    assert all("read MLFLOW_RUN_ID before any MLflow call" in hint for hint in hints)
+    assert all("run PhaseSweep supplies (MLFLOW_RUN_ID)" in hint for hint in hints)
 
 
 @pytest.mark.parametrize(
@@ -927,7 +929,7 @@ def test_nonzero_exit_without_a_stderr_line_keeps_the_reason_and_the_hint(
 
     assert result.failure_reason == "non-zero exit code 2"
     (hint,) = _environment_hints(caplog)
-    assert "Its last stderr line" not in hint
+    assert "Last stderr line" not in hint
 
 
 @pytest.mark.parametrize(
