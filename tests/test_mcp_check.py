@@ -15,6 +15,7 @@ from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.registry import Registry, check_catalog
 from phasesweep.mcp.runs import FRESH_STATE_DIR_STEP
 from phasesweep.runtime.files import PlatformCapabilityError
+from tests.conftest import patch_path_method_failure
 from tests.mcp_helpers import mcp_experiment_config_text, write_mcp_config_catalog
 
 
@@ -120,14 +121,12 @@ def test_catalog_keeps_healthy_entries_when_a_config_path_cannot_be_read(
     )
     blocked = tmp_path / "bad.yaml"
     if invalid_path == "inaccessible":
-        stat_path = Path.stat
-
-        def stat_with_denial(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-            if path == blocked:
-                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
-            return stat_path(path, follow_symlinks=follow_symlinks)
-
-        monkeypatch.setattr(Path, "stat", stat_with_denial)
+        patch_path_method_failure(
+            monkeypatch,
+            blocked,
+            "stat",
+            PermissionError(errno.EACCES, os.strerror(errno.EACCES), blocked),
+        )
     else:
         catalog.write_text(
             catalog.read_text().replace(str(blocked), "~missing-phasesweep-user/bad.yaml")
@@ -444,14 +443,9 @@ def test_catalog_reports_a_definite_trainer_directory_refusal(
         {"blocked": blocked, "healthy": mcp_experiment_config_text(tmp_path, name="healthy")},
         allow={"launch": True},
     )
-    stat = Path.stat
-
-    def stat_with_error(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-        if path == denied:
-            raise OSError(error, os.strerror(error), path)
-        return stat(path, follow_symlinks=follow_symlinks)
-
-    monkeypatch.setattr(Path, "stat", stat_with_error)
+    patch_path_method_failure(
+        monkeypatch, denied, "stat", OSError(error, os.strerror(error), denied)
+    )
     blocked_entry, healthy_entry = check_catalog(catalog).entries
     assert blocked_entry.ok is not refused
     if refused:
