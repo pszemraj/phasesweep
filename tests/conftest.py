@@ -41,7 +41,7 @@ from phasesweep.config.models import (
     Observation,
     Phase,
 )
-from phasesweep.config.search import IntParam, Sampler
+from phasesweep.config.search import CategoricalParam, IntParam, Sampler
 from phasesweep.engine.artifact_roots import (
     _check_artifact_root_binding,
     _write_artifact_root_binding,
@@ -758,6 +758,26 @@ def make_experiment(
         kwargs["execution"] = execution
 
     return Experiment(**kwargs)
+
+
+def grid_experiment(name: str = "phasesweep_starter") -> Experiment:
+    """Build the starter's shape: two grid phases of two trials each on the CPU."""
+    grid = {"x": CategoricalParam(type="categorical", choices=[1, 2])}
+    return make_experiment(
+        experiment=name,
+        metric=FAKE_TRAIN_METRIC,
+        storage="auto",
+        phases=[
+            Phase(
+                name=phase,
+                n_trials=2,
+                gpu_policy="none",
+                sampler=Sampler(type="grid"),
+                search_space=grid,
+            )
+            for phase in ("depth", "learning_rate")
+        ],
+    )
 
 
 def write_experiment_config(path: Path, experiment: Experiment) -> Path:
