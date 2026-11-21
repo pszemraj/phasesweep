@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
-import shutil
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, Literal, NamedTuple, TypedDict
 
 import optuna
@@ -1197,8 +1196,7 @@ def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdenti
         )
 
 
-#: Words ``/bin/sh`` handles itself rather than finding on PATH: the reserved words and
-#: builtins of dash and bash, since either may be ``/bin/sh``.
+#: Reserved words and builtins of dash and bash, either of which may be ``/bin/sh``.
 _SHELL_OWN_WORDS = frozenset(
     [
         "case",
@@ -1280,20 +1278,8 @@ _SHELL_OWN_WORDS = frozenset(
         "wait",
     ]
 )
-#: A first word of only these characters names a program with no quoting, expansion,
-#: assignment or placeholder in it.
 _PLAIN_PROGRAM = re.compile(r"[A-Za-z0-9_./+-]+")
-#: Characters the trial command's lexer splits out as shell operators. The newline is one
-#: because it separates commands.
-_SHELL_OPERATOR_CHARS = "();<>|&\n"
-#: The operators after a program that cannot rescue its failure: ``&&``, and a redirection
-#: (``>``, ``2>&1``), which belongs to the program's own command.
-_NON_RESCUING_OPERATOR = re.compile(r"&&|[<>]+&?")
-#: Openers of the quoting contexts ``shlex`` has no rule for: a command substitution, a braced
-#: expansion and an ANSI-C string. The shell reads quotes nested in a substitution or expansion,
-#: or escaped in an ANSI-C string, differently, so ``shlex`` can pair them otherwise and read a
-#: real ``||`` as quoted text.
-_UNMODELED_QUOTING = ("$(", "`", "${", "$'")
+_SHELL_SYNTAX = "\n\r();<>|&#\\'\"$`"
 
 
 def _require_launch_target(experiment: Experiment, *, path: str | None = None) -> None:
@@ -1308,18 +1294,28 @@ def _require_launch_target(experiment: Experiment, *, path: str | None = None) -
     :param Experiment experiment: Experiment whose ``execution.cwd`` and trial command are checked.
     :param str | None path: ``PATH`` the trainer receives, or ``None`` to judge only a program
         written with a ``/``, which no ``PATH`` changes.
-    :raises LaunchEnvironmentError: ``execution.cwd`` is not a directory on this host, or the
-        trial command's program cannot be found.
+    :raises LaunchEnvironmentError: The trainer directory or plain program is known
+        to be unavailable.
     """
-    missing = _missing_trainer_cwd(experiment)
-    if missing is not None:
+    try:
+        missing = _missing_trainer_cwd(experiment)
+        if missing is not None:
+            raise LaunchEnvironmentError(
+                missing,
+                remediation="Create that directory, or set execution.cwd to an existing one.",
+            )
+        cwd = experiment.execution.resolved_cwd() or Path.cwd()
+    except PermissionError as exc:
         raise LaunchEnvironmentError(
-            missing, remediation="Create that directory, or set execution.cwd to an existing one."
-        )
+            f"Cannot access the trainer directory: {exc}. No trial was allocated.",
+            remediation="Restore access to the directory, or set execution.cwd to an accessible one.",
+        ) from exc
+    except OSError:
+        return
     refusal = _trial_program_refusal(
         experiment.trial_command,
         path=path,
-        cwd=experiment.execution.resolved_cwd() or Path.cwd(),
+        cwd=cwd,
         path_from_config="PATH" in experiment.env,
     )
     if refusal is not None:
@@ -1330,23 +1326,27 @@ def _require_launch_target(experiment: Experiment, *, path: str | None = None) -
         )
 
 
+def _is_executable_file(path: Path) -> bool | None:
+    """Check for a regular executable when its path can be inspected.
+
+    :param Path path: Program candidate as resolved from the trainer's directory.
+    :return bool | None: Whether the candidate is executable, or ``None`` if unknown.
+    """
+    try:
+        return S_ISREG(path.stat().st_mode) and os.access(path, os.X_OK)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return None
+
+
 def _trial_program_refusal(
     command: str, *, path: str | None, cwd: Path, path_from_config: bool = False
 ) -> tuple[str, str] | None:
     """Judge whether the shell that runs a trial command can find its program.
 
-    The trial command runs through ``/bin/sh``, so only a first word with no quoting,
-    expansion, assignment or placeholder is judged, and never a word the shell handles
-    itself. A missing first program fails the whole command only when nothing after it can
-    rescue it, so a command is judged only when it is one simple command or commands joined
-    by ``&&``. Any other operator outside quotes (``||``, ``;``, ``|``, ``&``, a subshell or a
-    newline between commands) can run something else after the failure. A backslash at a line
-    end continues the command, so the two lines are joined before the words are read; two
-    backslashes there may be an escaped backslash before a real line end, which leaves the
-    command unjudged. So does a ``#`` anywhere: a comment runs to its line end whatever
-    quotes it holds, which this lexer cannot follow. So does a command substitution, a braced
-    expansion or an ANSI-C string, which this lexer does not model. Anything the check cannot
-    judge is left to the shell, never refused.
+    Only a plain executable name in one simple command is checked. Shell operators, quotes,
+    expansions and continuations are left to the shell, which can resolve them in context.
 
     :param str command: The trial command template.
     :param str | None path: ``PATH`` the trainer receives, or ``None`` to judge only a program
@@ -1357,35 +1357,15 @@ def _trial_program_refusal(
     :return tuple[str, str] | None: Refusal diagnosis and remedy, or ``None`` when the program
         is found or cannot be judged.
     """
-    text = command.strip()
-    if "#" in text or "\\\\\n" in text or any(opener in text for opener in _UNMODELED_QUOTING):
+    text = command.strip(" \t\n")
+    if any(char in text for char in _SHELL_SYNTAX):
         return None
-    text = text.replace("\\\n", "")
-    try:
-        lexer = shlex.shlex(text, posix=True, punctuation_chars=_SHELL_OPERATOR_CHARS)
-        lexer.whitespace = " \t\r"
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        words = list(lexer)
-    except ValueError:
-        return None
-    if not words or text.split(maxsplit=1)[0] != words[0]:
-        return None
-    # A quoted word that looks like an operator reads as one here, which only leaves the
-    # command unjudged.
-    for word in words[1:]:
-        if (
-            word
-            and all(char in _SHELL_OPERATOR_CHARS for char in word)
-            and _NON_RESCUING_OPERATOR.fullmatch(word) is None
-        ):
-            return None
-    program = words[0]
+    program = re.split(r"[ \t]", text, maxsplit=1)[0]
     if program in _SHELL_OWN_WORDS or _PLAIN_PROGRAM.fullmatch(program) is None:
         return None
     if "/" in program:
         resolved = cwd / program
-        if resolved.is_file() and os.access(resolved, os.X_OK):
+        if _is_executable_file(resolved) is not False:
             return None
         where = (
             f"is {program!r}" if str(resolved) == program else f"{program!r} resolves to {resolved}"
@@ -1397,9 +1377,9 @@ def _trial_program_refusal(
         )
     if path is None:
         return None
-    # The shell resolves a relative PATH entry against the trainer's directory.
-    search = os.pathsep.join(str(cwd / entry) for entry in path.split(os.pathsep))
-    if shutil.which(program, path=search) is not None:
+    if any(
+        _is_executable_file(cwd / entry / program) is not False for entry in path.split(os.pathsep)
+    ):
         return None
     source = (
         "the PATH the config's `env` sets"

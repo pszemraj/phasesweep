@@ -3,9 +3,8 @@
 The trial command runs through ``/bin/sh`` on the PATH the run starts with, in the trainer's
 working directory. A program that PATH lacks, or a missing ``execution.cwd``, would fail every
 trial before its trainer ran and record each as a failure, so the launch preflight refuses
-them up front. The program check judges only a plain first word, and only in a command that no
-later operator could rescue; it never refuses a command it cannot judge. ``validate`` runs the
-directory check and judges a program written with a ``/``, whose answers no ``PATH`` changes.
+them up front. The program check judges only a plain executable in one simple command.
+``validate`` checks the directory and a program written with a ``/``, which do not depend on PATH.
 """
 
 from __future__ import annotations
@@ -99,10 +98,11 @@ def test_program_missing_from_a_path_the_config_sets_is_sent_to_the_config(tmp_p
 
 
 def test_relative_path_entry_resolves_against_the_trainer_directory(tmp_path: Path) -> None:
-    """A relative PATH entry is searched from the trainer's directory, as its shell would."""
-    _executable(tmp_path / "tools" / "trainer")
+    """A relative PATH entry is searched from the trainer's directory even when it contains a colon."""
+    cwd = tmp_path / "trainer:project"
+    _executable(cwd / "tools" / "trainer")
 
-    assert _trial_program_refusal("trainer", path="tools", cwd=tmp_path) is None
+    assert _trial_program_refusal("trainer", path="tools", cwd=cwd) is None
 
 
 @pytest.mark.parametrize("program", ["./run.sh", "scripts/run.sh"])
@@ -134,49 +134,31 @@ def test_absolute_program_must_be_an_executable_file(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "command",
     [
-        pytest.param(f"{_MISSING} 'unbalanced", id="unsplittable"),
         pytest.param(f"if true; then {_MISSING}; fi", id="reserved-word"),
         pytest.param(f"exec {_MISSING} --x 1", id="builtin"),
-        pytest.param("printf 'x=1\\n'", id="printf-builtin"),
-        pytest.param("chdir . && true", id="dash-chdir-builtin"),
-        pytest.param(f". ./env.sh && {_MISSING}", id="dot-builtin"),
+        pytest.param("chdir .", id="dash-chdir-builtin"),
         pytest.param(f"CUDA_VISIBLE_DEVICES=0 {_MISSING}", id="assignment"),
         pytest.param(f"$PYTHON {_MISSING}.py", id="parameter-expansion"),
         pytest.param(f"~/bin/{_MISSING}", id="tilde"),
         pytest.param("{python} train.py --config {config_path}", id="placeholder"),
         pytest.param(f"{_MISSING}* --x 1", id="glob"),
         pytest.param(f"'{_MISSING}' --x 1", id="quoted"),
-        pytest.param(f'{_MISSING}"" --x 1', id="partly-quoted"),
-        pytest.param(f"{_MISSING}>out.log", id="redirection"),
+        pytest.param(f'{_MISSING} --x ""', id="quoted-argument"),
+        pytest.param(f"{_MISSING} --lr $LR", id="parameter-argument"),
+        pytest.param(f"{_MISSING} >out.log", id="redirection"),
         pytest.param("", id="empty"),
         pytest.param(f"{_MISSING} --x 1 || true", id="or-fallback"),
-        pytest.param(f"{_MISSING} --x 1 || {_MISSING}-2 --x 1", id="or-second-program"),
+        pytest.param(f"{_MISSING} --x 1 && true", id="and-chain"),
         pytest.param(f"{_MISSING} --x 1 ; true", id="sequence"),
         pytest.param(f"{_MISSING} --x 1 | tee out.log", id="pipe"),
         pytest.param(f"{_MISSING} --x 1 &", id="background"),
         pytest.param(f"{_MISSING} --x 1\ntrue", id="newline-between-commands"),
-        pytest.param(f"{_MISSING} --x 1 && true || true", id="and-then-or"),
-        pytest.param(f"{_MISSING} --x $(true)", id="command-substitution"),
         pytest.param(
             f'{_MISSING} "$(echo "\'")" || echo "$(echo "\'")"',
             id="fallback-after-nested-quotes-in-command-substitution",
         ),
-        pytest.param(
-            f'{_MISSING} "`echo "\'"`" || echo "`echo "\'"`"',
-            id="fallback-after-nested-quotes-in-backticks",
-        ),
-        pytest.param(
-            f'{_MISSING} "${{v:-"\'"}}" || echo "${{v:-"\'"}}"',
-            id="fallback-after-nested-quotes-in-braced-expansion",
-        ),
-        # Where /bin/sh is bash (macOS), $'a\'b' is one word; shlex ends its quote at the escaped one.
-        pytest.param(f"{_MISSING} $'a\\'b' || true \\'", id="fallback-after-ansi-c-string"),
-        pytest.param(f"{_MISSING} --x 1 '||' true", id="quoted-operator-word"),
-        pytest.param(f"{_MISSING} \\\n  --x 1 \\\n  || true", id="continued-or-fallback"),
+        pytest.param(f"{_MISSING} \\\n  --x 1", id="continued-command"),
         pytest.param(f"{_MISSING} --x 1 # don't\ntrue # it's", id="comment-quotes-span-lines"),
-        pytest.param(f"{_MISSING} a\\;b # #\\\n < out.log", id="comment-ends-in-backslash"),
-        pytest.param(f"{_MISSING} --tag '#1'", id="hash-in-argument"),
-        pytest.param(f"{_MISSING} out.log \\\\\ntrue", id="escaped-backslash-before-newline"),
     ],
 )
 def test_program_check_skips_what_it_cannot_judge(tmp_path: Path, command: str) -> None:
@@ -188,21 +170,14 @@ def test_program_check_skips_what_it_cannot_judge(tmp_path: Path, command: str) 
     "command",
     [
         pytest.param(f"{_MISSING} --x 1", id="simple"),
-        pytest.param(f"{_MISSING} --x 1 && true", id="and-chain"),
-        pytest.param(f"{_MISSING} --x 1 && true && true", id="long-and-chain"),
-        pytest.param(f"{_MISSING} --x 1 > out.log 2>&1", id="redirections"),
-        pytest.param(f"{_MISSING} --x 'a || b; c | d'", id="operators-inside-quotes"),
-        pytest.param(f'{_MISSING} --x ""', id="empty-argument"),
-        pytest.param(f'{_MISSING} --x $LR --y "$LR"', id="plain-parameter-argument"),
         pytest.param(f"{_MISSING} --x 1\n", id="trailing-newline"),
         pytest.param(f"\n  {_MISSING} --x 1  ", id="surrounding-whitespace"),
-        pytest.param(f"{_MISSING} \\\n  --x 1", id="indented-continuation"),
     ],
 )
-def test_program_check_refuses_a_command_nothing_after_its_program_can_rescue(
+def test_program_check_refuses_a_missing_program_in_a_simple_command(
     tmp_path: Path, command: str
 ) -> None:
-    """A missing first program fails the whole command when only ``&&`` follows it."""
+    """A simple command whose program is missing fails before allocating a trial."""
     refusal = _trial_program_refusal(command, path=str(tmp_path), cwd=tmp_path)
 
     assert refusal is not None

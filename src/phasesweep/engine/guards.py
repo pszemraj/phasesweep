@@ -128,14 +128,10 @@ def _preflight_existing_studies(
         if isinstance(exc, (ProcessCleanupUncertainError, StudyStorageUnavailableError)):
             report.mark_uncertain(exc)
         errors.append(exc)
-    reached = from_phase is None
     for phase in experiment.phases:
-        if phase.name == from_phase:
-            reached = True
         study = loaded.get(phase.name)
         if study is None:
             continue
-        studies[phase.name] = study
         try:
             # Each attempt is collected as soon as its trial's durable state
             # changes, so a later trial's refusal must not drop the evidence
@@ -176,7 +172,18 @@ def _preflight_existing_studies(
         try:
             _validate_study_direction(study, experiment.metric.goal)
             _initialize_study_schema(study)
-            if reached:
+        except Exception as exc:
+            errors.append(exc)
+        else:
+            studies[phase.name] = study
+    # An unreadable tracker leaves finished training pending. Until it answers, neither the
+    # retry ceiling nor the need for a trainer is known, and the run reports pending evidence.
+    if not report.unreadable_evidence:
+        for _, phase in experiment.phases_from(from_phase):
+            study = studies.get(phase.name)
+            if study is None:
+                continue
+            try:
                 _validate_trial_target(study, phase)
                 partial_decision = _load_accepted_partial_decision(study)
                 finished_trials = _finished_trial_count(study.get_trials(deepcopy=False))
@@ -185,8 +192,8 @@ def _preflight_existing_studies(
                 )
                 if needs_new_trials:
                     _launch_preflight(experiment, phase.name, study)
-        except Exception as exc:
-            errors.append(exc)
+            except Exception as exc:
+                errors.append(exc)
     _raise_collected_errors(errors)
     return studies
 

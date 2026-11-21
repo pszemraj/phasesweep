@@ -17,6 +17,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from stat import S_ISDIR
 from typing import Any
 
 import optuna
@@ -462,11 +463,18 @@ def _missing_trainer_cwd(experiment: Experiment) -> str | None:
     """Describe a configured trainer directory that is not a directory on this host.
 
     :param Experiment experiment: Experiment whose ``execution.cwd`` is checked.
+    :raises OSError: The directory cannot be inspected for a reason other than absence.
     :return str | None: The diagnostic, or ``None`` when ``execution.cwd`` is unset or names
         a directory.
     """
     trainer_cwd = experiment.execution.resolved_cwd()
-    if trainer_cwd is None or trainer_cwd.is_dir():
+    if trainer_cwd is None:
+        return None
+    try:
+        is_directory = S_ISDIR(trainer_cwd.stat().st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        is_directory = False
+    if is_directory:
         return None
     configured = experiment.execution.cwd
     if configured == str(trainer_cwd):

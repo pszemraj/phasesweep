@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import os
 import tempfile
 from pathlib import Path
 
@@ -374,6 +376,50 @@ def test_mcp_check_prints_the_trainer_directory_and_refuses_a_missing_one(tmp_pa
     )
     assert "fix: Create that directory, or set execution.cwd to an existing one." in result.output
     assert result.exit_code == 2
+
+
+@pytest.mark.parametrize(
+    ("field", "error", "refused"),
+    [
+        ("execution.cwd", errno.EACCES, True),
+        ("execution.cwd", errno.EIO, False),
+        ("trial_command", errno.EACCES, False),
+    ],
+)
+def test_catalog_reports_a_definite_trainer_directory_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, error: int, refused: bool
+) -> None:
+    """A denied cwd has a permissions fix, while inconclusive inspections are deferred."""
+    denied = tmp_path / "denied" / "trainer"
+    blocked = mcp_experiment_config_text(tmp_path, name="blocked")
+    if field == "execution.cwd":
+        blocked += f"execution:\n  cwd: {denied}\n"
+    else:
+        blocked = blocked.replace("python train.py", str(denied))
+    catalog = write_mcp_config_catalog(
+        tmp_path,
+        {"blocked": blocked, "healthy": mcp_experiment_config_text(tmp_path, name="healthy")},
+    )
+    stat = Path.stat
+
+    def stat_with_error(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if path == denied:
+            raise OSError(error, os.strerror(error), path)
+        return stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", stat_with_error)
+    blocked_entry, healthy_entry = check_catalog(catalog).entries
+    assert blocked_entry.ok is not refused
+    if refused:
+        assert "Cannot access the trainer directory" in (blocked_entry.error or "")
+        assert str(denied) in (blocked_entry.error or "")
+        assert "Restore access" in (blocked_entry.suggestion or "")
+    assert healthy_entry.ok
+    registry = Registry.load(catalog, collect_errors=True)
+    assert registry.get("healthy").id == "healthy"
+    assert [failure.experiment_id for failure in registry.failures] == (
+        ["blocked"] if refused else []
+    )
 
 
 def test_mcp_check_prints_a_fix_for_every_failing_entry(tmp_path: Path) -> None:

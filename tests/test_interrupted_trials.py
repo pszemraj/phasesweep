@@ -1356,13 +1356,19 @@ def test_unreadable_tracker_leaves_finished_training_pending_until_it_answers(
     """A tracker that gives no answer stops the run with each finished trial pending; its next answer is kept.
 
     The run's reconciliation learns of the outage from the live stop, so it reads no tracker,
-    and its pending evidence names only attempts.
+    and its pending evidence names only attempts. Until the tracker answers, the run cannot
+    know whether new trainers are needed and leaves their launch checks to a later pass.
     """
     import phasesweep.engine.guards as guards_module
 
     caplog.set_level(logging.INFO)
     tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
     experiment, launches = wandb_objective_experiment(tmp_path, n_trials=n_jobs, n_jobs=n_jobs)
+    trainer_cwd = tmp_path / "trainer-cwd"
+    trainer_cwd.mkdir()
+    experiment = experiment.model_copy(
+        update={"execution": experiment.execution.model_copy(update={"cwd": str(trainer_cwd)})}
+    )
     reconciliations: list[_PreflightCleanupReport] = []
     reconcile = guards_module._reconcile_existing_studies
 
@@ -1391,6 +1397,9 @@ def test_unreadable_tracker_leaves_finished_training_pending_until_it_answers(
         trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials
     }
     assert reconciliation.unreadable_tracker == str(refused.value)
+    trainer_cwd.rmdir()
+    with pytest.raises(TrackingTargetUnavailableError, match="tracker could not be read"):
+        run_experiment(experiment)
     _assert_restored_tracker_keeps_training(experiment, tracker, launches, caplog)
     # Only a failed run reconciles.
     assert len(reconciliations) == 1
