@@ -221,9 +221,9 @@ def test_cancel_requires_catalog_and_launch_time_permission(
     with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted") as denied:
         app.cancel(run_id)
     assert (
-        f"To stop this run, the operator can run `kill -TERM -{handle.pgid}` from a host "
-        f"shell, which signals runner PID {handle.pid} and its process group {handle.pgid}; "
-        "the runner handles SIGTERM as cancellation. Do not retry."
+        f"To stop this run, the operator can check that `ps -p {handle.pid} -o args=` shows "
+        f"`runner.py --run-id {run_id}`, then run `kill -TERM {handle.pid}` from a host shell. "
+        "The runner handles SIGTERM as cancellation. Do not retry."
     ) in str(denied.value)
 
 
@@ -324,7 +324,7 @@ def test_cancel_refusal_gives_no_pid_number_from_a_container_namespace(
         app.cancel(handle.run_id)
 
     message = str(denied.value)
-    assert f"run `pgrep -af {handle.run_id}` from a host shell" in message
+    assert f"find the PID of `runner.py --run-id {handle.run_id}`" in message
     assert str(handle.pid) not in message
     assert str(handle.pgid) not in message
 
@@ -333,7 +333,7 @@ def test_cancel_refusal_gives_no_pid_number_from_a_container_namespace(
 def test_cancel_refusal_names_a_stop_route_only_it_can_give(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: str
 ) -> None:
-    """A runner whose PID cannot be read here is found with pgrep; a finished run gets no stop route."""
+    """A runner whose PID cannot be read here is found by its run id; a finished run gets no stop route."""
     config = write_srv_config(tmp_path)
     app, registry, store = make_mcp_app(
         write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
@@ -361,10 +361,8 @@ def test_cancel_refusal_names_a_stop_route_only_it_can_give(
         assert "To stop this run" not in message
     else:
         assert (
-            f"To stop this run, the operator can run `pgrep -af {run_id}` from a host shell, take "
-            f"the PID of its `runner.py --run-id {run_id}` line and run `kill -TERM -<that PID>`, "
-            "since the runner leads its own process group; the runner handles SIGTERM as "
-            "cancellation. Do not retry."
+            f"find the PID of `runner.py --run-id {run_id}` in `ps -A -o pid=,args=`, "
+            "then run `kill -TERM PID` with that PID from a host shell."
         ) in message
 
 

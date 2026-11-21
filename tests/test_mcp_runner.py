@@ -1906,10 +1906,8 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
         trial_dir = _wait_for_running_trial(config, proc, log_path)
         trial_pgid = json.loads((trial_dir / PROCESS_IDENTITY_FILE).read_text())["pgid"]
 
-        # SIGTERM the runner's process group. The trial runs in its OWN session,
-        # so this does not reach it directly; the runner's installed shutdown
-        # handler tears the trial group down, then exits 128+SIGTERM = 143.
-        os.killpg(proc.pid, signal.SIGTERM)
+        # The manual stop targets the runner; its handler stops the separate trial group.
+        proc.terminate()
         proc.wait(timeout=30)
 
     assert proc.returncode == 143, (

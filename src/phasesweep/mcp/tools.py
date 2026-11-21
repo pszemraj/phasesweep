@@ -1928,7 +1928,7 @@ class PhaseSweepMCP:
         :param RunHandle handle: Run whose cancellation was refused.
         :return str | None: Where ``RunStore.runner_may_be_alive`` rules the runner out, the
             remediation a read of the run reports, else its recover-run step. Otherwise the
-            route naming its PID and group when this server can probe them and its numbers
+            route naming its PID when this server can probe it and its numbers
             are the host's, else the run id to find the runner by, or the recorded failure's
             remediation for an unobservable runner whose run requires recovery. ``None``
             when the run is not running.
@@ -1943,12 +1943,12 @@ class PhaseSweepMCP:
                 return str(failure["remediation"])
             return f"Its runner has exited; ask the operator to {recover_run_step(handle.run_id)}."
         if view.visibility == "observable":
-            return runner_stop_step(handle.run_id, handle.pid, handle.pgid)
+            return runner_stop_step(handle.run_id, handle.pid)
         if observation.recovery_required:
             failure = run_failure_payload(self._runs, handle, view=view, observation=observation)
             if failure is not None:
                 return str(failure["remediation"])
-        return runner_stop_step(handle.run_id, None, None)
+        return runner_stop_step(handle.run_id, None)
 
     def _cancel_allowed(self, handle: RunHandle) -> bool:
         """Require both launch-time and current cancellation permission.

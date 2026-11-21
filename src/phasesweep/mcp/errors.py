@@ -100,33 +100,24 @@ def live_runner_step(pid: int | None, pgid: int | None, run_id: str) -> str:
     )
 
 
-def runner_stop_step(run_id: str, pid: int | None, pgid: int | None) -> str:
-    """Return the operator's route to stop a running run that ``cancel_run`` may not stop.
+def runner_stop_step(run_id: str, pid: int | None) -> str:
+    """Give the operator a host command that signals the runner handling cancellation.
 
-    The runner leads its own process group and handles SIGTERM as cancellation, so a
-    group SIGTERM ends the run ``cancelled`` with its trials cleaned up. The command names
-    the recorded group only in the host's initial PID namespace, and the run to find the
-    runner by anywhere else.
-
-    :param str run_id: The run to stop.
-    :param int | None pid: The runner's recorded PID, if any.
-    :param int | None pgid: The runner's recorded process group, if any.
-    :return str: One sentence naming the host command.
+    :param str run_id: Run id to verify in the runner's command line.
+    :param int | None pid: Recorded runner PID, if observable in this namespace.
+    :return str: The operator's stop instruction.
     """
-    pid, pgid = _host_runner_numbers(pid, pgid)
-    if pid is not None and pgid is not None:
-        found = (
-            f"run `kill -TERM -{pgid}` from a host shell, which signals runner PID {pid} and "
-            f"its process group {pgid}"
-        )
+    runner = f"runner.py --run-id {run_id}"
+    if pid is not None and in_initial_pid_namespace():
+        step = f"check that `ps -p {pid} -o args=` shows `{runner}`, then run `kill -TERM {pid}`"
     else:
-        found = (
-            f"run `pgrep -af {run_id}` from a host shell, take the PID of its "
-            f"`runner.py --run-id {run_id}` line and run `kill -TERM -<that PID>`, since the "
-            "runner leads its own process group"
+        step = (
+            f"find the PID of `{runner}` in `ps -A -o pid=,args=`, "
+            "then run `kill -TERM PID` with that PID"
         )
     return (
-        f"To stop this run, the operator can {found}; the runner handles SIGTERM as cancellation."
+        f"To stop this run, the operator can {step} from a host shell. "
+        "The runner handles SIGTERM as cancellation."
     )
 
 
