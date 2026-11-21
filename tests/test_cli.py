@@ -79,7 +79,8 @@ from tests.recovery_helpers import recover_run_cli
                 "r.json",
                 "eval.loss",
                 "evaluation_point check: n/a (json objectives record no evaluation position; "
-                "json_envelope via report_objective, wandb with evaluation_axis, or mlflow would)",
+                "json_envelope via report_objective, wandb with evaluation_axis, or mlflow with "
+                "select: last or step would)",
             ],
         ),
         (
@@ -99,7 +100,7 @@ from tests.recovery_helpers import recover_run_cli
                 "stdout.log",
                 "evaluation_point check: n/a (log_regex objectives record no evaluation "
                 "position; json_envelope via report_objective, wandb with evaluation_axis, "
-                "or mlflow would)",
+                "or mlflow with select: last or step would)",
             ],
         ),
         (

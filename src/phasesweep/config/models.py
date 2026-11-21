@@ -331,7 +331,8 @@ def _evaluation_point_line(metric: Metric) -> str:
     if extractor.type not in POSITIONED_EXTRACTOR_KINDS:
         return (
             f"{prefix} n/a ({extractor.type} objectives record no evaluation position; "
-            "json_envelope via report_objective, wandb with evaluation_axis, or mlflow would)"
+            "json_envelope via report_objective, wandb with evaluation_axis, or mlflow with "
+            "select: last or step would)"
         )
     if isinstance(extractor, JsonEnvelopeExtractor):
         source = (
