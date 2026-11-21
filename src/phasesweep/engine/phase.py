@@ -211,7 +211,7 @@ _UNLAUNCHED_ABORT_CAUSE = "phase aborted before this trial's trainer launched"
 
 
 class _TrialLeftRunning(BaseException):
-    """Keep a trial RUNNING, with no outcome, and stop the phase with ``error``.
+    """Keep a trial RUNNING for evidence or journal recovery and stop the phase with ``error``.
 
     Optuna does not catch this BaseException subclass, so it commits no terminal
     state. After workers drain, ``_run_phase`` raises ``error``, unless a worker's
@@ -1273,7 +1273,7 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         try:
             return _execute_objective(run, trial)
         except _TrialLeftRunning:
-            # The trial deliberately has no outcome; no later handler may record one.
+            # Recovery owns the unresolved trial and any outcome already in the journal.
             raise
         except (_DeadlineTrialExecutionError, _UnlaunchedAbortError) as exc:
             _record_outcome(run, trial, "interrupted", cause=str(exc))

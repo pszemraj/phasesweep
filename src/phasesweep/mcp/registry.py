@@ -477,7 +477,7 @@ class CatalogCheckEntry:
 
     @property
     def ok(self) -> bool:
-        """Whether the entry would load at server startup.
+        """Whether the entry passed the requested catalog checks.
 
         :return bool: True when the entry passed every validation rule.
         """

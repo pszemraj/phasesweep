@@ -1285,8 +1285,8 @@ _SHELL_SYNTAX = "\n\r();<>|&#\\'\"$`"
 def _require_launch_target(experiment: Experiment, *, path: str | None = None) -> None:
     """Refuse a trainer directory that does not exist or a trial program the shell cannot run.
 
-    Without ``path`` no shell's ``PATH`` changes the answer, so ``validate`` and the MCP
-    catalog load ask it that way. A launch passes the trainer's ``PATH`` in
+    Without ``path`` no shell's ``PATH`` changes the answer, so ``validate`` and ``mcp check``
+    call it that way. A launch passes the trainer's ``PATH`` in
     :func:`_launch_preflight`, because the ``PATH`` that counts is the one the run starts with.
     With ``execution.cwd`` unset the trainer starts where PhaseSweep was started, so a relative
     program is judged against that directory, as a run started there would resolve it.
