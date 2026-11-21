@@ -171,7 +171,7 @@ def _send(
                 "MLflow: %s is pending (%s).%s",
                 record_name(path),
                 exc,
-                f" MLflow did not answer, so {later} later record(s) wait too."
+                f" MLflow did not answer, so {plural(later, 'later record')} must wait too."
                 if unanswered and later
                 else "",
             )
