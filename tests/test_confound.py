@@ -44,6 +44,7 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_ATTR,
     Winner,
 )
+from phasesweep.errors import FRESH_STUDY
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from phasesweep.evidence.models import MlflowExtractor
 from phasesweep.runtime.json import JsonObject
@@ -257,8 +258,11 @@ def test_evaluation_point_disagreement_is_heterogeneous(
     check = block["checks"]["evaluation_point"]
     assert check == {"verdict": "heterogeneous", "detail": {"axis": axis, "values": groups}}
     assert _flagged_checks(block) == ["evaluation_point"]
-    values = ", ".join(str(group["value"]) for group in groups)
-    assert f"2 distinct {axis} values ({values})" in _describe_flagged(block)[0]
+    short, furthest = groups[0]["value"], groups[1]["value"]
+    assert _describe_flagged(block, winner_trial=2)[0].startswith(
+        f"evaluation_point: the winner, trial 2, was measured at {axis} {short}; 1 ranked trial "
+        f"fell more than 1% short of the furthest, {furthest}: trial 2 at {short}. "
+    )
 
 
 _BINDING_TEXT = (
@@ -333,26 +337,31 @@ def test_mlflow_best_value_objective_leaves_evaluation_point_unchecked(select: s
         }
 
 
-def test_evaluation_point_heterogeneous_line_mentions_training_length() -> None:
-    """A flagged position is expected when the search space changes training length."""
-    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2))
-    block = _assess(trials, trials, provenance={0: _envelope(step=400), 1: _envelope(step=1000)})
+def test_evaluation_point_line_names_the_winner_the_short_trials_and_every_ordinary_cause() -> None:
+    """The line says where the winner and each short trial stand, and does not pick a cause."""
+    trials = _trials(*[(_COMPLETE, 0.5 - index / 100, index) for index in range(8)])
+    steps = [1000, 400, 500, 600, 700, 800, 900, 995]
+    block = _assess(
+        trials, trials, provenance={n: _envelope(step=step) for n, step in enumerate(steps)}
+    )
 
-    (line,) = _describe_flagged(block)
+    (line,) = _describe_flagged(block, winner_trial=7)
 
-    assert "2 distinct step values (400, 1000)" in line
-    assert line.endswith(
-        "Expected when this phase's search space changes training length "
-        "(for example epochs or max_steps); otherwise the trials were not trained to one budget. "
-        "A training-length phase checks relative completion on a schedule_fraction axis, "
-        "which still flags a run that stopped early"
+    assert line == (
+        "evaluation_point: the winner, trial 7, was measured at step 995; 6 ranked trials fell "
+        "more than 1% short of the furthest, 1000: trial 1 at 400, trial 2 at 500, trial 3 at "
+        "600, trial 4 at 700, trial 5 at 800 and 1 more. Ordinary causes are a search space "
+        "that sets training length (for example epochs or max_steps), a trainer that stops "
+        "early, and a trainer that reports its best checkpoint rather than how far it trained"
     )
 
 
 @pytest.mark.parametrize("kind", ["json_envelope", "wandb", "mlflow"])
 def test_evaluation_point_remedy_uses_the_current_reader(kind: str) -> None:
-    """Reporting remedies retain each reader's own evaluation-position contract."""
+    """Each reader's remedy is for a training-length phase and says the change starts a new study."""
     remedy = _evaluation_point_remedy(kind)
+    assert remedy.startswith("For a phase that searches training length, ")
+    assert remedy.endswith(f"changes the study's identity, so {FRESH_STUDY}.")
     assert "actual_steps / planned_steps" in remedy
     if kind == "wandb":
         assert "same wandb.log() call" in remedy
@@ -373,12 +382,16 @@ def test_evaluation_point_remedy_uses_the_current_reader(kind: str) -> None:
 
 @pytest.mark.parametrize("kind", ["json_envelope", "wandb"])
 def test_evaluation_point_remedy_keeps_an_existing_relative_axis(kind: str) -> None:
-    """A relative-completion disagreement calls for inspecting the schedules and early stops."""
+    """A fraction below 1 is a trial that stopped before its own planned steps, not a budget gap."""
     remedy = _evaluation_point_remedy(kind, axis="schedule_fraction")
 
+    assert remedy.startswith("In a phase that searches training length, ")
     assert "already measures actual_steps / planned_steps" in remedy
-    assert "inspect trials that stopped early" in remedy
-    assert "retain their lower fractions" in remedy
+    assert (
+        "a fraction below 1 is a trial that stopped before its own planned steps, and its trial "
+        "log says why"
+    ) in remedy
+    assert remedy.endswith(f"so {FRESH_STUDY}.")
     assert "set metric.extractor.evaluation_axis" not in remedy
 
 
@@ -454,7 +467,9 @@ def test_survivorship_warning_names_each_failed_configuration_and_the_retry_step
     )
     step = "raise phases[p].n_trials above 7 in the config and rerun to draw new configurations."
 
-    (line,) = _describe_flagged(block, trials=trials, untried_cells=[{"x": 99}], retry_step=step)
+    (line,) = _describe_flagged(
+        block, winner_trial=0, trials=trials, untried_cells=[{"x": 99}], retry_step=step
+    )
 
     assert line == (
         "survivorship: 7 of 8 configurations have no result, so the winner was chosen among "
@@ -478,7 +493,7 @@ def test_survivorship_counts_a_grid_cell_no_trial_reached() -> None:
         "verdict": "heterogeneous",
         "detail": {"ranked": 2, "infeasible": 0, "failed": 0, "untried": 1, "failed_trials": []},
     }
-    (line,) = _describe_flagged(plain, untried_cells=[{"x": 3}])
+    (line,) = _describe_flagged(plain, winner_trial=1, untried_cells=[{"x": 3}])
     assert line == (
         "survivorship: 1 of 3 configurations has no result, so the winner was chosen among "
         "the rest: x=3 was never tried."
@@ -505,9 +520,10 @@ def test_tie_between_distinct_params_is_heterogeneous() -> None:
         "verdict": "heterogeneous",
         "detail": {"tied_trials": [1], "within_noise": None},
     }
-    assert "trial(s) 1 matched" in _describe_flagged(block)[0]
-    assert "No noise estimate" in _describe_flagged(block)[0]
-    assert "phases[].repeats" in _describe_flagged(block)[0]
+    (line,) = _describe_flagged(block, winner_trial=0)
+    assert "trial(s) 1 matched" in line
+    assert "No noise estimate" in line
+    assert "phases[].repeats" in line
 
 
 def test_noise_remedy_accompanies_only_a_flagged_tie() -> None:
@@ -595,7 +611,7 @@ def test_repeats_tie_flags_groups_within_noise() -> None:
         "detail": {"tied_trials": [], "within_noise": [3]},
     }
     assert _validate_confound_block(block, winner_trial=1) == block
-    (line,) = _describe_flagged(block)
+    (line,) = _describe_flagged(block, winner_trial=1)
     assert "repeat group(s) ending at trial(s) 3 are within two standard errors" in line
     assert _confound_summary(block, winner_trial=1, extractor_kind="json_envelope")["tie"] == {
         "verdict": "heterogeneous",
@@ -614,7 +630,7 @@ def test_repeats_exact_group_tie_is_within_noise_and_clear_groups_are_ok() -> No
     )
     tied = _assess_groups(trials, [[0, 1], [2, 3]])
     assert tied["checks"]["tie"]["detail"] == {"tied_trials": [3], "within_noise": [3]}
-    assert "lowest draw position won" in _describe_flagged(tied)[0]
+    assert "lowest draw position won" in _describe_flagged(tied, winner_trial=1)[0]
 
     clear = _trials(
         (_COMPLETE, 0.50, 1, 0),
@@ -1049,13 +1065,16 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
     ]
     assert len(warnings) == 1
     assert warnings[0].startswith("[p] potential confounds in the 2 ranked trials")
-    assert "2 distinct step values (400, 1000)" in warnings[0]
+    assert (
+        "evaluation_point: the winner, trial 0, was measured at step 1000; 1 ranked trial fell "
+        "more than 1% short of the furthest, 1000: trial 1 at 400."
+    ) in warnings[0]
     assert (
         "survivorship: 2 of 4 configurations have no result, so the winner was chosen among "
         "the rest: trial 2 x=5 failed, trial 3 x=6 failed. Raise phases[p].n_trials above 3 "
         "in the config and rerun to draw new configurations; the failed ones are not retried;"
     ) in warnings[0]
-    assert warnings[0].endswith("json_envelope metric.")
+    assert warnings[0].endswith(_evaluation_point_remedy("json_envelope"))
     assert "metric.." not in warnings[0]
 
 

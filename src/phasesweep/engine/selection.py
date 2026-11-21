@@ -402,6 +402,7 @@ def select_winner(
     survivorship = confound["checks"]["survivorship"]
     flagged = _describe_flagged(
         confound,
+        winner_trial=best.number,
         trials=trials,
         untried_cells=untried_cells,
         retry_step=(

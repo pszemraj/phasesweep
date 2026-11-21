@@ -25,6 +25,7 @@ from phasesweep.engine.repeats import (
     within_noise,
 )
 from phasesweep.engine.state import _unreplaced_attempts
+from phasesweep.errors import FRESH_STUDY
 from phasesweep.evidence.models import POSITIONED_EXTRACTOR_KINDS
 from phasesweep.runtime.json import progress_position
 from phasesweep.runtime.terminal import param_text
@@ -141,7 +142,7 @@ _PENDING_STATES = frozenset({"WAITING", "RUNNING"})
 # point: a fixed-token batch-size sweep stops each trial within a batch of its
 # budget, while a truncated trial falls short by far more.
 _POSITION_TOLERANCE = 0.01
-# Distinct values a log line spells out before eliding the rest.
+# Trials or configurations a log line spells out before counting the rest.
 _LOGGED_VALUES = 5
 
 
@@ -718,6 +719,7 @@ def _flagged_checks(block: ConfoundBlock) -> list[ConfoundCheck]:
 def _describe_flagged(
     block: ConfoundBlock,
     *,
+    winner_trial: int,
     trials: Sequence[optuna.trial.FrozenTrial] = (),
     untried_cells: Sequence[Mapping[str, object]] = (),
     retry_step: str | None = None,
@@ -725,6 +727,7 @@ def _describe_flagged(
     """Describe each flagged check with the numbers behind it, for operator logs.
 
     :param ConfoundBlock block: A freshly assessed block.
+    :param int winner_trial: The selected trial, one of the block's ranked trials.
     :param Sequence[optuna.trial.FrozenTrial] trials: The assessed study's trials, whose
         params name the failed configurations, defaults to none.
     :param Sequence[Mapping[str, object]] untried_cells: The untried grid cells passed to
@@ -738,16 +741,7 @@ def _describe_flagged(
     lines: list[str] = []
     evaluation = checks["evaluation_point"]
     if evaluation["verdict"] == "heterogeneous":
-        groups = evaluation["detail"]["values"]
-        lines.append(
-            f"evaluation_point: ranked objectives were measured at {len(groups)} distinct "
-            f"{evaluation['detail']['axis']} values ({_logged_values(groups)}), the lowest more "
-            f"than {_POSITION_TOLERANCE:.0%} short of the highest. Expected when this phase's "
-            "search space changes training length (for example epochs or max_steps); "
-            "otherwise the trials were not trained to one budget. A training-length phase "
-            "checks relative completion on a schedule_fraction axis, which still flags "
-            "a run that stopped early"
-        )
+        lines.append(_describe_evaluation_point(evaluation["detail"], winner_trial=winner_trial))
     survivorship = checks["survivorship"]
     if survivorship["verdict"] == "heterogeneous":
         lines.append(
@@ -770,6 +764,35 @@ def _describe_flagged(
         else:
             lines.extend(_describe_group_tie(detail["tied_trials"], detail["within_noise"]))
     return lines
+
+
+def _describe_evaluation_point(detail: EvaluationDetail, *, winner_trial: int) -> str:
+    """Say where the winner was measured and which ranked trials fell short of the furthest.
+
+    :param EvaluationDetail detail: Flagged evaluation-point evidence.
+    :param int winner_trial: The selected trial, one of the ranked trials the evidence places.
+    :return str: The warning sentence, naming the ordinary causes without picking one.
+    """
+    axis, groups = detail["axis"], detail["values"]
+    furthest = groups[-1]["value"]
+    position = {number: group["value"] for group in groups for number in group["trials"]}
+    short = [
+        f"trial {number} at {param_text(value)}"
+        for number, value in sorted(position.items())
+        if value < (1 - _POSITION_TOLERANCE) * furthest
+    ]
+    listed = ", ".join(short[:_LOGGED_VALUES])
+    if len(short) > _LOGGED_VALUES:
+        listed += f" and {len(short) - _LOGGED_VALUES} more"
+    return (
+        f"evaluation_point: the winner, trial {winner_trial}, was measured at {axis} "
+        f"{param_text(position[winner_trial])}; {len(short)} ranked "
+        f"{'trial' if len(short) == 1 else 'trials'} fell more than {_POSITION_TOLERANCE:.0%} "
+        f"short of the furthest, {param_text(furthest)}: {listed}. Ordinary causes are a "
+        "search space that sets training length (for example epochs or max_steps), a trainer "
+        "that stops early, and a trainer that reports its best checkpoint rather than how far "
+        "it trained"
+    )
 
 
 def _describe_survivorship(
@@ -814,35 +837,44 @@ def _params_text(params: Mapping[str, object]) -> str:
 
 
 def _evaluation_point_remedy(kind: str, *, axis: str = "step") -> str:
-    """Describe relative completion using the objective reader in use.
+    """Say how a phase that searches training length compares relative completion instead.
+
+    Every branch is for that phase only: when the positions differ for another reason, the
+    trainer is what to fix. The axis and the metric key are extractor config, so each branch
+    also says that changing them starts a new study.
 
     :param str kind: Objective extractor kind.
     :param str axis: Recorded evaluation axis, defaults to ``step``.
     :return str: Trainer reporting and evaluation-axis instructions.
     """
+    new_study = f"Changing evaluation_axis changes the study's identity, so {FRESH_STUDY}."
     if axis == "schedule_fraction":
         return (
-            "schedule_fraction already measures actual_steps / planned_steps. Compare "
-            "objectives at the same relative completion and inspect trials that stopped "
-            "early; retain their lower fractions."
+            "In a phase that searches training length, schedule_fraction already measures "
+            "actual_steps / planned_steps, so a fraction below 1 is a trial that stopped before "
+            "its own planned steps, and its trial log says why. Keep the lower fractions "
+            f"rather than rescaling them. {new_study}"
         )
     if kind == "wandb":
         return (
-            "Log schedule_fraction=actual_steps / planned_steps alongside the objective in "
-            "the same wandb.log() call and set metric.extractor.evaluation_axis to schedule_fraction."
+            "For a phase that searches training length, log schedule_fraction=actual_steps / "
+            "planned_steps alongside the objective in the same wandb.log() call and set "
+            f"metric.extractor.evaluation_axis to schedule_fraction. {new_study}"
         )
     if kind == "mlflow":
         return (
-            "MLflow compares the selected metric's integer step. For a training-length "
-            "comparison, log the objective under a separate metric key (for example "
-            "objective_schedule_fraction) at step=int(10000 * actual_steps / planned_steps). "
-            "Set metric.extractor.metric_key to that key and select: last, keeping "
-            "native-step history under its original key and lower steps for early stops."
+            "For a phase that searches training length, MLflow compares the selected metric's "
+            "integer step, so log the objective under a separate metric key (for example "
+            "objective_schedule_fraction) at step=int(10000 * actual_steps / planned_steps), "
+            "keeping native-step history under its original key; a trial that stopped early "
+            "logs a lower step. Set metric.extractor.metric_key to that key and select: last. "
+            f"Changing the metric key changes the study's identity, so {FRESH_STUDY}."
         )
     return (
-        'Report progress={"schedule_fraction": actual_steps / planned_steps} through '
-        "report_objective and set metric.extractor.evaluation_axis to schedule_fraction "
-        "on the json_envelope metric."
+        "For a phase that searches training length, report "
+        'progress={"schedule_fraction": actual_steps / planned_steps} through report_objective '
+        "and set metric.extractor.evaluation_axis to schedule_fraction on the json_envelope "
+        f"metric. {new_study}"
     )
 
 
@@ -943,13 +975,3 @@ def _confound_summary(
             ),
         },
     }
-
-
-def _logged_values(groups: Sequence[PositionGroup]) -> str:
-    """Render group values for a log line, eliding past a few.
-
-    :param Sequence[PositionGroup] groups: Value groups from the evidence.
-    :return str: Comma-separated values.
-    """
-    shown = ", ".join(str(group["value"]) for group in groups[:_LOGGED_VALUES])
-    return shown + (", ..." if len(groups) > _LOGGED_VALUES else "")
