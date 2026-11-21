@@ -60,7 +60,6 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
     _study_schema_supported,
-    _trial_interrupted,
     _unique_trial_outcomes,
     _unreplaced_attempts,
 )
