@@ -986,7 +986,12 @@ def test_sync_leaves_superseded_publication_unresolved_when_its_record_cannot_be
         without_mirror.setattr(publication, "publish_generation", lambda *_: None)
         without_mirror.setattr(publication, "_deliver", lambda *args, **kwargs: False)
         run_experiment(experiment, generation_id="older")
-    run_experiment(experiment, generation_id="newer")
+    with monkeypatch.context() as older_left_for_sync:
+        # The newer run's closeout would otherwise deliver the older generation's records.
+        older_left_for_sync.setattr(
+            publication, "deliver_ended_generations", lambda *args, **kwargs: 0
+        )
+        run_experiment(experiment, generation_id="newer")
     assert read_status(experiment)["published_generation_id"] == "newer"
     lifecycle = _generation_record_path(experiment, "older")
     assert _recorded_generation(lifecycle).state == "published"
@@ -1185,7 +1190,10 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
         publication.sync_tracking(experiment)
     if upload == "offline":
         assert read_record(record_path)["state"] == "pending"
-        assert "Retry with sync-tracking" in caplog.text
+        assert (
+            f"MLflow upload attempt-{attempt} of generation {generation} is pending (upload "
+            "refused)." in caplog.text
+        )
         refused_upload.clear()
         uploads.clear()
         publication.sync_tracking(experiment)
@@ -1232,8 +1240,8 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
 
     It ends KILLED, as its run recorded no failure, and is sent once, whether the run was
     killed with its trials in flight or between them, with no trial left to settle. A run's
-    recovered delivery never finishes that run's own summary run, which its terminal delivery
-    owns, and a dry run writes and sends nothing.
+    delivery of ended generations never finishes that run's own summary run, which its terminal
+    delivery owns, and a dry run writes and sends nothing.
     """
     experiment, uploads, _attempts = killed_sweep(
         tmp_path, monkeypatch, n_jobs=1, in_flight=in_flight
@@ -1243,8 +1251,7 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
     ledger = validate_ledger(experiment)
     uploads.clear()
     if caller == "own-run":
-        sent = publication.deliver_recovered_attempts(experiment, ledger, generation, [generation])
-        assert sent == {"delivered": 0, "pending_uploads": 0, "pending_creations": 0}
+        assert publication.deliver_ended_generations(experiment, ledger, generation) == 0
         assert not record.exists()
         assert uploads == []
         return
@@ -1263,10 +1270,11 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
         assert uploads == []
     else:
         if caller == "recover-run":
-            sent = publication.deliver_recovered_attempts(
-                experiment, ledger, generation, [generation], recovering=True
+            sent = publication.deliver_ended_generations(
+                experiment, ledger, generation, recovering=True
             )
-            assert sent == {"delivered": 1, "pending_uploads": 0, "pending_creations": 0}
+            assert sent == 1
+            assert publication.delivery_status(experiment)["pending"] == 0
         else:
             # A finished attempt's accepted outcome was delivered before the kill.
             delivered = 1 if in_flight else 2

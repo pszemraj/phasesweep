@@ -469,21 +469,25 @@ def _run_experiment_outcome(
                 )
             if experiment.mlflow is not None and cleanup.cleanup_confirmed:
                 from phasesweep.tracking.publication import (
-                    deliver_recovered_attempts,
+                    deliver_ended_generations,
                     publish_failed_generation,
+                    report_delivery,
                 )
 
                 try:
-                    publish_failed_generation(experiment, generation_id, primary_error, claimed)
-                    deliver_recovered_attempts(
+                    answered = publish_failed_generation(
+                        experiment, generation_id, primary_error, claimed
+                    )
+                    delivered = deliver_ended_generations(
                         experiment,
                         claimed,
                         generation_id,
-                        cleanup.settled_generations,
-                        tracker_unreachable=isinstance(
-                            primary_error, TrackingTargetUnavailableError
+                        tracker_unreachable=(
+                            isinstance(primary_error, TrackingTargetUnavailableError)
+                            or not answered
                         ),
                     )
+                    report_delivery(experiment, generation_id, delivered)
                 except ProcessCleanupUncertainError as tracking_exc:
                     cleanup.mark_uncertain(tracking_exc)
                     log.exception("MLflow failure delivery cleanup could not be confirmed")
@@ -575,28 +579,35 @@ def _mirror_publication(
 ) -> None:
     """Mirror a successful run's result to MLflow without changing the run's outcome.
 
-    The mirror sends the published generation's records, then the outcomes this run's
-    recovery committed for earlier attempts. Once the last-success pointer has committed,
-    nothing may fail the run. An ordinary failure only leaves the mirror for ``phasesweep
-    sync-tracking``, which rebuilds any record this left unsaved. A tracking worker whose
-    cleanup is uncertain is recorded as cleanup evidence, and a shutdown still ends the run,
-    marked as arriving after the published result.
+    The mirror sends the published generation's pending records, then, once MLflow has
+    answered them, whatever earlier generations left pending, as ``phasesweep sync-tracking``
+    would. Once the last-success pointer has committed, nothing may fail the run. An ordinary
+    failure only leaves the mirror for the next run or ``phasesweep sync-tracking``, which
+    rebuild any record this left unsaved. A tracking worker whose cleanup is uncertain is
+    recorded as cleanup evidence, and a shutdown still ends the run, marked as arriving after
+    the published result.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param str generation_id: This run's generation.
     :param attempt_ops._PreflightCleanupReport cleanup: Cleanup evidence for the
-        terminal report, naming the generations recovery settled.
+        terminal report.
     :param ledger_ops.ValidatedLedger ledger: The run's ledger, holding the settled trials.
     :param bool published: Whether this run published ``generation_id``; a replay of an
         existing publication did not.
     :raises PhaseSweepShutdown: A shutdown signal arrived during the mirror.
     """
-    from phasesweep.tracking.publication import deliver_recovered_attempts, publish_generation
+    from phasesweep.tracking.publication import (
+        deliver_ended_generations,
+        publish_generation,
+        report_delivery,
+    )
 
     try:
-        if published:
-            publish_generation(experiment, generation_id)
-        deliver_recovered_attempts(experiment, ledger, generation_id, cleanup.settled_generations)
+        answered = publish_generation(experiment, generation_id) if published else True
+        delivered = deliver_ended_generations(
+            experiment, ledger, generation_id, tracker_unreachable=not answered
+        )
+        report_delivery(experiment, generation_id, delivered)
     except ProcessCleanupUncertainError as exc:
         cleanup.mark_uncertain(exc)
         log.exception(
@@ -613,8 +624,8 @@ def _mirror_publication(
     except Exception:
         log.exception(
             "MLflow delivery records of generation %s's run were not all saved; the published "
-            "result is unaffected. `phasesweep sync-tracking` rebuilds them from the ledger "
-            "and the published generation.",
+            "result is unaffected. The next run or `phasesweep sync-tracking` rebuilds them "
+            "from the ledger and the published generation.",
             generation_id,
         )
 

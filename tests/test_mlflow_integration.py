@@ -341,9 +341,11 @@ def test_two_phases_native_http_then_offline(offline_server, tmp_path, monkeypat
     assert not list((tmp_path / "work").rglob("*.pending.json"))
     status = read_status(experiment)
     generation_id = status["published_generation_id"]
-    assert delivery_status(experiment, generation_id) == {"pending": 1, "delivered": 6}
-    assert sync_tracking(experiment, generation_id) == {"pending": 0, "delivered": 7}
+    # Closeout retries the upload the outage left pending, so nothing is left for sync-tracking.
+    assert uploads.count("publish") == 8
     assert delivery_status(experiment, generation_id) == {"pending": 0, "delivered": 7}
+    assert sync_tracking(experiment, generation_id) == {"pending": 0, "delivered": 7}
+    assert uploads.count("publish") == 8
     runs = client.search_runs(
         [experiment_id], filter_string="tags.`phasesweep.phase` != 'generation'"
     )

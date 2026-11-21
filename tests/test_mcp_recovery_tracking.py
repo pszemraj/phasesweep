@@ -240,10 +240,7 @@ def test_recover_run_finishes_the_mlflow_run_of_each_trial_it_settles(
     sends = 2 if source == "running" else 1
     assert requests == ["resolve"] + ["publish"] * sends
     assert (run.sent(), run.summaries()) == ([finish], [finish])
-    assert (
-        f"Delivered {sends} MLflow outcome(s) of the recovered trials and generations; none stay "
-        "pending." in confirmed.output
-    )
+    assert f"Delivered {sends} MLflow record(s); none stay pending." in confirmed.output
     assert _PENDING_STEP not in confirmed.output
     assert not run.store.observe(run.handle).recovery_required
     delivery = run.app.status(_RUN_ID)["tracking_delivery"]
@@ -286,10 +283,7 @@ def test_recover_run_ends_the_summary_run_of_a_run_killed_between_trials(
     assert confirmed.exit_code == 0, confirmed.output
     assert requests == ["resolve", "publish"]
     assert (run.sent(), run.summaries()) == ([], ["KILLED"])
-    assert (
-        "Delivered 1 MLflow outcome(s) of the recovered trials and generations; none stay "
-        "pending." in confirmed.output
-    )
+    assert "Delivered 1 MLflow record(s); none stay pending." in confirmed.output
     assert not run.store.observe(run.handle).recovery_required
     delivery = run.app.status(_RUN_ID)["tracking_delivery"]
     assert (delivery["pending"], delivery["remedy"]) == (0, None)

@@ -271,20 +271,21 @@ def recover_run(
                 publication_summary,
                 emit=emit,
             )
-            delivery: dict[str, int] | None = None
+            delivered: int | None = None
             if delivering:
-                from phasesweep.tracking.publication import deliver_recovered_attempts
+                from phasesweep.tracking.publication import deliver_ended_generations
 
                 assert evidence.ledger is not None
                 # Sent before the marker clears, so a tracking worker whose cleanup is
                 # unconfirmed fails this command and leaves the run recovery-required, as an
                 # evidence worker's does. The workers are registered under this run, so the
                 # next pass resolves one through its registry entry as this run's evidence.
-                delivery = deliver_recovered_attempts(
+                # The runner is proven dead and the lock held, so every generation has ended
+                # and each gets what sync-tracking would send it.
+                delivered = deliver_ended_generations(
                     config,
                     evidence.ledger,
                     run_id,
-                    evidence.settled_generations,
                     recovering=True,
                     tracker_unreachable=bool(evidence.pending_evidence),
                 )
@@ -309,8 +310,9 @@ def recover_run(
                 emit(
                     f"Reconciled {evidence.registered_attempts_reconciled} registered MLflow "
                     f"tracking operation(s) for {run_id} and terminated {evidence.terminated} "
-                    "live process group(s). Retry any remaining uploads with "
-                    "`phasesweep sync-tracking CONFIG` using the config this run launched with."
+                    "live process group(s). The next launch with this config, or "
+                    "`phasesweep sync-tracking CONFIG` with the config this run launched with, "
+                    "delivers any remaining uploads."
                 )
             if evidence.pending_evidence:
                 # Cleanup is proven, so recovery succeeds; the next run refuses until
@@ -322,18 +324,28 @@ def recover_run(
                     "to the tracker, then start the run again; their training is kept and "
                     "nothing is retrained."
                 )
-            if delivery and any(delivery.values()):
-                message = f"Delivered {delivery['delivered']} MLflow outcome(s) of the recovered trials and generations"
-                uploads = delivery["pending_uploads"]
-                creations = delivery["pending_creations"]
-                if uploads or creations:
-                    emit(
-                        f"{message}. Pending uploads: {uploads}. Unconfirmed run creations: "
-                        f"{creations}. Run `phasesweep sync-tracking CONFIG` with the config "
-                        "this run launched with to retry. Delivery never retrains."
-                    )
+            if delivered is not None:
+                from phasesweep.tracking.publication import delivery_status
+                from phasesweep.tracking.session import pending_creation_records
+
+                # Counted after the uploads across every generation, as delivery covered them all.
+                try:
+                    pending = delivery_status(config)["pending"]
+                    creations = len(pending_creation_records(config))
+                except (OSError, ValueError) as exc:
+                    emit(f"MLflow pending records could not be counted ({exc}).")
                 else:
-                    emit(f"{message}; none stay pending.")
+                    sent = f"Delivered {delivered} MLflow record(s)" if delivered else ""
+                    if pending:
+                        emit(
+                            (f"{sent}. " if sent else "")
+                            + f"Pending uploads: {pending - creations}. Unconfirmed run "
+                            f"creations: {creations}. The next launch with this config, or "
+                            "`phasesweep sync-tracking CONFIG` with the config this run "
+                            "launched with, delivers them. Delivery never retrains."
+                        )
+                    elif sent:
+                        emit(f"{sent}; none stay pending.")
     except RunRecoveryError:
         raise
     except (PhaseSweepError, OSError) as exc:

@@ -398,8 +398,9 @@ def killed_sweep(
         patch.setattr(
             generation_module, "_persist_failed_state_unless_recorded", lambda *args: None
         )
-        patch.setattr(publication, "publish_failed_generation", lambda *args: None)
-        patch.setattr(publication, "deliver_recovered_attempts", lambda *args, **kwargs: None)
+        patch.setattr(publication, "publish_failed_generation", lambda *args: True)
+        patch.setattr(publication, "deliver_ended_generations", lambda *args, **kwargs: 0)
+        patch.setattr(publication, "report_delivery", lambda *args: None)
         with pytest.raises(RunnerKilled):
             run_experiment(experiment, generation_id=generation_id)
     assert not any(session.tracking_root(experiment).glob("*/delivery/generation.json"))
