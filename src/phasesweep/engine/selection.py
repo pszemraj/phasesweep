@@ -19,7 +19,6 @@ from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import (
     grid_search_space,
     phase_draws,
-    retry_target_ceiling,
     sampler_search_space,
 )
 from phasesweep.engine.artifacts import _winner_common_payload
@@ -34,8 +33,6 @@ from phasesweep.engine.optuna import (
     _any_objective_unreadable,
     _any_trial_timed_out,
     _draw_positions,
-    _finished_trial_count,
-    _measured_trial_count,
     _trial_count_state,
 )
 from phasesweep.engine.paths import _phase_dir
@@ -63,6 +60,7 @@ from phasesweep.engine.state import (
     _validate_observed_block,
     constraint_attr,
 )
+from phasesweep.engine.study_policy import _raised_target_step
 from phasesweep.errors import (
     FRESH_STUDY,
     NEW_STUDY_STEP,
@@ -145,31 +143,21 @@ def _no_feasible_remedy(
     if infeasible:
         return f"{evidence} Changing metric.min, metric.max or constraints changes persistent study identity. {NEW_STUDY_STEP}"
     timeout_lead = ""
+    step: str | None = "raise the phase's n_trials in the config and rerun."
     if phase_name is not None:
         phase = experiment.phase(phase_name)
-        finished = _finished_trial_count(trials)
-        ceiling = retry_target_ceiling(
-            phase, finished=finished, measured=_measured_trial_count(trials)
-        )
-        target = f"above {phase.n_trials}" if ceiling is None else f"to {ceiling}"
-        budget = f"phases[{phase.name}].n_trials {target}"
-        # A grid or fixed configuration retries its failed cells at a raised target; a sampler
-        # that draws only adds draws, so a failed configuration is never tried again.
-        outcome = (
-            " to draw new configurations; the failed ones are not retried"
-            if ceiling is None
-            else " to retry the failed attempts"
-        )
+        step = _raised_target_step(phase, trials)
         if _any_trial_timed_out(trials):
             timeout_lead = f"{timeout_step(phase.name, experiment.phases_inheriting(phase.name))} "
-    else:
-        budget = "the phase's n_trials"
-        outcome = ""
     objective_lead = f"{unreadable_objective_step(persistent=True)} " if unreadable else ""
     fix = "For any other failure, fix it" if timeout_lead else "Fix the failure"
+    then = (
+        f"{fix}, then {step}"
+        if step is not None
+        else f"{fix}; every configuration was measured, so no larger n_trials retries one."
+    )
     return (
-        f"{evidence} {timeout_lead}{objective_lead}{fix}, then raise {budget} in the config "
-        f"and rerun{outcome}. "
+        f"{evidence} {timeout_lead}{objective_lead}{then} "
         "Run controls such as `n_jobs` can change on retry. "
         "If the fix changes study identity (for example `metric`, `trial_command`, "
         f"`trainer_config` or `provenance`), {FRESH_STUDY}."

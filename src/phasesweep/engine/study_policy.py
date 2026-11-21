@@ -771,31 +771,45 @@ def _recovery_action(study: optuna.Study, abort: Mapping[str, object]) -> Operat
     return OperatorAction.FIX_CONFIG
 
 
-def _retry_remedy(
-    phase: Phase, trials: Sequence[optuna.trial.FrozenTrial], ceiling: int, *, restarts: bool
-) -> str:
-    """Name the ``n_trials`` that retries every failed cell of a grid or fixed configuration.
+def _raised_target_step(
+    phase: Phase, trials: Sequence[optuna.trial.FrozenTrial], *, restarts: bool = False
+) -> str | None:
+    """Name the raised ``n_trials`` that retries a phase's failed work, or say none does.
 
-    :param Phase phase: Phase whose configured ``n_trials`` the remedy raises.
+    A grid or fixed configuration retries each failed cell once up to the ceiling
+    :func:`~phasesweep.config.search.retry_target_ceiling` allows, and a grid runs its
+    unvisited cells too. Any other sampler only adds draws, so a raised target draws new
+    configurations and never retries a failed one. The no-winner remedy, the recovery
+    remedies and the survivorship warning all give this one step.
+
+    :param Phase phase: Phase whose configured ``n_trials`` the step raises.
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
-    :param int ceiling: The target :func:`~phasesweep.config.search.retry_target_ceiling`
-        allows, above ``phase.n_trials``; it also runs the cells no attempt has reached.
-    :param bool restarts: Whether the abort recorded a failure streak, which the recovery
-        restarts from zero.
-    :return str: The step, in lower case so a caller can lead into it, ending with a period.
+    :param bool restarts: Whether the step also restarts a recorded failure streak, which the
+        recovery from a streak abort does, defaults to False.
+    :return str | None: The step, in lower case so a caller can lead into it, ending with a
+        period; ``None`` when a grid or fixed configuration is at its retry ceiling.
     """
-    raise_to = (
-        f"raise phases[{phase.name}].n_trials from {phase.n_trials} "
-        f"to {ceiling} in the config and rerun to"
-    )
+    name, target = phase.name, phase.n_trials
+    finished = _finished_trial_count(trials)
+    ceiling = retry_target_ceiling(phase, finished=finished, measured=_measured_trial_count(trials))
     restart = f", and {_COUNT_RESTARTS}" if restarts else ""
+    if ceiling is None:
+        return (
+            f"raise phases[{name}].n_trials above {target} in the config and rerun to draw new "
+            f"configurations; the failed ones are not retried{restart}."
+        )
+    if ceiling <= target:
+        return None
+    raise_to = (
+        f"raise phases[{name}].n_trials from {target} to {ceiling} in the config and rerun to"
+    )
     if not phase_draws(phase):
         return (
             f"{raise_to} retry its failed attempt once more; a COMPLETE or INFEASIBLE attempt "
             f"is not repeated{restart}."
         )
     failed = len(_failed_grid_cells(trials))
-    remaining = ceiling - _finished_trial_count(trials) - failed
+    remaining = ceiling - finished - failed
     actions = []
     if failed:
         actions.append(f"retry its {failed} failed cell{'' if failed == 1 else 's'}")
@@ -892,17 +906,8 @@ def _recovery_remedies(
     finished = _finished_trial_count(trials)
     ceiling = retry_target_ceiling(phase, finished=finished, measured=_measured_trial_count(trials))
     streak = _tripped_streak(abort)
-    remedies = []
-    if ceiling is None:
-        restart = "" if streak is None else f"; {_COUNT_RESTARTS}"
-        remedies.append(
-            f"{lead_in}raise phases[{name}].n_trials above {target} in the config "
-            f"and rerun to schedule new attempts{restart}."
-        )
-    elif ceiling > target:
-        remedies.append(
-            f"{lead_in}{_retry_remedy(phase, trials, ceiling, restarts=streak is not None)}"
-        )
+    step = _raised_target_step(phase, trials, restarts=streak is not None)
+    remedies = [] if step is None else [f"{lead_in}{step}"]
     if streak is not None and finished < target:
         left = target - finished
         remedies.append(

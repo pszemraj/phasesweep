@@ -503,14 +503,18 @@ def test_crashed_trials_remedy_names_the_next_attempt_budget(
         assert "raise" not in remedy
 
 
-def _failed_study(reasons: list[str | None]) -> optuna.Study:
-    """Build a study whose trials all failed, each recording the given failure reason."""
+def _failed_study(reasons: list[str | None], *, grid: bool = False) -> optuna.Study:
+    """Build a study whose trials all failed, each recording the given failure reason.
+
+    With ``grid``, each trial holds its own grid point, as the grid sampler assigns them.
+    """
     study = optuna.create_study()
-    for reason in reasons:
+    for index, reason in enumerate(reasons):
         study.add_trial(
             optuna.trial.create_trial(
                 state=optuna.trial.TrialState.FAIL,
                 user_attrs={} if reason is None else {FAILURE_REASON_ATTR: reason},
+                system_attrs={"grid_id": index} if grid else {},
             )
         )
     return study
@@ -525,8 +529,9 @@ def _crashed_remedy(
     """
     phases = [phase] if inheriting is None else [phase, inheriting]
     experiment = make_experiment(persistent=tmp_path, phases=phases)
+    study = _failed_study(reasons, grid=phase.sampler.type == "grid")
     with pytest.raises(NoFeasibleTrialError) as refused:
-        select_winner(_failed_study(reasons), experiment, phase_name=phase.name)
+        select_winner(study, experiment, phase_name=phase.name)
     remedy = refused.value.remediation
     assert remedy is not None
     return remedy
@@ -552,12 +557,14 @@ def _sampled_phase(sampler: Sampler, *, n_trials: int = 2) -> Phase:
                 sampler=Sampler(type="grid"),
                 search_space={"x": CategoricalParam(type="categorical", choices=[1, 2, 3])},
             ),
-            "to 6 in the config and rerun to retry the failed attempts.",
+            "from 3 to 6 in the config and rerun to retry its 3 failed cells; COMPLETE and "
+            "INFEASIBLE cells are not repeated.",
             id="grid-retries-failed-cells",
         ),
         pytest.param(
             Phase(name="p", n_trials=2, sampler=Sampler(type="random", seed=0), search_space={}),
-            "to 3 in the config and rerun to retry the failed attempts.",
+            "from 2 to 3 in the config and rerun to retry its failed attempt once more; a "
+            "COMPLETE or INFEASIBLE attempt is not repeated.",
             id="fixed-configuration-retries-its-cell",
         ),
         pytest.param(
