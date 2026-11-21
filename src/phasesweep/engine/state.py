@@ -550,6 +550,26 @@ def _trial_interrupted(trial: FrozenTrial) -> bool:
     return parsed is not None and parsed.outcome == "interrupted"
 
 
+def _winning_trials(
+    trial_number: int, attempt_id: str | None, repeats: RepeatsRecord | None
+) -> dict[int, str | None]:
+    """Map the trial numbers a phase winner stands on to the attempt each must carry.
+
+    A repeats winner stands on every member of its group, each with the attempt it was ranked
+    on; any other winner stands on its one trial.
+
+    :param int trial_number: The winner's trial number; for a repeats winner, its
+        highest-numbered member's.
+    :param str | None attempt_id: That trial's attempt, or ``None`` where only the number is known.
+    :param RepeatsRecord | None repeats: The winner's repeats block, if its phase has repeats.
+    :return dict[int, str | None]: The attempt id to require by trial number, for
+        :func:`_stands_under_winner`.
+    """
+    if repeats is None:
+        return {trial_number: attempt_id}
+    return {member["trial_number"]: member["attempt_id"] for member in repeats["members"]}
+
+
 def _stands_under_winner(trial: FrozenTrial, standing: Mapping[int, str | None]) -> bool:
     """Say whether a trial is one a phase winner stands on, the attempt included.
 

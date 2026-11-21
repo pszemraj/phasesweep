@@ -96,6 +96,7 @@ from phasesweep.engine.state import (
     _stands_under_winner,
     _trial_interrupted,
     _validate_observed_block,
+    _winning_trials,
 )
 from phasesweep.engine.study_policy import (
     _awaits_cleanup_recovery,
@@ -1221,27 +1222,6 @@ _RERUN_OF_COLUMN = "rerun_of"
 _WINNER_COLUMN = "winner"
 
 
-def _winning_trials(winner: PhaseWinnerView | None) -> dict[int, str | None]:
-    """Map the trial numbers a published winner stands on to the attempt each must carry.
-
-    A repeats winner stands on every member of its group; its scalar fields
-    name the highest-numbered member, so only that member's attempt is known
-    from the path-free view and the others are matched by number alone.
-
-    :param PhaseWinnerView | None winner: The phase's published winner, if any.
-    :return dict[int, str | None]: Attempt id to require by trial number, ``None`` where unchecked.
-    """
-    if winner is None:
-        return {}
-    standing: dict[int, str | None] = {
-        winner.trial_number: winner.source.attempt_id if winner.source is not None else None
-    }
-    if winner.repeats is not None:
-        for number in winner.repeats["member_trials"]:
-            standing.setdefault(number, None)
-    return standing
-
-
 def _trial_table(
     experiment: Experiment,
     phase: Phase,
@@ -1278,7 +1258,15 @@ def _trial_table(
         *(["reason"] if has_reason else []),
         _WINNER_COLUMN,
     )
-    standing = _winning_trials(winner)
+    standing = (
+        {}
+        if winner is None
+        else _winning_trials(
+            winner.trial_number,
+            None if winner.source is None else winner.source.attempt_id,
+            winner.repeats_detail,
+        )
+    )
     rows: list[JsonObject] = []
     for trial in trials:
         row: JsonObject = {header: getter(trial) for header, getter in _CORE_TRIAL_COLUMNS}

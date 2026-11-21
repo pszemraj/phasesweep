@@ -55,6 +55,7 @@ from phasesweep.engine.state import (
     Winner,
     _recorded_trial_dir,
     _stands_under_winner,
+    _winning_trials,
 )
 from phasesweep.engine.study_policy import _launch_preflight
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
@@ -648,11 +649,7 @@ def _phase_counts(
         return None
     trials = [] if read is None else read.trials
     states = Counter(_trial_count_state(trial) for trial in trials)
-    standing = (
-        {member["trial_number"]: member["attempt_id"] for member in winner.repeats["members"]}
-        if winner.repeats is not None
-        else {winner.trial_number: winner.attempt_id}
-    )
+    standing = _winning_trials(winner.trial_number, winner.attempt_id, winner.repeats)
     standing_dirs = (
         _recorded_trial_dir(trial)
         for trial in sorted(trials, key=lambda trial: trial.number)
