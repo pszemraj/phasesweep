@@ -13,7 +13,7 @@ from phasesweep.engine.read import RepeatGroupView, TrialTable, TrialTables
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.trial_table import render_trial_tables, unsettled_running_comment
-from tests.conftest import make_experiment
+from tests.conftest import invoke_cli_boundary, make_experiment, terminal_stream
 
 GENERATION = "6413d5c1edd5475998cfadd4d3b59980"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -725,3 +725,29 @@ def test_a_repeats_winner_names_each_winning_trials_directory_before_the_groups(
         "",
     ]
     assert lines[start + 3].startswith("Repeat groups")
+
+
+@pytest.mark.integration
+def test_status_trials_styles_the_winner_on_a_terminal_unless_no_color_is_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Escapes reach a terminal only when ``NO_COLOR`` is absent, and an empty value counts as set."""
+    config = tmp_path / "starter.yaml"
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    assert invoke_cli_boundary(["init", "-o", str(config)], monkeypatch) == 0
+    assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 0
+
+    shown: dict[str | None, str] = {}
+    for no_color in (None, "1", ""):
+        if no_color is None:
+            monkeypatch.delenv("NO_COLOR", raising=False)
+        else:
+            monkeypatch.setenv("NO_COLOR", no_color)
+        with terminal_stream("stdout", 100) as out:
+            assert invoke_cli_boundary(["status", str(config), "--trials"], monkeypatch) == 0
+        shown[no_color] = out.text
+
+    assert "\x1b[1;32mwinner\x1b[0m" in shown[None]
+    assert "\x1b" not in shown["1"]
+    assert "\x1b" not in shown[""]
+    assert ANSI.sub("", shown[None]) == shown["1"] == shown[""]

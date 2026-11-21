@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NoReturn, ParamSpec, TypeVar
+from typing import Any, Literal, NoReturn, ParamSpec, TypeVar
 
 import optuna
 import pytest
@@ -808,7 +808,7 @@ def invoke_cli_boundary(argv: list[str], monkeypatch: pytest.MonkeyPatch) -> int
 
 @dataclass
 class TerminalOutput:
-    """What a pseudo-terminal's reader collected, complete once the ``terminal_stderr`` block exits."""
+    """What a pseudo-terminal's reader collected, complete once the ``terminal_stream`` block exits."""
 
     text: str = ""
 
@@ -819,12 +819,13 @@ class TerminalOutput:
 
 
 @contextlib.contextmanager
-def terminal_stderr(columns: int) -> Iterator[TerminalOutput]:
-    """Make ``sys.stderr`` a pseudo-terminal that is ``columns`` wide and collect what it receives.
+def terminal_stream(name: Literal["stdout", "stderr"], columns: int) -> Iterator[TerminalOutput]:
+    """Make ``sys.stdout`` or ``sys.stderr`` a pseudo-terminal ``columns`` wide and collect its text.
 
     ``COLUMNS`` is removed so the width is the terminal's own, the way a person's shell has it, and
     output processing is off so the text reads back exactly as written. Both are restored on exit.
 
+    :param Literal["stdout", "stderr"] name: The ``sys`` stream to replace.
     :param int columns: Window width the terminal reports.
     :return Iterator[TerminalOutput]: The collector; its ``text`` is filled when the block exits.
     """
@@ -850,7 +851,7 @@ def terminal_stderr(columns: int) -> Iterator[TerminalOutput]:
     try:
         with pytest.MonkeyPatch.context() as patch:
             patch.delenv("COLUMNS", raising=False)
-            patch.setattr(sys, "stderr", stream)
+            patch.setattr(sys, name, stream)
             yield output
     finally:
         stream.close()

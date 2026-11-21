@@ -13,7 +13,7 @@ from phasesweep.engine.selection import PhaseTrialsFailedError
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
-    terminal_stderr,
+    terminal_stream,
     write_constant_trainer,
     write_experiment_config,
 )
@@ -109,7 +109,7 @@ def test_an_operational_error_wraps_under_its_labels_on_a_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, columns: int, expected: list[str]
 ) -> None:
     """The diagnosis and the fix step each break at spaces, their text hanging under the label."""
-    with terminal_stderr(columns) as stderr:
+    with terminal_stream("stderr", columns) as stderr:
         status = _refuse(tmp_path, monkeypatch)
 
     assert status == 1
@@ -144,7 +144,7 @@ def test_a_dry_run_wraps_its_lines_to_the_terminal_and_keeps_its_commands_whole(
     config = tmp_path / "starter.yaml"
     assert invoke_cli_boundary(["init", "-o", str(config)], monkeypatch) == 0
 
-    with terminal_stderr(80) as stderr:
+    with terminal_stream("stderr", 80) as stderr:
         assert invoke_cli_boundary(["run", str(config), "--dry-run"], monkeypatch) == 0
 
     root = str(tmp_path.resolve())

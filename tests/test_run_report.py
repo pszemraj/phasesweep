@@ -23,7 +23,7 @@ from phasesweep.engine.paths import _run_log_path
 from phasesweep.engine.repeats import RepeatsRecord, spread
 from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import PhaseCounts, Winner
-from phasesweep.errors import UnsafeProcessCleanupError
+from phasesweep.errors import UnsafeProcessCleanupError, operator_step
 from phasesweep.evidence.models import WandbExtractor
 from phasesweep.run_report import (
     LogLine,
@@ -1217,18 +1217,18 @@ def test_banner_and_summary_style_only_labels_paths_and_the_winner_mark() -> Non
     assert "\x1b[1mNext:\x1b[0m" in text
 
 
+@pytest.mark.parametrize("columns", ["500", "80", "60"])
 def test_the_log_path_comes_last_after_an_operational_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    columns: str,
 ) -> None:
-    """The error and its fix line come first, then the absolute path of ``run.log``."""
-    monkeypatch.setenv("COLUMNS", "500")
+    """The error and its fix line come first, then the absolute path of ``run.log`` fitted to the width."""
+    monkeypatch.setenv("COLUMNS", columns)
     config = make_experiment(persistent=tmp_path)
-    log = stub_run_command(
-        monkeypatch,
-        PhaseTrialsFailedError("no feasible trial in 'p'"),
-        config=config,
-        writes_log=True,
-    )
+    error = PhaseTrialsFailedError("no feasible trial in 'p'")
+    log = stub_run_command(monkeypatch, error, config=config, writes_log=True)
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
 
@@ -1236,17 +1236,39 @@ def test_the_log_path_comes_last_after_an_operational_error(
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    lines = captured.err.splitlines()
-    assert lines[-3] == "phasesweep: no feasible trial in 'p'"
-    assert lines[-2].startswith("fix: ")
-    assert lines[-1] == f"log: {log.resolve()}"
+    expected = [
+        "phasesweep: no feasible trial in 'p'",
+        f"fix: {operator_step(error)}",
+        *LogLine(str(log.resolve())).render(int(columns), color=False),
+    ]
+    assert captured.err.splitlines()[-len(expected) :] == expected
 
 
+_RESUME_HINT_AT = {
+    500: [
+        "phasesweep: stopped. Rerun the same command to resume: finished trials are kept and "
+        "interrupted ones rerun first."
+    ],
+    80: [
+        "phasesweep: stopped. Rerun the same command to resume: finished trials are kept",
+        "and interrupted ones rerun first.",
+    ],
+    60: [
+        "phasesweep: stopped. Rerun the same command to resume:",
+        "finished trials are kept and interrupted ones rerun first.",
+    ],
+}
+
+
+@pytest.mark.parametrize("columns", [500, 80, 60])
 def test_the_log_path_comes_last_after_ctrl_c(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    columns: int,
 ) -> None:
-    """An interrupted run prints its resume hint, then names the log, and exits 130."""
-    monkeypatch.setenv("COLUMNS", "500")
+    """An interrupted run prints its resume hint, wrapped to the width, then names the log, and exits 130."""
+    monkeypatch.setenv("COLUMNS", str(columns))
     config = make_experiment(persistent=tmp_path)
     shutdown = PhaseSweepShutdown(
         signal.SIGINT,
@@ -1258,10 +1280,12 @@ def test_the_log_path_comes_last_after_ctrl_c(
 
     assert invoke_cli_boundary(["run", str(config_path)], monkeypatch) == 128 + signal.SIGINT
 
-    lines = capsys.readouterr().err.splitlines()
-    assert lines[-3].startswith("phasesweep: stopped. Rerun the same command to resume")
-    assert lines[-2] == f"phasesweep run {config_path}"
-    assert lines[-1] == f"log: {log.resolve()}"
+    expected = [
+        *_RESUME_HINT_AT[columns],
+        f"phasesweep run {config_path}",
+        *LogLine(str(log.resolve())).render(columns, color=False),
+    ]
+    assert capsys.readouterr().err.splitlines()[-len(expected) :] == expected
 
 
 def test_the_stop_hint_repeats_the_command_quoted_with_its_settings(
