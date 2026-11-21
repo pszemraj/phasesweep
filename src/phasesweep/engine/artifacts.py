@@ -429,7 +429,7 @@ def _load_winner(
             objective_provenance=dict(data["objective_provenance"]),
             trainer_input=dict(data["trainer_input"]),
             trainer_env_digest=stored_env_digest,
-            confound=dict(validated.confound),
+            confound=validated.confound.copy(),
             observed=dict(validated.observed),
             repeats=validated.repeats,
         )

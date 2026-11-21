@@ -15,6 +15,7 @@ from phasesweep.runtime.json import JsonObject, json_object, progress_position
 if TYPE_CHECKING:
     from optuna.trial import FrozenTrial, Trial
 
+    from phasesweep.engine.confound import ConfoundBlock
     from phasesweep.engine.repeats import RepeatsRecord
     from phasesweep.runtime.process import AttemptLifecycle
 
@@ -145,7 +146,7 @@ class Winner:
     # Advisory verdicts on the population the source selection ranked, frozen
     # at that selection (:mod:`phasesweep.engine.confound`). A carried winner
     # keeps them verbatim; no fingerprint reads them.
-    confound: dict[str, Any] | None = None
+    confound: ConfoundBlock | None = None
     # Report-only values the selected trial recorded, by observation name; for
     # a repeats phase, the mean over the members that recorded each name.
     # They never enter a fingerprint or selection.

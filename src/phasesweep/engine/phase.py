@@ -24,6 +24,7 @@ from phasesweep.engine.attempts import (
     _trial_requires_cleanup_recovery,
 )
 from phasesweep.engine.cleanup import _reap_stale_trials
+from phasesweep.engine.confound import _validate_confound_block
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
     PhaseTimeoutError,
@@ -1945,7 +1946,7 @@ def _select_phase_winner(
         trainer_input=dict(selected.trainer_input),
         # Preserve the winning trial's environment, including on no-op replay.
         trainer_env_digest=selected.trainer_env_digest,
-        confound=selected.confound,
+        confound=_validate_confound_block(selected.confound, winner_trial=selected.trial_number),
         observed=selected.observed,
         repeats=selected.repeats,
     )

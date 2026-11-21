@@ -296,8 +296,7 @@ def _winner_view(
             observed = _validate_observed_block(data.get("observed"))
         else:
             source = validated.source
-            # Publication validation already checked this block; reading it once more types it.
-            confound_block = _validate_confound_block(validated.confound, winner_trial=trial_number)
+            confound_block = validated.confound
             metric = validated.metric
             repeats = validated.repeats
             observed = dict(validated.observed)

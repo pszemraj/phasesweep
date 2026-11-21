@@ -17,7 +17,7 @@ import phasesweep.engine.paths as path_ops
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
 from phasesweep.config.models import Experiment, Metric, _metric_semantics_payload
 from phasesweep.config.search import Repeats
-from phasesweep.engine.confound import _validate_confound_block
+from phasesweep.engine.confound import ConfoundBlock, _validate_confound_block
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.provenance import CodeRevision, _parse_code_revision
 from phasesweep.engine.repeats import RepeatsRecord, _check_repeats_axis, _validate_repeats_block
@@ -67,7 +67,7 @@ class ValidatedWinner:
     """The mapping decoded from ``content``."""
     metric: float
     source: WinnerSource
-    confound: Mapping[str, object]
+    confound: ConfoundBlock
     observed: dict[str, float]
     repeats: RepeatsRecord | None
 
