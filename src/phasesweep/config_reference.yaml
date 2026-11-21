@@ -168,7 +168,7 @@ phases: list[object] (required)
       # Repeat values, at least two: null, booleans, integers, finite floats or strings, distinct as categorical choices must be.
       values: list[bool | int | float | string | null] (required)
 
-      # How a group's member metrics combine into the value it ranks by: mean or median.
+      # How a group's member metrics combine into the value it ranks by: mean or median. Median groups get no noise band, so the tie check judges only exact ties and cost_key is unavailable.
       reduce: "mean" | "median" = "mean"
 
     # Sampling strategy and its parameters. Omit the block for the defaults.
