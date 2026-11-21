@@ -518,11 +518,12 @@ class RunCapacityUnknownError(McpToolError):
             # A trial carries the run id in its arguments only when its command uses
             # {trial_dir}, but always in its environment as PHASESWEEP_GENERATION_ID. The
             # listing prints PIDs alone: its input holds each process's whole environment,
-            # credentials included.
+            # credentials included, and only for the processes of the user who runs it.
             remaining = (
                 f" Unreadable or orphaned: {shown}{more_note}. For each run id, ask the operator "
-                "to run, on the server host, `pgrep -af <run-id>`, which lists the run's runner, "
-                "and `ps axeww | awk '/[P]HASESWEEP_GENERATION_ID=<run-id>/ {print $1}'`, which "
+                "to run, on the server host as the server's user, `pgrep -af <run-id>`, which "
+                "lists the run's runner, and "
+                "`ps axeww | awk '/[P]HASESWEEP_GENERATION_ID=<run-id>/ {print $1}'`, which "
                 "prints the PID of each of its trials, found by environment, wait for every "
                 "listed process to exit, or stop it, and move `runs/<run-id>.json` and "
                 f"`logs/<run-id>.*` out of the state directory only once both print nothing{file_note}."

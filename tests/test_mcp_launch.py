@@ -514,8 +514,8 @@ def test_launch_names_unreadable_run_records_and_passes_once_they_are_moved_away
     # A trial carries the run id in its arguments only when its command uses {trial_dir}, and
     # the listing by environment prints PIDs alone, never the environment it matched.
     assert (
-        "For each run id, ask the operator to run, on the server host, `pgrep -af <run-id>`, "
-        "which lists the run's runner, and "
+        "For each run id, ask the operator to run, on the server host as the server's user, "
+        "`pgrep -af <run-id>`, which lists the run's runner, and "
         "`ps axeww | awk '/[P]HASESWEEP_GENERATION_ID=<run-id>/ {print $1}'`, which prints the "
         "PID of each of its trials, found by environment, wait for every listed process to "
         "exit, or stop it, and move `runs/<run-id>.json` and `logs/<run-id>.*` out of the state "
