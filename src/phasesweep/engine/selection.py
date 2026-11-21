@@ -73,7 +73,7 @@ from phasesweep.errors import (
     unreadable_objective_step,
 )
 from phasesweep.runtime.json import JsonObject, json_object, json_text_map
-from phasesweep.runtime.terminal import display_path
+from phasesweep.runtime.terminal import display_path, objective_text
 
 log = logging.getLogger("phasesweep.engine.selection")
 
@@ -409,8 +409,10 @@ def select_winner(
             flagged.append(
                 f"group {comparison['trial_number']} params={comparison['params']} versus "
                 f"winner params={dict(winning.params)}, "
-                f"gap={comparison['gap']:.6g}, combined_se={comparison['combined_se']:.6g}, "
-                f"threshold={_NOISE_STANDARD_ERRORS:g}*combined_se={comparison['threshold']:.6g}"
+                f"gap={objective_text(comparison['gap'])}, "
+                f"combined_se={objective_text(comparison['combined_se'])}, "
+                f"threshold={_NOISE_STANDARD_ERRORS:g}*combined_se="
+                f"{objective_text(comparison['threshold'])}"
             )
     if confound["checks"]["evaluation_point"]["verdict"] == "heterogeneous":
         flagged.append(
@@ -507,7 +509,8 @@ def _cost_advisory(
         return (
             f"one-standard-error cost advisory: params={dict(cheapest.params)} has "
             f"{key}={cost(cheapest):g} versus winner {key}={cost(winner):g}, "
-            f"gap={abs(cheapest.aggregate - winner.aggregate):g} <= winner_se={winner_se:g}. "
+            f"gap={objective_text(abs(cheapest.aggregate - winner.aggregate))} <= "
+            f"winner_se={objective_text(winner_se)}. "
             "The selected winner is unchanged."
         )
     return None

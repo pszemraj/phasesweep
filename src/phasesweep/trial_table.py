@@ -27,10 +27,10 @@ from phasesweep.runtime.terminal import (
     INDENT,
     directory_lines,
     display_path,
+    objective_text,
     paint,
     param_text,
     plural,
-    significant,
     wrap,
 )
 
@@ -73,7 +73,7 @@ def _number_text(value: JsonValue) -> str:
     """
     if isinstance(value, bool) or not isinstance(value, int | float):
         return "-"
-    return significant(float(value), 6)
+    return objective_text(float(value))
 
 
 def _duration_text(value: JsonValue) -> str:

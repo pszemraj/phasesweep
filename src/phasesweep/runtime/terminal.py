@@ -179,6 +179,15 @@ def significant(value: float, digits: int) -> str:
     return format(Decimal(repr(value)).normalize(), "f")
 
 
+def objective_text(value: float) -> str:
+    """Format an objective, or a difference between objectives, to six significant digits.
+
+    :param float value: The objective or gap to show.
+    :return str: Terminal text for the number.
+    """
+    return significant(value, 6)
+
+
 def param_text(value: object) -> str:
     """Format one sampled param for display, floats to four significant digits.
 

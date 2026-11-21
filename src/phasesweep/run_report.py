@@ -28,6 +28,7 @@ from phasesweep.runtime.terminal import (
     break_path,
     directory_lines,
     display_path,
+    objective_text,
     pack,
     paint,
     param_text,
@@ -300,7 +301,7 @@ def winner_facts(winner: Winner, metric_name: str) -> tuple[list[str], list[str]
     :param str metric_name: Name the objective is shown under.
     :return tuple[list[str], list[str]]: The head and the tail.
     """
-    head = [f"trial {winner.trial_number}", f"{metric_name} {significant(winner.metric, 6)}"]
+    head = [f"trial {winner.trial_number}", f"{metric_name} {objective_text(winner.metric)}"]
     completion = winner.completion
     if completion.get("incomplete"):
         head += [
@@ -314,7 +315,7 @@ def winner_facts(winner: Winner, metric_name: str) -> tuple[list[str], list[str]
         tail += [
             f"{group['reduce']} of {spread['n']} repeats of {group['key']}",
             f"sd {significant(spread['sd'], 4)}",
-            f"range {significant(spread['min'], 6)}..{significant(spread['max'], 6)}",
+            f"range {objective_text(spread['min'])}..{objective_text(spread['max'])}",
             f"members {', '.join(str(member['trial_number']) for member in group['members'])}",
         ]
     return head, tail
@@ -410,7 +411,7 @@ def trial_line(
         label_width=phase_label_width(experiment),
         number=number,
         state=state,
-        objective=None if value is None else f"{experiment.metric.name} {significant(value, 6)}",
+        objective=None if value is None else f"{experiment.metric.name} {objective_text(value)}",
         duration=None if seconds is None else f"{seconds:.1f}s",
         ordinal=f"{finished}/{phase.n_trials}",
         params=tuple(f"{key}={param_text(item)}" for key, item in params.items()),
