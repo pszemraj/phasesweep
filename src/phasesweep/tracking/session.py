@@ -9,6 +9,7 @@ import threading
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -68,6 +69,22 @@ NO_ANSWER: tuple[type[Exception], ...] = (
     OperationOutcomeUnknownError,
     ShutdownLaunchRefusedError,
 )
+
+
+@dataclass
+class DeliveryTally:
+    """What the requests of one delivery met: a run's closeout, recover-run or sync-tracking.
+
+    Every pass of one closeout shares it. Once ``sending`` is False the later passes only save
+    their records: a later request would meet the same silent tracker.
+    """
+
+    sending: bool = True
+    """Whether requests may still be made."""
+    unanswered: str | None = None
+    """Why MLflow gave no answer, once a request got none."""
+    delivered: int = 0
+    """Records of ended generations delivered."""
 
 
 def tracking_root(experiment: Experiment) -> Path:
@@ -415,6 +432,7 @@ def resolve_pending_creations(
     skip: str | None = None,
     worker_generation: str | None = None,
     errors: list[TrackingSyncRefusedError] | None = None,
+    tally: DeliveryTally | None = None,
 ) -> bool:
     """Reconcile pending creations with one read-only search per record.
 
@@ -432,6 +450,8 @@ def resolve_pending_creations(
         each record's own generation.
     :param list[TrackingSyncRefusedError] | None errors: Collect local record failures and
         continue, or raise the first one if omitted.
+    :param DeliveryTally | None tally: The delivery this pass belongs to, which stops sending
+        once a search gets no answer.
     :raises ProcessCleanupUncertainError: A search worker's cleanup is uncertain.
     :raises TrackingSyncRefusedError: A local creation record could not be read or updated.
     :return bool: Whether MLflow answered every search sent, True when there was none to send.
@@ -446,7 +466,9 @@ def resolve_pending_creations(
     ]
     for pending in records:
         try:
-            answered = _reconcile_creation(experiment, pending, environment, worker_generation)
+            answered = _reconcile_creation(
+                experiment, pending, environment, worker_generation, tally
+            )
         except (OSError, UnsafePrivatePathError, ValueError) as exc:
             failure = TrackingSyncRefusedError(
                 f"Could not reconcile local MLflow creation record {pending}: {exc}",
@@ -467,6 +489,7 @@ def _reconcile_creation(
     pending: Path,
     environment: Mapping[str, str],
     worker_generation: str | None,
+    tally: DeliveryTally | None,
 ) -> bool:
     """Bind a found run or retire its expired intent after one conclusive lookup.
 
@@ -474,6 +497,8 @@ def _reconcile_creation(
     :param Path pending: Unconfirmed creation intent.
     :param Mapping[str, str] environment: Composed credentials and transport.
     :param str | None worker_generation: Invocation registering the lookup, defaulting to the intent's generation.
+    :param DeliveryTally | None tally: The delivery the search belongs to, told when MLflow
+        gives no answer.
     :return bool: Whether MLflow answered, False when the search met one of :data:`NO_ANSWER`.
     """
     path = pending.with_suffix("").with_suffix(".json")
@@ -505,6 +530,9 @@ def _reconcile_creation(
             pending,
             exc,
         )
+        if tally is not None:
+            tally.sending = False
+            tally.unanswered = unready_target_text(experiment, exc)
         return False
     except (ValueError, RuntimeError) as exc:
         log.warning("MLflow run creation at %s is still unresolved (%s).", pending, exc)
@@ -644,21 +672,36 @@ def require_tracking_target(
     except (OSError, ValueError, RuntimeError) as exc:
         if resolve_only and isinstance(exc, OSError) and not isinstance(exc, TimeoutError):
             raise
-        cause = str(exc).rstrip(".")
-        if isinstance(exc, TimeoutError):
-            if deadline is not None and time.monotonic() >= deadline:
-                raise
-            cause = "it did not answer within timeout_seconds; check that the server is reachable"
-        selector = (
-            f"experiment_id={settings.experiment_id!r}"
-            if settings.experiment_id is not None
-            else f"experiment_name={settings.experiment_name!r}"
-        )
+        if isinstance(exc, TimeoutError) and deadline is not None and time.monotonic() >= deadline:
+            raise
         launch = "" if resolve_only else " No trial was started."
-        raise TrackingTargetUnavailableError(
-            f"MLflow tracking target {selector} at {settings.tracking_uri!r} is not ready: "
-            f"{cause}.{launch}"
-        ) from exc
+        raise TrackingTargetUnavailableError(unready_target_text(experiment, exc) + launch) from exc
+
+
+def unready_target_text(experiment: Experiment, exc: BaseException) -> str:
+    """Say that the configured MLflow target gave no usable answer, and why.
+
+    A run's target check and a delivery MLflow stopped answering word the target alike. The
+    tracking URI carries no credentials, which config load refuses, so it is printed as is.
+
+    :param Experiment experiment: MLflow-backed experiment.
+    :param BaseException exc: The failed request's error; a timeout is worded as the
+        ``timeout_seconds`` it outlasted.
+    :return str: One sentence naming the experiment selector, the URI and the cause.
+    """
+    settings = experiment.mlflow
+    assert settings is not None
+    cause = (
+        "it did not answer within timeout_seconds; check that the server is reachable"
+        if isinstance(exc, TimeoutError)
+        else str(exc).rstrip(".")
+    )
+    selector = (
+        f"experiment_id={settings.experiment_id!r}"
+        if settings.experiment_id is not None
+        else f"experiment_name={settings.experiment_name!r}"
+    )
+    return f"MLflow tracking target {selector} at {settings.tracking_uri!r} is not ready: {cause}."
 
 
 def prepare_attempt(

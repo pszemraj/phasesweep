@@ -1331,7 +1331,7 @@ def test_failed_trainer_never_reads_remote_metrics(tmp_path, monkeypatch):
 
 def test_pending_sync_uses_retained_projection(tmp_path, monkeypatch):
     from phasesweep.tracking import publication
-    from phasesweep.tracking.session import read_record, tracking_root
+    from phasesweep.tracking.session import DeliveryTally, read_record, tracking_root
 
     experiment = native_experiment(tmp_path)
     binding = mlflow_binding()
@@ -1365,7 +1365,9 @@ def test_pending_sync_uses_retained_projection(tmp_path, monkeypatch):
     path = publication._save_intent(
         experiment, binding["generation_id"], "test", binding, projection
     )
-    assert publication._deliver(experiment, path, {}) is False
+    tally = DeliveryTally()
+    assert publication._send(experiment, [path], {}, worker_generation=None, tally=tally) == []
+    assert tally.sending
     assert publication.delivery_status(experiment) == {"pending": 1, "delivered": 0}
     requests = []
 

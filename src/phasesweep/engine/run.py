@@ -483,26 +483,10 @@ def _run_experiment_outcome(
                     ),
                 )
             if experiment.mlflow is not None and cleanup.cleanup_confirmed:
-                from phasesweep.tracking.publication import (
-                    deliver_ended_generations,
-                    publish_failed_generation,
-                    report_delivery,
-                )
+                from phasesweep.tracking.publication import deliver_closeout
 
                 try:
-                    answered = publish_failed_generation(
-                        experiment, generation_id, primary_error, claimed
-                    )
-                    delivered = deliver_ended_generations(
-                        experiment,
-                        claimed,
-                        generation_id,
-                        tracker_unreachable=(
-                            isinstance(primary_error, TrackingTargetUnavailableError)
-                            or not answered
-                        ),
-                    )
-                    report_delivery(experiment, generation_id, delivered)
+                    deliver_closeout(experiment, claimed, generation_id, error=primary_error)
                 except ProcessCleanupUncertainError as tracking_exc:
                     cleanup.mark_uncertain(tracking_exc)
                     log.exception("MLflow failure delivery cleanup could not be confirmed")
@@ -595,9 +579,9 @@ def _mirror_publication(
 ) -> None:
     """Mirror a successful run's result to MLflow without changing the run's outcome.
 
-    The mirror sends the published generation's pending records, then, once MLflow has
-    answered them, whatever earlier generations left pending, as ``phasesweep sync-tracking``
-    would. Once the last-success pointer has committed, nothing may fail the run. An ordinary
+    The mirror sends whatever earlier generations left pending, as ``phasesweep sync-tracking``
+    would, then the published generation's pending records, until MLflow stops answering.
+    Once the last-success pointer has committed, nothing may fail the run. An ordinary
     failure only leaves the mirror for the next run or ``phasesweep sync-tracking``, which
     rebuild any record this left unsaved. A tracking worker whose cleanup is uncertain is
     recorded as cleanup evidence, and a shutdown still ends the run, marked as arriving after
@@ -612,18 +596,10 @@ def _mirror_publication(
         existing publication did not.
     :raises PhaseSweepShutdown: A shutdown signal arrived during the mirror.
     """
-    from phasesweep.tracking.publication import (
-        deliver_ended_generations,
-        publish_generation,
-        report_delivery,
-    )
+    from phasesweep.tracking.publication import deliver_closeout
 
     try:
-        answered = publish_generation(experiment, generation_id) if published else True
-        delivered = deliver_ended_generations(
-            experiment, ledger, generation_id, tracker_unreachable=not answered
-        )
-        report_delivery(experiment, generation_id, delivered)
+        deliver_closeout(experiment, ledger, generation_id, published=published)
     except ProcessCleanupUncertainError as exc:
         cleanup.mark_uncertain(exc)
         log.exception(

@@ -270,24 +270,22 @@ def recover_run(
                 publication_summary,
                 emit=emit,
             )
-            delivered: int | None = None
+            from phasesweep.tracking.session import DeliveryTally
+
+            tally: DeliveryTally | None = None
             if delivering:
                 from phasesweep.tracking.publication import deliver_ended_generations
 
                 assert evidence.ledger is not None
+                # A tracker that just gave no answer for evidence is sent nothing.
+                tally = DeliveryTally(sending=not evidence.pending_evidence)
                 # Sent before the marker clears, so a tracking worker whose cleanup is
                 # unconfirmed fails this command and leaves the run recovery-required, as an
                 # evidence worker's does. The workers are registered under this run, so the
                 # next pass resolves one through its registry entry as this run's evidence.
                 # The runner is proven dead and the lock held, so every generation has ended
                 # and each gets what sync-tracking would send it.
-                delivered = deliver_ended_generations(
-                    config,
-                    evidence.ledger,
-                    run_id,
-                    recovering=True,
-                    tracker_unreachable=bool(evidence.pending_evidence),
-                )
+                deliver_ended_generations(config, evidence.ledger, run_id, tally, recovering=True)
             if synthesized:
                 # A runner that left no status is recovery-required until one exists, and the
                 # status this pass writes reports cleanup confirmed, which a marker cannot
@@ -323,7 +321,7 @@ def recover_run(
                     "to the tracker, then start the run again; their training is kept and "
                     "nothing is retrained."
                 )
-            if delivered is not None:
+            if tally is not None:
                 from phasesweep.tracking.publication import delivery_status
                 from phasesweep.tracking.session import pending_creation_records
 
@@ -334,6 +332,7 @@ def recover_run(
                 except (OSError, ValueError) as exc:
                     emit(f"MLflow pending records could not be counted ({exc}).")
                 else:
+                    delivered = tally.delivered
                     sent = f"Delivered {delivered} MLflow record(s)" if delivered else ""
                     if pending:
                         emit(

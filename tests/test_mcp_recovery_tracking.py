@@ -436,10 +436,10 @@ def test_a_recover_run_killed_before_its_uploads_end_is_settled_by_one_more_pass
 
     def dies_before_summary(
         experiment: Experiment, path: Path, environment: dict[str, str], **kwargs: object
-    ) -> bool:
+    ) -> None:
         if path.stem == "generation":
             raise RunnerKilled()
-        return deliver(experiment, path, environment, **kwargs)
+        deliver(experiment, path, environment, **kwargs)
 
     with monkeypatch.context() as patch:
         if killed_at == "after-cleanup-record":

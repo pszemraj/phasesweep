@@ -10,7 +10,9 @@ from typing import NamedTuple
 import pytest
 
 from phasesweep.config.models import Experiment
+from phasesweep.engine import run as run_module
 from phasesweep.engine.errors import StudyFingerprintMismatchError
+from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
@@ -193,19 +195,24 @@ def test_the_next_run_delivers_an_interrupted_runs_pending_records(
 @pytest.mark.integration
 @pytest.mark.parametrize("creation", [False, True], ids=["uploads", "creation-and-uploads"])
 @pytest.mark.parametrize("failure", ["outage", "rejection"])
-def test_closeout_stops_at_the_first_unanswered_request_and_keeps_the_result(
+@pytest.mark.parametrize("ending", ["normal", "failed"])
+def test_closeout_sends_earlier_records_first_and_stops_at_the_first_unanswered_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    ending: str,
     failure: str,
     creation: bool,
 ) -> None:
-    """An outage that starts after the run's own uploads costs one request and leaves earlier records pending.
+    """Closeout sends what earlier runs left before the run's own records, and one unanswered request ends it.
 
-    With an earlier run's creation intent pending too, that one request is its search, and no
-    upload follows it. The run still returns its winners with no error, its closing line counts
-    what stays pending, and the outage costs one warning. A rejection of one earlier record,
-    after an answered search, is a verdict on that record alone, so the next one is still sent.
+    The earlier run's records go first, its summary record last of them, so MLflow never shows
+    this run's result before the outcomes an earlier run left. An outage at closeout costs one
+    request, the search for an earlier creation intent when one is pending and otherwise the
+    earlier run's first record, and leaves every record pending, the run's own too, under one
+    warning. The run keeps its outcome, its winners or its own error, whether it ended normally
+    or failed after checking its target. A rejection of one earlier record, after an answered
+    search, is a verdict on that record alone, so every other record is still sent.
     """
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
     respond = session.request_operation
@@ -220,67 +227,99 @@ def test_closeout_stops_at_the_first_unanswered_request_and_keeps_the_result(
 
         with monkeypatch.context() as patch:
             patch.setattr(session, "request_operation", killed_at_summary_creation)
-            patch.setattr(publication, "publish_failed_generation", lambda *args: True)
-            patch.setattr(publication, "deliver_ended_generations", lambda *args, **kwargs: 0)
-            patch.setattr(publication, "report_delivery", lambda *args: None)
+            patch.setattr(publication, "deliver_closeout", lambda *args, **kwargs: None)
             with pytest.raises(RunnerKilled):
                 run_experiment(sweep.experiment)
         assert sweep.uploads == []
         intents = session.pending_creation_records(sweep.experiment)
         assert len(intents) == 1
-    own_sent: list[bool] = []
-    after_own: list[str] = []
+    closing: list[bool] = []
+    requested: list[str] = []
+    rejected: list[str] = []
+    sent: list[tuple[str, str]] = []
 
     def failing(request: dict[str, object], **kwargs: object) -> JsonObject:
-        if own_sent:
+        if closing:
             name = str(request.get("name", request["action"]))
-            after_own.append(name)
+            requested.append(name)
             if failure == "outage":
                 raise OperationUnavailableError("tracking server unreachable")
             if name == "find":
                 return {"found": False}
-            if name.startswith("attempt-"):
+            if name.startswith("attempt-") and not rejected:
+                rejected.append(name)
                 raise OperationRejectedError("RESOURCE_DOES_NOT_EXIST: run was deleted")
         return respond(request, **kwargs)
 
+    close = publication.deliver_closeout
+    deliver = publication._deliver
+
+    def closeout(*args: object, **kwargs: object) -> None:
+        closing.append(True)
+        close(*args, **kwargs)
+
+    def recording(experiment: Experiment, path: Path, *args: object, **kwargs: object) -> None:
+        if closing:
+            sent.append((path.parent.parent.name, path.stem))
+        deliver(experiment, path, *args, **kwargs)
+
     monkeypatch.setattr(session, "request_operation", failing)
     monkeypatch.setattr(worker, "request_operation", failing)
-    publish = publication.publish_generation
+    monkeypatch.setattr(publication, "deliver_closeout", closeout)
+    monkeypatch.setattr(publication, "_deliver", recording)
+    lost = RuntimeError("trainer host lost")
+    if ending == "failed":
+        run_phase = run_module._run_phase
+        phases: list[str] = []
 
-    def publish_then_fail(experiment: Experiment, generation_id: str) -> bool:
-        answered = publish(experiment, generation_id)
-        own_sent.append(answered)
-        return answered
+        def second_phase_fails(*args: object, **kwargs: object) -> object:
+            # The first phase checked the target and bound the run's summary run.
+            if phases:
+                raise lost
+            phases.append("depth")
+            return run_phase(*args, **kwargs)
 
-    monkeypatch.setattr(publication, "publish_generation", publish_then_fail)
+        monkeypatch.setattr(run_module, "_run_phase", second_phase_fails)
     caplog.set_level(logging.INFO)
     caplog.clear()
     reports: list[TerminalReport] = []
 
-    winners = run_experiment(sweep.experiment, terminal_callback=reports.append)
-
-    assert set(winners) == {"depth", "rate"}
-    assert reports[0].primary_error is None
-    assert own_sent == [True]
-    assert read_status(sweep.experiment)["published_generation_id"] == reports[0].generation_id
+    if ending == "failed":
+        with pytest.raises(RuntimeError) as caught:
+            run_experiment(sweep.experiment, terminal_callback=reports.append)
+        assert caught.value is lost
+        assert reports[0].primary_error is lost
+    else:
+        winners = run_experiment(sweep.experiment, terminal_callback=reports.append)
+        assert set(winners) == {"depth", "rate"}
+        assert reports[0].primary_error is None
+        assert read_status(sweep.experiment)["published_generation_id"] == reports[0].generation_id
+    own = reports[0].generation_id
+    own_pending = publication.delivery_status(sweep.experiment, own)["pending"]
+    assert closing == [True]
     assert all(intent.exists() for intent in intents)
     searched = ["find"] if creation else []
     if failure == "outage":
-        [request] = after_own
+        [request] = requested
         assert request == "find" if creation else request.startswith("attempt-")
+        assert sent == ([] if creation else [(sweep.generation, request)])
         assert read_record(sweep.summary)["state"] == "pending"
+        assert own_pending > 0
         assert caplog.text.count("MLflow did not answer") == 1
-        pending = 2 + len(intents)
+        earlier = 2 + len(intents)
         assert (
-            f"MLflow: {pending} upload(s) pending ({pending} from earlier runs); {_PENDING_STEP}"
-            in caplog.text
+            f"MLflow: {earlier + own_pending} upload(s) pending ({earlier} from earlier runs); "
+            f"{_PENDING_STEP}" in caplog.text
         )
         assert "left pending by earlier runs." not in caplog.text
     else:
-        assert after_own[: len(searched)] == searched
-        [rejected, summary] = after_own[len(searched) :]
-        assert rejected.startswith("attempt-") and summary == "generation"
+        assert requested[: len(searched)] == searched
+        [attempt] = rejected
+        assert sent[:2] == [(sweep.generation, attempt), (sweep.generation, "generation")]
+        assert sent[2:] and {generation for generation, _ in sent[2:]} == {own}
+        assert sent[-1] == (own, "generation")
         assert sweep.summaries() == ["KILLED"]
+        assert own_pending == 0
         assert "MLflow: delivered 1 record(s) left pending by earlier runs." in caplog.text
         pending = 1 + len(intents)
         assert (
@@ -316,3 +355,9 @@ def test_a_different_target_sends_nothing_and_the_original_config_delivers(
     assert caplog.text.count("records of earlier runs were neither saved nor sent") == 1
     assert publication.sync_tracking(experiment) == {"pending": 0, "delivered": 2}
     assert sweep.summaries() == ["KILLED"]
+    # Once nothing is left to send, the moved target costs no warning.
+    caplog.clear()
+    publication.deliver_ended_generations(
+        moved, validate_ledger(experiment), "f" * 32, session.DeliveryTally()
+    )
+    assert "neither saved nor sent" not in caplog.text

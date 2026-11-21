@@ -29,6 +29,7 @@ from phasesweep.tracking.session import (
     BINDING_FILE,
     GENERATION_BINDING_FILE,
     NO_ANSWER,
+    DeliveryTally,
     call_tracking,
     pending_creation_records,
     read_binding,
@@ -37,6 +38,7 @@ from phasesweep.tracking.session import (
     require_tracking_target,
     resolve_pending_creations,
     tracking_root,
+    unready_target_text,
     write_record,
 )
 
@@ -81,13 +83,12 @@ def _deliver(
     environment: Mapping[str, str],
     *,
     worker_generation: str | None = None,
-) -> bool:
-    """Try one persisted projection, keeping it pending when the upload fails.
+) -> None:
+    """Upload one persisted projection and mark its record delivered.
 
-    A failure MLflow answered, such as a deleted run, concerns this record alone, so it costs
-    a warning and the caller's other uploads go on. The upload worker is registered under the
-    generation of the run that sends it, so a worker whose cleanup that run cannot confirm is
-    attributed to it, whatever generation the record belongs to.
+    The upload worker is registered under the generation of the run that sends it, so a worker
+    whose cleanup that run cannot confirm is attributed to it, whatever generation the record
+    belongs to. :func:`_send` decides what a failure means for the record and the pass.
 
     :param Experiment experiment: Configured target.
     :param Path path: Pending delivery record.
@@ -96,14 +97,13 @@ def _deliver(
         record, under which its upload worker is registered; ``None`` registers it under the
         record's own generation, as for a run's own records and for sync-tracking, which is no run.
     :raises ProcessCleanupUncertainError: The upload worker's cleanup is uncertain.
-    :raises TimeoutError: MLflow gave no answer in time, as for every member of
-        :data:`~phasesweep.tracking.session.NO_ANSWER`, which the caller handles for the pass.
-    :return bool: Whether delivery has succeeded.
+    :raises OSError: The upload or the record's update failed, MLflow's verdict or no answer.
+    :raises ValueError: The upload failed.
+    :raises RuntimeError: The upload failed.
     """
     record = read_record(path)
     if record["state"] == "delivered":
-        return True
-    generation_id = json_text(record, "generation_id")
+        return
     action: PublishAction = {
         "action": "publish",
         "name": path.stem,
@@ -111,20 +111,10 @@ def _deliver(
         "projection": json_object(record["projection"]),
         "finish": json_optional_text(record, "finish"),
     }
-    try:
-        call_tracking(experiment, worker_generation or generation_id, action, environment)
-        # A lost acknowledgement resends the same projection on the next sync.
-        write_record(path, {**record, "state": "delivered"})
-    except ProcessCleanupUncertainError:
-        raise
-    except NO_ANSWER:
-        raise
-    except (OSError, ValueError, RuntimeError) as exc:
-        log.warning(
-            "MLflow upload %s of generation %s is pending (%s).", path.stem, generation_id, exc
-        )
-        return False
-    return True
+    generation_id = json_text(record, "generation_id")
+    call_tracking(experiment, worker_generation or generation_id, action, environment)
+    # A lost acknowledgement resends the same projection on the next sync.
+    write_record(path, {**record, "state": "delivered"})
 
 
 def _send(
@@ -133,24 +123,32 @@ def _send(
     environment: Mapping[str, str],
     *,
     worker_generation: str | None,
-) -> bool:
-    """Send records in order until MLflow stops answering.
+    tally: DeliveryTally,
+) -> list[Path]:
+    """Send records in order while the delivery is still sending.
 
-    A rejection of one record leaves it pending and the rest go on. A request MLflow gives no
-    answer to would meet the same tracker for every later record, so one such request ends the
-    pass and leaves the rest pending for the next run or sync-tracking.
+    A failure MLflow answered, such as a deleted run, concerns its record alone, so it costs a
+    warning and the rest go on. A request MLflow gives no answer to would meet the same tracker
+    for every later record, so one such request ends the pass and stops ``tally`` sending,
+    leaving the rest pending for the next run or sync-tracking.
 
     :param Experiment experiment: Configured target.
     :param list[Path] paths: Delivery records, in sending order.
     :param Mapping[str, str] environment: Composed credentials and transport.
     :param str | None worker_generation: Generation the upload workers register under, as for
         :func:`_deliver`.
+    :param DeliveryTally tally: The delivery this pass belongs to.
     :raises ProcessCleanupUncertainError: An upload worker's cleanup is uncertain.
-    :return bool: Whether MLflow answered every request sent.
+    :return list[Path]: The records delivered.
     """
+    delivered: list[Path] = []
     for index, path in enumerate(paths):
+        if not tally.sending:
+            break
         try:
             _deliver(experiment, path, environment, worker_generation=worker_generation)
+        except ProcessCleanupUncertainError:
+            raise
         except NO_ANSWER as exc:
             later = len(paths) - index - 1
             log.warning(
@@ -160,8 +158,19 @@ def _send(
                 exc,
                 f" MLflow did not answer, so {later} later upload(s) wait too." if later else "",
             )
-            return False
-    return True
+            tally.sending = False
+            tally.unanswered = unready_target_text(experiment, exc)
+            break
+        except (OSError, ValueError, RuntimeError) as exc:
+            log.warning(
+                "MLflow upload %s of generation %s is pending (%s).",
+                path.stem,
+                path.parent.parent.name,
+                exc,
+            )
+            continue
+        delivered.append(path)
+    return delivered
 
 
 def _records(experiment: Experiment, scope: str | None, *, skip: str | None = None) -> list[Path]:
@@ -343,7 +352,7 @@ def publish_trial(
         {binding["attempt_id"]: _AttemptTrial(trial, cleanup_confirmed=True)},
         ended=None,
     )
-    _send(experiment, paths, environment, worker_generation=None)
+    _send(experiment, paths, environment, worker_generation=None, tally=DeliveryTally())
 
 
 def _unrecorded_attempts(
@@ -565,30 +574,21 @@ def _save_generation_intents(experiment: Experiment, generation_id: str) -> list
     return paths
 
 
-def publish_generation(experiment: Experiment, generation_id: str) -> bool:
-    """Mirror a committed generation's winner references to its MLflow runs.
-
-    Every record is saved before the first upload, then every record of the generation still
-    pending is sent, including attempt outcomes an earlier upload left behind, so an outage
-    leaves all of them pending for the next run or sync-tracking.
+def _save_published(experiment: Experiment, generation_id: str) -> list[Path]:
+    """Save a committed generation's winner references to its MLflow runs, sending nothing.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Committed generation.
     :raises PublicationIntegrityError: The committed artifacts no longer validate.
     :raises OSError: A delivery record cannot be read or written.
-    :raises ProcessCleanupUncertainError: An upload worker's cleanup is uncertain.
-    :return bool: Whether MLflow answered every upload sent; True when the generation bound no
-        summary run, as a no-work replay sends nothing of its own.
+    :return list[Path]: Every record of the generation still pending, attempt outcomes an
+        earlier upload left behind included; none when the generation bound no summary run, as
+        a no-work replay sends nothing of its own.
     """
-    from phasesweep.engine.trial import _environment_identity
-
     if not (tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE).exists():
-        return True  # No-work replay never imports the SDK or creates remote runs.
-    environment = _environment_identity(experiment, experiment.phases[0].name).values
+        return []
     _save_generation_intents(experiment, generation_id)
-    return _send(
-        experiment, _pending_records(experiment, generation_id), environment, worker_generation=None
-    )
+    return _pending_records(experiment, generation_id)
 
 
 def _generation_publication_record(
@@ -668,44 +668,35 @@ def _save_failure_summary(
     )
 
 
-def publish_failed_generation(
+def _save_failed(
     experiment: Experiment,
     generation_id: str,
     error: BaseException,
     ledger: ValidatedLedger,
-) -> bool:
-    """Finish a failed invocation's owned runs after confirmed cleanup.
+) -> list[Path]:
+    """Save the records that finish a failed invocation's owned runs, sending nothing.
 
     Accepted trials keep accepted projections; other finished managed attempts, and without
     persistent storage RUNNING ones too, finish with the invocation's status. Committed
-    generations remain untouched. Every record of the generation still pending is sent,
-    including attempt outcomes an earlier upload left behind. A shutdown being serviced refuses
-    each upload, so an interrupted invocation only saves its records for the next run.
+    generations remain untouched.
 
     :param Experiment experiment: Configured experiment.
-    :param str generation_id: Failed invocation identity.
+    :param str generation_id: Failed invocation identity, whose cleanup is confirmed.
     :param BaseException error: Authoritative engine failure, without its private message.
     :param ValidatedLedger ledger: The invocation's ledger, holding its trials.
-    :raises ProcessCleanupUncertainError: An upload worker's cleanup is uncertain.
-    :return bool: Whether MLflow answered every upload sent; True when nothing was sent.
+    :return list[Path]: Every record of the generation still pending, attempt outcomes an
+        earlier upload left behind included; none when it bound no summary run or is published.
     """
-    from phasesweep.engine.trial import _environment_identity
-
     parent_path = tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE
-    if not parent_path.exists():
-        return True
-    if _published(experiment, generation_id):
-        return True
+    if not parent_path.exists() or _published(experiment, generation_id):
+        return []
     error_class = type(error).__name__
     status = _failure_status(error_class)
-    environment = _environment_identity(experiment, experiment.phases[0].name).values
     attempts = _unrecorded_attempts(experiment, generation_id)
     trials = _attempt_trials(ledger, {binding["phase"] for _, binding in attempts})
     _save_attempt_intents(experiment, generation_id, attempts, trials, ended=status)
     _save_failure_summary(experiment, generation_id, status, error_class)
-    return _send(
-        experiment, _pending_records(experiment, generation_id), environment, worker_generation=None
-    )
+    return _pending_records(experiment, generation_id)
 
 
 def _rebuild_attempt_intents(
@@ -873,7 +864,7 @@ def _stage_outstanding(
     ledger: ValidatedLedger,
     generation_ids: list[str],
     *,
-    errors: list[TrackingSyncRefusedError],
+    unresolved: dict[str, TrackingSyncRefusedError],
 ) -> None:
     """Save every record ended generations still owe their MLflow runs, sending nothing.
 
@@ -884,12 +875,12 @@ def _stage_outstanding(
     :param Experiment experiment: Configured experiment whose target the tree recorded.
     :param ValidatedLedger ledger: The experiment's validated ledger, holding the attempts' trials.
     :param list[str] generation_ids: Ended generations with a bound summary run.
-    :param list[TrackingSyncRefusedError] errors: Collects each generation whose lifecycle record
-        is unreadable or malformed; its outcomes stay unsaved.
+    :param dict[str, TrackingSyncRefusedError] unresolved: Collects each generation whose
+        lifecycle record is unreadable or malformed; its outcomes stay unsaved, and a generation
+        already in it is not read again.
     :raises OSError: A record cannot be read or written.
     :raises PublicationIntegrityError: A published generation's artifacts no longer validate.
     """
-    unresolved: dict[str, TrackingSyncRefusedError] = {}
     _rebuild_attempt_intents(experiment, ledger, generation_ids, unresolved=unresolved)
     _save_ended_summaries(experiment, generation_ids, unresolved=unresolved)
     root = tracking_root(experiment)
@@ -901,181 +892,269 @@ def _stage_outstanding(
         ):
             continue
         _save_generation_intents(experiment, generation_id)
-    errors.extend(unresolved.values())
 
 
 def _deliver_outstanding(
     experiment: Experiment,
     ledger: ValidatedLedger,
-    environment: Mapping[str, str],
     *,
     scope: str | None,
     skip: str | None,
     worker_generation: str | None,
+    tally: DeliveryTally,
     errors: list[TrackingSyncRefusedError],
-) -> list[Path]:
+    resolve: bool = False,
+    own: list[Path] | None = None,
+) -> None:
     """Deliver what every ended generation in scope still owes its MLflow runs.
 
     This is sync-tracking's work, shared with run closeout and recover-run. The caller holds the
-    experiment lock, so every generation in scope but ``skip`` has ended. Pending creations are
-    searched first, so a run a timed-out creation made late is bound before its records are
-    rebuilt; then missing records are staged and every pending record is sent. The first request
-    MLflow gives no answer to ends the pass, search or upload, so an outage costs one failed
-    request; records are still staged, and stay pending for the next run or sync-tracking.
+    experiment lock, so every generation in scope but ``skip`` has ended. Missing records are
+    staged first, locally, so nothing is requested when nothing is pending or ``tally`` has
+    stopped sending. Then the target is resolved if asked, pending creations are searched, so a
+    run a timed-out creation made late is bound and its records rebuilt, and every pending record
+    is sent, a closing run's own after the ended generations' ones, so MLflow never shows a run's
+    winner before the outcomes an earlier run left for it. The first request MLflow gives no
+    answer to ends the pass, search or upload, so an outage costs one failed request; what is
+    left stays pending for the next run or sync-tracking.
 
     :param Experiment experiment: Configured MLflow-backed experiment.
     :param ValidatedLedger ledger: The experiment's validated ledger, holding the attempts' trials.
-    :param Mapping[str, str] environment: Composed credentials and transport.
     :param str | None scope: One generation, or ``None`` for every generation.
-    :param str | None skip: Generation left out, a live invocation's own, whose records its
-        terminal delivery sends.
+    :param str | None skip: Generation left out, a live invocation's own, whose records arrive
+        as ``own``.
     :param str | None worker_generation: Generation the search and upload workers register
         under, or ``None`` for each record's own.
+    :param DeliveryTally tally: The delivery this pass belongs to; records of ended generations
+        delivered here are added to its count.
     :param list[TrackingSyncRefusedError] errors: Collects local creation record failures and
         unreadable lifecycle records, whose outcomes stay pending.
+    :param bool resolve: Resolve the target under ``worker_generation`` before the first request,
+        for a caller whose process made no target check, defaults to False.
+    :param list[Path] | None own: A closing run's own records, already saved, sent last.
     :raises TrackingSyncRefusedError: The configured target, or a saved record's target or
         generation, is not the one the tree recorded; nothing is sent.
+    :raises TrackingTargetUnavailableError: The target did not resolve; nothing else is sent.
     :raises ProcessCleanupUncertainError: A search or upload worker's cleanup is uncertain.
     :raises PublicationIntegrityError: A published generation's artifacts no longer validate.
-    :return list[Path]: The records sent, in sending order, or none after an unanswered search.
     """
+    from phasesweep.engine.trial import _environment_identity
+
     assert experiment.mlflow is not None
     different = "Tracking delivery belongs to a different target or generation."
     if not _target_recorded(experiment):
         raise TrackingSyncRefusedError(different)
-    answered = resolve_pending_creations(
-        experiment,
-        environment,
-        scope,
-        skip=skip,
-        worker_generation=worker_generation,
-        errors=errors,
-    )
-    _stage_outstanding(
-        experiment, ledger, _bound_generations(experiment, scope, skip), errors=errors
-    )
-    for path in _records(experiment, scope, skip=skip):
-        record = read_record(path)
-        if (
-            record["source"] != experiment.mlflow.evidence_identity()
-            or record["generation_id"] != path.parent.parent.name
-        ):
-            raise TrackingSyncRefusedError(different)
-    if not answered:
-        # The unanswered search already warned that the uploads wait too.
-        return []
-    paths = _pending_records(experiment, scope, skip=skip)
-    _send(experiment, paths, environment, worker_generation=worker_generation)
-    return paths
+    unresolved: dict[str, TrackingSyncRefusedError] = {}
+    try:
+        _stage_outstanding(
+            experiment, ledger, _bound_generations(experiment, scope, skip), unresolved=unresolved
+        )
+        for path in _records(experiment, scope, skip=skip):
+            record = read_record(path)
+            if (
+                record["source"] != experiment.mlflow.evidence_identity()
+                or record["generation_id"] != path.parent.parent.name
+            ):
+                raise TrackingSyncRefusedError(different)
+        creations = _pending_creations(experiment, scope, skip)
+        own_pending = [path for path in own or [] if read_record(path)["state"] != "delivered"]
+        pending = _pending_records(experiment, scope, skip=skip)
+        if not tally.sending or not (creations or pending or own_pending):
+            return
+        environment = _environment_identity(experiment, experiment.phases[0].name).values
+        if resolve:
+            assert worker_generation is not None
+            require_tracking_target(
+                experiment,
+                generation_id=worker_generation,
+                environment=environment,
+                deadline=None,
+                resolve_only=True,
+            )
+        if creations:
+            resolve_pending_creations(
+                experiment,
+                environment,
+                scope,
+                skip=skip,
+                worker_generation=worker_generation,
+                errors=errors,
+                tally=tally,
+            )
+            # A run a search bound gets its records now rather than on the next pass.
+            _stage_outstanding(
+                experiment,
+                ledger,
+                _bound_generations(experiment, scope, skip),
+                unresolved=unresolved,
+            )
+            pending = _pending_records(experiment, scope, skip=skip)
+        sent = _send(
+            experiment,
+            pending + own_pending,
+            environment,
+            worker_generation=worker_generation,
+            tally=tally,
+        )
+        tally.delivered += len(set(sent) & set(pending))
+    finally:
+        errors.extend(unresolved.values())
 
 
-def _pending_creations(experiment: Experiment, skip: str | None) -> list[Path]:
-    """List the pending creation intents of every generation but ``skip``.
+def _pending_creations(experiment: Experiment, scope: str | None, skip: str | None) -> list[Path]:
+    """List the pending creation intents in scope, but ``skip``'s.
 
     :param Experiment experiment: Configured experiment.
+    :param str | None scope: One generation, or ``None`` for every generation.
     :param str | None skip: Generation left out, a live invocation's own.
     :return list[Path]: Pending summary and attempt creation records.
     """
     skipped = set() if skip is None else set(pending_creation_records(experiment, skip))
-    return [path for path in pending_creation_records(experiment) if path not in skipped]
+    return [path for path in pending_creation_records(experiment, scope) if path not in skipped]
+
+
+def _owed(experiment: Experiment, skip: str | None) -> bool:
+    """Report whether any generation but ``skip`` has something left to save or send.
+
+    That is a pending record or creation, or a bound summary run with no delivered record, as
+    an invocation killed outright leaves.
+
+    :param Experiment experiment: Configured experiment.
+    :param str | None skip: Generation left out, a live invocation's own.
+    :raises OSError: A record cannot be read.
+    :raises ValueError: A record does not use the current format.
+    :return bool: Whether an ended generation still owes MLflow anything.
+    """
+    root = tracking_root(experiment)
+    return bool(
+        _pending_records(experiment, None, skip=skip)
+        or _pending_creations(experiment, None, skip)
+        or any(
+            not (root / generation_id / "delivery" / "generation.json").exists()
+            for generation_id in _bound_generations(experiment, None, skip)
+        )
+    )
 
 
 def deliver_ended_generations(
     experiment: Experiment,
     ledger: ValidatedLedger,
     generation_id: str,
+    tally: DeliveryTally,
     *,
     recovering: bool = False,
-    tracker_unreachable: bool = False,
-) -> int:
+    own: list[Path] | None = None,
+) -> None:
     """Finish, at a run's end, what sync-tracking would for every generation that has ended.
 
-    That is every generation but a run's own, whose records are its terminal delivery's, which
-    knows how the run ended; for recover-run it is every generation. Records are staged locally
-    first, so nothing is requested when nothing is pending. The rest goes only after a target
+    That is every generation but a run's own, whose saved records come as ``own`` and go last;
+    for recover-run it is every generation. The core stages first and requests nothing when
+    nothing is pending or ``tally`` has stopped sending. Its first request follows a target
     check: the one the calling run made when it bound its own summary run, or else a resolve
-    made here, which binds none. Workers register under ``generation_id`` because this
+    the core makes, which binds none. Workers register under ``generation_id`` because this
     invocation is accountable for their cleanup. A configured target other than the recorded
-    one stages and sends nothing. Every failure but an uncertain worker cleanup or a shutdown
-    costs a warning and leaves the records for the next run or sync-tracking, never the
-    caller's outcome.
+    one stages and sends nothing, with a warning when an earlier run left something to send.
+    Every failure but an uncertain worker cleanup or a shutdown costs a warning and leaves the
+    records for the next run or sync-tracking, never the caller's outcome.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param ValidatedLedger ledger: The caller's ledger, holding the trials the records describe.
     :param str generation_id: The calling run's generation, or for ``recover-run`` the run it
         recovers.
+    :param DeliveryTally tally: The caller's delivery, which says whether anything is sent and
+        counts what is.
     :param bool recovering: The caller is ``recover-run``, so ``generation_id`` is the run it
         recovers rather than its own invocation: that run's records are sent with the rest, and
-        the target is resolved here, as no check in this process covered it.
-    :param bool tracker_unreachable: The caller found MLflow silent, so records are only staged.
+        the target is resolved first, as no check in this process covered it.
+    :param list[Path] | None own: The calling run's own pending records, saved already.
     :raises ProcessCleanupUncertainError: A search or upload worker's cleanup is uncertain.
-    :return int: Records of those generations delivered here.
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
-    from phasesweep.engine.trial import _environment_identity
 
     skip = None if recovering else generation_id
+    checked = (
+        not recovering
+        and (tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE).is_file()
+    )
     errors: list[TrackingSyncRefusedError] = []
     try:
-        generations = _bound_generations(experiment, None, skip)
         if not _target_recorded(experiment):
-            if generations or _pending_creations(experiment, skip):
+            if _owed(experiment, skip):
                 log.warning(
                     "MLflow: records of earlier runs were neither saved nor sent: this config's "
                     "MLflow target is not the one those runs used. A run or `phasesweep "
-                    "sync-tracking CONFIG` with the config the sweep ran with delivers what they "
+                    "sync-tracking CONFIG` with the config the sweep ran with sends what they "
                     "left pending."
                 )
-            return 0
-        _stage_outstanding(experiment, ledger, generations, errors=errors)
-        pending = _pending_records(experiment, None, skip=skip) or _pending_creations(
-            experiment, skip
-        )
-        if not pending or tracker_unreachable:
-            return 0
-        environment = _environment_identity(experiment, experiment.phases[0].name).values
-        checked = (
-            not recovering
-            and (tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE).is_file()
-        )
-        if not checked:
-            require_tracking_target(
-                experiment,
-                generation_id=generation_id,
-                environment=environment,
-                deadline=None,
-                resolve_only=True,
-            )
-        # The core stages again after its searches, so its errors replace the first staging's.
-        errors = []
-        sent = _deliver_outstanding(
+            return
+        _deliver_outstanding(
             experiment,
             ledger,
-            environment,
             scope=None,
             skip=skip,
             worker_generation=generation_id,
+            tally=tally,
             errors=errors,
+            resolve=not checked,
+            own=own,
         )
-        return sum(1 for path in sent if read_record(path)["state"] == "delivered")
     except ProcessCleanupUncertainError:
         raise
     except TrackingTargetUnavailableError as exc:
+        tally.sending = False
         log.warning("%s", exc)
-        return 0
     except (OSError, ValueError, PhaseSweepError) as exc:
+        tally.sending = False
         log.warning(
-            "MLflow: records left by earlier runs were not all delivered (%s). The next run or "
-            "`phasesweep sync-tracking CONFIG` rebuilds and delivers them.",
+            "MLflow: records were not all sent (%s). The next run or `phasesweep sync-tracking "
+            "CONFIG` rebuilds and sends them.",
             exc,
         )
-        return 0
     finally:
         for error in errors:
             log.warning("%s %s", error, operator_step(error))
 
 
-def report_delivery(experiment: Experiment, generation_id: str, delivered: int) -> None:
+def deliver_closeout(
+    experiment: Experiment,
+    ledger: ValidatedLedger,
+    generation_id: str,
+    *,
+    error: BaseException | None = None,
+    published: bool = False,
+) -> None:
+    """Save a closing run's own MLflow records, send what is pending, and log the closing lines.
+
+    The run's own records are saved before anything is sent, so however the delivery ends they
+    are counted; then every ended generation's records go, the run's own last, through the core
+    sync-tracking runs. The closing lines are logged however the delivery ends.
+
+    :param Experiment experiment: MLflow-backed experiment.
+    :param ValidatedLedger ledger: The run's ledger, holding its trials and those it settled.
+    :param str generation_id: The closing run's generation.
+    :param BaseException | None error: The run's primary failure, or ``None`` for a run that ended
+        normally.
+    :param bool published: Whether a run that ended normally published ``generation_id``; a
+        replay of an existing publication did not.
+    :raises PublicationIntegrityError: The run's committed artifacts no longer validate.
+    :raises OSError: A record of the run's own cannot be read or written.
+    :raises ProcessCleanupUncertainError: An upload worker's cleanup is uncertain.
+    """
+    from phasesweep.engine.errors import TrackingTargetUnavailableError
+
+    # A run that just found its tracker silent sends nothing more to it.
+    tally = DeliveryTally(sending=not isinstance(error, TrackingTargetUnavailableError))
+    try:
+        if error is not None:
+            own = _save_failed(experiment, generation_id, error, ledger)
+        else:
+            own = _save_published(experiment, generation_id) if published else []
+        deliver_ended_generations(experiment, ledger, generation_id, tally, own=own)
+    finally:
+        report_delivery(experiment, generation_id, tally)
+
+
+def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryTally) -> None:
     """Log the lines that close a run's MLflow delivery.
 
     Records delivered for earlier runs are counted when there are any, then the records still
@@ -1083,8 +1162,9 @@ def report_delivery(experiment: Experiment, generation_id: str, delivered: int) 
 
     :param Experiment experiment: MLflow-backed experiment.
     :param str generation_id: The run's own generation.
-    :param int delivered: Records of earlier generations this run delivered.
+    :param DeliveryTally tally: The run's closeout delivery.
     """
+    delivered = tally.delivered
     try:
         pending = delivery_status(experiment)["pending"]
         earlier = pending - delivery_status(experiment, generation_id)["pending"]
@@ -1121,13 +1201,18 @@ def delivery_status(experiment: Experiment, generation_id: str | None = None) ->
     return counts
 
 
-def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
+def sync_tracking(
+    experiment: Experiment,
+    generation_id: str | None = None,
+    *,
+    tally: DeliveryTally | None = None,
+) -> dict[str, int]:
     """Retry pending result projections without selecting or training.
 
     Check the artifact-root binding and ledger format as every writer does, then
-    reconcile unresolved creations, rebuild missing attempt records from Optuna,
-    the summary-run record of each ended unpublished generation from its lifecycle
-    record, and winner records from committed generation artifacts, and send what is pending
+    rebuild missing attempt records from Optuna, the summary-run record of each ended
+    unpublished generation from its lifecycle record, and winner records from committed
+    generation artifacts, reconcile unresolved creations, and send what is pending
     until MLflow stops answering, through the core run closeout shares.
     Report local creation or lifecycle record errors after delivering independent records
     in the selected scope.
@@ -1135,6 +1220,8 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
     :param Experiment experiment: Matching source experiment configuration.
     :param str | None generation_id: Generation whose deliveries should be
         retried, or ``None`` for every generation's retained deliveries.
+    :param DeliveryTally | None tally: Receives what the requests met, for a caller that words
+        the outcome; a fresh one when omitted.
     :raises ValueError: The generation name is unsafe, or a delivery record is malformed.
     :raises TrackingSyncRefusedError: The config has no ``mlflow`` block, no deliveries
         exist, the target or generation does not match the saved records, or a generation's
@@ -1151,7 +1238,6 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
     from phasesweep.engine.attempts import _preflight_active_attempts, _PreflightCleanupReport
     from phasesweep.engine.ledger import validate_ledger
     from phasesweep.engine.locking import _experiment_lock
-    from phasesweep.engine.trial import _environment_identity
     from phasesweep.runtime.shutdown import signal_handler_scope
     from phasesweep.tracking.mlflow import require_mlflow_sdk
 
@@ -1171,16 +1257,15 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
         )
         root = tracking_root(experiment)
         had_creations = bool(pending_creation_records(experiment, generation_id))
-        environment = _environment_identity(experiment, experiment.phases[0].name).values
         errors: list[TrackingSyncRefusedError] = []
         # The lock rules out a live invocation, so every unpublished generation here has ended.
         _deliver_outstanding(
             experiment,
             ledger,
-            environment,
             scope=generation_id,
             skip=None,
             worker_generation=None,
+            tally=DeliveryTally() if tally is None else tally,
             errors=errors,
         )
         if (

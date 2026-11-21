@@ -65,6 +65,7 @@ from phasesweep.tracking.mlflow import _publish
 from phasesweep.tracking.session import (
     BINDING_FILE,
     INHERITS_FILE,
+    DeliveryTally,
     read_record,
     tracking_root,
     write_record,
@@ -372,7 +373,7 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
     )
     requests = []
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
-    publication.publish_failed_generation(experiment, generation, KeyboardInterrupt(), ledger)
+    publication.deliver_closeout(experiment, ledger, generation, error=KeyboardInterrupt())
     assert [(r["binding"]["attempt_id"][0], r["finish"]) for r in requests] == [
         ("4", None),
         ("a", "KILLED"),
@@ -431,7 +432,7 @@ def test_failed_invocation_leaves_a_pending_trials_managed_run_open_only_when_pe
     write_record(directory / INHERITS_FILE, {"schema_version": 1, "inherits": {}})
     requests = []
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
-    publication.publish_failed_generation(experiment, generation, RuntimeError("outage"), ledger)
+    publication.deliver_closeout(experiment, ledger, generation, error=RuntimeError("outage"))
     delivery = tracking_root(experiment) / generation / "delivery"
     if storage == "memory":
         assert [(r["binding"]["attempt_id"], r["finish"]) for r in requests] == [
@@ -699,20 +700,54 @@ def test_failure_persistence_error_cannot_replace_primary(tmp_path, monkeypatch)
     experiment = _fail_engine(tmp_path, monkeypatch, error)
     monkeypatch.setattr(
         publication,
-        "publish_failed_generation",
-        lambda *args: (_ for _ in ()).throw(PermissionError("delivery filesystem read-only")),
+        "deliver_closeout",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            PermissionError("delivery filesystem read-only")
+        ),
     )
     with pytest.raises(RuntimeError) as caught:
         run_experiment(experiment)
     assert caught.value is error
 
 
+def test_each_summary_record_is_sent_after_the_records_of_its_generation(tmp_path: Path) -> None:
+    """Records go generation by generation, each summary-run record after its generation's others.
+
+    A summary run MLflow shows ended therefore had the attempt outcomes and winner references it
+    summarizes sent first, including a winner record whose name sorts after ``generation``.
+    """
+    experiment = native_experiment(tmp_path)
+    root = tracking_root(experiment)
+    stems = {
+        "1" * 32: ["winner-rate", "generation", "attempt-b", "attempt-a"],
+        "2" * 32: ["generation", "attempt-c"],
+    }
+    for generation, names in stems.items():
+        (root / generation / "delivery").mkdir(parents=True)
+        for name in names:
+            write_record(
+                root / generation / "delivery" / f"{name}.json",
+                {"schema_version": 1, "state": "pending"},
+            )
+    assert [
+        f"{path.parent.parent.name[0]}/{path.stem}"
+        for path in publication._pending_records(experiment, None)
+    ] == [
+        "1/attempt-a",
+        "1/attempt-b",
+        "1/winner-rate",
+        "1/generation",
+        "2/attempt-c",
+        "2/generation",
+    ]
+
+
 def test_missing_binding_never_creates_or_discovers_a_summary(tmp_path, monkeypatch):
     """An unresolved create response cannot identify a run to finish by guessing."""
     experiment = native_experiment(tmp_path)
     monkeypatch.setattr(publication, "call_tracking", lambda *args: pytest.fail("No remote work"))
-    publication.publish_failed_generation(
-        experiment, "a" * 32, RuntimeError("create unresolved"), validate_ledger(experiment)
+    publication.deliver_closeout(
+        experiment, validate_ledger(experiment), "a" * 32, error=RuntimeError("create unresolved")
     )
     assert publication.delivery_status(experiment) == {"pending": 0, "delivered": 0}
 
@@ -751,9 +786,7 @@ def test_failure_publisher_preserves_historical_generation_outcome(
     requests = []
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
 
-    publication.publish_failed_generation(
-        experiment, generation, RuntimeError("late error"), ledger
-    )
+    publication.deliver_closeout(experiment, ledger, generation, error=RuntimeError("late error"))
 
     assert pointer.read_bytes() == pointer_before
     assert published_generation_id(experiment) == newer_generation
@@ -945,7 +978,7 @@ def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_pa
 
     with monkeypatch.context() as crash:
         lose_record_writes(crash, OSError("controller died after the pointer commit"))
-        crash.setattr(publication, "publish_generation", lambda *args: None)
+        crash.setattr(publication, "deliver_closeout", lambda *args, **kwargs: None)
         run_experiment(experiment)
     first = yaml.safe_load(pointer_path.read_text())["generation_id"]
     first_delivery = tracking_root(experiment) / first / "delivery"
@@ -981,14 +1014,18 @@ def test_sync_leaves_superseded_publication_unresolved_when_its_record_cannot_be
     config["phases"] = config["phases"][:1]
     config["phases"][0].update(n_trials=1, gpu_policy="none", sampler={"type": "random", "seed": 1})
     experiment = Experiment.model_validate(config)
+
+    def offline(*args: object, **kwargs: object) -> None:
+        raise OSError("tracker offline")
+
     with monkeypatch.context() as without_mirror:
-        without_mirror.setattr(publication, "publish_generation", lambda *_: None)
-        without_mirror.setattr(publication, "_deliver", lambda *args, **kwargs: False)
+        without_mirror.setattr(publication, "deliver_closeout", lambda *args, **kwargs: None)
+        without_mirror.setattr(publication, "_deliver", offline)
         run_experiment(experiment, generation_id="older")
     with monkeypatch.context() as older_left_for_sync:
         # The newer run's closeout would otherwise deliver the older generation's records.
         older_left_for_sync.setattr(
-            publication, "deliver_ended_generations", lambda *args, **kwargs: 0
+            publication, "deliver_ended_generations", lambda *args, **kwargs: None
         )
         run_experiment(experiment, generation_id="newer")
     assert read_status(experiment)["published_generation_id"] == "newer"
@@ -1250,7 +1287,9 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
     ledger = validate_ledger(experiment)
     uploads.clear()
     if caller == "own-run":
-        assert publication.deliver_ended_generations(experiment, ledger, generation) == 0
+        tally = DeliveryTally()
+        publication.deliver_ended_generations(experiment, ledger, generation, tally)
+        assert tally.delivered == 0
         assert not record.exists()
         assert uploads == []
         return
@@ -1269,10 +1308,11 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
         assert uploads == []
     else:
         if caller == "recover-run":
-            sent = publication.deliver_ended_generations(
-                experiment, ledger, generation, recovering=True
+            tally = DeliveryTally()
+            publication.deliver_ended_generations(
+                experiment, ledger, generation, tally, recovering=True
             )
-            assert sent == 1
+            assert tally.delivered == 1
             assert publication.delivery_status(experiment)["pending"] == 0
         else:
             # A finished attempt's accepted outcome was delivered before the kill.
