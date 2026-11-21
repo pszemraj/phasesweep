@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import shlex
@@ -1103,23 +1104,34 @@ def test_a_ctrl_c_during_sync_tracking_says_what_stays_pending_and_exits_130(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("window", ["open", "closing"])
 def test_sync_tracking_says_when_a_creation_inside_its_window_can_be_settled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    window: str,
 ) -> None:
     """A creation MLflow has no run for yet, inside its window, gets its cause and when to retry.
 
     The search answers that no run carries the identity, so the lost request may still create
-    one until timeout_seconds after it was sent; the step names that time and the command.
+    one until timeout_seconds after it was sent; the step names that time, rounded up so a
+    retry at the printed second is past it, and the command. A window that closes during the
+    search gets the same cause and a step to retry now, which settles the creation.
     """
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
+    timeout = 600.0 if window == "open" else 2.0
     experiment = sweep.experiment.model_copy(
-        update={"mlflow": sweep.experiment.mlflow.model_copy(update={"timeout_seconds": 600.0})}
+        update={"mlflow": sweep.experiment.mlflow.model_copy(update={"timeout_seconds": timeout})}
     )
     respond = session.request_operation
     intent = _kill_at_summary_creation(monkeypatch, experiment)
+    end = intent.stat().st_mtime + timeout
 
     def no_run_yet(request: dict[str, object], **kwargs: object) -> JsonObject:
         if request["action"] == "find":
+            if window == "closing":
+                # Past the second the step would print as the window's end.
+                time.sleep(max(0.0, math.ceil(end) - time.time()) + 0.2)
             return {"found": False}
         return respond(request, **kwargs)
 
@@ -1131,18 +1143,27 @@ def test_sync_tracking_says_when_a_creation_inside_its_window_can_be_settled(
     assert invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch) == 1
 
     error = capsys.readouterr().err
-    until = time.strftime("%H:%M:%S", time.localtime(intent.stat().st_mtime + 600.0))
+    until = time.strftime("%H:%M:%S", time.localtime(math.ceil(end)))
+    step = (
+        rf"Wait until {until}, about (\d+) s from now, then"
+        if window == "open"
+        else "That window has closed since the search, so"
+    )
     match = re.search(
         r"phasesweep: MLflow delivery remains pending: MLflow has no run yet for 1 unconfirmed "
         r"run creation, and the request whose answer was lost may still create one until "
-        r"timeout_seconds \(600 s\) after it was sent\.\n"
-        rf"fix: Wait until {until}, about (\d+) s from now, then run this command again:\n"
+        rf"timeout_seconds \({timeout:g} s\) after it was sent\.\n"
+        rf"fix: {step} run this command again:\n"
         rf"phasesweep sync-tracking {re.escape(str(config))}\n$",
         error,
     )
     assert match is not None, error
-    assert 0 < int(match.group(1)) <= 600
     assert intent.exists()
+    if window == "open":
+        assert 0 < int(match.group(1)) <= 601
+    else:
+        assert invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch) == 0
+        assert not intent.exists()
 
 
 def test_a_run_whose_target_gives_no_answer_ends_with_the_retry_step(

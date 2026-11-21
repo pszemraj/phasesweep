@@ -1466,6 +1466,8 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
     with _console_logging(verbose=False):
         config = _command_config(config_path, settings=settings)
         require_study(config)
+        # Every creation search starts after this, so a window open now was open at its search.
+        started = time.time()
         try:
             counts = sync(config, generation_id, tally=tally)
         except ValueError as exc:
@@ -1490,15 +1492,16 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
             remediation=f"Once each such cause is fixed, {again}",
         )
     creations = pending_creation_records(config, generation_id)
-    now = time.time()
     open_windows = [
-        end for end in (creation_window_end(config, path) for path in creations) if end > now
+        end for end in (creation_window_end(config, path) for path in creations) if end > started
     ]
     if open_windows:
         assert config.mlflow is not None
         # MLflow answered that no run carries the identity yet, and the lost request may still
-        # make one, so only a search after the window can settle the creation.
-        until = max(open_windows)
+        # make one, so only a search after the window can settle the creation. The time is
+        # rounded up, so a retry at the printed second is past the window.
+        until = math.ceil(max(open_windows))
+        left = math.ceil(until - time.time())
         raise PhaseSweepError(
             f"MLflow delivery remains pending: MLflow has no run yet for "
             f"{count_text(0, len(open_windows))}, and the request whose answer was lost may "
@@ -1506,8 +1509,10 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
             "after it was sent.",
             action=OperatorAction.RETRY,
             remediation=(
-                f"Wait until {time.strftime('%H:%M:%S', time.localtime(until))}, about "
-                f"{math.ceil(until - now)} s from now, then {again}"
+                f"Wait until {time.strftime('%H:%M:%S', time.localtime(until))}, about {left} s "
+                f"from now, then {again}"
+                if left > 0
+                else f"That window has closed since the search, so {again}"
             ),
         )
     records = counts["pending"] - len(creations)
