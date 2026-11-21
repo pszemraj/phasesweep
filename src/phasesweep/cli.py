@@ -87,7 +87,14 @@ from phasesweep.mcp.registry import (
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.tool_names import TOOL_NAMES
 from phasesweep.reporting import _progress_values, report_objective
-from phasesweep.run_report import banner, nothing_to_run, report, summary
+from phasesweep.run_report import (
+    Banner,
+    NothingToRun,
+    Summary,
+    banner,
+    nothing_to_run,
+    summary,
+)
 from phasesweep.runtime.console import ConsoleHandler
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
@@ -106,7 +113,6 @@ from phasesweep.runtime.shutdown import (
     install_signal_handlers,
 )
 from phasesweep.runtime.terminal import (
-    ReportBlock,
     display_path,
     paint,
     plural,
@@ -575,7 +581,7 @@ def run(
         run_log = _run_log_path(config)
         if not dry_run:
             _RUN_LOG.set(run_log)
-            report.info(
+            _print_block(
                 banner(
                     config,
                     config_path=display_path(config_path),
@@ -601,7 +607,7 @@ def run(
                 click.echo(_resume_hint(config), err=True)
             raise
         if not dry_run and finished:
-            report.info(
+            _print_block(
                 _closing_block(
                     config,
                     finished[-1],
@@ -614,6 +620,16 @@ def run(
             )
 
 
+def _print_block(block: Banner | Summary | NothingToRun) -> None:
+    """Write a block the run prints but does not log to stderr, fitted to its width and colour.
+
+    :param Banner | Summary | NothingToRun block: The block to draw.
+    """
+    stream = sys.stderr
+    lines = block.render(terminal_width(stream), color=use_color(stream))
+    click.echo("\n".join(lines), err=True)
+
+
 def _closing_block(
     config: Experiment,
     outcome: TerminalReport,
@@ -623,7 +639,7 @@ def _closing_block(
     config_path: Path,
     settings: tuple[str, ...],
     from_phase: str | None,
-) -> ReportBlock:
+) -> Summary | NothingToRun:
     """Build what a successful run closes with: its summary, or that it had nothing to run.
 
     :param Experiment config: The config that ran.
@@ -634,7 +650,7 @@ def _closing_block(
     :param Path config_path: The config path as typed.
     :param tuple[str, ...] settings: The ``--set`` assignments as typed.
     :param str | None from_phase: The ``--from-phase`` value, if given.
-    :return ReportBlock: The block to log.
+    :return Summary | NothingToRun: The block to print.
     """
     if outcome.replayed_generation_id is not None:
         return nothing_to_run(

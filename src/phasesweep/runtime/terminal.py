@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
-from typing import ClassVar, Literal, Protocol, TextIO
+from typing import Literal, Protocol, TextIO
 
 #: Name of the logger whose records are a run's report: the lines a person reads on the console.
 REPORT_LOGGER = "phasesweep.report"
@@ -211,11 +211,8 @@ class ReportBlock(ABC):
 
     A block is logged on the ``phasesweep.report`` logger. ``str()`` is the plain one-line text
     that ``run.log``, a test's captured records and the MCP runner's log receive, and
-    :meth:`render` is what the console handler prints.
+    :meth:`render` is what the console handler prints after the time of day.
     """
-
-    #: Whether the console prefixes the block's first line with the time of day.
-    timestamped: ClassVar[bool] = True
 
     @abstractmethod
     def render(self, width: int, *, color: bool) -> list[str]:

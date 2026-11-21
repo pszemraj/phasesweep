@@ -22,7 +22,6 @@ from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import PhaseCounts, Winner
 from phasesweep.evidence.models import WandbExtractor
 from phasesweep.run_report import (
-    PhaseStart,
     banner,
     nothing_to_run,
     phase_start,
@@ -325,16 +324,6 @@ def test_winner_line_forms(experiment: Experiment) -> None:
         "timeout scope phase  model.n_layers=8  optimizer.lr=0.0003123  mean of 3 repeats of seed  "
         "sd 0.01235  range 0.3..0.32  members 5, 6, 7"
     )
-
-
-def test_every_block_is_a_one_line_log_message(experiment: Experiment) -> None:
-    """``str()`` never breaks a line, so a ``run.log`` record stays one line."""
-    blocks: list[ReportBlock] = [
-        PhaseStart("p", 1, 2, 0, 0, 1),
-        phase_start(experiment, experiment.phases[0], finished=0, remaining=4, reruns=0),
-        rerun_line(experiment, experiment.phases[0], number=1, source=0, reason="cause"),
-    ]
-    assert all("\n" not in str(block) for block in blocks)
 
 
 class FakeStderr(io.StringIO):
@@ -654,13 +643,6 @@ def test_banner_for_the_starter() -> None:
         "  log       /home/me/runs/phasesweep_starter/run.log",
         "",
     ]
-    assert str(block) == (
-        "phasesweep run phasesweep_starter  config starter.yaml  phases depth 2 trials, grid, "
-        "1 at a time, gpu none; learning_rate 2 trials, grid, 1 at a time, gpu none  "
-        "storage auto  tracker none  workdir runs/phasesweep_starter  "
-        "log /home/me/runs/phasesweep_starter/run.log"
-    )
-    assert not block.timestamped
 
 
 def _tracked_experiment() -> Experiment:
@@ -726,7 +708,6 @@ def test_banner_names_trackers_devices_and_the_starting_phase() -> None:
         "                           fixed  1 at a time",
         "                           gpu whole_node devices GPU-aa",
     ]
-    assert "from learning_rate" in str(block)
 
 
 def test_banner_breaks_a_long_path_at_slashes_and_never_shows_the_environment() -> None:
@@ -751,7 +732,7 @@ def test_banner_breaks_a_long_path_at_slashes_and_never_shows_the_environment() 
         "            phasesweep_starter/run.log",
         "",
     ]
-    shown = str(block) + "".join(block.render(80, color=False))
+    shown = "".join(block.render(80, color=False))
     assert "hunter2" not in shown
     assert "API_TOKEN" not in shown
     assert "SECRET_NAME" not in shown
@@ -804,15 +785,6 @@ def test_summary_for_a_fresh_run() -> None:
         "",
         "Next: phasesweep status starter.yaml --trials",
     ]
-    assert str(block) == (
-        "Finished in 3.0s: 2 phases, 4 trials, 0 from a previous run  "
-        "depth: 2 complete, winner trial 0 eval_loss 0.3 model.n_layers=8  "
-        "learning_rate: 2 complete, winner trial 0 eval_loss 0.3 optimizer.lr=0.0003  "
-        "Written under runs/phasesweep_starter: "
-        "generations/6413d5c1edd5475998cfadd4d3b59980/summary.yaml, depth/trials.csv, "
-        "learning_rate/trials.csv  Next: phasesweep status starter.yaml --trials"
-    )
-    assert not block.timestamped
 
 
 def test_summary_of_a_resumed_run_with_failures_and_a_skipped_phase() -> None:
@@ -863,7 +835,6 @@ def test_summary_omits_the_written_section_when_nothing_was_written() -> None:
         next_command="phasesweep status starter.yaml --trials",
     )
     assert "Written under" not in "\n".join(block.render(80, color=False))
-    assert "Written under" not in str(block)
 
 
 def test_nothing_to_run_is_one_sentence() -> None:
@@ -878,10 +849,6 @@ def test_nothing_to_run_is_one_sentence() -> None:
         "Finished in 0.4s: nothing to run, 4 trials already finished, and generation",
         "6413d5c1edd5475998cfadd4d3b59980 already publishes these winners.",
     ]
-    assert str(block) == (
-        "Finished in 0.4s: nothing to run, 4 trials already finished, and generation "
-        "6413d5c1edd5475998cfadd4d3b59980 already publishes these winners."
-    )
 
 
 def test_banner_and_summary_style_only_labels_paths_and_the_winner_mark() -> None:
@@ -994,6 +961,12 @@ def test_a_live_run_opens_with_the_banner_and_closes_with_summary_then_log(
     assert [line.split("/")[-1].strip() for line in written] == ["summary.yaml", "trials.csv"]
     assert lines[-2] == f"Next: phasesweep status {config} --trials"
     assert lines[-1] == f"log: {tmp_path / 'first' / 'runs' / 't' / 'run.log'}"
+    # The banner and the summary are written to stderr only; run.log holds the progress lines.
+    run_log = (tmp_path / "first" / "runs" / "t" / "run.log").read_text(encoding="utf-8")
+    assert "phasesweep.report p  trial 0  COMPLETE" in run_log
+    assert "phasesweep run" not in run_log
+    assert "Finished in" not in run_log
+    assert "Written under" not in run_log
 
 
 def test_a_replay_says_nothing_ran_and_lists_no_written_files(

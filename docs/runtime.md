@@ -11,7 +11,7 @@ demo/
   .gitignore
   .ignore
   artifact_root_binding.json
-  run.log                         # PhaseSweep's log: the console's report lines, warnings, errors and debug messages, with timestamps and logger names
+  run.log                         # PhaseSweep's log: every progress line, warning, error and diagnostic message, with timestamps and logger names
   study.journal                   # storage: auto
   generation.yaml
   last_successful_generation.yaml
@@ -72,7 +72,7 @@ The two files are owner-only while their directories keep ordinary permissions. 
 
 ## Following a run
 
-`phasesweep run` prints a report on stderr and leaves stdout empty. It opens with a banner naming the config, each phase's trial count, sampler, parallelism and GPU policy, the storage, tracker and workdir, and the absolute path of `run.log`, and it closes with a summary of each phase's trial counts and winner, the files the run wrote and the command that reads the result. In between, every phase start, trial, rerun, skipped phase and winner prints on a line of its own with the time, and so does each warning or error, wrapped to the terminal under a `warning:` or `error:` label. The last line is `log: <path>`, printed after the summary, after a failure's `fix:` line and after an interrupt's resume hint whenever `run.log` exists. The console shows the report and warnings while `run.log` holds everything, with timestamps and logger names: the trainer command of each trial, GPU and storage notes, and every report line below. Optuna logs only errors in both. `run --verbose` records PhaseSweep's debug messages and the traceback of a failure in `run.log` and leaves the console as it is. A failure-policy `ABORTED` line, such as `ABORTED: 3 consecutive failed/infeasible trials reached max_consecutive_failures=3.`, follows the trial line that triggered it.
+`phasesweep run` prints a report on stderr and leaves stdout empty. It opens with a banner naming the config, each phase's trial count, sampler, parallelism and GPU policy, the storage, tracker and workdir, and the absolute path of `run.log`, and it closes with a summary of each phase's trial counts and winner, the files the run wrote and the command that reads the result. In between, every phase start, trial, rerun, skipped phase and winner prints on a line of its own with the time, and so does each warning or error, wrapped to the terminal under a `warning:` or `error:` label. The last line is `log: <path>`, printed after the summary, after a failure's `fix:` line and after an interrupt's resume hint whenever `run.log` exists. The banner and the summary are printed on the console only. `run.log` holds every progress line, warning, error and diagnostic message with its timestamp and logger name, including what the console leaves out, such as the trainer command of each trial and GPU and storage notes. Optuna logs only errors in both. `run --verbose` records PhaseSweep's debug messages and the traceback of a failure in `run.log` and leaves the console as it is. A failure-policy `ABORTED` line, such as `ABORTED: 3 consecutive failed/infeasible trials reached max_consecutive_failures=3.`, follows the trial line that triggered it.
 
 On a 100-column terminal the starter prints:
 

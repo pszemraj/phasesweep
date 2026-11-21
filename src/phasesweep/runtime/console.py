@@ -53,11 +53,9 @@ class ConsoleHandler(logging.Handler):
         :param logging.LogRecord record: The record to draw.
         :param int width: Terminal width in columns.
         :param bool color: Whether the stream takes styling.
-        :return list[str]: The lines to print, the time before the first of a stamped record.
+        :return list[str]: The lines to print, the time before the first.
         """
         block = record.msg
-        if isinstance(block, ReportBlock) and not block.timestamped:
-            return block.render(width, color=color)
         stamp = time.strftime("%H:%M:%S", time.localtime(record.created)) + "  "
         room = width - len(stamp)
         if isinstance(block, ReportBlock):

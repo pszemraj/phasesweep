@@ -1,9 +1,12 @@
-"""The report of a ``phasesweep run``: the facts a person reads on the console, as log messages.
+"""The report of a ``phasesweep run``: the facts a person reads on the console, as blocks.
 
-Each block is one fact of the run, held as plain values and logged on ``phasesweep.report``.
-``str()`` is the one-line text that ``run.log`` and captured records carry, and ``render`` draws
-the same facts for a terminal of a given width, styled only when the caller says so. Nothing here
-touches a stream or a clock, so a block's text is a pure function of its fields.
+Each block is one fact of the run, held as plain values. The progress blocks (phase start, trial,
+rerun, skipped phase and winner) are logged on ``phasesweep.report``: ``str()`` is the one-line
+text that ``run.log`` and captured records carry, and ``render`` draws the same facts for a
+terminal of a given width, styled only when the caller says so. The banner, the closing summary
+and the replay sentence are written to stderr by the CLI and reach no log file, so they have
+``render`` alone. Nothing here touches a stream or a clock, so a block's text is a pure function
+of its fields.
 """
 
 from __future__ import annotations
@@ -11,7 +14,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import ClassVar
 
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import phase_draws
@@ -502,10 +504,8 @@ def _value_lines(row: BannerRow, room: int, *, color: bool) -> list[str]:
 
 
 @dataclass(frozen=True)
-class Banner(ReportBlock):
+class Banner:
     """What a run is about to do: the experiment, its phases and where everything goes."""
-
-    timestamped: ClassVar[bool] = False
 
     experiment: str
     head: tuple[BannerRow, ...]
@@ -551,16 +551,6 @@ class Banner(ReportBlock):
             (_label_column(row.label, color=color) if index == 0 else pad) + value
             for index, value in enumerate(values)
         ]
-
-    def __str__(self) -> str:
-        """Return the banner's facts on one line.
-
-        :return str: The one-line text.
-        """
-        rows = [f"{row.label} {row.text}" for row in self.head]
-        phases = "; ".join(f"{phase.name} {', '.join(phase.facts)}" for phase in self.phases)
-        rows += [f"phases {phases}", *(f"{row.label} {row.text}" for row in self.tail)]
-        return f"phasesweep run {self.experiment}{GAP}{GAP.join(rows)}"
 
 
 def _gpu_fact(phase: Phase) -> str:
@@ -669,10 +659,8 @@ class SummaryPhase:
 
 
 @dataclass(frozen=True)
-class Summary(ReportBlock):
+class Summary:
     """What a finished run did and where it went: counts, winners, files and the next command."""
-
-    timestamped: ClassVar[bool] = False
 
     headline: str
     phases: tuple[SummaryPhase, ...]
@@ -743,29 +731,10 @@ class Summary(ReportBlock):
             *(INDENT + paint(path, "path", color=color) for path in self.written),
         ]
 
-    def __str__(self) -> str:
-        """Return the summary's facts on one line.
-
-        :return str: The one-line text.
-        """
-        phases = [
-            f"{phase.name}: {', '.join(phase.counts)}"
-            f"{', winner ' + ' '.join(phase.winner) if phase.winner else ''}"
-            for phase in self.phases
-        ]
-        written = (
-            [f"Written under {self.written_root}: {', '.join(self.written)}"]
-            if self.written
-            else []
-        )
-        return GAP.join([self.headline, *phases, *written, f"Next: {self.next_command}"])
-
 
 @dataclass(frozen=True)
-class NothingToRun(ReportBlock):
+class NothingToRun:
     """The one line a run closes with when every trial was already finished and nothing changed."""
-
-    timestamped: ClassVar[bool] = False
 
     elapsed: str
     trials: int
@@ -792,13 +761,6 @@ class NothingToRun(ReportBlock):
         opening = f"Finished in {self.elapsed}"
         lines[0] = paint(opening, "label", color=color) + lines[0].removeprefix(opening)
         return ["", *lines]
-
-    def __str__(self) -> str:
-        """Return the sentence.
-
-        :return str: The one-line text.
-        """
-        return self._text()
 
 
 def _count_clauses(counts: PhaseCounts) -> tuple[str, ...]:
