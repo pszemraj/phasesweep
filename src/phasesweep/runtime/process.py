@@ -925,13 +925,9 @@ def run_supervised(
             ):
                 settle = _supervisor._HELPER_SETTLE_SECONDS
                 survivors = guardian_status[1:].decode("ascii", "replace")
-                named = f": {survivors}" if survivors else ""
-                failure_reason = (
-                    f"trainer root exited with code {proc.returncode}, but the trainer "
-                    f"still had live descendants {settle:g}s later{named}. They were "
-                    "terminated. Make the trainer wait for its children before exiting"
-                )
-                log.warning(
+                # run.log keeps the names. After a crash the trial reports the crash
+                # itself; after exit 0 the trial line carries the names as its reason.
+                log.info(
                     "Trainer root PID %d exited with code %s but the trainer still had "
                     "live descendants %gs later (%s); the lease guardian terminated them",
                     pgid,
@@ -939,6 +935,14 @@ def run_supervised(
                     settle,
                     survivors or "members could not be named",
                 )
+                if proc.returncode == 0:
+                    named = f": {survivors}" if survivors else ""
+                    failure_reason = (
+                        "trainer root exited with code 0, but the trainer still had live "
+                        f"descendants {settle:g}s later{named}. They were terminated. Make "
+                        "the trainer wait for its children before exiting, and start any "
+                        "long-lived service it needs outside the trial"
+                    )
             # Root exit is insufficient: surviving descendants still require group cleanup.
             if failure_reason is None and _process_group_alive(pgid):
                 failure_reason = (

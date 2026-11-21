@@ -11,6 +11,7 @@ starts in sessions of their own, reaps each one as it exits, and the same rules 
 
 from __future__ import annotations
 
+import logging
 import os
 import shlex
 import signal
@@ -24,6 +25,7 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
+from phasesweep.engine.paths import _run_log_path
 from phasesweep.engine.state import FAILURE_REASON_ATTR
 from phasesweep.errors import PhaseSweepError
 from phasesweep.runtime import process, reaper, supervisor
@@ -311,7 +313,8 @@ def test_a_persistent_child_is_terminated_after_the_settle_and_named(
         "trainer root exited with code 0, but the trainer still had live descendants 0.5s later"
     )
     assert result.failure_reason.endswith(
-        ". They were terminated. Make the trainer wait for its children before exiting"
+        ". They were terminated. Make the trainer wait for its children before exiting, and "
+        "start any long-lived service it needs outside the trial"
     )
     if sys.platform == "linux":
         assert f": {child_pid} ({_named_command(marks)[:40]}" in result.failure_reason
@@ -378,9 +381,10 @@ def test_descendant_termination_is_outside_the_trial_budget(
 
 @_LINUX_ADOPTION
 def test_a_killed_launchers_session_escaped_child_holds_the_lease_until_terminated(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The guardian adopts a child its SIGKILLed root started in a new session, holds the lease while it runs, then terminates and names it."""
+    """The guardian adopts a child its SIGKILLed root started in a new session, holds the lease while it runs, then terminates it and names it in the log, leaving the kill as the trial's reason."""
+    caplog.set_level(logging.INFO, logger="phasesweep.runtime.process")
     use_guardian_timing(monkeypatch, tmp_path, settle_seconds=0.5, term_grace_seconds=0.5)
     trainer, marks = _trainer(tmp_path, _KILLED_LAUNCHER)
     lease_read, lease_write = os.pipe()
@@ -411,12 +415,13 @@ def test_a_killed_launchers_session_escaped_child_holds_the_lease_until_terminat
 
     child_pid = int((marks / "child_pid").read_text())
     assert_descendant_dies(child_pid, on_timeout_msg=f"child {child_pid} survived the guardian")
-    assert (result.return_code, result.cleanup_confirmed) == (-signal.SIGKILL, True)
-    assert result.failure_reason is not None
-    assert result.failure_reason.startswith(
-        "trainer root exited with code -9, but the trainer still had live descendants "
-        f"0.5s later: {child_pid} ({_named_command(marks)[:40]}"
+    assert (result.return_code, result.failure_reason, result.cleanup_confirmed) == (
+        -signal.SIGKILL,
+        None,
+        True,
     )
+    named = f"still had live descendants 0.5s later ({child_pid} ({_named_command(marks)[:40]}"
+    assert [r.levelno for r in caplog.records if named in r.getMessage()] == [logging.INFO]
     _assert_exited(trial_dir, -signal.SIGKILL)
     root_exit = float((marks / "root_exit").read_text())
     assert float((marks / "child_sigterm").read_text()) - root_exit >= 0.5
@@ -773,6 +778,54 @@ def test_an_engine_trial_with_a_short_lived_helper_keeps_its_own_outcome(
     assert not (marks / "helper_sigterm").exists()
 
 
+#: Prints the objective, starts ``_PERSISTENT_CHILD``, which outlives any settle, prints an
+#: error line on stderr and exits 3, as a crash that leaves a helper running ends.
+_ENGINE_CRASH = """
+import subprocess, sys, time
+from pathlib import Path
+marks = Path({marks!r})
+print("x=0.5", flush=True)
+subprocess.Popen([sys.executable, "-c", {child!r}, str(marks)])
+while not (marks / "child_pid").exists():
+    time.sleep(0.005)
+print("torch.OutOfMemoryError: CUDA out of memory", file=sys.stderr, flush=True)
+sys.exit(3)
+"""
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="names survivors from procfs")
+def test_a_crash_that_leaves_a_child_running_keeps_its_own_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exit 3 whose child outlives the settle fails with the exit code and the stderr line; run.log names the child."""
+    use_guardian_timing(monkeypatch, tmp_path, settle_seconds=0.3, term_grace_seconds=0.3)
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        _ENGINE_CRASH.format(marks=str(marks), child=_PERSISTENT_CHILD),
+    )
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=trainer, n_trials=1, gpu_policy="none"
+    )
+
+    with pytest.raises(PhaseSweepError):
+        run_experiment(experiment)
+
+    child_pid = int((marks / "child_pid").read_text())
+    assert_descendant_dies(child_pid, on_timeout_msg=f"child {child_pid} survived the guardian")
+    (trial,) = phase_trials(experiment)
+    assert trial.state == optuna.trial.TrialState.FAIL
+    assert trial.user_attrs[FAILURE_REASON_ATTR] == (
+        "non-zero exit code 3; stderr: torch.OutOfMemoryError: CUDA out of memory"
+    )
+    run_log = _run_log_path(experiment).read_text(encoding="utf-8")
+    assert (
+        f"exited with code 3 but the trainer still had live descendants 0.3s later ({child_pid} ("
+        in run_log
+    )
+
+
 @pytest.mark.signals_own_pid
 def test_a_shutdown_during_the_settle_keeps_the_finished_result_for_the_next_run(
     tmp_path: Path,
@@ -847,7 +900,7 @@ if not (marks / "rank_pid").exists():
 def test_the_next_trial_waits_for_the_rank_a_killed_launcher_left(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A trial whose launcher is killed fails naming its rank, and the next trial starts only once that rank is gone."""
+    """A trial whose launcher is killed fails with the kill as its reason and its rank named in run.log, and the next trial starts only once that rank is gone."""
     use_guardian_timing(monkeypatch, tmp_path, settle_seconds=0.3, term_grace_seconds=0.3)
     marks = tmp_path / "marks"
     marks.mkdir()
@@ -867,10 +920,10 @@ def test_the_next_trial_waits_for_the_rank_a_killed_launcher_left(
     first, second = sorted(phase_trials(experiment), key=lambda trial: trial.number)
     rank_pid = int((marks / "rank_pid").read_text())
     assert first.state == optuna.trial.TrialState.FAIL
-    # The shell that runs the trainer command is the root; it reports the killed launcher.
-    assert f"but the trainer still had live descendants 0.3s later: {rank_pid} (" in str(
-        first.user_attrs[FAILURE_REASON_ATTR]
-    )
+    # The killed launcher's exit is the reason; run.log names the rank that outlived it.
+    assert str(first.user_attrs[FAILURE_REASON_ATTR]).startswith("non-zero exit code ")
+    run_log = _run_log_path(experiment).read_text(encoding="utf-8")
+    assert f"still had live descendants 0.3s later ({rank_pid} (" in run_log
     assert (second.state, second.value) == (optuna.trial.TrialState.COMPLETE, 0.5)
     assert winners["p"].metric == 0.5
     starts = [float(line) for line in (marks / "calls").read_text().splitlines()]

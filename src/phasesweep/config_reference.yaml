@@ -24,7 +24,7 @@
 # Warning: renaming starts new studies and a new artifact directory, and results recorded under the old name are not reused.
 experiment: string (required)
 
-# Shell command template that runs one trainer attempt under /bin/sh -c in execution.cwd, with the trainer environment rather than the shell's. It must exit 0.
+# Shell command template that runs one trainer attempt under /bin/sh -c in execution.cwd, with the trainer environment rather than the shell's. It must exit 0 and leave nothing it started running.
 # {trial_dir} is the absolute attempt directory, {trial_id} the phase's trial number, {phase} its name, {run_name} <experiment>-<phase>-<trial_id>-<attempt ID>.
 # {config_path}, {overrides} or {overrides_path} carries the trainer input, as override_format says, for example python train.py --config {config_path}.
 # PhaseSweep shell-quotes every placeholder but {trial_id}. Write {{ and }} for literal braces and $VAR or ${{VAR}} for a shell variable.
