@@ -76,7 +76,7 @@ pytest -n 2 --dist worksteal -m "not live and not signals_own_pid" \
   --durations=25 --durations-min=1
 ```
 
-`worksteal` balances tests across workers. Test homes, caches, journals and host-lock directories use per-test temporary paths. Keep the worker count bounded; `-n auto` can overload process-launch and deadline checks. For fast iteration, add `and not integration` to the parallel marker expression.
+`worksteal` balances tests across workers. Test homes, caches, journals and host-lock directories use per-test temporary paths. For a manual CPU smoke test, use a scratch experiment directory, a fresh mode-0700 `PHASESWEEP_LOCK_DIR`, and scratch `XDG_STATE_HOME` and `XDG_CACHE_HOME` directories. Tracker workers write their request files under the cache. Keep the worker count bounded; `-n auto` can overload process-launch and deadline checks. For fast iteration, add `and not integration` to the parallel marker expression.
 
 Run only the complementary self-signalling lane serially, after this checkout's parallel lane exits:
 
@@ -233,6 +233,12 @@ The principal test groups and what each covers:
 - TODO(runtime): Add a deliberately scoped generation-pruning command only if it preserves the current last-successful pointer and all cited winner provenance.
 - TODO(runtime): Distinguish independent trainer failure from guardian cancellation or a failed launch before counting a recovered nonzero exit toward the phase budget and failure limit. The lifecycle exit code alone can represent any of these cases. Track with the lifecycle recovery work in [issue 33](https://github.com/pszemraj/phasesweep/issues/33).
 - TODO(runtime): Decide whether shutdown should briefly wait for a trainer that has reported an objective but is still in teardown. Recovery requires a successful exit before accepting the result. Track with [issue 33](https://github.com/pszemraj/phasesweep/issues/33).
+- TODO(runtime): During a live run, a dry run can encounter an ongoing extraction and refuse to predict a trial count. Show the phase as awaiting evidence and label its remaining work as an estimate.
+- TODO(runtime): Use the recorded phase's repeat grouping to rebuild its `trials.csv` after recovery with a renamed or incompatible phase. An interrupted in-memory run also needs its final CSV snapshot taken while the settled study is still available.
+- TODO(runtime): Recover draws whose bookkeeping failed before the trainer started. A fatal pre-launch write can currently spend the draw and require a top-up.
+- TODO(tracking): Include earlier generations' undelivered outcomes in run closeout and distinguish unstaged or blocked terminal outcomes from an empty queue in `status`. A saved delivery count alone cannot represent either case.
+- TODO(tracking): Bound the time `sync-tracking` spends during a target-wide outage. A rejection specific to one remote run must allow independent uploads to proceed.
+- TODO(tracking): Recover the terminal verdict for a managed attempt whose binding appears after an in-memory generation has published. A published generation can contain both successful and failed trials.
 
 ## Declined requests
 
@@ -268,6 +274,7 @@ These have been requested and declined. Check this list before proposing one aga
 - **`mcp check` and `validate` resolving a trial program through `PATH`.** They run in the operator's shell. The [trainer contract](config.md#trainer-contract) describes which programs launch can check against the trainer's own `PATH`.
 - **Loading an MCP catalog only when its trainers are ready to run.** A separate trainer directory can disappear without invalidating a catalog entry or its saved results. `mcp check` checks trainer readiness for launch-enabled entries, and launch checks it when work would start.
 - **Dropping a pending MLflow run creation on the first lookup miss inside its request window.** The server may still commit the request. See [creation reconciliation](mlflow.md#result-delivery-and-recovery).
+- **Restricting the exceptions that preserve a trial after an evidence write fails.** This boundary encloses only writes to the ledger. Storage adapters can raise different exceptions. Once a write is uncertain, the trial must remain recoverable regardless of the exception type.
 - **Handling a bare `NaN` token in a JSON objective as a non-finite number.** The decoder refuses nonstandard JSON constants before the extractor looks up the objective.
 - **Recovering registered attempts before checking a new phase's trainer directory and program.** A phase with no study has nothing to replay, so it must be able to launch before the invocation does anything else; a launch refused there changes nothing, and the next launch that passes recovers the attempts. A phase that has a study is checked after recovery, which is what tells new work from a replay that needs no trainer.
 - **Settling several pending trials in trainer completion order.** Recovery settles them in attempt-registry order, so with `n_jobs` above 1, pending trials of mixed verdict and a streak one short of `max_consecutive_failures`, whether the abort trips depends on that order. Parallel workers finish in a timing-dependent order in a live run too, so either order is one the run could have produced, and following completion order would mean reading every registry entry before resolving any.
