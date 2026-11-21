@@ -781,7 +781,7 @@ class RunStore:
         private_atomic_write_text(target, payload + "\n", strict_dir_fsync=True)
 
     def get(self, run_id: str) -> RunHandle | None:
-        """Load a run handle, returning ``None`` for absent or path-unsafe IDs.
+        """Load a run handle, returning ``None`` for missing, unreadable or path-unsafe IDs.
 
         :param str run_id: Agent-supplied run id to look up.
         :return RunHandle | None: Persisted handle when present and well-shaped, otherwise ``None``.
@@ -792,6 +792,20 @@ class RunStore:
         if not path.is_file():
             return None
         return self._load_handle(path, expected_run_id=run_id)
+
+    def has_run_records(self, run_id: str) -> bool:
+        """Distinguish an absent run id from one with unreadable or orphaned evidence.
+
+        :param str run_id: Looked-up run id with no readable handle.
+        :return bool: Whether a handle entry or sibling launch evidence exists.
+        """
+        if not SAFE_NAME_PATTERN.fullmatch(run_id):
+            return False
+        paths = (
+            self._runs_dir / f"{run_id}.json",
+            *(self._logs_dir / f"{run_id}{suffix}" for suffix in _RUN_EVIDENCE_SUFFIXES),
+        )
+        return any(self._path_entry_exists(path) for path in paths)
 
     def _scan_handles(self) -> tuple[list[RunHandle], set[str]]:
         """Load persisted handles and identify malformed handle records.

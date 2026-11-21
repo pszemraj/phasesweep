@@ -1423,9 +1423,10 @@ def mcp_call(ctx: click.Context, tool: str, json_args: JsonObject, catalog: Path
     name="check",
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Validate an MCP catalog with the exact rules the server applies at startup and "
-        "print a per-experiment ok/FAIL report. A successful check provisions and probes "
-        "the configured state directory. Exit code 0 when every entry loads, 2 otherwise."
+        "Validate an MCP catalog and its enabled trainer launch paths, and print a "
+        "per-experiment ok/FAIL report. The check provisions and probes the configured "
+        "state directory and checks for run records that block launches. Exit code 0 when every "
+        "entry loads and the state passes, 2 otherwise."
     ),
     short_help="Preflight an MCP catalog.",
 )
@@ -1436,9 +1437,9 @@ def mcp_check(ctx: click.Context, catalog: Path) -> None:
 
     Shares the per-entry validation code path with ``Registry.load`` but
     collects every entry's verdict instead of failing fast, so a broken
-    catalog is diagnosed here rather than inside an MCP client restart. A
-    successful check also provisions the state layout through the exact server
-    startup path. Operator-facing: output may include paths.
+    catalog is diagnosed here rather than inside an MCP client restart. If every
+    entry passes, provision the state layout as the server does and report run
+    records that block launches. Operator-facing: output may include paths.
 
     :param click.Context ctx: Active Click context used for the exit code.
     :param Path catalog: Operator-authored MCP catalog to validate.

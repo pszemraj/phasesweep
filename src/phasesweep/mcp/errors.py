@@ -209,6 +209,21 @@ class UnknownRunError(McpToolError):
         )
 
 
+class UnreadableRunRecordError(McpToolError):
+    """Raised when a requested run has persisted evidence but no readable handle."""
+
+    def __init__(self, run_id: str) -> None:
+        """Direct the agent to the operator's state inventory check.
+
+        :param str run_id: Run whose handle or sibling evidence exists.
+        """
+        super().__init__(
+            f"MCP state has an unreadable or orphaned record for run {run_id!r}. "
+            f"Ask the operator to run {CHECK_CATALOG_COMMAND} and resolve the run record "
+            "before retrying."
+        )
+
+
 class InvalidPhaseError(McpToolError):
     """Raised when a ``from_phase`` is not a declared phase of the experiment."""
 

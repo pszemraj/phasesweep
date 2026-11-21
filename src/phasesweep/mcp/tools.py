@@ -71,6 +71,7 @@ from phasesweep.mcp.errors import (
     StateDirChangedError,
     UnknownExperimentError,
     UnknownRunError,
+    UnreadableRunRecordError,
     live_runner_step,
     recover_run_step,
     runner_stop_step,
@@ -820,6 +821,21 @@ class PhaseSweepMCP:
             status["tracking_delivery"] = delivery
         return target_id, status, run, handle, result_source
 
+    def _require_run_handle(self, run_id: str) -> RunHandle:
+        """Load the exact run or explain why its persisted handle is unavailable.
+
+        :param str run_id: Run id supplied by the caller.
+        :raises UnknownRunError: The run has no persisted records.
+        :raises UnreadableRunRecordError: Persisted records exist but no handle can be read.
+        :return RunHandle: The persisted run handle.
+        """
+        handle = self._runs.get(run_id)
+        if handle is None:
+            if self._runs.has_run_records(run_id):
+                raise UnreadableRunRecordError(run_id)
+            raise UnknownRunError(run_id)
+        return handle
+
     def _read_result_target(
         self, run_id: str
     ) -> tuple[
@@ -834,12 +850,11 @@ class PhaseSweepMCP:
         """Read one run's status and winners from the same live or frozen result.
 
         :param str run_id: Persisted run whose immutable configuration selects the read.
-        :raises UnknownRunError: The run id has no persisted handle.
+        :raises UnknownRunError: The run id has no persisted records.
+        :raises UnreadableRunRecordError: The run has no readable handle.
         :return tuple: Target, configuration, status, winners, handle, runner view and source.
         """
-        handle = self._runs.get(run_id)
-        if handle is None:
-            raise UnknownRunError(run_id)
+        handle = self._require_run_handle(run_id)
         target_id = handle.experiment_id
         view = self._runs.runner_view(handle)
         try:
@@ -1378,6 +1393,7 @@ class PhaseSweepMCP:
         :param str run_id: Detached run id to cancel.
         :return JsonObject: Cancellation result containing final state and optional cleanup confirmation.
         :raises UnknownRunError: If ``run_id`` names no persisted run.
+        :raises UnreadableRunRecordError: If persisted records exist but no handle can be read.
         :raises PermissionDeniedError: If the run did not allow cancel at launch, or its
             catalog entry no longer does.
         :raises RunLaunchUnsettledError: If the launch has not yet persisted a
@@ -1394,9 +1410,7 @@ class PhaseSweepMCP:
             # Permission below follows the reread catalog, or the last valid one after a
             # refused reread, so a catalog typo cannot leave a live run unstoppable.
             self._serving_registry()
-            handle = self._runs.get(run_id)
-            if handle is None:
-                raise UnknownRunError(run_id)
+            handle = self._require_run_handle(run_id)
             resolved = {"experiment_id": handle.experiment_id, "run_id": run_id}
             if not self._cancel_allowed(handle):
                 raise PermissionDeniedError(
@@ -1413,10 +1427,7 @@ class PhaseSweepMCP:
             if before == "running":
                 with self._runs.transition_lock(handle):
                     # Refresh the durable handle and runner view under the transition lock.
-                    refreshed = self._runs.get(run_id)
-                    if refreshed is None:
-                        raise UnknownRunError(run_id)
-                    handle = refreshed
+                    handle = self._require_run_handle(run_id)
                     view = self._runs.runner_view(handle)
                     observation = self._runs.observe(handle, view=view)
                     before = observation.state

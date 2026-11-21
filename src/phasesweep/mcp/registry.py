@@ -39,12 +39,19 @@ from phasesweep.errors import operator_step
 from phasesweep.mcp.errors import (
     CatalogEntryInvalidError,
     CatalogError,
+    RunCapacityUnknownError,
     StateDirChangedError,
     UnknownExperimentError,
 )
-from phasesweep.mcp.runs import FRESH_STATE_DIR_STEP, RunStore, UnsupportedStateFormatError
+from phasesweep.mcp.runs import (
+    FRESH_STATE_DIR_STEP,
+    RunStore,
+    UnsupportedStateFormatError,
+    decode_unreadable_record,
+)
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
+    UnsafeLockPathError,
     UnsafePrivatePathError,
     canonical_storage_identity,
     file_sha256,
@@ -257,32 +264,57 @@ def _resolve_existing_dir(base: Path, path: Path, *, label: str) -> Path:
     return resolved
 
 
-def _prepare_state_dir(base: Path, path: Path) -> Path:
-    """Resolve and initialize the run-store directories used at server startup.
+def _prepare_state_dir(base: Path, path: Path, *, check_runs: bool = False) -> Path:
+    """Resolve, initialize and probe the run-store directories.
 
     :param Path base: Directory containing the catalog file.
     :param Path path: Operator-authored ``state_dir`` path.
+    :param bool check_runs: Check for run records that prevent launches.
     :return Path: Absolute initialized state directory.
     :raises CatalogError: If the run store cannot create or secure its directories.
     """
     resolved = _resolve_catalog_relative_path(base, path, label="state_dir")
     try:
-        RunStore(resolved)
+        store = RunStore(resolved)
         for directory in (resolved, resolved / "runs", resolved / "logs"):
             with tempfile.NamedTemporaryFile(dir=directory):
                 pass
+        if check_runs:
+            _check_run_inventory(store)
     except UnsupportedStateFormatError as exc:
         raise CatalogError(
             f"state_dir is not usable: {resolved}: {exc}", suggestion=FRESH_STATE_DIR_STEP
         ) from exc
     except ValueError as exc:
         raise CatalogError(f"state_dir is not usable: {resolved}: {exc}") from exc
-    except (OSError, UnsafePrivatePathError) as exc:
+    except (OSError, UnsafeLockPathError, UnsafePrivatePathError) as exc:
         raise CatalogError(
             f"state_dir is not usable: {resolved}: {exc}",
             suggestion=_state_dir_remediation(resolved),
         ) from exc
     return resolved
+
+
+def _check_run_inventory(store: RunStore) -> None:
+    """Report unreadable records that a launch cannot clear automatically.
+
+    :param RunStore store: Initialized run store to check without removing records.
+    :raises CatalogError: The inventory is busy or has unreadable records that block launch.
+    """
+    with store.launch_lock() as acquired:
+        if not acquired:
+            raise CatalogError(
+                "another MCP launch or recovery holds the launch lock",
+                suggestion="Run this check again after the launch or recovery finishes.",
+            )
+        _, unreadable = store.launch_inventory()
+        blocking = set()
+        for identity in unreadable:
+            run_id, _ = decode_unreadable_record(identity)
+            if run_id is None or not store.is_pre_spawn_orphan(run_id):
+                blocking.add(identity)
+        if blocking:
+            raise CatalogError(str(RunCapacityUnknownError(blocking)))
 
 
 def _state_dir_remediation(state_dir: Path) -> str:
@@ -588,8 +620,8 @@ def _granted_actions(allow: _Allow) -> tuple[str, ...]:
 def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     """Validate all catalog entries and report each verdict.
 
-    If every entry passes, provision and probe the state directory as server startup does.
-    Catalog-level schema, file and state failures raise :class:`CatalogError`.
+    If every entry passes, provision and probe the state directory and check for run records
+    that block launches. Catalog-level schema, file and state failures raise :class:`CatalogError`.
 
     :param Path catalog_path: Path to the operator-authored catalog YAML.
     :return CatalogCheckReport: One verdict per catalog entry, in catalog order.
@@ -599,7 +631,7 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     _, verdicts = _load_catalog_entries(catalog, base, collect_errors=True, check_trainers=True)
     report = CatalogCheckReport(entries=verdicts)
     if report.ok:
-        _prepare_state_dir(base, catalog.state_dir)
+        _prepare_state_dir(base, catalog.state_dir, check_runs=True)
     return report
 
 

@@ -17,10 +17,12 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from click.testing import CliRunner
 
 import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.mcp.runs as mcp_runs
 import phasesweep.mcp.tools as mcp_tools
+from phasesweep.cli import cli as cli_main
 from phasesweep.config.io import load_experiment
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import FloatParam, IntParam, Sampler
@@ -34,6 +36,7 @@ from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
     ExperimentBusyError,
     InvalidPhaseError,
+    McpToolError,
     PermissionDeniedError,
     ResumeNotReadyError,
     ResumePublicationUnusableError,
@@ -478,6 +481,7 @@ def test_capacity_refusal_notes_runs_files_only_for_the_records_it_lists() -> No
 @pytest.mark.parametrize(
     ("record_kind", "listed", "run_id"),
     [
+        ("empty_handle", "`srv-broken`", "srv-broken"),
         ("malformed_handle", "`srv-broken`", "srv-broken"),
         ("orphan_config", "`srv-orphan`", "srv-orphan"),
         ("unsafe_handle_name", "`runs/not a run id.json`", None),
@@ -494,8 +498,9 @@ def test_launch_names_unreadable_run_records_and_passes_once_they_are_moved_away
     config, app, _registry, store = side_effect_app(tmp_path)
     captured = patch_popen_capture(monkeypatch)
     state_dir = tmp_path / "state"
-    if record_kind == "malformed_handle":
-        (state_dir / "runs" / "srv-broken.json").write_text("{not valid json")
+    if record_kind in {"empty_handle", "malformed_handle"}:
+        handle_text = "" if record_kind == "empty_handle" else "{not valid json"
+        (state_dir / "runs" / "srv-broken.json").write_text(handle_text)
         store.log_path("srv-broken").write_text("runner output\n")
     elif record_kind == "orphan_config":
         with open_private_text(store.config_snapshot_path("srv-orphan"), "x") as output:
@@ -526,6 +531,17 @@ def test_launch_names_unreadable_run_records_and_passes_once_they_are_moved_away
     assert "cmd" not in captured
     assert store.list_handles() == []
 
+    check_args = ["mcp", "check", "--catalog", str(tmp_path / "srv.catalog.yaml")]
+    check = CliRunner().invoke(cli_main, check_args)
+    assert check.exit_code == 2, check.output
+    assert f"Unreadable or orphaned: {listed}." in check.output
+    if run_id is not None:
+        for lookup in (app.status, app.cancel):
+            with pytest.raises(McpToolError, match="unreadable or orphaned") as refused:
+                lookup(run_id)
+            assert "`phasesweep mcp check --catalog CATALOG`" in str(refused.value)
+            assert str(state_dir) not in str(refused.value)
+
     moved = tmp_path / "moved"
     moved.mkdir()
     if run_id is None:
@@ -542,6 +558,9 @@ def test_launch_names_unreadable_run_records_and_passes_once_they_are_moved_away
         assert store.launch_inventory() == ([], set())
     if run_id is not None:
         assert store.get(run_id) is None
+
+    check = CliRunner().invoke(cli_main, check_args)
+    assert check.exit_code == 0, check.output
 
     result = app.launch("srv")
 
