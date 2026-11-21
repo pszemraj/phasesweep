@@ -1366,8 +1366,8 @@ def refusal_rule(where: str = "") -> str:
     A refused record is retried like any other, so a retry alone meets the same refusal; only
     fixing its cause in MLflow helps.
 
-    :param str where: Where the record's warning is, with a leading space, for a reader who
-        never saw the console, defaults to the console's own warning.
+    :param str where: Where the record's warning is, with its leading separator, for a reader
+        who never saw the console, defaults to the console's own warning.
     :return str: A clause that follows the record it is about, without a final period.
     """
     return (
