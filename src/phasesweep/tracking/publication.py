@@ -157,11 +157,11 @@ def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Pro
     :param Mapping[str, str] inherits: Native run of each parent winner the attempt inherited.
     :return Projection: The attempt's accepted projection.
     """
+    from phasesweep.engine.selection import _observed_values
     from phasesweep.engine.state import (
         CONSTRAINT_PREFIX,
         DURATION_ATTR,
         FEASIBLE_ATTR,
-        OBSERVED_PREFIX,
         OVERRIDES_ATTR,
     )
 
@@ -170,13 +170,9 @@ def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Pro
     constraints = {
         key.removeprefix(CONSTRAINT_PREFIX): json_number(trial.user_attrs, key)
         for key in sorted(trial.user_attrs)
-        if key.startswith(CONSTRAINT_PREFIX)
+        if key.startswith(CONSTRAINT_PREFIX) and trial.user_attrs[key] is not None
     }
-    observed = {
-        key.removeprefix(OBSERVED_PREFIX): json_number(trial.user_attrs, key)
-        for key in sorted(trial.user_attrs)
-        if key.startswith(OBSERVED_PREFIX)
-    }
+    observed = _observed_values(trial, subject=f"Trial {trial.number}")
     return _projection(
         metrics={
             "phasesweep.objective": float(trial.value),

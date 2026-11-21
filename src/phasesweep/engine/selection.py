@@ -658,7 +658,7 @@ def _observed_values(trial: optuna.trial.FrozenTrial, *, subject: str) -> dict[s
     recorded = {
         key.removeprefix(OBSERVED_PREFIX): value
         for key, value in sorted(trial.user_attrs.items())
-        if key.startswith(OBSERVED_PREFIX)
+        if key.startswith(OBSERVED_PREFIX) and value is not None
     }
     try:
         return _validate_observed_block(recorded)

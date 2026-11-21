@@ -27,10 +27,12 @@ from phasesweep.config.models import TRIAL_BOUND_ENV, Experiment, Observation, _
 from phasesweep.engine.errors import LaunchEnvironmentError
 from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.state import (
+    CONSTRAINT_PREFIX,
     DURATION_ATTR,
     FEASIBLE_ATTR,
     GATES_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
+    OBSERVED_PREFIX,
     OVERRIDES_ATTR,
     RETURN_CODE_ATTR,
     TRAINER_INPUT_SCHEMA_VERSION,
@@ -127,34 +129,47 @@ class TrialResult:
 def record_trial_result(trial: optuna.Trial, result: TrialResult, *, overrides_json: str) -> None:
     """Persist extracted evidence before committing a trial's terminal outcome.
 
+    Replace optional attributes from an earlier extraction with this result's values.
+
     :param optuna.Trial trial: Active trial receiving extracted evidence.
     :param TrialResult result: Canonical extraction result.
     :param str overrides_json: Fully composed trainer overrides serialized as JSON.
     """
+    previous = trial.user_attrs
     trial.set_user_attr(FEASIBLE_ATTR, result.feasible)
     trial.set_user_attr(RETURN_CODE_ATTR, result.return_code)
     trial.set_user_attr(DURATION_ATTR, result.duration_seconds)
     trial.set_user_attr(OVERRIDES_ATTR, overrides_json)
+    optional: dict[str, str | float | None] = {}
     if result.objective_provenance is not None:
-        trial.set_user_attr(
-            OBJECTIVE_PROVENANCE_ATTR, json.dumps(result.objective_provenance, sort_keys=True)
+        optional[OBJECTIVE_PROVENANCE_ATTR] = json.dumps(
+            result.objective_provenance, sort_keys=True
         )
     if result.gate_results is not None:
-        trial.set_user_attr(
-            GATES_ATTR,
-            json.dumps(
-                [
-                    {"type": gate.gate_type, "passed": gate.passed, "detail": gate.detail}
-                    for gate in result.gate_results
-                ],
-                sort_keys=True,
-            ),
+        optional[GATES_ATTR] = json.dumps(
+            [
+                {"type": gate.gate_type, "passed": gate.passed, "detail": gate.detail}
+                for gate in result.gate_results
+            ],
+            sort_keys=True,
         )
     if result.failure_reason is None:
-        for name, value in result.constraints.items():
-            trial.set_user_attr(constraint_attr(name), value)
-        for name, value in result.observed.items():
-            trial.set_user_attr(observed_attr(name), value)
+        optional.update(
+            {constraint_attr(name): value for name, value in result.constraints.items()}
+        )
+        optional.update({observed_attr(name): value for name, value in result.observed.items()})
+    for key, value in previous.items():
+        if (
+            (
+                key in {OBJECTIVE_PROVENANCE_ATTR, GATES_ATTR}
+                or key.startswith((CONSTRAINT_PREFIX, OBSERVED_PREFIX))
+            )
+            and key not in optional
+            and value is not None
+        ):
+            optional[key] = None
+    for key, value in optional.items():
+        trial.set_user_attr(key, value)
 
 
 # How far back from the end of ``stderr.log`` a failed trial's reason reads.
