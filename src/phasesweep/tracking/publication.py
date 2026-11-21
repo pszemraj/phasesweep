@@ -994,10 +994,10 @@ def _deliver_outstanding(
     staged first, locally, so nothing is requested when nothing is pending or ``tally`` has
     stopped sending. Then the target is resolved if asked, pending creations are searched, so a
     run a timed-out creation made late is bound and its records rebuilt, and every pending record
-    is sent, a closing run's own after the ended generations' ones, so MLflow never shows a run's
-    winner before the outcomes an earlier run left for it. The first request MLflow gives no
-    answer to ends the pass, search or upload, so an outage costs one failed request; what is
-    left stays pending for the next run or sync-tracking.
+    is sent, a closing run's own after the ended generations' ones, so the outcomes an earlier
+    run left go first and one MLflow refuses holds back none of the run's own. The first request
+    MLflow gives no answer to ends the pass, search or upload, so an outage costs the pass one
+    request's wait; what is left stays pending for the next run or sync-tracking.
 
     :param Experiment experiment: Configured MLflow-backed experiment.
     :param ValidatedLedger ledger: The experiment's validated ledger, holding the attempts' trials.
@@ -1152,9 +1152,10 @@ def deliver_ended_generations(
 ) -> None:
     """Finish what sync-tracking would for every generation that has ended.
 
-    A run calls it twice: right after its first target check, before its first trial, so MLflow
-    shows what an interrupted earlier run left as soon as the next run reaches the tracker, and
-    at its closeout, for what is still pending and its own records. Its scope is every
+    A run with trials to run calls it twice: right after its first target check, before its
+    first trial, so MLflow shows what an interrupted earlier run left as soon as the next run
+    reaches the tracker, and at its closeout, for what is still pending and its own records; a
+    run with none to run, such as a replay, calls it only at closeout. Its scope is every
     generation but a run's own, whose saved records come at closeout as ``own`` and go last; for
     recover-run it is every generation. The core stages first and requests nothing when nothing
     is pending or ``tally`` has stopped sending. Its first request follows a target check: the
@@ -1163,8 +1164,8 @@ def deliver_ended_generations(
     is accountable for their cleanup. A configured target other than the recorded one stages
     and sends nothing, with a warning when an earlier run left something to send. Every failure
     but an uncertain worker cleanup or a shutdown costs a warning and leaves the records for the
-    next run or sync-tracking, never the caller's outcome, so a silent tracker costs the caller
-    one request's ``timeout_seconds``.
+    next run or sync-tracking, never the caller's outcome, so a silent tracker costs each call
+    at most one request's ``timeout_seconds``.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param ValidatedLedger ledger: The caller's ledger, holding the trials the records describe.
