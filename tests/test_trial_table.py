@@ -508,15 +508,17 @@ def test_a_failure_reason_wraps_under_its_row_with_a_hanging_indent(
 
 
 @pytest.mark.parametrize("width", [80, 60])
-def test_a_path_longer_than_the_line_is_broken_instead_of_overrunning(width: int) -> None:
-    """An unbreakable word wider than the room splits, and no character of the reason is lost."""
+def test_a_path_longer_than_the_line_goes_whole_on_a_line_of_its_own(width: int) -> None:
+    """A word wider than the room is never cut, so the reason's path can be copied from one line."""
     path = "/data/" + "/".join(f"directory_{index}" for index in range(8)) + "/result.json"
 
-    lines = _failed_trial_lines(f"could not read {path}", width)
+    lines = _failed_trial_lines(f"could not read {path} before it exits", width)
 
-    assert all(len(line) <= width for line in lines)
-    joined = "".join("".join(lines).split()).removeprefix("reason:")
-    assert joined == f"couldnotread{path}"
+    assert lines == [
+        "          reason: could not read",
+        f"                  {path}",
+        "                  before it exits",
+    ]
 
 
 def test_winners_from_different_generations_name_each_phases_own() -> None:

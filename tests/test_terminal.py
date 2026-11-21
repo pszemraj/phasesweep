@@ -101,15 +101,24 @@ def test_wrap_hangs_continuation_lines_and_keeps_every_word() -> None:
     assert " ".join(line.strip() for line in lines).removeprefix("reason: ") == text
 
 
-def test_wrap_collapses_newlines_and_breaks_a_word_longer_than_the_width() -> None:
-    """Newlines become spaces, and an unbreakable path is split instead of overrunning."""
+def test_wrap_collapses_newlines_and_keeps_a_word_longer_than_the_width_whole() -> None:
+    """Newlines become spaces, and a path wider than the line gets a line of its own, uncut."""
     long_word = "/data/" + "x" * 50
     lines = wrap(f"saved to\n{long_word} done", 30, indent="# ", subsequent_indent="# ")
 
-    assert all(len(line) <= 30 and line.startswith("# ") for line in lines)
-    assert "".join(line.removeprefix("# ") for line in lines).replace(" ", "") == (
-        f"savedto{long_word}done"
-    )
+    assert lines == ["# saved to", f"# {long_word}", "# done"]
+
+
+def test_wrap_never_cuts_a_word_at_a_hyphen_or_a_slash() -> None:
+    """A hyphenated name or a path that does not fit the line moves down whole."""
+    name = "trial_00003__generation_88e54b25a7bb4d6c__attempt_dc15a62b79fb4dc1-and-more"
+    lines = wrap(f"reason: JSON file not found: {name} (the trainer writes it)", 40)
+
+    assert lines == [
+        "reason: JSON file not found:",
+        name,
+        "(the trainer writes it)",
+    ]
 
 
 def test_wrap_keeps_a_minimum_text_width_on_a_very_narrow_terminal() -> None:

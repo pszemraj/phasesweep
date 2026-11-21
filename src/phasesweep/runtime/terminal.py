@@ -94,13 +94,15 @@ def terminal_width(stream: TextIO) -> int:
 
 
 def wrap(text: str, width: int, *, indent: str = "", subsequent_indent: str = "") -> list[str]:
-    """Wrap prose to ``width`` columns, breaking an overlong word rather than overrunning.
+    """Wrap prose to ``width`` columns at spaces, never cutting a word.
 
-    Runs of whitespace, newlines included, collapse to one space. A terminal too narrow for the
-    indents still gets at least twenty columns of text.
+    Runs of whitespace, newlines included, collapse to one space. A word wider than the line,
+    such as a path, goes whole on a line of its own and overruns the width, so a person can copy
+    it. A terminal too narrow for the indents still gets at least twenty columns of text.
 
     :param str text: Prose to wrap.
-    :param int width: Maximum visible width of each line, indent included.
+    :param int width: Maximum visible width of each line, indent included, except for a word wider
+        than that.
     :param str indent: Prefix of the first line.
     :param str subsequent_indent: Prefix of every later line, the hanging indent.
     :return list[str]: The wrapped lines, empty when ``text`` has no words.
@@ -111,6 +113,7 @@ def wrap(text: str, width: int, *, indent: str = "", subsequent_indent: str = ""
         limit,
         initial_indent=indent,
         subsequent_indent=subsequent_indent,
+        break_long_words=False,
         break_on_hyphens=False,
     )
 
