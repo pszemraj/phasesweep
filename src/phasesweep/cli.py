@@ -1616,7 +1616,8 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         try:
             recover_run(state_dir, run_id, confirm=confirm, emit=click.echo)
         except RunRecoveryError as exc:
-            raise click.ClickException(_operational_error_text(exc)) from None
+            _print_operational_error(exc)
+            raise click.exceptions.Exit(_FAILURE_EXIT) from None
 
 
 @mcp.command(

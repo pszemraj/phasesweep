@@ -108,6 +108,7 @@ def test_recovery_cli_renders_state_directory_remedy(tmp_path: Path) -> None:
     result = recover_run_cli(registry.state_dir, "refused-run", confirm=True)
 
     assert result.exit_code == 1
+    assert result.output.startswith("phasesweep: ")
     assert "use a fresh MCP state directory" in result.output
     assert f"fix: {FRESH_STATE_DIR_STEP}" in result.output
     assert "artifact root" not in result.output
