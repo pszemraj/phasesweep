@@ -1196,7 +1196,7 @@ ORIGIN_CASES = (
         trigger=_claim_after_unlocked_bind,
         raised=ArtifactRootConflictError,
         action=OperatorAction.INSPECT_LOGS,
-        message="Stop that process before retrying.",
+        message="without the experiment lock; stop it and retry.",
     ),
     RoutingCase(
         id="registry_terminal_identity_missing",
@@ -1437,7 +1437,7 @@ ORIGIN_CASES = (
         trigger=_claim_ledger_under(_regular_file),
         raised=PhaseSweepError,
         action=OperatorAction.FIX_CONFIG,
-        message="Correct the storage path, or the workdir for auto storage",
+        message="Correct `storage`, or `workdir` for `storage: auto`.",
     ),
     RoutingCase(
         id="live_trial_tracker_unreadable",

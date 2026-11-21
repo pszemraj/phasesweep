@@ -159,15 +159,9 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
             handle = _lock_outlasting_probes(path)
             if handle is None:
                 raise ExperimentLockBusyError(
-                    f"Another phasesweep process appears to be using the same "
-                    f"experiment backend or output namespace for "
-                    f"{experiment.experiment!r} (lock file: {path}). phasesweep "
-                    f"supports one active orchestrator per experiment output "
-                    f"namespace and per persistent storage identity.",
-                    remediation=(
-                        "Wait for the other PhaseSweep operation using this experiment output "
-                        "or storage namespace to finish, then retry the same command."
-                    ),
+                    f"Another phasesweep process holds the lock for experiment "
+                    f"{experiment.experiment!r} (lock file: {path}).",
+                    remediation="Wait for it to finish, then retry.",
                 )
             handles.append(handle)
         yield

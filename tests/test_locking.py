@@ -52,7 +52,7 @@ def test_busy_probe_observes_run_locks_without_creating_paths(
         assert {path: path.read_bytes() for path in home.rglob("*") if path.is_file()} == before
         with pytest.raises(ExperimentLockBusyError) as busy, _experiment_lock(experiment):
             pytest.fail("the probe released the live operation's locks")
-        assert "finish, then retry the same command" in str(busy.value.remediation)
+        assert "Wait for it to finish, then retry" in str(busy.value.remediation)
         assert "MCP" not in str(busy.value.remediation)
         assert "only if the user" not in str(busy.value.remediation)
     assert not experiment_is_busy(experiment)
@@ -107,15 +107,10 @@ def test_run_lock_held_past_the_retry_window_is_refused_as_busy(tmp_path: Path) 
 
     assert time.monotonic() - started >= locking._PROBE_OUTLAST_SECONDS
     assert busy.value.args[0] == (
-        "Another phasesweep process appears to be using the same experiment backend or "
-        f"output namespace for {experiment.experiment!r} (lock file: {path}). phasesweep "
-        "supports one active orchestrator per experiment output namespace and per "
-        "persistent storage identity."
+        f"Another phasesweep process holds the lock for experiment {experiment.experiment!r} "
+        f"(lock file: {path})."
     )
-    assert busy.value.remediation == (
-        "Wait for the other PhaseSweep operation using this experiment output or storage "
-        "namespace to finish, then retry the same command."
-    )
+    assert busy.value.remediation == "Wait for it to finish, then retry."
 
 
 @pytest.mark.parametrize(
@@ -942,7 +937,7 @@ def test_run_lock_collides_for_different_storage_same_output_dir(
 
     with (  # testing that the inner enter raises
         _experiment_lock(exp_a),
-        pytest.raises(RuntimeError, match="output namespace|backend"),
+        pytest.raises(RuntimeError, match=r"lock file: .*__output__"),
         _experiment_lock(exp_b),
     ):
         pass

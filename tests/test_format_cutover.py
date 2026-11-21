@@ -297,7 +297,7 @@ def test_unsupported_populated_ledger_is_refused_with_a_fresh_output_root(
         StudySchemaMismatchError,
         match=(
             rf"'old_experiment::removed_phase' {shown}; "
-            rf"this PhaseSweep reads format {STUDY_SCHEMA_VERSION}\. Nothing was written"
+            rf"this PhaseSweep reads format {STUDY_SCHEMA_VERSION}\."
         ),
     ) as excinfo:
         run_experiment(experiment)
@@ -323,9 +323,10 @@ def test_float_schema_is_refused_by_live_and_snapshot_checks(tmp_path: Path) -> 
 
     with pytest.raises(StudySchemaMismatchError, match=r"t::p.*Affected trial numbers: \[0\]"):
         _initialize_study_schema(study)
-    with pytest.raises(StudySchemaMismatchError, match="t::p.*Nothing was written"):
+    uses = rf"t::p. uses format {float(STUDY_SCHEMA_VERSION)}"
+    with pytest.raises(StudySchemaMismatchError, match=uses):
         engine_ledger._check_study_schema(study, trials)
-    with pytest.raises(StudySchemaMismatchError, match="t::p.*Nothing was written"):
+    with pytest.raises(StudySchemaMismatchError, match=uses):
         engine_ledger._scan_ledger_format(storage)
 
     assert tree_snapshot(tmp_path) == before
@@ -436,7 +437,7 @@ def test_unwritable_ledger_directory_fails_before_the_tree_is_bound(
         monkeypatch.setattr(Path, "mkdir", refuse_ledger_directory)
 
     try:
-        with pytest.raises(PhaseSweepError, match="could not be created") as refused:
+        with pytest.raises(PhaseSweepError, match="cannot be created") as refused:
             claim_ledger(validate_ledger(experiment))
     finally:
         if denial == "permissions":
@@ -960,7 +961,7 @@ def test_repair_refuses_a_journal_lock_that_is_never_released(
         assert len(raised) == 1
         assert isinstance(raised[0], IncompleteJournalRecordError)
         assert raised[0].action == OperatorAction.RESTORE_LEDGER
-        assert "Wait for the writer to finish" in str(raised[0])
+        assert "Retry when the writer finishes" in str(raised[0])
         assert journal.read_bytes() == damaged
         assert holder.held()
         assert not list(journal.parent.glob(f"{journal.name}.*.bak"))

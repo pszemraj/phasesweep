@@ -484,9 +484,8 @@ def _publish_generation(
 
     if absorbed.signum is not None:
         log.warning(
-            "Shutdown signal %s arrived during the publication transaction for "
-            "generation %s; the committed publication wins and the shutdown is "
-            "honored at the next checkpoint before any new work starts.",
+            "Shutdown signal %s arrived while publishing generation %s; the publication "
+            "committed and the run stops at the next checkpoint.",
             signal_name(absorbed.signum),
             generation_id,
         )

@@ -65,7 +65,7 @@ Private records inside the tree have these additional requirements:
 | `environment.json` in a trial directory, written only when `execution.record_env` is set | `0600` | replace it under the same condition |
 | `attempts/`, the attempt registry | `0700` directory of `0600` entries | read it through a symlink or with shared permissions |
 
-The two files are owner-only while their directories keep ordinary permissions. The same validated, no-follow path handling protects the runtime lock namespace and the MCP `state_dir`.
+The two files are owner-only while their directories keep ordinary permissions, so only the publishing user can fully validate a published tree: another user is refused as unable to read the publication, which is not corruption, until the publishing user re-reads it or read permission is restored. The same validated, no-follow path handling protects the runtime lock namespace and the MCP `state_dir`.
 
 > [!WARNING]
 > `config.snapshot.yaml` is private because it can contain command and environment values. PhaseSweep writes a `.gitignore` containing `*` and a `.ignore` that permits ripgrep searches, without replacing existing files. Keep generated outputs, ledgers, and MCP state out of commits yourself.

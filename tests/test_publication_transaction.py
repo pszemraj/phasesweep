@@ -1794,7 +1794,7 @@ def test_unreadable_provenance_file_reports_permission_denied_not_corruption(
         status = read_status(experiment)
         assert status["publication_integrity"] == "permission_denied"
         assert "permission denied" in status["publication_error"]
-        assert "only the publishing user" in status["publication_error"]
+        assert "not readable as this user" in status["publication_error"]
         assert "missing or unreadable" not in status["publication_error"]
         assert status["published_generation_id"] is None
     finally:

@@ -1391,7 +1391,7 @@ def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     # The diagnostic names the failure and forbids the wrong move explicitly.
     assert generation_id in captured.err
     assert "does not match its recorded hash" in captured.err
-    assert "Do not run anything over this tree" in captured.err
+    assert "Inspect or restore the generation namespace under" in captured.err
 
     exit_code = invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch)
 
@@ -1401,7 +1401,7 @@ def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     assert "no winner yet" not in captured.out
     assert generation_id in captured.err
     assert "does not match its recorded hash" in captured.err
-    assert "Do not run anything over this tree" in captured.err
+    assert "Inspect or restore the generation namespace under" in captured.err
 
 
 @requires_nonroot
@@ -1438,8 +1438,7 @@ def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     assert "permission denied" in payload["publication_error"]
     assert "missing or unreadable" not in payload["publication_error"]
     assert "permission denied" in captured.err
-    assert "not evidence of corruption" in captured.err
-    assert "only the publishing user" in captured.err
+    assert "Re-read it as the publishing user" in captured.err
 
 
 def test_status_and_show_winners_stay_successful_without_corruption(
@@ -1512,7 +1511,7 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     assert not any(line.lstrip().startswith("winner") for line in captured.out.splitlines())
     assert generation_id in captured.err
     assert "does not match its recorded hash" in captured.err
-    assert "Do not run anything over this tree" in captured.err
+    assert "Inspect or restore the generation namespace under" in captured.err
 
 
 @pytest.mark.parametrize(

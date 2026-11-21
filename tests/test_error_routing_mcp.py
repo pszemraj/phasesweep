@@ -374,7 +374,7 @@ CASES = (
         trigger=_recover_while_locked,
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
-        message="Another phasesweep process appears to be using the same experiment backend",
+        message="Another phasesweep process holds the lock for experiment",
     ),
     RoutingCase(
         # Composed: the inbound refusal is a ValueError carrying no action, so the

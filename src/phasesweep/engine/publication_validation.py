@@ -195,18 +195,13 @@ def _generation_artifact_manifest(
 
 
 def _unreadable_artifact_permission_detail(subject: str) -> str:
-    """Describe an unreadable artifact by role, directing validation to its publishing user.
+    """Describe an unreadable artifact by role.
 
     :param str subject: Artifact that could not be read, named by role
         (e.g. ``"config_snapshot artifact"``), never by path.
     :return str: Bare reason clause for the caller's manifest-validation error.
     """
-    return (
-        f"{subject} is not readable as this user (permission denied): validation cannot run "
-        "without it, and a generation's config.snapshot.yaml is deliberately owner-only, so "
-        "only the publishing user can fully validate this tree -- re-read it as that user "
-        "before treating this publication as corrupt"
-    )
+    return f"{subject} is not readable as this user (permission denied)"
 
 
 def _validate_generation_manifest(

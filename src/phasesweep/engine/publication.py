@@ -36,15 +36,12 @@ def raise_for_unusable_publication(
     if state == "permission_denied":
         raise PublicationAccessError(
             f"{subject} records a publication that cannot be validated as the current user: "
-            f"{detail} Results remain hidden, but this is not evidence of corruption. Re-read "
-            "the publication as the publishing user or restore read permission before launching "
-            "another run."
+            f"{detail} Re-read it as the publishing user or restore read permission."
         )
     raise PublicationIntegrityError(
         f"{subject} records a publication that no longer validates: {detail} "
-        "Do not run anything over this tree until you have inspected or restored the "
-        f"generation namespace under {namespace_root} -- a successful run would advance the "
-        "last-success pointer past the corrupt generation and nothing would report it again."
+        f"Inspect or restore the generation namespace under {namespace_root} before "
+        "running anything over this tree."
     )
 
 
