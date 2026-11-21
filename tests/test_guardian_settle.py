@@ -6,7 +6,7 @@ A member still running when the settle ends is terminated, named in the failure 
 fails the trial even after a zero exit. Once the root has exited, a cancellation request no
 longer cuts the settle short, and every wait that covers the guardian grows by the settle.
 On Linux the guardian adopts descendants that left the root's group, such as ranks torchrun
-starts in sessions of their own, and the same rules hold for them.
+starts in sessions of their own, reaps each one as it exits, and the same rules hold for them.
 """
 
 from __future__ import annotations
@@ -73,7 +73,8 @@ signal.signal(signal.SIGTERM, lambda *_: (marks / "child_sigterm").write_text(re
 time.sleep(60)
 """
 
-#: Starts ``_PERSISTENT_CHILD`` in its own group, records when it exits, and exits 0.
+#: Starts ``_PERSISTENT_CHILD`` in its own group, records when it exits, and exits with
+#: ``sys.argv[2]``, 0 when omitted.
 _PERSISTENT_TRAINER = f"""
 import subprocess, sys, time
 from pathlib import Path
@@ -82,6 +83,42 @@ subprocess.Popen([sys.executable, "-c", {_PERSISTENT_CHILD!r}, str(marks)])
 while not (marks / "child_pid").exists():
     time.sleep(0.005)
 (marks / "root_exit").write_text(repr(time.monotonic()))
+sys.exit(int(sys.argv[2]) if sys.argv[2:] else 0)
+"""
+
+#: Leaves five orphans that re-parent to the guardian and exit a second later, waits up to
+#: five seconds for none of them to remain as a live or zombie child of the guardian, and
+#: writes how many it saw adopted and how many are left as zombies.
+_ORPHANING_TRAINER = """
+import os, subprocess, sys, time
+from pathlib import Path
+marks = Path(sys.argv[1])
+guardian = os.getppid()
+def adopted():
+    children = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or entry.name == str(os.getpid()):
+            continue
+        try:
+            stat = (entry / "stat").read_bytes()
+        except OSError:
+            continue
+        fields = stat[stat.rfind(b")") + 2 :].split()
+        if int(fields[1]) == guardian:
+            children[int(entry.name)] = fields[0]
+    return children
+for _ in range(5):
+    subprocess.run(["/bin/sh", "-c", "sleep 1 &"], check=True)
+seen = set()
+deadline = time.monotonic() + 5.0
+while True:
+    children = adopted()
+    seen.update(children)
+    if not children or time.monotonic() >= deadline:
+        break
+    time.sleep(0.02)
+zombies = sum(state == b"Z" for state in children.values())
+(marks / "orphans").write_text(f"{len(seen)} {zombies}")
 """
 
 #: Starts ``_PERSISTENT_CHILD`` in a session of its own, as torchrun starts a rank, records
@@ -417,6 +454,19 @@ def test_a_refused_subreaper_leaves_only_the_roots_group_watched(
     _wait_for_mark(marks / "helper_done")
 
 
+@_LINUX_ADOPTION
+def test_orphans_that_exit_while_the_root_runs_are_reaped_at_once(tmp_path: Path) -> None:
+    """An adopted process that exits while the root still runs leaves no zombie under the guardian."""
+    trainer, marks = _trainer(tmp_path, _ORPHANING_TRAINER)
+
+    result = _supervise(
+        tmp_path / "orphans", [sys.executable, str(trainer), str(marks)], timeout=30
+    )
+
+    assert (result.return_code, result.failure_reason, result.cleanup_confirmed) == (0, None, True)
+    assert (marks / "orphans").read_text() == "5 0"
+
+
 def _spawn_guardian(
     tmp_path: Path, argv: list[str], *, until_root_exit: bool = True
 ) -> tuple[subprocess.Popen[bytes], int, int]:
@@ -499,7 +549,8 @@ def test_cancellation_after_root_exit_does_not_cut_the_settle_short(
 
 
 #: Makes the guardian SIGTERM itself while its root is a zombie, before or after its own
-#: blocking ``waitpid`` reaps it; ``os.kill`` runs the handler before it returns.
+#: blocking ``waitpid`` reaps it; ``os.kill`` runs the handler before it returns. The root
+#: is the guardian's first child to exit, because the trainer's helpers outlive it.
 _RACE_PATCH = """
 import os, signal
 real_waitpid = os.waitpid
@@ -509,7 +560,7 @@ def racing_waitpid(pid, options):
         return real_waitpid(pid, options)
     fired.append(True)
     if {before_reap!r}:
-        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+        os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOWAIT)
         os.kill(os.getpid(), signal.SIGTERM)
         return real_waitpid(pid, options)
     result = real_waitpid(pid, options)
@@ -548,6 +599,38 @@ def test_cancellation_between_root_exit_and_reap_keeps_the_finished_result(
         True,
     )
     assert (marks / "helper_done").exists() and not (marks / "helper_sigterm").exists()
+
+
+@_LINUX_ADOPTION
+def test_a_cancellation_after_root_exit_ends_the_wait_while_an_adopted_child_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The handler that reaps an exited root ends the guardian's wait though an adopted child runs on, and the root's exit 3 is recorded."""
+    use_guardian_timing(
+        monkeypatch,
+        tmp_path,
+        settle_seconds=0.3,
+        term_grace_seconds=0.3,
+        patch=_RACE_PATCH.format(before_reap=True),
+    )
+    trainer, marks = _trainer(tmp_path, _PERSISTENT_TRAINER)
+
+    guardian, pgid, status_read = _spawn_guardian(
+        tmp_path, [sys.executable, str(trainer), str(marks), "3"]
+    )
+    rest = _finish_guardian(guardian, pgid, status_read)
+
+    child_pid = int((marks / "child_pid").read_text())
+    assert_descendant_dies(child_pid, on_timeout_msg=f"child {child_pid} survived the guardian")
+    assert guardian.returncode == 3
+    assert rest.startswith(supervisor._DESCENDANTS_REAPED + f"{child_pid} (".encode())
+    lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="settle")
+    assert lifecycle is not None
+    assert (lifecycle.state, lifecycle.return_code, lifecycle.cleanup_confirmed) == (
+        "exited",
+        3,
+        True,
+    )
 
 
 def test_the_guarded_shutdown_window_covers_the_settle(

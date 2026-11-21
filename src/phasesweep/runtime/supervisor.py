@@ -178,29 +178,16 @@ def _has_exited(pid: int, state: bytes) -> bool:
         return False
 
 
-def _unreadable_member(pid: int, pgid: int, *, adopts: bool, group_exists: bool) -> bool | None:
-    """Decide whether a process whose ``stat`` could not be read is a live trainer member.
+def _unreadable_member(pid: int, pgid: int) -> bool | None:
+    """Decide whether a process whose ``stat`` could not be read is in the trainer group.
 
-    ``waitpid`` answers exactly whether it is a live adopted child, without procfs or
-    permission checks, and reaps it if it has exited. The root is left to its group test,
-    because ``main`` collects its status. ``getpgid`` then answers whether it is in the
-    trainer group, which cannot gain members once it is gone.
+    ``getpgid`` answers without procfs. It is asked only while ``killpg`` finds the group,
+    which cannot gain members once it is gone.
 
     :param int pid: Process whose ``stat`` was unreadable.
-    :param int pgid: Trainer process group, which is also the root's PID.
-    :param bool adopts: Whether this process adopts the trainer's orphaned descendants.
-    :param bool group_exists: Whether ``killpg(pgid, 0)`` found the group.
-    :return bool | None: ``True`` for a live member, ``False`` for none, ``None`` when unknown.
+    :param int pgid: Trainer process group.
+    :return bool | None: ``True`` for a member, ``False`` for none, ``None`` when unknown.
     """
-    if adopts and pid != pgid:
-        try:
-            reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            pass
-        else:
-            return reaped_pid == 0
-    if not group_exists:
-        return False
     try:
         return os.getpgid(pid) == pgid
     except ProcessLookupError:
@@ -209,44 +196,32 @@ def _unreadable_member(pid: int, pgid: int, *, adopts: bool, group_exists: bool)
         return None
 
 
-def _trainer_group_alive(
-    pgid: int, members: list[int] | None = None, *, adopts: bool = False
-) -> bool:
-    """Return whether anything the trainer started can still run.
+def _trainer_group_alive(pgid: int, members: list[int] | None = None) -> bool:
+    """Return whether the trainer root's process group still has a member that can run.
 
-    The trainer's processes are the members of ``pgid`` and, when the guardian ``adopts``
-    as a child subreaper, its own children: the root and every descendant whose parent
-    died first, such as a rank its launcher started in a session of its own.
-    ``killpg(..., 0)`` is the primary probe of the group; without adoption a missing
-    group ends the check. On Linux a procfs scan finds members that have not exited, by
-    :func:`_has_exited`, and reaps exited adopted children other than the root, which
-    ``main`` reaps. Unreadable possible members keep the lease, as
-    :func:`_unreadable_member` decides.
+    ``killpg(..., 0)`` is the primary existence probe. On Linux a procfs scan checks for
+    group members that have not exited, by :func:`_has_exited`. Unreadable possible members
+    keep the lease, as :func:`_unreadable_member` decides. Processes that left the group are
+    :func:`_trainer_alive`'s concern.
 
-    :param int pgid: Trainer process-group identifier, which is also the root's PID.
+    :param int pgid: Trainer process-group identifier.
     :param list[int] | None members: When given, the scan continues past the first
         live member and appends every live or unreadable member's PID here; the
         verdict is the same either way.
-    :param bool adopts: Whether this process adopts the trainer's orphaned descendants.
     :return bool: ``True`` while a live member exists or absence is uncertain.
     """
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
-        if not adopts:
-            return False
-        group_exists = False
+        return False
     except OSError:
         return True
-    else:
-        group_exists = True
 
     try:
         entries = os.scandir("/proc")
     except OSError:
         return True
 
-    guardian = os.getpid()
     complete = True
     found_member = False
     live_member = False
@@ -261,26 +236,20 @@ def _trainer_group_alive(
                 right_paren = data.rfind(b")")
                 fields = data[right_paren + 2 :].split()
                 state = fields[0]
-                parent = int(fields[1])
                 member_pgid = int(fields[2])
             except FileNotFoundError:
                 continue
             except (IndexError, OSError, ValueError):
-                verdict = _unreadable_member(pid, pgid, adopts=adopts, group_exists=group_exists)
+                verdict = _unreadable_member(pid, pgid)
                 if verdict is None:
                     complete = False
                 if not verdict:
                     continue
             else:
-                adopted = adopts and parent == guardian and pid != pgid
-                if member_pgid == pgid:
-                    found_member = True
-                elif not adopted:
+                if member_pgid != pgid:
                     continue
+                found_member = True
                 if _has_exited(pid, state):
-                    if adopted:
-                        with contextlib.suppress(ChildProcessError):
-                            os.waitpid(pid, os.WNOHANG)
                     continue
             live_member = True
             if members is None:
@@ -289,7 +258,84 @@ def _trainer_group_alive(
 
     # A group that exists but had no readable member, or a scan with missing
     # evidence, is not enough proof to release a host-wide GPU lock.
-    return live_member or (group_exists and not (found_member and complete))
+    return live_member or not (found_member and complete)
+
+
+def _children_remain() -> bool:
+    """Reap every exited child of this process and return whether any child is left.
+
+    The kernel answers exactly, without procfs or permission checks: ``waitpid`` with
+    ``WNOHANG`` returns ``0`` while some child has not exited and raises
+    ``ChildProcessError`` once there is none.
+
+    :return bool: Whether at least one child has not exited.
+    """
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return False
+        if pid == 0:
+            return True
+
+
+def _adopted_children(root: int) -> list[int]:
+    """List this process's children other than the trainer root, from procfs.
+
+    The list only names and signals adopted processes; :func:`_children_remain` decides
+    whether any is left. A child the scan misses, such as one adopted during it, is found by
+    the next poll.
+
+    :param int root: The trainer root's PID, which the group scan covers.
+    :return list[int]: PIDs whose ``stat`` names this process as their parent.
+    """
+    guardian = os.getpid()
+    children: list[int] = []
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return children
+    with entries:
+        for entry in entries:
+            if not entry.name.isdigit() or entry.name == str(root):
+                continue
+            try:
+                with open(f"/proc/{entry.name}/stat", "rb") as stat_file:
+                    data = stat_file.read()
+                parent = int(data[data.rfind(b")") + 2 :].split()[1])
+            except (IndexError, OSError, ValueError):
+                continue
+            if parent == guardian:
+                children.append(int(entry.name))
+    return children
+
+
+def _trainer_alive(pgid: int, members: list[int] | None = None, *, adopts: bool) -> bool:
+    """Return whether anything the trainer started can still run.
+
+    Without adoption that is the root's group, by :func:`_trainer_group_alive`. A child
+    subreaper also owns every process that left the group: each is its child or a
+    descendant of one, so after the group check :func:`_children_remain` reaps the exited
+    children and says whether one is left. That order is race-free. A group with no live
+    member cannot gain one, and the kernel re-parents a dying process's children to the
+    guardian before that process reads as exited, so nothing leaves the group unseen
+    between the two checks. The children check also runs while the group lives, so an
+    exited child is reaped before it could be named or signalled as a survivor.
+
+    :param int pgid: Trainer process group, which is also the root's PID.
+    :param list[int] | None members: When given, every live or unreadable group member and,
+        while adopted children remain, each of them is appended here for naming and
+        signalling; the verdict is the same either way.
+    :param bool adopts: Whether this process adopts the trainer's orphaned descendants.
+    :return bool: ``True`` while something the trainer started may still run.
+    """
+    group_alive = _trainer_group_alive(pgid, members)
+    if not adopts:
+        return group_alive
+    children_alive = _children_remain()
+    if children_alive and members is not None:
+        members.extend(pid for pid in _adopted_children(pgid) if pid not in members)
+    return group_alive or children_alive
 
 
 def _short_argument(argument: str) -> str:
@@ -321,7 +367,7 @@ def _describe_members(pids: list[int]) -> str:
     non-ASCII bytes as ``?``, so each character is one byte of the status frame. Without
     procfs the scan that produced ``pids`` finds none, so the result is empty.
 
-    :param list[int] pids: Live or unreadable members found by :func:`_trainer_group_alive`.
+    :param list[int] pids: Live or unreadable members found by :func:`_trainer_alive`.
     :return str: Up to ``_SURVIVOR_ENTRIES`` entries joined by ``", "``, then ``+N more``
         for the rest, or ``""`` when ``pids`` is empty.
     """
@@ -362,7 +408,7 @@ def _signal_members(pgid: int, members: list[int], signum: int, signalled: set[i
     join it, because the root's session is a different one.
 
     :param int pgid: Trainer process group.
-    :param list[int] members: Live members found by :func:`_trainer_group_alive`.
+    :param list[int] members: Live members found by :func:`_trainer_alive`.
     :param int signum: Signal to send.
     :param set[int] signalled: Groups already sent ``signum``, extended here.
     """
@@ -397,7 +443,7 @@ def _wait_for_group_exit(
         with contextlib.suppress(ChildProcessError):
             os.waitpid(pgid, os.WNOHANG)
         members: list[int] | None = None if signum is None else []
-        if not _trainer_group_alive(pgid, members, adopts=adopts):
+        if not _trainer_alive(pgid, members, adopts=adopts):
             return True
         if signum is not None and members is not None:
             _signal_members(pgid, members, signum, signalled)
@@ -420,7 +466,7 @@ def _reap_remaining_group(pgid: int, *, adopts: bool) -> str | None:
         could be named.
     """
     members: list[int] = []
-    if not _trainer_group_alive(pgid, members, adopts=adopts):
+    if not _trainer_alive(pgid, members, adopts=adopts):
         return None
     survivors = _describe_members(members)
 
@@ -504,16 +550,31 @@ def _return_child_status(status: int) -> int:
     return 70
 
 
+def _wait_for_root(root: int) -> int:
+    """Block until the trainer root exits, reaping every other child that exits first.
+
+    A child subreaper gains children while the root runs, and each one that exits would
+    otherwise wait as a zombie until the root does.
+
+    :param int root: The trainer root, an unreaped child of this process.
+    :return int: The root's raw wait status.
+    """
+    while True:
+        pid, status = os.waitpid(-1, 0)
+        if pid == root:
+            return status
+
+
 def _become_subreaper() -> bool:
     """Make the trainer's orphaned descendants re-parent to this process.
 
     A launcher such as torchrun starts each rank in a session of its own, outside the
     trainer's group; if the launcher dies first, its ranks would re-parent to init and
-    outlive the lease. A child subreaper adopts them instead, and the procfs scan finds
-    them by parent. The standard library has no ``prctl`` binding, so the call goes
-    through ``ctypes``. Without that scan the adopted processes could not be seen and a
-    gone group would never read as gone, so adoption is skipped when ``/proc`` cannot be
-    listed.
+    outlive the lease. A child subreaper adopts them instead: ``waitpid`` says whether any
+    is left, and the procfs scan finds their PIDs to signal. The standard library has no
+    ``prctl`` binding, so the call goes through ``ctypes``. An adopted process that cannot
+    be found cannot be signalled, and would hold the lease until it exits by itself, so
+    adoption is skipped when ``/proc`` cannot be listed.
 
     :return bool: Whether the kernel accepted ``PR_SET_CHILD_SUBREAPER``.
     """
@@ -570,12 +631,15 @@ def main(argv: list[str] | None = None) -> int:
         A request that lands after the root exited but before ``main`` stops listening
         does not apply: the root is reaped here if ``main`` has not yet, and supervision
         goes on to the settle and verdict, so a finished trainer is not recorded as cancelled.
+        The handler then ends ``main``'s wait with ``ChildProcessError``, because a wait
+        resumed after a normal return would block on adopted children that still run.
         Reaping with ``WNOHANG`` works on every supported platform; ``os.waitid``, which
         could test the zombie without reaping it, is missing on macOS before Python 3.13.
 
         :param int signum: Cancellation request delivered to the guardian.
         :param FrameType | None _frame: Unused signal frame.
-        :raises SystemExit: A running root's group needs durably recorded cancellation.
+        :raises ChildProcessError: The root had exited and is reaped here, its status kept.
+        :raises SystemExit: A running root needs durably recorded cancellation.
         """
         nonlocal reaped_root_status
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -585,9 +649,8 @@ def main(argv: list[str] | None = None) -> int:
             return  # main() has just reaped the exited root.
         if reaped_pid == child_pid:
             reaped_root_status = wait_status
-            return
-        if _trainer_group_alive(child_pid, adopts=adopts):
-            raise SystemExit(128 + signum)
+            raise ChildProcessError(f"trainer root {child_pid} was reaped by cancel()")
+        raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, cancel)
 
@@ -598,11 +661,11 @@ def main(argv: list[str] | None = None) -> int:
     cancelled = False
     try:
         try:
-            signal.pthread_sigmask(signal.SIG_SETMASK, set())
             try:
-                _, status = os.waitpid(child_pid, 0)
+                signal.pthread_sigmask(signal.SIG_SETMASK, set())
+                status = _wait_for_root(child_pid)
             except ChildProcessError:
-                # cancel() reaped the exited root while this wait was interrupted.
+                # cancel() reaped the exited root and ended this wait.
                 if reaped_root_status is None:
                     raise
                 status = reaped_root_status
@@ -623,7 +686,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
             except OSError:
                 # Without durable intent, retain the lease and let the trainer finish.
-                _, status = os.waitpid(child_pid, 0)
+                status = _wait_for_root(child_pid)
                 _wait_for_group_exit(child_pid, None, adopts=adopts)
             else:
                 _reap_remaining_group(child_pid, adopts=adopts)

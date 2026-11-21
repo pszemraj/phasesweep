@@ -833,6 +833,8 @@ def test_supervisor_main_rejects_malformed_payload(
     monkeypatch.setattr(supervisor.os, "execve", lambda *a: exec_calls.append(a))
     # As a subreaper this pytest process would adopt every orphan for the rest of its session.
     monkeypatch.setattr(supervisor, "_become_subreaper", lambda: False)
+    # A wait for any child would also reap children other tests in this process started.
+    monkeypatch.setattr(supervisor, "_wait_for_root", lambda root: os.waitpid(root, 0)[1])
 
     ready_read, ready_write = os.pipe()
     ack_read, ack_write = os.pipe()
@@ -1408,48 +1410,121 @@ def test_guardian_proc_scan_ignores_only_proven_unrelated_entries(
 
 
 @pytest.mark.parametrize(
-    ("pid", "adopts", "group_exists", "waitpid_result", "pgid_result", "expected"),
+    ("pgid_result", "expected"),
     [
-        pytest.param(22, True, False, (0, 0), OSError, True, id="live-adopted-child"),
-        pytest.param(22, True, False, (22, 0), OSError, False, id="exited-child-is-reaped"),
-        pytest.param(22, True, False, ChildProcessError, OSError, False, id="gone-group"),
-        pytest.param(22, True, True, ChildProcessError, 1234, True, id="group-member"),
-        pytest.param(22, True, True, ChildProcessError, OSError, None, id="unknown-group"),
-        pytest.param(22, False, True, (0, 0), 99, False, id="no-adoption-asks-only-the-group"),
-        pytest.param(1234, True, True, (1234, 0), 1234, True, id="root-is-never-reaped"),
+        pytest.param(1234, True, id="group-member"),
+        pytest.param(99, False, id="other-group"),
+        pytest.param(ProcessLookupError, False, id="gone-process"),
+        pytest.param(PermissionError, None, id="unknown-group"),
     ],
 )
-def test_guardian_decides_an_unreadable_process_by_waitpid_then_getpgid(
-    monkeypatch: pytest.MonkeyPatch,
-    pid: int,
-    adopts: bool,
-    group_exists: bool,
-    waitpid_result: tuple[int, int] | type[OSError],
-    pgid_result: int | type[OSError],
-    expected: bool | None,
+def test_guardian_decides_an_unreadable_process_by_getpgid(
+    monkeypatch: pytest.MonkeyPatch, pgid_result: int | type[OSError], expected: bool | None
 ) -> None:
-    """Without ``stat``, ``waitpid`` settles an adopted child and ``getpgid`` the trainer group."""
-    waited: list[int] = []
-
-    def fake_waitpid(target: int, options: int) -> tuple[int, int]:
-        assert options == os.WNOHANG
-        waited.append(target)
-        if isinstance(waitpid_result, tuple):
-            return waitpid_result
-        raise waitpid_result(target)
+    """Without ``stat``, ``getpgid`` says whether a process is in the trainer group."""
 
     def fake_getpgid(target: int) -> int:
         if isinstance(pgid_result, int):
             return pgid_result
         raise pgid_result(target)
 
-    monkeypatch.setattr("phasesweep.runtime.supervisor.os.waitpid", fake_waitpid)
     monkeypatch.setattr("phasesweep.runtime.supervisor.os.getpgid", fake_getpgid)
 
-    verdict = supervisor._unreadable_member(pid, 1234, adopts=adopts, group_exists=group_exists)
+    assert supervisor._unreadable_member(22, 1234) is expected
 
-    assert verdict is expected
-    assert waited == ([pid] if adopts and pid != 1234 else [])
+
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        pytest.param([(0, 0)], True, id="running-child"),
+        pytest.param([(22, 0), (23, 9), (0, 0)], True, id="exited-children-reaped-one-runs"),
+        pytest.param([(22, 0), ChildProcessError], False, id="exited-child-reaped-none-left"),
+        pytest.param([ChildProcessError], False, id="no-child"),
+    ],
+)
+def test_guardian_counts_its_children_by_waitpid(
+    monkeypatch: pytest.MonkeyPatch,
+    results: list[tuple[int, int] | type[ChildProcessError]],
+    expected: bool,
+) -> None:
+    """``waitpid(-1, WNOHANG)`` reaps every exited child and stops at a running one or at none."""
+    calls: list[tuple[int, int]] = []
+
+    def fake_waitpid(target: int, options: int) -> tuple[int, int]:
+        calls.append((target, options))
+        result = results[len(calls) - 1]
+        if isinstance(result, tuple):
+            return result
+        raise result(target)
+
+    monkeypatch.setattr("phasesweep.runtime.supervisor.os.waitpid", fake_waitpid)
+
+    assert supervisor._children_remain() is expected
+    assert calls == [(-1, os.WNOHANG)] * len(results)
+
+
+@pytest.mark.parametrize(
+    ("adopts", "group_alive", "children_alive", "expected", "steps", "listed"),
+    [
+        pytest.param(
+            False, False, True, False, ["group"], [], id="no-adoption-asks-only-the-group"
+        ),
+        pytest.param(True, True, False, True, ["group", "children"], [1235], id="live-group"),
+        pytest.param(
+            True,
+            True,
+            True,
+            True,
+            ["group", "children", "adopted"],
+            [1235, 22],
+            id="adopted-member-listed-once",
+        ),
+        pytest.param(
+            True,
+            False,
+            True,
+            True,
+            ["group", "children", "adopted"],
+            [1235, 22],
+            id="adopted-child-outlives-the-group",
+        ),
+        pytest.param(True, False, False, False, ["group", "children"], [], id="nothing-left"),
+    ],
+)
+def test_guardian_asks_about_adopted_children_after_the_group(
+    monkeypatch: pytest.MonkeyPatch,
+    adopts: bool,
+    group_alive: bool,
+    children_alive: bool,
+    expected: bool,
+    steps: list[str],
+    listed: list[int],
+) -> None:
+    """The group is checked first, then ``waitpid``; only a remaining child is listed by PID."""
+    seen: list[str] = []
+
+    def group_check(pgid: int, members: list[int] | None = None) -> bool:
+        seen.append("group")
+        if members is not None and group_alive:
+            members.append(1235)
+        return group_alive
+
+    def children_check() -> bool:
+        seen.append("children")
+        return children_alive
+
+    def adopted(root: int) -> list[int]:
+        seen.append("adopted")
+        return [1235, 22]
+
+    monkeypatch.setattr(supervisor, "_trainer_group_alive", group_check)
+    monkeypatch.setattr(supervisor, "_children_remain", children_check)
+    monkeypatch.setattr(supervisor, "_adopted_children", adopted)
+    members: list[int] = []
+
+    assert supervisor._trainer_alive(1234, members, adopts=adopts) is expected
+    assert seen == steps
+    assert members == listed
 
 
 def test_terminate_process_groups_shares_grace_across_groups(tmp_path: Path) -> None:
