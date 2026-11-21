@@ -151,9 +151,10 @@ Versions already uploaded to PyPI cannot be replaced; duplicate uploads fail vis
 - `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates.
 - `phasesweep.reporting`: trainer-side JSON-envelope objective writer.
 - `phasesweep.tracking`: MLflow run bindings, supervised controller operations, result delivery, and upload retries.
-- `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, and override rendering. Keep `runtime/supervisor.py` stdlib-only; see the [launch ordering](invariants.md#9-nothing-runs-before-its-process-identity-is-durable).
+- `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, override rendering, and the terminal primitives of human-readable output (`runtime/terminal.py`: the colour decision, terminal width, prose wrapping, display paths). Keep `runtime/supervisor.py` stdlib-only; see the [launch ordering](invariants.md#9-nothing-runs-before-its-process-identity-is-durable).
 - `phasesweep.mcp`: catalog registry, stdio server, detached runner, durable run handles, frozen snapshots, the failure payload a run read returns (`mcp/failures.py`), and operator recovery.
 - `phasesweep.cli`: Click command surface.
+- `phasesweep.trial_table`: the plain-text trial tables of `status --trials`, rendered from the engine's trial tables with the width and colour decision passed in.
 - `phasesweep.errors`: the shared operator-facing error taxonomy and the operator steps behind the `fix:` lines.
 - `phasesweep.examples`: the toy trainers `fake_train` and `mlflow_train`, which the templates and examples run as the `phasesweep-fake-train` and `phasesweep-mlflow-train` console scripts.
 - Packaged data: `templates/` (the `init` templates), `config_reference.yaml` (parsed by `config/reference.py`, which expands its shared blocks into every key path for `explain`, `explain_config`, typo suggestions and validation hints), and `mcp/agent_prompt.md` (the agent guide that the MCP `get_guide` tool and `phasesweep_run_and_monitor` prompt return).
@@ -224,6 +225,7 @@ The principal test groups and what each covers:
 - `tests/test_mlflow_integration.py`: both ownership modes against a temporary HTTP server, stopped-server replay, worker cleanup, and delivery retries.
 - Storage, publication, recovery, interrupted trials and sampler resume: owning code and representative tests are listed by [durability invariant](invariants.md).
 - `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots, detached launch, status, cancellation, and recovery.
+- `tests/test_terminal.py` and `tests/test_trial_table.py`: the terminal primitives (the colour decision per stream, width, wrapping, display paths) and the exact plain-text output of `status --trials`.
 - `tests/test_init.py`, `tests/test_fake_train.py` and `tests/test_reporting.py`: template creation and runs, the toy trainer's seed noise, catalog scaffolding, and the objective-envelope writer (`report_objective` and `report-objective`).
 
 ## Tracked TODOs
@@ -256,7 +258,7 @@ These have been requested and declined. Check this list before proposing one aga
 - **Rewriting raw package files and PyPI metadata to pin documentation URLs.** Those static files link to `main`; the installed `explain` and `init` surfaces select release-tag links at read time. Build-time rewriting would add a second link mechanism and a build hook solely to change the raw-file view; the installed surfaces already provide the version-aware links.
 - **Splitting `mcp/tools.py` by size alone.** Moving code without removing a responsibility or mechanism adds review scope without simplifying the implementation. A responsibility moves out as a unit when one is cohesive, as the read-time failure composition did into `mcp/failures.py`.
 - **A nonzero exit for an accepted incomplete winner or pending MLflow uploads.** Both are configured successes: an incomplete winner is published only under `allow_incomplete_on_timeout`, and its `WINNER` line says `INCOMPLETE`; pending uploads end with a closing line that points to `sync-tracking`.
-- **Shorter trial directory names.** `trials.csv` and `status --trials` are the interfaces for scripts; the directory name carries the generation and attempt IDs that keep attempts apart.
+- **Shorter trial directory names.** `trials.csv` is the interface for scripts, since `status --trials` is a table for people; the directory name carries the generation and attempt IDs that keep attempts apart.
 - **Reporting a name missing from `mlflow_required` as a gate failure rather than an objective read error.** The gate and the objective read one shared capture, and a finished run that lacks a required name fails that capture at once, so the trial fails either way; the error names the missing key and lists the run's keys of that kind.
 - **Restricting `record_env` to `true` and `false`.** It is a plain boolean, and every boolean key accepts the same YAML forms.
 - **Treating a key that overrides a `<<:` merge as a duplicate key.** Keys written in a mapping win over merged ones under standard YAML merge semantics. A key written twice in one mapping, or a second `<<`, is still rejected.

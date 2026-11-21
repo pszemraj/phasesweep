@@ -496,7 +496,12 @@ def test_status_tells_a_killed_run_from_a_live_one(harness: _Harness) -> None:
     for arguments in (["status"], ["status", "--trials"]):
         shown = CliRunner().invoke(cli, [*arguments, str(config)])
         assert shown.exit_code == 0, shown.output
-        assert shown.output.splitlines()[0] == _NO_RUN_ACTIVE
+        # The table form wraps the comment to the terminal width, each line still a comment.
+        comment = [line for line in shown.output.splitlines() if line.startswith("# ")]
+        assert " ".join(line.removeprefix("# ") for line in comment) == _NO_RUN_ACTIVE.removeprefix(
+            "# "
+        )
+        assert shown.output.splitlines()[0] == comment[0]
         assert shown.output.count("No run is active") == 1
         with _experiment_lock(experiment):
             live = CliRunner().invoke(cli, [*arguments, str(config)])

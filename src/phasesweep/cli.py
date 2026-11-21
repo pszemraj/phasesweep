@@ -8,7 +8,6 @@ import shlex
 import sys
 import traceback
 from collections.abc import Sequence
-from decimal import Decimal
 from importlib import resources
 from pathlib import Path
 
@@ -58,7 +57,6 @@ from phasesweep.engine.publication import (
     raise_for_unusable_publication,
 )
 from phasesweep.engine.read import (
-    TrialTables,
     _read_generation_selection,
     _represented_winners,
     experiment_status,
@@ -93,7 +91,6 @@ from phasesweep.runtime.files import (
 from phasesweep.runtime.gpu import GpuPool
 from phasesweep.runtime.json import (
     JsonObject,
-    JsonValue,
     json_object,
     strict_json_loads,
 )
@@ -101,6 +98,8 @@ from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     install_signal_handlers,
 )
+from phasesweep.runtime.terminal import terminal_width, use_color
+from phasesweep.trial_table import render_trial_tables, unsettled_running_comment
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 CONFIG_PATH = click.Path(exists=True, dir_okay=False, path_type=Path)
@@ -964,100 +963,6 @@ class _WinnerDumper(yaml.SafeDumper):
 _WinnerDumper.add_representer(float, _WinnerDumper.represent_float)
 
 
-def _param_text(value: JsonValue) -> str:
-    """Format one sampled param for a trial table, floats to four significant digits.
-
-    Four digits would drop the leading digits of a float from 10000 up, which prints in full
-    plain notation instead. The exact value stays in ``trials.csv`` and ``winner.yaml``.
-
-    :param JsonValue value: The recorded param value.
-    :return str: Terminal text for the value.
-    """
-    if isinstance(value, float):
-        text = f"{value:.4g}"
-        if "e+" not in text:
-            return text
-        return format(Decimal(repr(value)).normalize(), "f")
-    return str(value)
-
-
-def _trial_cell(value: JsonValue, column: str) -> str:
-    """Format one trial-table cell for the terminal.
-
-    Params print floats to four significant digits and ``duration_s`` to one decimal place;
-    every other float uses the shared display precision. A missing value prints as ``-``.
-
-    :param JsonValue value: The row's value for that column.
-    :param str column: Header of the column the value sits in.
-    :return str: Terminal text for the cell.
-    """
-    if value is None:
-        return "-"
-    if isinstance(value, dict):
-        return ", ".join(f"{name}={_param_text(item)}" for name, item in value.items()) or "-"
-    if isinstance(value, float):
-        return f"{value:.1f}" if column == "duration_s" else _display_float(value)
-    return str(value)
-
-
-#: Columns whose text is not a number, which a trial table left-aligns.
-_TEXT_TRIAL_COLUMNS = frozenset({"state", "params", "winner", "reduce", "eligible", "reason"})
-
-
-def _aligned_row(columns: Sequence[str], texts: Sequence[str], widths: Sequence[int]) -> str:
-    """Pad one table row to its column widths, text columns left and numbers right.
-
-    :param Sequence[str] columns: Column headers, which pick each column's alignment.
-    :param Sequence[str] texts: The row's cell texts, one per column.
-    :param Sequence[int] widths: Width of each column.
-    :return str: The row joined by two spaces, without trailing spaces.
-    """
-    padded = (
-        text.ljust(width) if column in _TEXT_TRIAL_COLUMNS else text.rjust(width)
-        for column, text, width in zip(columns, texts, widths, strict=True)
-    )
-    return "  ".join(padded).rstrip()
-
-
-def _table_lines(columns: Sequence[str], rows: Sequence[JsonObject]) -> list[str]:
-    """Render trial or group rows as aligned plain text.
-
-    :param Sequence[str] columns: Column names in display order.
-    :param Sequence[JsonObject] rows: Rows to display, with every named column present.
-    :return list[str]: The header line followed by one line per row, without trailing spaces.
-    """
-    cells = [[_trial_cell(row[column], column) for column in columns] for row in rows]
-    widths = [
-        max(len(column), *(len(row[index]) for row in cells))
-        for index, column in enumerate(columns)
-    ]
-    return [
-        _aligned_row(columns, columns, widths),
-        *(_aligned_row(columns, row, widths) for row in cells),
-    ]
-
-
-def _unsettled_running_comment(running: int) -> str:
-    """Say that trials recorded RUNNING belong to no live run and what a rerun does with them.
-
-    Such a trial was cut off, or finished with a result its run could not read. A rerun
-    settles both, and stops a trainer that outlived its run, so the comment says to let
-    one finish first.
-
-    :param int running: How many trials the ledger records as RUNNING while no run holds the locks.
-    :return str: One ``#`` comment line.
-    """
-    if running == 1:
-        subject, verb, pronoun = "the 1 trial", "was", "it"
-    else:
-        subject, verb, pronoun = f"the {running} trials", "were", "them"
-    return (
-        f"# No run is active, so {subject} recorded RUNNING {verb} left by a run that stopped "
-        f"before recording {pronoun}; rerun the same config to settle {pronoun}. A trainer "
-        "still running is stopped and its trial rerun, so wait for it to exit to keep its result."
-    )
-
-
 def _status_can_suggest_resume(config: Experiment) -> bool:
     """Check whether status can confirm the experiment is idle before suggesting a resume.
 
@@ -1072,89 +977,11 @@ def _status_can_suggest_resume(config: Experiment) -> bool:
         return False
 
 
-def _render_trial_tables(tables: TrialTables, *, csv_root: Path | None) -> str:
-    """Render every phase's trial table under a header that names the winner marks' source.
-
-    :param TrialTables tables: The tables one publication resolution produced.
-    :param Path | None csv_root: The artifact directory of an experiment that keeps no ledger,
-        where each phase's ``trials.csv`` is the only record of its trials; ``None`` when a
-        ledger holds them.
-    :return str: The header line, then each phase's heading and table.
-    """
-    represented = tables.represented_generation_id or tables.published_generation_id
-    sources = set(tables.winner_generations.values())
-    if len(sources) == 1:
-        represented, published = next(iter(sources))
-        marks = f"winner (*) marks {'published' if published else 'unpublished'} generation {represented}"
-    elif len(sources) > 1:
-        marks = "winner (*) marks the phase generations listed below"
-    elif represented is None:
-        marks = "no generation is published, so no winner is marked"
-    elif represented != tables.published_generation_id:
-        marks = f"winner (*) marks unpublished generation {represented}"
-    else:
-        marks = f"winner (*) marks published generation {represented}"
-    lines = [f"experiment {tables.experiment}: {marks}"]
-    for table in tables.phases:
-        if not table.available:
-            note = "trial data unavailable"
-        elif csv_root is not None:
-            snapshot = csv_root / table.phase / "trials.csv"
-            note = "storage: null keeps no trial ledger"
-            if snapshot.is_file():
-                note += f"; the trials of this phase's last run are in {snapshot}"
-        elif not table.rows:
-            note = "no trials yet"
-        else:
-            note = f"{len(table.rows)} trial{'' if len(table.rows) == 1 else 's'}"
-        lines.extend(["", f"=== {table.phase} === ({note})"])
-        source = tables.winner_generations.get(table.phase)
-        if source is not None:
-            source_id, published = source
-            lines.append(
-                f"winner generation: {source_id} ({'published' if published else 'unpublished'})"
-            )
-        if table.rows:
-            lines.extend(_table_lines(table.columns, table.rows))
-        if table.groups:
-            groups: list[JsonObject] = [
-                {
-                    "group": group.group,
-                    "winner": "*" if group.winner else "",
-                    "params": group.params,
-                    "n/expected": f"{group.n}/{group.expected}",
-                    "reduce": group.reduce,
-                    "aggregate": group.aggregate,
-                    "mean": group.mean,
-                    "sd": group.sd,
-                    "min": group.min,
-                    "max": group.max,
-                    "eligible": "yes" if group.eligible else "no",
-                }
-                for group in table.groups
-            ]
-            observed_names = sorted({name for group in table.groups for name in group.observed})
-            for group, row in zip(table.groups, groups, strict=True):
-                for name in observed_names:
-                    row[f"observed:{name}"] = group.observed.get(name)
-                    row[f"observed_n:{name}"] = group.observed_n.get(name, 0)
-            lines.extend(
-                [
-                    "",
-                    "Repeat groups (statistics include infeasible measured members):",
-                    "Group numbers track the highest member trial number so far "
-                    "and can change as members arrive.",
-                ]
-            )
-            lines.extend(_table_lines(tuple(groups[0]), groups))
-    return "\n".join(lines)
-
-
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Print read-only trial counts and phase state for a phasesweep experiment, as YAML; "
-        "--trials prints trial and repeat-group tables per phase instead."
+        "--trials prints a table of trials per phase for reading instead."
     ),
     short_help="Print read-only run status.",
 )
@@ -1165,9 +992,10 @@ def _render_trial_tables(tables: TrialTables, *, csv_root: Path | None) -> str:
     "show_trials",
     is_flag=True,
     help=(
-        "Print one aligned table of trials per phase (state, value, params, duration, "
-        "repeat group, observed values, failure reasons, winner) and repeat-group statistics "
-        "instead of YAML."
+        "Print one table per phase instead of YAML: a column per swept parameter, rows sorted "
+        "by parameter value, the winner named in the first column, and a repeats phase's "
+        "groups below. The table is for reading; trials.csv in each phase's directory is the "
+        "machine-readable form."
     ),
 )
 def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> None:
@@ -1180,7 +1008,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     and trials recorded RUNNING while no run holds the experiment's locks get a comment
     saying that a rerun settles them. These comments require a successful idle lock probe.
     ``--trials`` prints the trial tables in its place, from one publication resolution,
-    and exits the same way.
+    styled only on a terminal, and exits the same way.
 
     :param Path config_path: Experiment YAML file to inspect.
     :param bool show_trials: Print per-phase trial tables instead of the YAML status.
@@ -1193,12 +1021,17 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     require_study(config)
     if show_trials:
         tables = read_trial_tables(config, latest=True)
+        width = terminal_width(sys.stdout)
         running = sum(row["state"] == "RUNNING" for table in tables.phases for row in table.rows)
         if running and _status_can_suggest_resume(config):
-            click.echo(_unsettled_running_comment(running))
+            click.echo(unsettled_running_comment(running, width))
         click.echo(
-            _render_trial_tables(
-                tables, csv_root=None if config.persistent else _experiment_dir(config)
+            render_trial_tables(
+                tables,
+                config,
+                csv_root=None if config.persistent else _experiment_dir(config),
+                width=width,
+                color=use_color(sys.stdout),
             )
         )
         raise_for_unusable_publication(
@@ -1227,7 +1060,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     # One probe serves both comments: flock cannot test a lock without taking it.
     suggest_resume = _status_can_suggest_resume(config) if running or retained else False
     if running and suggest_resume:
-        click.echo(_unsettled_running_comment(running))
+        click.echo(unsettled_running_comment(running))
     if retained and suggest_resume:
         step = unpublished_winner_step(config, ledger)
         if step is not None:

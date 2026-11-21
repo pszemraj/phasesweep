@@ -316,7 +316,12 @@ def test_published_winner_survives_a_failed_later_generation(
             assert winners.output.count(f"caption: {base}") == 1
     table = CliRunner().invoke(cli, ["status", str(path), "--trials"])
     assert table.exit_code == 0, table.exception
-    assert f"winner generation: {expected_generation} ({expected_label})" in table.output
+    if continuation == "prepend_drift":
+        # The new lead phase's winner is unpublished while p keeps its published one.
+        assert "winners come from different generations; each phase names its own" in table.output
+        assert f"winner from generation {expected_generation} ({expected_label})" in table.output
+    else:
+        assert f"{expected_label} generation {expected_generation}" in table.output
 
 
 def test_show_winners_distinguishes_appended_phases_from_historical_results(tmp_path: Path) -> None:
@@ -344,7 +349,7 @@ def test_show_winners_distinguishes_appended_phases_from_historical_results(tmp_
     assert payload["phases"][0]["winner"].endswith("/phases/p/winner.yaml")
     table = CliRunner().invoke(cli, ["status", str(path), "--trials"])
     assert table.exit_code == 0, table.output
-    assert "marks unpublished generation" in table.output
+    assert "\nunpublished generation " in table.output
 
 
 def test_unpublished_winner_discloses_semantic_config_drift(tmp_path: Path) -> None:

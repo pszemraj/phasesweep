@@ -616,11 +616,12 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     assert row[f"user_attr:{FAILURE_REASON_ATTR}"] == reason
     config = tmp_path / "sweep.yaml"
     write_experiment_config(config, experiment)
-    shown = CliRunner().invoke(cli, ["status", str(config), "--trials"])
+    shown = CliRunner().invoke(cli, ["status", str(config), "--trials"], env={"COLUMNS": "80"})
     assert shown.exit_code == 0, shown.output
-    assert shown.output.count(reason) == 1
-    header = next(line for line in shown.output.splitlines() if line.startswith("trial"))
-    assert header.index("reason") < 100
+    lines = shown.output.splitlines()
+    assert " ".join(shown.output.split()).count(reason) == 1
+    assert any(line.lstrip().startswith("reason: ") for line in lines)
+    assert max(map(len, lines)) <= 80
 
 
 def test_managed_missing_objective_hint_is_logged_once_per_phase(

@@ -8,7 +8,6 @@ from pathlib import Path
 import optuna
 import pytest
 
-from phasesweep.cli import _render_trial_tables
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.read import read_trial_tables
@@ -20,6 +19,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
 )
 from phasesweep.runtime.json import JsonObject
+from phasesweep.trial_table import render_trial_tables
 from tests.conftest import make_experiment, trial_outcome
 from tests.recovery_helpers import new_phase_study
 
@@ -109,7 +109,7 @@ def test_repeat_summary_includes_losing_infeasible_and_partial_groups(
     assert partial.group == 7 and partial.n == 1 and partial.expected == 3
     assert partial.mean == partial.min == partial.max == 7.0
     assert partial.sd is None and partial.aggregate is None and not partial.eligible
-    rendered = _render_trial_tables(tables, csv_root=None)
+    rendered = render_trial_tables(tables, experiment, csv_root=None, width=80, color=False)
     assert "Repeat groups (statistics include infeasible measured members):" in rendered
     assert "n/expected" in rendered and "aggregate" in rendered and "eligible" in rendered
     assert "3/3" in rendered and "1/3" in rendered
@@ -127,10 +127,10 @@ def test_repeat_table_explains_group_numbers_while_members_arrive(tmp_path: Path
         (group,) = table.groups
         assert group.params == {"x": 1} and group.group == seed
         assert all(row["repeat_group"] == seed for row in table.rows)
-        rendered = _render_trial_tables(tables, csv_root=None)
+        rendered = render_trial_tables(tables, experiment, csv_root=None, width=80, color=False)
         assert f"{seed + 1}/2" in rendered
-        assert "highest member trial number so far" in rendered
-        assert "can change as members arrive" in rendered
+        prose = " ".join(rendered.split())
+        assert "highest member trial number so far and can change as members arrive" in prose
 
 
 @pytest.mark.parametrize("outcome", ["failure", "interrupted"])
@@ -195,6 +195,6 @@ def test_repeat_observed_means_report_their_own_contributor_counts(tmp_path: Pat
     assert group.n == 3
     assert group.observed == {"cost": 2.0, "heldout": 0.7}
     assert group.observed_n == {"cost": 1, "heldout": 2}
-    rendered = _render_trial_tables(tables, csv_root=None)
+    rendered = render_trial_tables(tables, experiment, csv_root=None, width=80, color=False)
     assert "observed:heldout" in rendered and "observed_n:heldout" in rendered
     assert "observed:cost" in rendered and "observed_n:cost" in rendered

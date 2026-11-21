@@ -337,14 +337,15 @@ def test_in_memory_trial_table_points_at_the_last_runs_csv(
     experiment = make_experiment(workdir=tmp_path / "runs", trial_command="echo x=0.5 {overrides}")
     run_experiment(experiment)
     config = write_experiment_config(tmp_path / "config.yaml", experiment)
+    monkeypatch.chdir(tmp_path)
 
     assert invoke_cli_boundary(["status", str(config), "--trials"], monkeypatch) == 0
 
-    snapshot = tmp_path / "runs" / experiment.experiment / "p" / "trials.csv"
-    assert snapshot.is_file()
-    assert (
-        f"(storage: null keeps no trial ledger; the trials of this phase's last run are in {snapshot})"
-        in capsys.readouterr().out
+    assert (tmp_path / "runs" / experiment.experiment / "p" / "trials.csv").is_file()
+    lines = capsys.readouterr().out.splitlines()
+    heading = lines.index("p: storage: null keeps no trial ledger, objective (lower is better)")
+    assert lines[heading + 1] == (
+        f"  the trials of this phase's last run are in runs/{experiment.experiment}/p/trials.csv"
     )
 
 
@@ -366,10 +367,9 @@ def test_trial_table_prints_float_params_of_10000_or_more_in_full(
 
     assert invoke_cli_boundary(["status", str(config), "--trials"], monkeypatch) == 0
 
+    # Each row ends with the w column, then the state and the time.
     shown = {
-        line.split("w=")[1].split()[0]
-        for line in capsys.readouterr().out.splitlines()
-        if "w=" in line
+        line.split()[-3] for line in capsys.readouterr().out.splitlines() if "COMPLETE" in line
     }
     assert shown == {
         "16384",

@@ -354,7 +354,7 @@ def test_repeat_advisories_keep_the_selected_population_after_failed_top_up(tmp_
 def test_float_displays_share_precision_without_changing_recorded_values(
     tmp_path: Path, value: float, displayed: float
 ) -> None:
-    """Winner YAML keeps twelve digits and the trial table shortens params and durations; stored values stay exact."""
+    """Winner YAML keeps twelve digits and the trial table shortens the objective, params and durations; stored values stay exact."""
     trainer = write_trainer(tmp_path / "trainer.py", f"print('x={value!r}')")
     experiment = make_experiment(
         persistent=tmp_path,
@@ -384,12 +384,12 @@ def test_float_displays_share_precision_without_changing_recorded_values(
     assert capture_result_snapshot(experiment)["winners"][0]["metric"] == value
     table = CliRunner().invoke(cli, ["status", str(config), "--trials"])
     assert table.exit_code == 0, table.output
-    assert f"{value:.12g}" in table.output
-    assert f"lr={sampled:.4g}" in table.output
+    cells = next(line for line in table.output.splitlines() if "COMPLETE" in line).split()
+    assert cells[-4:-1] == [f"{value:.6g}", f"{sampled:.4g}", "COMPLETE"]
     assert f"{sampled:.12g}" not in table.output
     duration = read_trial_tables(experiment, latest=True).phases[0].rows[0]["duration_s"]
     assert isinstance(duration, float) and f"{duration:.12g}" != f"{duration:.1f}"
-    assert f" {duration:.1f} " in table.output
+    assert cells[-1] == f"{duration:.1f}s"
     assert f"{duration:.12g}" not in table.output
 
 

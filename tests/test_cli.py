@@ -1479,24 +1479,15 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     config_path = materialized.config_path
     generation_id = published_generation_id(materialized.experiment)
     assert generation_id is not None
-    heading = "=== p === (2 trials)"
+    heading = "p: 2 trials, objective (lower is better)"
 
     assert invoke_cli_boundary(["status", str(config_path), "--trials"], monkeypatch) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert generation_id in lines[0] and "winner (*)" in lines[0]
-    assert lines[lines.index(heading) + 1] == f"winner generation: {generation_id} (published)"
-    assert lines[lines.index(heading) + 2].split() == [
-        "trial",
-        "state",
-        "value",
-        "params",
-        "duration_s",
-        "winner",
-    ]
-    rows = lines[lines.index(heading) + 3 :]
-    assert [row.split()[:2] for row in rows] == [["0", "COMPLETE"], ["1", "COMPLETE"]]
+    assert lines[:2] == ["t", f"published generation {generation_id}"]
+    header, *rows = lines[lines.index(heading) + 1 :]
+    assert header.split() == ["trial", "objective", "a", "state", "time"]
     # The fixture's two trials tie on the metric, and the tie goes to the lower draw position.
-    assert rows[0].endswith("*") and not rows[1].endswith("*")
+    assert [row.split()[:3] for row in rows] == [["winner", "0", "0.5"], ["1", "0.5", "10"]]
 
     assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
     assert yaml.safe_load(capsys.readouterr().out)["kind"] == "experiment"
@@ -1512,10 +1503,10 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "Traceback" not in captured.err
-    # The tables still print, with no winner starred, before the boundary reports.
+    # The tables still print, with no winner marked, before the boundary reports.
     assert "no generation is published, so no winner is marked" in captured.out
     assert heading in captured.out
-    assert not any(line.endswith("*") for line in captured.out.splitlines())
+    assert not any(line.lstrip().startswith("winner") for line in captured.out.splitlines())
     assert generation_id in captured.err
     assert "does not match its recorded hash" in captured.err
     assert "Do not run anything over this tree" in captured.err
