@@ -174,92 +174,42 @@ class PhaseStart(ReportBlock):
 
 
 @dataclass(frozen=True)
-class TrialLine(ReportBlock):
-    """One finished trial: its state, objective, time, place in the phase and configuration."""
+class FactLine(ReportBlock):
+    """A trial, a rerun or a phase winner: facts beside a phase name, and the cause under them."""
 
     phase: str
     label_width: int
-    number: int
-    state: str
-    objective: str | None
-    duration: str | None
-    ordinal: str
-    params: tuple[str, ...]
-    notes: tuple[str, ...]
+    #: Facts that stay with the phase name's line.
+    head: tuple[str, ...]
+    #: Facts that move below the head when the whole line would overrun.
+    tail: tuple[str, ...]
     reason: str | None
-
-    def _head(self) -> list[str]:
-        """Collect the facts that always share the first line.
-
-        :return list[str]: Trial number, state, objective, duration and place in the phase.
-        """
-        facts = [f"trial {self.number}", self.state, self.objective, self.duration, self.ordinal]
-        return [fact for fact in facts if fact is not None]
+    #: A word of the first line and the style the console gives it, such as a failed trial's state.
+    marked: tuple[str, Style] | None = None
 
     def render(self, width: int, *, color: bool) -> list[str]:
-        """Draw the trial with its configuration beside it or below, and its cause under it.
+        """Draw the facts beside the phase name or below it, and the cause under them.
 
         :param int width: Columns available to each line.
-        :param bool color: Whether to style a failed, infeasible or interrupted state.
-        :return list[str]: The lines of the trial.
+        :param bool color: Whether to style the marked word.
+        :return list[str]: The lines of the block.
         """
-        lines = _lay_out(
-            self.phase, self.label_width, self._head(), [*self.params, *self.notes], width
-        )
-        style = _STATE_STYLES.get(self.state)
-        if style is not None:
+        lines = _lay_out(self.phase, self.label_width, self.head, self.tail, width)
+        if self.marked is not None:
+            word, style = self.marked
             lines[0] = _paint_word(
-                lines[0], self.state, style, start=self.label_width + len(GAP), color=color
+                lines[0], word, style, start=self.label_width + len(GAP), color=color
             )
         if self.reason:
             lines.extend(_reason_lines(self.reason, self.label_width, width))
         return lines
 
     def __str__(self) -> str:
-        """Return the trial's facts on one line, its cause last.
+        """Return the facts on one line, the cause last.
 
         :return str: The one-line text.
         """
-        facts = [self.phase, *self._head(), *self.params, *self.notes]
-        if self.reason:
-            facts.append(f"reason: {self.reason}")
-        return GAP.join(facts)
-
-
-@dataclass(frozen=True)
-class RerunLine(ReportBlock):
-    """A trial the run schedules again, and the cause of the trial it repeats."""
-
-    phase: str
-    label_width: int
-    number: int
-    source: int
-    reason: str | None
-
-    def render(self, width: int, *, color: bool) -> list[str]:
-        """Draw the rerun and the cause of its source under it.
-
-        :param int width: Columns available to each line.
-        :param bool color: Unused; the line carries no styling.
-        :return list[str]: The lines of the rerun.
-        """
-        lines = _lay_out(
-            self.phase,
-            self.label_width,
-            [f"trial {self.number}", f"RERUN of trial {self.source}"],
-            [],
-            width,
-        )
-        if self.reason:
-            lines.extend(_reason_lines(self.reason, self.label_width, width))
-        return lines
-
-    def __str__(self) -> str:
-        """Return the rerun and its cause on one line.
-
-        :return str: The one-line text.
-        """
-        facts = [self.phase, f"trial {self.number}", f"RERUN of trial {self.source}"]
+        facts = [self.phase, *self.head, *self.tail]
         if self.reason:
             facts.append(f"reason: {self.reason}")
         return GAP.join(facts)
@@ -321,42 +271,6 @@ def winner_facts(winner: Winner, metric_name: str) -> tuple[list[str], list[str]
     return head, tail
 
 
-@dataclass(frozen=True)
-class WinnerLine(ReportBlock):
-    """The winner a phase closes with: its trial, objective, configuration and any spread."""
-
-    phase: str
-    label_width: int
-    head: tuple[str, ...]
-    tail: tuple[str, ...]
-
-    def render(self, width: int, *, color: bool) -> list[str]:
-        """Draw the winner, its configuration beside it or below.
-
-        :param int width: Columns available to each line.
-        :param bool color: Whether to style the word ``winner``.
-        :return list[str]: The lines of the winner.
-        """
-        lines = _lay_out(
-            self.phase,
-            self.label_width,
-            [f"winner: {self.head[0]}", *self.head[1:]],
-            self.tail,
-            width,
-        )
-        lines[0] = _paint_word(
-            lines[0], "winner", "winner", start=self.label_width + len(GAP), color=color
-        )
-        return lines
-
-    def __str__(self) -> str:
-        """Return the winner's facts on one line.
-
-        :return str: The one-line text.
-        """
-        return GAP.join([self.phase, f"winner: {self.head[0]}", *self.head[1:], *self.tail])
-
-
 def phase_start(
     experiment: Experiment, phase: Phase, *, finished: int, remaining: int, reruns: int
 ) -> PhaseStart:
@@ -387,7 +301,7 @@ def trial_line(
     repeat: tuple[str, object] | None,
     rerun_of: object,
     reason: str | None,
-) -> TrialLine:
+) -> FactLine:
     """Build the line for one finished trial from its recorded values.
 
     :param Experiment experiment: The experiment, for the objective's name and the label width.
@@ -401,28 +315,32 @@ def trial_line(
     :param tuple[str, object] | None repeat: Repeat key and value this trial ran, if any.
     :param object rerun_of: Trial number this one reruns, ``None`` for a first attempt.
     :param str | None reason: First line of the recorded cause, if any.
-    :return TrialLine: The block to log.
+    :return FactLine: The block to log.
     """
+    facts = [
+        f"trial {number}",
+        state,
+        None if value is None else f"{experiment.metric.name} {objective_text(value)}",
+        None if seconds is None else f"{seconds:.1f}s",
+        f"{finished}/{phase.n_trials}",
+    ]
     notes = [] if repeat is None else [f"repeat {repeat[0]}={param_text(repeat[1])}"]
     if rerun_of is not None:
         notes.append(f"rerun of {rerun_of}")
-    return TrialLine(
-        phase=phase.name,
-        label_width=phase_label_width(experiment),
-        number=number,
-        state=state,
-        objective=None if value is None else f"{experiment.metric.name} {objective_text(value)}",
-        duration=None if seconds is None else f"{seconds:.1f}s",
-        ordinal=f"{finished}/{phase.n_trials}",
-        params=tuple(f"{key}={param_text(item)}" for key, item in params.items()),
-        notes=tuple(notes),
+    style = _STATE_STYLES.get(state)
+    return FactLine(
+        phase.name,
+        phase_label_width(experiment),
+        head=tuple(fact for fact in facts if fact is not None),
+        tail=(*(f"{key}={param_text(item)}" for key, item in params.items()), *notes),
         reason=reason,
+        marked=None if style is None else (state, style),
     )
 
 
 def rerun_line(
     experiment: Experiment, phase: Phase, *, number: int, source: int, reason: str | None
-) -> RerunLine:
+) -> FactLine:
     """Build the line for a trial scheduled again.
 
     :param Experiment experiment: The experiment, for the label width.
@@ -430,9 +348,10 @@ def rerun_line(
     :param int number: Trial number of the rerun.
     :param int source: Trial number it repeats.
     :param str | None reason: First line of the source's recorded cause, if any.
-    :return RerunLine: The block to log.
+    :return FactLine: The block to log.
     """
-    return RerunLine(phase.name, phase_label_width(experiment), number, source, reason)
+    head = (f"trial {number}", f"RERUN of trial {source}")
+    return FactLine(phase.name, phase_label_width(experiment), head, (), reason)
 
 
 def skipped_line(experiment: Experiment, phase: Phase, why: str) -> SkippedLine:
@@ -446,16 +365,23 @@ def skipped_line(experiment: Experiment, phase: Phase, why: str) -> SkippedLine:
     return SkippedLine(phase.name, phase_label_width(experiment), why)
 
 
-def winner_line(experiment: Experiment, phase: Phase, winner: Winner) -> WinnerLine:
+def winner_line(experiment: Experiment, phase: Phase, winner: Winner) -> FactLine:
     """Build the line that closes a phase with its winner.
 
     :param Experiment experiment: The experiment, for the objective's name and the label width.
     :param Phase phase: The phase the winner belongs to.
     :param Winner winner: The selected winner.
-    :return WinnerLine: The block to log.
+    :return FactLine: The block to log.
     """
     head, tail = winner_facts(winner, experiment.metric.name)
-    return WinnerLine(phase.name, phase_label_width(experiment), tuple(head), tuple(tail))
+    return FactLine(
+        phase.name,
+        phase_label_width(experiment),
+        head=(f"winner: {head[0]}", *head[1:]),
+        tail=tuple(tail),
+        reason=None,
+        marked=("winner", "winner"),
+    )
 
 
 #: Width of the label column in the banner, after its two-column indent.
