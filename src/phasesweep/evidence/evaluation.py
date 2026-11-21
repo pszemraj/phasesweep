@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import stat
@@ -49,6 +50,8 @@ from phasesweep.runtime.time import utc_now_iso
 if TYPE_CHECKING:
     from phasesweep.runtime.json import JsonObject
     from phasesweep.tracking.records import MlflowCapture, MlflowQuery, MlflowTarget
+
+log = logging.getLogger(__name__)
 
 # Objective-evidence provenance schema version.
 EVIDENCE_PROVENANCE_SCHEMA_VERSION = 4
@@ -351,8 +354,9 @@ def _extract_log_regex(
 ) -> float:
     """Select a numeric regex match and digest the complete log file.
 
-    First selection stops matching after its first hit but continues reading for
-    the digest. Provenance includes the selected 1-based line and numeric match count.
+    First selection stops matching after its first numeric hit but continues reading for
+    the digest. Warn when a numeric result leaves unparseable captures behind.
+    Provenance includes the selected 1-based line and numeric match count.
 
     :param TrialContext ctx: Trial identity; the log is read from its ``trial_dir``.
     :param LogRegexExtractor cfg: Log path, named value group, and first/last/min/max selector.
@@ -377,7 +381,7 @@ def _extract_log_regex(
     result: float | None = None
     result_line: int | None = None
     count = 0
-    unparseable = False
+    first_unparseable: str | None = None
     line_no = 0
     try:
         with target.open("r", encoding="utf-8", errors="surrogateescape", newline="") as fh:
@@ -396,10 +400,15 @@ def _extract_log_regex(
                     line = line[:-1] + "\n"
                 line_no += 1
                 for match in pattern.finditer(line):
+                    captured = match.group("value")
                     try:
-                        v = float(match.group("value"))
+                        v = float(captured)
                     except (TypeError, ValueError):
-                        unparseable = True
+                        if first_unparseable is None:
+                            first_unparseable = (
+                                f"First unparseable capture {captured!r} on line {line_no}. "
+                                "Adjust the capture to exclude delimiters around the number."
+                            )
                         continue
                     count += 1
                     if cfg.select in ("first", "last"):
@@ -426,14 +435,20 @@ def _extract_log_regex(
     except OSError as exc:
         raise ExtractorError(f"Could not read log file at {target}: {exc}") from exc
 
-    if count == 0:
-        if unparseable:
+    if first_unparseable is not None:
+        if result is None:
             raise ExtractorError(
                 f"Pattern {cfg.pattern!r} matched in {target}, but no 'value' capture was "
-                "numeric. Adjust the capture to exclude delimiters around the number."
+                f"numeric. {first_unparseable}"
             )
+        log.warning(
+            "Pattern %r skipped nonnumeric 'value' captures in %s. %s",
+            cfg.pattern,
+            target,
+            first_unparseable,
+        )
+    if result is None:
         raise ExtractorError(f"No matches for {cfg.pattern!r} in {target}.")
-    assert result is not None  # count > 0 guarantees this
     if provenance is not None:
         provenance["source"] = {
             "kind": "file",

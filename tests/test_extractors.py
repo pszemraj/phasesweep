@@ -1618,25 +1618,29 @@ def test_extractor_config_rejects_unsafe_paths_and_keys() -> None:
     ("select", "line", "expected", "match_count"),
     [
         ("last", "loss=9 loss=1\n", 1.0, 2),
-        ("min", "loss=9 loss=1\n", 1.0, 2),
+        ("min", "loss=0.5, loss=bad loss=9 loss=1\n", 1.0, 2),
         ("max", "loss=1 loss=9\n", 9.0, 2),
-        ("first", "loss=bad loss=1\n", 1.0, 1),
+        ("first", "loss=0.5, loss=1\n", 1.0, 1),
     ],
 )
 def test_log_regex_considers_every_numeric_match_per_line(
-    tmp_path: Path, select: str, line: str, expected: float, match_count: int
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    select: str,
+    line: str,
+    expected: float,
+    match_count: int,
 ) -> None:
     """One log line can contribute multiple numeric candidates."""
     raw = line.encode("utf-8")
     (tmp_path / "stdout.log").write_bytes(raw)
-    cfg = LogRegexExtractor(
-        type="log_regex",
-        pattern=r"loss=(?P<value>[^\s]+)",
-        select=select,
-    )
+    cfg = LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[^\s]+)", select=select)
 
     provenance: dict = {}
     assert run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance) == expected
+    assert len(caplog.messages) == int(select in {"first", "min"})
+    if caplog.messages:
+        assert "capture '0.5,' on line 1" in caplog.messages[0]
     assert provenance["source"] == {
         "kind": "file",
         "path": "stdout.log",
@@ -1675,7 +1679,7 @@ def test_log_regex_min_max_fails_on_any_non_finite_match(
 
 @pytest.mark.parametrize(
     ("line", "message"),
-    [("nothing here", "No matches"), ("eval_loss=0.5,", "no 'value' capture was numeric")],
+    [("nothing here", "No matches"), ("eval_loss=0.5,", r"was numeric\..*'0\.5,' on line 1")],
 )
 def test_log_regex_reports_no_matches(tmp_path: Path, line: str, message: str) -> None:
     (tmp_path / "stdout.log").write_text(line, encoding="utf-8")
