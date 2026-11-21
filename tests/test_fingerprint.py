@@ -837,11 +837,12 @@ def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path)
     ) as refused:
         run_experiment(topped_up)
 
-    # The one rename step comes first, naming the dependent, then the new experiment name.
+    # The one rename step comes first, naming only the dependent, then the new experiment name.
     assert refused.value.remediation == (
-        "To run the larger budget, give the phase, and each phase that inherits it (`lr`), a new "
-        "`name`, updating every `inherits` to match; each renamed phase starts a new study and "
-        f"runs again, and every other phase keeps its results. To rerun every phase, {FRESH_STUDY}."
+        "To run the larger budget, give each phase that inherits it (`lr`) a new `name`, "
+        "updating every `inherits` to match; each renamed phase starts a new study and runs "
+        f"again, while `arch` keeps its finished trials and runs the rest. To rerun every phase, "
+        f"{FRESH_STUDY}."
     )
 
     parent_after = optuna.load_study(study_name="t::arch", storage=_resolve_storage(storage)).trials

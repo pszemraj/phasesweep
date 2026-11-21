@@ -667,12 +667,12 @@ def test_raised_upstream_target_over_a_bound_descendant_is_refused_as_a_run_refu
         r"1 top-up trial remaining, but 2 dependent phases \(`b`, `c`\) are already bound",
     )
 
-    # The one rename step comes first, naming the dependents, then the new experiment name.
+    # The one rename step comes first, naming only the dependents, then the new experiment name.
     assert isinstance(refusal, StudyContextConflictError)
     assert refusal.remediation == (
-        "To run the larger budget, give the phase, and each phase that inherits it (`b`, `c`), a "
-        "new `name`, updating every `inherits` to match; each renamed phase starts a new study "
-        "and runs again, and every other phase keeps its results. To rerun every phase, "
+        "To run the larger budget, give each phase that inherits it (`b`, `c`) a new `name`, "
+        "updating every `inherits` to match; each renamed phase starts a new study and runs "
+        "again, while `a` keeps its finished trials and runs the rest. To rerun every phase, "
         f"{FRESH_STUDY}."
     )
 

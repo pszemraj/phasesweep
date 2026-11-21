@@ -133,6 +133,25 @@ def rename_phase_step(dependents: Sequence[str] | None) -> str:
     )
 
 
+def rename_dependents_step(phase_name: str, dependents: Sequence[str]) -> str:
+    """Say how to run a larger budget for a phase whose dependents are bound to its winner.
+
+    The target is no part of a phase's study identity, so the enlarged phase keeps its finished
+    trials and runs the rest. The studies of the phases that inherit it hold trials bound to its
+    old winner, and a new name gives each of them a new study that binds to the new one.
+
+    :param str phase_name: The phase whose ``n_trials`` was raised.
+    :param Sequence[str] dependents: The phases that inherit it, from
+        :meth:`~phasesweep.config.models.Experiment.phases_inheriting`.
+    :return str: A clause that gives each dependent a new ``name`` and says what the rename costs.
+    """
+    return (
+        f"give each phase that inherits it ({phase_names(dependents)}) a new `name`, updating "
+        "every `inherits` to match; each renamed phase starts a new study and runs again, while "
+        f"`{phase_name}` keeps its finished trials and runs the rest"
+    )
+
+
 def timeout_step(phase_name: str, dependents: Sequence[str]) -> str:
     """Say how to give a phase whose trials timed out a longer per-trial timeout.
 

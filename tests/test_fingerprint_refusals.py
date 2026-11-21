@@ -11,14 +11,18 @@ import pytest
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import _operational_error_text
-from phasesweep.config.models import ExecutionContext, Experiment
+from phasesweep.config.models import ExecutionContext, Experiment, Phase
 from phasesweep.config.reference import lookup
-from phasesweep.config.search import IntParam
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.artifact_roots import (
     _check_artifact_root_binding,
     _check_study_artifact_root,
 )
-from phasesweep.engine.errors import ArtifactRootConflictError, StudyFingerprintMismatchError
+from phasesweep.engine.errors import (
+    ArtifactRootConflictError,
+    StudyContextConflictError,
+    StudyFingerprintMismatchError,
+)
 from phasesweep.engine.fingerprints import (
     _phase_fingerprint,
     _phase_fingerprint_payload,
@@ -33,8 +37,13 @@ from phasesweep.engine.state import (
     PHASE_FINGERPRINT_ATTR,
     PHASE_FINGERPRINT_PAYLOAD_ATTR,
 )
-from phasesweep.errors import NEW_STUDY_STEP, OperatorAction, rename_phase_step
-from tests.conftest import make_experiment
+from phasesweep.errors import (
+    NEW_STUDY_STEP,
+    OperatorAction,
+    rename_dependents_step,
+    rename_phase_step,
+)
+from tests.conftest import make_experiment, phase_trials, write_constant_trainer
 from tests.experiments import (
     anchored_phase,
     phase_payload,
@@ -389,6 +398,58 @@ def test_the_rename_step_is_worded_once_and_names_the_dependents_it_is_given() -
     )
     (timeout,) = lookup("phases[].timeout_seconds_per_trial")
     assert unknown in " ".join(timeout.comments)
+
+
+def test_the_dependents_step_is_worded_once_and_keeps_the_enlarged_phase() -> None:
+    """The step for a raised target names only the dependents and says the enlarged phase keeps its trials."""
+    assert rename_dependents_step("a", ("b", "c")) == (
+        "give each phase that inherits it (`b`, `c`) a new `name`, updating every `inherits` "
+        "to match; each renamed phase starts a new study and runs again, while `a` keeps its "
+        "finished trials and runs the rest"
+    )
+
+
+@pytest.mark.integration
+def test_a_raised_target_is_run_by_renaming_only_the_phases_that_inherit_it(
+    tmp_path: Path,
+) -> None:
+    """Following the refusal's step as printed keeps the enlarged phase's finished trials and reruns its dependents."""
+    trainer = write_constant_trainer(tmp_path)
+
+    def chain(*, a_trials: int, suffix: str) -> Experiment:
+        def phase(name: str, trials: int, parent: str | None = None) -> Phase:
+            return Phase(
+                name=name,
+                n_trials=trials,
+                inherits=[] if parent is None else [parent],
+                sampler=Sampler(type="random", seed=0),
+                gpu_policy="none",
+                search_space={name[0]: IntParam(type="int", low=0, high=9)},
+            )
+
+        phases = [
+            phase("a", a_trials),
+            phase(f"b{suffix}", 2, "a"),
+            phase(f"c{suffix}", 2, f"b{suffix}"),
+        ]
+        return make_experiment(persistent=tmp_path, trainer=trainer, phases=phases)
+
+    run_experiment(chain(a_trials=2, suffix=""))
+    with pytest.raises(StudyContextConflictError) as refused:
+        run_experiment(chain(a_trials=3, suffix=""))
+    assert refused.value.remediation is not None
+    assert refused.value.remediation.startswith(
+        "To run the larger budget, give each phase that inherits it (`b`, `c`) a new `name`, "
+        "updating every `inherits` to match; each renamed phase starts a new study and runs "
+        "again, while `a` keeps its finished trials and runs the rest. "
+    )
+
+    renamed = chain(a_trials=3, suffix="2")
+    run_experiment(renamed)
+
+    assert [t.state.name for t in phase_trials(renamed, "a")] == ["COMPLETE"] * 3
+    assert [t.number for t in phase_trials(renamed, "a")][:2] == [0, 1]
+    assert len(phase_trials(renamed, "b2")) == len(phase_trials(renamed, "c2")) == 2
 
 
 def test_long_values_are_windowed_around_their_first_difference() -> None:

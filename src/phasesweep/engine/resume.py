@@ -18,7 +18,7 @@ from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
-from phasesweep.errors import FRESH_STUDY, phase_names, rename_phase_step
+from phasesweep.errors import FRESH_STUDY, phase_names, rename_dependents_step
 from phasesweep.runtime.terminal import plural
 
 
@@ -195,16 +195,14 @@ def _reject_bound_descendant_topups(
             and dependent.get_trials(deepcopy=False)
         ]
         if bound:
+            rename = rename_dependents_step(phase.name, experiment.phases_inheriting(phase.name))
             raise StudyContextConflictError(
                 f"Phase {phase.name!r} has {plural(phase.n_trials - finished, 'top-up trial')} "
                 f"remaining, but {plural(len(bound), 'dependent phase')} ({phase_names(bound)}) "
                 f"{'is' if len(bound) == 1 else 'are'} already bound to its published winner "
                 "via inheritance.",
                 remediation=(
-                    "To run the larger budget, "
-                    f"{rename_phase_step(experiment.phases_inheriting(phase.name))}; each "
-                    "renamed phase starts a new study and runs again, and every other phase "
-                    f"keeps its results. To rerun every phase, {FRESH_STUDY}."
+                    f"To run the larger budget, {rename}. To rerun every phase, {FRESH_STUDY}."
                 ),
             )
 
