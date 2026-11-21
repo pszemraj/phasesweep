@@ -44,6 +44,7 @@ from tests.conftest import (
     write_flaky_trainer,
 )
 from tests.experiments import write_experiment
+from tests.ledger_fixtures import published_survivorship
 from tests.recovery_helpers import fabricate_stale_trial
 
 _FRESH_THREE = "Phase 'p': n_trials=3 with an empty search_space would run 3 identical trials."
@@ -162,6 +163,11 @@ def test_fixed_configuration_retry_counts_every_failed_attempt(tmp_path: Path) -
 
     assert run_experiment(_fixed(tmp_path, trainer, 3))["p"].metric == 1.0
     assert _call_count(calls) == 3
+    # The retry measured the one configuration, so its failed attempts hid nothing from ranking.
+    assert published_survivorship(_fixed(tmp_path, trainer, 3)) == {
+        "verdict": "ok",
+        "detail": {"ranked": 1, "infeasible": 0, "incomplete_group": 0, "failed": 0},
+    }
 
 
 def _assert_advises_next_target(message: str, from_target: int) -> None:

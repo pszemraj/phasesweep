@@ -39,7 +39,7 @@ from tests.conftest import (
     write_trainer,
 )
 from tests.experiments import write_experiment
-from tests.ledger_fixtures import published_generation_id, winner_payload
+from tests.ledger_fixtures import published_survivorship
 
 
 def _grid(
@@ -245,7 +245,7 @@ def test_failed_grid_names_the_target_that_retries_every_failed_cell(
     ]
     assert len(calls.read_text().splitlines()) == 4
     # Every cell succeeded after its retry, so survivorship lost nothing.
-    assert _published_survivorship(recovered) == {
+    assert published_survivorship(recovered) == {
         "verdict": "ok",
         "detail": {"ranked": 2, "infeasible": 0, "incomplete_group": 0, "failed": 0},
     }
@@ -680,19 +680,6 @@ def test_grid_winner_with_a_successful_trial_in_every_cell_stays_quiet(
     assert _coverage_warnings(caplog) == []
 
 
-def _published_survivorship(experiment: Experiment) -> dict[str, object]:
-    """Read the survivorship check that phase ``p``'s published winner.yaml records."""
-    generation_id = published_generation_id(experiment)
-    assert generation_id is not None
-    confound = winner_payload(experiment, generation_id)["confound"]
-    assert isinstance(confound, dict)
-    checks = confound["checks"]
-    assert isinstance(checks, dict)
-    survivorship = checks["survivorship"]
-    assert isinstance(survivorship, dict)
-    return survivorship
-
-
 @pytest.mark.parametrize(
     ("failures", "target", "failed"),
     [
@@ -717,7 +704,7 @@ def test_survivorship_still_counts_the_failures_of_a_cell_that_never_succeeded(
     }
     assert len(succeeded) == 1
 
-    assert _published_survivorship(raised) == {
+    assert published_survivorship(raised) == {
         "verdict": "heterogeneous",
         "detail": {"ranked": 1, "infeasible": 0, "incomplete_group": 0, "failed": failed},
     }

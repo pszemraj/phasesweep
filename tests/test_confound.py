@@ -567,8 +567,25 @@ def test_survivorship_counts_feasible_trials_in_incomplete_groups() -> None:
     assert _validate_confound_block(block, winner_trial=1) == block
 
 
+def test_survivorship_leaves_out_the_failed_attempts_of_a_fixed_configuration_once_measured() -> (
+    None
+):
+    """A fixed configuration samples no params, and its retry carries no link to the failure."""
+    study = optuna.create_study()
+    for state in (_FAIL, _FAIL, _COMPLETE):
+        study.add_trial(
+            optuna.trial.create_trial(state=state, value=None if state == _FAIL else 0.5)
+        )
+    trials = study.get_trials(deepcopy=False)
+
+    assert _assess(trials, trials[2:])["checks"]["survivorship"] == {
+        "verdict": "ok",
+        "detail": {"ranked": 1, "infeasible": 0, "incomplete_group": 0, "failed": 0},
+    }
+
+
 def test_survivorship_discounts_a_failure_only_when_its_retry_chain_completed() -> None:
-    """A failed attempt is replaced when a retry of it, or of a retry of it, completed."""
+    """A failed attempt is left out when a retry of it, or of a retry of it, completed."""
     study = optuna.create_study()
     # (state, x, rerun_of): cell 1 fails, its retry fails, and the next retry completes; cell 2
     # fails and its retry fails; cell 3 fails and nothing retries it.

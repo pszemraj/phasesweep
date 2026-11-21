@@ -16,7 +16,7 @@ from typing import Any, Literal, get_args
 import optuna
 
 from phasesweep.engine.repeats import RankedGroup, within_noise
-from phasesweep.engine.state import RERUN_OF_ATTR, _trial_interrupted
+from phasesweep.engine.state import _trial_interrupted
 from phasesweep.evidence.models import POSITIONED_EXTRACTOR_KINDS
 from phasesweep.runtime.json import progress_position
 
@@ -148,9 +148,9 @@ def _survivorship(
 
     Failures include evidence-gate and extraction errors. Infeasible trials and
     feasible members of incomplete repeat groups are counted separately and do not
-    flag; interrupted trials are excluded, and so is a failed attempt that a
-    COMPLETE or INFEASIBLE retry replaced (:func:`_replaced_by_measured_retry`), since
-    its cell has a measured trial. Counts are recorded for every verdict.
+    flag; interrupted trials are excluded, and so is a failed attempt whose configuration
+    a COMPLETE or INFEASIBLE trial measured
+    (:func:`_failures_of_measured_configurations`). Counts are recorded for every verdict.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the study.
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials.
@@ -158,7 +158,7 @@ def _survivorship(
     :return dict[str, Any]: The check record.
     """
     ranked_numbers = {trial.number for trial in ranked}
-    replaced = _replaced_by_measured_retry(trials)
+    replaced = _failures_of_measured_configurations(trials)
     counts = dict.fromkeys(_SURVIVORSHIP_COUNTS, 0)
     counts["ranked"] = len(ranked_numbers)
     for trial in trials:
@@ -173,27 +173,25 @@ def _survivorship(
     return _checked("survivorship", counts)
 
 
-def _replaced_by_measured_retry(trials: Sequence[optuna.trial.FrozenTrial]) -> set[int]:
-    """Return the numbers of attempts that a COMPLETE retry replaced, however many retries ago.
+def _failures_of_measured_configurations(trials: Sequence[optuna.trial.FrozenTrial]) -> set[int]:
+    """Return the numbers of failed attempts whose configuration a COMPLETE trial measured.
 
-    A retry names the attempt it reran under :data:`~phasesweep.engine.state.RERUN_OF_ATTR`
-    and runs that attempt's configuration, repeat value included, so the links trace a
-    cell's attempts. Every attempt on the chain behind a COMPLETE trial is replaced; a chain
-    that ends in a failure replaces none, and the failures in it stay counted.
+    A retry runs its failed attempt's params unchanged, repeat value included, whether it is
+    a rerun of a grid cell or another attempt at a fixed configuration, which samples no
+    params at all. Equal params are therefore what ties a failure to the trial that measured
+    its configuration, the same test :func:`_tie` uses for one configuration. A
+    configuration that only ever failed keeps every failure counted.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the study.
-    :return set[int]: Trial numbers of the replaced attempts.
+    :return set[int]: Trial numbers of the failed attempts a measured trial stands in for.
     """
-    by_number = {trial.number: trial for trial in trials}
-    replaced: set[int] = set()
-    for trial in trials:
-        if trial.state != optuna.trial.TrialState.COMPLETE:
-            continue
-        source = trial.user_attrs.get(RERUN_OF_ATTR)
-        while source in by_number and source not in replaced:
-            replaced.add(source)
-            source = by_number[source].user_attrs.get(RERUN_OF_ATTR)
-    return replaced
+    measured = [trial.params for trial in trials if trial.state == optuna.trial.TrialState.COMPLETE]
+    return {
+        trial.number
+        for trial in trials
+        if trial.state == optuna.trial.TrialState.FAIL
+        and any(trial.params == params for params in measured)
+    }
 
 
 def _tie(
