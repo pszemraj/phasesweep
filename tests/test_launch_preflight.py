@@ -224,7 +224,7 @@ def test_fresh_tree_refuses_a_missing_program_before_creating_anything(tmp_path:
 
     assert type(caught.value) is LaunchEnvironmentError
     assert caught.value.action is OperatorAction.FIX_CONFIG
-    assert "none was allocated" in str(caught.value)
+    assert "Starting new trials requires this program" in str(caught.value)
     assert not _artifact_root_binding_path(experiment).exists()
     assert not (tmp_path / "studies.journal").exists()
 
@@ -423,6 +423,7 @@ def test_validate_refuses_a_program_written_with_a_slash_that_is_not_executable(
     assert isinstance(result.exception, PhaseSweepError)
     assert repr(program) in str(result.exception)
     assert "which is not an executable file" in str(result.exception)
+    assert "Starting new trials requires this program" in str(result.exception)
 
     _executable(tmp_path / "train.sh")
     result = CliRunner().invoke(cli_main, ["validate", str(config)])

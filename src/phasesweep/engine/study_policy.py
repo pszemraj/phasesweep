@@ -60,6 +60,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import EnvironmentIdentity, _environment_identity, _missing_trainer_cwd
 from phasesweep.errors import (
+    FRESH_STUDY,
     NEW_STUDY_STEP,
     OTHER_FORMAT_STEP,
     RERUN_CLEANUP_RECOVERY,
@@ -823,7 +824,8 @@ def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, obje
         return None
     return (
         f"{remedies} {results_stay} {fingerprint_kept} "
-        f"To discard invalid recorded results: {NEW_STUDY_STEP}"
+        f"If the fix changes trial_command or the trainer's PATH, or the recorded results "
+        f"are invalid, {FRESH_STUDY}."
     )
 
 
@@ -1304,7 +1306,7 @@ def _require_launch_target(experiment: Experiment, *, path: str | None = None) -
     if refusal is not None:
         message, remediation = refusal
         raise LaunchEnvironmentError(
-            f"{message} Every trial would fail before its trainer started, so none was allocated.",
+            f"{message} Starting new trials requires this program.",
             remediation=remediation,
         )
 
