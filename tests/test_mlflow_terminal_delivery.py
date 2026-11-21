@@ -191,7 +191,7 @@ def _add_bound_attempt(
 
 def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path, monkeypatch):
     """The Optuna outcome, never a missing record, decides what an unrecorded attempt reports."""
-    experiment = native_experiment(tmp_path)
+    experiment = native_experiment(tmp_path, storage=f"journal:///{tmp_path}/study.journal")
     generation = "a" * 32
     write_record(
         tracking_root(experiment) / generation / "generation-binding.json",
@@ -250,14 +250,19 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
     assert "phasesweep.outcome" not in accepted["tags"]
 
 
-def test_failed_invocation_leaves_a_pending_trials_managed_run_open(tmp_path, monkeypatch):
-    """A failed run never ends the run of a trial whose completed training awaits recovery.
+@pytest.mark.parametrize("storage", ["journal", "memory"])
+def test_failed_invocation_leaves_a_pending_trials_managed_run_open_only_when_persistent(
+    tmp_path, monkeypatch, storage
+):
+    """A failed run ends the run of a RUNNING trial only when no later recovery can settle it.
 
-    Ending it FAILED would read as a verdict when recovery captures the run, discarding
-    the training; left open, recovery's accepted result reaches it instead.
+    With persistent storage, ending it FAILED would read as a verdict when recovery captures
+    the run, discarding the training; left open, recovery's accepted result reaches it instead.
+    An in-memory trial is gone when the process exits, so its run ends with the invocation.
     """
     config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
-    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    if storage == "journal":
+        config["storage"] = f"journal:///{tmp_path}/study.journal"
     experiment = Experiment.model_validate(config)
     phase = experiment.phases[0]
     generation = "a" * 32
@@ -289,8 +294,15 @@ def test_failed_invocation_leaves_a_pending_trials_managed_run_open(tmp_path, mo
     requests = []
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
     publication.publish_failed_generation(experiment, generation, RuntimeError("outage"), ledger)
-    assert [(r["binding"]["attempt_id"], r["finish"]) for r in requests] == [(generation, "FAILED")]
     delivery = tracking_root(experiment) / generation / "delivery"
+    if storage == "memory":
+        assert [(r["binding"]["attempt_id"], r["finish"]) for r in requests] == [
+            (attempt, "FAILED"),
+            (generation, "FAILED"),
+        ]
+        assert read_record(delivery / f"attempt-{attempt}.json")["state"] == "delivered"
+        return
+    assert [(r["binding"]["attempt_id"], r["finish"]) for r in requests] == [(generation, "FAILED")]
     assert not (delivery / f"attempt-{attempt}.json").exists()
     # Recovery later accepts the completed training.
     (pending,) = study.get_trials()

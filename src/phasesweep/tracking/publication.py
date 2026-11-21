@@ -340,17 +340,18 @@ def _save_attempt_intents(
 
     COMPLETE trials receive accepted projections. Unaccepted managed runs finish
     only after cleanup is confirmed by the trial, live controller, or owning
-    study's recovery ledger. Unreadable trials, uncertain cleanup and RUNNING trials,
-    whose outcome recovery has yet to record, remain unresolved.
+    study's recovery ledger. Unreadable trials and uncertain cleanup remain unresolved, as
+    do RUNNING trials of a persistent study, whose outcome recovery has yet to record.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
     :param list[tuple[Path, RunBinding]] attempts: From :func:`_unrecorded_attempts`.
     :param Mapping[str, _AttemptTrial] trials: Ledger trials by attempt id, each with
         its controller's cleanup confirmation or its study's recovery.
-    :param str | None ended: Status for every terminal unaccepted managed run once the
-        invocation that owned it ended with confirmed cleanup, or ``None`` to
-        finish only trials Optuna failed with confirmed cleanup.
+    :param str | None ended: Status for every unaccepted managed run, terminal or, without
+        persistent storage, still RUNNING, once the invocation that owned it ended with
+        confirmed cleanup, or ``None`` to finish only trials Optuna failed with confirmed
+        cleanup.
     :return list[Path]: The records saved, in attempt order.
     """
     from optuna.trial import TrialState
@@ -376,9 +377,10 @@ def _save_attempt_intents(
         )
         if settled and _trial_interrupted(trial):
             status = "KILLED"
-        elif ended is not None and trial.state.is_finished():
-            # A RUNNING trial has no retained outcome yet: recovery may still accept its
-            # completed training, so its run stays open rather than reading as a verdict.
+        elif ended is not None and (trial.state.is_finished() or not experiment.persistent):
+            # A persistent study's RUNNING trial has no retained outcome yet: recovery may still
+            # accept its completed training, so its run stays open rather than reading as a
+            # verdict. An in-memory study is gone with the invocation, so nothing can settle it.
             status = ended
         elif settled:
             status = "FAILED"
@@ -564,8 +566,9 @@ def publish_failed_generation(
 ) -> None:
     """Finish a failed invocation's owned runs after confirmed cleanup.
 
-    Accepted trials keep accepted projections; other managed attempts finish with
-    the invocation's status. Committed generations remain untouched.
+    Accepted trials keep accepted projections; other finished managed attempts, and without
+    persistent storage RUNNING ones too, finish with the invocation's status. Committed
+    generations remain untouched.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Failed invocation identity.

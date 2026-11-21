@@ -89,12 +89,12 @@ def attempt_identity(generation_id="a" * 32, attempt_id="b" * 32):
     return {k: v for k, v in binding.items() if k != "run_id"}
 
 
-def native_experiment(tmp_path):
-    """Build the complete native example in an isolated artifact namespace."""
+def native_experiment(tmp_path, *, storage=None):
+    """Build the complete native example in an isolated artifact namespace, in memory unless ``storage`` names a ledger."""
     config = yaml.safe_load(
         (Path(__file__).parents[1] / "src/phasesweep/templates/mlflow.yaml").read_text()
     )
-    config.update(workdir=str(tmp_path), storage=None)
+    config.update(workdir=str(tmp_path), storage=storage)
     return Experiment.model_validate(config)
 
 
