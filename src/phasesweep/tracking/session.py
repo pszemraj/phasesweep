@@ -68,9 +68,10 @@ NO_ANSWER: tuple[type[Exception], ...] = (
     OperationUnavailableError,
     OperationOutcomeUnknownError,
 )
-# The step that sends what a run left pending, as every line a run logs names it. A run's lines
-# cannot quote the command line it was started with, so they name CONFIG and say what it is.
-SYNC_TRACKING_STEP = "`phasesweep sync-tracking CONFIG` with this run's config file as CONFIG"
+# The step that sends what a run left pending, as every line a run logs names it. These lines
+# also reach run.log and an MCP runner's log, where no command follows them, so they say in words
+# what the command needs; the CLI prints the command as typed after a run that leaves work pending.
+SYNC_TRACKING_STEP = "`phasesweep sync-tracking` with this run's config file and `--set` overrides"
 
 
 @dataclass

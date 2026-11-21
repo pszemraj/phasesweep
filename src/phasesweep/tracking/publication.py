@@ -799,7 +799,7 @@ def _ended_status(
             action=OperatorAction.RESTORE_TREE,
             remediation=(
                 "Restore the generation record, then run phasesweep sync-tracking with "
-                "the same config."
+                "the same config and --set overrides."
             ),
         )
         if unresolved is None:

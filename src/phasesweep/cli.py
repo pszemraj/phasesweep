@@ -703,6 +703,8 @@ def run(
                     ),
                     err=True,
                 )
+            if not dry_run:
+                _echo_sync_step(config, config_path, settings)
             raise
         if not dry_run and finished:
             _print_block(
@@ -716,6 +718,7 @@ def run(
                     from_phase=from_phase,
                 )
             )
+            _echo_sync_step(config, config_path, settings)
 
 
 def _print_block(block: Banner | Summary | NothingToRun | LogLine) -> None:
@@ -780,6 +783,32 @@ def _closing_block(
         written=written,
         next_command=next_command,
     )
+
+
+def _echo_sync_step(config: Experiment, config_path: Path, settings: tuple[str, ...]) -> None:
+    """Print the ``sync-tracking`` command as typed when a run leaves MLflow work pending.
+
+    The engine's closing warning says in words what that command needs, as it also goes to
+    ``run.log``; this line gives the command itself, whole so it pastes. Nothing is printed when
+    nothing is pending or the count fails, which the engine's closing lines already report.
+
+    :param Experiment config: The config the run was started with.
+    :param Path config_path: The config path as typed.
+    :param tuple[str, ...] settings: The ``--set`` assignments as typed.
+    """
+    if config.mlflow is None:
+        return
+    from phasesweep.tracking.publication import delivery_status
+
+    try:
+        pending = delivery_status(config)["pending"]
+    except (OSError, ValueError):
+        return
+    if pending:
+        command = shlex.join(
+            ["phasesweep", "sync-tracking", *_config_arguments(config_path, settings)]
+        )
+        click.echo(f"MLflow: to send what is pending without training, run:\n{command}", err=True)
 
 
 def _config_arguments(config_path: Path, settings: tuple[str, ...]) -> list[str]:

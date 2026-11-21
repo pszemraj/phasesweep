@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 import signal
 import threading
 import time
@@ -50,8 +51,8 @@ from tests.tracking_helpers import (
 )
 
 _PENDING_STEP = (
-    "results are saved locally. The next run or `phasesweep sync-tracking CONFIG` with this "
-    "run's config file as CONFIG sends them."
+    "results are saved locally. The next run or `phasesweep sync-tracking` with this run's "
+    "config file and `--set` overrides sends them."
 )
 _REFUSAL = (
     "a refused record stays pending until the cause given in its warning is fixed in MLflow, for "
@@ -810,8 +811,8 @@ def test_sync_tracking_names_what_keeps_its_records_pending(
     A tracker that gives no answer is named with its tracking URI, and the step is a retry. A
     record MLflow refuses, as for a run deleted in MLflow, is named in its warning, printed on
     the console under a ``warning:`` label, and the step is to fix that cause in MLflow, since
-    a retry alone meets the same refusal. Either step ends with the command as typed, on a line
-    of its own.
+    a retry alone meets the same refusal. Either step ends with the command as typed, its
+    ``--set`` and ``--generation`` flags included, on a line of its own.
     """
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
     experiment = sweep.experiment
@@ -830,16 +831,12 @@ def test_sync_tracking_names_what_keeps_its_records_pending(
     monkeypatch.setattr(worker, "request_operation", failing)
     config = write_experiment_config(Path.cwd() / "experiment.yaml", experiment)
     capsys.readouterr()
+    arguments = [str(config), "--set", "phases.0.n_trials=2", "--generation", sweep.generation]
 
-    assert (
-        invoke_cli_boundary(
-            ["sync-tracking", str(config), "--set", "phases.0.n_trials=2"], monkeypatch
-        )
-        == 1
-    )
+    assert invoke_cli_boundary(["sync-tracking", *arguments], monkeypatch) == 1
 
     error = capsys.readouterr().err
-    command = f"phasesweep sync-tracking {config} --set phases.0.n_trials=2\n"
+    command = shlex.join(["phasesweep", "sync-tracking", *arguments]) + "\n"
     if failure == "no-answer":
         assert error.endswith(
             "phasesweep: MLflow delivery remains pending: MLflow tracking target "
@@ -861,6 +858,61 @@ def test_sync_tracking_names_what_keeps_its_records_pending(
         [warning] = [line for line in error.splitlines() if "MLflow: attempt record" in line]
         assert re.fullmatch(r"\d\d:\d\d:\d\d  warning: MLflow: attempt record\b.*", warning)
         assert sweep.summaries() == ["KILLED"]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("ending", ["finished", "stopped"])
+def test_a_run_started_with_overrides_prints_the_sync_command_that_sends_what_it_left(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    ending: str,
+) -> None:
+    """A run that leaves MLflow work pending prints the sync-tracking command as typed, and it delivers.
+
+    Whether the run finishes with its uploads unanswered or a shutdown stops it, the last lines
+    before the log path give the command with the run's ``--set`` overrides, whole on a line of
+    its own; the closing warning says in words what that command needs. Run as printed, the
+    command finds the study the overrides named and sends everything.
+    """
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config["storage"] = "auto"
+    path = write_experiment_config(
+        Path.cwd() / "experiment.yaml", Experiment.model_validate(config)
+    )
+    respond = session.request_operation
+    stopped: list[int] = []
+
+    def unsent(request: dict[str, object], **kwargs: object) -> JsonObject:
+        if request["action"] != "publish":
+            return respond(request, **kwargs)
+        if ending == "finished":
+            raise OperationUnavailableError("tracking server unreachable")
+        if stopped:
+            raise ShutdownLaunchRefusedError(stopped[0])
+        stopped.append(signal.SIGINT)
+        raise PhaseSweepShutdown(signal.SIGINT, ShutdownCleanupReport(signal.SIGINT, True, ()))
+
+    capsys.readouterr()
+    with monkeypatch.context() as patch:
+        patch.setattr(session, "request_operation", unsent)
+        patch.setattr(worker, "request_operation", unsent)
+        status = invoke_cli_boundary(["run", str(path), "--set", "experiment=tuned"], monkeypatch)
+
+    assert status == (0 if ending == "finished" else 130)
+    lines = capsys.readouterr().err.splitlines()
+    printed = shlex.join(["phasesweep", "sync-tracking", str(path), "--set", "experiment=tuned"])
+    step = lines.index("MLflow: to send what is pending without training, run:")
+    # Only the log path, which may break after its slashes, follows the command.
+    assert (lines[step + 1], lines[step + 2][:5]) == (printed, "log: ")
+    assert lines.count(printed) == 1
+    # The closing warning wraps to the terminal.
+    assert _PENDING_STEP in " ".join(" ".join(lines).split())
+    assert uploads == []
+
+    assert invoke_cli_boundary(shlex.split(printed)[1:], monkeypatch) == 0
+    assert capsys.readouterr().out.splitlines()[0] == "pending: 0"
+    assert uploads and all(request["action"] == "publish" for request in uploads)
 
 
 @pytest.mark.integration

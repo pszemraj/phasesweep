@@ -43,7 +43,7 @@ from tests.tracking_helpers import (
 
 _RUN_ID = "mcp-recovered-run"
 _SENDING_RUN_ID = "mcp-sending-run"
-_PENDING_STEP = "`phasesweep sync-tracking CONFIG`"
+_PENDING_STEP = "`phasesweep sync-tracking"
 
 
 class _RecoveredRun:
@@ -399,7 +399,7 @@ def test_recover_run_and_mcp_status_say_what_keeps_a_refused_record_pending(
     assert read_record(run.record)["state"] == "pending"
     assert (
         "MLflow: delivered 1 record. MLflow: 1 record pending. The next launch with this config, "
-        "or `phasesweep sync-tracking CONFIG` with this run's config file as CONFIG, sends "
+        "or `phasesweep sync-tracking` with this run's config file and `--set` overrides, sends "
         "them; delivery never retrains. MLflow refused 1 record; a refused record stays pending "
         "until the cause given in its warning is fixed in MLflow, for example by restoring a "
         "deleted run or its experiment." in confirmed.output.splitlines()
