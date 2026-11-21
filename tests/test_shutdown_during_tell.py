@@ -90,6 +90,7 @@ def _assert_completed_with_one_start_each(experiment: Experiment, starts: Path) 
     assert sorted(name.split("__")[0] for name in names) == ["trial_00000", "trial_00001"]
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("when", ["before", "after"], ids=["before-tell", "after-tell"])
 def test_run_experiment_raises_the_shutdown_optuna_raised_over(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, when: str
