@@ -1918,9 +1918,9 @@ def test_sync_tracking_without_an_mlflow_block_uses_the_standard_error_format(
     assert status == 1
     error = capsys.readouterr().err
     assert error == (
-        "phasesweep: sync-tracking needs an `mlflow` block, and this config has none. Use the "
-        "config the sweep ran with, or see `phasesweep explain mlflow`.\n"
-        "fix: correct the experiment configuration or the environment it runs in.\n"
+        "phasesweep: sync-tracking needs an `mlflow` block, and this config has none.\n"
+        "fix: Pass the config the sweep ran with, which has its `mlflow` block; "
+        "`phasesweep explain mlflow` describes the block.\n"
     )
 
 
@@ -1930,7 +1930,7 @@ def test_sync_tracking_with_uploads_still_pending_uses_the_standard_error_format
     """Counts print first, then the failure is a `phasesweep:` line with a retry step."""
     monkeypatch.setattr(
         "phasesweep.tracking.publication.sync_tracking",
-        lambda *_args: {"pending": 2, "delivered": 1},
+        lambda *_args, **_kwargs: {"pending": 2, "delivered": 1},
     )
     config = materialize("current-journal", tmp_path, mode="tree").config_path
 

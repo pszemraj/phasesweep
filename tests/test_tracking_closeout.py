@@ -29,10 +29,11 @@ from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
 from phasesweep.tracking.mlflow import OperationRejectedError, OperationUnavailableError
 from phasesweep.tracking.session import read_record, tracking_root
+from tests.conftest import invoke_cli_boundary, write_experiment_config
 from tests.tracking_helpers import RunnerKilled, remote_mlflow_example
 
 _PENDING_STEP = (
-    "results are saved locally. The next run or `phasesweep sync-tracking CONFIG` delivers them."
+    "results are saved locally. The next run or `phasesweep sync-tracking CONFIG` sends them."
 )
 
 
@@ -51,7 +52,8 @@ def test_pending_mlflow_uploads_get_final_closeout_without_failing_publication(
     """The final warning names pending delivery while the committed result remains successful.
 
     Each trial's upload fails as it ends, whether MLflow rejects it or gives no answer, and
-    neither failure reaches the trial or the run.
+    neither failure reaches the trial or the run. Records MLflow refused at closeout are counted
+    in the final warning, which says what keeps them pending.
     """
     config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
     experiment = Experiment.model_validate(config)
@@ -76,7 +78,14 @@ def test_pending_mlflow_uploads_get_final_closeout_without_failing_publication(
     final = records[-1]
     assert final.levelno == logging.WARNING
     message = final.getMessage()
-    assert message == f"MLflow: 7 upload(s) pending; {_PENDING_STEP}"
+    refused = (
+        " MLflow refused 7 of them; a refused record stays pending until the cause its warning "
+        "gives is fixed in MLflow."
+        if isinstance(failure, OperationRejectedError)
+        and not isinstance(failure, OperationUnavailableError)
+        else ""
+    )
+    assert message == f"MLflow: 7 record(s) pending; {_PENDING_STEP}{refused}"
     assert message in (_experiment_dir(experiment) / "run.log").read_text()
 
 
@@ -263,7 +272,7 @@ def test_a_shutdown_requests_nothing_more_and_still_counts_what_stays_pending(
     assert "is not ready" not in caplog.text
     assert "launch refused" not in caplog.text
     in_parentheses = f" ({earlier} from earlier runs)" if earlier else ""
-    assert f"MLflow: {pending} upload(s) pending{in_parentheses}; {_PENDING_STEP}" in caplog.text
+    assert f"MLflow: {pending} record(s) pending{in_parentheses}; {_PENDING_STEP}" in caplog.text
 
 
 @pytest.mark.integration
@@ -382,7 +391,7 @@ def test_closeout_sends_earlier_records_first_and_stops_at_the_first_unanswered_
         assert caplog.text.count("MLflow did not answer") == 1
         earlier = 2 + len(intents)
         assert (
-            f"MLflow: {earlier + own_pending} upload(s) pending ({earlier} from earlier runs); "
+            f"MLflow: {earlier + own_pending} record(s) pending ({earlier} from earlier runs); "
             f"{_PENDING_STEP}" in caplog.text
         )
         assert "MLflow: delivered" not in caplog.text
@@ -397,8 +406,13 @@ def test_closeout_sends_earlier_records_first_and_stops_at_the_first_unanswered_
         assert "MLflow: delivered 1 record(s) left pending by earlier runs." in caplog.text
         pending = 1 + len(intents)
         assert (
-            f"MLflow: {pending} upload(s) pending ({pending} from earlier runs); {_PENDING_STEP}"
-            in caplog.text
+            f"MLflow: {pending} record(s) pending ({pending} from earlier runs); {_PENDING_STEP} "
+            "MLflow refused 1 of them; a refused record stays pending until the cause its warning "
+            "gives is fixed in MLflow." in caplog.text
+        )
+        assert (
+            f"MLflow: attempt record {attempt} of generation {sweep.generation} is pending "
+            "(RESOURCE_DOES_NOT_EXIST: run was deleted)." in caplog.text
         )
 
 
@@ -434,7 +448,7 @@ def test_a_run_refused_before_its_target_check_never_waits_on_the_tracker(
     assert requests == []
     assert read_record(sweep.summary)["state"] == "pending"
     assert "MLflow: sending" not in caplog.text
-    assert f"MLflow: 2 upload(s) pending (2 from earlier runs); {_PENDING_STEP}" in caplog.text
+    assert f"MLflow: 2 record(s) pending (2 from earlier runs); {_PENDING_STEP}" in caplog.text
     run_experiment(experiment)
     assert sweep.summaries() == ["KILLED"]
 
@@ -472,3 +486,63 @@ def test_a_different_target_sends_nothing_and_the_original_config_delivers(
         moved, validate_ledger(experiment), "f" * 32, session.DeliveryTally()
     )
     assert "neither saved nor sent" not in caplog.text
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("failure", ["no-answer", "refusal"])
+def test_sync_tracking_names_what_keeps_its_records_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    """sync-tracking ends with the step that clears what is left: a retry or a fix in MLflow.
+
+    A tracker that gives no answer is named with its tracking URI, and the step is a retry. A
+    record MLflow refuses, as for a run deleted in MLflow, is named in its warning, and the
+    step is to fix that cause in MLflow, since a retry alone meets the same refusal.
+    """
+    sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
+    experiment = sweep.experiment
+    assert experiment.mlflow is not None
+    [stem] = [path.stem for path in sweep.summary.parent.glob("attempt-*.json")]
+    respond = session.request_operation
+
+    def failing(request: dict[str, object], **kwargs: object) -> JsonObject:
+        if failure == "no-answer":
+            raise TimeoutError("MLflow operation exceeded its deadline.")
+        if request["action"] == "publish" and request["name"] == stem:
+            raise OperationRejectedError("MLflow run is deleted; restore it, or its experiment.")
+        return respond(request, **kwargs)
+
+    monkeypatch.setattr(session, "request_operation", failing)
+    monkeypatch.setattr(worker, "request_operation", failing)
+    config = write_experiment_config(Path.cwd() / "experiment.yaml", experiment)
+    capsys.readouterr()
+
+    assert invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch) == 1
+
+    error = capsys.readouterr().err
+    if failure == "no-answer":
+        assert error == (
+            "phasesweep: MLflow delivery remains pending: MLflow tracking target "
+            f"experiment_name={experiment.mlflow.experiment_name!r} at "
+            f"{experiment.mlflow.tracking_uri!r} is not ready: it did not answer within "
+            "timeout_seconds; check that the server is reachable.\n"
+            "fix: Wait briefly, then retry the same operation once the reported blocker is "
+            "resolved.\n"
+        )
+        assert sweep.summaries() == []
+    else:
+        assert error == (
+            "phasesweep: MLflow delivery remains pending: MLflow refused 1 record(s), each for "
+            "the cause its warning gives.\n"
+            "fix: Fix the cause MLflow gave for each refused record, for example by restoring a "
+            "deleted run or its experiment in MLflow, then run `phasesweep sync-tracking` again.\n"
+        )
+        assert (
+            f"MLflow: attempt record {stem} of generation {sweep.generation} is pending (MLflow "
+            "run is deleted; restore it, or its experiment.)." in caplog.text
+        )
+        assert sweep.summaries() == ["KILLED"]

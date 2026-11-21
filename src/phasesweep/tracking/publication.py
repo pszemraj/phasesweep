@@ -25,6 +25,7 @@ from phasesweep.runtime.json import (
 )
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText
+from phasesweep.tracking.mlflow import OperationRejectedError
 from phasesweep.tracking.records import validate_binding
 from phasesweep.tracking.session import (
     BINDING_FILE,
@@ -36,6 +37,7 @@ from phasesweep.tracking.session import (
     read_binding,
     read_inherits,
     read_record,
+    record_name,
     require_tracking_target,
     resolve_pending_creations,
     tracking_root,
@@ -155,13 +157,14 @@ def _send(
             if tally.stop_for_shutdown():
                 break
             unanswered = isinstance(exc, NO_ANSWER)
+            if isinstance(exc, OperationRejectedError) and not unanswered:
+                tally.refused += 1
             later = len(paths) - index - 1
             log.warning(
-                "MLflow upload %s of generation %s is pending (%s).%s",
-                path.stem,
-                path.parent.parent.name,
+                "MLflow: %s is pending (%s).%s",
+                record_name(path),
                 exc,
-                f" MLflow did not answer, so {later} later upload(s) wait too."
+                f" MLflow did not answer, so {later} later record(s) wait too."
                 if unanswered and later
                 else "",
             )
@@ -1188,7 +1191,8 @@ def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryT
     """Log the lines that close a run's MLflow delivery.
 
     Records delivered for earlier runs are counted when there are any, then the records still
-    pending, the run's own and earlier runs', with the step that delivers them.
+    pending, the run's own and earlier runs', with the step that sends them and, when MLflow
+    refused some, what keeps those pending.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param str generation_id: The run's own generation.
@@ -1199,7 +1203,7 @@ def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryT
         pending = delivery_status(experiment)["pending"]
         earlier = pending - delivery_status(experiment, generation_id)["pending"]
     except (OSError, ValueError) as exc:
-        log.warning("MLflow: pending uploads could not be counted (%s).", exc)
+        log.warning("MLflow: pending records could not be counted (%s).", exc)
         return
     if delivered:
         # A report line, so the console shows that an earlier interruption was made good.
@@ -1208,11 +1212,29 @@ def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryT
         )
     if pending:
         log.warning(
-            "MLflow: %d upload(s) pending%s; results are saved locally. The next run or "
-            "`phasesweep sync-tracking CONFIG` delivers them.",
+            "MLflow: %d record(s) pending%s; results are saved locally. The next run or "
+            "`phasesweep sync-tracking CONFIG` sends them.%s",
             pending,
             f" ({earlier} from earlier runs)" if earlier else "",
+            refused_text(tally.refused),
         )
+
+
+def refused_text(refused: int) -> str:
+    """Say how many pending records MLflow refused, and what keeps them pending.
+
+    A refused record is retried like any other, so it stays pending until its cause, which the
+    record's own warning names, is fixed in MLflow.
+
+    :param int refused: Records MLflow refused in this delivery.
+    :return str: A sentence with a leading space, or an empty string when none were refused.
+    """
+    if not refused:
+        return ""
+    return (
+        f" MLflow refused {refused} of them; a refused record stays pending until the cause its "
+        "warning gives is fixed in MLflow."
+    )
 
 
 def delivery_status(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
@@ -1275,8 +1297,11 @@ def sync_tracking(
         _validate_safe_name("generation", generation_id)
     if experiment.mlflow is None:
         raise TrackingSyncRefusedError(
-            "sync-tracking needs an `mlflow` block, and this config has none. Use the config "
-            "the sweep ran with, or see `phasesweep explain mlflow`."
+            "sync-tracking needs an `mlflow` block, and this config has none.",
+            remediation=(
+                "Pass the config the sweep ran with, which has its `mlflow` block; "
+                "`phasesweep explain mlflow` describes the block."
+            ),
         )
     require_mlflow_sdk()
     with signal_handler_scope(), _experiment_lock(experiment):
@@ -1304,7 +1329,16 @@ def sync_tracking(
             and not any(root.glob(f"{generation_id or '*'}/delivery/*.json"))
             and not any(root.glob(f"{generation_id or '*'}/operations"))
         ):
-            raise TrackingSyncRefusedError("No tracking deliveries exist for this scope.")
+            raise TrackingSyncRefusedError(
+                "No tracking deliveries exist for this scope.",
+                remediation=(
+                    f"Check the generation ID {generation_id!r}, such as an MCP run ID, or omit "
+                    "--generation to sync every generation of this experiment."
+                    if generation_id is not None
+                    else "Pass the config the sweep ran with; no run of this experiment has "
+                    "saved an MLflow record yet."
+                ),
+            )
         counts = delivery_status(experiment, generation_id)
         if errors:
             detail = "\n".join(str(error) for error in errors)

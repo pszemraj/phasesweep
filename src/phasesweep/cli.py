@@ -1301,19 +1301,39 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
     :param str | None generation_id: Generation to synchronize, or ``None`` for all.
     :param tuple[str, ...] settings: The same config overrides used by the run.
     :raises ClickException: The generation name or a delivery record is malformed.
-    :raises PhaseSweepError: Nothing matching can be synchronized, or records remain pending.
+    :raises PhaseSweepError: Nothing matching can be synchronized, or records remain pending;
+        its step is a retry when MLflow gave no answer, and fixing the causes when it refused.
     """
     from phasesweep.tracking.publication import sync_tracking as sync
+    from phasesweep.tracking.session import DeliveryTally
 
     config = _command_config(config_path, settings=settings)
     require_study(config)
+    tally = DeliveryTally()
     try:
-        counts = sync(config, generation_id)
+        counts = sync(config, generation_id, tally=tally)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(yaml.safe_dump(counts, sort_keys=False).rstrip())
-    if counts["pending"]:
-        raise PhaseSweepError("MLflow delivery remains pending.", action=OperatorAction.RETRY)
+    if not counts["pending"]:
+        return
+    if tally.unanswered is not None:
+        raise PhaseSweepError(
+            f"MLflow delivery remains pending: {tally.unanswered}", action=OperatorAction.RETRY
+        )
+    if tally.refused:
+        # A refused record is retried like any other, so only fixing its cause in MLflow helps.
+        raise PhaseSweepError(
+            f"MLflow delivery remains pending: MLflow refused {tally.refused} record(s), each "
+            "for the cause its warning gives.",
+            action=OperatorAction.FIX_CONFIG,
+            remediation=(
+                "Fix the cause MLflow gave for each refused record, for example by restoring a "
+                "deleted run or its experiment in MLflow, then run `phasesweep sync-tracking` "
+                "again."
+            ),
+        )
+    raise PhaseSweepError("MLflow delivery remains pending.", action=OperatorAction.RETRY)
 
 
 @cli.group(

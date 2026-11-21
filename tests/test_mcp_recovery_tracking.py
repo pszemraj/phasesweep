@@ -320,7 +320,7 @@ def test_recover_run_distinguishes_a_creation_miss_from_an_upload_failure(
     monkeypatch.setattr(session, "request_operation", lookup)
     result = run.recover()
     assert result.exit_code == 0, result.output
-    assert "Pending uploads: 0. Unconfirmed run creations: 1." in result.output
+    assert "MLflow records pending: 1, 1 of them unconfirmed run creations." in result.output
     assert _PENDING_STEP in result.output
     assert pending.is_file() and not bound.exists()
     assert not run.store.observe(run.handle).recovery_required
@@ -346,7 +346,7 @@ def test_recover_run_leaves_outcomes_pending_while_mlflow_is_down(
     assert requests == ["resolve"]
     assert run.sent() == []
     assert read_record(run.record)["state"] == "pending"
-    assert "Pending uploads: 2. Unconfirmed run creations: 0." in confirmed.output
+    assert "MLflow records pending: 2, 0 of them unconfirmed run creations." in confirmed.output
     assert _PENDING_STEP in confirmed.output
     assert not run.store.observe(run.handle).recovery_required
     delivery = run.app.status(_RUN_ID)["tracking_delivery"]

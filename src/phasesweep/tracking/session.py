@@ -84,6 +84,8 @@ class DeliveryTally:
     """Why MLflow gave no answer, once a request got none."""
     delivered: int = 0
     """Records of ended generations delivered."""
+    refused: int = 0
+    """Records MLflow answered with a refusal, such as for a deleted run; they stay pending."""
 
     def stop_for_shutdown(self) -> bool:
         """Stop sending, without blaming MLflow, once a shutdown is being serviced.
@@ -97,6 +99,30 @@ class DeliveryTally:
             return False
         self.sending = False
         return True
+
+
+def record_name(path: Path) -> str:
+    """Name a delivery record or creation intent by what it is, for the lines that report it.
+
+    :param Path path: A delivery record under ``tracking/<generation>/delivery``, a summary
+        run's creation intent under ``tracking/<generation>``, or an attempt run's creation
+        intent in its trial directory.
+    :return str: For example ``the summary record of generation <id>`` or ``attempt record
+        attempt-<id> of generation <id>``.
+    """
+    if path.name == PENDING_GENERATION_BINDING_FILE:
+        return f"the summary-run creation record of generation {path.parent.name}"
+    if path.name.endswith(_PENDING_SUFFIX):
+        # pending_creation_records finds these only in trial_<n>__generation_<id>__attempt_<id>.
+        _, generation, attempt = path.parent.name.split("__")
+        return (
+            f"the run-creation record of attempt {attempt.removeprefix('attempt_')} of "
+            f"generation {generation.removeprefix('generation_')}"
+        )
+    generation = path.parent.parent.name
+    if path.stem == "generation":
+        return f"the summary record of generation {generation}"
+    return f"{path.stem.split('-', 1)[0]} record {path.stem} of generation {generation}"
 
 
 def tracking_root(experiment: Experiment) -> Path:
@@ -533,13 +559,15 @@ def _reconcile_creation(
         if tally.stop_for_shutdown():
             return
         if not isinstance(exc, NO_ANSWER):
-            log.warning("MLflow run creation at %s is still unresolved (%s).", pending, exc)
+            if isinstance(exc, OperationRejectedError):
+                tally.refused += 1
+            log.warning("MLflow: %s is still unresolved (%s).", record_name(pending), exc)
             return
         # The pass sends nothing after this, so this is its only outage warning.
         log.warning(
-            "MLflow run creation at %s is still unresolved (%s). MLflow did not answer, so later "
-            "searches and uploads wait too.",
-            pending,
+            "MLflow: %s is still unresolved (%s). MLflow did not answer, so later searches and "
+            "uploads wait too.",
+            record_name(pending),
             exc,
         )
         tally.sending = False

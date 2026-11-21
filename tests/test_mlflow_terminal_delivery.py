@@ -1239,7 +1239,7 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     if upload == "offline":
         assert read_record(record_path)["state"] == "pending"
         assert (
-            f"MLflow upload attempt-{attempt} of generation {generation} is pending (upload "
+            f"MLflow: attempt record attempt-{attempt} of generation {generation} is pending (upload "
             "refused)." in caplog.text
         )
         refused_upload.clear()

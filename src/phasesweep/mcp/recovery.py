@@ -309,7 +309,7 @@ def recover_run(
                     f"tracking operation(s) for {run_id} and terminated {evidence.terminated} "
                     "live process group(s). The next launch with this config, or "
                     "`phasesweep sync-tracking CONFIG` with the config this run launched with, "
-                    "delivers any remaining uploads."
+                    "sends any records still pending."
                 )
             if evidence.pending_evidence:
                 # Cleanup is proven, so recovery succeeds; the next run refuses until
@@ -322,7 +322,7 @@ def recover_run(
                     "nothing is retrained."
                 )
             if tally is not None:
-                from phasesweep.tracking.publication import delivery_status
+                from phasesweep.tracking.publication import delivery_status, refused_text
                 from phasesweep.tracking.session import pending_creation_records
 
                 # Counted after the uploads across every generation, as delivery covered them all.
@@ -337,10 +337,11 @@ def recover_run(
                     if pending:
                         emit(
                             (f"{sent}. " if sent else "")
-                            + f"Pending uploads: {pending - creations}. Unconfirmed run "
-                            f"creations: {creations}. The next launch with this config, or "
+                            + f"MLflow records pending: {pending}, {creations} of them "
+                            "unconfirmed run creations. The next launch with this config, or "
                             "`phasesweep sync-tracking CONFIG` with the config this run "
-                            "launched with, delivers them. Delivery never retrains."
+                            "launched with, sends them; delivery never retrains."
+                            + refused_text(tally.refused)
                         )
                     elif sent:
                         emit(f"{sent}; none stay pending.")

@@ -227,9 +227,11 @@ def _tracking_delivery_payload(counts: Mapping[str, int], run: Mapping[str, obje
     if pending and run["state"] != "running":
         remedy = (
             f"{pending} MLflow record(s) of this run are pending. Its scores and winners are "
-            "unaffected. The next launch with this config delivers them, or ask the operator "
+            "unaffected. The next launch with this config sends them, or ask the operator "
             f"to retry them with `phasesweep sync-tracking CONFIG --generation {run['run_id']}` "
-            "using the config this run launched with; delivery never retrains."
+            "using the config this run launched with; delivery never retrains. A record MLflow "
+            "refused, as for a run deleted in MLflow, stays pending until the operator fixes "
+            "the cause its warning gives in MLflow."
         )
     return {"pending": pending, "delivered": counts["delivered"], "remedy": remedy}
 
