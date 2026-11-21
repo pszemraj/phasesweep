@@ -1,4 +1,4 @@
-"""What the CLI writes to a terminal, laid out at fixed widths, and what it writes to a pipe."""
+"""What the CLI prints: terminal layouts at fixed widths, what a pipe gets, and closing lines."""
 
 from __future__ import annotations
 
@@ -146,3 +146,28 @@ def test_a_dry_run_wraps_its_lines_to_the_terminal_and_keeps_its_commands_whole(
         for line in stderr.text.splitlines()
     ]
     assert lines == _STARTER_DRY_RUN_AT_80
+
+
+def test_validate_says_it_checked_the_config_alone_and_names_the_dry_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A passing validation ends by naming the command that also compares with a recorded study."""
+    config = tmp_path / "my sweep.yaml"
+    assert invoke_cli_boundary(["init", "-o", str(config)], monkeypatch) == 0
+    capsys.readouterr()
+
+    assert (
+        invoke_cli_boundary(
+            ["validate", str(config), "--set", "phases[depth].gpu_policy=none"], monkeypatch
+        )
+        == 0
+    )
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "OK: phasesweep_starter (2 phases)"
+    assert lines[-1] == (
+        "Checked the config alone; phasesweep run "
+        f"'{config}' --set 'phases[depth].gpu_policy=none' --dry-run "
+        "also compares it with a recorded study."
+    )
+    assert sum(line.startswith("Checked the config alone") for line in lines) == 1
