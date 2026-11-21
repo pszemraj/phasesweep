@@ -18,7 +18,6 @@ import pytest
 from phasesweep.cli import _console_logging
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Sampler
-from phasesweep.engine.paths import _run_log_path
 from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import PhaseCounts, Winner
 from phasesweep.evidence.models import WandbExtractor
@@ -41,6 +40,7 @@ from tests.conftest import (
     FAKE_TRAIN_METRIC,
     invoke_cli_boundary,
     make_experiment,
+    stub_run_command,
     write_constant_trainer,
     write_experiment_config,
 )
@@ -915,30 +915,17 @@ def test_banner_and_summary_style_only_labels_paths_and_the_winner_mark() -> Non
     assert "\x1b[1mNext:\x1b[0m" in text
 
 
-def _stub_engine(monkeypatch: pytest.MonkeyPatch, config: Experiment, error: BaseException) -> Path:
-    """Make ``phasesweep run`` load ``config`` and fail with ``error`` after writing ``run.log``.
-
-    :return Path: The ``run.log`` the stubbed engine wrote.
-    """
-    log = _run_log_path(config)
-    monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
-    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: config)
-
-    def fail(*_args: object, **_kwargs: object) -> None:
-        log.parent.mkdir(parents=True, exist_ok=True)
-        log.write_text("the engine's log\n", encoding="utf-8")
-        raise error
-
-    monkeypatch.setattr("phasesweep.cli.run_experiment", fail)
-    return log
-
-
 def test_the_log_path_comes_last_after_an_operational_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The error and its fix line come first, then the absolute path of ``run.log``."""
     config = make_experiment(persistent=tmp_path)
-    log = _stub_engine(monkeypatch, config, PhaseTrialsFailedError("no feasible trial in 'p'"))
+    log = stub_run_command(
+        monkeypatch,
+        PhaseTrialsFailedError("no feasible trial in 'p'"),
+        config=config,
+        writes_log=True,
+    )
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
 
@@ -961,7 +948,7 @@ def test_the_log_path_comes_last_after_ctrl_c(
         signal.SIGINT,
         ShutdownCleanupReport(signum=signal.SIGINT, cleanup_confirmed=True, child_pgids=()),
     )
-    log = _stub_engine(monkeypatch, config, shutdown)
+    log = stub_run_command(monkeypatch, shutdown, config=config, writes_log=True)
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
 
@@ -977,13 +964,7 @@ def test_no_log_line_when_the_engine_never_wrote_a_log(
 ) -> None:
     """A run that failed before creating ``run.log`` names no file."""
     config = make_experiment(persistent=tmp_path)
-    monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
-    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: config)
-
-    def fail(*_args: object, **_kwargs: object) -> None:
-        raise PhaseTrialsFailedError("no feasible trial in 'p'")
-
-    monkeypatch.setattr("phasesweep.cli.run_experiment", fail)
+    stub_run_command(monkeypatch, PhaseTrialsFailedError("no feasible trial in 'p'"), config=config)
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
 

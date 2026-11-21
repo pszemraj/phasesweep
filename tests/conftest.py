@@ -43,7 +43,7 @@ from phasesweep.engine.artifact_roots import (
 from phasesweep.engine.confound import CONFOUND_SCHEMA_VERSION
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
-from phasesweep.engine.paths import _last_successful_generation_path
+from phasesweep.engine.paths import _last_successful_generation_path, _run_log_path
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     FEASIBLE_ATTR,
@@ -795,6 +795,37 @@ def invoke_cli_boundary(argv: list[str], monkeypatch: pytest.MonkeyPatch) -> int
         logger.setLevel(previous_level)
     code = excinfo.value.code
     return 0 if code is None else int(code)
+
+
+def stub_run_command(
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+    *,
+    config: Experiment | None = None,
+    writes_log: bool = False,
+) -> Path:
+    """Make ``phasesweep run`` load ``config`` and fail with ``error`` once it reaches the engine.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture used to replace the CLI's collaborators.
+    :param BaseException error: Exception ``run_experiment`` raises.
+    :param Experiment | None config: Experiment the stubbed loader returns; defaults to
+        :func:`make_experiment`'s.
+    :param bool writes_log: Have the stubbed engine write ``run.log`` before it fails.
+    :return Path: The experiment's ``run.log`` path, which exists only when ``writes_log``.
+    """
+    experiment = make_experiment() if config is None else config
+    log = _run_log_path(experiment)
+    monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
+    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: experiment)
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        if writes_log:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text("the engine's log\n", encoding="utf-8")
+        raise error
+
+    monkeypatch.setattr("phasesweep.cli.run_experiment", fail)
+    return log
 
 
 def trial_outcome(sequence: int, outcome: str, **extra: JsonValue) -> JsonObject:

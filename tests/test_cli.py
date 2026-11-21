@@ -60,6 +60,7 @@ from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
     requires_nonroot,
+    stub_run_command,
     write_constant_trainer,
     write_experiment_config,
     write_param_echo_trainer,
@@ -1516,21 +1517,6 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     assert "Do not run anything over this tree" in captured.err
 
 
-def _stub_run_command(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
-    """Make ``phasesweep run`` reach the engine and fail with ``error``.
-
-    :param pytest.MonkeyPatch monkeypatch: Fixture used to replace CLI collaborators.
-    :param BaseException error: Exception ``run_experiment`` raises once the CLI calls it.
-    """
-    monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
-    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: make_experiment())
-
-    def fail(*_args: object, **_kwargs: object) -> None:
-        raise error
-
-    monkeypatch.setattr("phasesweep.cli.run_experiment", fail)
-
-
 @pytest.mark.parametrize(
     ("published_result_committed", "expects_notice"),
     [
@@ -1559,7 +1545,7 @@ def test_cli_only_explains_marked_post_publication_shutdown(
     assert shutdown.published_result_committed is False
     if published_result_committed:
         shutdown.published_result_committed = True
-    _stub_run_command(monkeypatch, shutdown)
+    stub_run_command(monkeypatch, shutdown)
 
     exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
@@ -1582,7 +1568,7 @@ def test_cli_trial_cleanup_refusal_names_the_cli_recovery(
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
     refusal = UnsafeProcessCleanupError("Trial 0 cleanup could not be confirmed.")
-    _stub_run_command(monkeypatch, refusal)
+    stub_run_command(monkeypatch, refusal)
 
     exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
@@ -1713,7 +1699,7 @@ def test_cli_boundary_reports_expected_run_failure(
     """An expected failure prints no traceback on the console, with or without ``-v``."""
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
-    _stub_run_command(
+    stub_run_command(
         monkeypatch,
         PhaseTrialsFailedError("no feasible trial in phase 'depth'"),
     )
@@ -1891,7 +1877,7 @@ def test_cli_boundary_separates_internal_errors_from_operational_failures(
     """
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
-    _stub_run_command(monkeypatch, error)
+    stub_run_command(monkeypatch, error)
 
     actual_exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
