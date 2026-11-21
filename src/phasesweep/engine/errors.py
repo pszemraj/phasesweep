@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar
 
-from phasesweep.errors import NEW_STUDY_STEP, OperatorAction, PhaseSweepError
+from phasesweep.errors import (
+    NEW_STUDY_STEP,
+    PERSISTENT_STUDY_KEEPS_TRIALS,
+    STORAGE_NULL_KEEPS_NOTHING,
+    OperatorAction,
+    PhaseSweepError,
+)
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Experiment
@@ -155,9 +161,9 @@ def phase_timeout(message: str, *, scope: str | None, experiment: Experiment) ->
     """
     key = "timeout_seconds_per_run" if scope == "run" else "timeout_seconds_per_phase"
     continuation = (
-        "resume the phase; completed trials are kept."
+        f"resume the phase; {PERSISTENT_STUDY_KEEPS_TRIALS}."
         if experiment.persistent
-        else "start the run again; storage: null keeps no completed trials between runs."
+        else f"start the run again; {STORAGE_NULL_KEEPS_NOTHING}."
     )
     return PhaseTimeoutError(
         message,

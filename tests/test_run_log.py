@@ -151,7 +151,7 @@ def test_trial_write_error_reports_cause_and_storage_specific_recovery(
         if persistent:
             assert "the next run recovers the attempt" in diagnostic
         else:
-            assert "storage: null keeps no study to resume" in diagnostic
+            assert "storage: null keeps no completed trials between runs" in diagnostic
             assert "The trial result was lost" in diagnostic
             assert "RUNNING" not in diagnostic
 

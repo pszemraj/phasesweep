@@ -15,6 +15,7 @@ from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_OUTCOME_ATTR, _parsed_trial_outcome
+from phasesweep.errors import STORAGE_NULL_KEEPS_NOTHING
 from phasesweep.run_report import report, rerun_line, trial_line
 
 # Warnings keep the phase channel that run.log readers match on.
@@ -58,7 +59,7 @@ def _warn_deferred_extraction(
     else:
         message = (
             "Trial %d in phase %s finished training, but its result was not extracted and is "
-            "lost: storage: null keeps no trials between runs."
+            f"lost: {STORAGE_NULL_KEEPS_NOTHING}."
         )
     _warn_once(log, ("deferred-extraction", attempt_id), message, trial_number, phase_name)
 

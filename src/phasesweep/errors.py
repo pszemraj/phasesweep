@@ -102,6 +102,13 @@ FRESH_STUDY = f"set{_FRESH_STUDY_TAIL}"
 
 NEW_STUDY_STEP = f"Set{_FRESH_STUDY_TAIL}; the old study stays readable with its original config."
 
+#: The fact about a rerun under `storage: null`, as a clause for each step that offers one to
+#: compose with its own lead-in, so a restart is worded the same wherever it is offered.
+STORAGE_NULL_KEEPS_NOTHING = "storage: null keeps no completed trials between runs"
+
+#: The fact about a rerun under a persistent study, the counterpart of the clause above.
+PERSISTENT_STUDY_KEEPS_TRIALS = "completed trials are kept"
+
 
 def phase_names(names: Sequence[str]) -> str:
     """List phase names the way every step that names phases does.
@@ -185,7 +192,7 @@ def unreadable_objective_step(*, persistent: bool) -> str:
     if not persistent:
         return (
             "A trial's trainer ran, but its objective could not be read; fix the trainer's "
-            f"output or {settings}, then rerun; storage: null starts fresh."
+            f"output or {settings}, then rerun; {STORAGE_NULL_KEEPS_NOTHING}."
         )
     return (
         "A trial's trainer ran, but its objective could not be read; if the trainer wrote the "

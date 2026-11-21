@@ -106,7 +106,12 @@ from phasesweep.engine.study_policy import (
     _load_phase_policy_state,
     _recovery_advice,
 )
-from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
+from phasesweep.errors import (
+    NEW_STUDY_STEP,
+    PERSISTENT_STUDY_KEEPS_TRIALS,
+    STORAGE_NULL_KEEPS_NOTHING,
+    OperatorAction,
+)
 from phasesweep.evidence.models import EXTRACTOR_KINDS
 from phasesweep.runtime.json import JsonObject, JsonValue, json_object
 
@@ -1072,7 +1077,7 @@ def unpublished_winner_step(
     if not experiment.persistent:
         return UnpublishedWinnerStep(
             None,
-            "Rerun the same config to start the run again; storage: null keeps no completed trials between runs.",
+            f"Rerun the same config to start the run again; {STORAGE_NULL_KEEPS_NOTHING}.",
         )
     try:
         studies = read_phase_studies(ledger)
@@ -1110,7 +1115,7 @@ def unpublished_winner_step(
                 _no_feasible_remedy(experiment, trials, phase.name),
             )
     return UnpublishedWinnerStep(
-        None, "Rerun the same config to resume and publish; completed trials are kept."
+        None, f"Rerun the same config to resume and publish; {PERSISTENT_STUDY_KEEPS_TRIALS}."
     )
 
 

@@ -37,7 +37,12 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import _describe_environment_changes
 from phasesweep.engine.trial import _environment_identity
-from phasesweep.errors import OperatorAction, PhaseSweepError, operator_step
+from phasesweep.errors import (
+    STORAGE_NULL_KEEPS_NOTHING,
+    OperatorAction,
+    PhaseSweepError,
+    operator_step,
+)
 from phasesweep.runtime.files import atomic_text_writer
 
 log = logging.getLogger(__name__)
@@ -366,8 +371,8 @@ def _load_winner(
         rerun = (
             "Run without --from-phase so the earlier phases run first (completed trials are reused)"
             if experiment.persistent
-            else "Run without --from-phase to start every phase again, because storage: null "
-            "keeps no completed trials"
+            else "Run without --from-phase to start every phase again, because "
+            f"{STORAGE_NULL_KEEPS_NOTHING}"
         )
         raise ResumeWinnerMissingError(
             f"Winner file missing for phase {phase.name!r}: {absent} "

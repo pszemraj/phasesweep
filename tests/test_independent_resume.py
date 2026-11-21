@@ -120,7 +120,7 @@ def test_from_phase_without_publication_in_memory_does_not_promise_reused_trials
     assert "reuse completed trials" not in message
     assert (
         "fix: Run without --from-phase to start every phase again, because storage: null keeps "
-        "no completed trials, or use the workdir that holds the publication."
+        "no completed trials between runs, or use the workdir that holds the publication."
     ) in message
 
 

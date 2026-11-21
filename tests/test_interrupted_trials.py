@@ -1831,7 +1831,7 @@ def test_shutdown_during_extraction_promises_kept_training_only_with_persistent_
     assert (retained in caplog.text) is (storage == "journal")
     assert (lost in caplog.text) is (storage == "memory")
     if storage == "memory":
-        assert "storage: null keeps no trials between runs" in caplog.text
+        assert "storage: null keeps no completed trials between runs" in caplog.text
 
 
 _RUN_CONFIG = """

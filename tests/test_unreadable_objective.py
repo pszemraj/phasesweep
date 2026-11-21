@@ -67,7 +67,7 @@ def test_an_unreadable_objective_in_memory_names_the_trainer_and_the_metric_sett
     assert (
         f"{_UNREADABLE}; fix the trainer's output or the config's `metric` settings (for "
         "example the extractor's path, key or objective name), then rerun; "
-        "storage: null starts fresh."
+        "storage: null keeps no completed trials between runs."
     ) in remedy
     assert "metric bounds" not in remedy
 

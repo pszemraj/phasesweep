@@ -113,6 +113,7 @@ from phasesweep.engine.trial import (
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import (
+    STORAGE_NULL_KEEPS_NOTHING,
     OperatorAction,
     PhaseSweepError,
     ProcessCleanupUncertainError,
@@ -942,7 +943,7 @@ def _trial_recording_error(
     )
     if not run.experiment.persistent:
         return StudyStorageUnavailableError(
-            f"{message} storage: null keeps no study to resume. The trial result was lost.",
+            f"{message} {STORAGE_NULL_KEEPS_NOTHING}. The trial result was lost.",
             action=OperatorAction.RETRY,
             remediation="Resolve the reported error and run the sweep again from the start.",
         )
