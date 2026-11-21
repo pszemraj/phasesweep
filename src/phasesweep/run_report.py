@@ -862,13 +862,21 @@ def summary(
             if phase.name in counts:
                 directories = tuple(display_path(path) for path in counts[phase.name].winner_dirs)
         phases.append(SummaryPhase(phase.name, clauses, facts, directories))
+    headline = f"Finished in {duration_text(elapsed)}: {run_totals(counts)}"
+    return Summary(headline, tuple(phases), written_root, tuple(written), next_command)
+
+
+def run_totals(counts: Mapping[str, PhaseCounts]) -> str:
+    """Count the phases and trials a run covered, as the summary headline and ``run.log`` say it.
+
+    :param Mapping[str, PhaseCounts] counts: Trial counts of each phase the run executed.
+    :return str: For example ``2 phases, 6 trials, 4 from a previous run``.
+    """
     trials = sum(item.total for item in counts.values())
     earlier = sum(item.earlier for item in counts.values())
-    headline = (
-        f"Finished in {duration_text(elapsed)}: {plural(len(counts), 'phase')}, "
-        f"{plural(trials, 'trial')}, {earlier} from a previous run"
+    return (
+        f"{plural(len(counts), 'phase')}, {plural(trials, 'trial')}, {earlier} from a previous run"
     )
-    return Summary(headline, tuple(phases), written_root, tuple(written), next_command)
 
 
 def nothing_to_run(

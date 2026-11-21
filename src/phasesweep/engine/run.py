@@ -59,7 +59,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import _launch_preflight
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
-from phasesweep.run_report import report, skipped_line, winner_line
+from phasesweep.run_report import duration_text, report, run_totals, skipped_line, winner_line
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
     UnsafeLockPathError,
@@ -364,6 +364,7 @@ def _run_experiment_outcome(
         # ``run.log`` is appended to by every run, so this line marks where this one begins.
         # It carries no command line or ``--set`` value, which can hold a tracking URI with
         # credentials, and the console prints only the report logger's INFO records.
+        run_started = time.monotonic()
         log.info(
             "Run started: experiment %s, pid %d%s",
             experiment.experiment,
@@ -556,6 +557,14 @@ def _run_experiment_outcome(
                     replayed_generation_id=generation.replayed_generation_id,
                     phase_counts=generation.phase_counts,
                 )
+            # Pairs with the start line, so a log that holds several runs shows which finished.
+            log.info(
+                "Run finished: experiment %s, pid %d, %s, %s",
+                experiment.experiment,
+                os.getpid(),
+                run_totals(generation.phase_counts),
+                duration_text(time.monotonic() - run_started),
+            )
             return MappingProxyType(dict(result))
         finally:
             if terminal_callback is not None:

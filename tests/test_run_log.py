@@ -513,6 +513,7 @@ def test_run_log_reports_abort_after_its_triggering_trial(tmp_path: Path, n_jobs
     assert abort["cause"] in lines[abort_lines[0]]
 
 
+@pytest.mark.integration
 def test_each_run_marks_its_start_in_run_log_and_never_on_the_console(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -547,6 +548,42 @@ def test_each_run_marks_its_start_in_run_log_and_never_on_the_console(
     assert any(" p  trial 0  COMPLETE  " in line for line in lines[starts[0] : starts[1]])
     assert "SECRET-TOKEN" not in run_log.read_text(encoding="utf-8")
     assert "Run started" not in first_console + second_console
+
+    ends = [index for index, line in enumerate(lines) if "Run finished" in line]
+    assert len(ends) == 2
+    first_end, second_end = (lines[index] for index in ends)
+    assert starts[0] < ends[0] < starts[1] < ends[1]
+    assert re.search(
+        r" I phasesweep\.engine\.run Run finished: experiment t, pid \d+, "
+        r"1 phase, 2 trials, 0 from a previous run, \d+\.\ds$",
+        first_end,
+    )
+    assert re.search(
+        r" I phasesweep\.engine\.run Run finished: experiment t, pid \d+, "
+        r"1 phase, 2 trials, 2 from a previous run, \d+\.\ds$",
+        second_end,
+    )
+    assert _field(first, r"pid (\d+)") == _field(first_end, r"pid (\d+)")
+    assert "Run finished" not in first_console + second_console
+
+
+def test_a_run_that_fails_leaves_its_start_line_without_a_finish_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a run that finishes normally logs ``Run finished``, so an unmatched start marks a failure."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_trainer(tmp_path, "import sys\nsys.exit(1)\n"),
+        n_trials=1,
+        gpu_policy="none",
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+
+    assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 1
+
+    text = (_experiment_dir(experiment) / "run.log").read_text(encoding="utf-8")
+    assert "Run started" in text
+    assert "Run finished" not in text
 
 
 def test_a_dry_run_opens_no_run_log_and_prints_no_start_line(
