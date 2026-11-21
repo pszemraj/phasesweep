@@ -38,4 +38,4 @@ The generator keeps the fixture tracked and independent of the generating host:
 
 A test that resumes the fixture and allocates trials calls `pin_fixture_environment(monkeypatch)` from [`ledger_fixtures.py`](../../ledger_fixtures.py) to match the recorded environment.
 
-Regenerate when the stored format changes. Generated identities, timestamps, paths and SCM metadata vary between regenerations; the pinned trainer environment and its checksum stay fixed.
+Generated identities, timestamps, paths and SCM metadata vary between regenerations; the pinned trainer environment and its checksum stay fixed.

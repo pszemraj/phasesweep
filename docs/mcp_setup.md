@@ -46,6 +46,12 @@ Configure your client's stdio server with the absolute `phasesweep-mcp` executab
 /absolute/path/to/phasesweep-mcp --catalog /absolute/path/to/catalog.yaml
 ```
 
+To run the stdio server directly instead:
+
+```bash
+phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
+```
+
 For Codex CLI, the [official MCP instructions](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) use:
 
 ```bash
@@ -67,7 +73,7 @@ To check the same operation without a client, run it from a shell:
 phasesweep mcp call list_experiments --catalog /absolute/path/to/catalog.yaml
 ```
 
-See [shell calls](mcp.md#calling-a-tool-from-a-shell) for arguments, exit codes and monitoring. For an explicitly authorized run, follow the [tool workflow](mcp.md#tool-workflow) and [response shapes](mcp.md#reading-status-responses). A launch of an experiment whose trials a shell run already finished launches nothing and succeeds with `run_wrote_generation: false`.
+See [shell calls](mcp.md#calling-a-tool-from-a-shell) for arguments, exit codes and monitoring. For an explicitly authorized run, follow the [tool workflow](mcp.md#tool-workflow) and [response shapes](mcp.md#reading-status-responses).
 
 ## Maintenance and troubleshooting
 
@@ -76,13 +82,13 @@ Use `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` after a cata
 - `MCP support is not installed`: install the MCP extra in the environment that supplies `phasesweep-mcp`.
 - The client cannot start the server: verify its client-owned stdio entry has absolute executable and catalog paths, then run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml`.
 - `action 'launch' is not permitted`, `action 'cancel' is not permitted` or `action 'from_phase' is not permitted`: the running server applies a catalog change on the next call, but a grant never reaches [a run launched without cancel permission](mcp.md#the-catalog); to stop such a run, follow the stop step its refusal names, a `kill -TERM` of the verified runner PID, which ends it `cancelled`.
-- `catalog_status.stale: true`, or a launch or inspection refused because a catalog entry `failed to load` or the catalog file `does not validate`: run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` and fix what it reports; the server's stderr log names the file, and a server that started with a failing entry printed it there too. A refusal for a different `state_dir` requires a server restart. Other reads keep using the entries that loaded and saved run snapshots. See [the catalog](mcp.md#the-catalog).
+- `catalog_status.stale: true`, or a launch or inspection refused because a catalog entry `failed to load` or the catalog file `does not validate`: run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` and fix what it reports; the server's stderr log names the file. See [catalog reload behavior](mcp.md#the-catalog), including when a restart is required.
 - `concurrency limit reached` or an experiment that already has a running sweep: [run state and recovery](mcp.md#run-state-and-recovery) says which blockers to await and which need the operator.
 - `cannot prove available launch capacity`: `state_dir` holds unreadable or orphaned run records, which the refusal lists. Run the `phasesweep mcp recover-run` command it names for each pre-spawn orphan; for each other listed run id, run `pgrep -af <run-id>`, which lists the run's runner, and `ps axeww | awk '/[P]HASESWEEP_GENERATION_ID=<run-id>/ {print $1}'`, which prints the PID of each of its trials, found by environment (a trial's arguments carry the run id only when its command uses `{trial_dir}`), on the server host as the server's user, since `ps` shows another user's processes no environment, wait for every listed process to exit, or stop it, and move `runs/<run-id>.json` and `logs/<run-id>.*` out of `state_dir` only once both print nothing.
 - `another launch is in progress`: a launch sharing this `state_dir` holds the launch lock; retry in a moment.
 - Lock-directory access failure (`storage_unavailable`): set the same `PHASESWEEP_LOCK_DIR` for every participating shell, MCP server, and sandbox, following the [lock directory rules](runtime.md#storage-and-locks).
 - `recovery_required: true`, unresolved launch, or uncertain cleanup: stop agent activity and follow [run state and recovery](mcp.md#run-state-and-recovery).
-- Unavailable terminal snapshot: follow `failure.remediation`; it distinguishes a runner that exited without final status from one whose host boot ended, for which process cleanup is unnecessary, and says that a new run of the experiment keeps its finished trials and reruns its interrupted ones first. Other capture failures require inspection of run/server diagnostics. [Historical results](mcp.md#reading-status-responses) cannot be reconstructed from the current ledger.
+- Unavailable terminal snapshot: follow `failure.remediation` and inspect run/server diagnostics when it asks. [Historical results](mcp.md#reading-status-responses) cannot be reconstructed from the current ledger.
 - `runner_observable: false`, alone or with `recovery_required: true`, or a PID-namespace refusal: follow [PID namespace recovery](mcp.md#pid-namespaces).
 - Catalog path, storage, or working-directory rejection: follow [the catalog requirements](mcp.md#the-catalog).
 - Trainer environment cohort mismatch: the [launching server or `mcp call` shell](mcp.md#the-catalog) supplies the trainer's base environment; reconcile it using the [trainer contract](config.md#trainer-contract).

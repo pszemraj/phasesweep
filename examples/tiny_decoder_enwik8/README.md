@@ -29,7 +29,7 @@ phasesweep run examples/tiny_decoder_enwik8/gpu_smoke.yaml
 phasesweep show-winners examples/tiny_decoder_enwik8/gpu_smoke.yaml
 ```
 
-The smoke config uses in-memory Optuna storage so every `run` invocation executes both trials without accumulating a reusable study. Its winner must also pass a `runtime.accelerated == true` evidence gate, which verifies that final-checkpoint evaluation used CUDA or MPS; a CPU fallback cannot win. `result.json` retains the exact `runtime.device_type`. macOS discovers its MPS pool and refuses explicit CUDA device lists. Use [inspection commands](../../docs/runtime.md#inspection-commands) to read the saved winners. For a bounded comparison with seed noise and persistent resume, use [Learning rates over seeds](#learning-rates-over-seeds). The full config below uses an Optuna journal file for persistent status and reuse.
+The in-memory smoke executes both trials on every invocation. The `runtime.accelerated == true` gate requires final-checkpoint evaluation on CUDA or MPS. `result.json` records the device type. The full sweep below uses a persistent Optuna journal.
 
 Use the full three-phase example only when you want the longer experiment:
 
@@ -45,8 +45,6 @@ A fresh study targets nine terminal trial attempts (3 phases x 3 attempts, 1000 
 The example sweeps only supported trainer controls. The upstream template does not expose warmup ratio or grouped-query attention, and its SwiGLU feedforward rounds hidden width to a multiple of 256. At `dim: 128`, `ffn_dim_multiplier` values up to 2.0 therefore build the same 256-wide feedforward layer.
 
 The upstream trainer records periodic validation with labels 0, 100, ..., 900, after that iteration's optimizer update, then saves `final.pt` at step 1000. After training finishes, `run_trial.py` reloads that checkpoint and evaluates it once with the same validation settings. Only this step-1000 `final_checkpoint` evaluation is published through `report_objective(...)`; the periodic log minimum is not used. The configured [`json_envelope` extractor](../../docs/config.md#objective-evidence-constraints-and-gates) validates that report.
-
-See [objective evidence](../../docs/config.md#objective-evidence-constraints-and-gates) for other reporting formats and [phase composition](../../docs/config.md#phase-composition) for inheritance.
 
 ## Learning rates over seeds
 
@@ -112,9 +110,9 @@ phasesweep status examples/tiny_decoder_enwik8/mlflow_gpu_smoke.yaml
 
 The `--mlflow` option of `run_trial.py` logs the evaluated `final.pt` loss as native `val_loss` at step `10`, with trainer parameters and evaluation/device tags. It logs `runtime/cuda=1` when final evaluation uses CUDA; a native constraint requires that value before a trial can win. Periodic upstream validation losses remain local and do not enter the objective. In this mode, the objective comes from MLflow rather than a JSON envelope. The upstream trainer runs as pinned, with no modification.
 
-The default `mlflow.run_mode: managed` resumes PhaseSweep's supplied run. To check trainer ownership, copy the configuration, change `run_mode` to `trainer`, and choose a fresh `experiment` and `workdir`. `run_trial.py` then creates its run, calls `bind_mlflow_run`, and closes it after evaluation. Both modes publish results and a generation summary to the same configured MLflow experiment. Open `http://127.0.0.1:5000` to inspect the native metrics and `phasesweep.*` results. See [MLflow tracking](../../docs/mlflow.md) for ownership, selectors, offline replay, and pending-upload recovery.
+The smoke uses [managed run ownership](../../docs/mlflow.md#choose-run-ownership). To exercise trainer ownership, copy the config, set `mlflow.run_mode: trainer`, and choose a fresh `experiment` and `workdir`. Open `http://127.0.0.1:5000` to inspect the native metrics and `phasesweep.*` results.
 
-Completed trials are reused. See [continuation](../../docs/runtime.md#timeouts-cleanup-and-continuation) for a fresh study and [copying the repeats config](#learning-rates-over-seeds) for the working-directory rule. To use another server, change `mlflow.tracking_uri` and provision `mlflow.experiment_name` there first.
+When copying the MLflow config outside the checkout, set `execution.cwd` to the absolute PhaseSweep repository path. To use another server, set `mlflow.tracking_uri` and provision `mlflow.experiment_name` there first.
 
 ## MCP smoke
 
