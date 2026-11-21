@@ -781,13 +781,13 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
     :raises ExtractorError: Binding or remote evidence cannot be accepted.
     """
     from phasesweep.evidence.mlflow import validate_capture
-    from phasesweep.tracking.mlflow import (
-        ManagedObjectiveMissingError,
-        OperationOutcomeUnknownError,
-        OperationUnavailableError,
-        request_operation,
+    from phasesweep.tracking.mlflow import ManagedObjectiveMissingError, request_operation
+    from phasesweep.tracking.session import (
+        BINDING_FILE,
+        gave_no_answer,
+        read_binding,
+        read_record,
     )
-    from phasesweep.tracking.session import BINDING_FILE, read_binding, read_record
 
     if ctx.mlflow_capture:
         return validate_capture(ctx.mlflow_capture)
@@ -824,18 +824,16 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
             deadline=min(stop, deadline) if deadline is not None else stop,
         )
         capture = validate_capture(retrieved)
-    except TimeoutError as exc:
-        if deadline is not None and time.monotonic() >= deadline:
-            raise DeadlineExceededError(str(exc)) from exc
-        raise EvidenceUnreadableError(str(exc)) from exc
-    except (OperationUnavailableError, OperationOutcomeUnknownError) as exc:
-        raise EvidenceUnreadableError(str(exc)) from exc
     except ManagedObjectiveMissingError as exc:
         raise MlflowObjectiveMissingError(str(exc)) from exc
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:  # every NO_ANSWER error included
         if isinstance(exc, UnsafeProcessCleanupError):
             raise
-        raise ExtractorError(str(exc)) from exc
+        if not gave_no_answer(exc):
+            raise ExtractorError(str(exc)) from exc
+        if isinstance(exc, TimeoutError) and deadline is not None and time.monotonic() >= deadline:
+            raise DeadlineExceededError(str(exc)) from exc
+        raise EvidenceUnreadableError(str(exc)) from exc
     ctx.mlflow_capture.update(retrieved)
     return capture
 

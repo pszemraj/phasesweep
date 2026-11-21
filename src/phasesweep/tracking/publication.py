@@ -21,14 +21,12 @@ from phasesweep.runtime.json import (
     json_number,
     json_object,
 )
-from phasesweep.runtime.shutdown import PhaseSweepShutdown, servicing_shutdown_signal
+from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText, plural
-from phasesweep.tracking.mlflow import OperationRejectedError
 from phasesweep.tracking.records import validate_binding
 from phasesweep.tracking.session import (
     BINDING_FILE,
     GENERATION_BINDING_FILE,
-    NO_ANSWER,
     SYNC_TRACKING_STEP,
     DeliveryTally,
     call_tracking,
@@ -41,7 +39,6 @@ from phasesweep.tracking.session import (
     require_tracking_target,
     resolve_pending_creations,
     tracking_root,
-    unready_target_text,
     write_record,
 )
 
@@ -221,29 +218,22 @@ def _send(
         except ProcessCleanupUncertainError:
             raise
         except (OSError, ValueError, RuntimeError) as exc:  # every NO_ANSWER error included
-            if servicing_shutdown_signal() is not None:
-                # A shutdown refuses every worker launch and kills running workers, so this
-                # failure says nothing about MLflow.
-                tally.sending = False
+            failure = tally.note_failure(experiment, path, exc)
+            if failure == "shutdown":
                 break
-            unanswered = isinstance(exc, NO_ANSWER)
-            if isinstance(exc, OperationRejectedError) and not unanswered:
-                if path in tally.refused:
-                    # Warned when first refused in this delivery; the closing line counts it.
-                    continue
-                tally.refused.add(path)
+            if failure == "refused again":
+                # Warned when first refused in this delivery; the closing line counts it.
+                continue
             later = len(paths) - index - 1
             log.warning(
                 "MLflow: %s is pending (%s).%s",
                 record_name(path),
                 exc,
                 f" MLflow did not answer, so {plural(later, 'later record')} must wait too."
-                if unanswered and later
+                if failure == "no answer" and later
                 else "",
             )
-            if unanswered:
-                tally.sending = False
-                tally.unanswered = unready_target_text(experiment, exc)
+            if failure == "no answer":
                 break
             continue
         tally.refused.discard(path)

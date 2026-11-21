@@ -11,7 +11,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
@@ -68,6 +68,8 @@ NO_ANSWER: tuple[type[Exception], ...] = (
     OperationUnavailableError,
     OperationOutcomeUnknownError,
 )
+# What one failed request of a delivery was, as DeliveryTally.note_failure classifies it.
+RequestFailure = Literal["shutdown", "no answer", "refused", "refused again", "other"]
 # The step that sends what a run left pending, as every line a run logs names it. These lines
 # also reach run.log and an MCP runner's log, where no command follows them, so they say in words
 # what the command needs; the CLI prints the command as typed after a run that leaves work pending.
@@ -98,6 +100,48 @@ class DeliveryTally:
     They stay pending. A record is warned about and counted once however many passes refuse it,
     and leaves the set once a later request delivers or settles it.
     """
+
+    def note_failure(
+        self, experiment: Experiment, path: Path, exc: BaseException
+    ) -> RequestFailure:
+        """Record what one failed request of this delivery means for the rest of it.
+
+        During a shutdown the failure says nothing about MLflow, as a shutdown refuses every
+        worker launch and kills running workers, so the delivery stops quietly. When MLflow gave
+        no answer, the next request would meet the same tracker, so the delivery stops and keeps
+        why. A refusal MLflow answered concerns its record alone, which stays pending.
+
+        :param Experiment experiment: The delivery's MLflow-backed experiment.
+        :param Path path: The delivery record or creation intent the request was for.
+        :param BaseException exc: The request's error.
+        :return RequestFailure: Which it was: ``shutdown``, ``no answer``, ``refused``,
+            ``refused again`` for a refusal this delivery already met, or ``other``.
+        """
+        if servicing_shutdown_signal() is not None:
+            self.sending = False
+            return "shutdown"
+        if gave_no_answer(exc):
+            self.sending = False
+            self.unanswered = unready_target_text(experiment, exc)
+            return "no answer"
+        if not isinstance(exc, OperationRejectedError):
+            return "other"
+        if path in self.refused:
+            return "refused again"
+        self.refused.add(path)
+        return "refused"
+
+
+def gave_no_answer(exc: BaseException) -> bool:
+    """Tell a request MLflow gave no answer to from one it answered with a failure.
+
+    A creation whose answer was lost and that no search could confirm is raised from the error
+    that lost it, so that cause counts too.
+
+    :param BaseException exc: The failed request's error.
+    :return bool: Whether ``exc`` or its cause is one of :data:`NO_ANSWER`.
+    """
+    return isinstance(exc, NO_ANSWER) or isinstance(exc.__cause__, NO_ANSWER)
 
 
 def record_name(path: Path) -> str:
@@ -587,28 +631,18 @@ def _reconcile_creation(
     except PhaseSweepError:
         raise
     except (TimeoutError, ValueError, RuntimeError) as exc:  # every NO_ANSWER error included
-        if servicing_shutdown_signal() is not None:
-            # A shutdown refuses every worker launch and kills running workers, so this failure
-            # says nothing about MLflow; nothing more is sent, and nothing blames it.
-            tally.sending = False
-            return
-        if not isinstance(exc, NO_ANSWER):
-            if isinstance(exc, OperationRejectedError):
-                if pending in tally.refused:
-                    # Warned when first refused in this delivery; the closing line counts it.
-                    return
-                tally.refused.add(pending)
-            log.warning("MLflow: %s is still unresolved (%s).", record_name(pending), exc)
-            return
-        # The pass sends nothing after this, so this is its only outage warning.
-        log.warning(
-            "MLflow: %s is still unresolved (%s). MLflow did not answer, so later searches and "
-            "uploads wait too.",
-            record_name(pending),
-            exc,
-        )
-        tally.sending = False
-        tally.unanswered = unready_target_text(experiment, exc)
+        failure = tally.note_failure(experiment, pending, exc)
+        # Nothing blames MLflow for a shutdown, and a refusal met before is counted already.
+        if failure not in ("shutdown", "refused again"):
+            # After no answer the pass sends nothing more, so this is its only outage warning.
+            log.warning(
+                "MLflow: %s is still unresolved (%s).%s",
+                record_name(pending),
+                exc,
+                " MLflow did not answer, so later searches and uploads wait too."
+                if failure == "no answer"
+                else "",
+            )
         return
     if binding is not None:
         write_record(path, binding)
@@ -766,10 +800,9 @@ def require_tracking_target(
         # A server that gave no answer may give one to the same command later, and so may one
         # whose creation answer was lost; a refusal it answered, such as a missing experiment,
         # needs the configuration or MLflow fixed first.
-        unanswered = isinstance(exc, NO_ANSWER) or isinstance(exc.__cause__, NO_ANSWER)
         raise TrackingTargetUnavailableError(
             unready_target_text(experiment, exc) + launch,
-            action=OperatorAction.RETRY if unanswered else None,
+            action=OperatorAction.RETRY if gave_no_answer(exc) else None,
         ) from exc
 
 
