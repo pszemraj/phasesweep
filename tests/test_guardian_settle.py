@@ -936,14 +936,22 @@ def test_the_next_trial_waits_for_the_rank_a_killed_launcher_left(
 
 @pytest.mark.skipif(sys.platform != "linux", reason="reads Linux procfs command lines")
 def test_a_survivor_is_named_by_its_script_behind_long_paths(tmp_path: Path) -> None:
-    """Each argument shows the last component of its path, an option keeping its name."""
+    """Each absolute path shows its last component, an option keeping its name; a relative value such as a model ID stays whole."""
     deep = tmp_path / ("d" * 80) / "run"
     deep.mkdir(parents=True)
     script = deep / "rank_train.py"
     script.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
     config = deep / "config.yaml"
     proc = subprocess.Popen(
-        [sys.executable, "-u", str(script), "--config", str(config), f"--out={deep}/"]
+        [
+            sys.executable,
+            "-u",
+            str(script),
+            "--config",
+            str(config),
+            "--model=meta-llama/Llama-3.1-8B",
+            f"--out={deep}/",
+        ]
     )
     try:
         deadline = time.monotonic() + 5.0
@@ -958,7 +966,8 @@ def test_a_survivor_is_named_by_its_script_behind_long_paths(tmp_path: Path) -> 
 
     interpreter = Path(sys.executable).name
     assert described == (
-        f"{proc.pid} ({interpreter} -u rank_train.py --config config.yaml --out=run)"
+        f"{proc.pid} ({interpreter} -u rank_train.py --config config.yaml "
+        "--model=meta-llama/Llama-3.1-8B --out=run)"
     )
 
 

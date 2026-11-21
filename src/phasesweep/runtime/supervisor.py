@@ -343,21 +343,22 @@ def _trainer_alive(pgid: int, members: list[int] | None = None, *, adopts: bool)
 
 
 def _short_argument(argument: str) -> str:
-    """Cut one command-line argument to the last component of the path it names.
+    """Cut an argument that is an absolute path to the path's last component.
 
     The survivors are terminated before anyone reads their names, so the command line is
     all that identifies them, and an interpreter or checkout prefix would otherwise fill
     the entry before the script's name. An option keeps its name: ``--config=/a/b.yaml``
-    reads ``--config=b.yaml``. An argument with whitespace or a URL scheme, such as inline
-    code after ``-c`` or a tracking URI, is no path and is kept whole.
+    reads ``--config=b.yaml``. Anything else is kept whole: a relative value such as the
+    model ID ``meta-llama/Llama-3.1-8B`` names more than its last part, and an argument
+    with whitespace, such as inline code after ``-c``, is no single path.
 
     :param str argument: One argument of a process's command line.
-    :return str: The argument with any directory prefix removed.
+    :return str: The argument with an absolute path's directory prefix removed.
     """
     option, separator, value = (
         argument.partition("=") if argument.startswith("-") else ("", "", argument)
     )
-    if "://" in value or len(value.split()) != 1:
+    if not value.startswith("/") or len(value.split()) != 1:
         return argument
     return option + separator + (value.rstrip("/").rsplit("/", 1)[-1] or value)
 
