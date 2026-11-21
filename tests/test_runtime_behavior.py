@@ -1064,6 +1064,7 @@ def test_transient_trial_outcome_write_failure_is_retried(
     assert [trial.state.name for trial in trials] == ["COMPLETE", "COMPLETE"]
     assert [trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials] == [1, 2]
     assert all(trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "success" for trial in trials)
+    assert all(trial.user_attrs[TRIAL_OUTCOME_ATTR]["metric"] == 0.5 for trial in trials)
 
 
 @pytest.mark.integration

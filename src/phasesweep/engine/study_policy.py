@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISREG
@@ -54,9 +54,9 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
-    _parsed_trial_outcome,
     _study_schema_supported,
     _trial_interrupted,
+    _unique_trial_outcomes,
 )
 from phasesweep.engine.trial import EnvironmentIdentity, _environment_identity, _missing_trainer_cwd
 from phasesweep.errors import (
@@ -249,16 +249,11 @@ def _load_recovery_record(study: optuna.Study) -> _RecoveryRecord | None:
     return _RecoveryRecord(start_after_sequence, trial_target)
 
 
-def _load_phase_policy_state(
-    study: optuna.Study, *, leave_out: Collection[int] = ()
-) -> _PhasePolicyState:
+def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
     """Validate and reconstruct the durable consecutive-failure state.
 
     :param optuna.Study study: Study whose ``PHASE_RECOVERY_ATTR`` and
         per-trial outcome attrs are read and validated.
-    :param Collection[int] leave_out: Numbers of RUNNING trials whose records stale recovery
-        replaces, which a replay predicting the state after that recovery skips; defaults to
-        none, replaying every record.
     :return _PhasePolicyState: Reconstructed state: the highest recorded
         outcome sequence, the consecutive-failure count since the last
         recovery boundary, and the first abort recorded after it (if any)
@@ -271,31 +266,20 @@ def _load_phase_policy_state(
     recovery = _load_recovery_record(study)
     recovery_boundary = 0 if recovery is None else recovery.start_after_sequence
 
-    events: list[tuple[int, str, dict[str, Any] | None, int]] = []
-    seen_sequences: dict[int, int] = {}
-    for trial in study.get_trials(deepcopy=False):
-        if trial.number in leave_out:
-            continue
-        raw = trial.user_attrs.get(TRIAL_OUTCOME_ATTR)
-        parsed = _parsed_trial_outcome(raw)
-        if trial.state.is_finished() and parsed is None:
+    trials = study.get_trials(deepcopy=False)
+    outcomes = _unique_trial_outcomes(trials)
+    for trial in trials:
+        if trial.state.is_finished() and trial.number not in outcomes:
+            raw = trial.user_attrs.get(TRIAL_OUTCOME_ATTR)
             raise _phase_policy_schema_error(
                 study,
                 f"terminal trial {trial.number} has missing or malformed "
                 f"{TRIAL_OUTCOME_ATTR!r}: {raw!r}",
             )
-        if parsed is None:
-            continue
-        sequence = parsed.sequence
-        other_trial = seen_sequences.get(sequence)
-        if other_trial is not None:
-            raise _phase_policy_schema_error(
-                study,
-                f"trials {other_trial} and {trial.number} both use completion sequence {sequence}",
-            )
-        seen_sequences[sequence] = trial.number
-        events.append((sequence, parsed.outcome, parsed.abort, trial.number))
-
+    events = [
+        (parsed.sequence, parsed.outcome, parsed.abort, number)
+        for number, parsed in outcomes.items()
+    ]
     events.sort(key=lambda event: event[0])
     max_sequence = events[-1][0] if events else 0
     if recovery_boundary > max_sequence:

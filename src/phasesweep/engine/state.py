@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import math
-from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 from phasesweep.config.common import _validate_safe_name
-from phasesweep.runtime.json import JsonObject, json_object, strict_json_loads
+from phasesweep.engine.errors import StudySchemaMismatchError
+from phasesweep.runtime.json import JsonObject, json_object
 
 if TYPE_CHECKING:
     from optuna.trial import FrozenTrial, Trial
@@ -169,7 +169,7 @@ PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
 # it so a refusal can name which keys changed instead of two opaque hashes.
 PHASE_FINGERPRINT_PAYLOAD_ATTR = "phasesweep_fingerprint_payload"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 11
+STUDY_SCHEMA_VERSION = 12
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The
@@ -178,7 +178,7 @@ TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # a restarted orchestrator cannot reinterpret the same terminal trials as a
 # completed phase.
 TRIAL_OUTCOME_ATTR = "phasesweep_trial_outcome"
-TRIAL_OUTCOME_SCHEMA_VERSION = 2
+TRIAL_OUTCOME_SCHEMA_VERSION = 3
 TRIAL_OUTCOME_ABORT_KEY = "abort"
 # ``interrupted`` is the one label for a trial whose orchestrator stopped it before it
 # could finish: a signal, a phase or run deadline, or recovery after the orchestrator died.
@@ -294,6 +294,7 @@ class _ParsedTrialOutcome:
 
     sequence: int
     outcome: str
+    metric: float | None
     cause: str | None
     policy: str | None
     abort: JsonObject | None
@@ -331,6 +332,7 @@ def _trial_outcome_payload(
     sequence: int,
     outcome: str,
     *,
+    metric: float | None = None,
     cause: str | None = None,
     policy: str | None = None,
     abort: JsonObject | None = None,
@@ -339,6 +341,7 @@ def _trial_outcome_payload(
 
     :param int sequence: Completion sequence assigned under the outcome lock.
     :param str outcome: Terminal outcome category.
+    :param float | None metric: Accepted scalar to tell Optuna, including measured infeasibility.
     :param str | None cause: Failure explanation when present.
     :param str | None policy: Fatal policy when present.
     :param JsonObject | None abort: Phase abort tripped by this outcome.
@@ -349,6 +352,8 @@ def _trial_outcome_payload(
         "sequence": sequence,
         "outcome": outcome,
     }
+    if metric is not None:
+        payload["metric"] = metric
     if cause is not None:
         payload["cause"] = cause
     if policy is not None:
@@ -372,6 +377,7 @@ def _parsed_trial_outcome(value: object) -> _ParsedTrialOutcome | None:
     schema_version = value.get("schema_version")
     sequence = value.get("sequence")
     outcome = value.get("outcome")
+    metric = value.get("metric")
     cause = value.get("cause")
     policy = value.get("policy")
     abort = value.get(TRIAL_OUTCOME_ABORT_KEY)
@@ -381,6 +387,8 @@ def _parsed_trial_outcome(value: object) -> _ParsedTrialOutcome | None:
         or sequence < 1
         or not isinstance(outcome, str)
         or outcome not in _TRIAL_OUTCOMES
+        or (outcome == "success" and metric is None)
+        or (metric is not None and outcome not in {"success", "failure"})
         or (cause is not None and not isinstance(cause, str))
         or (
             policy is not None and (outcome != "fatal" or not isinstance(policy, str) or not policy)
@@ -395,64 +403,46 @@ def _parsed_trial_outcome(value: object) -> _ParsedTrialOutcome | None:
     ):
         return None
     try:
+        if metric is not None and (
+            isinstance(metric, bool)
+            or not isinstance(metric, int | float)
+            or not math.isfinite(metric)
+        ):
+            return None
         abort_record = None if abort is None else json_object(abort)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     return _ParsedTrialOutcome(
         sequence=sequence,
         outcome=outcome,
+        metric=None if metric is None else float(metric),
         cause=cause,
         policy=policy,
         abort=abort_record,
     )
 
 
-def _stale_recovery_outcome(parsed: _ParsedTrialOutcome | None) -> str:
-    """Return the durable outcome to record when recovering a RUNNING trial.
+def _unique_trial_outcomes(trials: Iterable[FrozenTrial]) -> dict[int, _ParsedTrialOutcome]:
+    """Read valid outcomes and reject duplicate completion sequences.
 
-    Preserve recorded failure, fatal, or interrupted outcomes. Missing or uncommitted
-    success outcomes recover as interrupted. Preview uses the same rule.
-
-    :param _ParsedTrialOutcome | None parsed: The trial's valid, unduplicated recorded
-        outcome, or ``None`` when it has none.
-    :return str: ``failure``, ``fatal`` or ``interrupted``.
+    :param Iterable[FrozenTrial] trials: Trials from one study.
+    :raises StudySchemaMismatchError: Two outcomes share a completion sequence.
+    :return dict[int, _ParsedTrialOutcome]: Parsed outcomes keyed by trial number.
     """
-    if parsed is not None and parsed.outcome in {"failure", "fatal", "interrupted"}:
-        return parsed.outcome
-    return "interrupted"
-
-
-def _outcome_sequence_counts(trials: Iterable[FrozenTrial]) -> Counter[int]:
-    """Count how many trials' valid outcome records carry each sequence.
-
-    :param Iterable[FrozenTrial] trials: Every trial of one study.
-    :return Counter[int]: Records per sequence number.
-    """
-    return Counter(
-        parsed.sequence
-        for trial in trials
-        if (parsed := _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))) is not None
-    )
-
-
-def _unduplicated_outcome(
-    trial: FrozenTrial, sequence_counts: Counter[int]
-) -> _ParsedTrialOutcome | None:
-    """Return a trial's recorded outcome unless another record shares its sequence.
-
-    Stale recovery discards a duplicated record and records ``interrupted`` with a
-    fresh sequence, so its prediction must discard the same records.
-
-    :param FrozenTrial trial: Trial whose record is read.
-    :param Counter[int] sequence_counts: The study's
-        :func:`_outcome_sequence_counts`.
-    :return _ParsedTrialOutcome | None: The valid record, or ``None`` when it is
-        missing, malformed or duplicated.
-    """
-    parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
-    if parsed is None or sequence_counts[parsed.sequence] != 1:
-        return None
-    return parsed
+    outcomes: dict[int, _ParsedTrialOutcome] = {}
+    sequences: dict[int, int] = {}
+    for trial in trials:
+        parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+        if parsed is None:
+            continue
+        other = sequences.get(parsed.sequence)
+        if other is not None:
+            raise StudySchemaMismatchError(
+                f"trials {other} and {trial.number} both use completion sequence {parsed.sequence}"
+            )
+        sequences[parsed.sequence] = trial.number
+        outcomes[trial.number] = parsed
+    return outcomes
 
 
 def _completed_trainer_duration(
@@ -489,72 +479,31 @@ def _completed_trainer_duration(
         return None
 
 
-def _recorded_infeasible_result(trial: FrozenTrial, outcome: _ParsedTrialOutcome | None) -> bool:
-    """Recognize extracted bound violations that still commit as measured COMPLETE trials.
-
-    A failed gate can retain the objective's provenance. The recorded gates distinguish
-    that failure even when the separate failure-reason write has not committed.
-
-    :param FrozenTrial trial: Trial carrying canonical extracted result attributes.
-    :param _ParsedTrialOutcome | None outcome: Parsed terminal outcome, when recorded.
-    :return bool: Whether a failed outcome represents measured infeasibility.
-    """
-    if not (
-        outcome is not None
-        and outcome.outcome == "failure"
-        and trial.user_attrs.get(FEASIBLE_ATTR) is False
-        and trial.user_attrs.get(RETURN_CODE_ATTR) == 0
-        and isinstance(trial.user_attrs.get(OBJECTIVE_PROVENANCE_ATTR), str)
-        and FAILURE_REASON_ATTR not in trial.user_attrs
-    ):
-        return False
-    raw_gates = trial.user_attrs.get(GATES_ATTR)
-    if raw_gates is None:
-        return True
-    if not isinstance(raw_gates, str):
-        return False
-    try:
-        gates = strict_json_loads(raw_gates)
-    except ValueError:
-        return False
-    return isinstance(gates, list) and all(
-        isinstance(gate, dict) and gate.get("passed") is True for gate in gates
-    )
-
-
 def _recovered_trial_state(
-    trial: FrozenTrial, sequence_counts: Counter[int]
+    trial: FrozenTrial, outcome: _ParsedTrialOutcome | None
 ) -> RecoveredTrialState:
-    """Predict the counted state stale recovery derives from a RUNNING trial's outcome.
+    """Predict the recovery disposition of a RUNNING trial.
 
-    :param FrozenTrial trial: RUNNING trial to predict for.
-    :param Counter[int] sequence_counts: The study's
-        :func:`_outcome_sequence_counts`, so a duplicated record is discarded
-        as recovery discards it.
-    :return RecoveredTrialState: ``EVIDENCE_PENDING`` for successful trainer evidence awaiting extraction, ``FAIL`` for recorded failure or fatal error, otherwise ``INTERRUPTED``.
+    :param FrozenTrial trial: Trial whose finished training may await extraction.
+    :param _ParsedTrialOutcome | None outcome: Its unique committed outcome, if any.
+    :return RecoveredTrialState: Pending evidence, a recorded failure, or an interruption.
     """
     from phasesweep.runtime.process import read_attempt_lifecycle
 
-    parsed = _unduplicated_outcome(trial, sequence_counts)
+    if outcome is not None:
+        if outcome.metric is not None:
+            return "EVIDENCE_PENDING"
+        return "INTERRUPTED" if outcome.outcome == "interrupted" else "FAIL"
     directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
     attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
-    if (
-        (
-            parsed is None
-            or parsed.outcome == "success"
-            or _recorded_infeasible_result(trial, parsed)
-        )
-        and isinstance(directory, str)
-        and isinstance(attempt_id, str)
-    ):
+    if isinstance(directory, str) and isinstance(attempt_id, str):
         try:
             lifecycle = read_attempt_lifecycle(Path(directory), expected_attempt_id=attempt_id)
         except ValueError:
             lifecycle = None
         if lifecycle is not None and _completed_trainer_duration(trial, lifecycle) is not None:
             return "EVIDENCE_PENDING"
-    outcome = _stale_recovery_outcome(parsed)
-    return "INTERRUPTED" if outcome == "interrupted" else "FAIL"
+    return "INTERRUPTED"
 
 
 def _trial_interrupted(trial: FrozenTrial) -> bool:

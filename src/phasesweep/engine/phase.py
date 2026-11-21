@@ -929,6 +929,7 @@ def _record_outcome(
     trial: optuna.Trial,
     outcome: str,
     *,
+    metric: float | None = None,
     cause: str | None = None,
     fatal_policy: str | None = None,
 ) -> None:
@@ -942,6 +943,7 @@ def _record_outcome(
     :param _PhaseExecution run: Phase execution whose counters advance after the durable write.
     :param optuna.Trial trial: Trial receiving the outcome record.
     :param str outcome: ``success``, ``failure``, ``interrupted``, or ``fatal``.
+    :param float | None metric: Accepted objective, also recorded when it violates bounds.
     :param str | None cause: Optional explanation stored in the outcome.
     :param str | None fatal_policy: Optional policy stored in the outcome and fatal abort.
     :raises _TrialLeftRunning: Retries exhausted or an outcome remains unconfirmed; leave
@@ -963,6 +965,7 @@ def _record_outcome(
             payload = _trial_outcome_payload(
                 run.completion_sequence + 1,
                 outcome,
+                metric=metric,
                 cause=cause,
                 policy=fatal_policy,
                 abort=abort_record,
@@ -1252,6 +1255,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         run,
         trial,
         "success" if result.feasible else "failure",
+        metric=result.metric,
         cause=(
             None
             if result.feasible

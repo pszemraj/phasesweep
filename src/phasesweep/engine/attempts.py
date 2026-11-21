@@ -20,6 +20,7 @@ from phasesweep.engine.errors import (
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrackingTargetUnavailableError,
+    TrialEvidenceMissingError,
     tracker_unreadable,
 )
 from phasesweep.engine.ledger import open_registry_study
@@ -39,12 +40,9 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     _completed_trainer_duration,
-    _outcome_sequence_counts,
     _parsed_trial_outcome,
-    _recorded_infeasible_result,
-    _stale_recovery_outcome,
     _trial_outcome_payload,
-    _unduplicated_outcome,
+    _unique_trial_outcomes,
 )
 from phasesweep.errors import (
     OperatorAction,
@@ -60,7 +58,7 @@ from phasesweep.runtime.files import (
     read_private_text_at,
     storage_recovery_locator,
 )
-from phasesweep.runtime.json import JsonObject, json_text, strict_json_loads
+from phasesweep.runtime.json import json_text, strict_json_loads
 from phasesweep.runtime.process import (
     AttemptLifecycle,
     _record_attempt_exited,
@@ -646,109 +644,57 @@ def _trial_requires_cleanup_recovery(trial: optuna.trial.FrozenTrial) -> bool:
 def _record_stale_trial_outcome(
     study: optuna.Study,
     trial: optuna.trial.FrozenTrial,
+    outcome: str = "interrupted",
     *,
-    completed_feasible: bool | None = None,
-    evidence_failure: str | None = None,
+    metric: float | None = None,
+    cause: str | None = None,
     policy_phase: Phase | None = None,
 ) -> None:
-    """Record a recovered result or interruption before advancing stale-trial recovery.
+    """Commit a newly recovered verdict in completion order, preserving any existing decision.
 
-    Keep recorded failures, fatal errors, interruptions, and their aborts. A finished
-    trainer's evidence decides its outcome as it does a live trial's; an unproven success or
-    missing outcome becomes interrupted and reruns. Malformed or duplicate outcomes receive a
-    fresh sequence. An evidence verdict recorded at a fresh sequence trips the producing
-    phase's failure limit as the live path would, through the same decision, and its abort is
-    written with the outcome. A verdict at the sequence of the trial's own valid record keeps
-    that record's abort only when it agrees with the record, and an interruption trips none.
-
-    :param optuna.Study study: Study providing outcome sequences.
-    :param optuna.trial.FrozenTrial trial: Stale RUNNING trial.
-    :param bool | None completed_feasible: Recovered result feasibility, or None when no
-        result was accepted.
-    :param str | None evidence_failure: Why a finished trainer's evidence was rejected, recorded
-        as the cause of a failure, or None when no evidence answered.
-    :param Phase | None policy_phase: Producing phase whose failure policy an evidence verdict
-        is recorded under, or None when no evidence answered.
-    :raises StudySchemaMismatchError: The study's recorded outcomes cannot be replayed to
-        decide an evidence verdict's abort; nothing is written.
-    :raises StudyStorageUnavailableError: Outcome state could not be read or persisted; leave the trial RUNNING.
+    :param optuna.Study study: Owning study.
+    :param optuna.trial.FrozenTrial trial: Trial being settled.
+    :param str outcome: Success, failure, or an interruption when no measurement exists.
+    :param float | None metric: Accepted objective, including measured infeasibility.
+    :param str | None cause: Reason for a failure or interruption.
+    :param Phase | None policy_phase: Producing phase whose failure limit applies to a new verdict.
+    :raises StudySchemaMismatchError: The durable completion order is invalid.
+    :raises StudyStorageUnavailableError: Recovery could not read or commit the decision.
     """
     from phasesweep.engine.phase import _abort_decision
     from phasesweep.engine.study_policy import _load_phase_policy_state
 
-    outcome: str | None = None
     try:
-        trials = study.get_trials(deepcopy=False)
-        sequence_counts = _outcome_sequence_counts(trials)
-        current = next(
-            (candidate for candidate in trials if candidate.number == trial.number), trial
-        )
-        existing = _unduplicated_outcome(current, sequence_counts)
-        if completed_feasible is not None:
-            outcome = "success" if completed_feasible else "failure"
-        elif evidence_failure is not None:
-            outcome = "failure"
-        else:
-            outcome = _stale_recovery_outcome(existing)
-        policy: str | None = None
-        abort: JsonObject | None = None
-        if existing is None:
-            sequence = max(sequence_counts, default=0) + 1
-            cause: str | None = "stale RUNNING trial recovered after its orchestrator stopped"
-            if policy_phase is not None:
-                # A disputed RUNNING record has no trustworthy place in completion order.
-                replaced = [
-                    candidate
-                    for candidate in trials
-                    if candidate.state == optuna.trial.TrialState.RUNNING
-                    and _parsed_trial_outcome(candidate.user_attrs.get(TRIAL_OUTCOME_ATTR))
-                    is not None
-                    and _unduplicated_outcome(candidate, sequence_counts) is None
-                ]
-                state = _load_phase_policy_state(
-                    study, leave_out={candidate.number for candidate in replaced}
-                )
-                # Clear the disputed outcomes before committing a verdict based on their
-                # absence. Otherwise the last holder can retain the old sequence on restart.
-                for candidate in replaced:
-                    optuna.Trial(study, candidate._trial_id).set_user_attr(TRIAL_OUTCOME_ATTR, None)
-                abort = _abort_decision(
-                    policy_phase,
-                    trial.number,
-                    outcome,
-                    # The abort belongs at this outcome's own sequence.
-                    completion_sequence=sequence - 1,
-                    consecutive_failures=state.consecutive_failures,
-                    abort_recorded=state.abort is not None,
-                )
-        elif existing.outcome == outcome:
-            sequence = existing.sequence
-            cause = existing.cause
-            policy = existing.policy
-            abort = existing.abort
-        else:
-            sequence = existing.sequence
-            cause = "orchestrator stopped before Optuna committed the terminal trial state"
-
-        if completed_feasible is not None:
-            cause = (
-                None
-                if completed_feasible
-                else "recovered evidence violates metric or constraint bounds"
+        state = _load_phase_policy_state(study)
+        if (
+            _parsed_trial_outcome(
+                study._storage.get_trial(trial._trial_id).user_attrs.get(TRIAL_OUTCOME_ATTR)
             )
-        elif evidence_failure is not None:
-            cause = evidence_failure
-        payload = _trial_outcome_payload(sequence, outcome, cause=cause, policy=policy, abort=abort)
-        active_trial = optuna.Trial(study, trial._trial_id)
-        active_trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
+            is not None
+        ):
+            return
+        abort = None
+        if policy_phase is not None:
+            abort = _abort_decision(
+                policy_phase,
+                trial.number,
+                outcome,
+                completion_sequence=state.max_sequence,
+                consecutive_failures=state.consecutive_failures,
+                abort_recorded=state.abort is not None,
+            )
+        if outcome == "interrupted" and cause is None:
+            cause = "stale RUNNING trial recovered after its orchestrator stopped"
+        payload = _trial_outcome_payload(
+            state.max_sequence + 1, outcome, metric=metric, cause=cause, abort=abort
+        )
+        optuna.Trial(study, trial._trial_id).set_user_attr(TRIAL_OUTCOME_ATTR, payload)
     except StudySchemaMismatchError:
         raise
     except Exception as exc:
         raise StudyStorageUnavailableError(
-            f"Recovery of stale RUNNING trial {trial.number} in study "
-            f"{study.study_name!r} cannot advance because its durable {outcome or 'recovered'} outcome could not be recorded. "
-            "The trial remains RUNNING so a later retry records its outcome before anything "
-            "counts it."
+            f"Recovery of stale RUNNING trial {trial.number} in study {study.study_name!r} cannot advance "
+            f"because its durable {outcome} outcome could not be recorded."
         ) from exc
 
 
@@ -1191,7 +1137,6 @@ def _recover_completed_trial(
     :raises TrackingTargetUnavailableError: The tracker gave no answer and no report
         collects the pending attempt for a refusal after the pass.
     """
-    from phasesweep.engine.evidence import _recorded_trial_metric
     from phasesweep.engine.trial import (
         ExecutedTrial,
         _environment_identity,
@@ -1204,16 +1149,6 @@ def _recover_completed_trial(
     from phasesweep.runtime.process import ProcessResult
 
     lifecycle = read_attempt_lifecycle(record.trial_dir, expected_attempt_id=record.attempt_id)
-    outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
-    if outcome is not None:
-        try:
-            sequences = _outcome_sequence_counts(study.get_trials(deepcopy=False))
-        except Exception as exc:
-            raise StudyStorageUnavailableError(
-                f"Cannot verify the recorded outcome sequence for trial {trial.number} in study {study.study_name!r}."
-            ) from exc
-        outcome = _unduplicated_outcome(trial, sequences)
-    measured_infeasible = _recorded_infeasible_result(trial, outcome)
     trainer_duration = None if lifecycle is None else _completed_trainer_duration(trial, lifecycle)
     if (
         lifecycle is None
@@ -1221,7 +1156,6 @@ def _recover_completed_trial(
         or not lifecycle.cleanup_confirmed
         or trainer_duration is None
         or record.generation_id is None
-        or (outcome is not None and outcome.outcome != "success" and not measured_infeasible)
     ):
         return False
     if servicing_shutdown_signal() is not None:
@@ -1229,7 +1163,7 @@ def _recover_completed_trial(
             record.attempt_id, record.phase_name, trial.number, persistent=True
         )
         return None
-    if outcome is None and report is not None and report.unreadable_tracker is not None:
+    if report is not None and report.unreadable_tracker is not None:
         # This pass already found a tracker unreadable; keep the training without
         # spending another read's timeout on it.
         report.unreadable_evidence.setdefault(record.attempt_id, report.unreadable_tracker)
@@ -1270,12 +1204,6 @@ def _recover_completed_trial(
         wandb_environment=environment,
         mlflow_environment=environment,
     )
-    if outcome is not None:
-        # A measured outcome commits after all evidence attributes and before Optuna's tell.
-        # Only the terminal transition is outstanding, even if a peer has since completed.
-        metric = _recorded_trial_metric(experiment, phase, trial, ctx)
-        _tell_recovered_trial(study, trial, record, metric, report)
-        return True
     active_trial = optuna.Trial(study, trial._trial_id)
     try:
         active_trial.set_user_attr(DURATION_ATTR, trainer_duration)
@@ -1321,19 +1249,19 @@ def _recover_completed_trial(
         assert result.metric is not None
     try:
         record_trial_result(active_trial, result, overrides_json=overrides_json)
+        cause = result.failure_reason
+        if cause is None and not result.feasible:
+            cause = "recovered evidence violates metric or constraint bounds"
+        _record_stale_trial_outcome(
+            study,
+            trial,
+            "success" if result.feasible else "failure",
+            metric=result.metric,
+            cause=cause,
+            policy_phase=phase,
+        )
         if result.failure_reason is not None:
-            # The tracker answered about finished training, so this is the trial's measured
-            # failure, recorded as the live path records it; only unproven training reruns.
-            _record_stale_trial_outcome(
-                study, trial, evidence_failure=result.failure_reason, policy_phase=phase
-            )
-            # The outcome owns the verdict. Writing this diagnostic first would make a
-            # retry skip extraction even if the failure and its abort never committed.
             active_trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
-        else:
-            _record_stale_trial_outcome(
-                study, trial, completed_feasible=result.feasible, policy_phase=phase
-            )
     except StudySchemaMismatchError:
         raise
     except Exception as exc:
@@ -1424,20 +1352,43 @@ def _fail_stale_running_trial(
     """
     try:
         trial = study._storage.get_trial(trial._trial_id)
+        outcome = _unique_trial_outcomes(study.get_trials(deepcopy=False)).get(trial.number)
+    except StudySchemaMismatchError:
+        raise
     except Exception as exc:
         raise StudyStorageUnavailableError(
             f"Recovery of stale RUNNING trial {trial.number} in study {study.study_name!r} could not reload its durable outcome before settlement. The trial remains RUNNING for retry."
         ) from exc
-    recovered = False
-    if record is not None and experiment is not None:
+    if outcome is not None and outcome.metric is not None:
+        from phasesweep.engine.evidence import _EvidenceVerification
+
+        if record is None or record.generation_id is None or experiment is None:
+            raise TrialEvidenceMissingError(
+                f"Trial {trial.number} in study {study.study_name!r} has a recorded measurement but no producing attempt to verify."
+            )
+        producing = _load_generation_experiment(_experiment_dir(experiment), record.generation_id)
+        _EvidenceVerification(producing, producing.phase(record.phase_name)).verify_trial(
+            trial,
+            record.trial_dir,
+            record.attempt_id,
+            outcome.metric,
+            subject=f"Phase {record.phase_name!r} trial {trial.number}",
+            verify_digest=True,
+        )
+        _tell_recovered_trial(study, trial, record, outcome.metric, report)
+        recovered = True
+    elif outcome is None and record is not None and experiment is not None:
         extracted = _recover_completed_trial(
             study, trial, record=record, current=experiment, report=report
         )
         if extracted is None:
             return False
         recovered = extracted
+    else:
+        recovered = False
     if not recovered:
-        _record_stale_trial_outcome(study, trial)
+        if outcome is None:
+            _record_stale_trial_outcome(study, trial)
         _record_cleanup_recovery(study, trial)
         try:
             study.tell(trial.number, state=optuna.trial.TrialState.FAIL)

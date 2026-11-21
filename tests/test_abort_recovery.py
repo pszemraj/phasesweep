@@ -102,7 +102,7 @@ def test_parallel_outcome_write_with_lost_acknowledgment(
     def record_peer_outcome() -> None:
         assert committed.wait(timeout=10)
         peer_ready.set()
-        phase_module._record_outcome(run, peer, "success")
+        phase_module._record_outcome(run, peer, "success", metric=0.5)
 
     monkeypatch.setattr(first, "set_user_attr", write_without_acknowledgment)
     monkeypatch.setattr(storage, "get_trial", read_trial)
@@ -123,7 +123,7 @@ def test_parallel_outcome_write_with_lost_acknowledgment(
     assert state.abort_streak == (first.number,)
     attrs = replay.trials[peer.number].user_attrs
     if readback_available:
-        assert attrs[TRIAL_OUTCOME_ATTR] == trial_outcome(2, "success")
+        assert attrs[TRIAL_OUTCOME_ATTR] == trial_outcome(2, "success", metric=0.5)
         assert state.consecutive_failures == 0
     else:
         assert TRIAL_OUTCOME_ATTR not in attrs

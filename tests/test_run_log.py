@@ -320,7 +320,13 @@ def _finish(run: phase_ops._PhaseExecution, outcome: str) -> int:
     trial = run.study.ask()
     trial.set_user_attr(FEASIBLE_ATTR, outcome == "success")
     trial.set_user_attr(
-        TRIAL_OUTCOME_ATTR, trial_outcome(run.completion_sequence + 1, outcome, cause="boom")
+        TRIAL_OUTCOME_ATTR,
+        trial_outcome(
+            run.completion_sequence + 1,
+            outcome,
+            metric=0.5 if outcome == "success" else None,
+            cause="boom",
+        ),
     )
     run.advance(trial.number, outcome)
     return trial.number

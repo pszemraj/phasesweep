@@ -805,6 +805,7 @@ def trial_outcome(sequence: int, outcome: str, **extra: JsonValue) -> JsonObject
         "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
         "sequence": sequence,
         "outcome": outcome,
+        **({"metric": 0.0} if outcome == "success" else {}),
         **extra,
     }
 

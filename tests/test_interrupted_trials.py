@@ -33,6 +33,7 @@ from phasesweep.engine.attempts import (
     _record_stale_trial_outcome,
 )
 from phasesweep.engine.errors import (
+    StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrackingTargetUnavailableError,
     TrialEvidenceMissingError,
@@ -68,10 +69,8 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
-    _outcome_sequence_counts,
     _parsed_trial_outcome,
     _recovered_trial_state,
-    _stale_recovery_outcome,
     _trial_interrupted,
 )
 from phasesweep.engine.study_policy import (
@@ -99,7 +98,6 @@ from tests.recovery_helpers import fabricate_stale_trial, write_trial_identity
 from tests.tracking_helpers import SwitchableWandb, switchable_wandb, wandb_objective_experiment
 
 _STALE_CAUSE = "stale RUNNING trial recovered after its orchestrator stopped"
-_UNCOMMITTED_CAUSE = "orchestrator stopped before Optuna committed the terminal trial state"
 
 
 def _abort(sequence: int) -> JsonObject:
@@ -117,38 +115,33 @@ def _abort(sequence: int) -> JsonObject:
     }
 
 
-@pytest.mark.parametrize(
-    ("recorded", "expected"),
-    [
-        pytest.param(None, "interrupted", id="no-record"),
-        pytest.param(trial_outcome(1, "success"), "interrupted", id="uncommitted-success"),
-        pytest.param(trial_outcome(1, "interrupted"), "interrupted", id="interrupted"),
-        pytest.param(trial_outcome(1, "failure"), "failure", id="failure"),
-        pytest.param(
-            trial_outcome(1, "failure", **{TRIAL_OUTCOME_ABORT_KEY: _abort(1)}),
-            "failure",
-            id="failure-with-abort",
-        ),
-        pytest.param(
-            trial_outcome(1, "fatal", policy="unsafe_process_cleanup"), "fatal", id="fatal"
-        ),
-    ],
-)
-def test_stale_recovery_keeps_failures_and_interrupts_everything_else(
-    recorded: JsonObject | None, expected: str
-) -> None:
-    """Recovery keeps a recorded failure or fatal error and turns anything unproven into an interruption."""
-    parsed = None if recorded is None else _parsed_trial_outcome(recorded)
-    assert recorded is None or parsed is not None
-    assert _stale_recovery_outcome(parsed) == expected
-
-
 def test_the_outcome_parser_rejects_an_unknown_label_and_another_schema_version() -> None:
     """A label outside the outcome vocabulary, such as ``cancelled``, and any other schema version parse as nothing."""
     assert _parsed_trial_outcome(trial_outcome(1, "cancelled")) is None
     previous = trial_outcome(1, "interrupted")
     previous["schema_version"] = TRIAL_OUTCOME_SCHEMA_VERSION - 1
     assert _parsed_trial_outcome(previous) is None
+
+
+@pytest.mark.parametrize("metric", [None, True, "1", float("inf"), float("nan")])
+def test_outcome_parser_requires_a_finite_numeric_success_metric(metric: JsonValue) -> None:
+    """A successful outcome must carry a finite numeric measurement."""
+    payload = trial_outcome(1, "success", metric=metric)
+    assert _parsed_trial_outcome(payload) is None
+    del payload["metric"]
+    assert _parsed_trial_outcome(payload) is None
+
+
+def test_outcome_parser_distinguishes_measured_and_unmeasured_failure() -> None:
+    """Zero is a valid measurement; failures, fatal errors, and interruptions can lack one."""
+    assert _parsed_trial_outcome(trial_outcome(1, "success", metric=0.0)) is not None
+    measured = _parsed_trial_outcome(trial_outcome(2, "failure", metric=0.0))
+    assert measured is not None and measured.metric == 0.0
+    for outcome in ("failure", "fatal", "interrupted"):
+        parsed = _parsed_trial_outcome(trial_outcome(3, outcome))
+        assert parsed is not None and parsed.metric is None
+    for outcome in ("fatal", "interrupted"):
+        assert _parsed_trial_outcome(trial_outcome(3, outcome, metric=1.0)) is None
 
 
 def _running_trial(study: optuna.Study, outcome: JsonObject | None) -> optuna.trial.FrozenTrial:
@@ -188,11 +181,6 @@ def _finished(study: optuna.Study, sequence: int, outcome: str) -> None:
     [
         pytest.param(None, trial_outcome(3, "interrupted", cause=_STALE_CAUSE), id="no-record"),
         pytest.param(
-            trial_outcome(3, "success"),
-            trial_outcome(3, "interrupted", cause=_UNCOMMITTED_CAUSE),
-            id="uncommitted-success",
-        ),
-        pytest.param(
             trial_outcome(3, "interrupted", cause="orchestrator interrupted by signal 2"),
             trial_outcome(3, "interrupted", cause="orchestrator interrupted by signal 2"),
             id="signal",
@@ -201,16 +189,6 @@ def _finished(study: optuna.Study, sequence: int, outcome: str) -> None:
             trial_outcome(3, "failure", cause="exit 1"),
             trial_outcome(3, "failure", cause="exit 1"),
             id="failure",
-        ),
-        pytest.param(
-            trial_outcome(2, "interrupted"),
-            trial_outcome(3, "interrupted", cause=_STALE_CAUSE),
-            id="duplicate-sequence",
-        ),
-        pytest.param(
-            trial_outcome(2, "failure", cause="exit 1"),
-            trial_outcome(3, "interrupted", cause=_STALE_CAUSE),
-            id="duplicate-sequence-failure",
         ),
     ],
 )
@@ -222,7 +200,7 @@ def test_stale_recovery_records_interrupted_unless_the_objective_recorded_a_fail
     _finished(study, 1, "failure")
     _finished(study, 2, "failure")
     trial = _running_trial(study, recorded)
-    predicted = _recovered_trial_state(trial, _outcome_sequence_counts(study.get_trials()))
+    predicted = _recovered_trial_state(trial, _parsed_trial_outcome(recorded))
 
     _record_stale_trial_outcome(study, trial)
     assert predicted == ("INTERRUPTED" if expected["outcome"] == "interrupted" else "FAIL")
@@ -249,62 +227,19 @@ def test_an_interruption_between_two_failures_leaves_the_streak_at_two() -> None
 
 
 @pytest.mark.parametrize("holder", ["peer", "itself"])
-def test_a_recovered_verdict_decides_its_abort_past_a_duplicate_its_recovery_heals(
-    holder: str,
-) -> None:
-    """A recovered verdict decides its abort past a RUNNING trial's record that duplicates a sequence.
-
-    Recovery replaces that record at a fresh sequence, whether a peer or the verdict's own
-    trial holds it, so the verdict's replay leaves it out: the failure trips
-    max_consecutive_failures at its own sequence, and once every duplicate holder is recovered
-    the strict replay validates and finds that abort.
-    """
-    phase = make_experiment(max_consecutive_failures=3).phases[0]
-    study = optuna.create_study()
-    _finished(study, 1, "failure")
-    _finished(study, 2, "failure")
-    peer = _running_trial(study, None) if holder == "peer" else None
-    duplicate = _running_trial(study, trial_outcome(2, "failure", cause="exit 1"))
-    finished_training = duplicate if peer is None else peer
-
-    _record_stale_trial_outcome(
-        study, finished_training, evidence_failure="crashed", policy_phase=phase
-    )
-
-    recorded = study.trials[finished_training.number].user_attrs[TRIAL_OUTCOME_ATTR]
-    assert (recorded["sequence"], recorded["outcome"], recorded["cause"]) == (
-        3,
-        "failure",
-        "crashed",
-    )
-    assert recorded[TRIAL_OUTCOME_ABORT_KEY]["completion_sequence"] == 3
-    if peer is not None:
-        assert _load_phase_policy_state(study).consecutive_failures == 3
-        _record_stale_trial_outcome(study, duplicate)
-    state = _load_phase_policy_state(study)
-    assert state.max_sequence == (4 if peer is not None else 3)
-    assert state.consecutive_failures == 3
-    assert state.abort == recorded[TRIAL_OUTCOME_ABORT_KEY]
-
-
-@pytest.mark.parametrize("success_first", [False, True])
-def test_recovery_counts_disputed_running_outcomes_in_settlement_order(success_first: bool) -> None:
-    """A recovered verdict's abort agrees with the durable sequence after its peer settles."""
+def test_recovery_refuses_duplicate_sequences_without_erasing_outcomes(holder: str) -> None:
+    """Disputed completion order leaves both saved measurements and aborts intact."""
     phase = make_experiment(max_consecutive_failures=2).phases[0]
     study = optuna.create_study()
     _finished(study, 1, "failure")
-    failed = _running_trial(study, trial_outcome(2, "failure"))
-    succeeded = _running_trial(study, trial_outcome(2, "success"))
-    pending = [(failed, False), (succeeded, True)]
-    for trial, feasible in reversed(pending) if success_first else pending:
-        _record_stale_trial_outcome(study, trial, completed_feasible=feasible, policy_phase=phase)
-        study.tell(trial.number, float(feasible))
-
-    state = _load_phase_policy_state(study)
-    assert (state.abort is None) == success_first
-    assert state.abort_streak == (() if success_first else (0, failed.number))
-    assert state.consecutive_failures == int(success_first)
-    assert state.max_sequence == 4
+    failed = _running_trial(study, trial_outcome(2, "failure", metric=3.0, abort=_abort(2)))
+    succeeded = _running_trial(study, trial_outcome(2, "success", metric=4.0))
+    pending = _running_trial(study, None) if holder == "peer" else failed
+    before = [trial.user_attrs for trial in study.get_trials()]
+    with pytest.raises(StudySchemaMismatchError, match="both use completion sequence"):
+        _record_stale_trial_outcome(study, pending, "failure", cause="crashed", policy_phase=phase)
+    assert [trial.user_attrs for trial in study.get_trials()] == before
+    assert all(trial.state == optuna.trial.TrialState.RUNNING for trial in (failed, succeeded))
 
 
 def test_a_running_trial_is_not_interrupted_until_it_is_terminal() -> None:
@@ -1165,7 +1100,9 @@ else:
                 )
             if return_code == 0 and not terminated:
                 assert (
-                    _recovered_trial_state(trial, _outcome_sequence_counts([trial]))
+                    _recovered_trial_state(
+                        trial, _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+                    )
                     == "EVIDENCE_PENDING"
                 )
                 with pytest.raises(
@@ -1184,17 +1121,18 @@ else:
                         )
                 pending = phase_trials(experiment)[0]
                 assert pending.state.name == "RUNNING"
+                assert pending.user_attrs[TRIAL_OUTCOME_ATTR]["metric"] == 1.0
+                saved_outcome = json_object(pending.user_attrs[TRIAL_OUTCOME_ATTR])
                 if recovery_stage == "finished":
                     objective = directory / "stdout.log"
                     original = objective.read_bytes()
                     objective.unlink()
-                    with pytest.raises(
-                        TrialEvidenceMissingError, match="its objective cannot be read"
-                    ):
+                    with pytest.raises(TrialEvidenceMissingError, match="missing or unreadable"):
                         run_experiment(experiment)
                     objective.write_bytes(original.replace(b"x=1.0", b"x=0.1"))
                     with pytest.raises(
-                        TrialEvidenceMissingError, match="differs from the recorded evidence"
+                        TrialEvidenceMissingError,
+                        match="bytes behind the published metric have changed",
                     ):
                         run_experiment(experiment)
                     unchanged = phase_trials(experiment)[0]
@@ -1207,7 +1145,6 @@ else:
                     pending = interrupted_study.get_trials()[0]
                     parsed_pending = _parsed_trial_outcome(pending.user_attrs[TRIAL_OUTCOME_ATTR])
                     assert parsed_pending is not None
-                    saved_outcome = json_object(pending.user_attrs[TRIAL_OUTCOME_ATTR])
                     saved_abort = _abort(parsed_pending.sequence)
                     saved_abort["trial_target"] = 1
                     saved_outcome[TRIAL_OUTCOME_ABORT_KEY] = saved_abort
@@ -1262,9 +1199,9 @@ else:
                         )
                 pending = phase_trials(experiment)[0]
                 assert pending.state.name == "RUNNING"
-                assert _recovered_trial_state(pending, _outcome_sequence_counts([pending])) == (
-                    "INTERRUPTED"
-                )
+                assert _recovered_trial_state(
+                    pending, _parsed_trial_outcome(pending.user_attrs.get(TRIAL_OUTCOME_ATTR))
+                ) == ("INTERRUPTED")
                 assert _cause(pending) == _STALE_CAUSE
                 assert reaper._process_group_alive(orphan_identity.pgid) is (
                     recovery_stage == "interrupt-intent"
@@ -1300,6 +1237,7 @@ else:
             )
             if return_code == 0 and not terminated:
                 assert recovered.value == 1.0
+                assert recovered.user_attrs[TRIAL_OUTCOME_ATTR] == saved_outcome
                 assert recovered.user_attrs[FEASIBLE_ATTR] is feasible
                 if feasible:
                     assert _cause(recovered) is None
@@ -1357,7 +1295,7 @@ def _assert_evidence_pending(experiment: Experiment, trial: optuna.trial.FrozenT
     assert FAILURE_REASON_ATTR not in trial.user_attrs
     assert TRIAL_OUTCOME_ATTR not in trial.user_attrs
     assert (_attempts_dir(experiment) / f"{trial.user_attrs[ATTEMPT_ID_ATTR]}.json").is_file()
-    assert _recovered_trial_state(trial, _outcome_sequence_counts([trial])) == "EVIDENCE_PENDING"
+    assert _recovered_trial_state(trial, None) == "EVIDENCE_PENDING"
 
 
 def _assert_restored_tracker_keeps_training(
@@ -1506,12 +1444,11 @@ def test_finished_training_whose_tracker_answers_a_failure_fails_once(
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
-    "failed_write",
-    [TRIAL_OUTCOME_ATTR, FAILURE_REASON_ATTR],
-    ids=["before-outcome", "after-gate-outcome"],
+    "failure_stage",
+    ["before-outcome", "after-gate-outcome", "partial-before-failure"],
 )
 def test_recovered_evidence_failure_survives_a_journal_write_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_write: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str
 ) -> None:
     """Keep finished training and its failure-limit abort across a failed recovery write."""
     from phasesweep.evidence.models import RequiredFileGate
@@ -1521,7 +1458,8 @@ def test_recovered_evidence_failure_survives_a_journal_write_failure(
     experiment, launches = wandb_objective_experiment(
         tmp_path, n_trials=1, max_consecutive_failures=1
     )
-    gate_failure = failed_write == FAILURE_REASON_ATTR
+    gate_failure = failure_stage == "after-gate-outcome"
+    partial_success = failure_stage == "partial-before-failure"
     if gate_failure:
         (phase,) = experiment.phases
         gate = RequiredFileGate(type="required_file", path="receipt")
@@ -1537,7 +1475,7 @@ def test_recovered_evidence_failure_survives_a_journal_write_failure(
         reads += 1
         if tracker_down:
             raise WandbSetupError(run_id, "HTTP 503")
-        if not gate_failure:
+        if not gate_failure and not partial_success:
             raise WandbRunTerminalError(run_id, "crashed")
         return {"values": {"x": 4.0}, "present_keys": [], "retrieved_at": utc_now_iso()}
 
@@ -1549,6 +1487,7 @@ def test_recovered_evidence_failure_survives_a_journal_write_failure(
 
     original_set = optuna.Trial.set_user_attr
     writes_failed = False
+    failed_write = TRIAL_OUTCOME_ATTR if failure_stage == "before-outcome" else FAILURE_REASON_ATTR
 
     def fail_journal(trial: optuna.Trial, key: str, value: JsonValue) -> None:
         nonlocal writes_failed
@@ -1557,18 +1496,33 @@ def test_recovered_evidence_failure_survives_a_journal_write_failure(
             raise OSError("journal write failed")
         original_set(trial, key, value)
 
+    if partial_success:
+        failed_write = TRIAL_OUTCOME_ATTR
+        with monkeypatch.context() as journal:
+            journal.setattr(optuna.Trial, "set_user_attr", fail_journal)
+            with pytest.raises(StudyStorageUnavailableError, match="could not be committed"):
+                run_experiment(experiment)
+        (partial,) = phase_trials(experiment)
+        assert OBJECTIVE_PROVENANCE_ATTR in partial.user_attrs
+        assert TRIAL_OUTCOME_ATTR not in partial.user_attrs
+        partial_success = False
+        writes_failed = False
+        failed_write = FAILURE_REASON_ATTR
+
     with monkeypatch.context() as journal:
         journal.setattr(optuna.Trial, "set_user_attr", fail_journal)
         with pytest.raises(StudyStorageUnavailableError, match="could not be committed"):
             run_experiment(experiment)
 
     (pending,) = phase_trials(experiment)
-    assert pending.state == optuna.trial.TrialState.RUNNING
     assert FAILURE_REASON_ATTR not in pending.user_attrs
-    if gate_failure:
+    if failed_write == FAILURE_REASON_ATTR:
+        assert pending.state == optuna.trial.TrialState.FAIL
         assert OBJECTIVE_PROVENANCE_ATTR in pending.user_attrs
         assert TRIAL_OUTCOME_ATTR in pending.user_attrs
+        assert pending.user_attrs[TRIAL_OUTCOME_ATTR].get("metric") is None
     else:
+        assert pending.state == optuna.trial.TrialState.RUNNING
         assert TRIAL_OUTCOME_ATTR not in pending.user_attrs
 
     reads_before_retry = reads
@@ -1578,10 +1532,11 @@ def test_recovered_evidence_failure_survives_a_journal_write_failure(
     outcome = failed.user_attrs[TRIAL_OUTCOME_ATTR]
     assert failed.state == optuna.trial.TrialState.FAIL
     assert outcome["outcome"] == "failure"
+    assert outcome.get("metric") is None
     assert ("receipt is missing" if gate_failure else "crashed") in outcome["cause"]
     assert outcome[TRIAL_OUTCOME_ABORT_KEY]["consecutive_failures"] == 1
-    # The committed gate rejection never re-reads its evidence.
-    assert reads == reads_before_retry + (0 if gate_failure else 1)
+    # A committed rejection never re-reads its evidence.
+    assert reads == reads_before_retry + (0 if failed_write == FAILURE_REASON_ATTR else 1)
     assert launches.read_text().splitlines() == ["launch"]
     assert not _last_successful_generation_path(experiment).exists()
 
@@ -1616,6 +1571,7 @@ def test_a_recovered_verdict_trips_the_failure_limit_as_a_live_one_does(
     assert second.state.name == ("FAIL" if verdict == "failure" else "COMPLETE")
     outcome = second.user_attrs[TRIAL_OUTCOME_ATTR]
     assert outcome["outcome"] == "failure"
+    assert outcome.get("metric") == (second.value if verdict == "infeasible" else None)
     assert outcome[TRIAL_OUTCOME_ABORT_KEY] == {
         "schema_version": 1,
         "policy": "max_consecutive_failures",

@@ -165,7 +165,9 @@ def _record(
             state, _OUTCOME.get(state)
         )
         if outcomes and outcome is not None:
-            attrs[TRIAL_OUTCOME_ATTR] = trial_outcome(sequence, outcome, cause=None)
+            attrs[TRIAL_OUTCOME_ATTR] = trial_outcome(
+                sequence, outcome, metric=1.0 if outcome == "success" else None
+            )
         value = 1.0 if state == _STATE.COMPLETE else None
         study.add_trial(optuna.trial.create_trial(state=state, value=value, user_attrs=attrs))
 

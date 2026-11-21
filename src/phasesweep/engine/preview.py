@@ -47,8 +47,8 @@ from phasesweep.engine.progress import _log_phase_header
 from phasesweep.engine.state import (
     RecoveredTrialState,
     Winner,
-    _outcome_sequence_counts,
     _recovered_trial_state,
+    _unique_trial_outcomes,
 )
 from phasesweep.engine.study_policy import (
     _launch_preflight,
@@ -138,9 +138,9 @@ def _recovered_running_states(
     :param Sequence[optuna.trial.FrozenTrial] trials: A phase study's trials.
     :return list[RecoveredTrialState]: One prediction per RUNNING trial, in trial order.
     """
-    sequence_counts = _outcome_sequence_counts(trials)
+    outcomes = _unique_trial_outcomes(trials)
     return [
-        _recovered_trial_state(trial, sequence_counts)
+        _recovered_trial_state(trial, outcomes.get(trial.number))
         for trial in trials
         if trial.state == optuna.trial.TrialState.RUNNING
     ]
