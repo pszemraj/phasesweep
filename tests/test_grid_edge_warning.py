@@ -43,6 +43,7 @@ from phasesweep.engine.state import (
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
 from phasesweep.mcp.snapshots import RESULT_SNAPSHOT_SCHEMA_VERSION, capture_result_snapshot
 from phasesweep.runtime.json import JsonValue
+from phasesweep.runtime.terminal import significant
 from tests.conftest import (
     log_regex_provenance,
     make_experiment,
@@ -385,7 +386,7 @@ def test_float_displays_share_precision_without_changing_recorded_values(
     table = CliRunner().invoke(cli, ["status", str(config), "--trials"])
     assert table.exit_code == 0, table.output
     cells = next(line for line in table.output.splitlines() if "COMPLETE" in line).split()
-    assert cells[-4:-1] == [f"{value:.6g}", f"{sampled:.4g}", "COMPLETE"]
+    assert cells[-4:-1] == [significant(value, 6), f"{sampled:.4g}", "COMPLETE"]
     assert f"{sampled:.12g}" not in table.output
     duration = read_trial_tables(experiment, latest=True).phases[0].rows[0]["duration_s"]
     assert isinstance(duration, float) and f"{duration:.12g}" != f"{duration:.1f}"
