@@ -28,6 +28,7 @@ from phasesweep.config.models import (
     _metric_semantics_payload,
     experiment_disclosures,
 )
+from phasesweep.engine.artifact_roots import _artifact_path_mode
 from phasesweep.engine.errors import (
     IncompleteJournalRecordError,
     StudyStorageUnavailableError,
@@ -241,7 +242,8 @@ def run_experiment(
             generation=None,
         )
     # Fresh-tree launch checks precede writes; existing trees defer them until work remains.
-    environments_preflighted = not path_ops._artifact_root_binding_path(experiment).exists()
+    binding_path = path_ops._artifact_root_binding_path(experiment)
+    environments_preflighted = _artifact_path_mode(binding_path) == 0
     if environments_preflighted:
         # A fresh tree holds no publication, so a resume that needs earlier winners cannot
         # succeed; refuse it before the run creates the tree.

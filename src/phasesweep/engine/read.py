@@ -16,12 +16,14 @@ import typing
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from stat import S_ISDIR, S_ISREG
 from typing import Any, Literal, TypeAlias
 
 import optuna
 
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import Experiment, Phase, _metric_semantics_payload
+from phasesweep.engine.artifact_roots import _artifact_path_mode
 from phasesweep.engine.artifacts import read_yaml_or_none
 from phasesweep.engine.confound import (
     _confound_summary,
@@ -433,11 +435,13 @@ def require_study(experiment: Experiment) -> None:
     """Require evidence of a started study at the configured artifact root.
 
     :param Experiment experiment: Config locating the study.
+    :raises ArtifactRootConflictError: Access to the study path is denied.
     :raises StudyStorageUnavailableError: No study has initialized this root.
     """
     ledger_path = resolved_ledger_path(experiment)
-    if not _experiment_dir(experiment).is_dir() or not any(
-        path.is_file()
+    artifact_root = _experiment_dir(experiment)
+    if not S_ISDIR(_artifact_path_mode(artifact_root)) or not any(
+        S_ISREG(_artifact_path_mode(path))
         for path in (
             _artifact_root_binding_path(experiment),
             _generation_path(experiment),
@@ -445,7 +449,7 @@ def require_study(experiment: Experiment) -> None:
         )
     ):
         raise StudyStorageUnavailableError(
-            f"No study directory at {_experiment_dir(experiment)} contains a started study.",
+            f"No study directory at {artifact_root} contains a started study.",
             action=OperatorAction.FIX_CONFIG,
             remediation=(
                 "Use the same config and --set overrides as the run that created the study. "

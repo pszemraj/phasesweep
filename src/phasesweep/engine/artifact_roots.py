@@ -184,6 +184,34 @@ def _binding_mismatch(
     )
 
 
+def _artifact_access_refusal(error: PermissionError, fallback: Path) -> ArtifactRootConflictError:
+    """Explain how to restore access to a path the artifact tree needs.
+
+    :param PermissionError error: OS refusal, which normally names the path.
+    :param Path fallback: Path to report if the refusal names none.
+    :return ArtifactRootConflictError: Refusal carrying the restore-permissions action.
+    """
+    return ArtifactRootConflictError(
+        f"The current user cannot access {error.filename or fallback} (permission denied).",
+        action=OperatorAction.RESTORE_TREE,
+    )
+
+
+def _artifact_path_mode(path: Path) -> int:
+    """Read a path's mode without treating denied access as a missing entry.
+
+    :param Path path: Path to inspect, following symlinks.
+    :raises ArtifactRootConflictError: The current user cannot access the path.
+    :return int: The mode from stat, or zero when no entry exists at the path.
+    """
+    try:
+        return path.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return 0
+    except PermissionError as exc:
+        raise _artifact_access_refusal(exc, path) from exc
+
+
 def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
     """Classify a tree's experiment and ledger ownership without reading the ledger.
 
@@ -211,11 +239,7 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
             ) from None
         return "unbound"
     except PermissionError as exc:
-        raise ArtifactRootConflictError(
-            f"Artifact-root binding {path} cannot be validated as the current user "
-            "(permission denied).",
-            action=OperatorAction.RESTORE_TREE,
-        ) from exc
+        raise _artifact_access_refusal(exc, path) from exc
     except (OSError, ValueError) as exc:
         raise ArtifactRootConflictError(
             f"Artifact-root binding {path} is unreadable or malformed: {exc}.",

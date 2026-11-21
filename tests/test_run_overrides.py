@@ -33,6 +33,7 @@ from phasesweep.runtime.files import file_sha256
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
+    requires_nonroot,
     write_experiment_config,
     write_trainer,
 )
@@ -154,6 +155,33 @@ def test_study_reads_name_the_missing_directory(
     assert str(tmp_path / "absent" / "t") in message
     with pytest.raises(StudyStorageUnavailableError, match="No study directory at"):
         experiment_status(cli_module._load_cli_config(path))
+
+
+@requires_nonroot
+@pytest.mark.parametrize(
+    "command", [("run",), ("run", "--dry-run"), ("status",), ("show-winners",)]
+)
+def test_study_commands_report_denied_access_to_workdir(
+    tmp_path: Path,
+    command: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Name the inaccessible study path and advise restoring its permissions."""
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    config = write_experiment(tmp_path / "sweep.yaml", workdir="blocked/runs")
+    blocked.chmod(0o600)
+    try:
+        assert invoke_cli_boundary([*command, str(config)], monkeypatch) == 1
+    finally:
+        blocked.chmod(0o700)
+
+    message = capsys.readouterr().err
+    assert f"The current user cannot access {blocked / 'runs' / 't'}" in message
+    assert "(permission denied)." in message
+    assert "fix: restore the files and permissions identified in the error" in message
+    assert not (blocked / "runs").exists()
 
 
 @pytest.mark.parametrize(
