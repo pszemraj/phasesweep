@@ -20,6 +20,7 @@ from phasesweep.runtime.shutdown import (
     ShutdownCleanupReport,
     ShutdownLaunchRefusedError,
 )
+from phasesweep.runtime.terminal import REPORT_LOGGER, ReportBlock
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
 from phasesweep.tracking.mlflow import OperationRejectedError, OperationUnavailableError
@@ -183,6 +184,9 @@ def test_the_next_run_delivers_an_interrupted_runs_pending_records(
     assert sweep.summaries() == ["KILLED"]
     assert read_record(sweep.summary)["state"] == "delivered"
     assert "MLflow: delivered 2 record(s) left pending by earlier runs." in caplog.text
+    # A report block, so the console wraps it to the terminal.
+    [delivered] = [r for r in caplog.records if "left pending by earlier runs." in r.getMessage()]
+    assert delivered.name == REPORT_LOGGER and isinstance(delivered.msg, ReportBlock)
     assert publication.delivery_status(experiment)["pending"] == 0
     sweep.uploads.clear()
     publication.sync_tracking(experiment)

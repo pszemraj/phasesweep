@@ -10,6 +10,7 @@ import os
 import textwrap
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal, Protocol, TextIO
@@ -229,3 +230,26 @@ class ReportBlock(ABC):
 
         :return str: Text without line breaks or styling.
         """
+
+
+@dataclass(frozen=True)
+class ReportText(ReportBlock):
+    """A report line of prose: wrapped to the terminal on the console, as written in a log file."""
+
+    text: str
+
+    def render(self, width: int, *, color: bool) -> list[str]:
+        """Wrap the text to the terminal, any later line under the first.
+
+        :param int width: Columns available to each line.
+        :param bool color: Unused; the line carries no styling.
+        :return list[str]: The wrapped lines.
+        """
+        return wrap(self.text, width)
+
+    def __str__(self) -> str:
+        """Return the text as written.
+
+        :return str: The one-line text.
+        """
+        return self.text

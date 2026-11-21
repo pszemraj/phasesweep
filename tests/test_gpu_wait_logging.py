@@ -7,6 +7,7 @@ import logging
 import pytest
 
 from phasesweep.runtime.gpu import GpuDevice, GpuLeaseTimeoutError, GpuPool
+from phasesweep.runtime.terminal import ReportBlock
 
 
 @pytest.mark.parametrize("whole_node", [False, True], ids=["single", "whole-node"])
@@ -42,11 +43,16 @@ def test_gpu_wait_emits_one_info_message(
     ):
         pytest.fail("a blocked GPU lease was acquired")
 
-    waiting = [
-        (record.name, record.getMessage())
+    records = [
+        record
         for record in caplog.records
         if record.levelno == logging.INFO and record.getMessage().startswith("Waiting for")
     ]
+    # The console wraps a report line only when it is a block, so the lock wait must be one.
+    assert [isinstance(record.msg, ReportBlock) for record in records] == [
+        blocked_by == "host-lease"
+    ]
+    waiting = [(record.name, record.getMessage()) for record in records]
     assert waiting == [
         (
             "phasesweep.report",

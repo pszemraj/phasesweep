@@ -30,13 +30,13 @@ from phasesweep.config.models import GpuPolicy, Phase
 from phasesweep.errors import GpuConfigurationError
 from phasesweep.runtime.files import lock_dir, try_lock_file, unlock_file
 from phasesweep.runtime.shutdown import register_shutdown_waker, servicing_shutdown_signal
-from phasesweep.runtime.terminal import REPORT_LOGGER
+from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText
 
 log = logging.getLogger("phasesweep.runtime.gpu")
 # A wait on another process's lock can last as long as that process runs, so it is a
 # report line the console shows; a wait on this run's own slots is routine queueing.
 report = logging.getLogger(REPORT_LOGGER)
-_HOST_LOCK_WAIT = (
+_HOST_LOCK_WAIT = ReportText(
     "Waiting for a GPU: another process holds its lock, such as another sweep or a trial "
     "that is still shutting down."
 )

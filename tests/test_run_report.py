@@ -33,8 +33,9 @@ from phasesweep.run_report import (
     winner_line,
 )
 from phasesweep.runtime.console import ConsoleHandler
+from phasesweep.runtime.gpu import _HOST_LOCK_WAIT
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
-from phasesweep.runtime.terminal import REPORT_LOGGER, ReportBlock
+from phasesweep.runtime.terminal import REPORT_LOGGER, ReportBlock, ReportText
 from phasesweep.tracking.models import MlflowSettings
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
@@ -424,6 +425,54 @@ def test_a_dry_run_prints_info_records_of_the_package_as_report_lines(
     assert stderr.getvalue() == (
         "12:00:00  GPU pool: 2 device(s).\n12:00:00  phase=p\n            second line\n"
     )
+
+
+@pytest.mark.parametrize(
+    ("width", "expected"),
+    [
+        pytest.param(
+            80,
+            [
+                "12:00:00  Waiting for a GPU: another process holds its lock, such as another",
+                "          sweep or a trial that is still shutting down.",
+                "12:00:00  MLflow: delivered 12 record(s) left pending by earlier runs.",
+            ],
+            id="80",
+        ),
+        pytest.param(
+            60,
+            [
+                "12:00:00  Waiting for a GPU: another process holds its lock,",
+                "          such as another sweep or a trial that is still",
+                "          shutting down.",
+                "12:00:00  MLflow: delivered 12 record(s) left pending by",
+                "          earlier runs.",
+            ],
+            id="60",
+        ),
+    ],
+)
+def test_prose_report_lines_wrap_to_the_terminal(
+    redirect_stderr: Callable[..., FakeStderr],
+    monkeypatch: pytest.MonkeyPatch,
+    width: int,
+    expected: list[str],
+) -> None:
+    """A prose report line wraps with its continuation under the text, not under the time."""
+    stderr = redirect_stderr()
+    monkeypatch.setenv("COLUMNS", str(width))
+    handler = ConsoleHandler()
+    handler.handle(record(REPORT_LOGGER, logging.INFO, _HOST_LOCK_WAIT))
+    handler.handle(
+        record(
+            REPORT_LOGGER,
+            logging.INFO,
+            ReportText("MLflow: delivered 12 record(s) left pending by earlier runs."),
+        )
+    )
+    assert stderr.getvalue().splitlines() == expected
+    assert all(len(line) <= width for line in expected)
+    assert str(_HOST_LOCK_WAIT).startswith("Waiting for a GPU: another process holds its lock")
 
 
 def test_a_warning_wraps_under_its_label(redirect_stderr: Callable[..., FakeStderr]) -> None:
