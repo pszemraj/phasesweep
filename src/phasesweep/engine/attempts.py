@@ -1124,7 +1124,9 @@ def _resolve_attempt(
             "and check GPU processes before retrying recovery."
         )
     _record_attempt_exited(record.trial_dir, attempt_id=record.attempt_id, return_code=None)
-    log.warning(
+    # Signalling a live group is worth a warning; a group that was already gone is routine.
+    log.log(
+        logging.WARNING if terminated else logging.INFO,
         "%s: %s (pid=%s pgid=%s).",
         label,
         "terminated training process group; confirmed process cleanup"

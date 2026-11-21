@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+from phasesweep.engine import attempts
 from phasesweep.engine.attempts import _attempt_process_resolution, _AttemptRecord, _resolve_attempt
 from phasesweep.errors import OperatorAction
 from phasesweep.runtime.json import JsonObject
@@ -18,6 +20,7 @@ from phasesweep.runtime.process import (
     read_attempt_lifecycle,
     write_attempt_lifecycle,
 )
+from phasesweep.runtime.reaper import StaleProcessIdentity
 
 
 @pytest.mark.parametrize(
@@ -160,4 +163,67 @@ def test_an_attempt_settled_without_signalling_is_routine_in_a_run_and_collected
     assert collected == {record: expected}
     assert [(entry.levelno, entry.getMessage()) for entry in caplog.records] == [
         (logging.INFO, expected)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("signalled", "level", "text"),
+    [
+        pytest.param(
+            True,
+            logging.WARNING,
+            "terminated training process group; confirmed process cleanup (pid=41 pgid=41).",
+            id="signalled",
+        ),
+        pytest.param(
+            False,
+            logging.INFO,
+            "confirmed process cleanup without signalling (pid=41 pgid=41).",
+            id="already-gone",
+        ),
+    ],
+)
+def test_a_stale_group_warns_only_when_cleanup_signalled_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    signalled: bool,
+    level: int,
+    text: str,
+) -> None:
+    """Terminating a live group warns; confirming one that was already gone is routine."""
+    identity = StaleProcessIdentity(
+        schema_version=1,
+        attempt_id="a1",
+        pid=41,
+        pgid=41,
+        proc_starttime=None,
+        boot_id=None,
+        pid_namespace="pid:[1]@0",
+    )
+
+    def cleanup(_identity: StaleProcessIdentity, *, before_terminate: Callable[[], None]) -> bool:
+        if signalled:
+            before_terminate()
+        return True
+
+    monkeypatch.setattr(attempts, "read_stale_process_identity", lambda *_a, **_k: identity)
+    monkeypatch.setattr(attempts, "cleanup_stale_trial_process", cleanup)
+    monkeypatch.setattr(attempts, "_record_attempt_exited", lambda *_a, **_k: None)
+    record = _AttemptRecord("a1", tmp_path, "generation", "p", 3)
+
+    with caplog.at_level(logging.INFO, logger="phasesweep"):
+        assert (
+            _resolve_attempt(
+                record,
+                context="RUNNING trial 3",
+                evidence_action=OperatorAction.RESTORE_TREE,
+                lifecycle_settles=False,
+                confirm=True,
+            )
+            is signalled
+        )
+
+    assert [(entry.levelno, entry.getMessage()) for entry in caplog.records] == [
+        (level, f"Attempt a1 phase='p' trial=3: {text}")
     ]
