@@ -117,6 +117,37 @@ def test_an_operational_error_wraps_under_its_labels_on_a_terminal(
     assert all(len(line) <= columns for line in expected)
 
 
+def test_a_fix_steps_command_stays_whole_and_flush_left_on_a_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A command a fix step sets off on its own line is pasted, so a terminal narrower than it prints it whole, with no indent."""
+    command = (
+        "phasesweep sync-tracking /srv/experiments/sweeps/learning-rate.yaml "
+        "--set mlflow.timeout_seconds=30 --generation 0123abcd"
+    )
+
+    def refuse(_path: Path) -> Experiment:
+        raise PhaseTrialsFailedError(
+            "MLflow delivery remains pending.",
+            remediation=f"Once the server answers, run this command again:\n{command}",
+        )
+
+    monkeypatch.setattr("phasesweep.cli.load_experiment", refuse)
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text("placeholder: true\n")
+    with terminal_stream("stderr", 60) as stderr:
+        status = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+
+    assert status == 1
+    assert len(command) > 60
+    assert stderr.text.split("\n") == [
+        "phasesweep: MLflow delivery remains pending.",
+        "fix: Once the server answers, run this command again:",
+        command,
+        "",
+    ]
+
+
 @pytest.mark.parametrize("columns", ["40", "200"])
 def test_a_redirected_operational_error_is_one_line_per_label(
     tmp_path: Path,

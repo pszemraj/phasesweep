@@ -215,7 +215,8 @@ def _print_operational_error(exc: PhaseSweepError) -> None:
 
     On a terminal each wraps at word boundaries to the width with its text hanging under the
     label. Redirected, each stays one logical line: scripts and agents match on these sentences,
-    and a refusal may have no ``run.log`` copy to read them from.
+    and a refusal may have no ``run.log`` copy to read them from. A line the step sets off after
+    its sentence is a command to paste, so it prints whole and flush left either way.
 
     :param PhaseSweepError exc: Operational failure to report.
     """
@@ -224,9 +225,11 @@ def _print_operational_error(exc: PhaseSweepError) -> None:
         click.echo(f"phasesweep: {_operational_error_text(exc)}", err=True)
         return
     width = terminal_width(stream)
+    step, *commands = operator_step(exc).split("\n")
     lines = [
         *wrap_labeled("phasesweep:", str(exc), width),
-        *wrap_labeled("fix:", operator_step(exc), width),
+        *wrap_labeled("fix:", step, width),
+        *commands,
     ]
     click.echo("\n".join(lines), err=True)
 
