@@ -700,7 +700,7 @@ class Summary:
         if self.written:
             lines.append("")
             lines.extend(self._written_lines(width, color=color))
-        # A command is pasted, so it stays on one line whatever the width, as the log path does.
+        # A command is pasted, so it stays on one line whatever the width.
         following = f"{paint('Next:', 'label', color=color)} {self.next_command}"
         return [*lines, "", following]
 
