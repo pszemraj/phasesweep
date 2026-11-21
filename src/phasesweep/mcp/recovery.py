@@ -321,19 +321,18 @@ def recover_run(
                     "to the tracker, then start the run again; their training is kept and "
                     "nothing is retrained."
                 )
-            if delivery is not None and (delivery["delivered"] or delivery["pending"]):
-                pending = delivery["pending"]
-                emit(
-                    f"Delivered {delivery['delivered']} MLflow outcome(s) of the recovered "
-                    "trials and generations; "
-                    + (
-                        f"{pending} MLflow record(s) stay pending. Once the tracker is reachable, run "
-                        "`phasesweep sync-tracking CONFIG` with the config this run launched "
-                        "with; delivery never retrains."
-                        if pending
-                        else "none stay pending."
+            if delivery and any(delivery.values()):
+                message = f"Delivered {delivery['delivered']} MLflow outcome(s) of the recovered trials and generations"
+                uploads = delivery["pending_uploads"]
+                creations = delivery["pending_creations"]
+                if uploads or creations:
+                    emit(
+                        f"{message}. Pending uploads: {uploads}. Unconfirmed run creations: "
+                        f"{creations}. Run `phasesweep sync-tracking CONFIG` with the config "
+                        "this run launched with to retry. Delivery never retrains."
                     )
-                )
+                else:
+                    emit(f"{message}; none stay pending.")
     except RunRecoveryError:
         raise
     except (PhaseSweepError, OSError) as exc:

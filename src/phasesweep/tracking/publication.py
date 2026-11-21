@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from phasesweep.engine.errors import TrackingSyncRefusedError
-from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
+from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError, operator_step
 from phasesweep.runtime.files import UnsafePrivatePathError
 from phasesweep.runtime.json import (
     JsonObject,
@@ -876,8 +876,8 @@ def deliver_recovered_attempts(
     :param bool tracker_unreachable: The caller found a tracker it could not read, so the
         records are only saved.
     :raises ProcessCleanupUncertainError: A search or upload worker's cleanup is uncertain.
-    :return dict[str, int]: How many of those records were ``delivered`` here and how many stay
-        ``pending``.
+    :return dict[str, int]: Outcomes delivered here, uploads still pending, and creations
+        whose remote runs have yet to be confirmed.
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
     from phasesweep.engine.trial import _environment_identity
@@ -887,11 +887,11 @@ def deliver_recovered_attempts(
     generations = sorted(set(generation_ids) - own)
     paths = save_recovered_attempts(experiment, ledger, generations)
     creations = sum(len(pending_creation_records(experiment, gid)) for gid in generations)
-    unsent = {"delivered": 0, "pending": len(paths) + creations}
-    if not unsent["pending"]:
+    unsent = {"delivered": 0, "pending_uploads": len(paths), "pending_creations": creations}
+    if not (paths or creations):
         return unsent
     pending = (
-        f"{unsent['pending']} MLflow record(s) stay pending. "
+        f"MLflow has {len(paths)} pending upload(s) and {creations} unconfirmed run creation(s). "
         "Run phasesweep sync-tracking with the original tracking config."
     )
     if tracker_unreachable:
@@ -914,14 +914,24 @@ def deliver_recovered_attempts(
                 deadline=None,
                 resolve_only=True,
             )
-    except (OSError, ValueError, UnsafePrivatePathError, TrackingTargetUnavailableError) as exc:
+    except TrackingTargetUnavailableError as exc:
         log.warning("%s %s", exc, pending)
         return unsent
+    except (OSError, ValueError, UnsafePrivatePathError) as exc:
+        log.warning("Repair the local MLflow tracking records (%s). %s", exc, pending)
+        return unsent
     if creations:
+        creation_errors: list[TrackingSyncRefusedError] = []
         for previous in generations:
             resolve_pending_creations(
-                experiment, environment, previous, worker_generation=generation_id
+                experiment,
+                environment,
+                previous,
+                worker_generation=generation_id,
+                errors=creation_errors,
             )
+        for error in creation_errors:
+            log.warning("%s %s", error, operator_step(error))
         paths = save_recovered_attempts(experiment, ledger, generations)
         creations = sum(len(pending_creation_records(experiment, gid)) for gid in generations)
         if creations:
@@ -935,7 +945,11 @@ def deliver_recovered_attempts(
         if not _deliver(experiment, path, environment, worker_generation=generation_id):
             break
         delivered += 1
-    return {"delivered": delivered, "pending": len(paths) - delivered + creations}
+    return {
+        "delivered": delivered,
+        "pending_uploads": len(paths) - delivered,
+        "pending_creations": creations,
+    }
 
 
 def delivery_status(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
@@ -961,8 +975,8 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
     reconcile unresolved creations, rebuild missing attempt records from Optuna,
     the summary-run record of each ended unpublished generation from its lifecycle
     record, and winner records from committed generation artifacts.
-    When syncing all generations, defer an unreadable lifecycle record's error until
-    the other generations have been processed.
+    Report local creation or lifecycle record errors after delivering independent records
+    in the selected scope.
 
     :param Experiment experiment: Matching source experiment configuration.
     :param str | None generation_id: Generation whose deliveries should be
@@ -1008,14 +1022,16 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
             )
         environment = _environment_identity(experiment, experiment.phases[0].name).values
         # A run a timed-out creation made late is bound before its records are rebuilt.
-        resolve_pending_creations(experiment, environment, generation_id)
+        errors: list[TrackingSyncRefusedError] = []
+        had_creations = resolve_pending_creations(
+            experiment, environment, generation_id, errors=errors
+        )
         parents = sorted(root.glob(f"{generation_id or '*'}/{GENERATION_BINDING_FILE}"))
         # The lock rules out a live invocation, so every unpublished generation here has ended.
         generations = [parent.parent.name for parent in parents]
         unresolved: dict[str, TrackingSyncRefusedError] = {}
-        collect = unresolved if generation_id is None else None
-        _rebuild_attempt_intents(experiment, ledger, generations, unresolved=collect)
-        _save_ended_summaries(experiment, generations, unresolved=collect)
+        _rebuild_attempt_intents(experiment, ledger, generations, unresolved=unresolved)
+        _save_ended_summaries(experiment, generations, unresolved=unresolved)
         for parent in parents:
             generation = parent.parent.name
             if (
@@ -1026,7 +1042,12 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
                 continue
             _save_generation_intents(experiment, generation)
         paths = sorted(root.glob(f"{generation_id or '*'}/delivery/*.json"))
-        if not paths and not unresolved and not pending_creation_records(experiment, generation_id):
+        if (
+            not paths
+            and not unresolved
+            and not had_creations
+            and not any(root.glob(f"{generation_id or '*'}/operations"))
+        ):
             raise TrackingSyncRefusedError("No tracking deliveries exist for this scope.")
         for path in paths:
             record = read_record(path)
@@ -1039,10 +1060,11 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
                 )
         for path in paths:
             _deliver(experiment, path, environment)
-        if unresolved:
-            first = next(iter(unresolved.values()))
-            if len(unresolved) == 1:
-                raise first
-            detail = "\n".join(str(error) for error in unresolved.values())
-            raise TrackingSyncRefusedError.rewrap(first, detail) from first
-    return delivery_status(experiment, generation_id)
+        counts = delivery_status(experiment, generation_id)
+        errors.extend(unresolved.values())
+        if errors:
+            detail = "\n".join(str(error) for error in errors)
+            raise TrackingSyncRefusedError.rewrap(
+                errors[0], f"{detail}\nDelivered records in scope: {counts['delivered']}."
+            ) from errors[0]
+        return counts

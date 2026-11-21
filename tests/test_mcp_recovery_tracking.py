@@ -13,7 +13,7 @@ from phasesweep.config.models import Experiment
 from phasesweep.engine.attempts import _retire_active_attempt
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
 from phasesweep.engine.paths import _attempts_dir
-from phasesweep.engine.state import CLEANUP_CONFIRMED_ATTR
+from phasesweep.engine.state import CLEANUP_CONFIRMED_ATTR, TRIAL_DIR_ATTR
 from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
@@ -298,6 +298,41 @@ def test_recover_run_ends_the_summary_run_of_a_run_killed_between_trials(
 
 
 @pytest.mark.integration
+def test_recover_run_distinguishes_a_creation_miss_from_an_upload_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An answering tracker can have no run for a recently interrupted creation."""
+    run = _killed_run(tmp_path, monkeypatch)
+    [trial] = read_phase_trials(validate_ledger(run.experiment), "depth").trials
+    bound = Path(trial.user_attrs[TRIAL_DIR_ATTR]) / session.BINDING_FILE
+    identity = session.read_binding(bound.parent)
+    pending = bound.with_suffix(".pending.json")
+    session.write_record(
+        pending,
+        {
+            "schema_version": 1,
+            "identity": {k: v for k, v in identity.items() if k != "run_id"},
+            "run_name": "trial",
+        },
+    )
+    bound.unlink()
+    respond = session.request_operation
+
+    def lookup(request: dict[str, object], **kwargs: object) -> object:
+        if request["action"] == "find":
+            return {"found": False}
+        return respond(request, **kwargs)
+
+    monkeypatch.setattr(session, "request_operation", lookup)
+    result = run.recover()
+    assert result.exit_code == 0, result.output
+    assert "Pending uploads: 0. Unconfirmed run creations: 1." in result.output
+    assert _PENDING_STEP in result.output
+    assert pending.is_file() and not bound.exists()
+    assert not run.store.observe(run.handle).recovery_required
+
+
+@pytest.mark.integration
 def test_recover_run_leaves_outcomes_pending_while_mlflow_is_down(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -317,10 +352,7 @@ def test_recover_run_leaves_outcomes_pending_while_mlflow_is_down(
     assert requests == ["resolve"]
     assert run.sent() == []
     assert read_record(run.record)["state"] == "pending"
-    assert (
-        "Delivered 0 MLflow outcome(s) of the recovered trials and generations; "
-        "2 MLflow record(s) stay pending." in confirmed.output
-    )
+    assert "Pending uploads: 2. Unconfirmed run creations: 0." in confirmed.output
     assert _PENDING_STEP in confirmed.output
     assert not run.store.observe(run.handle).recovery_required
     delivery = run.app.status(_RUN_ID)["tracking_delivery"]

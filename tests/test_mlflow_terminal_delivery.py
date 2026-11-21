@@ -192,10 +192,11 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
     assert publication.delivery_status(experiment)["pending"] == 0
 
 
-def test_next_run_finishes_a_summary_created_before_its_binding_was_saved(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("appears_late", [True, False], ids=["late-run", "abandoned"])
+def test_interrupted_summary_creation_is_reconciled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, appears_late: bool
 ) -> None:
-    """An invocation can leave a summary creation behind before allocating any trial."""
+    """Recovery binds an interrupted summary or clears its expired, unmatched intent."""
     config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     experiment = Experiment.model_validate(config)
     respond = session.request_operation
@@ -219,13 +220,21 @@ def test_next_run_finishes_a_summary_created_before_its_binding_was_saved(
     assert experiment_status(experiment)["tracking_delivery"] == {"delivered": 0, "pending": 1}
     assert publication.sync_tracking(experiment, previous) == {"delivered": 0, "pending": 1}
 
-    appeared = True
-    run_experiment(experiment)
+    [pending] = session.pending_creation_records(experiment, previous)
+    os.utime(pending, (0, 0))
+    counts = {"delivered": 0, "pending": 0}
+    if appears_late:
+        appeared = True
+        run_experiment(experiment)
+        counts["delivered"] = 1
+    else:
+        assert publication.sync_tracking(experiment, previous) == counts
 
-    assert [(gid, state) for gid, state in _summaries(uploads) if gid == previous] == [
-        (previous, "KILLED")
-    ]
-    assert publication.delivery_status(experiment, previous) == {"delivered": 1, "pending": 0}
+    expected = [(previous, "KILLED")] if appears_late else []
+    assert [(gid, state) for gid, state in _summaries(uploads) if gid == previous] == expected
+    assert publication.sync_tracking(experiment, previous) == counts
+    assert experiment_status(experiment)["tracking_delivery"]["pending"] == 0
+    assert not pending.exists()
 
 
 def test_failed_trial_finishes_its_managed_run(tmp_path, monkeypatch):
@@ -975,6 +984,7 @@ def test_sync_leaves_superseded_publication_unresolved_when_its_record_cannot_be
     experiment = Experiment.model_validate(config)
     with monkeypatch.context() as without_mirror:
         without_mirror.setattr(publication, "publish_generation", lambda *_: None)
+        without_mirror.setattr(publication, "_deliver", lambda *args, **kwargs: False)
         run_experiment(experiment, generation_id="older")
     run_experiment(experiment, generation_id="newer")
     assert read_status(experiment)["published_generation_id"] == "newer"
@@ -994,11 +1004,14 @@ def test_sync_leaves_superseded_publication_unresolved_when_its_record_cannot_be
 
     with monkeypatch.context() as fault:
         fault.setattr(Path, "read_text", unreadable_once)
-        with pytest.raises(TrackingSyncRefusedError, match="generation record .* is unreadable"):
+        with pytest.raises(
+            TrackingSyncRefusedError, match="generation record .* is unreadable"
+        ) as refusal:
             publication.sync_tracking(experiment, "older")
     assert reads == [lifecycle]
     assert not summary.exists()
-    assert uploads == []
+    assert len(uploads) == 1 and uploads[0]["name"].startswith("attempt-")
+    assert "Delivered records in scope: 1" in str(refusal.value)
 
     assert publication.sync_tracking(experiment, "older") == {"pending": 0, "delivered": 3}
     assert read_record(summary)["finish"] == "FINISHED"
@@ -1231,7 +1244,7 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
     uploads.clear()
     if caller == "own-run":
         sent = publication.deliver_recovered_attempts(experiment, ledger, generation, [generation])
-        assert sent == {"delivered": 0, "pending": 0}
+        assert sent == {"delivered": 0, "pending_uploads": 0, "pending_creations": 0}
         assert not record.exists()
         assert uploads == []
         return
@@ -1253,7 +1266,7 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
             sent = publication.deliver_recovered_attempts(
                 experiment, ledger, generation, [generation], recovering=True
             )
-            assert sent == {"delivered": 1, "pending": 0}
+            assert sent == {"delivered": 1, "pending_uploads": 0, "pending_creations": 0}
         else:
             # A finished attempt's accepted outcome was delivered before the kill.
             delivered = 1 if in_flight else 2

@@ -513,6 +513,20 @@ def _failure_cause(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {code}" if code else type(exc).__name__
 
 
+def _creation_identity(client: _SdkClient, request: CreateRequest | FindRequest) -> RunIdentity:
+    """Confirm that the configured target still names the recorded MLflow experiment.
+
+    :param _SdkClient client: Public MLflow client in the supervised worker.
+    :param CreateRequest | FindRequest request: Worker target and creation identity.
+    :raises ValueError: The configured experiment contradicts the identity.
+    :return RunIdentity: The verified identity.
+    """
+    identity = request["binding"]
+    if _resolve(client, request["settings"]) != identity["experiment_id"]:
+        raise ValueError("MLflow experiment resolves differently from the creation intent.")
+    return identity
+
+
 def _create(client: _SdkClient, request: CreateRequest) -> RunBinding:
     """Find or create the run carrying an exact identity, without SDK creation retries.
 
@@ -521,14 +535,14 @@ def _create(client: _SdkClient, request: CreateRequest) -> RunBinding:
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param CreateRequest request: Trusted target and identity.
-    :raises ValueError: More than one run carries the identity, or a run found by
-        search contradicts it.
+    :raises ValueError: The configured experiment or matching run contradicts the identity,
+        or more than one run carries it.
     :raises OperationOutcomeUnknownError: The creation request failed without a server
         rejection, or the run it created fails verification.
     :return RunBinding: Verified remote run binding.
     """
-    experiment_id = _resolve(client, request["settings"])
-    identity: RunIdentity = {**request["binding"], "experiment_id": experiment_id}
+    identity = _creation_identity(client, request)
+    experiment_id = identity["experiment_id"]
     run = _identity_run(client, identity)
     created = run is None
     if run is None:
@@ -568,11 +582,11 @@ def _find(client: _SdkClient, request: FindRequest) -> FindResult:
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param FindRequest request: Trusted target, identity, and polling bound.
-    :raises ValueError: More than one run carries the identity, or the run contradicts it.
+    :raises ValueError: The configured experiment or matching run contradicts the identity,
+        or more than one run carries it.
     :return FindResult: The verified binding, or that no run carries the identity.
     """
-    experiment_id = _resolve(client, request["settings"])
-    identity: RunIdentity = {**request["binding"], "experiment_id": experiment_id}
+    identity = _creation_identity(client, request)
     reserve = report_reserve(request["settings"]["timeout_seconds"], _REPORT_SECONDS)
     stop = request["timeout_at"] - reserve
     while True:

@@ -8,13 +8,17 @@ import os
 import threading
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
-from phasesweep.runtime.files import private_atomic_write_text
+from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
+from phasesweep.runtime.files import (
+    UnsafePrivatePathError,
+    open_directory_fd,
+    private_atomic_write_text,
+)
 from phasesweep.runtime.json import (
     JsonObject,
     json_object,
@@ -34,6 +38,7 @@ from phasesweep.tracking.records import validate_binding, validate_identity
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Experiment
+    from phasesweep.engine.errors import TrackingSyncRefusedError
     from phasesweep.engine.state import Winner
     from phasesweep.tracking.mlflow import _SdkClient
     from phasesweep.tracking.records import (
@@ -262,7 +267,7 @@ def _create_bound(
 
     A confirmed rejection removes pending intent. Unknown outcomes, timeouts,
     and other failures retain it; subsequent calls search rather than create.
-    An empty search leaves the creation unresolved across restarts.
+    Only recovery can retire an intent after an empty search.
 
     :param Experiment experiment: Configured experiment.
     :param RunIdentity identity: Exact creation identity.
@@ -298,7 +303,7 @@ def _create_bound(
         raise RuntimeError(
             f"MLflow run creation for attempt {identity['attempt_id']} of generation "
             f"{identity['generation_id']} is unresolved: an earlier request may still create "
-            "the run, so it is not sent again. sync-tracking binds the run if it appears."
+            "the run, so it is not sent again. Run sync-tracking to reconcile the intent."
         ) from cause
 
     if pending.exists():
@@ -313,15 +318,28 @@ def _create_bound(
             )
         except OperationRejectedError:
             # A refused or unsent request created nothing, so a later call may send it afresh.
-            pending.unlink(missing_ok=True)
+            _retire_creation(pending)
             raise
         except (OperationOutcomeUnknownError, TimeoutError) as exc:
             binding = reconcile(exc)
         else:
             binding = validate_binding(created)
     write_record(path, binding)
-    pending.unlink(missing_ok=True)
+    _retire_creation(pending)
     return binding
+
+
+def _retire_creation(path: Path) -> None:
+    """Remove an intent without following a symlinked parent.
+
+    :param Path path: Creation intent to retire.
+    """
+    with suppress(FileNotFoundError):
+        directory_fd = open_directory_fd(path.parent, create=False, private_final=False)
+        try:
+            os.unlink(path.name, dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 def _find_bound(
@@ -342,13 +360,18 @@ def _find_bound(
     :param float | None deadline: Existing execution deadline.
     :param str | None worker_generation: Invocation registering the search, defaulting to the
         identity's own generation.
+    :raises ValueError: The lookup response was malformed.
     :return RunBinding | None: The verified binding, or ``None`` when no run carries the identity.
     """
     request: FindAction = {"action": "find", "binding": identity, "timeout_at": timeout_at}
     found = call_tracking(
         experiment, worker_generation or identity["generation_id"], request, environment, deadline
     )
-    return validate_binding(found["binding"]) if found.get("found") is True else None
+    if found.get("found") is False and "binding" not in found:
+        return None
+    if found.get("found") is True:
+        return validate_binding(found.get("binding"))
+    raise ValueError("MLflow lookup response did not say whether it found the run.")
 
 
 def pending_creation_records(
@@ -379,41 +402,85 @@ def resolve_pending_creations(
     generation_id: str | None,
     *,
     worker_generation: str | None = None,
-) -> None:
+    errors: list[TrackingSyncRefusedError] | None = None,
+) -> bool:
     """Reconcile pending creations with one read-only search per record.
 
-    Persist each found binding before removing its intent. Search or local record failures
-    leave the record for another pass and emit a warning.
+    The caller holds the experiment lock and has confirmed cleanup of registered workers for
+    the generations it reconciles. Persist each found binding before retiring its intent.
+    Retire an unmatched intent only after a successful lookup started outside its request window.
 
     :param Experiment experiment: Configured experiment with a verified tracking target.
     :param Mapping[str, str] environment: Composed credentials and transport.
     :param str | None generation_id: Generation to resolve, or ``None`` for every generation.
     :param str | None worker_generation: Invocation registering the searches, defaulting to
         each record's own generation.
+    :param list[TrackingSyncRefusedError] | None errors: Collect local record failures and
+        continue, or raise the first one if omitted.
     :raises ProcessCleanupUncertainError: A search worker's cleanup is uncertain.
+    :raises TrackingSyncRefusedError: A local creation record could not be read or updated.
+    :return bool: Whether the requested scope had any creation intents.
     """
-    for pending in pending_creation_records(experiment, generation_id):
-        path = pending.with_suffix("").with_suffix(".json")
+    from phasesweep.engine.errors import TrackingSyncRefusedError
+
+    records = pending_creation_records(experiment, generation_id)
+    for pending in records:
         try:
-            if not path.exists():
-                identity = validate_identity(read_record(pending).get("identity"))
-                binding = _find_bound(
-                    experiment,
-                    identity,
-                    environment,
-                    timeout_at=time.monotonic(),
-                    deadline=None,
-                    worker_generation=worker_generation,
-                )
-                if binding is None:
-                    # The server may still commit a sent create after its worker is gone.
-                    continue
-                write_record(path, binding)
-            pending.unlink(missing_ok=True)
-        except ProcessCleanupUncertainError:
-            raise
-        except (OSError, ValueError, RuntimeError) as exc:
-            log.warning("MLflow run creation at %s is still unresolved (%s).", pending, exc)
+            _reconcile_creation(experiment, pending, environment, worker_generation)
+        except (OSError, UnsafePrivatePathError, ValueError) as exc:
+            failure = TrackingSyncRefusedError(
+                f"Could not reconcile local MLflow creation record {pending}: {exc}",
+                action=OperatorAction.RESTORE_TREE,
+            )
+            if errors is None:
+                raise failure from exc
+            failure.__cause__ = exc
+            errors.append(failure)
+    return bool(records)
+
+
+def _reconcile_creation(
+    experiment: Experiment,
+    pending: Path,
+    environment: Mapping[str, str],
+    worker_generation: str | None,
+) -> None:
+    """Bind a found run or retire its expired intent after one conclusive lookup.
+
+    :param Experiment experiment: Configured experiment with a verified tracking target.
+    :param Path pending: Unconfirmed creation intent.
+    :param Mapping[str, str] environment: Composed credentials and transport.
+    :param str | None worker_generation: Invocation registering the lookup, defaulting to the intent's generation.
+    """
+    path = pending.with_suffix("").with_suffix(".json")
+    if path.exists():
+        _retire_creation(pending)
+        return
+    settings = experiment.mlflow
+    assert settings is not None
+    identity = validate_identity(read_record(pending).get("identity"))
+    expires_at = pending.stat().st_mtime + settings.timeout_seconds
+    # A search started inside the window may see absence even if it returns after the window.
+    expired = time.time() >= expires_at
+    try:
+        binding = _find_bound(
+            experiment,
+            identity,
+            environment,
+            timeout_at=time.monotonic(),
+            deadline=None,
+            worker_generation=worker_generation,
+        )
+    except PhaseSweepError:
+        raise
+    except (TimeoutError, ValueError, RuntimeError) as exc:
+        log.warning("MLflow run creation at %s is still unresolved (%s).", pending, exc)
+        return
+    if binding is not None:
+        write_record(path, binding)
+    elif not expired:
+        return
+    _retire_creation(pending)
 
 
 def _resolve_source(
@@ -517,10 +584,10 @@ def require_tracking_target(
     :param float | None deadline: Phase/run deadline; reaching it stays a timeout.
     :param bool resolve_only: Only resolve the target, for a caller that launches nothing and
         sends recovered outcomes, defaults to False.
+    :raises OSError: A recovery-only check could not access its local tracking records.
     :raises TrackingTargetUnavailableError: The target cannot be resolved or reached.
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
-    from phasesweep.errors import PhaseSweepError
 
     settings = experiment.mlflow
     assert settings is not None
@@ -540,7 +607,9 @@ def require_tracking_target(
             )
     except PhaseSweepError:
         raise
-    except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
+        if resolve_only and isinstance(exc, OSError) and not isinstance(exc, TimeoutError):
+            raise
         cause = str(exc).rstrip(".")
         if isinstance(exc, TimeoutError):
             if deadline is not None and time.monotonic() >= deadline:
@@ -551,9 +620,10 @@ def require_tracking_target(
             if settings.experiment_id is not None
             else f"experiment_name={settings.experiment_name!r}"
         )
+        launch = "" if resolve_only else " No trial was started."
         raise TrackingTargetUnavailableError(
             f"MLflow tracking target {selector} at {settings.tracking_uri!r} is not ready: "
-            f"{cause}. No trial was started."
+            f"{cause}.{launch}"
         ) from exc
 
 

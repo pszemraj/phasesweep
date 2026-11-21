@@ -162,7 +162,7 @@ class FindResult(TypedDict):
 
 
 class PendingCreation(TypedDict):
-    """A creation request that may have been sent, kept until its run is bound."""
+    """A creation request kept until its run is bound or recovery retires it."""
 
     schema_version: Literal[1]
     identity: RunIdentity

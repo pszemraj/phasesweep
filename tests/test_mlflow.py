@@ -448,14 +448,22 @@ def test_find_polls_for_the_identity_and_never_creates(
     assert all("phasesweep.attempt_id" in query for query in searches)
 
 
-def test_find_action_runs_through_the_worker_entry_point(tmp_path, monkeypatch):
-    """The worker routes a find request to a read-only lookup and reports its result."""
-    import json
-
+@pytest.mark.parametrize("recorded_experiment", ["1", "2"])
+@pytest.mark.parametrize("action", ["create", "find"])
+def test_creation_actions_check_the_recorded_experiment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorded_experiment: str, action: str
+) -> None:
+    """Creation and lookup act only on the MLflow experiment recorded before launch."""
     from phasesweep.tracking import mlflow as worker
 
     binding = mlflow_binding()
-    client = _creation_client(search=lambda *a, **k: _Page([mlflow_run(binding)]))
+    searched: list[object] = []
+
+    def search(experiment_ids: object, **kwargs: object) -> _Page:
+        searched.append(experiment_ids)
+        return _Page([mlflow_run(binding)])
+
+    client = _creation_client(search=search)
     monkeypatch.setitem(
         sys.modules, "mlflow", SimpleNamespace(MlflowClient=lambda **kwargs: client)
     )
@@ -465,21 +473,32 @@ def test_find_action_runs_through_the_worker_entry_point(tmp_path, monkeypatch):
         "experiment_name": None,
     }
     request, response = tmp_path / "request.json", tmp_path / "response.json"
+    options = (
+        {"timeout_at": time.monotonic() + 10} if action == "find" else {"run_name": "managed-run"}
+    )
     request.write_text(
         json.dumps(
             {
-                "action": "find",
+                "action": action,
                 "settings": settings,
-                "binding": attempt_identity(),
-                "timeout_at": time.monotonic() + 10,
+                "binding": {**attempt_identity(), "experiment_id": recorded_experiment},
+                **options,
             }
-        )
+        ),
+        encoding="utf-8",
     )
     assert worker.main([str(request), str(response)]) == 0
-    assert json.loads(response.read_text()) == {
-        "status": "ok",
-        "result": {"found": True, "binding": binding},
-    }
+    result = json.loads(response.read_text(encoding="utf-8"))
+    if recorded_experiment == "1":
+        assert searched == [["1"]]
+        assert result == {
+            "status": "ok",
+            "result": {"found": True, "binding": binding} if action == "find" else binding,
+        }
+    else:
+        assert not searched
+        assert result["status"] == "error"
+        assert "experiment resolves differently from the creation intent" in result["message"]
 
 
 @pytest.mark.parametrize("target", ["experiment_id", "experiment_name"])
@@ -835,8 +854,10 @@ def _write_pending(path, identity):
     return path
 
 
-def test_sync_binds_late_runs_and_leaves_absent_ones_pending(tmp_path, monkeypatch):
-    """Leftover records get one read-only search each; a found run is bound, an absent one waits."""
+def test_sync_binds_late_runs_and_retires_expired_misses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bind found runs at any age and retire absent ones outside the request window."""
     from phasesweep.engine.paths import _trial_dir_for
     from phasesweep.tracking import session
 
@@ -865,6 +886,7 @@ def test_sync_binds_late_runs_and_leaves_absent_ones_pending(tmp_path, monkeypat
         ),
     }
     session.write_record(pending["bound"].with_name("mlflow-binding.json"), mlflow_binding())
+    os.utime(pending["generation"], (0, 0))
     searched = []
 
     def find(experiment, generation_id, request, environment, deadline=None):
@@ -884,23 +906,32 @@ def test_sync_binds_late_runs_and_leaves_absent_ones_pending(tmp_path, monkeypat
     assert pending["absent"].exists() and pending["other"].exists()
     assert not pending["absent"].with_name("mlflow-binding.json").exists()
 
+    os.utime(pending["absent"], (0, 0))
     session.resolve_pending_creations(experiment, {}, None)
     assert not pending["other"].exists()
     assert session.read_binding(pending["other"].parent)["run_id"] == "late-run"
-    assert pending["absent"].exists()
+    assert not pending["absent"].exists()
+    assert not pending["absent"].with_name("mlflow-binding.json").exists()
     assert {action for _, action, _ in searched} == {"find"}
 
 
 @pytest.mark.parametrize(
-    "error,raises",
+    "outcome",
     [
-        (RuntimeError("MLflow find failed (MlflowException: PERMISSION_DENIED)."), False),
-        (ValueError("Multiple MLflow runs carry this attempt identity."), False),
-        (UnsafeProcessCleanupError("worker cleanup is uncertain"), True),
+        RuntimeError("MLflow find failed (MlflowException: PERMISSION_DENIED)."),
+        ValueError("Multiple MLflow runs carry this attempt identity."),
+        UnsafeProcessCleanupError("worker cleanup is uncertain"),
+        {"found": None},
     ],
-    ids=["failed", "ambiguous", "cleanup-uncertain"],
+    ids=["failed", "ambiguous", "cleanup-uncertain", "malformed-response"],
 )
-def test_sync_keeps_a_record_whose_search_fails(tmp_path, monkeypatch, caplog, error, raises):
+def test_sync_keeps_a_record_whose_search_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outcome: RuntimeError | ValueError | dict[str, None],
+) -> None:
+    """An expired intent still requires a conclusive lookup before it can be retired."""
     from phasesweep.tracking import session
 
     experiment = native_experiment(tmp_path)
@@ -909,19 +940,83 @@ def test_sync_keeps_a_record_whose_search_fails(tmp_path, monkeypatch, caplog, e
         session.tracking_root(experiment) / generation / "generation-binding.pending.json",
         attempt_identity(generation, generation),
     )
+    os.utime(path, (0, 0))
 
-    def find(*args, **kwargs):
-        raise error
+    def find(*args: object, **kwargs: object) -> dict[str, None]:
+        if isinstance(outcome, RuntimeError | ValueError):
+            raise outcome
+        return outcome
 
     monkeypatch.setattr(session, "call_tracking", find)
-    if raises:
-        with pytest.raises(type(error)):
+    if isinstance(outcome, UnsafeProcessCleanupError):
+        with pytest.raises(UnsafeProcessCleanupError):
             session.resolve_pending_creations(experiment, {}, generation)
     else:
         session.resolve_pending_creations(experiment, {}, generation)
         assert "still unresolved" in caplog.text
     assert path.exists()
     assert not path.with_name("generation-binding.json").exists()
+
+
+@pytest.mark.parametrize("failure", ["invalid-intent", "unsafe-binding", "full-disk"])
+def test_sync_reports_local_creation_record_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """A broken local read or write leaves its repair diagnostic and retains the intent."""
+    from phasesweep.engine.errors import TrackingSyncRefusedError
+    from phasesweep.errors import OperatorAction
+    from phasesweep.runtime.files import UnsafePrivatePathError
+    from phasesweep.tracking import session
+    from phasesweep.tracking.records import RunBinding, RunIdentity
+
+    experiment = native_experiment(tmp_path)
+    generation = "1" * 32
+    path = _write_pending(
+        session.tracking_root(experiment) / generation / "generation-binding.pending.json",
+        attempt_identity(generation, generation),
+    )
+    other = "2" * 32
+    healthy = _write_pending(
+        session.tracking_root(experiment) / other / "generation-binding.pending.json",
+        attempt_identity(other, other),
+    )
+    os.utime(healthy, (0, 0))
+    if failure == "invalid-intent":
+        session.write_record(path, {"schema_version": 1, "identity": None})
+
+    def find(
+        configured: Experiment, identity: RunIdentity, *args: object, **kwargs: object
+    ) -> RunBinding | None:
+        if identity["generation_id"] == other:
+            return None
+        assert failure != "invalid-intent"
+        return {**identity, "run_id": "found-run"}
+
+    def write(*args: object, **kwargs: object) -> None:
+        if failure == "unsafe-binding":
+            raise UnsafePrivatePathError("unsafe binding path")
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(session, "_find_bound", find)
+    monkeypatch.setattr(session, "write_record", write)
+    with pytest.raises(TrackingSyncRefusedError) as caught:
+        session.resolve_pending_creations(experiment, {}, generation)
+    expected = {
+        "invalid-intent": ValueError,
+        "unsafe-binding": UnsafePrivatePathError,
+        "full-disk": OSError,
+    }
+    assert isinstance(caught.value.__cause__, expected[failure])
+    assert str(path) in str(caught.value)
+    assert caught.value.action is OperatorAction.RESTORE_TREE
+    assert path.exists()
+    assert not path.with_name("generation-binding.json").exists()
+
+    collected: list[TrackingSyncRefusedError] = []
+    assert session.resolve_pending_creations(experiment, {}, None, errors=collected)
+    assert len(collected) == 1 and collected[0].args == caught.value.args
+    assert path.exists()
+    assert not healthy.exists()
 
 
 @pytest.mark.parametrize("field", ["run_id", "experiment_id", "attempt_id", "unbound"])
