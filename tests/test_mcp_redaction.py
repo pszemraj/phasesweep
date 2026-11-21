@@ -18,7 +18,12 @@ from phasesweep.engine.run import run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import WinnerSource
 from phasesweep.evidence.models import JsonEnvelopeExtractor
-from phasesweep.mcp.redaction import intersect_visible_params, status_payload, winners_payload
+from phasesweep.mcp.redaction import (
+    _tracking_delivery_payload,
+    intersect_visible_params,
+    status_payload,
+    winners_payload,
+)
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.runtime.json import json_object
 from tests.conftest import make_experiment, write_experiment_config, write_trainer
@@ -462,6 +467,27 @@ def test_trial_failure_reasons_and_their_stderr_quote_never_reach_status_or_snap
     assert status["phases"][0]["trials"]["FAIL"] == 2
     for payload in payloads:
         assert_no_sensitive(payload, ["STDERR_SENTINEL", "leaked-credential-123", "non-zero exit"])
+
+
+def test_the_delivery_remedy_counts_records_and_run_creations_apart() -> None:
+    """``pending`` sums the two, and the remedy words them as a run's closing line does, once the run has ended."""
+    ended = {"state": "stopped", "run_id": "run-1"}
+
+    both = _tracking_delivery_payload({"records": 2, "creations": 1, "delivered": 3}, ended)
+    creations = _tracking_delivery_payload({"records": 0, "creations": 1, "delivered": 0}, ended)
+    running = _tracking_delivery_payload(
+        {"records": 2, "creations": 1, "delivered": 3}, {"state": "running", "run_id": "run-1"}
+    )
+
+    assert (both["pending"], both["delivered"]) == (3, 3)
+    assert isinstance(both["remedy"], str) and both["remedy"].startswith(
+        "MLflow: 2 records and 1 unconfirmed run creation pending for this run. "
+    )
+    assert (creations["pending"], creations["delivered"]) == (1, 0)
+    assert isinstance(creations["remedy"], str) and creations["remedy"].startswith(
+        "MLflow: 1 unconfirmed run creation pending for this run. "
+    )
+    assert (running["pending"], running["remedy"]) == (3, None)
 
 
 def test_winners_payload_defaults_claim_no_historical_provenance() -> None:

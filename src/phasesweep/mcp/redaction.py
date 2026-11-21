@@ -217,21 +217,24 @@ def winners_payload(
 def _tracking_delivery_payload(counts: Mapping[str, int], run: Mapping[str, object]) -> JsonObject:
     """Attach the retry step to a run's tracking counts once sync can acquire the lock.
 
-    :param Mapping[str, int] counts: Pending creations and deliveries, and delivered uploads.
+    :param Mapping[str, int] counts: Pending ``records`` and unconfirmed ``creations``, and
+        ``delivered`` uploads.
     :param Mapping[str, object] run: Path-free detached-run state.
-    :return JsonObject: Counts plus ``remedy``, the retry step when records are pending after
-        the run ended, otherwise ``None``.
+    :return JsonObject: ``pending`` (records and creations together), ``delivered`` and
+        ``remedy``, the retry step when anything is pending after the run ended, otherwise
+        ``None``.
     """
-    from phasesweep.tracking.session import refusal_rule
+    from phasesweep.tracking.session import count_text, refusal_rule
 
-    pending = counts["pending"]
+    pending = counts["records"] + counts["creations"]
     remedy = None
     if pending and run["state"] != "running":
         # The payload is path-free, so the warning is placed by the log the run wrote and by
         # the retry, whose every pass warns again.
         remedy = (
-            f"{pending} MLflow record(s) of this run are pending. Its scores and winners are "
-            "unaffected. The next launch with this config sends them, or ask the operator "
+            f"MLflow: {count_text(counts['records'], counts['creations'])} pending for this run. "
+            "Its scores and winners are unaffected. "
+            "The next launch with this config sends them, or ask the operator "
             f"to retry them with `phasesweep sync-tracking CONFIG --generation {run['run_id']}` "
             "using the config this run launched with; delivery never retrains. If MLflow "
             "refused a record, such as for a run deleted in MLflow, that record "

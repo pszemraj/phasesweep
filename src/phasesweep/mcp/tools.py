@@ -891,8 +891,8 @@ class PhaseSweepMCP:
 
         :param RunHandle handle: Run whose generation owns the records.
         :param Experiment | None experiment: Launch config, when already loaded.
-        :return dict[str, int] | None: Pending and delivered counts, or ``None``
-            when the run does not use MLflow or its config is unavailable.
+        :return dict[str, int] | None: Pending records, unconfirmed creations and delivered
+            counts, or ``None`` when the run uses no MLflow or its config is unavailable.
         """
         if experiment is None:
             try:
@@ -901,9 +901,9 @@ class PhaseSweepMCP:
                 return None
         if experiment.mlflow is None:
             return None
-        from phasesweep.tracking.publication import delivery_status
+        from phasesweep.tracking.publication import delivery_counts
 
-        return delivery_status(experiment, handle.run_id)
+        return delivery_counts(experiment, handle.run_id)._asdict()
 
     def _catalog_comparison_experiment(self, experiment_id: str) -> Experiment | None:
         """Return the config a future catalog launch would execute, if available.
