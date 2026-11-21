@@ -43,7 +43,7 @@ from phasesweep.engine.optuna import (
     _finished_trial_count,
     _suggest,
 )
-from phasesweep.engine.paths import _phase_dir, _trial_dir_for
+from phasesweep.engine.paths import _phase_dir, _trial_dir_for, _trials_csv_path
 from phasesweep.engine.progress import (
     _log_finished_trial,
     _log_reruns,
@@ -1490,7 +1490,7 @@ def _settle_finished_trial(
             with contextlib.suppress(Exception):
                 _write_trials_csv(
                     study,
-                    _phase_dir(run.experiment, run.phase.name) / "trials.csv",
+                    _trials_csv_path(run.experiment, run.phase.name),
                     repeats=repeat_axis(run.phase),
                 )
                 run.csv_throttle.mark_written(finished, now)
@@ -1806,7 +1806,7 @@ def _run_phase(
             with contextlib.suppress(Exception):
                 _write_trials_csv(
                     study,
-                    _phase_dir(experiment, phase.name) / "trials.csv",
+                    _trials_csv_path(experiment, phase.name),
                     repeats=repeat_axis(phase),
                 )
 

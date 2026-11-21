@@ -202,7 +202,7 @@ def _refresh_recovered_trials_csv(
         ) == fingerprint_ops._semantic_phase_dump(phase):
             _write_trials_csv(
                 study,
-                path_ops._phase_dir(experiment, phase.name) / "trials.csv",
+                path_ops._trials_csv_path(experiment, phase.name),
                 repeats=repeat_axis(phase),
             )
     except Exception as exc:
