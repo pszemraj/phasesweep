@@ -31,6 +31,7 @@ from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
     StaleProcessIdentity,
+    _guardian_exit_timeout,
     _process_group_alive,
     _terminate_process_groups,
     read_boot_id,
@@ -51,12 +52,6 @@ from phasesweep.runtime.shutdown import (
 log = logging.getLogger("phasesweep.runtime.process")
 
 _DIRECT_CHILD_REAP_TIMEOUT_SECONDS = 5.0
-# After the root exits the guardian waits out the helper settle, then the SIGTERM grace.
-_GUARDIAN_EXIT_TIMEOUT_SECONDS = (
-    _supervisor._HELPER_SETTLE_SECONDS
-    + _supervisor._GROUP_TERM_GRACE_SECONDS
-    + _DIRECT_CHILD_REAP_TIMEOUT_SECONDS
-)
 _SUPERVISOR_READY_TIMEOUT_SECONDS = 10.0
 # poll() takes its timeout as a C int of milliseconds, about 24.8 days, and a
 # trial timeout may be longer.
@@ -115,7 +110,7 @@ def _kill_group(pgid: int, proc: subprocess.Popen[bytes]) -> bool:
 
 
 def _wait_for_guardian_exit(proc: subprocess.Popen[bytes]) -> bool:
-    """Wait a bounded time for the GPU-lease guardian to exit.
+    """Wait :func:`~phasesweep.runtime.reaper._guardian_exit_timeout` for the GPU-lease guardian to exit.
 
     An uncertain group cleanup leaves the guardian holding its leases; a wait
     that expires must preserve that uncertainty.
@@ -123,14 +118,15 @@ def _wait_for_guardian_exit(proc: subprocess.Popen[bytes]) -> bool:
     :param subprocess.Popen[bytes] proc: Guardian process whose trainer-status pipe became ready or closed.
     :return bool: Whether the guardian exited inside its cleanup allowance.
     """
+    timeout = _guardian_exit_timeout()
     try:
-        proc.wait(timeout=_GUARDIAN_EXIT_TIMEOUT_SECONDS)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         log.error(
             "Lease guardian PID %d did not finish descendant cleanup within %.1fs; "
             "returning cleanup uncertainty while it retains the GPU lease",
             proc.pid,
-            _GUARDIAN_EXIT_TIMEOUT_SECONDS,
+            timeout,
         )
         return False
     return True

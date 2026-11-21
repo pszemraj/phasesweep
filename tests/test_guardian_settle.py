@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import optuna
 import pytest
@@ -28,6 +29,7 @@ from phasesweep import run_experiment
 from phasesweep.engine.paths import _run_log_path
 from phasesweep.engine.state import FAILURE_REASON_ATTR
 from phasesweep.errors import PhaseSweepError
+from phasesweep.mcp.runs import RUNNER_STOP_GRACE_SECONDS
 from phasesweep.runtime import process, reaper, supervisor
 from phasesweep.runtime.process import ProcessResult, read_attempt_lifecycle, run_supervised
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
@@ -690,6 +692,37 @@ def test_the_guarded_shutdown_window_covers_the_settle(
         0,
         True,
     )
+
+
+def test_the_guarded_shutdown_window_allows_what_the_guardian_exit_wait_allows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A guardian that never exits is waited for as long as a trial's own wait for its guardian allows, and an MCP runner's stop grace outlasts that."""
+    clock = [0.0]
+
+    def sleep(seconds: float) -> None:
+        clock[0] += seconds
+
+    monkeypatch.setattr(reaper, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    monkeypatch.setattr(reaper, "_process_group_alive", lambda pgid: True)
+    monkeypatch.setattr(reaper, "_process_group_alive_with_members", lambda pgid, members: True)
+    monkeypatch.setattr(reaper, "_group_member_pids", lambda pgid: SimpleNamespace(pids=()))
+    signalled: list[int] = []
+    guardian = SimpleNamespace(pid=4321, poll=lambda: None, send_signal=signalled.append)
+    waited: list[float] = []
+
+    def wait(timeout: float) -> None:
+        waited.append(timeout)
+
+    verdict = reaper._terminate_process_groups(
+        (1234,), grace_seconds=reaper._KILL_GRACE_SECONDS, guardians={1234: guardian}
+    )
+    assert process._wait_for_guardian_exit(SimpleNamespace(pid=4321, wait=wait))
+
+    allowance = reaper._guardian_exit_timeout()
+    assert (verdict, signalled, waited) == ({1234: False}, [signal.SIGTERM], [allowance])
+    assert allowance <= clock[0] < allowance + 0.5
+    assert allowance < RUNNER_STOP_GRACE_SECONDS
 
 
 @_LINUX_ADOPTION

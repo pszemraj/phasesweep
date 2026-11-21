@@ -73,8 +73,10 @@ RUNNER_HEARTBEAT_INTERVAL_SECONDS = 15.0
 RUNNER_HEARTBEAT_STALE_SECONDS = 120.0
 #: How long a SIGTERMed runner group gets before SIGKILL. A runner confirms its
 #: trials' cleanup by waiting for their guardians, and a guardian whose trainer root
-#: had just exited finishes its helper settle and SIGTERM grace first; the last 20 s
-#: are margin on that wait plus the runner's ledger and status writes.
+#: had just exited finishes its helper settle and SIGTERM grace first. The runner allows
+#: that guardian ``runtime.reaper._guardian_exit_timeout()``; this grace adds a larger
+#: margin to the same settle and grace, so the runner's ledger and status writes still
+#: fit after its wait.
 RUNNER_STOP_GRACE_SECONDS = (
     _supervisor._HELPER_SETTLE_SECONDS + _supervisor._GROUP_TERM_GRACE_SECONDS + 20.0
 )

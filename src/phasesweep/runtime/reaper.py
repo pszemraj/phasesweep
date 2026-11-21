@@ -35,6 +35,9 @@ from phasesweep.runtime.json import strict_json_loads
 log = logging.getLogger("phasesweep.runtime.process")
 
 _KILL_GRACE_SECONDS = 10.0
+# Room past a guardian's helper settle and SIGTERM grace for its poll overshoot and procfs
+# scans, which a loaded machine stretches to over a second.
+_GUARDIAN_EXIT_MARGIN_SECONDS = 5.0
 PROCESS_IDENTITY_FILE = "process_identity.json"
 PROCESS_IDENTITY_SCHEMA_VERSION = 3
 
@@ -618,6 +621,22 @@ def _apply_stale_process_decision(
     return _terminate_process_group(decision.pgid, grace_seconds=grace_seconds)
 
 
+def _guardian_exit_timeout() -> float:
+    """Return how long the controller waits for a guardian whose trainer root has exited.
+
+    Such a guardian ignores cancellation, waits out its helper settle, then gives survivors its
+    SIGTERM grace. Both the wait for a guardian's exit and the guarded shutdown window allow
+    this, read from the guardian's constants at each call.
+
+    :return float: The helper settle plus the SIGTERM grace plus the margin, in seconds.
+    """
+    return (
+        _supervisor._HELPER_SETTLE_SECONDS
+        + _supervisor._GROUP_TERM_GRACE_SECONDS
+        + _GUARDIAN_EXIT_MARGIN_SECONDS
+    )
+
+
 def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
     """Send SIGTERM, wait, then SIGKILL, confirming the group is gone.
 
@@ -640,11 +659,12 @@ def _terminate_process_groups(
 
     All groups share one grace period and one final confirmation window. Unguarded
     groups still alive after the grace period receive direct SIGKILL; live guardians own
-    escalation for their groups. If a guardian exits, its trainer group receives direct
-    termination once a probe finds it still alive. While a guardian still runs after the
-    grace period, the confirmation window grows to cover the rest of its worst case: a
-    guardian whose trainer root already exited ignores cancellation, waits out the helper
-    settle, then gives survivors its own SIGTERM grace.
+    escalation for their groups. A trainer group whose guardian has exited, or exits during
+    the grace period, receives SIGTERM directly; after the grace period it receives SIGKILL
+    once a probe finds it still alive. While a guardian still
+    runs after the grace period, the confirmation window grows to the rest of
+    :func:`_guardian_exit_timeout`: a guardian whose trainer root already exited ignores
+    cancellation, waits out the helper settle, then gives survivors its own SIGTERM grace.
 
     :param tuple[int, ...] pgids: Target process-group IDs.
     :param float grace_seconds: Shared wait after requesting cancellation, before direct SIGKILL for unguarded groups or continued observation of guardians.
@@ -760,13 +780,10 @@ def _terminate_process_groups(
     # "marked FAIL" state means cleanup completed, not requested. A guardian
     # whose trainer root exited as the request arrived ignores it, waits out the
     # helper settle, then gives survivors its own SIGTERM grace; a group it still
-    # guards gets what is left of that after the grace already spent here.
+    # guards gets what is left of the guardian-exit allowance after the grace spent here.
     kill_window = 2.0
     if any(pgid in active_guardians for pgid in survivors):
-        guardian_worst_case = (
-            _supervisor._HELPER_SETTLE_SECONDS + _supervisor._GROUP_TERM_GRACE_SECONDS
-        )
-        kill_window += max(0.0, guardian_worst_case - grace_seconds)
+        kill_window = max(kill_window, _guardian_exit_timeout() - grace_seconds)
     kill_deadline = time.monotonic() + kill_window
     while survivors and time.monotonic() < kill_deadline:
         still_alive = []
