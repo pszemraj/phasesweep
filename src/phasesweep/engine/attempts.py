@@ -582,16 +582,27 @@ def _attempt_process_resolution(
 ) -> str:
     """Classify the fail-closed recovery authority for one interrupted attempt.
 
+    ``launching`` with no identity file settles without signalling. The launch writes
+    ``launching`` before it spawns the supervisor and sends the payload only after the
+    identity file is written, so a missing file means no payload crossed. Recovery acts on
+    this only under the experiment lock, which proves the controller holding the payload
+    pipe is dead, and a supervisor that reads end-of-file instead of a payload exits without
+    running the trainer. An identity file that exists at all, even partial, keeps the strict
+    read: its payload may have crossed.
+
     :param AttemptLifecycle | None lifecycle: Validated durable lifecycle, if present.
     :param bool identity_exists: Whether a retained process-identity file exists.
     :return str: ``"exited"`` for confirmed cleanup, ``"allocated"`` when launch
-        provably never began, or ``"identity"`` when the process identity must
-        be validated (and, outside inspection mode, cleaned).
+        provably never began, ``"payload_withheld"`` when a launch began but no worker
+        received its payload, or ``"identity"`` when the process identity must be
+        validated (and, outside inspection mode, cleaned).
     """
     if lifecycle is not None and lifecycle.state == "exited" and lifecycle.cleanup_confirmed:
         return "exited"
     if not identity_exists and lifecycle is not None and lifecycle.state == "allocated":
         return "allocated"
+    if not identity_exists and lifecycle is not None and lifecycle.state == "launching":
+        return "payload_withheld"
     return "identity"
 
 
@@ -980,6 +991,18 @@ class _AttemptRecord:
     trial_number: int | None
 
 
+def _record_process_resolution(record: _AttemptRecord, lifecycle: AttemptLifecycle | None) -> str:
+    """Classify one attempt's process slot from its lifecycle and its identity file.
+
+    :param _AttemptRecord record: Attempt whose trial directory holds the identity file.
+    :param AttemptLifecycle | None lifecycle: Validated durable lifecycle, if present.
+    :return str: The :func:`_attempt_process_resolution` verdict for the attempt.
+    """
+    return _attempt_process_resolution(
+        lifecycle, identity_exists=(record.trial_dir / PROCESS_IDENTITY_FILE).exists()
+    )
+
+
 def _resolve_attempt(
     record: _AttemptRecord,
     *,
@@ -992,8 +1015,9 @@ def _resolve_attempt(
 ) -> bool:
     """Inspect or clean one attempt using its durable lifecycle and process identity.
 
-    Confirmed exited attempts and allocated attempts without identities need no signal
-    when ``lifecycle_settles`` is true. Terminal cleanup uncertainty requires a valid
+    When ``lifecycle_settles`` is true, three slots need no signal: confirmed exited
+    attempts, allocated attempts without an identity, and launching attempts without an
+    identity, whose payload never crossed. Terminal cleanup uncertainty requires a valid
     identity regardless of lifecycle. Confirmed resolution cleans the identified group.
 
     :param _AttemptRecord record: Attempt identity and evidence directory to resolve.
@@ -1034,11 +1058,13 @@ def _resolve_attempt(
                 f"{context}: attempt lifecycle record is malformed or belongs to another attempt.",
                 action=evidence_action,
             ) from exc
-        # Only allocated with an absent identity settles without a strict identity read.
-        resolution = _attempt_process_resolution(
-            lifecycle,
-            identity_exists=(record.trial_dir / PROCESS_IDENTITY_FILE).exists(),
-        )
+        resolution = _record_process_resolution(record, lifecycle)
+        if resolution == "payload_withheld":
+            report(
+                f"{label}: lifecycle=launching with no process identity: no worker received "
+                "its payload; settles without signalling."
+            )
+            return False
         if resolution != "identity":
             assert lifecycle is not None
             report(
@@ -1116,10 +1142,12 @@ def _recover_completed_trial(
 ) -> bool | None:
     """Accept a finished orphan through the producing configuration's extraction path.
 
-    Confirmed group cleanup and successful trainer exit evidence permit acceptance.
-    Trainer ledger attributes precede SDK workers and take priority over the reused
-    process slot; the guardian covers a runner death before those attributes commit.
-    Recorded process failures and interruptions remain authoritative; a measured
+    An idle process slot and successful trainer exit evidence permit acceptance. The slot
+    is idle once its group's cleanup is confirmed or its last launch never delivered a
+    payload (see :func:`_attempt_process_resolution`). Trainer ledger attributes precede
+    SDK workers and take priority over the reused process slot; the guardian covers a
+    runner death before those attributes commit. A withheld payload carries no exit status,
+    so it proves a finished trainer only through those attributes. Recorded process failures and interruptions remain authoritative; a measured
     bound violation may still commit as COMPLETE and infeasible. Evidence that answers
     with a failure commits FAIL with that failure as the trial's outcome, as the live path
     records it, so finished training is never trained again. Either verdict counts toward the
@@ -1157,9 +1185,7 @@ def _recover_completed_trial(
     lifecycle = read_attempt_lifecycle(record.trial_dir, expected_attempt_id=record.attempt_id)
     trainer_duration = None if lifecycle is None else _completed_trainer_duration(trial, lifecycle)
     if (
-        lifecycle is None
-        or lifecycle.state != "exited"
-        or not lifecycle.cleanup_confirmed
+        _record_process_resolution(record, lifecycle) not in {"exited", "payload_withheld"}
         or trainer_duration is None
         or record.generation_id is None
     ):

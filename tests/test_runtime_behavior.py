@@ -48,7 +48,6 @@ from phasesweep.engine.selection import (
     PhaseTrialsFailedError,
 )
 from phasesweep.engine.state import (
-    ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     DURATION_ATTR,
@@ -59,7 +58,6 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
-    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
@@ -1327,9 +1325,9 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         if calls["n"] == 2:
             result.cleanup_confirmed = False
             # ``real_run_supervised`` already observed a clean exit before this
-            # fault injection. Restore the durable pre-exit shape a genuinely
-            # unconfirmed cleanup leaves behind so preflight must consult the
-            # process identity and our cleanup verdict.
+            # fault injection. Restore a durable pre-exit shape: with an identity,
+            # preflight must consult it and our cleanup verdict; without one, the
+            # identity write failed before any payload crossed.
             trial_dir = Path(str(kwargs["trial_dir"]))
             write_attempt_lifecycle(
                 trial_dir,
@@ -1373,6 +1371,16 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         assert unsafe_trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
     else:
         assert CLEANUP_CONFIRMED_ATTR not in unsafe_trial.user_attrs
+    if not identity_persists:
+        # No trainer received its payload, so the run's own reconciliation settles the
+        # launch without a cleanup verdict and only the recorded abort remains.
+        assert list(_attempts_dir(_exp(2)).glob("*.json")) == []
+        assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [unsafe_trial.number]
+        with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
+            run_experiment(_exp(2))
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(_exp(3))
+        return
     assert list(_attempts_dir(_exp(2)).glob("*.json"))
 
     # A preview cannot confirm cleanup, so it names the recovery that retires the abort.
@@ -1406,14 +1414,6 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     # Positive cleanup is durably consumed before the registry is retired and
     # the ordinary fatal-abort top-up path becomes available.
     cleanup_safe["value"] = True
-    if not identity_persists:
-        write_attempt_lifecycle(
-            Path(str(unsafe_trial.user_attrs[TRIAL_DIR_ATTR])),
-            attempt_id=str(unsafe_trial.user_attrs[ATTEMPT_ID_ATTR]),
-            state="exited",
-            return_code=0,
-            cleanup_confirmed=True,
-        )
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", real_run_supervised)
     # Once the preflight has confirmed cleanup, only the target is left to raise.
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as confirmed:

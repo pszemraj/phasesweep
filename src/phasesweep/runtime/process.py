@@ -272,9 +272,11 @@ class AttemptLifecycle:
     """Durable launch state for one attempt.
 
     ``allocated`` identifies a durable RUNNING trial before launch, possibly queued
-    for a GPU. ``launching`` is recorded before spawning, so a missing identity
-    then requires recovery. ``terminating`` preserves cancellation before the guardian
-    signals the trainer. ``exited`` confirms group cleanup before Optuna completion.
+    for a GPU. ``launching`` is recorded before spawning; the payload crosses only after
+    the identity file is written, so ``launching`` without one means no worker received
+    its payload and recovery settles it without signalling. ``terminating`` preserves
+    cancellation before the guardian signals the trainer. ``exited`` confirms group
+    cleanup before Optuna completion.
     """
 
     state: str
@@ -723,8 +725,9 @@ def run_supervised(
             signum = servicing_shutdown_signal()
             if signum is not None:
                 raise ShutdownLaunchRefusedError(signum)
-            # Persist launching before Popen so missing identity requires recovery rather
-            # than being mistaken for a worker still queued for a GPU.
+            # Persist launching before Popen. Until the identity below is written no
+            # payload has crossed, so recovery settles launching without an identity
+            # without signalling; once it exists, recovery must validate and clean it.
             write_attempt_lifecycle(
                 trial_dir,
                 attempt_id=attempt_id,

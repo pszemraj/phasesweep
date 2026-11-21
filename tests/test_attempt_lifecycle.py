@@ -1,4 +1,4 @@
-"""Attempt lifecycle reader refusal contracts."""
+"""Attempt lifecycle reader refusal contracts and the recovery authority each state grants."""
 
 from __future__ import annotations
 
@@ -7,12 +7,47 @@ from pathlib import Path
 
 import pytest
 
+from phasesweep.engine.attempts import _attempt_process_resolution
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import (
     ATTEMPT_LIFECYCLE_FILE,
     ATTEMPT_LIFECYCLE_SCHEMA_VERSION,
+    AttemptLifecycle,
     read_attempt_lifecycle,
 )
+
+
+@pytest.mark.parametrize(
+    ("state", "cleanup_confirmed", "identity_exists", "resolution"),
+    [
+        (None, None, False, "identity"),
+        (None, None, True, "identity"),
+        ("allocated", None, False, "allocated"),
+        ("allocated", None, True, "identity"),
+        ("launching", None, False, "payload_withheld"),
+        ("launching", None, True, "identity"),
+        ("terminating", False, False, "identity"),
+        ("terminating", False, True, "identity"),
+        ("exited", False, False, "identity"),
+        ("exited", True, False, "exited"),
+        ("exited", True, True, "exited"),
+    ],
+)
+def test_attempt_process_resolution_table(
+    state: str | None, cleanup_confirmed: bool | None, identity_exists: bool, resolution: str
+) -> None:
+    """Only proof that no process can remain skips the identity read; any identity file keeps it."""
+    lifecycle = (
+        None
+        if state is None
+        else AttemptLifecycle(
+            state=state,
+            return_code=None,
+            cleanup_confirmed=cleanup_confirmed,
+            duration_seconds=None,
+        )
+    )
+    assert _attempt_process_resolution(lifecycle, identity_exists=identity_exists) == resolution
 
 
 def test_read_attempt_lifecycle_rejects_unreadable_record(tmp_path: Path) -> None:
