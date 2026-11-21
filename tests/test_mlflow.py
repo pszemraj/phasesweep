@@ -1428,7 +1428,7 @@ def test_pending_sync_uses_retained_projection(tmp_path, monkeypatch):
     assert publication.delivery_status(experiment) == {"pending": 1, "delivered": 0}
     requests = []
 
-    def deliver(experiment, generation_id, request, environment):
+    def deliver(experiment, generation_id, request, environment, deadline=None):
         requests.append(request)
         return {}
 

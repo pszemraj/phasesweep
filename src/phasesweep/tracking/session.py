@@ -486,6 +486,7 @@ def resolve_pending_creations(
     worker_generation: str | None = None,
     errors: list[TrackingSyncRefusedError] | None = None,
     tally: DeliveryTally | None = None,
+    deadline: float | None = None,
 ) -> None:
     """Reconcile pending creations with one read-only search per record.
 
@@ -506,6 +507,8 @@ def resolve_pending_creations(
         continue, or raise the first one if omitted.
     :param DeliveryTally | None tally: The delivery this pass belongs to; a fresh one when
         omitted.
+    :param float | None deadline: Absolute run deadline every search is cut at, defaults to
+        none.
     :raises ProcessCleanupUncertainError: A search worker's cleanup is uncertain.
     :raises TrackingSyncRefusedError: A local creation record could not be read or updated.
     """
@@ -522,7 +525,9 @@ def resolve_pending_creations(
         if not tally.sending:
             return
         try:
-            _reconcile_creation(experiment, pending, environment, worker_generation, tally)
+            _reconcile_creation(
+                experiment, pending, environment, worker_generation, tally, deadline
+            )
         except (OSError, UnsafePrivatePathError, ValueError) as exc:
             failure = TrackingSyncRefusedError(
                 f"Could not reconcile local MLflow creation record {pending}: {exc}",
@@ -540,6 +545,7 @@ def _reconcile_creation(
     environment: Mapping[str, str],
     worker_generation: str | None,
     tally: DeliveryTally,
+    deadline: float | None,
 ) -> None:
     """Bind a found run or retire its expired intent after one conclusive lookup.
 
@@ -550,6 +556,7 @@ def _reconcile_creation(
     :param DeliveryTally tally: The delivery the search belongs to, which counts the intent
         settled once it is retired, and stops sending when MLflow gives no answer or a shutdown
         is under way.
+    :param float | None deadline: Absolute run deadline the search is cut at, if any.
     """
     path = pending.with_suffix("").with_suffix(".json")
     if path.exists():
@@ -564,7 +571,7 @@ def _reconcile_creation(
             identity,
             environment,
             timeout_at=time.monotonic(),
-            deadline=None,
+            deadline=deadline,
             worker_generation=worker_generation,
         )
     except PhaseSweepError:

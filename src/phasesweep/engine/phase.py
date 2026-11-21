@@ -1739,9 +1739,12 @@ def _run_phase(
             from phasesweep.tracking.publication import deliver_ended_generations
 
             # Once per run, before its first trial: what an interrupted earlier run left reaches
-            # MLflow now rather than after this run's training. A tracker silent here costs one
-            # request and a warning, never the run; the closeout sends whatever is left.
-            deliver_ended_generations(experiment, ledger, generation.generation_id, tracking)
+            # MLflow now rather than after this run's training. Its requests are cut at the run
+            # deadline, the phase's budget starts after it, and the closeout sends what is left.
+            deliver_ended_generations(
+                experiment, ledger, generation.generation_id, tracking, deadline=run_deadline
+            )
+            budget = _phase_budget(experiment, phase, run_deadline)
     generation_id = generation.claim()
     run = _PhaseExecution(
         experiment=experiment,

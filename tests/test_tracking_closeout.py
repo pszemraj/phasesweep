@@ -16,7 +16,11 @@ import pytest
 
 from phasesweep.config.models import Experiment
 from phasesweep.engine import run as run_module
-from phasesweep.engine.errors import StudyFingerprintMismatchError, TrackingSyncRefusedError
+from phasesweep.engine.errors import (
+    PhaseTimeoutError,
+    StudyFingerprintMismatchError,
+    TrackingSyncRefusedError,
+)
 from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.read import read_status
@@ -309,6 +313,83 @@ def test_the_next_run_delivers_an_interrupted_runs_pending_records(
     publication.sync_tracking(experiment)
     assert sweep.uploads == []
     assert "MLflow: sending" not in caplog.text
+
+
+@pytest.mark.integration
+def test_the_pass_before_the_first_trial_leaves_the_phase_its_whole_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow pass over an earlier run's records spends none of the phase's timeout.
+
+    The two records the interrupted run left take longer to send than the depth phase's
+    ``timeout_seconds_per_phase``; the phase's budget starts once the pass ends, so its trial
+    runs and the sweep publishes.
+    """
+    sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
+    phases = [
+        phase.model_copy(update={"timeout_seconds_per_phase": 4.0})
+        if phase.name == "depth"
+        else phase
+        for phase in sweep.experiment.phases
+    ]
+    experiment = sweep.experiment.model_copy(update={"phases": phases})
+    respond = session.request_operation
+
+    def slow_for_earlier_records(request: dict[str, object], **kwargs: object) -> JsonObject:
+        binding = request.get("binding")
+        if (
+            request["action"] == "publish"
+            and isinstance(binding, dict)
+            and binding["generation_id"] == sweep.generation
+        ):
+            time.sleep(2.5)
+        return respond(request, **kwargs)
+
+    monkeypatch.setattr(session, "request_operation", slow_for_earlier_records)
+    monkeypatch.setattr(worker, "request_operation", slow_for_earlier_records)
+
+    assert set(run_experiment(experiment)) == {"depth", "rate"}
+    assert sweep.summaries() == ["KILLED"]
+
+
+@pytest.mark.integration
+def test_the_pass_before_the_first_trial_never_outlasts_the_run_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tracker silent during the pass before the first trial is given up on at the run deadline.
+
+    The upload gets ``timeout_seconds_per_run``'s deadline rather than ``mlflow.timeout_seconds``,
+    so the run stops on its own guard before any trial, and its closeout sends the record once
+    the tracker answers.
+    """
+    sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
+    assert sweep.experiment.mlflow is not None
+    experiment = sweep.experiment.model_copy(
+        update={
+            "timeout_seconds_per_run": 3.0,
+            "mlflow": sweep.experiment.mlflow.model_copy(update={"timeout_seconds": 60.0}),
+        }
+    )
+    respond = session.request_operation
+    deadlines: list[float] = []
+
+    def silent_once(request: dict[str, object], *, deadline: float, **kwargs: object) -> JsonObject:
+        if request["action"] == "publish" and not deadlines:
+            deadlines.append(deadline)
+            time.sleep(max(0.0, deadline - time.monotonic()))
+            raise TimeoutError("MLflow operation exceeded its deadline.")
+        return respond(request, deadline=deadline, **kwargs)
+
+    monkeypatch.setattr(session, "request_operation", silent_once)
+    monkeypatch.setattr(worker, "request_operation", silent_once)
+    started = time.monotonic()
+
+    with pytest.raises(PhaseTimeoutError, match="Run wallclock deadline reached before phase"):
+        run_experiment(experiment)
+
+    # The run's deadline, set as it started, rather than one 60 s after the upload began.
+    assert len(deadlines) == 1 and deadlines[0] - started < 5.0
+    assert sweep.summaries() == ["KILLED"]
 
 
 @pytest.mark.integration

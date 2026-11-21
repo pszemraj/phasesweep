@@ -87,6 +87,7 @@ def _deliver(
     environment: Mapping[str, str],
     *,
     worker_generation: str | None = None,
+    deadline: float | None = None,
 ) -> None:
     """Upload one persisted projection and mark its record delivered.
 
@@ -100,6 +101,7 @@ def _deliver(
     :param str | None worker_generation: Generation of the run sending another generation's
         record, under which its upload worker is registered; ``None`` registers it under the
         record's own generation, as for a run's own records and for sync-tracking, which is no run.
+    :param float | None deadline: Absolute run deadline the upload is cut at, defaults to none.
     :raises ProcessCleanupUncertainError: The upload worker's cleanup is uncertain.
     :raises OSError: The upload or the record's update failed, MLflow's verdict or no answer.
     :raises ValueError: The upload failed.
@@ -116,7 +118,7 @@ def _deliver(
         "finish": json_optional_text(record, "finish"),
     }
     generation_id = json_text(record, "generation_id")
-    call_tracking(experiment, worker_generation or generation_id, action, environment)
+    call_tracking(experiment, worker_generation or generation_id, action, environment, deadline)
     # A lost acknowledgement resends the same projection on the next sync.
     write_record(path, {**record, "state": "delivered"})
 
@@ -129,6 +131,7 @@ def _send(
     worker_generation: str | None,
     tally: DeliveryTally,
     counted: Collection[Path] = (),
+    deadline: float | None = None,
 ) -> None:
     """Send records in order while the delivery is still sending.
 
@@ -148,13 +151,21 @@ def _send(
     :param DeliveryTally tally: The delivery this pass belongs to.
     :param Collection[Path] counted: Records whose delivery adds to ``tally.delivered``, counted
         as each is sent so a pass a shutdown interrupts still reports them, defaults to none.
+    :param float | None deadline: Absolute run deadline every upload is cut at, defaults to
+        none.
     :raises ProcessCleanupUncertainError: An upload worker's cleanup is uncertain.
     """
     for index, path in enumerate(paths):
         if not tally.sending:
             break
         try:
-            _deliver(experiment, path, environment, worker_generation=worker_generation)
+            _deliver(
+                experiment,
+                path,
+                environment,
+                worker_generation=worker_generation,
+                deadline=deadline,
+            )
         except ProcessCleanupUncertainError:
             raise
         except (OSError, ValueError, RuntimeError) as exc:  # every NO_ANSWER error included
@@ -919,6 +930,7 @@ def _deliver_outstanding(
     errors: list[TrackingSyncRefusedError],
     resolve: bool = False,
     own: list[Path] | None = None,
+    deadline: float | None = None,
 ) -> None:
     """Deliver what every ended generation in scope still owes its MLflow runs.
 
@@ -947,6 +959,8 @@ def _deliver_outstanding(
     :param bool resolve: Resolve the target under ``worker_generation`` before the first request,
         for a caller whose process made no target check, defaults to False.
     :param list[Path] | None own: A closing run's own records, already saved, sent last.
+    :param float | None deadline: Absolute run deadline every request is cut at, defaults to
+        none.
     :raises TrackingSyncRefusedError: The configured target, or a saved record's target or
         generation, is not the one the tree recorded; nothing is sent.
     :raises TrackingTargetUnavailableError: The target did not resolve; nothing else is sent.
@@ -994,7 +1008,7 @@ def _deliver_outstanding(
                 experiment,
                 generation_id=worker_generation,
                 environment=environment,
-                deadline=None,
+                deadline=deadline,
                 resolve_only=True,
             )
         if creations:
@@ -1006,6 +1020,7 @@ def _deliver_outstanding(
                 worker_generation=worker_generation,
                 errors=errors,
                 tally=tally,
+                deadline=deadline,
             )
             # A run a search bound gets its records now rather than on the next pass.
             _stage_outstanding(
@@ -1024,6 +1039,7 @@ def _deliver_outstanding(
             worker_generation=worker_generation,
             tally=tally,
             counted=set(pending),
+            deadline=deadline,
         )
     finally:
         errors.extend(unresolved.values())
@@ -1090,6 +1106,7 @@ def deliver_ended_generations(
     *,
     recovering: bool = False,
     own: list[Path] | None = None,
+    deadline: float | None = None,
 ) -> None:
     """Finish what sync-tracking would for every generation that has ended.
 
@@ -1117,6 +1134,8 @@ def deliver_ended_generations(
         recovers rather than its own invocation: that run's records are sent with the rest, and
         the target is resolved first, as no check in this process covered it.
     :param list[Path] | None own: The calling run's own pending records, saved already.
+    :param float | None deadline: Absolute run deadline every request is cut at, so a pass
+        before a run's first trial never outlasts ``timeout_seconds_per_run``, defaults to none.
     :raises ProcessCleanupUncertainError: A search or upload worker's cleanup is uncertain.
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
@@ -1147,6 +1166,7 @@ def deliver_ended_generations(
             errors=errors,
             resolve=not checked,
             own=own,
+            deadline=deadline,
         )
     except ProcessCleanupUncertainError:
         raise
