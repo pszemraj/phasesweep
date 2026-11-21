@@ -49,7 +49,9 @@ metric:
     expected_step: 100
 
 phases:
+  # The toy trainer runs on CPU. For a GPU trainer, remove gpu_policy: none to enable leasing.
   - name: learning_rate
+    gpu_policy: none
     comment: "Search the learning rate on a log scale, with a fixed seed so the draws repeat."
     n_trials: 4
     # Each draw derives from this seed and the draw position, so a resumed phase draws the same set as an uninterrupted one.

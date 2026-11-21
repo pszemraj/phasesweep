@@ -199,9 +199,9 @@ def test_init_template_loads_validates_and_scaffolds_a_catalog(
         assert experiment.workdir == str(config_path.parent / "runs")
         assert experiment.execution.cwd == str(config_path.parent)
         assert experiment.storage == "auto"
+        assert all(phase.gpu_policy == "none" for phase in experiment.phases)
         if template == "mlflow":
             assert experiment.trial_command == "phasesweep-mlflow-train --config {config_path}"
-            assert all(phase.gpu_policy == "none" for phase in experiment.phases)
         else:
             assert experiment.trial_command.startswith("phasesweep-fake-train ")
 
@@ -232,7 +232,6 @@ def test_starter_template_shape(tmp_path: Path) -> None:
         assert [phase.name for phase in experiment.phases] == ["depth", "learning_rate"]
         assert sum(phase.n_trials for phase in experiment.phases) == 4
         assert experiment.phases[1].inherits == ["depth"]
-        assert all(phase.gpu_policy == "none" for phase in experiment.phases)
         assert experiment.override_format == "yaml_file"
         assert experiment.execution.inherit_env == "none"
         assert "{config_path}" in experiment.trial_command

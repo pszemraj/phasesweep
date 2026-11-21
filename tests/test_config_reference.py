@@ -201,6 +201,13 @@ def test_configuration_guide_complete_yaml_examples_load_through_real_loader() -
         load_experiment_bytes(block.encode("utf-8"), source=f"docs/config.md YAML example {index}")
 
 
+@pytest.mark.parametrize("example", ["experiment.yaml", "mcp_experiment.yaml"])
+def test_toy_sweep_examples_run_without_gpu_leases(example: str) -> None:
+    """Both CLI and MCP examples use the packaged CPU trainer for every phase."""
+    experiment = load_experiment(REPO / "examples" / example)
+    assert all(phase.gpu_policy == "none" for phase in experiment.phases)
+
+
 def test_top_level_entries_are_the_undotted_paths_in_file_order() -> None:
     """Top-level keys are exactly the entries whose path has no dot."""
     paths = [entry.path for entry in top_level_entries()]

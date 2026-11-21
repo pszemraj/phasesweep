@@ -42,7 +42,9 @@ constraints:
     max: 16777216  # 16 MiB
 
 phases:
+  # The toy trainer runs on CPU. For a GPU trainer, remove gpu_policy: none to enable leasing.
   - name: depth
+    gpu_policy: none
     comment: |
       Settle on a network depth before tuning anything else.
       Grid over a small set of integer choices because we expect a clear
@@ -55,6 +57,7 @@ phases:
       model.n_layers: { type: categorical, choices: [4, 8, 12, 16] }
 
   - name: lr
+    gpu_policy: none
     comment: |
       With depth locked, find the LR. Log-scale sweep over three orders of
       magnitude - that's where LRs live. TPE is fine here; the response
@@ -69,6 +72,7 @@ phases:
       optimizer.lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
 
   - name: regularization
+    gpu_policy: none
     comment: |
       Last: jointly tune weight_decay and dropout. They interact, so a
       single CMA-ES phase over both is more efficient than two greedy 1D sweeps.
