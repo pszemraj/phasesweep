@@ -604,7 +604,7 @@ MlflowExtractor:
   # A metric missing from a finished run fails the trial at once, naming it and listing the run's metric keys.
   metric_key: string (required)
 
-  # Which point of the metric history is used: last, min, max, or the point at step. It must be finite, and its step is the evaluation_point position.
+  # Which point of the metric history is used: last, min, max, or the point at step. It must be finite. For last and step its step is the evaluation_point position; min and max leave evaluation_point n/a, since their step is where the best value fell.
   # Requires: step set exactly when select is step.
   select: "last" | "min" | "max" | "step" (required)
 
