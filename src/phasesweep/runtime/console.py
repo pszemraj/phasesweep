@@ -31,7 +31,8 @@ class ConsoleHandler(logging.Handler):
     under the first. A record at WARNING or above from any other logger prints as
     ``warning:`` or ``error:`` and its message, wrapped to the terminal with a hanging indent.
     Neither shows a traceback. A dry run is the launch contract, so there an INFO record from
-    any ``phasesweep`` logger also prints, as the time and its text like a report line. Each
+    any ``phasesweep`` logger also prints, as the time and its text like a report line; a flush-left
+    line wider than the terminal wraps under its first, and an indented one stays whole. Each
     record is one write under the handler's lock, so lines from parallel trials never
     interleave inside a record. The stream, its width and its colour decision are read at each
     emit, so a swapped ``sys.stderr`` is honoured.
@@ -90,13 +91,33 @@ class ConsoleHandler(logging.Handler):
         if isinstance(block, ReportBlock):
             body = block.render(room, color=color)
         elif record.name == REPORT_LOGGER or record.levelno < logging.WARNING:
-            body = record.getMessage().splitlines() or [""]
+            body = _plain_lines(record.getMessage(), room)
         else:
             body = _diagnostic(record, room, color)
         return [
             ((stamp if index == 0 else " " * len(stamp)) + line).rstrip()
             for index, line in enumerate(body)
         ]
+
+
+def _plain_lines(message: str, width: int) -> list[str]:
+    """Draw a record's own lines, wrapping each flush-left one that is wider than ``width``.
+
+    A wrapped line breaks at spaces and hangs under its first line, which the handler's time
+    prefix already indents; a word wider than the line, such as a path, stays whole. A line that
+    starts with whitespace holds text to copy, such as the example command, so it stays whole.
+
+    :param str message: The formatted record text.
+    :param int width: Columns available after the time.
+    :return list[str]: The lines to print, at least one.
+    """
+    lines: list[str] = []
+    for line in message.splitlines() or [""]:
+        if len(line) <= width or line[0].isspace():
+            lines.append(line)
+        else:
+            lines.extend(wrap(line, width))
+    return lines
 
 
 def _diagnostic(record: logging.LogRecord, width: int, color: bool) -> list[str]:

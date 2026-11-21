@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,50 @@ _AT_60 = [
     "     in its trial_* directories. Fix the failure, then raise",
     "     phases[phase].n_trials to 10 in the config and rerun to",
     "     retry the failed attempts.",
+]
+
+
+_PAD = " " * 10
+_STARTER_DRY_RUN_AT_80 = [
+    "HH:MM:SS  DRY RUN metric='eval_loss' goal=minimize extractor={'type':",
+    f"{_PAD}'json_envelope', 'path': 'result.json', 'objective_name': 'eval_loss',",
+    f"{_PAD}'split': 'validation', 'policy': 'synthetic', 'checkpoint':",
+    f"{_PAD}'toy_formula', 'expected_step': 100, 'evaluation_axis': 'step'}}",
+    "HH:MM:SS  DRY RUN evaluation_point check: supported (axis 'step' from the",
+    f"{_PAD}envelope; any other axis from evaluation.progress)",
+    "HH:MM:SS  DRY RUN environment: inherit_env=none (inherited when set, and",
+    f"{_PAD}digested: PATH, HOME, LANG, LC_ALL, USER, LOGNAME, TZ); env keys:",
+    f"{_PAD}none; passthrough_env: TMPDIR (built in; inherited when set, excluded",
+    f"{_PAD}from the digest); a persistent study refuses to resume when any",
+    f"{_PAD}digested value changes",
+    "HH:MM:SS  DRY RUN trainer cwd:",
+    f"{_PAD}TMP",
+    f"{_PAD}(execution.cwd; part of the study identity)",
+    "HH:MM:SS  DRY RUN artifact root:",
+    f"{_PAD}TMP/runs/phasesweep_starter",
+    "HH:MM:SS  DRY RUN phase 'depth': sampler=grid (resumable, reproducible)",
+    "HH:MM:SS  DRY RUN grid order: configurations are shuffled by sampler.seed, not",
+    f"{_PAD}listed choice order.",
+    "HH:MM:SS  DRY RUN phase 'learning_rate': sampler=grid (resumable, reproducible)",
+    "HH:MM:SS  DRY RUN grid order: configurations are shuffled by sampler.seed, not",
+    f"{_PAD}listed choice order.",
+    "HH:MM:SS  phase=depth study=phasesweep_starter::depth finished=0 remaining=2",
+    f"{_PAD}reruns=0 n_jobs=1",
+    "HH:MM:SS  GPU isolation disabled by gpu_policy='none'.",
+    "HH:MM:SS  DRY RUN phase=depth would launch 2 trials",
+    "HH:MM:SS  DRY RUN example command:",
+    f"{_PAD}  phasesweep-fake-train --config "
+    "TMP/runs/phasesweep_starter/depth/trial_dryrun/trainer_config.yaml",
+    "HH:MM:SS  phase=learning_rate study=phasesweep_starter::learning_rate finished=0",
+    f"{_PAD}remaining=2 reruns=0 n_jobs=1",
+    "HH:MM:SS  GPU isolation disabled by gpu_policy='none'.",
+    "HH:MM:SS  DRY RUN phase=learning_rate would launch 2 trials",
+    "HH:MM:SS  DRY RUN example command (placeholders until 'depth' publishes a",
+    f"{_PAD}winner: model.n_layers):",
+    f"{_PAD}  phasesweep-fake-train --config "
+    "TMP/runs/phasesweep_starter/learning_rate/trial_dryrun/trainer_config.yaml",
+    "HH:MM:SS  DRY RUN total: would launch 4 trials across 2 phases",
+    "HH:MM:SS  DRY RUN complete. No trials launched, no summary written.",
 ]
 
 
@@ -80,3 +125,24 @@ def test_a_redirected_operational_error_is_one_line_per_label(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == f"phasesweep: {_DIAGNOSIS}\nfix: {_STEP}\n"
+
+
+def test_a_dry_run_wraps_its_lines_to_the_terminal_and_keeps_its_commands_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each flush-left line breaks at spaces under the text after the time, and a path stays whole.
+
+    The indented example commands are meant to be copied, so they overrun the width on one line.
+    """
+    config = tmp_path / "starter.yaml"
+    assert invoke_cli_boundary(["init", "-o", str(config)], monkeypatch) == 0
+
+    with terminal_stderr(80) as stderr:
+        assert invoke_cli_boundary(["run", str(config), "--dry-run"], monkeypatch) == 0
+
+    root = str(tmp_path.resolve())
+    lines = [
+        re.sub(r"^\d\d:\d\d:\d\d", "HH:MM:SS", line).replace(root, "TMP")
+        for line in stderr.text.splitlines()
+    ]
+    assert lines == _STARTER_DRY_RUN_AT_80
