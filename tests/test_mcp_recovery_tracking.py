@@ -14,6 +14,7 @@ from phasesweep.engine.paths import _attempts_dir
 from phasesweep.engine.state import CLEANUP_CONFIRMED_ATTR
 from phasesweep.errors import ProcessCleanupUncertainError
 from phasesweep.mcp.runs import RunHandle, RunStore
+from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
@@ -30,6 +31,7 @@ from tests.mcp_helpers import (
 )
 from tests.recovery_helpers import recover_run_cli
 from tests.tracking_helpers import (
+    RunnerKilled,
     killed_sweep,
     leak_tracking_worker,
     leave_cleanup_uncertain_attempt,
@@ -53,8 +55,10 @@ class _RecoveredRun:
         attempt: str,
         *,
         wrote_status: bool = True,
+        marked: bool = True,
+        snapshot: bool = False,
     ) -> None:
-        """Stage the run, with the unsafe-cleanup status its runner wrote unless ``wrote_status`` is False."""
+        """Stage the run, with the unsafe-cleanup status its runner wrote unless ``wrote_status`` is False, holding an unfinalized result snapshot when ``snapshot`` is True, and the cleanup marker a server writes unless ``marked`` is False."""
         config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
         app, registry, store = make_mcp_app(
             write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
@@ -66,10 +70,15 @@ class _RecoveredRun:
         self.store: RunStore = store
         self.state_dir = registry.state_dir
         self.handle: RunHandle = stage_dead_run(
-            store, _RUN_ID, config, registry.get("srv").id, cleanup_uncertain=True
+            store, _RUN_ID, config, registry.get("srv").id, cleanup_uncertain=marked
         )
         if wrote_status:
-            write_unsafe_cleanup_status(store, _RUN_ID)
+            frozen = (
+                capture_result_snapshot(experiment, generation_id=_RUN_ID) if snapshot else None
+            )
+            write_unsafe_cleanup_status(
+                store, _RUN_ID, **({} if frozen is None else {"result_snapshot": frozen})
+            )
         monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *a, **k: True)
 
     def recover(self, *, confirm: bool = True) -> Result:
@@ -93,20 +102,53 @@ class _RecoveredRun:
 
 
 def _killed_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, in_flight: bool = True
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    in_flight: bool = True,
+    wrote_status: bool | None = None,
+    marked: bool = True,
+    snapshot: bool = False,
 ) -> _RecoveredRun:
     """Stage an MCP run killed with its one managed attempt still RUNNING.
 
     :param bool in_flight: ``False`` lets the attempt finish and kills the runner before it
         publishes, writing no status, as a hard kill between trials leaves it.
+    :param bool | None wrote_status: Whether the runner wrote its unsafe-cleanup status;
+        ``None`` writes it only for a runner killed in flight.
+    :param bool marked: Whether a server watching the run wrote its cleanup marker.
+    :param bool snapshot: Whether that status holds a result snapshot recovery must finalize.
     :return _RecoveredRun: The staged run.
     """
     experiment, uploads, [attempt] = killed_sweep(
         tmp_path, monkeypatch, n_jobs=1, generation_id=_RUN_ID, in_flight=in_flight
     )
     return _RecoveredRun(
-        tmp_path, monkeypatch, experiment, uploads, attempt, wrote_status=in_flight
+        tmp_path,
+        monkeypatch,
+        experiment,
+        uploads,
+        attempt,
+        wrote_status=in_flight if wrote_status is None else wrote_status,
+        marked=marked,
+        snapshot=snapshot,
     )
+
+
+# How a killed runner can leave its run for recover-run: what it wrote and whether a server
+# watching it wrote the cleanup marker.
+_STAGINGS = {
+    "unsafe-status": {"in_flight": True, "wrote_status": True, "marked": True},
+    "unsafe-status-no-marker": {"in_flight": True, "wrote_status": True, "marked": False},
+    "unsafe-status-with-snapshot": {
+        "in_flight": True,
+        "wrote_status": True,
+        "marked": False,
+        "snapshot": True,
+    },
+    "no-status-no-marker": {"in_flight": True, "wrote_status": False, "marked": False},
+    "between-trials": {"in_flight": False, "wrote_status": False, "marked": True},
+}
 
 
 def _uncertain_attempt(
@@ -290,17 +332,22 @@ def test_recover_run_leaves_outcomes_pending_while_mlflow_is_down(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("staging", list(_STAGINGS))
 def test_an_upload_worker_recover_run_cannot_confirm_leaves_the_run_for_another_pass(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, staging: str
 ) -> None:
     """An upload worker whose cleanup is unconfirmed fails recover-run as an evidence worker's does.
 
-    The run stays recovery-required; the next confirmed pass resolves the worker through its
-    registry entry, clears the run, and sends the outcomes the failed pass left pending, each
-    once.
+    However the runner left the run, with its unsafe-cleanup status or none, marked by a server
+    or not, the run stays recovery-required and no status reports its cleanup confirmed; the
+    next confirmed pass resolves the worker through its registry entry, clears the run, and
+    sends the outcomes the failed pass left pending, each once.
     """
-    run = _killed_run(tmp_path, monkeypatch)
-    leaked = leak_tracking_worker(monkeypatch, name=f"attempt-{run.attempt}")
+    run = _killed_run(tmp_path, monkeypatch, **_STAGINGS[staging])
+    in_flight, wrote_status = _STAGINGS[staging]["in_flight"], _STAGINGS[staging]["wrote_status"]
+    # Killed between trials, the attempt's outcome went out before the kill.
+    record = run.record if in_flight else run.record.with_name("generation.json")
+    leaked = leak_tracking_worker(monkeypatch, name=record.stem)
 
     failed = run.recover()
 
@@ -308,7 +355,13 @@ def test_an_upload_worker_recover_run_cannot_confirm_leaves_the_run_for_another_
     assert failed.exit_code != 0
     assert "worker cleanup is uncertain" in failed.output
     assert run.store.observe(run.handle).recovery_required
-    assert read_record(run.record)["state"] == "pending"
+    status = run.store.recorded_terminal_status(run.handle)
+    # recover-run writes the status of a runner that left none only after its uploads.
+    assert status["cleanup_confirmed"] is False if wrote_status else status is None
+    if _STAGINGS[staging].get("snapshot"):
+        # Its snapshot was finalized before the uploads, keeping the runner's unconfirmed cleanup.
+        assert status["result_snapshot_state"] == "complete"
+    assert read_record(record)["state"] == "pending"
     entry = _attempts_dir(run.experiment) / f"{operation}.json"
     assert entry.is_file()
     run.uploads.clear()
@@ -318,6 +371,72 @@ def test_an_upload_worker_recover_run_cannot_confirm_leaves_the_run_for_another_
     assert retried.exit_code == 0, retried.output
     assert not entry.exists()
     assert not run.store.observe(run.handle).recovery_required
+    assert not run.store.cleanup_uncertain(run.handle)
+    sent = (["KILLED"] if in_flight else [], ["KILLED"])
+    assert (run.sent(), run.summaries()) == sent
+    publication.sync_tracking(run.experiment)
+    assert (run.sent(), run.summaries()) == sent
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("staging", "killed_at"),
+    [
+        ("no-status-no-marker", "after-cleanup-record"),
+        ("no-status-no-marker", "between-uploads"),
+        ("no-status-no-marker", "before-status"),
+        ("unsafe-status-no-marker", "after-cleanup-record"),
+        ("unsafe-status-no-marker", "between-uploads"),
+    ],
+)
+def test_a_recover_run_killed_before_its_uploads_end_is_settled_by_one_more_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, staging: str, killed_at: str
+) -> None:
+    """recover-run killed after recording its cleanup and before its uploads end leaves the run recovery-required.
+
+    It dies after its cleanup record, after sending the attempt's outcome and before the summary
+    run's, or before writing the status of a runner that left none. One more confirmed pass
+    clears the run, and each outcome reaches its MLflow run once.
+    """
+    run = _killed_run(tmp_path, monkeypatch, **_STAGINGS[staging])
+    run.uploads.clear()
+    deliver = publication._deliver
+
+    def dies(*args: object, **kwargs: object) -> None:
+        raise RunnerKilled()
+
+    def dies_before_summary(
+        experiment: Experiment, path: Path, environment: dict[str, str], **kwargs: object
+    ) -> bool:
+        if path.stem == "generation":
+            raise RunnerKilled()
+        return deliver(experiment, path, environment, **kwargs)
+
+    with monkeypatch.context() as patch:
+        if killed_at == "after-cleanup-record":
+            patch.setattr("phasesweep.mcp.recovery._finish_result_recovery", dies)
+        elif killed_at == "between-uploads":
+            patch.setattr(publication, "_deliver", dies_before_summary)
+        else:
+            patch.setattr("phasesweep.mcp.recovery.write_status_file", dies)
+        with pytest.raises(RunnerKilled):
+            run.recover()
+
+    assert run.store.observe(run.handle).recovery_required
+    status = run.store.recorded_terminal_status(run.handle)
+    assert status is None or status["cleanup_confirmed"] is False
+    sent_before = {
+        "after-cleanup-record": ([], []),
+        "between-uploads": (["KILLED"], []),
+        "before-status": (["KILLED"], ["KILLED"]),
+    }
+    assert (run.sent(), run.summaries()) == sent_before[killed_at]
+
+    retried = run.recover()
+
+    assert retried.exit_code == 0, retried.output
+    assert not run.store.observe(run.handle).recovery_required
+    assert not run.store.cleanup_uncertain(run.handle)
     assert (run.sent(), run.summaries()) == (["KILLED"], ["KILLED"])
     publication.sync_tracking(run.experiment)
     assert (run.sent(), run.summaries()) == (["KILLED"], ["KILLED"])

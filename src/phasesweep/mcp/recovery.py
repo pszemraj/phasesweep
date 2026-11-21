@@ -218,6 +218,7 @@ def recover_run(
                 emit(_preflight_message(run_id, needs, evidence, publication_action))
                 return
 
+            synthesized = terminal_status is None
             if terminal_status is None:
                 terminal_status = {
                     "run_id": run_id,
@@ -228,7 +229,7 @@ def recover_run(
                     "result_snapshot_state": "failed",
                     "result_snapshot_error": "HistoricalSnapshotUnavailable",
                 }
-                write_status_file(store.status_path(run_id), terminal_status)
+            delivering = config.mlflow is not None and evidence.ledger is not None
             if (
                 needs.snapshot_finalize_needed
                 and terminal_status.get("result_snapshot_state") != "complete"
@@ -249,10 +250,12 @@ def recover_run(
                 needs.snapshot_finalize_needed
                 and terminal_status.get("result_snapshot_state") == "complete"
             )
-            if repairing_complete_snapshot:
-                # Keep the recovery reservation while the prior frozen result stays readable.
-                # Reboot proves processes dead, but this marker must still survive until
-                # their trial evidence is reflected in the immutable snapshot.
+            if repairing_complete_snapshot or delivering:
+                # Keep the recovery reservation while the prior frozen result stays readable,
+                # and while upload workers may start: once the cleanup record below is written,
+                # the marker is all that leaves an unconfirmed status recovery-required. Reboot
+                # proves processes dead, but this marker must still survive until their trial
+                # evidence is reflected in the immutable snapshot.
                 store.mark_cleanup_uncertain(handle)
             if needs.cleanup_needed:
                 _persist_cleanup_recovery(store, handle, config, evidence)
@@ -267,9 +270,10 @@ def recover_run(
                 emit=emit,
             )
             delivery: dict[str, int] | None = None
-            if config.mlflow is not None and evidence.ledger is not None:
+            if delivering:
                 from phasesweep.tracking.publication import deliver_recovered_attempts
 
+                assert evidence.ledger is not None
                 # Sent before the marker clears, so an upload worker whose cleanup is
                 # unconfirmed fails this command and leaves the run recovery-required, as an
                 # evidence worker's does. The workers are registered under this run, so the
@@ -282,6 +286,12 @@ def recover_run(
                     recovering=True,
                     tracker_unreachable=bool(evidence.pending_evidence),
                 )
+            if synthesized:
+                # A runner that left no status is recovery-required until one exists, and the
+                # status this pass writes reports cleanup confirmed, which a marker cannot
+                # outrank. Written only after the uploads, a failed or interrupted delivery
+                # leaves the run for another pass, which repeats this one.
+                write_status_file(store.status_path(run_id), terminal_status)
             if needs.cleanup_needed or repairing_complete_snapshot:
                 store.clear_cleanup_uncertain(handle)
             if needs.cleanup_needed:
