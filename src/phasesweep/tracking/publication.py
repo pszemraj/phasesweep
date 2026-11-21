@@ -966,6 +966,18 @@ def _deliver_outstanding(
             or not (creations or pending or own_pending)
         ):
             return
+        # A report line, so the console shows what the seconds before the last lines are for.
+        earlier = len(creations) + len(pending)
+        total = earlier + len(own_pending)
+        logging.getLogger(REPORT_LOGGER).info(
+            "MLflow: sending %d record(s)%s.",
+            total,
+            ""
+            if not earlier
+            else " left pending by earlier runs"
+            if earlier == total
+            else f", {earlier} of them left pending by earlier runs",
+        )
         environment = _environment_identity(experiment, experiment.phases[0].name).values
         if resolve:
             assert worker_generation is not None
@@ -1133,8 +1145,10 @@ def deliver_closeout(
     The run's own records are saved before anything is sent, so however the delivery ends they
     are counted; then every ended generation's records go, the run's own last, through the core
     sync-tracking runs. A run that is shutting down, or that just found its tracker silent,
-    only saves: a shutdown refuses every worker launch. The closing lines are logged however
-    the delivery ends, a shutdown during it included.
+    only saves: a shutdown refuses every worker launch. So does a run that failed before its
+    target check, which would otherwise wait on a tracker it never reached before reporting
+    its own error. The closing lines are logged however the delivery ends, a shutdown during
+    it included.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param ValidatedLedger ledger: The run's ledger, holding its trials and those it settled.
@@ -1149,9 +1163,15 @@ def deliver_closeout(
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
 
+    # A run binds its summary run in its first target check.
+    checked = (tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE).is_file()
     tally = DeliveryTally(
-        sending=not isinstance(
-            error, (TrackingTargetUnavailableError, PhaseSweepShutdown, KeyboardInterrupt)
+        sending=error is None
+        or (
+            checked
+            and not isinstance(
+                error, (TrackingTargetUnavailableError, PhaseSweepShutdown, KeyboardInterrupt)
+            )
         )
     )
     try:

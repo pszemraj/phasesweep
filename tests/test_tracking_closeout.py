@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import signal
 from pathlib import Path
 from typing import NamedTuple
@@ -162,8 +163,9 @@ def test_the_next_run_delivers_an_interrupted_runs_pending_records(
 ) -> None:
     """A run that reaches closeout sends what an interrupted earlier run saved, each record once.
 
-    A dry run writes and sends nothing; the next real run ends the earlier summary run KILLED
-    once, says so, and leaves nothing for sync-tracking.
+    A dry run writes and sends nothing; the next real run says on the console how many records
+    it is sending before its first request, ends the earlier summary run KILLED once, says so,
+    and leaves nothing for sync-tracking, whose pass then sends and says nothing.
     """
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=persistent)
     experiment = sweep.experiment
@@ -183,14 +185,23 @@ def test_the_next_run_delivers_an_interrupted_runs_pending_records(
     assert reports[0].primary_error is None
     assert sweep.summaries() == ["KILLED"]
     assert read_record(sweep.summary)["state"] == "delivered"
-    assert "MLflow: delivered 2 record(s) left pending by earlier runs." in caplog.text
+    report = [r.getMessage() for r in caplog.records if r.name == REPORT_LOGGER]
+    [sending] = [line for line in report if line.startswith("MLflow: sending")]
+    assert re.fullmatch(
+        r"MLflow: sending \d+ record\(s\), 2 of them left pending by earlier runs\.", sending
+    )
+    assert report.index(sending) < report.index(
+        "MLflow: delivered 2 record(s) left pending by earlier runs."
+    )
     # A report block, so the console wraps it to the terminal.
-    [delivered] = [r for r in caplog.records if "left pending by earlier runs." in r.getMessage()]
+    [delivered] = [r for r in caplog.records if "MLflow: delivered" in r.getMessage()]
     assert delivered.name == REPORT_LOGGER and isinstance(delivered.msg, ReportBlock)
     assert publication.delivery_status(experiment)["pending"] == 0
     sweep.uploads.clear()
+    caplog.clear()
     publication.sync_tracking(experiment)
     assert sweep.uploads == []
+    assert "MLflow: sending" not in caplog.text
 
 
 @pytest.mark.integration
@@ -374,7 +385,7 @@ def test_closeout_sends_earlier_records_first_and_stops_at_the_first_unanswered_
             f"MLflow: {earlier + own_pending} upload(s) pending ({earlier} from earlier runs); "
             f"{_PENDING_STEP}" in caplog.text
         )
-        assert "left pending by earlier runs." not in caplog.text
+        assert "MLflow: delivered" not in caplog.text
     else:
         assert requested[: len(searched)] == searched
         [attempt] = rejected
@@ -389,6 +400,43 @@ def test_closeout_sends_earlier_records_first_and_stops_at_the_first_unanswered_
             f"MLflow: {pending} upload(s) pending ({pending} from earlier runs); {_PENDING_STEP}"
             in caplog.text
         )
+
+
+@pytest.mark.integration
+def test_a_run_refused_before_its_target_check_never_waits_on_the_tracker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A run that fails before checking its target makes no MLflow request for earlier records.
+
+    Earlier records stay pending and are counted, so a refusal is reported at once rather
+    than after a down tracker's timeout; the next run that checks its target sends them.
+    """
+    sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
+    experiment = sweep.experiment
+    changed = experiment.model_copy(update={"env": {**experiment.env, "EXTRA_FLAG": "1"}})
+
+    requests: list[object] = []
+
+    def no_request(request: dict[str, object], **kwargs: object) -> JsonObject:
+        # A raise from here is swallowed by the closeout, so the request is recorded instead.
+        requests.append(request["action"])
+        raise OperationUnavailableError("tracking server unreachable")
+
+    caplog.set_level(logging.INFO)
+    with monkeypatch.context() as patch:
+        patch.setattr(session, "request_operation", no_request)
+        patch.setattr(worker, "request_operation", no_request)
+        # The trainer environment is part of the kept trial's cohort, so the changed config is
+        # refused before it allocates anything or checks its target.
+        with pytest.raises(StudyFingerprintMismatchError):
+            run_experiment(changed)
+
+    assert requests == []
+    assert read_record(sweep.summary)["state"] == "pending"
+    assert "MLflow: sending" not in caplog.text
+    assert f"MLflow: 2 upload(s) pending (2 from earlier runs); {_PENDING_STEP}" in caplog.text
+    run_experiment(experiment)
+    assert sweep.summaries() == ["KILLED"]
 
 
 @pytest.mark.integration

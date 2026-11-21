@@ -290,8 +290,8 @@ def remote_mlflow_example(tmp_path, monkeypatch):
     return config, uploads
 
 
-def leak_tracking_worker(monkeypatch, *, action="publish", name=None):
-    """Leave the first MLflow worker of one request with its cleanup unconfirmed.
+def leak_tracking_worker(monkeypatch, *, name=None):
+    """Leave the first MLflow upload worker of one request with its cleanup unconfirmed.
 
     The worker's process group really runs and exits, but its lifecycle stays ``terminating`` and
     its attempt-registry entry stays, as for a worker the controller lost track of, so a later pass
@@ -299,17 +299,15 @@ def leak_tracking_worker(monkeypatch, *, action="publish", name=None):
     already in place.
 
     :param pytest.MonkeyPatch monkeypatch: Replaces ``request_operation`` for the test.
-    :param str action: Worker action to leave unconfirmed: ``publish`` for an upload, ``resolve``
-        for a target check.
-    :param str | None name: Upload name to match, such as ``attempt-<id>``; any request of
-        ``action`` when ``None``.
+    :param str | None name: Upload name to match, such as ``attempt-<id>``; any upload when
+        ``None``.
     :return list[str]: The operation id of the worker left unconfirmed, once one has been.
     """
     respond = session.request_operation
     leaked = []
 
     def leaky(request, *, operation_id, directory, environment, deadline):
-        matches = request["action"] == action and name in {None, request.get("name")}
+        matches = request["action"] == "publish" and name in {None, request.get("name")}
         if not matches or leaked:
             return respond(
                 request,

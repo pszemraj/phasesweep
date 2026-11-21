@@ -1171,9 +1171,10 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     """A pending trial's managed run receives the outcome recovery commits.
 
     Accepted evidence sends its accepted projection. Evidence the tracker answers with a
-    failure records the finished trial failed with that reason, as a live trial would be, which
-    ends the run FAILED and trains nothing again. An upload that fails, or a record that cannot
-    be saved, leaves the outcome for sync-tracking and the run still publishes its result.
+    failure records the finished trial failed with that reason, as a live trial would be, and
+    trains nothing again; the run then fails before any target check, so it only saves the
+    outcome, and sync-tracking ends the run FAILED. An upload that fails, or a record that
+    cannot be saved, leaves the outcome for sync-tracking and the run still publishes its result.
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
     from phasesweep.tracking.mlflow import OperationUnavailableError
@@ -1224,6 +1225,10 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     (recovered,) = read_phase_trials(validate_ledger(experiment), "depth").trials
     assert recovered.state == (TrialState.COMPLETE if answer == "accepted" else TrialState.FAIL)
     record_path = delivery / f"attempt-{attempt}.json"
+    if answer == "objective-missing":
+        assert [r for r in uploads if r["name"] == f"attempt-{attempt}"] == []
+        assert read_record(record_path)["state"] == "pending"
+        publication.sync_tracking(experiment)
     if upload == "unsaved":
         assert read_status(experiment)["published_generation_id"] not in {None, generation}
         assert not record_path.exists()

@@ -14,7 +14,7 @@ from phasesweep.engine.attempts import _retire_active_attempt
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
 from phasesweep.engine.paths import _attempts_dir
 from phasesweep.engine.state import CLEANUP_CONFIRMED_ATTR, TRIAL_DIR_ATTR
-from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
+from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
@@ -472,42 +472,26 @@ def test_a_recover_run_killed_before_its_uploads_end_is_settled_by_one_more_pass
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize(
-    ("earlier", "action"),
-    [("killed", "publish"), ("uncertain", "publish"), ("uncertain", "resolve")],
-    ids=["upload-after-success", "upload-after-failure", "resolve-after-failure"],
-)
 def test_the_printed_steps_clear_a_run_whose_worker_sent_an_earlier_outcome(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, earlier: str, action: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A tracking worker a run starts for an earlier generation's recovered outcome is that run's to recover.
 
-    The run recovers an earlier sweep's attempt, then succeeds or fails, leaving the worker that
-    resolves the target for that outcome, or uploads it, with its cleanup unconfirmed. Following
-    the steps the run's MCP status prints, sync-tracking where it names one and then a confirmed
-    recover-run, clears the run, and the outcome reaches its MLflow run once.
+    The run recovers an earlier sweep's attempt and succeeds, leaving the worker that uploads
+    that outcome with its cleanup unconfirmed. Following the steps the run's MCP status prints,
+    sync-tracking where it names one and then a confirmed recover-run, clears the run, and the
+    outcome reaches its MLflow run once. A failed run starts no such worker before its own
+    target check, so this success is the run that sends an earlier generation's records.
     """
-    if earlier == "killed":
-        experiment, uploads, [attempt] = killed_sweep(tmp_path, monkeypatch, n_jobs=1)
-        finish = "KILLED"
-    else:
-        experiment, uploads, attempt = _uncertain_attempt(tmp_path, monkeypatch)
-        finish = "FAILED"
+    experiment, uploads, [attempt] = killed_sweep(tmp_path, monkeypatch, n_jobs=1)
     # The runner resolves the config's relative paths against its directory, and the earlier
     # sweep ran from the working directory.
     config = write_experiment_config(Path.cwd() / "experiment.yaml", experiment)
     app, registry, store = make_mcp_app(
         write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
     )
-    leaked = leak_tracking_worker(
-        monkeypatch, action=action, name=f"attempt-{attempt}" if action == "publish" else None
-    )
-    if earlier == "killed":
-        assert run_claimed_runner(store, _SENDING_RUN_ID, config, cwd=Path.cwd()) == 0
-    else:
-        # The earlier sweep's unsafe-cleanup abort stays recorded, so this run fails.
-        with pytest.raises(ProcessCleanupUncertainError, match="worker cleanup is uncertain"):
-            run_claimed_runner(store, _SENDING_RUN_ID, config, cwd=Path.cwd())
+    leaked = leak_tracking_worker(monkeypatch, name=f"attempt-{attempt}")
+    assert run_claimed_runner(store, _SENDING_RUN_ID, config, cwd=Path.cwd()) == 0
     assert leaked
     failure = app.status(_SENDING_RUN_ID)["run"]["failure"]
     assert failure["code"] == "cleanup_uncertain"
@@ -526,7 +510,7 @@ def test_the_printed_steps_clear_a_run_whose_worker_sent_an_earlier_outcome(
     assert handle is not None and not store.observe(handle).recovery_required
     publication.sync_tracking(experiment)
     publication.sync_tracking(experiment)
-    assert [r["finish"] for r in uploads if r["name"] == f"attempt-{attempt}"] == [finish]
+    assert [r["finish"] for r in uploads if r["name"] == f"attempt-{attempt}"] == ["KILLED"]
 
 
 @pytest.mark.integration
