@@ -496,6 +496,14 @@ def test_show_winners_reads_unpublished_phase_results(
         assert live.exit_code == 0, live.output
         assert "Winner retained but not published" not in live.output
 
+    missing_locks = tmp_path / "missing-locks"
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(missing_locks))
+    unavailable = CliRunner().invoke(cli, ["status", str(config_path)])
+    assert unavailable.exit_code == 0, unavailable.output
+    assert "Winner retained but not published" not in unavailable.output
+    assert yaml.safe_load(unavailable.output) == yaml.safe_load(status.output)
+    assert not missing_locks.exists()
+
 
 @pytest.mark.parametrize("streak_abort", [False, True], ids=["no-feasible", "streak-abort"])
 def test_unpublished_status_prints_the_recorded_failure_remedy_once(

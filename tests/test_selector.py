@@ -489,7 +489,7 @@ def test_crashed_trials_remedy_names_the_next_attempt_budget(
     remedy = refused.value.remediation
     assert remedy is not None
     if persistent:
-        assert "raise phases[p].n_trials above 2" in remedy
+        assert "raise phases[p].n_trials above 2 in the config" in remedy
         assert "Fix the failure" in remedy
         assert "`n_jobs` can change on retry" in remedy
         assert "changes study identity" in remedy
