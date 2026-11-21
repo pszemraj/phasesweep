@@ -736,7 +736,7 @@ class _PhaseExecution:
     budget, and before the durable trial target is recorded. The context
     fields never change afterwards. The state fields are what the workers
     share: ``outcome_lock`` orders outcome recording, ``fatal_lock`` guards the
-    first fatal error, and every flag only ever goes from ``False`` to
+    first fatal error, ``csv_lock`` orders CSV snapshots, and every flag only ever goes from ``False`` to
     ``True``. The methods change memory and Optuna's stop flag only; every
     durable write stays with its caller.
     """
@@ -769,6 +769,7 @@ class _PhaseExecution:
     # Retain the first fatal worker exception for propagation after all workers drain.
     fatal_error: BaseException | None = None
     csv_throttle: CsvSnapshotThrottle = field(default_factory=CsvSnapshotThrottle)
+    csv_lock: threading.Lock = field(default_factory=threading.Lock)
     outcome_lock: threading.Lock = field(default_factory=threading.Lock)
     fatal_lock: threading.Lock = field(default_factory=threading.Lock)
     workers: _WorkerTrials = field(default_factory=_WorkerTrials)
@@ -1422,10 +1423,10 @@ def _settle_finished_trial(
     study: optuna.Study,
     trial: optuna.trial.FrozenTrial,
 ) -> None:
-    """Log a finished trial, retire cleaned attempts, mirror MLflow, and snapshot CSV.
+    """Log a finished trial, retire cleaned attempts, snapshot CSV, and mirror MLflow.
 
     Repeat ``study.stop()`` after an abort; the objective owns the abort decision.
-    Write the log before attempting MLflow publication.
+    Write local results before attempting MLflow publication.
 
     :param _PhaseExecution run: Phase execution.
     :param optuna.Study study: Running study to stop after an abort.
@@ -1449,6 +1450,16 @@ def _settle_finished_trial(
         and not _trial_requires_cleanup_recovery(trial)
     ):
         _retire_active_attempt(run.experiment, finished_attempt)
+    with run.csv_lock:
+        now = time.monotonic()
+        if not run.experiment.persistent or run.csv_throttle.should_write(finished, now):
+            with contextlib.suppress(Exception):
+                _write_trials_csv(
+                    study,
+                    _phase_dir(run.experiment, run.phase.name) / "trials.csv",
+                    repeats=repeat_axis(run.phase),
+                )
+                run.csv_throttle.mark_written(finished, now)
     if run.experiment.mlflow is not None and (
         trial.state == optuna.trial.TrialState.COMPLETE
         or not _trial_requires_cleanup_recovery(trial)
@@ -1456,15 +1467,6 @@ def _settle_finished_trial(
         from phasesweep.tracking.publication import publish_trial
 
         publish_trial(run.experiment, run.generation_id, trial, run.environment_identity.values)
-    now = time.monotonic()
-    if run.csv_throttle.should_write(finished, now):
-        with contextlib.suppress(Exception):
-            _write_trials_csv(
-                study,
-                _phase_dir(run.experiment, run.phase.name) / "trials.csv",
-                repeats=repeat_axis(run.phase),
-            )
-            run.csv_throttle.mark_written(finished, now)
 
 
 def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:

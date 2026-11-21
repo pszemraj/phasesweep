@@ -63,6 +63,30 @@ def _x_trainer(tmp_path: Path) -> Path:
     )
 
 
+def test_in_memory_run_snapshots_every_finished_trial_before_optimize_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep each finished in-memory trial in the CSV before the next trial can start."""
+    trainer = write_trainer(tmp_path / "trainer.py", 'print("x=0.5")')
+    experiment = make_experiment(workdir=tmp_path, trainer=trainer, n_trials=2)
+    after_trial = phase_ops._after_trial
+    rows_per_callback: list[int] = []
+
+    def inspect_snapshot(
+        run: phase_ops._PhaseExecution, study: optuna.Study, trial: optuna.trial.FrozenTrial
+    ) -> None:
+        after_trial(run, study, trial)
+        with (_phase_dir(experiment, "p") / "trials.csv").open(newline="") as handle:
+            rows_per_callback.append(
+                sum(row["state"] == "COMPLETE" for row in csv.DictReader(handle))
+            )
+
+    monkeypatch.setattr(phase_ops, "_after_trial", inspect_snapshot)
+    run_experiment(experiment)
+
+    assert rows_per_callback == [1, 2]
+
+
 def test_run_log_records_one_line_per_finished_trial(tmp_path: Path) -> None:
     """A feasible, a failed and an infeasible trial each get one line with their numbers."""
     experiment = make_experiment(

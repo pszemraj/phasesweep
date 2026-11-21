@@ -1248,6 +1248,9 @@ else:
                 cleanup_report = _PreflightCleanupReport()
                 _reconcile_existing_studies(experiment, cleanup_report=cleanup_report)
                 assert cleanup_report.retained_results == int(return_code == 0 and not terminated)
+                with (_phase_dir(experiment, "p") / "trials.csv").open(newline="") as handle:
+                    (row,) = csv.DictReader(handle)
+                assert row["state"] == _trial_count_state(phase_trials(experiment)[0])
             (recovered,) = phase_trials(experiment)
             assert recovered.state.name == (
                 "COMPLETE" if return_code == 0 and not terminated else "FAIL"

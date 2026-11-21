@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Sequence
 
 import optuna
 
 from phasesweep.config.models import Experiment
+from phasesweep.engine.artifacts import _write_trials_csv
 from phasesweep.engine.attempts import (
     _AttemptRecord,
     _preflight_active_attempts,
@@ -26,6 +28,8 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.ledger import ClaimedLedger, claim_ledger, validate_ledger
 from phasesweep.engine.optuna import _finished_trial_count
+from phasesweep.engine.paths import _phase_dir
+from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.study_policy import (
     _initialize_study_schema,
     _launch_preflight,
@@ -176,6 +180,14 @@ def _preflight_existing_studies(
             errors.append(exc)
         else:
             studies[phase.name] = study
+            # Recovery or an earlier interrupted snapshot can leave the projection stale.
+            # Refresh here even if this phase only replays or the trial target refuses.
+            with contextlib.suppress(Exception):
+                _write_trials_csv(
+                    study,
+                    _phase_dir(experiment, phase.name) / "trials.csv",
+                    repeats=repeat_axis(phase),
+                )
     # An unreadable tracker leaves finished training pending. Until it answers, neither the
     # retry ceiling nor the need for a trainer is known, and the run reports pending evidence.
     if not report.unreadable_evidence:
