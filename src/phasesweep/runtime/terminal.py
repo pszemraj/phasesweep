@@ -8,8 +8,14 @@ from __future__ import annotations
 
 import os
 import textwrap
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from decimal import Decimal
 from pathlib import Path
-from typing import Literal, Protocol, TextIO
+from typing import ClassVar, Literal, Protocol, TextIO
+
+#: Name of the logger whose records are a run's report: the lines a person reads on the console.
+REPORT_LOGGER = "phasesweep.report"
 
 Style = Literal["winner", "error", "warning", "label", "path"]
 
@@ -126,3 +132,83 @@ def plural(count: int, noun: str) -> str:
     :return str: ``1 trial``, ``2 trials``, ``0 trials``, with a thousands separator on large counts.
     """
     return f"{count:,} {noun}{'' if count == 1 else 's'}"
+
+
+def significant(value: float, digits: int) -> str:
+    """Format a number to ``digits`` significant digits, never in positive-exponent form.
+
+    A value too large for ``digits`` would read as ``8.8e+06``, so it prints in full plain
+    notation instead. The exact value stays in ``trials.csv`` and ``winner.yaml``.
+
+    :param float value: The number to show.
+    :param int digits: Significant digits kept for a value that fits them.
+    :return str: Terminal text for the number.
+    """
+    text = f"{value:.{digits}g}"
+    if "e+" not in text:
+        return text
+    return format(Decimal(repr(value)).normalize(), "f")
+
+
+def param_text(value: object) -> str:
+    """Format one sampled param for display, floats to four significant digits.
+
+    :param object value: The recorded param value.
+    :return str: Terminal text for the value.
+    """
+    return significant(value, 4) if isinstance(value, float) else str(value)
+
+
+def pack(items: Sequence[str], width: int, *, indent: str = "", separator: str = "  ") -> list[str]:
+    """Fill lines of ``width`` columns with whole items joined by ``separator``.
+
+    An item is never split, so ``key=value`` pairs stay readable; one wider than the line gets a
+    line of its own. A line that ends before the last item keeps the separator's trailing
+    punctuation, so a comma list reads on after each break.
+
+    :param Sequence[str] items: Texts to place, in order.
+    :param int width: Maximum visible width of each line, indent included.
+    :param str indent: Prefix of every line.
+    :param str separator: Text between two items on one line.
+    :return list[str]: The lines, empty when there are no items.
+    """
+    lines: list[str] = []
+    current = ""
+    punctuation = separator.rstrip()
+    for item in items:
+        if current and len(indent + current + separator + item + punctuation) > width:
+            lines.append(indent + current + punctuation)
+            current = item
+        else:
+            current = f"{current}{separator}{item}" if current else item
+    if current:
+        lines.append(indent + current)
+    return lines
+
+
+class ReportBlock(ABC):
+    """A log message that draws itself on the console and reads as one line in a log file.
+
+    A block is logged on the ``phasesweep.report`` logger. ``str()`` is the plain one-line text
+    that ``run.log``, a test's captured records and the MCP runner's log receive, and
+    :meth:`render` is what the console handler prints.
+    """
+
+    #: Whether the console prefixes the block's first line with the time of day.
+    timestamped: ClassVar[bool] = True
+
+    @abstractmethod
+    def render(self, width: int, *, color: bool) -> list[str]:
+        """Draw the block for a terminal.
+
+        :param int width: Columns available to each line; the console takes the time prefix off.
+        :param bool color: Whether to style the text, from :func:`use_color` on the stream.
+        :return list[str]: The lines, without line breaks and without the time prefix.
+        """
+
+    @abstractmethod
+    def __str__(self) -> str:
+        """Return the block as one plain line of text.
+
+        :return str: Text without line breaks or styling.
+        """

@@ -43,8 +43,8 @@ from tests.conftest import (
 
 def _trial_lines(experiment_log: Path, phase: str) -> list[str]:
     """Return every ``run.log`` line the phase logged for a finished trial, in order."""
-    marker = f"phase={phase} TRIAL "
-    return [line for line in experiment_log.read_text().splitlines() if marker in line]
+    finished = re.compile(rf" {re.escape(phase)}  trial \d+  [A-Z]+  ")
+    return [line for line in experiment_log.read_text().splitlines() if finished.search(line)]
 
 
 def _field(line: str, pattern: str) -> str:
@@ -182,24 +182,24 @@ def test_run_log_records_one_line_per_finished_trial(tmp_path: Path) -> None:
     run_experiment(experiment)
 
     lines = _trial_lines(_experiment_dir(experiment) / "run.log", "p")
-    assert [_field(line, r"TRIAL trial=(\d+)") for line in lines] == ["0", "1", "2", "3"]
-    assert [_field(line, r"\((\d+)/4 finished\)") for line in lines] == ["1", "2", "3", "4"]
-    by_state = {_field(line, r"state=(\w+)"): line for line in lines}
+    assert [_field(line, r"trial (\d+)") for line in lines] == ["0", "1", "2", "3"]
+    assert [_field(line, r"  (\d+)/4(?:  |$)") for line in lines] == ["1", "2", "3", "4"]
+    by_state = {_field(line, r"  (COMPLETE|FAIL|INFEASIBLE)  "): line for line in lines}
     assert sorted(by_state) == ["COMPLETE", "FAIL", "INFEASIBLE"]
 
     failed = by_state["FAIL"]
-    assert "state=FAIL value=none" in failed
-    assert failed.endswith(" reason=non-zero exit code 3; stderr: second line")
+    assert re.search(r"  FAIL  \d+\.\ds  ", failed), "a failed trial reports no objective"
+    assert failed.endswith("  reason: non-zero exit code 3; stderr: second line")
     infeasible = by_state["INFEASIBLE"]
-    assert "state=INFEASIBLE value=52.5" in infeasible
-    assert "reason=metric or evidence constraints were infeasible" in infeasible
-    feasible = [line for line in lines if "state=COMPLETE" in line]
+    assert "  INFEASIBLE  objective 52.5  " in infeasible
+    assert "reason: metric or evidence constraints were infeasible" in infeasible
+    feasible = [line for line in lines if "  COMPLETE  " in line]
     assert len(feasible) == 2
-    assert all(re.search(r"state=COMPLETE value=\d", line) for line in feasible)
-    assert all("reason=" not in line for line in feasible)
+    assert all(re.search(r"  COMPLETE  objective \d", line) for line in feasible)
+    assert all("reason:" not in line for line in feasible)
     assert all("outcome=" not in line for line in lines)
-    assert all(re.search(r"duration=\d+\.\ds", line) for line in lines)
-    assert all("repeat=" not in line for line in lines)
+    assert all(re.search(r"  \d+\.\ds  ", line) for line in lines)
+    assert all("repeat " not in line for line in lines)
 
 
 @pytest.mark.parametrize("source", ["metric", "constraint"])
@@ -241,7 +241,7 @@ def test_infeasible_reason_names_measured_value_and_violated_bound(
     assert bound in cause
     assert str(limit) in cause
     lines = _trial_lines(_experiment_dir(experiment) / "run.log", "p")
-    assert any(line.endswith(f" reason={cause}") for line in lines)
+    assert any(line.endswith(f"  reason: {cause}") for line in lines)
 
 
 def test_run_log_names_the_configuration_and_repeat_value_of_each_trial(tmp_path: Path) -> None:
@@ -263,9 +263,9 @@ def test_run_log_names_the_configuration_and_repeat_value_of_each_trial(tmp_path
     run_experiment(experiment)
 
     lines = _trial_lines(_experiment_dir(experiment) / "run.log", "p")
-    assert [_field(line, r"repeat=seed=(\d+)") for line in lines] == ["0", "1", "0", "1"]
-    assert all("params={'x': " in line for line in lines)
-    assert all("'seed':" not in line for line in lines)
+    assert [_field(line, r"repeat seed=(\d+)") for line in lines] == ["0", "1", "0", "1"]
+    assert all(re.search(r"  x=\d", line) for line in lines)
+    assert all("  seed=" not in line for line in lines)
     csv_path = _phase_dir(experiment, "p") / "trials.csv"
     with csv_path.open(newline="") as handle:
         assert [row["repeat_group"] for row in csv.DictReader(handle)] == ["1", "1", "3", "3"]
@@ -334,19 +334,19 @@ def test_failed_trials_carry_their_stderr_cause_and_the_hint_only_for_the_enviro
         3: "non-zero exit code 1; stderr: ModuleNotFoundError: No module named 'm3'",
     }
     log_path = _experiment_dir(experiment) / "run.log"
-    lines = {int(_field(line, r"TRIAL trial=(\d+)")): line for line in _trial_lines(log_path, "p")}
+    lines = {int(_field(line, r"trial (\d+)")): line for line in _trial_lines(log_path, "p")}
     with (_phase_dir(experiment, "p") / "trials.csv").open(newline="") as handle:
         rows = {int(row["number"]): row for row in csv.DictReader(handle)}
     for trial in study.trials:
         x = x_by_trial[trial.number]
         if x == 4:
             assert FAILURE_REASON_ATTR not in trial.user_attrs
-            assert " reason=" not in lines[trial.number]
+            assert "reason:" not in lines[trial.number]
             continue
         assert trial.user_attrs[FAILURE_REASON_ATTR] == causes[x]
         assert trial.user_attrs[TRIAL_OUTCOME_ATTR]["cause"] == causes[x]
         assert rows[trial.number][f"user_attr:{FAILURE_REASON_ATTR}"] == causes[x]
-        assert lines[trial.number].endswith(f" reason={causes[x]}")
+        assert lines[trial.number].endswith(f"  reason: {causes[x]}")
 
     hints = [line for line in log_path.read_text().splitlines() if "execution.inherit_env" in line]
     first_import_failure = min(number for number, x in x_by_trial.items() if x in {2, 3})
@@ -405,8 +405,8 @@ def test_cli_failed_trial_tracebacks_require_verbose(tmp_path: Path, verbose: bo
     )
 
     assert result.returncode == 1, result.stdout + result.stderr
-    assert "TRIAL trial=0 state=FAIL" in result.stderr
-    assert "reason=non-zero exit code 3; stderr: second line" in result.stderr
+    assert "p  trial 0  FAIL  " in result.stderr
+    assert "reason: non-zero exit code 3; stderr: second line" in result.stderr
     if verbose:
         assert "A new study created" in result.stderr
         assert "Trial 0 failed" in result.stderr
@@ -466,9 +466,9 @@ def test_trial_lines_carry_their_own_completion_ordinal(
         phase_ops._settle_finished_trial(run, run.study, run.study.trials[number])
 
     ordinals = [
-        _field(record.getMessage(), r"\((\d+/6) finished\)")
+        _field(record.getMessage(), r"  (\d+/6)(?:  |$)")
         for record in caplog.records
-        if " TRIAL " in record.getMessage()
+        if re.search(r"^p  trial \d+  [A-Z]+  ", record.getMessage())
     ]
     assert ordinals == ["1/6", "2/6", "3/6"]
 
@@ -505,9 +505,7 @@ def test_run_log_reports_abort_after_its_triggering_trial(tmp_path: Path, n_jobs
     lines = (_experiment_dir(experiment) / "run.log").read_text().splitlines()
     abort_lines = [index for index, line in enumerate(lines) if "phase=p ABORTED:" in line]
     trial_index = next(
-        index
-        for index, line in enumerate(lines)
-        if f"phase=p TRIAL trial={triggering.number} " in line
+        index for index, line in enumerate(lines) if f" p  trial {triggering.number}  " in line
     )
     assert len(abort_lines) == 1
     assert trial_index < abort_lines[0]

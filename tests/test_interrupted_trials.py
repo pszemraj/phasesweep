@@ -349,10 +349,11 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
     assert (winner.params, winner.metric) == (expected.params, expected.metric)
     assert winner.completion["finished_trials"] == 3
 
-    assert "phase=p study=t::p finished=0 remaining=3 reruns=1 n_jobs=1" in lines
-    assert f"phase=p RERUN trial=1 of=0 reason={_STALE_CAUSE}" in lines
-    (rerun_line,) = (line for line in lines if line.startswith("phase=p TRIAL trial=1 "))
-    assert " rerun_of=0 (1/3 finished)" in rerun_line
+    assert "p  3 trials to run, 1 of them a rerun, 1 at a time" in lines
+    assert f"p  trial 1  RERUN of trial 0  reason: {_STALE_CAUSE}" in lines
+    (rerun_line,) = (line for line in lines if line.startswith("p  trial 1  COMPLETE  "))
+    assert "  1/3  " in rerun_line
+    assert rerun_line.endswith("  rerun of 0")
     with (_phase_dir(exp, "p") / "trials.csv").open(newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert [row["state"] for row in rows] == ["INTERRUPTED", "COMPLETE", "COMPLETE", "COMPLETE"]
@@ -1799,8 +1800,8 @@ def test_in_memory_sweep_keeps_its_finished_trials_when_the_tracker_turns_unread
     assert winners["p"].metric == 1.0
     assert launches.read_text().splitlines() == ["launch"] * 6
     assert _last_successful_generation_path(experiment).is_file()
-    assert caplog.text.count("state=COMPLETE") == 4
-    assert caplog.text.count("reason=metric extractor: W&B authentication/setup failed") == 2
+    assert caplog.text.count("  COMPLETE  ") == 4
+    assert caplog.text.count("reason: metric extractor: W&B authentication/setup failed") == 2
 
 
 @pytest.mark.parametrize("storage", ["journal", "memory"])

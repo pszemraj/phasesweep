@@ -252,14 +252,24 @@ def test_failed_grid_names_the_target_that_retries_every_failed_cell(
 
 
 @pytest.mark.parametrize(
-    ("target", "launch"),
+    ("target", "launch", "started"),
     [
-        pytest.param(3, "1 trial, 1 of them a rerun", id="one-retry"),
-        pytest.param(4, "2 trials, 2 of them reruns", id="both-retried"),
+        pytest.param(
+            3,
+            "1 trial, 1 of them a rerun",
+            "1 trial to run, 1 of them a rerun, 1 at a time, 2 already finished",
+            id="one-retry",
+        ),
+        pytest.param(
+            4,
+            "2 trials, 2 of them reruns",
+            "2 trials to run, 2 of them reruns, 1 at a time, 2 already finished",
+            id="both-retried",
+        ),
     ],
 )
 def test_phase_header_counts_the_failed_cells_a_raised_target_retries(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, target: int, launch: str
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, target: int, launch: str, started: str
 ) -> None:
     """The header's reruns agrees with the RERUN lines, in the dry run as in the run."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=2)
@@ -277,9 +287,9 @@ def test_phase_header_counts_the_failed_cells_a_raised_target_retries(
     caplog.clear()
     run_experiment(raised)
     lines = [record.getMessage() for record in caplog.records]
-    assert header in lines
-    rerun_lines = [line.split(" reason=")[0] for line in lines if " RERUN " in line]
-    assert rerun_lines == ["phase=p RERUN trial=2 of=0", "phase=p RERUN trial=3 of=1"][:retried]
+    assert f"p  {started}" in lines
+    rerun_lines = [line.split("  reason: ")[0] for line in lines if "  RERUN of " in line]
+    assert rerun_lines == ["p  trial 2  RERUN of trial 0", "p  trial 3  RERUN of trial 1"][:retried]
 
 
 def test_aborted_grid_names_the_cells_it_never_reached(tmp_path: Path) -> None:

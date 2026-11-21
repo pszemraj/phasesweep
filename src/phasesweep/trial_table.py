@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal
 from pathlib import Path
 
 from phasesweep.config.models import Experiment, Phase
@@ -23,7 +22,14 @@ from phasesweep.engine.read import (
 )
 from phasesweep.engine.state import OBSERVED_PREFIX
 from phasesweep.runtime.json import JsonObject, JsonValue
-from phasesweep.runtime.terminal import display_path, paint, plural, wrap
+from phasesweep.runtime.terminal import (
+    display_path,
+    paint,
+    param_text,
+    plural,
+    significant,
+    wrap,
+)
 
 #: The word that marks a winning row, and so the width of the leading marker column.
 _WINNER_WORD = "winner"
@@ -58,31 +64,6 @@ def _is_number(value: JsonValue) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool)
 
 
-def _significant(value: float, digits: int) -> str:
-    """Format a number to ``digits`` significant digits, never in positive-exponent form.
-
-    A value too large for ``digits`` would read as ``8.8e+06``, so it prints in full plain
-    notation instead. The exact value stays in ``trials.csv`` and ``winner.yaml``.
-
-    :param float value: The number to show.
-    :param int digits: Significant digits kept for a value that fits them.
-    :return str: Terminal text for the number.
-    """
-    text = f"{value:.{digits}g}"
-    if "e+" not in text:
-        return text
-    return format(Decimal(repr(value)).normalize(), "f")
-
-
-def _param_text(value: JsonValue) -> str:
-    """Format one sampled param for a trial table, floats to four significant digits.
-
-    :param JsonValue value: The recorded param value.
-    :return str: Terminal text for the value.
-    """
-    return _significant(value, 4) if isinstance(value, float) else str(value)
-
-
 def _number_text(value: JsonValue) -> str:
     """Format a measured value to six significant digits, ``-`` when there is none.
 
@@ -91,7 +72,7 @@ def _number_text(value: JsonValue) -> str:
     """
     if isinstance(value, bool) or not isinstance(value, int | float):
         return "-"
-    return _significant(float(value), 6)
+    return significant(float(value), 6)
 
 
 def _duration_text(value: JsonValue) -> str:
@@ -208,7 +189,7 @@ def _param_columns(keys: Sequence[str], params: Sequence[JsonObject]) -> list[_C
         columns.append(
             _Column(
                 header=key,
-                cells=tuple(_param_text(row[key]) if key in row else "-" for row in params),
+                cells=tuple(param_text(row[key]) if key in row else "-" for row in params),
                 numeric=bool(present) and all(_is_number(value) for value in present),
             )
         )

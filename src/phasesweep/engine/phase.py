@@ -41,13 +41,12 @@ from phasesweep.engine.ledger import ClaimedLedger, open_phase_study
 from phasesweep.engine.optuna import (
     _completed_trial_count,
     _finished_trial_count,
-    _phase_study_name,
     _suggest,
 )
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
 from phasesweep.engine.progress import (
     _log_finished_trial,
-    _log_phase_header,
+    _log_phase_start,
     _log_reruns,
     _warn_deferred_extraction,
 )
@@ -1451,7 +1450,9 @@ def _settle_finished_trial(
     finished = _finished_trial_count(study.get_trials(deepcopy=False))
     # Peers finish while this callback waits, so the study's count here can repeat or skip a
     # value; the ordinal this trial's outcome took is its own.
-    _log_finished_trial(run.phase, trial, run.finished_ordinals.get(trial.number, finished))
+    _log_finished_trial(
+        run.experiment, run.phase, trial, run.finished_ordinals.get(trial.number, finished)
+    )
     outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
     if outcome is not None and outcome.abort is not None:
         log.error("phase=%s ABORTED: %s", run.phase.name, outcome.abort["cause"])
@@ -1654,7 +1655,6 @@ def _run_phase(
         abort, or exception, which violates the runner invariant.
     :return Winner: The selected phase winner.
     """
-    study_name = _phase_study_name(experiment, phase)
     # The live opener also claims a newly created study's publication root,
     # before any inspection, reaping, or trial work below can run against it.
     study = open_phase_study(ledger, phase)
@@ -1666,9 +1666,9 @@ def _run_phase(
     trials = study.get_trials(deepcopy=False)
     finished = _finished_trial_count(trials)
     remaining = max(0, phase.n_trials - finished)
-    _log_phase_header(
+    _log_phase_start(
+        experiment,
         phase,
-        study_name,
         finished=finished,
         remaining=remaining,
         reruns=_pending_rerun_count(trials, phase),
@@ -1739,7 +1739,7 @@ def _run_phase(
                 trainer_environment=environment_identity.digest,
             )
             # WAITING reruns precede new draws and share the allocation context.
-            _log_reruns(phase, study, _record_reruns(study, phase))
+            _log_reruns(experiment, phase, study, _record_reruns(study, phase))
             try:
                 study.optimize(
                     functools.partial(_objective, run),

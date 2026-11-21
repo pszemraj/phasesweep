@@ -47,6 +47,7 @@ from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
 from phasesweep.engine.study_policy import _launch_preflight
 from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
+from phasesweep.run_report import report, skipped_line, winner_line
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
     UnsafeLockPathError,
@@ -714,7 +715,7 @@ def _run_experiment_inner(
             and preloaded_winners is not None
             and phase.name not in preloaded_winners
         ):
-            log.info("phase=%s SKIPPED (no published or required winner)", phase.name)
+            report.info(skipped_line(experiment, phase, "no published or required winner"))
             continue
         # Resolve current parents before validating skipped winners or running the phase.
         inherited = {p: winners[p] for p in phase.inherits}
@@ -724,7 +725,7 @@ def _run_experiment_inner(
             winners[phase.name] = preloaded_winners[phase.name]
             if generation is not None:
                 generation.save_winner(phase.name, winners[phase.name])
-            log.info("phase=%s SKIPPED (using preflight-validated winner)", phase.name)
+            report.info(skipped_line(experiment, phase, "using its validated earlier winner"))
             continue
         skip_until = False
 
@@ -743,30 +744,7 @@ def _run_experiment_inner(
             )
         if generation is not None:
             generation.save_winner(phase.name, winner)
-            group = winner.repeats
-            completion = winner.completion
-            log.info(
-                "phase=%s WINNER trial=%d metric=%g params=%s%s%s",
-                phase.name,
-                winner.trial_number,
-                winner.metric,
-                winner.params,
-                ""
-                if group is None
-                else (
-                    f" ({group['reduce']} over {group['spread']['n']} repeats of "
-                    f"{group['key']!r}: sd={group['spread']['sd']:g}, "
-                    f"range {group['spread']['min']:g}..{group['spread']['max']:g}, "
-                    f"members {[member['trial_number'] for member in group['members']]})"
-                ),
-                ""
-                if not completion.get("incomplete")
-                else (
-                    f" INCOMPLETE {completion['finished_trials']}/"
-                    f"{completion['requested_trials']} finished "
-                    f"timeout_scope={completion['timeout_scope']}"
-                ),
-            )
+            report.info(winner_line(experiment, phase, winner))
         winners[phase.name] = winner
 
     if generation is None:
