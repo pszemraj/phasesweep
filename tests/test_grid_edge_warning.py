@@ -447,7 +447,9 @@ def test_overlap_warning_keeps_threshold_with_groups_before_evaluation_remedy(
         if "potential confounds" in record.getMessage()
     )
     assert "threshold=2*combined_se=" in warning
-    assert warning.index("group ") < warning.index("Report progress=")
+    assert warning.index("group ") < warning.index(
+        ". For a phase that searches training length, report progress="
+    )
     _, views = read_result(experiment)
     assert views[0].cost_advisory_status == "no_cheaper_configuration"
     config = write_experiment_config(tmp_path / "experiment.yaml", experiment)

@@ -422,19 +422,22 @@ def select_winner(
                 f"{objective_text(comparison['threshold'])}"
             )
     evaluation = confound["checks"]["evaluation_point"]
-    if evaluation["verdict"] == "heterogeneous":
-        flagged.append(
-            _evaluation_point_remedy(
-                experiment.metric.extractor.type, axis=evaluation["detail"]["axis"]
-            )
+    remedy = (
+        " "
+        + _evaluation_point_remedy(
+            experiment.metric.extractor.type, axis=evaluation["detail"]["axis"]
         )
+        if evaluation["verdict"] == "heterogeneous"
+        else ""
+    )
     if flagged and emit_advisories:
         log.warning(
             "[%s] potential confounds in the %d ranked trials (verdicts recorded in the "
-            "winner's confound block): %s.",
+            "winner's confound block): %s.%s",
             phase_name or study.study_name,
             len(survivors),
             "; ".join(fragment.rstrip(".") for fragment in flagged),
+            remedy,
         )
     if phase is not None and emit_advisories:
         _warn_grid_edges(phase, best.params)

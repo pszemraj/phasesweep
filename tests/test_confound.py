@@ -1078,9 +1078,9 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
     assert (
         "survivorship: 2 of 4 configurations have no result, so the winner was chosen among "
         "the rest: trial 2 x=5 failed, trial 3 x=6 failed. Raise phases[p].n_trials above 3 "
-        "in the config and rerun to draw new configurations; the failed ones are not retried;"
+        "in the config and rerun to draw new configurations; the failed ones are not retried. "
     ) in warnings[0]
-    assert warnings[0].endswith(_evaluation_point_remedy("json_envelope"))
+    assert warnings[0].endswith(". " + _evaluation_point_remedy("json_envelope"))
     assert "metric.." not in warnings[0]
 
 
