@@ -1484,7 +1484,7 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     config_path = materialized.config_path
     generation_id = published_generation_id(materialized.experiment)
     assert generation_id is not None
-    heading = "p: 2 trials, objective (lower is better)"
+    heading = "p: 2 of 2 trials, objective (lower is better)"
 
     assert invoke_cli_boundary(["status", str(config_path), "--trials"], monkeypatch) == 0
     lines = capsys.readouterr().out.splitlines()

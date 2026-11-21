@@ -420,6 +420,9 @@ def _phase_lines(
 ) -> list[str]:
     """Render one phase: its heading, any notes under it, its trials and its repeat groups.
 
+    The heading reads ``finished of target trials``, then in parentheses the rows that do not
+    count toward the target, by state.
+
     :param TrialTable table: The phase's trials.
     :param Phase phase: The configured phase.
     :param Experiment experiment: The experiment, for the metric's name and direction.
@@ -440,7 +443,10 @@ def _phase_lines(
     elif not table.rows:
         count = "no trials yet"
     else:
-        count = plural(len(table.rows), "trial")
+        count = f"{table.finished} of {plural(phase.n_trials, 'trial')}"
+        if table.uncounted:
+            others = ", ".join(f"{rows} {state.lower()}" for state, rows in table.uncounted)
+            count = f"{count} ({others})"
     metric = experiment.metric
     direction = "lower" if metric.goal == "minimize" else "higher"
     lines = wrap(

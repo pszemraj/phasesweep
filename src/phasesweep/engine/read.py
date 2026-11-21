@@ -84,10 +84,12 @@ from phasesweep.engine.selection import (
 from phasesweep.engine.state import (
     DURATION_ATTR,
     FAILURE_REASON_ATTR,
+    FINISHED_TRIAL_STATES,
     GENERATION_SUMMARY_SCHEMA_VERSION,
     OBSERVED_PREFIX,
     RERUN_OF_ATTR,
     TRIAL_OUTCOME_ATTR,
+    TRIAL_STATE_NAMES,
     PublicationState,
     WinnerSource,
     _parse_winner_source,
@@ -976,7 +978,9 @@ class TrialTable:
     trial has a recorded cause, and ``winner``. ``state`` is the Optuna state, except that a
     COMPLETE trial that violated a constraint or a metric bound reads
     ``INFEASIBLE``. ``winner`` is ``*`` on the trials the represented phase's
-    winner stands on and empty elsewhere.
+    winner stands on and empty elsewhere. ``finished`` is how many rows count toward the
+    phase's ``n_trials``, and ``uncounted`` pairs each state of the rows that do not with its
+    row count, in :data:`~phasesweep.engine.state.TRIAL_STATE_NAMES` order.
     """
 
     phase: str
@@ -984,6 +988,8 @@ class TrialTable:
     available: bool
     columns: tuple[str, ...]
     rows: tuple[JsonObject, ...]
+    finished: int
+    uncounted: tuple[tuple[str, int], ...]
     groups: tuple[RepeatGroupView, ...] = ()
 
 
@@ -1280,11 +1286,18 @@ def _trial_table(
             row["reason"] = reasons[trial.number]
         row[_WINNER_COLUMN] = "*" if _stands_under_winner(trial, standing) else ""
         rows.append(row)
+    states = [_trial_count_state(trial) for trial in trials]
     return TrialTable(
         phase=phase.name,
         available=available,
         columns=columns,
         rows=tuple(rows),
+        finished=_finished_trial_count(trials),
+        uncounted=tuple(
+            (state, states.count(state))
+            for state in TRIAL_STATE_NAMES
+            if state not in FINISHED_TRIAL_STATES and state in states
+        ),
         groups=_repeat_group_views(experiment, phase, trials, rows),
     )
 

@@ -34,10 +34,15 @@ def _metric(goal: str = "minimize") -> Metric:
     )
 
 
-def _phase(name: str, **space: CategoricalParam | FloatParam | IntParam) -> Phase:
-    """Build a phase whose search space is ``space``, in the given order."""
+def _phase(
+    name: str, *, n_trials: int = 4, **space: CategoricalParam | FloatParam | IntParam
+) -> Phase:
+    """Build a phase of ``n_trials`` whose search space is ``space``, in the given order."""
     return Phase(
-        name=name, n_trials=4, sampler=Sampler(type="random", seed=0), search_space=dict(space)
+        name=name,
+        n_trials=n_trials,
+        sampler=Sampler(type="random", seed=0),
+        search_space=dict(space),
     )
 
 
@@ -69,8 +74,13 @@ def _table(
     *,
     groups: tuple[RepeatGroupView, ...] = (),
     available: bool = True,
+    finished: int | None = None,
+    uncounted: tuple[tuple[str, int], ...] = (),
 ) -> TrialTable:
-    """Build a table whose columns are the core ones plus every optional key any row carries."""
+    """Build a table whose columns are the core ones plus every optional key any row carries.
+
+    Every row counts toward the target unless ``finished`` and ``uncounted`` say otherwise.
+    """
     core = ("trial", "state", "value", "params", "duration_s", "trial_dir")
     optional = {key for row in rows for key in row} - {*core, "winner"}
     ordered = [name for name in ("repeat_group", "rerun_of") if name in optional]
@@ -82,6 +92,8 @@ def _table(
         available=available,
         columns=columns,
         rows=tuple({name: row.get(name) for name in columns} for row in rows),
+        finished=len(rows) if finished is None else finished,
+        uncounted=uncounted,
         groups=groups,
     )
 
@@ -125,10 +137,13 @@ def _render(
 def _starter() -> tuple[TrialTables, tuple[Phase, Phase]]:
     """Build the packaged starter's two phases as ``status --trials`` reads them."""
     depth = _phase(
-        "depth", **{"model.n_layers": CategoricalParam(type="categorical", choices=[6, 8])}
+        "depth",
+        n_trials=2,
+        **{"model.n_layers": CategoricalParam(type="categorical", choices=[6, 8])},
     )
     rate = _phase(
         "learning_rate",
+        n_trials=2,
         **{"optimizer.lr": CategoricalParam(type="categorical", choices=[0.0001, 0.0003])},
     )
     tables = _tables(
@@ -161,12 +176,12 @@ def test_starter_tables_name_the_winner_in_a_column_and_fit_eighty_columns() -> 
             "phasesweep_starter",
             f"published generation {GENERATION}",
             "",
-            "depth: 2 trials, eval_loss (lower is better)",
+            "depth: 2 of 2 trials, eval_loss (lower is better)",
             "          trial  eval_loss  model.n_layers  state     time",
             "              1        0.5               6  COMPLETE  0.5s",
             "  winner      0        0.3               8  COMPLETE  0.5s",
             "",
-            "learning_rate: 2 trials, eval_loss (lower is better)",
+            "learning_rate: 2 of 2 trials, eval_loss (lower is better)",
             "          trial  eval_loss  optimizer.lr  state     time",
             "              1   0.413822        0.0001  COMPLETE  0.5s",
             "  winner      0        0.3        0.0003  COMPLETE  0.5s",
@@ -181,7 +196,7 @@ def test_a_maximized_metric_says_higher_is_better() -> None:
 
     rendered = _render(tables, *phases, goal="maximize")
 
-    assert "depth: 2 trials, eval_loss (higher is better)" in rendered.splitlines()
+    assert "depth: 2 of 2 trials, eval_loss (higher is better)" in rendered.splitlines()
 
 
 def test_colour_styles_only_the_winner_row_and_leaves_the_text_otherwise_identical() -> None:
@@ -314,7 +329,7 @@ def test_repeat_groups_mark_every_member_of_the_winning_group() -> None:
             "phasesweep_starter",
             f"published generation {GENERATION}",
             "",
-            "r: 5 trials, eval_loss (lower is better)",
+            "r: 5 of 6 trials, eval_loss (lower is better)",
             "          trial  eval_loss  x  seed  group  state     time",
             "              3          1  1     0      5  COMPLETE  0.5s",
             "              4          2  1     1      5  COMPLETE  0.5s",
@@ -355,7 +370,7 @@ def test_rows_with_different_key_sets_show_a_dash_and_sort_by_value() -> None:
     )
 
     assert _render(tables, phase).splitlines()[3:] == [
-        "p: 4 trials, eval_loss (lower is better)",
+        "p: 4 of 4 trials, eval_loss (lower is better)",
         "          trial  eval_loss  a  c  extra  state     time",
         "              3          4  2  1  -      COMPLETE  0.5s",
         "              1          2  2  2  -      COMPLETE  0.5s",
@@ -430,6 +445,8 @@ def test_a_rerun_and_an_observation_get_their_own_columns() -> None:
                 ),
                 _row(1, 0.4, {"x": 3}, rerun_of=0, **{"observed:acc": 0.91234567}),
             ],
+            finished=1,
+            uncounted=(("INTERRUPTED", 1),),
         ),
         winners={},
     )
@@ -529,8 +546,8 @@ def test_a_path_longer_than_the_line_goes_whole_on_a_line_of_its_own(width: int)
 
 def test_winners_from_different_generations_name_each_phases_own() -> None:
     """When winner generations differ the header says so and each phase names its source."""
-    first = _phase("a", x=IntParam(type="int", low=0, high=9))
-    second = _phase("b", x=IntParam(type="int", low=0, high=9))
+    first = _phase("a", n_trials=1, x=IntParam(type="int", low=0, high=9))
+    second = _phase("b", n_trials=1, x=IntParam(type="int", low=0, high=9))
     tables = _tables(
         _table("a", [_row(0, 0.2, {"x": 1}, winner=True)]),
         _table("b", [_row(0, 0.3, {"x": 2}, winner=True)]),
@@ -542,12 +559,12 @@ def test_winners_from_different_generations_name_each_phases_own() -> None:
             "phasesweep_starter",
             "winners come from different generations; each phase names its own",
             "",
-            "a: 1 trial, eval_loss (lower is better)",
+            "a: 1 of 1 trial, eval_loss (lower is better)",
             f"  winner from generation {GENERATION} (published)",
             "          trial  eval_loss  x  state     time",
             "  winner      0        0.2  1  COMPLETE  0.5s",
             "",
-            "b: 1 trial, eval_loss (lower is better)",
+            "b: 1 of 1 trial, eval_loss (lower is better)",
             "  winner from generation 0123456789abcdef0123456789abcdef (unpublished)",
             "          trial  eval_loss  x  state     time",
             "  winner      0        0.3  2  COMPLETE  0.5s",
@@ -602,7 +619,7 @@ ATTEMPT_DIR = f"runs/phasesweep_starter/depth/{ATTEMPT_TRIAL_NAME}"
 
 def _winner_tables(trial_dir: str | None, *, winner: bool = True) -> tuple[TrialTables, Phase]:
     """Build a two-trial phase whose trial 1 carries ``trial_dir`` and is the winner when asked."""
-    phase = _phase("depth", x=IntParam(type="int", low=0, high=9))
+    phase = _phase("depth", n_trials=2, x=IntParam(type="int", low=0, high=9))
     rows = [
         _row(0, 0.5, {"x": 2}, trial_dir="runs/depth/trial_00000"),
         _row(1, 0.3, {"x": 4}, winner=winner, trial_dir=trial_dir),
@@ -618,7 +635,7 @@ def test_the_winning_trials_directory_prints_under_its_table(
     tables, phase = _winner_tables(str(tmp_path / SHORT_DIR))
 
     assert _render(tables, phase).splitlines()[3:] == [
-        "depth: 2 trials, eval_loss (lower is better)",
+        "depth: 2 of 2 trials, eval_loss (lower is better)",
         "          trial  eval_loss  x  state     time",
         "              0        0.5  2  COMPLETE  0.5s",
         "  winner      1        0.3  4  COMPLETE  0.5s",
@@ -637,7 +654,7 @@ def test_a_directory_too_wide_for_its_line_prints_whole_on_a_line_of_its_own(
     lines = _render(tables, phase, width=width).splitlines()
 
     assert lines[3:] == [
-        "depth: 2 trials, eval_loss (lower is better)",
+        "depth: 2 of 2 trials, eval_loss (lower is better)",
         "          trial  eval_loss  x  state     time",
         "              0        0.5  2  COMPLETE  0.5s",
         "  winner      1        0.3  4  COMPLETE  0.5s",
