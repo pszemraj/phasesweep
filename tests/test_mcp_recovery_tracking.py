@@ -21,7 +21,7 @@ from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.json import JsonObject
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
-from phasesweep.tracking.mlflow import OperationUnavailableError
+from phasesweep.tracking.mlflow import OperationRejectedError, OperationUnavailableError
 from phasesweep.tracking.session import read_record, tracking_root
 from tests.conftest import write_experiment_config
 from tests.mcp_helpers import (
@@ -363,6 +363,53 @@ def test_recover_run_leaves_outcomes_pending_while_mlflow_is_down(
     publication.sync_tracking(run.experiment)
     publication.sync_tracking(run.experiment)
     assert (run.sent(), run.summaries()) == (["KILLED"], ["KILLED"])
+
+
+@pytest.mark.integration
+def test_recover_run_and_mcp_status_say_what_keeps_a_refused_record_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A record MLflow refuses during recover-run stays pending, and recover-run and MCP status say what clears it.
+
+    MLflow refuses the attempt's outcome, as for a run deleted in MLflow, and accepts the
+    summary run's end. recover-run's line counts both and names the refusal; the run's MCP
+    remedy places the refusal's warning, as an MCP reader never sees the console.
+    """
+    run = _killed_run(tmp_path, monkeypatch)
+    respond = session.request_operation
+
+    def deleted(request: dict[str, object], **kwargs: object) -> JsonObject:
+        if request["action"] == "publish" and request["name"] == f"attempt-{run.attempt}":
+            raise OperationRejectedError("MLflow run is deleted; restore it, or its experiment.")
+        return respond(request, **kwargs)
+
+    monkeypatch.setattr(session, "request_operation", deleted)
+    monkeypatch.setattr(worker, "request_operation", deleted)
+    run.uploads.clear()
+
+    confirmed = run.recover()
+
+    assert confirmed.exit_code == 0, confirmed.output
+    assert (run.sent(), run.summaries()) == ([], ["KILLED"])
+    assert read_record(run.record)["state"] == "pending"
+    assert (
+        "MLflow: delivered 1 record. MLflow: 1 record pending. The next launch with this config, "
+        "or `phasesweep sync-tracking CONFIG` with the config this run launched with, sends "
+        "them; delivery never retrains. MLflow refused 1 record; a refused record stays pending "
+        "until the cause given in its warning is fixed in MLflow, for example by restoring a "
+        "deleted run or its experiment." in confirmed.output.splitlines()
+    )
+    assert not run.store.observe(run.handle).recovery_required
+    delivery = run.app.status(_RUN_ID)["tracking_delivery"]
+    assert delivery["remedy"] == (
+        "1 MLflow record(s) of this run are pending. Its scores and winners are unaffected. The "
+        "next launch with this config sends them, or ask the operator to retry them with "
+        f"`phasesweep sync-tracking CONFIG --generation {_RUN_ID}` using the config this run "
+        "launched with; delivery never retrains. If MLflow refused a record, such as for a run "
+        "deleted in MLflow, that record stays pending until the cause given in its warning in "
+        "the engine's `run.log` in the experiment workdir, or on the console of the operator's "
+        "retry, is fixed in MLflow, for example by restoring a deleted run or its experiment."
+    )
 
 
 @pytest.mark.integration
