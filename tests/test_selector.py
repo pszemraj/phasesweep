@@ -26,6 +26,7 @@ from phasesweep.engine.state import (
     constraint_attr,
 )
 from phasesweep.evidence.models import JsonExtractor
+from phasesweep.runtime.process import TIMEOUT_REASON_PREFIX
 from tests.conftest import log_regex_provenance, make_experiment, trial_outcome
 
 # Allocation writes both attrs on every trial before its trainer runs.
@@ -599,7 +600,9 @@ def test_a_timed_out_phase_is_told_to_rename_it_not_to_raise_the_timeout_in_plac
     """A recorded per-trial timeout leads the remedy: the raised timeout needs a new phase name."""
     phase = _sampled_phase(Sampler(type="random", seed=0))
 
-    remedy = _crashed_remedy(tmp_path, phase, ["timeout after 5.0s", "timeout after 5.0s"])
+    timeout = f"{TIMEOUT_REASON_PREFIX}5.0s"
+
+    remedy = _crashed_remedy(tmp_path, phase, [timeout, timeout])
 
     assert "A trial timed out under phases[p].timeout_seconds_per_trial" in remedy
     assert "raising it in place is refused as a changed study" in remedy

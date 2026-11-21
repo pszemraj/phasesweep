@@ -51,6 +51,11 @@ from phasesweep.runtime.shutdown import (
 
 log = logging.getLogger("phasesweep.runtime.process")
 
+# How a trial's failure reason begins when the trainer is killed at its per-trial timeout.
+# ``engine.optuna`` matches a recorded reason on this prefix to tell a timed-out phase from
+# a crashed one, so the wording lives here once.
+TIMEOUT_REASON_PREFIX = "timeout after "
+
 _DIRECT_CHILD_REAP_TIMEOUT_SECONDS = 5.0
 _SUPERVISOR_READY_TIMEOUT_SECONDS = 10.0
 # poll() takes its timeout as a C int of milliseconds, about 24.8 days, and a
@@ -705,7 +710,7 @@ def run_supervised(
     timeout_reason = (
         "phase/run wallclock deadline exceeded"
         if timeout_capped_by_wallclock
-        else f"timeout after {timeout}s"
+        else f"{TIMEOUT_REASON_PREFIX}{timeout}s"
     )
 
     # Defer signals before taking the launch lock, and release it before unmasking.

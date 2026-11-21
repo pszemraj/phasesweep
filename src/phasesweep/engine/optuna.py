@@ -42,6 +42,7 @@ from phasesweep.engine.state import (
     TrialStateName,
     _trial_interrupted,
 )
+from phasesweep.runtime.process import TIMEOUT_REASON_PREFIX
 
 if TYPE_CHECKING:
     from optuna.samplers._cmaes import CmaClass
@@ -145,21 +146,18 @@ def _measured_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
     return sum(1 for trial in trials if trial.state == optuna.trial.TrialState.COMPLETE)
 
 
-#: How the supervisor words a trainer killed at ``timeout_seconds_per_trial``, as a trial's failure
-#: reason begins. The phase and run deadlines word theirs differently, and raising either is not
-#: a change of study identity.
-_TIMEOUT_REASON_PREFIX = "timeout after "
-
-
 def _any_trial_timed_out(trials: Iterable[optuna.trial.FrozenTrial]) -> bool:
     """Say whether any trial was killed at the phase's per-trial timeout.
+
+    The phase and run deadlines word their reasons differently, and raising either is not
+    a change of study identity, so only the supervisor's per-trial prefix counts.
 
     :param Iterable[optuna.trial.FrozenTrial] trials: Trials of one phase.
     :return bool: ``True`` when a recorded failure reason says the trial timed out.
     """
     for trial in trials:
         reason = trial.user_attrs.get(FAILURE_REASON_ATTR)
-        if isinstance(reason, str) and reason.startswith(_TIMEOUT_REASON_PREFIX):
+        if isinstance(reason, str) and reason.startswith(TIMEOUT_REASON_PREFIX):
             return True
     return False
 
