@@ -475,9 +475,8 @@ def test_model_samplers_top_up_real_runs_exactly(
 
 
 _NO_RUN_ACTIVE = (
-    "# No run is active, so the 1 trial recorded RUNNING was left by a run that stopped before "
-    "recording it; rerun the same config to settle it. A trainer still running is stopped and "
-    "its trial rerun, so wait for it to exit to keep its result."
+    "# No run is active; 1 trial is recorded RUNNING. Rerun the same config to settle it. "
+    "A trainer still running is stopped, so let it exit first to keep its result."
 )
 
 
@@ -548,8 +547,7 @@ def test_a_stopped_run_ends_with_the_next_step_once(
 
     assert harness.spawned[-1].returncode == 128 + sig
     expected = (
-        "phasesweep: stopped. Rerun the same command to resume: finished trials are kept "
-        "and interrupted ones rerun first."
+        "phasesweep: stopped. Rerun the same command to resume."
         if persistent
         else "phasesweep: stopped. Rerun the same command to start over: storage: null keeps "
         "no completed trials between runs."

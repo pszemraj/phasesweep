@@ -39,9 +39,7 @@ from phasesweep.runtime.terminal import (
 #: The word that marks a winning row, and so the width of the leading marker column.
 _WINNER_WORD = "winner"
 _REPEAT_GROUPS_HEADING = "Repeat groups (statistics include infeasible measured members):"
-_REPEAT_GROUPS_NOTE = (
-    "Group numbers track the highest member trial number so far and can change as members arrive."
-)
+_REPEAT_GROUPS_NOTE = "Group numbers can change as members arrive."
 
 #: How a value sorts within one parameter column: listed choices, then unlisted values, then
 #: missing ones; the second and third fields order values within the first kind.
@@ -499,12 +497,11 @@ def unsettled_running_comment(running: int, width: int | None = None) -> str:
         the comment on one line.
     :return str: The ``#`` comment.
     """
-    verb, pronoun = ("was", "it") if running == 1 else ("were", "them")
+    verb, pronoun = ("is", "it") if running == 1 else ("are", "them")
     text = (
-        f"No run is active, so the {plural(running, 'trial')} recorded RUNNING {verb} left by a "
-        f"run that stopped before recording {pronoun}; rerun the same config to settle {pronoun}. "
-        "A trainer still running is stopped and its trial rerun, so wait for it to exit to keep "
-        "its result."
+        f"No run is active; {plural(running, 'trial')} {verb} recorded RUNNING. Rerun the same "
+        f"config to settle {pronoun}. A trainer still running is stopped, so let it exit first "
+        "to keep its result."
     )
     if width is None:
         return f"# {text}"

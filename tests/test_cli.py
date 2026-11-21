@@ -374,7 +374,7 @@ def test_help_registers_commands_and_options() -> None:
     for flag in ("--state-dir", "--run-id", "--confirm", "-h, --help"):
         assert flag in recovery_help.output
     assert (
-        "restore the original complete storage ledger and access to it before recovery"
+        "without --confirm it only reports the actions; --confirm performs them"
         in " ".join(recovery_help.output.split()).lower()
     )
 
@@ -1548,7 +1548,7 @@ def test_cli_only_explains_marked_post_publication_shutdown(
 
     captured = capsys.readouterr()
     assert exit_code == 128 + signal.SIGTERM
-    notice = "shutdown was honored after the published result was committed"
+    notice = "stopped after the result was published"
     assert (notice in captured.err) is expects_notice
 
 
@@ -1913,8 +1913,7 @@ def test_sync_tracking_without_an_mlflow_block_uses_the_standard_error_format(
     error = capsys.readouterr().err
     assert error == (
         "phasesweep: sync-tracking needs an `mlflow` block, and this config has none.\n"
-        "fix: Pass the config the sweep ran with, which has its `mlflow` block; "
-        "`phasesweep explain mlflow` describes the block.\n"
+        "fix: Pass the config the sweep ran with; `phasesweep explain mlflow` describes the block.\n"
     )
 
 

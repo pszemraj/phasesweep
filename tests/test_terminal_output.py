@@ -284,13 +284,12 @@ def test_a_terminal_closed_mid_trial_leaves_the_runs_own_exit_status(
 
 _VALIDATE_CLOSING_AT_80 = [
     "Checked the config alone. A dry run also compares it with the recorded study and",
-    "the environment of its recorded trials, and checks the trial program on the",
-    "trainer's PATH:",
+    "its trials' environment, and checks the trial program on PATH:",
 ]
 _VALIDATE_CLOSING_AT_60 = [
     "Checked the config alone. A dry run also compares it with",
-    "the recorded study and the environment of its recorded",
-    "trials, and checks the trial program on the trainer's PATH:",
+    "the recorded study and its trials' environment, and checks",
+    "the trial program on PATH:",
 ]
 
 
@@ -317,7 +316,7 @@ def test_validate_says_what_it_left_to_the_dry_run_and_gives_its_command_whole(
     assert status == 0
     lines = stdout.text.splitlines()
     assert lines[0] == "OK: phasesweep_starter (2 phases)"
-    assert lines[-4:] == [
+    assert lines[-(len(sentence) + 1) :] == [
         *sentence,
         f"phasesweep run '{config}' --set 'phases[depth].gpu_policy=none' --dry-run",
     ]

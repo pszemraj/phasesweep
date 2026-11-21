@@ -130,7 +130,7 @@ def test_repeat_table_explains_group_numbers_while_members_arrive(tmp_path: Path
         rendered = render_trial_tables(tables, experiment, csv_root=None, width=80, color=False)
         assert f"{seed + 1}/2" in rendered
         prose = " ".join(rendered.split())
-        assert "highest member trial number so far and can change as members arrive" in prose
+        assert "Group numbers can change as members arrive" in prose
 
 
 @pytest.mark.parametrize("outcome", ["failure", "interrupted"])

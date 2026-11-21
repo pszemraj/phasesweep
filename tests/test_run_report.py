@@ -453,24 +453,23 @@ def test_a_dry_run_prints_info_records_of_the_package_as_report_lines(
     ("width", "expected"),
     [
         pytest.param(
-            80,
-            [
-                "12:00:00  Waiting for a GPU: another process holds its lock, such as another",
-                "          sweep or a trial that is still shutting down.",
-                "12:00:00  MLflow: delivered 12 record(s) left pending by earlier runs.",
-            ],
-            id="80",
-        ),
-        pytest.param(
             60,
             [
-                "12:00:00  Waiting for a GPU: another process holds its lock,",
-                "          such as another sweep or a trial that is still",
-                "          shutting down.",
+                "12:00:00  Waiting for a GPU: another process holds its lock.",
                 "12:00:00  MLflow: delivered 12 record(s) left pending by",
                 "          earlier runs.",
             ],
             id="60",
+        ),
+        pytest.param(
+            40,
+            [
+                "12:00:00  Waiting for a GPU: another",
+                "          process holds its lock.",
+                "12:00:00  MLflow: delivered 12 record(s)",
+                "          left pending by earlier runs.",
+            ],
+            id="40",
         ),
     ],
 )
@@ -504,8 +503,8 @@ def test_prose_report_lines_wrap_to_the_terminal(
             80,
             [
                 "12:00:00  warning: MLflow: 2 records pending (1 from earlier runs); results are",
-                "                   saved locally. The next run or `phasesweep sync-tracking`",
-                "                   with this run's config file and `--set` overrides sends them.",
+                "                   saved locally. Send them with `phasesweep sync-tracking",
+                "                   CONFIG`.",
             ],
             id="80",
         ),
@@ -513,10 +512,9 @@ def test_prose_report_lines_wrap_to_the_terminal(
             60,
             [
                 "12:00:00  warning: MLflow: 2 records pending (1 from earlier",
-                "                   runs); results are saved locally. The",
-                "                   next run or `phasesweep sync-tracking`",
-                "                   with this run's config file and `--set`",
-                "                   overrides sends them.",
+                "                   runs); results are saved locally. Send",
+                "                   them with `phasesweep sync-tracking",
+                "                   CONFIG`.",
             ],
             id="60",
         ),
@@ -533,7 +531,7 @@ def test_a_warning_wraps_under_the_text_after_its_label(
     monkeypatch.setenv("COLUMNS", str(width))
     message = (
         f"MLflow: {count_text(2, 0)} pending (1 from earlier runs); results are saved locally. "
-        f"The next run or {SYNC_TRACKING_STEP} sends them."
+        f"Send them with {SYNC_TRACKING_STEP}."
     )
     handler = ConsoleHandler()
     handler.handle(record("phasesweep.tracking.publication", logging.WARNING, message))
@@ -923,22 +921,16 @@ def test_the_log_path_comes_last_after_an_operational_error(
 
 
 _RESUME_HINT_AT = {
-    500: [
-        "phasesweep: stopped. Rerun the same command to resume: finished trials are kept and "
-        "interrupted ones rerun first."
-    ],
-    80: [
-        "phasesweep: stopped. Rerun the same command to resume: finished trials are kept",
-        "and interrupted ones rerun first.",
-    ],
-    60: [
-        "phasesweep: stopped. Rerun the same command to resume:",
-        "finished trials are kept and interrupted ones rerun first.",
+    500: ["phasesweep: stopped. Rerun the same command to resume."],
+    80: ["phasesweep: stopped. Rerun the same command to resume."],
+    40: [
+        "phasesweep: stopped. Rerun the same",
+        "command to resume.",
     ],
 }
 
 
-@pytest.mark.parametrize("columns", [500, 80, 60])
+@pytest.mark.parametrize("columns", [500, 80, 40])
 def test_the_log_path_comes_last_after_ctrl_c(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1022,21 +1014,20 @@ def test_the_stop_hint_repeats_the_command_quoted_with_its_settings(
             True,
             80,
             [
-                "phasesweep: stopped. Rerun the same command to resume: finished trials are kept",
-                "and interrupted ones rerun first.",
+                "phasesweep: stopped. Rerun the same command to resume.",
                 "phasesweep run sweep.yaml --set optimizer.lr=0.01",
             ],
             id="persistent-80",
         ),
         pytest.param(
             True,
-            60,
+            40,
             [
-                "phasesweep: stopped. Rerun the same command to resume:",
-                "finished trials are kept and interrupted ones rerun first.",
+                "phasesweep: stopped. Rerun the same",
+                "command to resume.",
                 "phasesweep run sweep.yaml --set optimizer.lr=0.01",
             ],
-            id="persistent-60",
+            id="persistent-40",
         ),
         pytest.param(
             False,

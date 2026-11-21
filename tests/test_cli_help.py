@@ -45,7 +45,7 @@ def test_status_help_describes_the_trial_table() -> None:
     help_text = " ".join(CliRunner().invoke(cli, ["status", "--help"]).output.split())
 
     assert "a column per swept parameter" in help_text
-    assert "winner named in the first column" in help_text
+    assert "the winner marked" in help_text
     assert "trials.csv" in help_text
 
 

@@ -339,8 +339,7 @@ def test_repeat_groups_mark_every_member_of_the_winning_group() -> None:
             "",
             "Repeat groups (statistics include infeasible measured",
             "members):",
-            "Group numbers track the highest member trial number so far",
-            "and can change as members arrive.",
+            "Group numbers can change as members arrive.",
             "          group  x  n/expected  reduce  aggregate  mean      sd"
             "  min  max  eligible  observed:acc  observed_n:acc",
             "              5  1         2/3  mean            -   1.5  0.7071    1    2  no"
@@ -607,7 +606,9 @@ def test_the_unsettled_running_comment_wraps_as_comment_lines(width: int) -> Non
 
     wrapped = unsettled_running_comment(2, width)
 
-    assert "\n" not in single and single.startswith("# No run is active, so the 2 trials")
+    assert "\n" not in single and single.startswith(
+        "# No run is active; 2 trials are recorded RUNNING."
+    )
     lines = wrapped.splitlines()
     assert len(lines) > 1 and all(line.startswith("# ") and len(line) <= width for line in lines)
     assert " ".join(line.removeprefix("# ") for line in lines) == single.removeprefix("# ")

@@ -15,7 +15,7 @@ from collections.abc import Iterator, Sequence
 from contextvars import ContextVar
 from importlib import resources
 from pathlib import Path
-from typing import TYPE_CHECKING, TextIO
+from typing import TYPE_CHECKING, NoReturn, TextIO
 
 import click
 import optuna
@@ -140,12 +140,10 @@ CONFIG_OVERRIDES = click.option(
     "settings",
     multiple=True,
     metavar="KEY=VALUE",
-    help=(
-        "Override a config value with a YAML VALUE; repeat as needed. KEY is dot-separated "
-        "names (env.NOTE). Select a list element by zero-based index, as phases.0 or "
-        "phases[0], and a phase by name, as phases[NAME]. Write [KEY] to take a mapping key "
-        "verbatim when it contains dots: phases[NAME].search_space[model.n_layers].choices. "
-        "Paths resolve against the config file's directory, just as in the config."
+    help=pin_documentation_links(
+        "Override a config value with a YAML VALUE; repeatable. KEY is dot-separated "
+        "(env.NOTE); select a phase as phases[NAME] or phases[0]. Syntax: "
+        "https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#run-time-overrides"
     ),
 )
 MCP_CATALOG = click.option(
@@ -353,7 +351,7 @@ def _error_boundary() -> None:
             )
         ):
             exc = click.UsageError(
-                f"{exc.message} Use --set workdir=PATH; relative paths resolve against the config file's directory.",
+                f"{exc.message} Use --set workdir=PATH.",
                 ctx=exc.ctx,
             )
         exc.show()
@@ -398,6 +396,16 @@ def _load_cli_config(path: Path) -> Experiment:
 
 _DEFAULT_TEMPLATE = "starter"
 _TEMPLATE_PURPOSE_PREFIX = "# phasesweep template: "
+
+
+def _refuse_init_overwrite(target: Path) -> NoReturn:
+    """Print that ``init`` will not replace ``target`` and exit with the usage status.
+
+    :param Path target: Destination that already exists, or appeared during publication.
+    :raises click.exceptions.Exit: Always, with code 2.
+    """
+    click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
+    raise click.exceptions.Exit(2)
 
 
 def _template_names() -> list[str]:
@@ -487,13 +495,11 @@ def init(template: str, list_templates: bool, output: str) -> None:
         expanded = expanded / f"{template}.yaml"
     target = expanded.absolute()
     if target.exists() or target.is_symlink():
-        click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
-        raise click.exceptions.Exit(2)
+        _refuse_init_overwrite(target)
     text = _template_text(template)
     try:
         if not atomic_create_text(target, text):
-            click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
-            raise click.exceptions.Exit(2)
+            _refuse_init_overwrite(target)
     except OSError as exc:
         # `phasesweep init` is the first command a new user runs; an unwritable
         # directory or a filesystem without hard links must report one line, not
@@ -602,10 +608,9 @@ def report_objective_cmd(
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Run configured phases. Use --from-phase to skip earlier phases; only the winners "
-        "inherited by the remaining phases are required. The console shows what will run, "
-        "each trial and winner as it finishes, warnings and a summary; run.log in the "
-        "experiment's directory holds the full timestamped log."
+        "Run configured phases. --from-phase skips earlier phases and needs only the "
+        "winners the remaining phases inherit. The full log is run.log in the experiment's "
+        "directory."
     ),
     short_help="Run configured phases.",
 )
@@ -690,11 +695,7 @@ def run(
             )
         except PhaseSweepShutdown as exc:
             if exc.published_result_committed:
-                click.echo(
-                    "phasesweep: shutdown was honored after the published result was committed; "
-                    "the result is available for inspection.",
-                    err=True,
-                )
+                click.echo("phasesweep: stopped after the result was published.", err=True)
             elif not dry_run:
                 click.echo(
                     _resume_hint(
@@ -845,10 +846,7 @@ def _resume_hint(config: Experiment, *, command: str, width: int) -> str:
         cleanup log above it is not the final word.
     """
     if config.persistent:
-        sentence = (
-            "phasesweep: stopped. Rerun the same command to resume: finished trials are kept "
-            "and interrupted ones rerun first."
-        )
+        sentence = "phasesweep: stopped. Rerun the same command to resume."
     else:
         sentence = (
             "phasesweep: stopped. Rerun the same command to start over: "
@@ -927,8 +925,8 @@ def validate(config_path: Path, settings: tuple[str, ...]) -> None:
     # pass it. The ledger is read only for some targets, so this cannot tell whether a study is
     # recorded and says it every time.
     sentence = (
-        "Checked the config alone. A dry run also compares it with the recorded study and the "
-        "environment of its recorded trials, and checks the trial program on the trainer's PATH:"
+        "Checked the config alone. A dry run also compares it with the recorded study and "
+        "its trials' environment, and checks the trial program on PATH:"
     )
     dry_run = command_line("run", *_config_arguments(config_path, settings), "--dry-run")
     click.echo("\n".join([*wrap(sentence, terminal_width(sys.stdout)), dry_run]))
@@ -970,13 +968,9 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Explain config keys from the packaged reference. Without KEY, list the top-level "
-        "keys; with a KEY such as 'phases[].sampler', print the section rules and shared-block "
-        "descriptions that govern it, then that key and every key below it. "
-        "The spellings 'phases[].sampler', phases.sampler and phases.0.sampler are equivalent; "
-        "quote a key that has brackets so the shell passes it whole. "
-        "The broad phases key prints the rules over the phase list and its immediate "
-        "children; narrow it for full details. With --notes, print the general notes on the "
-        "config file, paths, YAML typing and the study fingerprint instead."
+        "keys; with a KEY such as 'phases[].sampler' (quote brackets), print it and every "
+        "key below it with the rules that govern it. --notes prints the general notes on "
+        "the config file, paths, YAML typing and the study fingerprint."
     ),
     short_help="Explain config keys.",
 )
@@ -1326,9 +1320,8 @@ def _status_can_suggest_resume(config: Experiment) -> bool:
     is_flag=True,
     help=(
         "Print one table per phase instead of YAML: a column per swept parameter, rows sorted "
-        "by parameter value, the winner named in the first column, and a repeats phase's "
-        "groups below. The table is for reading; trials.csv in each phase's directory is the "
-        "machine-readable form."
+        "by value, the winner marked, repeat groups below. trials.csv in each phase's "
+        "directory is the machine-readable form."
     ),
 )
 def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> None:
@@ -1481,7 +1474,10 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
         raise PhaseSweepError(
             "MLflow delivery remains pending:" + refused_text(tally.refused),
             action=OperatorAction.FIX_CONFIG,
-            remediation=f"Once each such cause is fixed, {again}",
+            remediation=(
+                f"Fix {'each cause' if len(tally.refused) > 1 else 'the cause'} in MLflow, "
+                f"then {again}"
+            ),
         )
     creations = pending_creation_records(config, generation_id)
     open_windows = [
@@ -1495,10 +1491,9 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
         until = math.ceil(max(open_windows))
         left = math.ceil(until - time.time())
         raise PhaseSweepError(
-            f"MLflow delivery remains pending: MLflow has no run yet for "
-            f"{count_text(0, len(open_windows))}, and the request whose answer was lost may "
-            f"still create one until timeout_seconds ({config.mlflow.timeout_seconds:g} s) "
-            "after it was sent.",
+            f"MLflow delivery remains pending: no run yet for {count_text(0, len(open_windows))}, "
+            "which may still be created until timeout_seconds "
+            f"({config.mlflow.timeout_seconds:g} s) after the request was sent.",
             action=OperatorAction.RETRY,
             remediation=(
                 f"Wait until {time.strftime('%H:%M:%S', time.localtime(until))}, about {left} s "
@@ -1567,10 +1562,9 @@ def _catalog_error_text(exc: CatalogError) -> str:
     name="recover-run",
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Operator-only recovery for MCP cleanup uncertainty, interrupted publication, or "
-        "terminal-result finalization. If study storage is unavailable, restore the original "
-        "complete storage ledger and access to it before recovery. "
-        "--confirm performs the reported actions."
+        "Recover an MCP run after uncertain cleanup, an interrupted publication or an "
+        "unfinished result snapshot. Without --confirm it only reports the actions; "
+        "--confirm performs them."
     ),
     short_help="Recover MCP cleanup or result finalization.",
 )
@@ -1659,13 +1653,12 @@ def _tool_arguments(ctx: click.Context, param: click.Parameter, value: str) -> J
     name="call",
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Run one MCP tool against a catalog in this process and print its result (JSON, or the "
-        "text of get_guide), through the same dispatch, validation, redaction and audit as "
-        "`mcp serve`. "
+        "Call one MCP tool against a catalog in this process and print its result (JSON, or "
+        "get_guide's text) through the path `mcp serve` uses. "
         f"TOOL is one of {', '.join(TOOL_NAMES)}. "
-        "JSON_ARGS is a JSON object of tool arguments and defaults to {}. Exit code 0 prints the "
-        "result; 1 prints the tool's error on stderr; 2 means bad input or a catalog that cannot "
-        "be loaded as a whole. The call is real: launch_run starts a detached run."
+        "JSON_ARGS is a JSON object of tool arguments, default {}. Exit status: 0 result, "
+        "1 tool error on stderr, 2 bad input or an unloadable catalog. "
+        "The call is real: launch_run starts a detached run."
     ),
     short_help="Call one MCP tool from the shell.",
 )
@@ -1690,10 +1683,9 @@ def mcp_call(ctx: click.Context, tool: str, json_args: JsonObject, catalog: Path
     name="check",
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Validate an MCP catalog and its enabled trainer launch paths, and print a "
-        "per-experiment ok/FAIL report. The check provisions and probes the configured "
-        "state directory and checks for run records that block launches. Exit code 0 when every "
-        "entry loads and the state passes, 2 otherwise."
+        "Check an MCP catalog: print an ok/FAIL line per experiment, then provision and probe "
+        "the state directory and report run records that block launches. Exit status 0 when "
+        "all pass, 2 otherwise."
     ),
     short_help="Preflight an MCP catalog.",
 )
@@ -1748,13 +1740,11 @@ def _echo_catalog_report(report: CatalogCheckReport) -> None:
     name="init-catalog",
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Write an annotated MCP catalog for existing experiment configs: absolute "
-        "state_dir under PHASESWEEP_HOME/mcp/<catalog-digest> or "
-        "${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>, one read-only "
-        "entry per --from config (visible_params: none, no allow block). The staged "
-        "catalog is validated with the server startup path before it is published. "
-        "Existing files are never overwritten; edit the result, then re-check it with "
-        "`phasesweep mcp check`."
+        "Write an annotated MCP catalog with one read-only entry per --from config "
+        "(visible_params: none, no allow block) and an absolute state_dir under "
+        "PHASESWEEP_HOME/mcp/<catalog-digest> or "
+        "${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>. Existing files "
+        "are never overwritten. Edit it, then run `phasesweep mcp check`."
     ),
     short_help="Scaffold an MCP catalog.",
 )
@@ -1793,6 +1783,20 @@ def init_catalog(ctx: click.Context, from_configs: tuple[Path, ...], output: Pat
     )
 
 
+def _refuse_catalog_overwrite(output: Path) -> bool:
+    """Print that ``init-catalog`` will not replace ``output``.
+
+    :param Path output: Catalog destination that exists, or appeared during publication.
+    :return bool: Always False, the scaffold writer's "not written" result.
+    """
+    click.echo(
+        f"phasesweep mcp init-catalog: {output} already exists; refusing to overwrite. "
+        "Pass -o to choose another name.",
+        err=True,
+    )
+    return False
+
+
 def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> bool:
     """Stage, validate, and exclusively publish a scaffolded catalog.
 
@@ -1801,12 +1805,7 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
     :return bool: True when the catalog was written; False after printing why not.
     """
     if output.is_symlink() or output.exists():
-        click.echo(
-            f"phasesweep mcp init-catalog: {output} already exists; refusing to overwrite. "
-            "Pass -o to choose another name.",
-            err=True,
-        )
-        return False
+        return _refuse_catalog_overwrite(output)
 
     try:
         text = scaffold_catalog_text(output, from_configs)
@@ -1817,12 +1816,7 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
             private_atomic_write_text(registry.state_dir / "origin", str(output.resolve()) + "\n")
 
         if not atomic_create_text(output, text, validate=validate_scaffold):
-            click.echo(
-                f"phasesweep mcp init-catalog: {output} already exists; refusing to "
-                "overwrite. Pass -o to choose another name.",
-                err=True,
-            )
-            return False
+            return _refuse_catalog_overwrite(output)
     except CatalogError as exc:
         click.echo(f"phasesweep mcp init-catalog: {_catalog_error_text(exc)}", err=True)
         return False
