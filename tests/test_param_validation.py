@@ -252,7 +252,8 @@ def test_validate_rejects_invalid_grid_configs() -> None:
             "over_budget",
             {"x": {"type": "categorical", "choices": [1, 2]}},
             3,
-            "n_trials=3 exceeds the grid cardinality 2",
+            r"n_trials=3 exceeds the grid cardinality 2\. Set phases\[p\]\.n_trials to at most 2\. "
+            "To enlarge the grid instead, change the search space.",
         ),
     ]
 

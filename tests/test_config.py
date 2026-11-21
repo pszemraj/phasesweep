@@ -1333,7 +1333,9 @@ def test_repeats_values_follow_categorical_choice_rules(values: JsonValue, match
         ),
         pytest.param(
             {"sampler": {"type": "grid"}, "n_trials": 9},
-            r"n_trials=9 exceeds the grid cardinality 6 \(2 configurations x 3 repeats\)",
+            r"n_trials=9 exceeds the grid cardinality 6 \(2 configurations x 3 repeats\)\. "
+            r"Set phases\[[^\]]+\]\.n_trials to at most 6\. To enlarge the grid instead, "
+            r"change the search space\.",
             id="grid-over",
         ),
         pytest.param(

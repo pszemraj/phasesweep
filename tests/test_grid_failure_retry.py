@@ -784,7 +784,9 @@ def test_validate_refuses_an_oversized_fresh_persistent_grid(
     remedy = next(
         line.removeprefix("fix: ") for line in error.splitlines() if line.startswith("fix: ")
     )
+    assert diagnosis == "Phase 'p': n_trials=3 exceeds the grid cardinality 2."
     assert diagnosis not in remedy
+    assert "available attempts" not in error
     assert "correct the experiment configuration" not in error
     assert "new `experiment` name" not in error
     assert "old study" not in error

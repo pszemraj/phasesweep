@@ -517,6 +517,19 @@ def grid_cardinality(phase: Phase) -> int:
     )
 
 
+def _repeat_note(phase: Phase, cardinality: int) -> str:
+    """Break a repeats grid's cell count into configurations and repeats.
+
+    :param Phase phase: Grid phase whose cells are counted.
+    :param int cardinality: The grid's cell count, repeat axis included.
+    :return str: ``" (2 configurations x 3 repeats)"``, or an empty string without repeats.
+    """
+    if phase.repeats is None:
+        return ""
+    repeats = len(phase.repeats.values)
+    return f" ({cardinality // repeats} configurations x {repeats} repeats)"
+
+
 def grid_target_refusal(
     phase: Phase, *, finished: int, measured: int, has_study: bool, dependents: Sequence[str]
 ) -> tuple[str, str] | None:
@@ -524,7 +537,8 @@ def grid_target_refusal(
 
     Finished failures remain spent. Raising the target may retry each failed
     cell once, or visit an unvisited cell; a completed cell is closed even if
-    its metric was infeasible.
+    its metric was infeasible. With nothing finished there are no failures to count or retry,
+    so the diagnosis says only that the target exceeds the grid's cells.
 
     :param Phase phase: Phase whose target is checked.
     :param int finished: Finished attempts, excluding interruptions.
@@ -539,6 +553,7 @@ def grid_target_refusal(
     if phase.sampler.type != "grid" or maximum is None or phase.n_trials <= maximum:
         return None
     cardinality = grid_cardinality(phase)
+    repeat_note = _repeat_note(phase, cardinality)
     # A recorded study refuses a changed search space, and a new phase name is the step that
     # loses the least work: it starts a new study for this phase and the phases that inherit it.
     enlarge = (
@@ -551,12 +566,18 @@ def grid_target_refusal(
         f"Set phases[{phase.name}].n_trials to at most {maximum}. "
         f"To enlarge the grid instead, {enlarge}."
     )
+    if finished == 0:
+        return (
+            f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid cardinality "
+            f"{cardinality}{repeat_note}.",
+            remedy,
+        )
     return (
         f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid's available "
         f"attempts: {plural(finished, 'finished attempt')} and "
         f"{plural(measured, 'COMPLETE or INFEASIBLE cell')} "
-        f"in a {cardinality}-cell grid allow at most {maximum}. Raising n_trials retries "
-        "failed cells once each; COMPLETE and INFEASIBLE cells are never repeated.",
+        f"in a {cardinality}-cell grid{repeat_note} allow at most {maximum}. Raising n_trials "
+        "retries failed cells once each; COMPLETE and INFEASIBLE cells are never repeated.",
         remedy,
     )
 
@@ -612,17 +633,13 @@ def _validate_sampler_search_space(phase: Phase, *, persistent: bool = False) ->
 
     if sampler_type == "grid" and phase_draws(phase):
         cardinality = grid_cardinality(phase)
-        repeat_note = (
-            ""
-            if phase.repeats is None
-            else f" ({cardinality // len(phase.repeats.values)} configurations x "
-            f"{len(phase.repeats.values)} repeats)"
-        )
-        if phase.n_trials > cardinality and not persistent:
-            raise ValueError(
-                f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid "
-                f"cardinality {cardinality}{repeat_note}."
+        repeat_note = _repeat_note(phase, cardinality)
+        if not persistent:
+            refusal = grid_target_refusal(
+                phase, finished=0, measured=0, has_study=False, dependents=()
             )
+            if refusal is not None:
+                raise ValueError(" ".join(refusal))
         if not phase.allow_partial_grid and phase.n_trials < cardinality:
             remedy = (
                 "increase n_trials or set allow_partial_grid: true."
