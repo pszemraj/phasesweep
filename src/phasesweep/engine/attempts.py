@@ -1183,6 +1183,7 @@ def _recover_completed_trial(
         COMPLETE or as a failure, False without proof the trainer finished, or None when
         shutdown or an unreadable tracker leaves extraction pending.
     :raises WinnerIntegrityError: The producing configuration snapshot is unavailable or invalid.
+    :raises TrialEvidenceMissingError: Evidence for a recorded measurement is missing or has changed.
     :raises StudySchemaMismatchError: The study's recorded outcomes cannot be replayed to
         decide the verdict's abort; the trial remains RUNNING.
     :raises StudyStorageUnavailableError: The extracted evidence or its outcome could not be
@@ -1190,6 +1191,7 @@ def _recover_completed_trial(
     :raises TrackingTargetUnavailableError: The tracker gave no answer and no report
         collects the pending attempt for a refusal after the pass.
     """
+    from phasesweep.engine.evidence import _recorded_trial_metric
     from phasesweep.engine.trial import (
         ExecutedTrial,
         _environment_identity,
@@ -1203,6 +1205,14 @@ def _recover_completed_trial(
 
     lifecycle = read_attempt_lifecycle(record.trial_dir, expected_attempt_id=record.attempt_id)
     outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+    if outcome is not None:
+        try:
+            sequences = _outcome_sequence_counts(study.get_trials(deepcopy=False))
+        except Exception as exc:
+            raise StudyStorageUnavailableError(
+                f"Cannot verify the recorded outcome sequence for trial {trial.number} in study {study.study_name!r}."
+            ) from exc
+        outcome = _unduplicated_outcome(trial, sequences)
     measured_infeasible = _recorded_infeasible_result(trial, outcome)
     trainer_duration = None if lifecycle is None else _completed_trainer_duration(trial, lifecycle)
     if (
@@ -1219,7 +1229,7 @@ def _recover_completed_trial(
             record.attempt_id, record.phase_name, trial.number, persistent=True
         )
         return None
-    if report is not None and report.unreadable_tracker is not None:
+    if outcome is None and report is not None and report.unreadable_tracker is not None:
         # This pass already found a tracker unreadable; keep the training without
         # spending another read's timeout on it.
         report.unreadable_evidence.setdefault(record.attempt_id, report.unreadable_tracker)
@@ -1260,6 +1270,12 @@ def _recover_completed_trial(
         wandb_environment=environment,
         mlflow_environment=environment,
     )
+    if outcome is not None:
+        # A measured outcome commits after all evidence attributes and before Optuna's tell.
+        # Only the terminal transition is outstanding, even if a peer has since completed.
+        metric = _recorded_trial_metric(experiment, phase, trial, ctx)
+        _tell_recovered_trial(study, trial, record, metric, report)
+        return True
     active_trial = optuna.Trial(study, trial._trial_id)
     try:
         active_trial.set_user_attr(DURATION_ATTR, trainer_duration)
@@ -1318,34 +1334,59 @@ def _recover_completed_trial(
             _record_stale_trial_outcome(
                 study, trial, completed_feasible=result.feasible, policy_phase=phase
             )
-        _record_cleanup_recovery(study, trial)
-        if result.metric is None or result.failure_reason is not None:
-            study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
-        else:
-            study.tell(trial.number, result.metric)
     except StudySchemaMismatchError:
         raise
     except Exception as exc:
         raise StudyStorageUnavailableError(
             f"Completed attempt {record.attempt_id} could not be committed; its retained evidence permits recovery on retry."
         ) from exc
+    _tell_recovered_trial(study, trial, record, result.metric, report)
     if result.failure_reason is not None:
         log.warning(
             "Completed orphan attempt %s failed: its evidence could not be accepted: %s",
             record.attempt_id,
             result.failure_reason,
         )
-        return True
+    return True
+
+
+def _tell_recovered_trial(
+    study: optuna.Study,
+    trial: optuna.trial.FrozenTrial,
+    record: _AttemptRecord,
+    metric: float | None,
+    report: _PreflightCleanupReport | None,
+) -> None:
+    """Finish the Optuna transition for a trial whose outcome is already durable.
+
+    :param optuna.Study study: Owning study.
+    :param optuna.trial.FrozenTrial trial: Trial to settle.
+    :param _AttemptRecord record: Attempt that produced the measurement.
+    :param float | None metric: Accepted objective, or None for a failed extraction.
+    :param _PreflightCleanupReport | None report: Collector for newly retained measurements.
+    :raises StudyStorageUnavailableError: The cleanup record or terminal transition failed.
+    """
+    _record_cleanup_recovery(study, trial)
+    try:
+        if metric is None:
+            study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+        else:
+            study.tell(trial.number, metric)
+    except Exception as exc:
+        raise StudyStorageUnavailableError(
+            f"Completed attempt {record.attempt_id} could not be committed; its retained evidence permits recovery on retry."
+        ) from exc
+    if metric is None:
+        return
     if report is not None:
         report.retained_results += 1
     log.warning(
         "Kept completed trial result: phase=%r trial=%d value=%g (attempt=%s).",
         record.phase_name,
         trial.number,
-        result.metric,
+        metric,
         record.attempt_id,
     )
-    return True
 
 
 def _fail_stale_running_trial(

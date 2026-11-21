@@ -36,8 +36,11 @@ from phasesweep.errors import (
 )
 from phasesweep.evidence.evaluation import (
     EVIDENCE_PROVENANCE_SCHEMA_VERSION,
+    ExtractorError,
+    TrialContext,
     extractor_config_fingerprint,
     json_float,
+    run_extractor,
 )
 from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
 from phasesweep.evidence.models import (
@@ -591,6 +594,55 @@ def _verify_trial_evidence_dir(
         raise TrialEvidenceMissingError(
             f"{subject} JSON evidence disagrees with its configured path/key."
         )
+
+
+def _recorded_trial_metric(
+    experiment: Experiment, phase: Phase, trial: optuna.trial.FrozenTrial, ctx: TrialContext
+) -> float:
+    """Recover the scalar Optuna still needs after the trial's measured outcome committed.
+
+    :param Experiment experiment: Producing configuration.
+    :param Phase phase: Phase that measured the trial.
+    :param optuna.trial.FrozenTrial trial: Trial holding the accepted evidence and constraints.
+    :param TrialContext ctx: Original attempt and directory.
+    :raises TrialEvidenceMissingError: The recorded measurement cannot be verified.
+    :return float: The objective from the original file bytes or frozen tracker capture.
+    """
+    provenance = _trial_objective_provenance(trial)
+    source = provenance["source"]
+    subject = f"Phase {phase.name!r} trial {trial.number} has a recorded outcome but"
+    if provenance["extractor"]["kind"] != experiment.metric.extractor.type:
+        raise TrialEvidenceMissingError(f"{subject} its recorded extractor differs.")
+    if source["kind"] == "wandb":
+        value = float(provenance["remote_capture"]["values"][source["metric_key"]])
+    elif source["kind"] == "mlflow":
+        value = float(provenance["remote_capture"]["observations"][source["selection"]]["value"])
+    else:
+        read: dict[str, object] = {}
+        try:
+            value = run_extractor(ctx, experiment.metric.extractor, provenance=read)
+        except ExtractorError as exc:
+            raise TrialEvidenceMissingError(
+                f"{subject} its objective cannot be read: {exc}"
+            ) from exc
+        if read["source"] != source:
+            raise TrialEvidenceMissingError(
+                f"{subject} its objective file differs from the recorded evidence."
+            )
+    _verify_trial_evidence_dir(
+        ctx.trial_dir,
+        subject=subject,
+        attempt_id=ctx.attempt_id,
+        provenance=provenance,
+        trainer_input=trial.user_attrs.get(TRAINER_INPUT_ATTR),
+        verify_objective_digest=False,  # The extractor digested the bytes it read above.
+        verification=_EvidenceVerification(experiment, phase),
+        metric_value=value,
+        constraints={
+            c.name: trial.user_attrs.get(constraint_attr(c.name)) for c in experiment.constraints
+        },
+    )
+    return value
 
 
 def _validate_selection_evidence(

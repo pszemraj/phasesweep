@@ -35,6 +35,7 @@ from phasesweep.engine.attempts import (
 from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
     TrackingTargetUnavailableError,
+    TrialEvidenceMissingError,
 )
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.guards import _reconcile_existing_studies
@@ -1181,7 +1182,26 @@ else:
                         _reconcile_existing_studies(
                             experiment, cleanup_report=_PreflightCleanupReport()
                         )
-                assert phase_trials(experiment)[0].state.name == "RUNNING"
+                pending = phase_trials(experiment)[0]
+                assert pending.state.name == "RUNNING"
+                if recovery_stage == "finished":
+                    objective = directory / "stdout.log"
+                    original = objective.read_bytes()
+                    objective.unlink()
+                    with pytest.raises(
+                        TrialEvidenceMissingError, match="its objective cannot be read"
+                    ):
+                        run_experiment(experiment)
+                    objective.write_bytes(original.replace(b"x=1.0", b"x=0.1"))
+                    with pytest.raises(
+                        TrialEvidenceMissingError, match="differs from the recorded evidence"
+                    ):
+                        run_experiment(experiment)
+                    unchanged = phase_trials(experiment)[0]
+                    assert unchanged.state.name == "RUNNING"
+                    assert unchanged.user_attrs == pending.user_attrs
+                    assert not _last_successful_generation_path(experiment).exists()
+                    objective.write_bytes(original)
                 if not feasible:
                     interrupted_study = phase_study(experiment)
                     pending = interrupted_study.get_trials()[0]
