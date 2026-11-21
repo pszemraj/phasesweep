@@ -832,11 +832,17 @@ def validate(config_path: Path, settings: tuple[str, ...]) -> None:
         GpuPool.for_phase(phase, cuda_visible_devices=config.env.get("CUDA_VISIBLE_DEVICES"))
     click.echo(f"OK: {config.experiment} ({plural(len(config.phases), 'phase')})")
     _render_experiment_phases(config)
-    # Validation never compares the config with a study's recorded identity, so an edit that a
-    # recorded study refuses passes it. The ledger is read only for some targets, so this
-    # cannot tell whether a study is recorded and says it every time.
+    # Validation never compares the config with a study's recorded identity or the environment
+    # of its recorded trials, and it leaves a trial program found through PATH to the launch's
+    # PATH, so an edit that a recorded study refuses and a program that is not installed both
+    # pass it. The ledger is read only for some targets, so this cannot tell whether a study is
+    # recorded and says it every time.
+    sentence = (
+        "Checked the config alone. A dry run also compares it with the recorded study and the "
+        "environment of its recorded trials, and checks the trial program on the trainer's PATH:"
+    )
     dry_run = f"{_rerun_command(config_path, settings, None)} --dry-run"
-    click.echo(f"Checked the config alone; {dry_run} also compares it with a recorded study.")
+    click.echo("\n".join([*wrap(sentence, terminal_width(sys.stdout)), dry_run]))
 
 
 def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> None:

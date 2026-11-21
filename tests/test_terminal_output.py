@@ -214,26 +214,44 @@ def test_a_run_with_nothing_to_run_still_names_the_command_that_reads_the_result
     assert after[after.index("") + 2].startswith("log: ")
 
 
-def test_validate_says_it_checked_the_config_alone_and_names_the_dry_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+_VALIDATE_CLOSING_AT_80 = [
+    "Checked the config alone. A dry run also compares it with the recorded study and",
+    "the environment of its recorded trials, and checks the trial program on the",
+    "trainer's PATH:",
+]
+_VALIDATE_CLOSING_AT_60 = [
+    "Checked the config alone. A dry run also compares it with",
+    "the recorded study and the environment of its recorded",
+    "trials, and checks the trial program on the trainer's PATH:",
+]
+
+
+@pytest.mark.parametrize(
+    ("columns", "sentence"), [(80, _VALIDATE_CLOSING_AT_80), (60, _VALIDATE_CLOSING_AT_60)]
+)
+def test_validate_says_what_it_left_to_the_dry_run_and_gives_its_command_whole(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    columns: int,
+    sentence: list[str],
 ) -> None:
-    """A passing validation ends by naming the command that also compares with a recorded study."""
+    """A passing validation ends with one sentence naming the checks only a dry run makes, then the command, flush left and unbroken."""
     config = tmp_path / "my sweep.yaml"
     assert invoke_cli_boundary(["init", "-o", str(config)], monkeypatch) == 0
     capsys.readouterr()
 
-    assert (
-        invoke_cli_boundary(
+    with terminal_stream("stdout", columns) as stdout:
+        status = invoke_cli_boundary(
             ["validate", str(config), "--set", "phases[depth].gpu_policy=none"], monkeypatch
         )
-        == 0
-    )
 
-    lines = capsys.readouterr().out.splitlines()
+    assert status == 0
+    lines = stdout.text.splitlines()
     assert lines[0] == "OK: phasesweep_starter (2 phases)"
-    assert lines[-1] == (
-        "Checked the config alone; phasesweep run "
-        f"'{config}' --set 'phases[depth].gpu_policy=none' --dry-run "
-        "also compares it with a recorded study."
-    )
+    assert lines[-4:] == [
+        *sentence,
+        f"phasesweep run '{config}' --set 'phases[depth].gpu_policy=none' --dry-run",
+    ]
+    assert all(len(line) <= columns for line in sentence)
     assert sum(line.startswith("Checked the config alone") for line in lines) == 1
