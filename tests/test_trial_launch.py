@@ -699,6 +699,47 @@ def test_nonzero_exit_reason_quotes_the_last_stderr_line(
 
 
 @pytest.mark.parametrize(
+    ("code", "reason"),
+    [
+        (
+            -signal.SIGKILL,
+            "killed by signal 9 (SIGKILL), which the kernel's out-of-memory killer sends",
+        ),
+        (-signal.SIGSEGV, "killed by signal 11 (SIGSEGV)"),
+        (-signal.SIGTERM, "killed by signal 15 (SIGTERM)"),
+        (-200, "killed by signal 200"),
+    ],
+)
+def test_trainer_killed_by_a_signal_is_reported_as_that_without_an_environment_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    code: int,
+    reason: str,
+) -> None:
+    """A negative return code names its signal, SIGKILL names the OOM killer, and no inherit_env hint follows."""
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        result = _exit_code_result(tmp_path, make_experiment(), "p", code)
+
+    assert result.failure_reason == reason
+    assert _environment_hints(caplog) == []
+
+
+def test_trainer_killed_by_a_signal_keeps_its_stderr_line(tmp_path: Path) -> None:
+    """The stderr line is appended to a signal death exactly as it is to a nonzero exit."""
+    result = _exit_code_result(
+        tmp_path, make_experiment(), "p", -signal.SIGKILL, stderr=b"loading shards\n"
+    )
+
+    assert result.failure_reason == (
+        "killed by signal 9 (SIGKILL), which the kernel's out-of-memory killer sends"
+        "; stderr: loading shards"
+    )
+
+
+@pytest.mark.parametrize(
     "line",
     [
         "ModuleNotFoundError: No module named 'x'",

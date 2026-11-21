@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import re
+import signal
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -401,6 +402,26 @@ def _stderr_last_line(trial_dir: Path) -> str | None:
             return line[: _STDERR_QUOTE_CHARS - 3].rstrip() + "..."
         return line
     return None
+
+
+def _nonzero_exit_reason(return_code: int) -> str:
+    """Name how a trainer ended abnormally, reading a negative code as a signal death.
+
+    :param int return_code: Nonzero trainer return code; a negative value is ``-N`` for
+        a trainer killed by signal ``N``.
+    :return str: The failure reason without any stderr quote.
+    """
+    if return_code > 0:
+        return f"non-zero exit code {return_code}"
+    signum = -return_code
+    try:
+        name = signal.Signals(signum).name
+    except ValueError:
+        return f"killed by signal {signum}"
+    reason = f"killed by signal {signum} ({name})"
+    if signum == signal.SIGKILL:
+        reason += ", which the kernel's out-of-memory killer sends"
+    return reason
 
 
 def _warn_narrowed_environment_exit(
@@ -811,16 +832,19 @@ def extract_trial_result(
 
     if rc != 0 and failure_reason is None:
         stderr_line = _stderr_last_line(executed.ctx.trial_dir)
-        failure_reason = f"non-zero exit code {rc}"
+        failure_reason = _nonzero_exit_reason(rc)
         if stderr_line is not None:
             failure_reason += f"; stderr: {stderr_line}"
-        _warn_narrowed_environment_exit(
-            experiment=experiment,
-            phase_name=executed.ctx.phase,
-            trial_id=executed.ctx.trial_id,
-            return_code=rc,
-            stderr_line=stderr_line,
-        )
+        # A signal death is not a missing-environment failure: the trainer never chose
+        # to exit, so the inheritance hint would send the operator the wrong way.
+        if rc > 0:
+            _warn_narrowed_environment_exit(
+                experiment=experiment,
+                phase_name=executed.ctx.phase,
+                trial_id=executed.ctx.trial_id,
+                return_code=rc,
+                stderr_line=stderr_line,
+            )
 
     if failure_reason is not None:
         return _failed_trial(
