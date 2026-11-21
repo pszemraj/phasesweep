@@ -52,6 +52,8 @@ from phasesweep.engine.state import (
     GENERATION_SUMMARY_SCHEMA_VERSION,
     PhaseCounts,
     Winner,
+    _recorded_trial_dir,
+    _stands_under_winner,
 )
 from phasesweep.engine.study_policy import _launch_preflight
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
@@ -648,16 +650,19 @@ def _mirror_publication(
 
 
 def _phase_counts(
-    ledger: ledger_ops.ValidatedLedger, phase: Phase, generation_id: str
+    ledger: ledger_ops.ValidatedLedger, phase: Phase, generation_id: str, winner: Winner
 ) -> PhaseCounts | None:
     """Count a finished phase's trials by recorded state, and those an earlier run recorded.
 
-    Reporting never fails a run whose result is already decided, so a ledger that cannot be
-    read back here costs the summary its counts for the phase and nothing else.
+    The counts also carry the attempt directory of each trial the phase's winner stands on, so
+    the summary names them from the same read. Reporting never fails a run whose result is
+    already decided, so a ledger that cannot be read back here costs the summary its counts for
+    the phase and nothing else.
 
     :param ledger_ops.ValidatedLedger ledger: The run's ledger, memory-backed or journal-backed.
     :param Phase phase: The phase that just ended.
     :param str generation_id: This run's generation, which its own trials carry.
+    :param Winner winner: The phase's winner, whose trials' directories the counts carry.
     :return PhaseCounts | None: The counts, or ``None`` when the phase's trials cannot be read.
     """
     try:
@@ -667,6 +672,16 @@ def _phase_counts(
         return None
     trials = [] if read is None else read.trials
     states = Counter(_trial_count_state(trial) for trial in trials)
+    standing = (
+        {member["trial_number"]: member["attempt_id"] for member in winner.repeats["members"]}
+        if winner.repeats is not None
+        else {winner.trial_number: winner.attempt_id}
+    )
+    standing_dirs = (
+        _recorded_trial_dir(trial)
+        for trial in sorted(trials, key=lambda trial: trial.number)
+        if _stands_under_winner(trial, standing)
+    )
     return PhaseCounts(
         complete=states["COMPLETE"],
         infeasible=states["INFEASIBLE"],
@@ -675,6 +690,7 @@ def _phase_counts(
         earlier=sum(
             1 for trial in trials if trial.user_attrs.get(GENERATION_ID_ATTR) != generation_id
         ),
+        winner_dirs=tuple(directory for directory in standing_dirs if directory is not None),
     )
 
 
@@ -789,7 +805,7 @@ def _run_experiment_inner(
                 ledger=ledger,
                 run_deadline=run_deadline,
             )
-            counts = _phase_counts(ledger, phase, generation.generation_id)
+            counts = _phase_counts(ledger, phase, generation.generation_id, winner)
             if counts is not None:
                 generation.phase_counts[phase.name] = counts
         if generation is not None:

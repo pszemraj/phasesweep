@@ -166,6 +166,8 @@ class PhaseCounts:
     """A phase's trials by recorded state when the phase ended, as the run's summary reports them.
 
     ``earlier`` counts the trials, in any of those states, that a previous run recorded.
+    ``winner_dirs`` holds the attempt directory of each trial the phase's winner stands on, in
+    trial order, leaving out one that recorded none; it is read for the summary and never saved.
     """
 
     complete: int = 0
@@ -173,6 +175,7 @@ class PhaseCounts:
     failed: int = 0
     interrupted: int = 0
     earlier: int = 0
+    winner_dirs: tuple[Path, ...] = ()
 
     @property
     def total(self) -> int:
@@ -545,6 +548,30 @@ def _trial_interrupted(trial: FrozenTrial) -> bool:
         return False
     parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
     return parsed is not None and parsed.outcome == "interrupted"
+
+
+def _stands_under_winner(trial: FrozenTrial, standing: Mapping[int, str | None]) -> bool:
+    """Say whether a trial is one a phase winner stands on, the attempt included.
+
+    :param FrozenTrial trial: Trial to test.
+    :param Mapping[int, str | None] standing: The winner's trials by number, each with the
+        attempt id the trial must carry, ``None`` where only the number is known.
+    :return bool: ``True`` when the number is listed and any attempt id recorded for it matches.
+    """
+    if trial.number not in standing:
+        return False
+    attempt = standing[trial.number]
+    return attempt is None or trial.user_attrs.get(ATTEMPT_ID_ATTR) == attempt
+
+
+def _recorded_trial_dir(trial: FrozenTrial) -> Path | None:
+    """Return the attempt directory a trial recorded when it launched.
+
+    :param FrozenTrial trial: Trial to read.
+    :return Path | None: The directory, or ``None`` when none was recorded.
+    """
+    directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
+    return Path(directory) if isinstance(directory, str) and directory else None
 
 
 GENERATION_SUMMARY_SCHEMA_VERSION = 6

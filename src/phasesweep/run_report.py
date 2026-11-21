@@ -26,6 +26,7 @@ from phasesweep.runtime.terminal import (
     ReportBlock,
     Style,
     break_path,
+    display_path,
     pack,
     paint,
     param_text,
@@ -656,6 +657,8 @@ class SummaryPhase:
     name: str
     counts: tuple[str, ...]
     winner: tuple[str, ...]
+    #: Directory of each trial the winner stands on, as the console shows it.
+    winner_dirs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -689,6 +692,11 @@ class Summary:
                 drawn[0] = lead + drawn[0].removeprefix(" " * len(lead))
                 lines.append(_paint_word(drawn[0], "winner", "winner", start=len(pad), color=color))
                 lines.extend(drawn[1:])
+                for directory in phase.winner_dirs:
+                    lines.extend(
+                        pad + paint(line.removeprefix(pad), "path", color=color)
+                        for line in break_path(directory, width, indent=pad)
+                    )
         if self.written:
             lines.append("")
             lines.extend(self._written_lines(width, color=color))
@@ -838,10 +846,13 @@ def summary(
         else:
             clauses = ("trial counts unavailable",)
         facts: tuple[str, ...] = ()
+        directories: tuple[str, ...] = ()
         if winner is not None:
             head, tail = winner_facts(winner, experiment.metric.name)
             facts = (*head, *tail)
-        phases.append(SummaryPhase(phase.name, clauses, facts))
+            if phase.name in counts:
+                directories = tuple(display_path(path) for path in counts[phase.name].winner_dirs)
+        phases.append(SummaryPhase(phase.name, clauses, facts, directories))
     trials = sum(item.total for item in counts.values())
     earlier = sum(item.earlier for item in counts.values())
     headline = (

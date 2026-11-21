@@ -481,6 +481,7 @@ def test_trial_tables_label_repeat_groups_and_star_every_winning_member(
         "value",
         "params",
         "duration_s",
+        "trial_dir",
         "repeat_group",
         "winner",
     )

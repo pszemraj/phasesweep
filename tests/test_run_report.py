@@ -20,12 +20,14 @@ from phasesweep.cli import _console_logging, _rerun_command, _resume_hint
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Sampler
 from phasesweep.engine.paths import _run_log_path
+from phasesweep.engine.repeats import RepeatsRecord, spread
 from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import PhaseCounts, Winner
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence.models import WandbExtractor
 from phasesweep.run_report import (
     LogLine,
+    Summary,
     banner,
     nothing_to_run,
     phase_start,
@@ -627,7 +629,7 @@ def _console_text(err: str, tmp_path: Path, name: str) -> str:
     """Normalize what differs between two runs of the same sweep: times, durations, ids, paths."""
     text = re.sub(r"(?m)^\d\d:\d\d:\d\d", "HH:MM:SS", err.replace(str(tmp_path), "TMP"))
     text = re.sub(r"\d+\.\ds", "Ns", text)
-    return re.sub(r"\b[0-9a-f]{32}\b", "GENERATION", text).replace(name, "NAME")
+    return re.sub(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])", "ID", text).replace(name, "NAME")
 
 
 def test_verbose_leaves_the_console_unchanged_and_deepens_run_log(
@@ -650,6 +652,10 @@ def test_verbose_leaves_the_console_unchanged_and_deepens_run_log(
         logs[name] = (tmp_path / name / "runs" / "t" / "run.log").read_text(encoding="utf-8")
     assert transcripts["plain"] == transcripts["verbose"]
     assert "trial 1  COMPLETE" in transcripts["plain"]
+    # The summary names the winning trial's directory, relative to the working directory or whole.
+    assert re.search(
+        r"(?m)^ +\S*/NAME/runs/t/p/trial_00000__generation_ID__attempt_ID$", transcripts["plain"]
+    )
     assert not re.search(r"^\S+ \S+ D ", logs["plain"], re.MULTILINE)
     assert re.search(r"^\S+ \S+ D phasesweep\.", logs["verbose"], re.MULTILINE)
 
@@ -957,6 +963,148 @@ def test_summary_omits_the_written_section_when_nothing_was_written() -> None:
         next_command="phasesweep status starter.yaml --trials",
     )
     assert "Written under" not in "\n".join(block.render(80, color=False))
+
+
+SHORT_TRIAL_DIR = Path("/data/runs/depth/trial_00001")
+ATTEMPT_TRIAL_DIR = Path(
+    "/data/sweeps/phasesweep_starter/runs/phasesweep_starter/depth/trial_00001"
+    "__generation_6413d5c1edd5475998cfadd4d3b59980__attempt_0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+)
+ATTEMPT_NAME = ATTEMPT_TRIAL_DIR.name
+
+
+def _summary_with_dirs(
+    winner_dirs: tuple[Path, ...], *, winners: dict[str, Winner] | None = None
+) -> Summary:
+    """Build the starter's summary whose ``depth`` winner stands on trials in ``winner_dirs``."""
+    return summary(
+        _grid_experiment(),
+        elapsed=3.05,
+        counts={
+            "depth": PhaseCounts(complete=2, winner_dirs=winner_dirs),
+            "learning_rate": PhaseCounts(complete=2),
+        },
+        winners=STARTER_WINNERS if winners is None else winners,
+        from_phase=None,
+        written_root="runs/x",
+        written=[],
+        next_command="phasesweep status c.yaml --trials",
+    )
+
+
+@pytest.mark.parametrize(
+    ("width", "directory", "expected"),
+    [
+        pytest.param(
+            80,
+            SHORT_TRIAL_DIR,
+            ["                 /data/runs/depth/trial_00001"],
+            id="short-80",
+        ),
+        pytest.param(
+            60,
+            SHORT_TRIAL_DIR,
+            [
+                "                 winner  trial 0  eval_loss 0.3",
+                "                         model.n_layers=8",
+                "                 /data/runs/depth/trial_00001",
+            ],
+            id="short-60",
+        ),
+        pytest.param(
+            80,
+            ATTEMPT_TRIAL_DIR,
+            [
+                "                 /data/sweeps/phasesweep_starter/runs/phasesweep_starter/depth/",
+                f"                 {ATTEMPT_NAME}",
+            ],
+            id="long-80",
+        ),
+        pytest.param(
+            60,
+            ATTEMPT_TRIAL_DIR,
+            [
+                "                 winner  trial 0  eval_loss 0.3",
+                "                         model.n_layers=8",
+                "                 /data/sweeps/phasesweep_starter/runs/",
+                "                 phasesweep_starter/depth/",
+                f"                 {ATTEMPT_NAME}",
+            ],
+            id="long-60",
+        ),
+    ],
+)
+def test_summary_names_the_winners_directory_under_its_winner_line(
+    width: int, directory: Path, expected: list[str]
+) -> None:
+    """The directory sits under the winner line, broken at slashes, its last component whole."""
+    lines = _summary_with_dirs((directory,)).render(width, color=False)
+
+    start = lines.index("  depth          2 complete")
+    block = lines[start + 1 : lines.index("  learning_rate  2 complete")]
+    assert block[-len(expected) :] == expected
+    assert block[0].startswith("                 winner  trial 0")
+    assert all(len(line) <= width for line in block if ATTEMPT_NAME not in line)
+
+
+def test_summary_names_every_winning_trials_directory_of_a_repeats_phase() -> None:
+    """A repeats winner stands on each member, so each member's directory gets a line."""
+    repeats: RepeatsRecord = {
+        "key": "seed",
+        "reduce": "mean",
+        "spread": spread([0.2, 0.4]),
+        "members": [
+            {
+                "trial_number": number,
+                "repeat": number - 4,
+                "metric": metric,
+                "generation_id": "g",
+                "attempt_id": f"attempt-{number}",
+                "objective_provenance": {},
+                "trainer_input": {},
+                "constraints": {},
+                "observed": {},
+            }
+            for number, metric in ((4, 0.2), (5, 0.4))
+        ],
+    }
+    repeated = Winner(
+        trial_number=5,
+        params={"model.n_layers": 8},
+        effective_overrides={},
+        metric=0.3,
+        repeats=repeats,
+    )
+    lines = _summary_with_dirs(
+        (Path("/data/runs/depth/trial_00004"), Path("/data/runs/depth/trial_00005")),
+        winners={**STARTER_WINNERS, "depth": repeated},
+    ).render(80, color=False)
+
+    start = lines.index("  learning_rate  2 complete")
+    assert lines[start - 2 : start] == [
+        "                 /data/runs/depth/trial_00004",
+        "                 /data/runs/depth/trial_00005",
+    ]
+
+
+def test_summary_prints_no_directory_without_a_winner_or_a_recorded_directory() -> None:
+    """A phase with no winner, and a winner whose trial recorded no directory, add no line."""
+    without_dirs = _summary_with_dirs(()).render(80, color=False)
+    without_winner = _summary_with_dirs(
+        (SHORT_TRIAL_DIR,), winners={"learning_rate": STARTER_WINNERS["learning_rate"]}
+    ).render(80, color=False)
+
+    assert not any("/data" in line for line in without_dirs)
+    assert not any("/data" in line for line in without_winner)
+    assert "  depth          2 complete" in without_winner
+    assert "                 winner  trial 0  eval_loss 0.3  model.n_layers=8" not in without_winner
+
+
+def test_summary_dims_the_winners_directory_on_a_terminal() -> None:
+    """Colour wraps the path alone and leaves its indentation plain."""
+    lines = _summary_with_dirs((SHORT_TRIAL_DIR,)).render(80, color=True)
+
+    assert f"                 \x1b[2m{SHORT_TRIAL_DIR}\x1b[0m" in lines
 
 
 def test_nothing_to_run_is_one_sentence() -> None:

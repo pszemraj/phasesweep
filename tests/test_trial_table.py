@@ -65,7 +65,7 @@ def _table(
     available: bool = True,
 ) -> TrialTable:
     """Build a table whose columns are the core ones plus every optional key any row carries."""
-    core = ("trial", "state", "value", "params", "duration_s")
+    core = ("trial", "state", "value", "params", "duration_s", "trial_dir")
     optional = {key for row in rows for key in row} - {*core, "winner"}
     ordered = [name for name in ("repeat_group", "rerun_of") if name in optional]
     ordered += sorted(name for name in optional if name.startswith("observed:"))
@@ -586,3 +586,140 @@ def test_the_unsettled_running_comment_wraps_as_comment_lines(width: int) -> Non
     lines = wrapped.splitlines()
     assert len(lines) > 1 and all(line.startswith("# ") and len(line) <= width for line in lines)
     assert " ".join(line.removeprefix("# ") for line in lines) == single.removeprefix("# ")
+
+
+SHORT_DIR = "runs/depth/trial_00001"
+ATTEMPT_DIR = (
+    "runs/phasesweep_starter/depth/trial_00001__generation_6413d5c1edd5475998cfadd4d3b59980"
+    "__attempt_0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+)
+
+
+def _winner_tables(trial_dir: str | None, *, winner: bool = True) -> tuple[TrialTables, Phase]:
+    """Build a two-trial phase whose trial 1 carries ``trial_dir`` and is the winner when asked."""
+    phase = _phase("depth", x=IntParam(type="int", low=0, high=9))
+    rows = [
+        _row(0, 0.5, {"x": 2}, trial_dir="runs/depth/trial_00000"),
+        _row(1, 0.3, {"x": 4}, winner=winner, trial_dir=trial_dir),
+    ]
+    return _tables(_table("depth", rows), winners={"depth": (GENERATION, True)}), phase
+
+
+def test_the_winning_trials_directory_prints_under_its_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory that fits shares a line with its label, relative to the working directory."""
+    monkeypatch.chdir(tmp_path)
+    tables, phase = _winner_tables(str(tmp_path / SHORT_DIR))
+
+    assert _render(tables, phase).splitlines()[3:] == [
+        "depth: 2 trials, eval_loss (lower is better)",
+        "          trial  eval_loss  x  state     time",
+        "              0        0.5  2  COMPLETE  0.5s",
+        "  winner      1        0.3  4  COMPLETE  0.5s",
+        f"  winner trial 1 directory: {SHORT_DIR}",
+    ]
+
+
+@pytest.mark.parametrize("width", [80, 60])
+def test_a_directory_too_wide_for_its_line_prints_whole_on_a_line_of_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, width: int
+) -> None:
+    """A real attempt directory is wider than the terminal, so its label stands alone above it."""
+    monkeypatch.chdir(tmp_path)
+    tables, phase = _winner_tables(str(tmp_path / ATTEMPT_DIR))
+
+    lines = _render(tables, phase, width=width).splitlines()
+
+    assert lines[3:] == [
+        "depth: 2 trials, eval_loss (lower is better)",
+        "          trial  eval_loss  x  state     time",
+        "              0        0.5  2  COMPLETE  0.5s",
+        "  winner      1        0.3  4  COMPLETE  0.5s",
+        "  winner trial 1 directory:",
+        f"    {ATTEMPT_DIR}",
+    ]
+    assert len(lines[-1]) > width
+
+
+def test_a_directory_outside_the_working_directory_prints_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path under neither the working directory nor home keeps its full spelling."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    tables, phase = _winner_tables("/data/sweeps/depth/trial_00001")
+
+    assert _render(tables, phase).splitlines()[-1] == (
+        "  winner trial 1 directory: /data/sweeps/depth/trial_00001"
+    )
+
+
+def test_a_phase_without_a_winner_or_a_recorded_directory_prints_no_directory_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No winner mark means no line, and a winner that recorded no directory gets none either."""
+    monkeypatch.chdir(tmp_path)
+    unmarked, phase = _winner_tables(SHORT_DIR, winner=False)
+    unrecorded, _ = _winner_tables(None)
+
+    assert "directory" not in _render(unmarked, phase)
+    assert "directory" not in _render(unrecorded, phase)
+
+
+def test_the_directory_is_dim_on_a_terminal_and_nothing_else_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Colour wraps only the path of the directory line."""
+    monkeypatch.chdir(tmp_path)
+    tables, phase = _winner_tables(str(tmp_path / SHORT_DIR))
+
+    styled = _render(tables, phase, color=True)
+
+    assert ANSI.sub("", styled) == _render(tables, phase)
+    assert styled.splitlines()[-1] == f"  winner trial 1 directory: \x1b[2m{SHORT_DIR}\x1b[0m"
+
+
+@pytest.mark.parametrize("width", [80, 60])
+def test_a_repeats_winner_names_each_winning_trials_directory_before_the_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, width: int
+) -> None:
+    """Every member of the winning group gets a line, in trial order, above the group table."""
+    monkeypatch.chdir(tmp_path)
+    phase = Phase(
+        name="r",
+        n_trials=4,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": IntParam(type="int", low=0, high=10)},
+        repeats=Repeats(key="seed", values=[0, 1]),
+    )
+    rows = [
+        _row(
+            number,
+            value,
+            {"x": x, "seed": seed},
+            repeat_group=group,
+            winner=x == 3,
+            trial_dir=str(tmp_path / f"runs/r/trial_{number:05d}"),
+        )
+        for number, (x, seed, value, group) in enumerate(
+            [(3, 0, 0.5, 1), (3, 1, 0.7, 1), (1, 0, 1.0, 3), (1, 1, 2.0, 3)]
+        )
+    ]
+    groups = (
+        RepeatGroupView(
+            group=1, params={"x": 3}, n=2, expected=2, reduce="mean", aggregate=0.6, mean=0.6,
+            sd=0.1, min=0.5, max=0.7, eligible=True, winner=True, observed={}, observed_n={},
+        ),
+    )  # fmt: skip
+    tables = _tables(_table("r", rows, groups=groups))
+
+    lines = _render(tables, phase, width=width).splitlines()
+
+    start = lines.index("  winner trial 0 directory: runs/r/trial_00000")
+    assert lines[start : start + 3] == [
+        "  winner trial 0 directory: runs/r/trial_00000",
+        "  winner trial 1 directory: runs/r/trial_00001",
+        "",
+    ]
+    assert lines[start + 3].startswith("Repeat groups")

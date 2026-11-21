@@ -82,7 +82,6 @@ from phasesweep.engine.selection import (
     tie_group_comparisons,
 )
 from phasesweep.engine.state import (
-    ATTEMPT_ID_ATTR,
     DURATION_ATTR,
     FAILURE_REASON_ATTR,
     GENERATION_SUMMARY_SCHEMA_VERSION,
@@ -93,6 +92,8 @@ from phasesweep.engine.state import (
     WinnerSource,
     _parse_winner_source,
     _parsed_trial_outcome,
+    _recorded_trial_dir,
+    _stands_under_winner,
     _trial_interrupted,
     _validate_observed_block,
 )
@@ -967,7 +968,8 @@ class TrialTable:
     """One phase's trials as table rows, in trial-number order.
 
     ``columns`` lists the keys every row carries, in display order: ``trial``,
-    ``state``, ``value``, ``params``, ``duration_s``, then ``repeat_group`` for a
+    ``state``, ``value``, ``params``, ``duration_s``, ``trial_dir`` (the attempt directory the
+    trial recorded, ``None`` when it recorded none), then ``repeat_group`` for a
     repeats phase, ``rerun_of`` once any trial is a rerun, one ``observed:<name>``
     per report-only value any trial recorded, an optional ``reason`` when any
     trial has a recorded cause, and ``winner``. ``state`` is the Optuna state, except that a
@@ -1190,6 +1192,16 @@ def _trial_reason(trial: optuna.trial.FrozenTrial) -> str | None:
     return None if outcome is None else outcome.cause
 
 
+def _trial_dir_text(trial: optuna.trial.FrozenTrial) -> str | None:
+    """Read the attempt directory a trial recorded, as text.
+
+    :param optuna.trial.FrozenTrial trial: Trial whose directory is displayed.
+    :return str | None: The directory, or ``None`` when none was recorded.
+    """
+    directory = _recorded_trial_dir(trial)
+    return None if directory is None else str(directory)
+
+
 #: Columns every trial table starts with, as ``(header, getter)`` pairs.
 _CORE_TRIAL_COLUMNS: tuple[tuple[str, Callable[[optuna.trial.FrozenTrial], JsonValue]], ...] = (
     ("trial", lambda trial: trial.number),
@@ -1197,6 +1209,7 @@ _CORE_TRIAL_COLUMNS: tuple[tuple[str, Callable[[optuna.trial.FrozenTrial], JsonV
     ("value", lambda trial: trial.value),
     ("params", lambda trial: dict(trial.params)),
     ("duration_s", lambda trial: _recorded_number(trial.user_attrs.get(DURATION_ATTR))),
+    ("trial_dir", _trial_dir_text),
 )
 _REPEAT_GROUP_COLUMN = "repeat_group"
 _RERUN_OF_COLUMN = "rerun_of"
@@ -1272,11 +1285,7 @@ def _trial_table(
             row[name] = _recorded_number(trial.user_attrs.get(name))
         if has_reason:
             row["reason"] = reasons[trial.number]
-        attempt = standing.get(trial.number)
-        marked = trial.number in standing and (
-            attempt is None or trial.user_attrs.get(ATTEMPT_ID_ATTR) == attempt
-        )
-        row[_WINNER_COLUMN] = "*" if marked else ""
+        row[_WINNER_COLUMN] = "*" if _stands_under_winner(trial, standing) else ""
         rows.append(row)
     return TrialTable(
         phase=phase.name,

@@ -299,13 +299,42 @@ def _trial_lines(
     if _RERUN_OF_COLUMN in table.columns:
         cells = tuple(_optional_text(row[_RERUN_OF_COLUMN]) for row in rows)
         columns.append(_Column("rerun of", cells, numeric=True))
-    return _table_lines(
-        columns,
-        [row["winner"] == "*" for row in rows],
-        width=width,
-        color=color,
-        reasons=[_reason(row) for row in rows],
-    )
+    return [
+        *_table_lines(
+            columns,
+            [row["winner"] == "*" for row in rows],
+            width=width,
+            color=color,
+            reasons=[_reason(row) for row in rows],
+        ),
+        *_winner_dir_lines(rows, width=width, color=color),
+    ]
+
+
+def _winner_dir_lines(rows: Sequence[JsonObject], *, width: int, color: bool) -> list[str]:
+    """Name the directory of each winning trial under the table, in trial order.
+
+    A path is never wrapped, as the table is not: one that does not fit its line after the
+    label prints whole on a line of its own. A winning trial that recorded no directory
+    gets no line.
+
+    :param Sequence[JsonObject] rows: The phase's trial rows.
+    :param int width: Terminal width a label and its path must fit to share a line.
+    :param bool color: Whether to style the paths.
+    :return list[str]: One line per winning trial with a recorded directory, two when it is wide.
+    """
+    lines: list[str] = []
+    for row in sorted(rows, key=lambda row: _integer(row, "trial")):
+        directory = row["trial_dir"]
+        if row["winner"] != "*" or not isinstance(directory, str):
+            continue
+        label = f"{INDENT}winner trial {row['trial']} directory:"
+        shown = display_path(Path(directory))
+        if len(label) + 1 + len(shown) <= width:
+            lines.append(f"{label} {paint(shown, 'path', color=color)}")
+        else:
+            lines.extend([label, f"{INDENT}{INDENT}{paint(shown, 'path', color=color)}"])
+    return lines
 
 
 def _group_lines(

@@ -1492,7 +1492,10 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     header, *rows = lines[lines.index(heading) + 1 :]
     assert header.split() == ["trial", "objective", "a", "state", "time"]
     # The fixture's two trials tie on the metric, and the tie goes to the lower draw position.
-    assert [row.split()[:3] for row in rows] == [["winner", "0", "0.5"], ["1", "0.5", "10"]]
+    assert [row.split()[:3] for row in rows[:2]] == [["winner", "0", "0.5"], ["1", "0.5", "10"]]
+    # The winner's attempt directory is too wide to share a line with its label.
+    assert rows[2] == "  winner trial 0 directory:"
+    assert Path(rows[3].strip()).name.startswith("trial_00000__generation_")
 
     assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
     assert yaml.safe_load(capsys.readouterr().out)["kind"] == "experiment"
