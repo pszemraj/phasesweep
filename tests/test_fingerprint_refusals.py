@@ -391,19 +391,17 @@ def test_a_study_bound_to_another_root_gets_a_step_that_fits(tmp_path: Path) -> 
 
 
 def test_the_rename_step_is_worded_once_and_names_the_dependents_it_is_given() -> None:
-    """Every site that offers the rename builds it here, and the explain text carries the same clause."""
+    """Every site that offers the rename builds it here, and the reference's timeout entry says it with no dependents named."""
     assert rename_phase_step(()) == "give the phase a new `name`"
     assert rename_phase_step(("q", "r")) == (
         "give the phase, and each phase that inherits it (`q`, `r`), a new `name`, updating "
         "every `inherits` to match"
     )
-    unknown = rename_phase_step(None)
-    assert unknown == (
-        "give the phase, and each phase that inherits it, a new `name`, updating every "
-        "`inherits` to match"
-    )
     (timeout,) = lookup("phases[].timeout_seconds_per_trial")
-    assert unknown in " ".join(timeout.comments)
+    assert (
+        "give the phase, and each phase that inherits it, a new `name`, updating every "
+        "`inherits` to match, to run it under another value."
+    ) in " ".join(timeout.comments)
 
 
 def test_the_dependents_step_is_worded_once_and_keeps_the_enlarged_phase() -> None:

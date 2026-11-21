@@ -112,24 +112,22 @@ def phase_names(names: Sequence[str]) -> str:
     return ", ".join(f"`{name}`" for name in names)
 
 
-def rename_phase_step(dependents: Sequence[str] | None) -> str:
+def rename_phase_step(dependents: Sequence[str]) -> str:
     """Say how to start one phase over when a setting of that phase changes.
 
     A phase's study is named after the phase, so a new name is a new study for it, and a phase
     that inherits it records the name in its own study identity and follows. The clause is
     worded for a step that offers it, so the caller adds what the rename costs.
 
-    :param Sequence[str] | None dependents: The phases that inherit the phase, from
-        :meth:`~phasesweep.config.models.Experiment.phases_inheriting`, or ``None`` where no
-        experiment is at hand and the sentence can only say there may be some.
+    :param Sequence[str] dependents: The phases that inherit the phase, from
+        :meth:`~phasesweep.config.models.Experiment.phases_inheriting`.
     :return str: A clause that gives the phase, and the dependents it names, a new ``name``.
     """
-    if dependents is not None and not dependents:
+    if not dependents:
         return "give the phase a new `name`"
-    named = "" if dependents is None else f" ({phase_names(dependents)})"
     return (
-        f"give the phase, and each phase that inherits it{named}, a new `name`, updating "
-        "every `inherits` to match"
+        f"give the phase, and each phase that inherits it ({phase_names(dependents)}), a new "
+        "`name`, updating every `inherits` to match"
     )
 
 
