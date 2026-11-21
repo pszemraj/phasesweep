@@ -895,7 +895,9 @@ def run_supervised(
         if root_status is None and deadline is not None and time.monotonic() >= deadline:
             timed_out = True
             failure_reason = timeout_reason
-            log.warning("Process PID %d (pgid %d) timed out — terminating group", pgid, pgid)
+            # The caller reports the timeout in its own words (a trial's reason, a tracker
+            # that did not answer), so this line is for run.log.
+            log.info("Process PID %d (pgid %d) timed out — terminating group", pgid, pgid)
             cleanup_confirmed = _kill_group(pgid, proc)
         else:
             # The trainer root exited within its budget. The helper settle and
