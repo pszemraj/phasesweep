@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import itertools
 import pickle
 from collections.abc import Callable
 
@@ -27,8 +28,9 @@ from phasesweep.engine.optuna import (
     _PositionCmaEsSampler,
     _suggest,
 )
-from phasesweep.engine.state import RERUN_OF_ATTR
+from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.engine.study_policy import _record_reruns
+from tests.conftest import trial_outcome
 
 _GRID_SPACE: dict[str, SearchParam] = {
     "x": CategoricalParam(type="categorical", choices=[1, 2, 3]),
@@ -104,16 +106,23 @@ def _run(
     :param int n_jobs: Optuna worker threads.
     """
 
+    finished = sum(t.state.is_finished() for t in study.get_trials(deepcopy=False))
+    sequences = itertools.count(finished + 1)
+
     def objective(trial: optuna.Trial) -> float:
         for name, param in space.items():
             _suggest(trial, name, param)
         if trial.number in interrupt_at and RERUN_OF_ATTR not in trial.user_attrs:
             raise _Interrupt
-        return sum(
+        metric = sum(
             (value - 0.3) ** 2
             for value in trial.params.values()
             if isinstance(value, int | float) and not isinstance(value, bool)
         )
+        trial.set_user_attr(
+            TRIAL_OUTCOME_ATTR, trial_outcome(next(sequences), "success", metric=metric)
+        )
+        return metric
 
     with contextlib.suppress(_Interrupt):
         study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)

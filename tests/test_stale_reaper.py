@@ -1043,7 +1043,9 @@ def test_reaper_raises_for_malformed_trial_dir_attr(
     [
         pytest.param("outcome", "durable interrupted outcome could not be recorded", id="outcome"),
         pytest.param(
-            "outcome-read", "durable recovered outcome could not be recorded", id="outcome-read"
+            "outcome-read",
+            "could not reload its durable outcome before settlement",
+            id="outcome-read",
         ),
         pytest.param("ledger", "cleanup recovery ledger could not be updated", id="ledger"),
         pytest.param(
@@ -1100,11 +1102,13 @@ def test_reaper_reports_storage_failures_after_cleanup(
         monkeypatch.setattr(study, "get_trials", read_trials)
     elif failure_site == "ledger-read":
 
-        def read_ledger(_study_id: int) -> NoReturn:
+        def read_ledger(_study: optuna.Study) -> NoReturn:
             """Refuse the study-level cleanup ledger read."""
             raise OSError("storage read failed")
 
-        monkeypatch.setattr(study._storage, "get_study_user_attrs", read_ledger)
+        monkeypatch.setattr(
+            "phasesweep.engine.attempts._cleanup_recovered_trial_numbers", read_ledger
+        )
     elif failure_site == "outcome":
         patch_rejected_trial_user_attr(
             monkeypatch,
@@ -1127,7 +1131,6 @@ def test_reaper_reports_storage_failures_after_cleanup(
     with pytest.raises(StudyStorageUnavailableError, match=match):
         _reap_stale_trials(study, exp, exp.phases[0].name, confirm=True)
 
-    # The trial must NOT have been marked FAIL (because tell raised).
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
 
 
