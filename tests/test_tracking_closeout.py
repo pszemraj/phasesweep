@@ -26,6 +26,7 @@ from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
+from phasesweep.errors import ProcessCleanupUncertainError
 from phasesweep.runtime import process, shutdown
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.shutdown import (
@@ -46,6 +47,7 @@ from tests.conftest import invoke_cli_boundary, write_experiment_config
 from tests.tracking_helpers import (
     RunnerKilled,
     attempt_identity,
+    leak_tracking_worker,
     native_experiment,
     remote_mlflow_example,
 )
@@ -723,6 +725,26 @@ def test_the_closing_lines_account_for_every_creation_and_record_the_sending_lin
     assert sweep.summaries() == ["KILLED"]
     assert publication.delivery_status(sweep.experiment)["pending"] == 0
     assert "pending;" not in caplog.text
+
+
+@pytest.mark.integration
+def test_an_unconfirmed_worker_of_the_early_pass_still_ends_the_run_with_its_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A worker the pass after the target check leaves unconfirmed stops the run, which still counts.
+
+    Nothing more is requested once cleanup is uncertain, but the closing count is a local read,
+    so it names what stays pending, the earlier run's records included.
+    """
+    sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
+    leaked = leak_tracking_worker(monkeypatch, action="publish")
+    caplog.set_level(logging.INFO)
+
+    with pytest.raises(ProcessCleanupUncertainError):
+        run_experiment(sweep.experiment)
+
+    assert leaked and sweep.uploads == []
+    assert f"MLflow: 2 records pending (2 from earlier runs); {_PENDING_STEP}" in caplog.text
 
 
 @pytest.mark.integration

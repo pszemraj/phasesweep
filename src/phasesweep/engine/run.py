@@ -504,6 +504,12 @@ def _run_experiment_outcome(
                     log.exception(
                         "MLflow failure delivery did not complete; preserving the original error"
                     )
+            elif tracking is not None:
+                from phasesweep.tracking.publication import report_delivery
+
+                # Unconfirmed cleanup sends and saves nothing, but the closing count is a local
+                # read, so it still says what the run's earlier pass delivered and what waits.
+                report_delivery(experiment, generation_id, tracking)
             terminal_report = _terminal_report_from_cleanup(
                 generation_id,
                 cleanup,
