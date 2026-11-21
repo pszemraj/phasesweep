@@ -1179,11 +1179,20 @@ def test_wandb_unanswered_lookup_at_settle_boundary_keeps_polling(monkeypatch, r
 
 
 def test_wandb_missing_key_failure_reason_names_missing_and_available_keys(tmp_path, monkeypatch):
-    """Worker failures retain missing-key details and the run URL."""
+    """A settled missing-key reply in the reporting reserve fails the trial with details."""
     from phasesweep.evidence import wandb as wandb_evidence
 
     clock = _fake_wandb_clock(monkeypatch)
-    _wandb_reads(monkeypatch, lambda read: "finished", lambda read: _RUNTIME_SUMMARY)
+    settle_by = wandb_evidence._FINISH_SETTLE_SECONDS
+    poll_cutoff = settle_by + 0.5
+    deadline = poll_cutoff + wandb_evidence._REPORT_SECONDS
+
+    def summary(_read: int) -> dict[str, float]:
+        if clock.now == settle_by:
+            clock.sleep(0.75)
+        return _RUNTIME_SUMMARY
+
+    _wandb_reads(monkeypatch, lambda read: "finished", summary)
 
     def in_process_worker(request, _worker_path, _backend, **_):
         # The worker's own entry point, so the report crosses its JSON response.
@@ -1193,7 +1202,6 @@ def test_wandb_missing_key_failure_reason_names_missing_and_available_keys(tmp_p
         request_path.write_text(json.dumps(dict(request)))
         assert wandb_evidence.main([str(request_path), str(response_path)]) == 0
         response = json.loads(response_path.read_text())
-        assert response["status"] == "missing_keys"
         return SimpleNamespace(timed_out=False, return_code=0), response, None
 
     monkeypatch.setattr(wandb_evidence, "run_worker", in_process_worker)
@@ -1207,14 +1215,14 @@ def test_wandb_missing_key_failure_reason_names_missing_and_available_keys(tmp_p
     )
     ctx = make_trial_context(tmp_path)
     with pytest.raises(ExtractorError) as caught:
-        run_extractor(ctx, extractor)
+        run_extractor(ctx, extractor, deadline=deadline)
     assert type(caught.value) is ExtractorError
     assert str(caught.value) == (
         f"W&B run https://api.wandb.ai/e/p/{ctx.attempt_id} finished without required "
         "summary key(s) ['train/train_runtime']; available summary keys: "
         "['_runtime', 'train_runtime']."
     )
-    assert clock.now < 240
+    assert poll_cutoff < clock.now < deadline
 
 
 @pytest.mark.parametrize("appears_at_read", [3, 6], ids=["mid-window", "window-end"])

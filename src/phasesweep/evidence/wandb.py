@@ -583,7 +583,7 @@ def _poll_wandb_summary(
                     observed_at = time.monotonic()
                     settle_by = min(settle_by, observed_at + _FINISH_SETTLE_SECONDS)
                     # An earlier incomplete summary cannot establish absence while reads fail.
-                    if settle_by <= observed_at < deadline:
+                    if settle_by <= observed_at:
                         raise WandbMissingKeysError(run_id, missing, available)
                     last_error = RuntimeError(
                         f"Missing required summary keys: {missing!r}; "
