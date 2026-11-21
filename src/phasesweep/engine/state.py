@@ -514,30 +514,46 @@ def _completed_trainer_duration(
     return None if seconds is None else float(seconds)
 
 
+def _trial_lifecycle(trial: FrozenTrial | Trial) -> AttemptLifecycle | None:
+    """Read the attempt lifecycle record in the directory a trial recorded for its attempt.
+
+    :param FrozenTrial | Trial trial: Trial whose directory and attempt id attributes name the record.
+    :raises ValueError: The record is unreadable, malformed or belongs to another attempt. A
+        caller that acts on the process treats that as cleanup uncertainty, not as absence.
+    :return AttemptLifecycle | None: The validated record, or ``None`` when the trial recorded
+        no directory or attempt id, or its directory holds no record.
+    """
+    from phasesweep.runtime.process import read_attempt_lifecycle
+
+    directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
+    attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+    if not isinstance(directory, str) or not isinstance(attempt_id, str):
+        return None
+    return read_attempt_lifecycle(Path(directory), expected_attempt_id=attempt_id)
+
+
 def _recovered_trial_state(
     trial: FrozenTrial, outcome: _ParsedTrialOutcome | None
 ) -> RecoveredTrialState:
     """Predict the recovery disposition of a RUNNING trial.
 
+    A lifecycle record that cannot be read predicts an interruption: this only previews what
+    recovery will settle, and recovery itself refuses the unreadable record.
+
     :param FrozenTrial trial: Trial whose finished training may await extraction.
     :param _ParsedTrialOutcome | None outcome: Its unique committed outcome, if any.
     :return RecoveredTrialState: Pending evidence, a recorded failure, or an interruption.
     """
-    from phasesweep.runtime.process import read_attempt_lifecycle
-
     if outcome is not None:
         if outcome.metric is not None:
             return "EVIDENCE_PENDING"
         return "INTERRUPTED" if outcome.outcome == "interrupted" else "FAIL"
-    directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
-    attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
-    if isinstance(directory, str) and isinstance(attempt_id, str):
-        try:
-            lifecycle = read_attempt_lifecycle(Path(directory), expected_attempt_id=attempt_id)
-        except ValueError:
-            lifecycle = None
-        if lifecycle is not None and _completed_trainer_duration(trial, lifecycle) is not None:
-            return "EVIDENCE_PENDING"
+    try:
+        lifecycle = _trial_lifecycle(trial)
+    except ValueError:
+        return "INTERRUPTED"
+    if lifecycle is not None and _completed_trainer_duration(trial, lifecycle) is not None:
+        return "EVIDENCE_PENDING"
     return "INTERRUPTED"
 
 

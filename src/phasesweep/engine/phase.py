@@ -10,7 +10,6 @@ import threading
 import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 from uuid import uuid4
 
@@ -77,6 +76,7 @@ from phasesweep.engine.state import (
     WinnerSource,
     _completed_trainer_duration,
     _parsed_trial_outcome,
+    _trial_lifecycle,
     _trial_outcome_payload,
 )
 from phasesweep.engine.study_policy import (
@@ -122,7 +122,7 @@ from phasesweep.errors import (
 from phasesweep.run_report import phase_start, report
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
 from phasesweep.runtime.json import JsonObject
-from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
+from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     ShutdownCleanupReport,
@@ -1385,16 +1385,11 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             )
             raise
         except PhaseSweepShutdown as exc:
-            lifecycle = None
-            directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
             attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
-            if isinstance(directory, str) and isinstance(attempt_id, str):
-                try:
-                    lifecycle = read_attempt_lifecycle(
-                        Path(directory), expected_attempt_id=attempt_id
-                    )
-                except ValueError as lifecycle_error:
-                    raise exc from lifecycle_error
+            try:
+                lifecycle = _trial_lifecycle(trial)
+            except ValueError as lifecycle_error:
+                raise exc from lifecycle_error
             if _completed_trainer_duration(trial, lifecycle) is None:
                 _record_outcome(run, trial, "interrupted", cause=interruption_cause(exc.signum))
             elif isinstance(attempt_id, str) and not (
