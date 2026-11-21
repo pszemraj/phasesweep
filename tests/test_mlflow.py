@@ -976,11 +976,13 @@ def test_a_creation_search_without_an_answer_ends_the_pass(
 ) -> None:
     """A search MLflow gives no answer to leaves every later intent unsearched and pending.
 
-    A failure MLflow answered concerns that one record, so the next intent is still searched.
+    The pass reports the missing answer so its caller sends no uploads. A failure MLflow
+    answered concerns that one record, so the next intent is still searched.
     """
     from phasesweep.tracking import session
 
     experiment = native_experiment(tmp_path)
+    assert session.resolve_pending_creations(experiment, {}, None)
     root = session.tracking_root(experiment)
     paths = [
         _write_pending(
@@ -998,7 +1000,7 @@ def test_a_creation_search_without_an_answer_ends_the_pass(
         raise outcome
 
     monkeypatch.setattr(session, "call_tracking", find)
-    assert session.resolve_pending_creations(experiment, {}, None)
+    assert session.resolve_pending_creations(experiment, {}, None) is (searched == 2)
     assert sent == ["1" * 32, "2" * 32][:searched]
     assert all(path.exists() for path in paths)
 

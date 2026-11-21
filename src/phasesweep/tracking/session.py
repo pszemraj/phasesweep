@@ -421,7 +421,8 @@ def resolve_pending_creations(
     The caller holds the experiment lock and has confirmed cleanup of registered workers for
     the generations it reconciles. Persist each found binding before retiring its intent.
     Retire an unmatched intent only after a successful lookup started outside its request window.
-    A search MLflow gives no answer to ends the pass, leaving the later intents for the next one.
+    A search MLflow gives no answer to ends the pass, leaving the later intents for the next one;
+    the caller then sends no uploads either, as they would meet the same tracker.
 
     :param Experiment experiment: Configured experiment with a verified tracking target.
     :param Mapping[str, str] environment: Composed credentials and transport.
@@ -433,7 +434,7 @@ def resolve_pending_creations(
         continue, or raise the first one if omitted.
     :raises ProcessCleanupUncertainError: A search worker's cleanup is uncertain.
     :raises TrackingSyncRefusedError: A local creation record could not be read or updated.
-    :return bool: Whether the requested scope, less ``skip``, had any creation intents.
+    :return bool: Whether MLflow answered every search sent, True when there was none to send.
     """
     from phasesweep.engine.errors import TrackingSyncRefusedError
 
@@ -457,8 +458,8 @@ def resolve_pending_creations(
             errors.append(failure)
             continue
         if not answered:
-            break
-    return bool(records)
+            return False
+    return True
 
 
 def _reconcile_creation(
@@ -497,7 +498,13 @@ def _reconcile_creation(
     except PhaseSweepError:
         raise
     except NO_ANSWER as exc:
-        log.warning("MLflow run creation at %s is still unresolved (%s).", pending, exc)
+        # The caller skips its uploads after this, so this is the pass's only outage warning.
+        log.warning(
+            "MLflow run creation at %s is still unresolved (%s). MLflow did not answer, so later "
+            "searches and uploads wait too.",
+            pending,
+            exc,
+        )
         return False
     except (ValueError, RuntimeError) as exc:
         log.warning("MLflow run creation at %s is still unresolved (%s).", pending, exc)

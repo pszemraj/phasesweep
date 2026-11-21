@@ -24,7 +24,7 @@ from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
 from phasesweep.tracking.mlflow import OperationRejectedError, OperationUnavailableError
 from phasesweep.tracking.session import read_record, tracking_root
-from tests.tracking_helpers import remote_mlflow_example
+from tests.tracking_helpers import RunnerKilled, remote_mlflow_example
 
 _PENDING_STEP = (
     "results are saved locally. The next run or `phasesweep sync-tracking CONFIG` delivers them."
@@ -190,21 +190,43 @@ def test_the_next_run_delivers_an_interrupted_runs_pending_records(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("creation", [False, True], ids=["uploads", "creation-and-uploads"])
 @pytest.mark.parametrize("failure", ["outage", "rejection"])
-def test_closeout_stops_at_the_first_unanswered_upload_and_keeps_the_result(
+def test_closeout_stops_at_the_first_unanswered_request_and_keeps_the_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     failure: str,
+    creation: bool,
 ) -> None:
     """An outage that starts after the run's own uploads costs one request and leaves earlier records pending.
 
-    The run still returns its winners with no error, and its closing line counts what stays
-    pending. A rejection of one earlier record is a verdict on that record alone, so the next
-    one is still sent.
+    With an earlier run's creation intent pending too, that one request is its search, and no
+    upload follows it. The run still returns its winners with no error, its closing line counts
+    what stays pending, and the outage costs one warning. A rejection of one earlier record,
+    after an answered search, is a verdict on that record alone, so the next one is still sent.
     """
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
     respond = session.request_operation
+    intents: list[Path] = []
+    if creation:
+        # A run killed outright while creating its summary run leaves that creation unconfirmed
+        # and runs no closeout, as with `killed_sweep`.
+        def killed_at_summary_creation(request: dict[str, object], **kwargs: object) -> JsonObject:
+            if request["action"] == "create":
+                raise RunnerKilled()
+            return respond(request, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(session, "request_operation", killed_at_summary_creation)
+            patch.setattr(publication, "publish_failed_generation", lambda *args: True)
+            patch.setattr(publication, "deliver_ended_generations", lambda *args, **kwargs: 0)
+            patch.setattr(publication, "report_delivery", lambda *args: None)
+            with pytest.raises(RunnerKilled):
+                run_experiment(sweep.experiment)
+        assert sweep.uploads == []
+        intents = session.pending_creation_records(sweep.experiment)
+        assert len(intents) == 1
     own_sent: list[bool] = []
     after_own: list[str] = []
 
@@ -214,6 +236,8 @@ def test_closeout_stops_at_the_first_unanswered_upload_and_keeps_the_result(
             after_own.append(name)
             if failure == "outage":
                 raise OperationUnavailableError("tracking server unreachable")
+            if name == "find":
+                return {"found": False}
             if name.startswith("attempt-"):
                 raise OperationRejectedError("RESOURCE_DOES_NOT_EXIST: run was deleted")
         return respond(request, **kwargs)
@@ -229,6 +253,7 @@ def test_closeout_stops_at_the_first_unanswered_upload_and_keeps_the_result(
 
     monkeypatch.setattr(publication, "publish_generation", publish_then_fail)
     caplog.set_level(logging.INFO)
+    caplog.clear()
     reports: list[TerminalReport] = []
 
     winners = run_experiment(sweep.experiment, terminal_callback=reports.append)
@@ -237,16 +262,30 @@ def test_closeout_stops_at_the_first_unanswered_upload_and_keeps_the_result(
     assert reports[0].primary_error is None
     assert own_sent == [True]
     assert read_status(sweep.experiment)["published_generation_id"] == reports[0].generation_id
+    assert all(intent.exists() for intent in intents)
+    searched = ["find"] if creation else []
     if failure == "outage":
-        assert len(after_own) == 1 and after_own[0].startswith("attempt-")
+        [request] = after_own
+        assert request == "find" if creation else request.startswith("attempt-")
         assert read_record(sweep.summary)["state"] == "pending"
-        assert f"MLflow: 2 upload(s) pending (2 from earlier runs); {_PENDING_STEP}" in caplog.text
+        assert caplog.text.count("MLflow did not answer") == 1
+        pending = 2 + len(intents)
+        assert (
+            f"MLflow: {pending} upload(s) pending ({pending} from earlier runs); {_PENDING_STEP}"
+            in caplog.text
+        )
         assert "left pending by earlier runs." not in caplog.text
     else:
-        assert after_own[0].startswith("attempt-") and after_own[1:] == ["generation"]
+        assert after_own[: len(searched)] == searched
+        [rejected, summary] = after_own[len(searched) :]
+        assert rejected.startswith("attempt-") and summary == "generation"
         assert sweep.summaries() == ["KILLED"]
         assert "MLflow: delivered 1 record(s) left pending by earlier runs." in caplog.text
-        assert f"MLflow: 1 upload(s) pending (1 from earlier runs); {_PENDING_STEP}" in caplog.text
+        pending = 1 + len(intents)
+        assert (
+            f"MLflow: {pending} upload(s) pending ({pending} from earlier runs); {_PENDING_STEP}"
+            in caplog.text
+        )
 
 
 @pytest.mark.integration

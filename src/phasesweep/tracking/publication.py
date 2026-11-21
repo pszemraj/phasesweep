@@ -987,9 +987,9 @@ def _deliver_outstanding(
     This is sync-tracking's work, shared with run closeout and recover-run. The caller holds the
     experiment lock, so every generation in scope but ``skip`` has ended. Pending creations are
     searched first, so a run a timed-out creation made late is bound before its records are
-    rebuilt; then missing records are staged and every pending record is sent. A request MLflow
-    gives no answer to ends the searches and the uploads, so an outage costs one failed request
-    of each.
+    rebuilt; then missing records are staged and every pending record is sent. The first request
+    MLflow gives no answer to ends the pass, search or upload, so an outage costs one failed
+    request; records are still staged, and stay pending for the next run or sync-tracking.
 
     :param Experiment experiment: Configured MLflow-backed experiment.
     :param ValidatedLedger ledger: The experiment's validated ledger, holding the attempts' trials.
@@ -1005,13 +1005,13 @@ def _deliver_outstanding(
         generation, is not the one the tree recorded; nothing is sent.
     :raises ProcessCleanupUncertainError: A search or upload worker's cleanup is uncertain.
     :raises PublicationIntegrityError: A published generation's artifacts no longer validate.
-    :return list[Path]: The records sent, in sending order.
+    :return list[Path]: The records sent, in sending order, or none after an unanswered search.
     """
     assert experiment.mlflow is not None
     different = "Tracking delivery belongs to a different target or generation."
     if not _target_recorded(experiment):
         raise TrackingSyncRefusedError(different)
-    resolve_pending_creations(
+    answered = resolve_pending_creations(
         experiment,
         environment,
         scope,
@@ -1029,6 +1029,9 @@ def _deliver_outstanding(
             or record["generation_id"] != path.parent.parent.name
         ):
             raise TrackingSyncRefusedError(different)
+    if not answered:
+        # The unanswered search already warned that the uploads wait too.
+        return []
     paths = _pending_records(experiment, scope, skip=skip)
     _send(experiment, paths, environment, worker_generation=worker_generation)
     return paths
