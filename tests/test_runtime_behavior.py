@@ -1009,6 +1009,30 @@ def _outcome_write_experiment(
 
 
 @pytest.mark.integration
+def test_finished_trainers_evidence_failure_survives_a_live_outcome_write_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resume a rejected log objective as a failure without launching a replacement."""
+    exp = _outcome_write_experiment(
+        tmp_path,
+        trainer_body='import os\nprint("missing" if os.environ["PHASESWEEP_TRIAL_ID"] == "0" else "x=0.5")',
+    )
+    with monkeypatch.context() as writes:
+        patch_rejected_trial_user_attr(writes, TRIAL_OUTCOME_ATTR, "journal unavailable")
+        with pytest.raises(StudyStorageUnavailableError):
+            run_experiment(exp)
+
+    (pending,) = phase_trials(exp)
+    assert pending.state == optuna.trial.TrialState.RUNNING
+    assert run_experiment(exp)["p"].metric == pytest.approx(0.5)
+    failed, winner = phase_trials(exp)
+    assert failed.state == optuna.trial.TrialState.FAIL
+    assert failed.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "failure"
+    assert "No matches" in failed.user_attrs[TRIAL_OUTCOME_ATTR]["cause"]
+    assert winner.state == optuna.trial.TrialState.COMPLETE
+
+
+@pytest.mark.integration
 def test_transient_trial_outcome_write_failure_is_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

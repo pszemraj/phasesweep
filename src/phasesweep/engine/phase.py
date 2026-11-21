@@ -1228,11 +1228,10 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
 
     # Process/extractor failures -> Optuna FAIL state, not COMPLETE with inf.
     if result.failure_reason:
-        trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
-        error_type = (
-            _DeadlineTrialExecutionError if result.deadline_exhausted else TrialExecutionError
-        )
-        raise error_type(result.failure_reason)
+        if result.deadline_exhausted:
+            trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
+            raise _DeadlineTrialExecutionError(result.failure_reason)
+        raise TrialExecutionError(result.failure_reason)
 
     assert result.metric is not None  # guaranteed when failure_reason is None
     violations: list[str] = []
@@ -1287,6 +1286,10 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                 # Under n_jobs > 1 the shutdown handler runs in the main thread and
                 # kills this worker's trainer, which ends here as a trainer error.
                 _record_outcome(run, trial, "interrupted", cause=interruption_cause(signum))
+            # An earlier diagnostic would prevent recovery from reading a finished trainer's
+            # evidence if its outcome could not be committed.
+            if FAILURE_REASON_ATTR not in trial.user_attrs:
+                trial.set_user_attr(FAILURE_REASON_ATTR, str(exc))
             raise
         except UnsafeProcessCleanupError as exc:
             run.record_fatal(exc)
