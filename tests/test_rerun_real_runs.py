@@ -127,6 +127,8 @@ class _Harness:
                 stdout=handle,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                # A wide terminal keeps the closing ``log:`` path on one line.
+                env={**os.environ, "COLUMNS": "500"},
             )
         self.spawned.append(proc)
         return proc

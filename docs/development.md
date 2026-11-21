@@ -227,7 +227,7 @@ The principal test groups and what each covers:
 - Storage, publication, recovery, interrupted trials and sampler resume: owning code and representative tests are listed by [durability invariant](invariants.md).
 - `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots, detached launch, status, cancellation, and recovery.
 - `tests/test_terminal.py`, `tests/test_trial_table.py` and `tests/test_cli_help.py`: the terminal primitives (the colour decision per stream, width, wrapping, display paths), the exact plain-text output of `status --trials`, command help text, and the quiet exit on a closed output pipe.
-- `tests/test_run_report.py`: what `phasesweep run` prints, as exact text at 80 and 60 columns for each report block (banner, phase start, trial, rerun, skipped, winner, summary), the console handler (time prefix, warning wrapping, styling, contiguous records from threads) and the CLI around it (`-v`, the closing `log:` line, a replay and a resume).
+- `tests/test_run_report.py`: what `phasesweep run` prints, as exact text at 80 and 60 columns for each report block (banner, phase start, trial, rerun, skipped, winner, summary), the console handler (time prefix, warning and prose wrapping, styling, contiguous records from threads, the INFO lines of a dry run) and the CLI around it (`-v`, the closing `log:` line, a replay, a resume, the starter's pinned dry-run lines, and a phase abort, failed extraction or fatal error printing once).
 - `tests/test_init.py`, `tests/test_fake_train.py` and `tests/test_reporting.py`: template creation and runs, the toy trainer's seed noise, catalog scaffolding, and the objective-envelope writer (`report_objective` and `report-objective`).
 
 ## Tracked TODOs

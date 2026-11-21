@@ -233,6 +233,8 @@ def test_format_refusal_gives_the_same_fix_to_every_command(
     options: list[str],
 ) -> None:
     """Data in another format ends in one fix line whichever command meets it, before any preview."""
+    # A wide terminal keeps the closing ``log:`` path on one line.
+    monkeypatch.setenv("COLUMNS", "500")
     materialized = materialize("current-journal", tmp_path, mode="tree")
     if format_record == "artifact-root":
         _downgrade_binding(materialized.experiment)
