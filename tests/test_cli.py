@@ -39,6 +39,7 @@ from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_dir,
 )
+from phasesweep.engine.run import TerminalReport
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseTrialsFailedError
 from phasesweep.engine.state import Winner
 from phasesweep.errors import (
@@ -54,6 +55,7 @@ from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
+    after_banner,
     console_script,
     invoke_cli_boundary,
     make_experiment,
@@ -480,7 +482,7 @@ def test_run_installs_signal_handlers_before_config_load(
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
     events: list[str] = []
-    config = object()
+    config = make_experiment(workdir=tmp_path / "runs")
 
     monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: events.append("signals"))
 
@@ -488,7 +490,13 @@ def test_run_installs_signal_handlers_before_config_load(
         events.append("load")
         return config
 
-    def fake_run_experiment(loaded: object, *, from_phase: str | None, dry_run: bool) -> None:
+    def fake_run_experiment(
+        loaded: object,
+        *,
+        from_phase: str | None,
+        dry_run: bool,
+        terminal_callback: Callable[[TerminalReport], None],
+    ) -> None:
         assert loaded is config
         assert from_phase is None
         assert dry_run is expected_dry_run
@@ -1580,7 +1588,7 @@ def test_cli_trial_cleanup_refusal_names_the_cli_recovery(
 
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert captured.err.strip() == (
+    assert after_banner(captured.err).strip() == (
         "phasesweep: Trial 0 cleanup could not be confirmed.\n"
         "fix: run `phasesweep run` again with the same config for a CLI run, or "
         "`phasesweep mcp recover-run` for an MCP run."
@@ -1815,7 +1823,7 @@ def test_cli_boundary_classifies_relative_lock_directory_as_operational(
     config_path.write_text("placeholder: true\n")
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", "relative-locks")
     monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
-    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: object())
+    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: make_experiment())
     monkeypatch.setattr(
         "phasesweep.cli.run_experiment",
         lambda *_args, **_kwargs: lock_dir(),

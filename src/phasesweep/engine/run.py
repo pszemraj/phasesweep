@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -25,6 +26,7 @@ from phasesweep._metadata import __version__
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.config.models import (
     Experiment,
+    Phase,
     _metric_semantics_payload,
     experiment_disclosures,
 )
@@ -35,6 +37,7 @@ from phasesweep.engine.errors import (
     TrackingTargetUnavailableError,
     phase_timeout,
 )
+from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.preview import (
     PhasePreview,
@@ -44,9 +47,14 @@ from phasesweep.engine.preview import (
     _preview_phase,
 )
 from phasesweep.engine.selection import _winner_summary_item
-from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
+from phasesweep.engine.state import (
+    GENERATION_ID_ATTR,
+    GENERATION_SUMMARY_SCHEMA_VERSION,
+    PhaseCounts,
+    Winner,
+)
 from phasesweep.engine.study_policy import _launch_preflight
-from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
+from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.run_report import report, skipped_line, winner_line
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
@@ -100,7 +108,9 @@ class TerminalReport:
     on success, so a terminal-result consumer need not re-read storage. It is
     ``None`` on every failure path. ``replayed_generation_id`` names the published
     generation whose winners a successful invocation replayed without writing a
-    generation, and is ``None`` otherwise.
+    generation, and is ``None`` otherwise. ``phase_counts`` holds the trial counts of
+    each phase a successful invocation ran, read from its ledger, so a run on in-memory
+    storage reports them too.
     """
 
     generation_id: str
@@ -113,6 +123,7 @@ class TerminalReport:
     failure_stage: str | None = None
     winners: Mapping[str, Winner] | None = None
     replayed_generation_id: str | None = None
+    phase_counts: Mapping[str, PhaseCounts] = field(default_factory=dict)
 
 
 class PublicationHook(Protocol):
@@ -156,6 +167,7 @@ def _terminal_report_from_cleanup(
     failure_stage: str | None,
     winners: Mapping[str, Winner] | None = None,
     replayed_generation_id: str | None = None,
+    phase_counts: Mapping[str, PhaseCounts] | None = None,
 ) -> TerminalReport:
     """Freeze accumulated cleanup evidence into one terminal report.
 
@@ -166,6 +178,8 @@ def _terminal_report_from_cleanup(
     :param Mapping[str, Winner] | None winners: Successful published winners.
     :param str | None replayed_generation_id: Published generation whose winners a successful
         invocation replayed without writing a generation.
+    :param Mapping[str, PhaseCounts] | None phase_counts: Trial counts of each phase the
+        invocation ran, for a successful one.
     :return TerminalReport: Immutable terminal outcome snapshot.
     """
     return TerminalReport(
@@ -179,6 +193,7 @@ def _terminal_report_from_cleanup(
         failure_stage=failure_stage,
         winners=MappingProxyType(dict(winners)) if winners is not None else None,
         replayed_generation_id=replayed_generation_id,
+        phase_counts=MappingProxyType(dict(phase_counts or {})),
     )
 
 
@@ -552,6 +567,7 @@ def _run_experiment_outcome(
                     failure_stage=None,
                     winners=result,
                     replayed_generation_id=generation.replayed_generation_id,
+                    phase_counts=generation.phase_counts,
                 )
             return MappingProxyType(dict(result))
         finally:
@@ -629,6 +645,37 @@ def _mirror_publication(
             "from the ledger and the published generation.",
             generation_id,
         )
+
+
+def _phase_counts(
+    ledger: ledger_ops.ValidatedLedger, phase: Phase, generation_id: str
+) -> PhaseCounts | None:
+    """Count a finished phase's trials by recorded state, and those an earlier run recorded.
+
+    Reporting never fails a run whose result is already decided, so a ledger that cannot be
+    read back here costs the summary its counts for the phase and nothing else.
+
+    :param ledger_ops.ValidatedLedger ledger: The run's ledger, memory-backed or journal-backed.
+    :param Phase phase: The phase that just ended.
+    :param str generation_id: This run's generation, which its own trials carry.
+    :return PhaseCounts | None: The counts, or ``None`` when the phase's trials cannot be read.
+    """
+    try:
+        read = ledger_ops.read_phase_trials(ledger, phase)
+    except (PhaseSweepError, OSError) as exc:
+        log.warning("Could not count phase %r's trials for the run summary: %s", phase.name, exc)
+        return None
+    trials = [] if read is None else read.trials
+    states = Counter(_trial_count_state(trial) for trial in trials)
+    return PhaseCounts(
+        complete=states["COMPLETE"],
+        infeasible=states["INFEASIBLE"],
+        failed=states["FAIL"],
+        interrupted=states["INTERRUPTED"],
+        earlier=sum(
+            1 for trial in trials if trial.user_attrs.get(GENERATION_ID_ATTR) != generation_id
+        ),
+    )
 
 
 def _run_experiment_inner(
@@ -742,6 +789,9 @@ def _run_experiment_inner(
                 ledger=ledger,
                 run_deadline=run_deadline,
             )
+            counts = _phase_counts(ledger, phase, generation.generation_id)
+            if counts is not None:
+                generation.phase_counts[phase.name] = counts
         if generation is not None:
             generation.save_winner(phase.name, winner)
             report.info(winner_line(experiment, phase, winner))

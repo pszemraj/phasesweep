@@ -775,6 +775,11 @@ def assert_invalid_experiment_yaml(tmp_path: Path, body: str, match: str) -> Non
         load_experiment(write_yaml(tmp_path, body))
 
 
+def after_banner(console: str) -> str:
+    """Return what a live ``phasesweep run`` printed after its banner, which ends at a blank line."""
+    return console.split("\n\n", 2)[2]
+
+
 def invoke_cli_boundary(argv: list[str], monkeypatch: pytest.MonkeyPatch) -> int:
     """Run the console-script entry point exactly as the installed command does; return its exit status."""
     # ``CliRunner`` invokes the Click group directly and so bypasses the

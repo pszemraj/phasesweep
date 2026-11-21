@@ -2,6 +2,7 @@
 
 import json
 import stat
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
 )
 from phasesweep.engine.read import experiment_status, read_result
+from phasesweep.engine.run import TerminalReport
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
 from phasesweep.errors import operator_step
@@ -721,7 +723,11 @@ def _derived(path: Path, monkeypatch: pytest.MonkeyPatch, *settings: str) -> Exp
     received: list[Experiment] = []
 
     def capture(
-        experiment: Experiment, *, from_phase: str | None, dry_run: bool
+        experiment: Experiment,
+        *,
+        from_phase: str | None,
+        dry_run: bool,
+        terminal_callback: Callable[[TerminalReport], None],
     ) -> dict[str, Winner]:
         assert dry_run
         assert from_phase is None

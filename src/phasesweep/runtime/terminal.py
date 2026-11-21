@@ -186,6 +186,20 @@ def pack(items: Sequence[str], width: int, *, indent: str = "", separator: str =
     return lines
 
 
+def break_path(text: str, width: int, *, indent: str = "") -> list[str]:
+    """Break a path or URL after a ``/`` so every component stays whole and readable.
+
+    :param str text: The path, absolute or relative.
+    :param int width: Maximum visible width of each line, indent included.
+    :param str indent: Prefix of every line.
+    :return list[str]: The lines, each but the last ending in ``/``.
+    """
+    parts = text.split("/")
+    if text.startswith("/") and len(parts) > 1:
+        parts = ["/" + parts[1], *parts[2:]]
+    return pack(parts, width, indent=indent, separator="/")
+
+
 class ReportBlock(ABC):
     """A log message that draws itself on the console and reads as one line in a log file.
 

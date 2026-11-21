@@ -1778,8 +1778,8 @@ def test_in_memory_run_fails_a_trial_whose_tracker_is_unreadable_and_promises_no
     with pytest.raises(NoFeasibleTrialError) as refused:
         run_experiment(experiment)
     assert not isinstance(refused.value, TrackingTargetUnavailableError)
-    assert "state=FAIL" in caplog.text
-    assert "reason=metric extractor: W&B authentication/setup failed" in caplog.text
+    assert "trial 0  FAIL" in caplog.text
+    assert "reason: metric extractor: W&B authentication/setup failed" in caplog.text
     assert "retained" not in caplog.text
     assert "kept" not in str(refused.value) + str(refused.value.remediation)
     # The next run starts afresh: nothing was kept, so the trainer runs again.

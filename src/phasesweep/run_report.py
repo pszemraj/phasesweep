@@ -9,15 +9,19 @@ touches a stream or a clock, so a block's text is a pure function of its fields.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import ClassVar
 
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.engine.state import Winner
+from phasesweep.config.search import phase_draws
+from phasesweep.engine.state import PhaseCounts, Winner
+from phasesweep.evidence.models import WandbExtractor
 from phasesweep.runtime.terminal import (
     REPORT_LOGGER,
     ReportBlock,
     Style,
+    break_path,
     pack,
     paint,
     param_text,
@@ -448,3 +452,431 @@ def winner_line(experiment: Experiment, phase: Phase, winner: Winner) -> WinnerL
     """
     head, tail = winner_facts(winner, experiment.metric.name)
     return WinnerLine(phase.name, phase_label_width(experiment), tuple(head), tuple(tail))
+
+
+#: Width of the label column in the banner, after its two-column indent.
+_BANNER_LABEL_WIDTH = 10
+
+_INDENT = "  "
+
+
+@dataclass(frozen=True)
+class BannerRow:
+    """One labelled value of the banner, drawn dim and broken at slashes when it is a path."""
+
+    label: str
+    text: str
+    is_path: bool = False
+
+
+@dataclass(frozen=True)
+class BannerPhase:
+    """One phase of the banner: its name and the facts of what it will run."""
+
+    name: str
+    facts: tuple[str, ...]
+
+
+def _label_column(label: str, *, color: bool) -> str:
+    """Pad a banner label to its column and style it.
+
+    :param str label: The label text.
+    :param bool color: Whether to style the label.
+    :return str: The indent, the label padded to the column and its styling.
+    """
+    return _INDENT + paint(label, "label", color=color) + " " * (_BANNER_LABEL_WIDTH - len(label))
+
+
+def _value_lines(row: BannerRow, room: int, *, color: bool) -> list[str]:
+    """Fit one banner value to ``room`` columns, a path broken at slashes and prose wrapped.
+
+    :param BannerRow row: The row whose value is drawn.
+    :param int room: Columns left after the label column.
+    :param bool color: Whether to style a path.
+    :return list[str]: The value's lines, without the label column.
+    """
+    if len(row.text) <= room:
+        lines = [row.text]
+    elif row.is_path:
+        lines = break_path(row.text, room)
+    else:
+        lines = wrap(row.text, room)
+    return [paint(line, "path", color=color) if row.is_path else line for line in lines]
+
+
+@dataclass(frozen=True)
+class Banner(ReportBlock):
+    """What a run is about to do: the experiment, its phases and where everything goes."""
+
+    timestamped: ClassVar[bool] = False
+
+    experiment: str
+    head: tuple[BannerRow, ...]
+    phases: tuple[BannerPhase, ...]
+    tail: tuple[BannerRow, ...]
+
+    def render(self, width: int, *, color: bool) -> list[str]:
+        """Draw the banner as labelled rows under its title.
+
+        :param int width: Columns available to each line.
+        :param bool color: Whether to style the labels and paths.
+        :return list[str]: The lines, ending with a blank line that separates the progress.
+        """
+        indent = len(_INDENT) + _BANNER_LABEL_WIDTH
+        room = max(width - indent, 20)
+        lines = [f"{paint('phasesweep run', 'label', color=color)}{_GAP}{self.experiment}", ""]
+        for row in self.head:
+            lines.extend(self._row(row, room, color=color))
+        label = _label_column("phases", color=color)
+        name_width = max((len(phase.name) for phase in self.phases), default=0)
+        for number, phase in enumerate(self.phases):
+            drawn = _lay_out(phase.name, name_width, phase.facts[:1], phase.facts[1:], room)
+            lines.extend(
+                (label if number == 0 and index == 0 else " " * indent) + line
+                for index, line in enumerate(drawn)
+            )
+        for row in self.tail:
+            lines.extend(self._row(row, room, color=color))
+        return [*lines, ""]
+
+    @staticmethod
+    def _row(row: BannerRow, room: int, *, color: bool) -> list[str]:
+        """Draw one labelled value, its label on the first line only.
+
+        :param BannerRow row: The row to draw.
+        :param int room: Columns left after the label column.
+        :param bool color: Whether to style the label and a path.
+        :return list[str]: The row's lines.
+        """
+        values = _value_lines(row, room, color=color)
+        pad = " " * (len(_INDENT) + _BANNER_LABEL_WIDTH)
+        return [
+            (_label_column(row.label, color=color) if index == 0 else pad) + value
+            for index, value in enumerate(values)
+        ]
+
+    def __str__(self) -> str:
+        """Return the banner's facts on one line.
+
+        :return str: The one-line text.
+        """
+        rows = [f"{row.label} {row.text}" for row in self.head]
+        phases = "; ".join(f"{phase.name} {', '.join(phase.facts)}" for phase in self.phases)
+        rows += [f"phases {phases}", *(f"{row.label} {row.text}" for row in self.tail)]
+        return f"phasesweep run {self.experiment}{_GAP}{_GAP.join(rows)}"
+
+
+def _gpu_fact(phase: Phase) -> str:
+    """Name a phase's GPU policy with the device list the config sets, if any.
+
+    :param Phase phase: The phase.
+    :return str: For example ``gpu none`` or ``gpu single_per_trial ids 0,1``.
+    """
+    if phase.gpu_ids is not None:
+        return f"gpu {phase.gpu_policy} ids {','.join(str(index) for index in phase.gpu_ids)}"
+    if phase.gpu_devices is not None:
+        return f"gpu {phase.gpu_policy} devices {','.join(phase.gpu_devices)}"
+    return f"gpu {phase.gpu_policy}"
+
+
+def _trackers(experiment: Experiment) -> str:
+    """Name the services a run reads results from, MLflow and W&B, or ``none``.
+
+    Only the target is named, never a credential or an environment value.
+
+    :param Experiment experiment: The experiment.
+    :return str: The services, comma-separated, or ``none``.
+    """
+    names = []
+    if experiment.mlflow is not None:
+        names.append(f"mlflow {experiment.mlflow.tracking_uri}")
+    extractors = [
+        experiment.metric.extractor,
+        *(item.extractor for item in [*experiment.constraints, *experiment.observe]),
+    ]
+    for extractor in extractors:
+        if isinstance(extractor, WandbExtractor):
+            name = f"wandb {extractor.entity}/{extractor.project}"
+            if name not in names:
+                names.append(name)
+    return ", ".join(names) or "none"
+
+
+def banner(
+    experiment: Experiment,
+    *,
+    config_path: str,
+    workdir: str,
+    log_path: str,
+    from_phase: str | None,
+) -> Banner:
+    """Build the banner a live run opens with.
+
+    :param Experiment experiment: The experiment about to run.
+    :param str config_path: The config file, as the console shows it.
+    :param str workdir: The directory the run writes its artifacts under, as shown.
+    :param str log_path: Absolute path of ``run.log``.
+    :param str | None from_phase: The phase ``--from-phase`` starts at, if given.
+    :return Banner: The block to log.
+    """
+    storage = "none (in memory)" if experiment.storage is None else experiment.storage
+    tail = [BannerRow("from", from_phase)] if from_phase is not None else []
+    tail += [
+        BannerRow("storage", storage),
+        BannerRow("tracker", _trackers(experiment)),
+        BannerRow("workdir", workdir, is_path=True),
+        BannerRow("log", log_path, is_path=True),
+    ]
+    phases = tuple(
+        BannerPhase(
+            phase.name,
+            (
+                plural(phase.n_trials, "trial"),
+                phase.sampler.type if phase_draws(phase) else "fixed",
+                f"{phase.n_jobs} at a time",
+                _gpu_fact(phase),
+            ),
+        )
+        for phase in experiment.phases
+    )
+    return Banner(
+        experiment.experiment,
+        (BannerRow("config", config_path, is_path=True),),
+        phases,
+        tuple(tail),
+    )
+
+
+def duration_text(seconds: float) -> str:
+    """Format an elapsed time: tenths of a second under a minute, then minutes and hours.
+
+    :param float seconds: Elapsed wall-clock seconds.
+    :return str: For example ``3.1s``, ``2m05s`` or ``1h02m05s``.
+    """
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, rest = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{rest:02d}s"
+    return f"{minutes}m{rest:02d}s"
+
+
+@dataclass(frozen=True)
+class SummaryPhase:
+    """One phase of the closing summary: how its trials ended and what won."""
+
+    name: str
+    counts: tuple[str, ...]
+    winner: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Summary(ReportBlock):
+    """What a finished run did and where it went: counts, winners, files and the next command."""
+
+    timestamped: ClassVar[bool] = False
+
+    headline: str
+    phases: tuple[SummaryPhase, ...]
+    written_root: str
+    written: tuple[str, ...]
+    next_command: str
+
+    def render(self, width: int, *, color: bool) -> list[str]:
+        """Draw the summary in sections separated by blank lines.
+
+        :param int width: Columns available to each line.
+        :param bool color: Whether to style the labels, the winner mark and the paths.
+        :return list[str]: The lines, starting with a blank line that separates the progress.
+        """
+        name_width = max((len(phase.name) for phase in self.phases), default=0)
+        pad = _INDENT + " " * (name_width + len(_GAP))
+        lines = ["", *self._headline_lines(width, color=color), ""]
+        for phase in self.phases:
+            drawn_counts = _lay_out_clauses(
+                phase.name, name_width, phase.counts, width - len(_INDENT)
+            )
+            lines.extend(_INDENT + line for line in drawn_counts)
+            if phase.winner:
+                lead = f"{pad}winner{_GAP}"
+                drawn = pack(phase.winner, width, indent=" " * len(lead))
+                drawn[0] = lead + drawn[0].removeprefix(" " * len(lead))
+                lines.append(_paint_word(drawn[0], "winner", "winner", start=len(pad), color=color))
+                lines.extend(drawn[1:])
+        if self.written:
+            lines.append("")
+            lines.extend(self._written_lines(width, color=color))
+        following = wrap(f"Next: {self.next_command}", width, subsequent_indent=" " * 6)
+        following[0] = paint("Next:", "label", color=color) + following[0].removeprefix("Next:")
+        return [*lines, "", *following]
+
+    def _headline_lines(self, width: int, *, color: bool) -> list[str]:
+        """Wrap the headline, styling its opening words.
+
+        :param int width: Columns available to each line.
+        :param bool color: Whether to style the opening words.
+        :return list[str]: The headline's lines.
+        """
+        lines = wrap(self.headline, width)
+        opening = self.headline.split(":")[0]
+        lines[0] = paint(opening, "label", color=color) + lines[0].removeprefix(opening)
+        return lines
+
+    def _written_lines(self, width: int, *, color: bool) -> list[str]:
+        """Draw the files the run wrote, relative to the directory they are under.
+
+        :param int width: Columns available to each line.
+        :param bool color: Whether to style the label and the paths.
+        :return list[str]: The section's lines.
+        """
+        head = f"Written under {self.written_root}"
+        if len(head) > width:
+            drawn = [
+                "Written under",
+                *break_path(self.written_root, width, indent=_INDENT),
+            ]
+        else:
+            drawn = [head]
+        drawn[0] = paint("Written under", "label", color=color) + drawn[0].removeprefix(
+            "Written under"
+        )
+        return [
+            *drawn,
+            *(_INDENT + paint(path, "path", color=color) for path in self.written),
+        ]
+
+    def __str__(self) -> str:
+        """Return the summary's facts on one line.
+
+        :return str: The one-line text.
+        """
+        phases = [
+            f"{phase.name}: {', '.join(phase.counts)}"
+            f"{', winner ' + ' '.join(phase.winner) if phase.winner else ''}"
+            for phase in self.phases
+        ]
+        written = (
+            [f"Written under {self.written_root}: {', '.join(self.written)}"]
+            if self.written
+            else []
+        )
+        return _GAP.join([self.headline, *phases, *written, f"Next: {self.next_command}"])
+
+
+@dataclass(frozen=True)
+class NothingToRun(ReportBlock):
+    """The one line a run closes with when every trial was already finished and nothing changed."""
+
+    timestamped: ClassVar[bool] = False
+
+    elapsed: str
+    trials: int
+    generation_id: str
+
+    def _text(self) -> str:
+        """Say that the run launched nothing and wrote nothing.
+
+        :return str: The sentence.
+        """
+        return (
+            f"Finished in {self.elapsed}: nothing to run, {plural(self.trials, 'trial')} already "
+            f"finished, and generation {self.generation_id} already publishes these winners."
+        )
+
+    def render(self, width: int, *, color: bool) -> list[str]:
+        """Draw the sentence wrapped to the terminal.
+
+        :param int width: Columns available to each line.
+        :param bool color: Whether to style the opening words.
+        :return list[str]: A blank line, then the sentence.
+        """
+        lines = wrap(self._text(), width)
+        opening = f"Finished in {self.elapsed}"
+        lines[0] = paint(opening, "label", color=color) + lines[0].removeprefix(opening)
+        return ["", *lines]
+
+    def __str__(self) -> str:
+        """Return the sentence.
+
+        :return str: The one-line text.
+        """
+        return self._text()
+
+
+def _count_clauses(counts: PhaseCounts) -> tuple[str, ...]:
+    """List a phase's nonzero trial counts, such as ``3 complete`` and ``1 failed``.
+
+    :param PhaseCounts counts: The phase's counts.
+    :return tuple[str, ...]: One clause per nonzero count, or ``no trials`` when all are zero.
+    """
+    named = [
+        (counts.complete, "complete"),
+        (counts.failed, "failed"),
+        (counts.infeasible, "infeasible"),
+        (counts.interrupted, "interrupted"),
+    ]
+    return tuple(f"{count} {name}" for count, name in named if count) or ("no trials",)
+
+
+def summary(
+    experiment: Experiment,
+    *,
+    elapsed: float,
+    counts: Mapping[str, PhaseCounts],
+    winners: Mapping[str, Winner],
+    from_phase: str | None,
+    written_root: str,
+    written: Sequence[str],
+    next_command: str,
+) -> Summary:
+    """Build the summary a successful run closes with.
+
+    :param Experiment experiment: The experiment that ran.
+    :param float elapsed: Wall-clock seconds the engine took.
+    :param Mapping[str, PhaseCounts] counts: Trial counts of each phase the run executed.
+    :param Mapping[str, Winner] winners: Every phase's winner.
+    :param str | None from_phase: The phase ``--from-phase`` started at; earlier phases are
+        reported as skipped.
+    :param str written_root: The directory the written files are under, as shown.
+    :param Sequence[str] written: The files this run wrote, relative to ``written_root``.
+    :param str next_command: The command that reads the result.
+    :return Summary: The block to log.
+    """
+    names = [phase.name for phase in experiment.phases]
+    skipped = set(names[: names.index(from_phase)]) if from_phase in names else set()
+    phases = []
+    for phase in experiment.phases:
+        winner = winners.get(phase.name)
+        if phase.name in skipped:
+            clauses: tuple[str, ...] = ("skipped",)
+        elif phase.name in counts:
+            clauses = _count_clauses(counts[phase.name])
+        else:
+            clauses = ("trial counts unavailable",)
+        facts: tuple[str, ...] = ()
+        if winner is not None:
+            head, tail = winner_facts(winner, experiment.metric.name)
+            facts = (*head, *tail)
+        phases.append(SummaryPhase(phase.name, clauses, facts))
+    trials = sum(item.total for item in counts.values())
+    earlier = sum(item.earlier for item in counts.values())
+    headline = (
+        f"Finished in {duration_text(elapsed)}: {plural(len(counts), 'phase')}, "
+        f"{plural(trials, 'trial')}, {earlier} from a previous run"
+    )
+    return Summary(headline, tuple(phases), written_root, tuple(written), next_command)
+
+
+def nothing_to_run(
+    *, elapsed: float, counts: Mapping[str, PhaseCounts], generation_id: str
+) -> NothingToRun:
+    """Build the closing line of a run that replayed a published result unchanged.
+
+    :param float elapsed: Wall-clock seconds the engine took.
+    :param Mapping[str, PhaseCounts] counts: Trial counts of each phase the run replayed.
+    :param str generation_id: The generation that already publishes the winners.
+    :return NothingToRun: The block to log.
+    """
+    trials = sum(item.total for item in counts.values())
+    return NothingToRun(duration_text(elapsed), trials, generation_id)

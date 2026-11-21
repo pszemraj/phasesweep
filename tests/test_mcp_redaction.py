@@ -446,7 +446,7 @@ def test_trial_failure_reasons_and_their_stderr_quote_never_reach_status_or_snap
         run_experiment(experiment)
 
     run_log = (_experiment_dir(experiment) / "run.log").read_text()
-    assert "reason=non-zero exit code 1; stderr: RuntimeError: STDERR_SENTINEL" in run_log
+    assert "reason: non-zero exit code 1; stderr: RuntimeError: STDERR_SENTINEL" in run_log
     status = read_status(experiment)
     payloads = [
         status,

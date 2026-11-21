@@ -249,7 +249,10 @@ def test_format_refusal_gives_the_same_fix_to_every_command(
     assert "checkout" not in output.err
     assert "format None" not in output.err
     assert not [record for record in caplog.records if "DRY RUN" in record.getMessage()]
-    assert output.err.endswith(f"\nfix: {OTHER_FORMAT_STEP}\n")
+    lines = output.err.splitlines()
+    if command == "run" and "--dry-run" not in options:
+        assert lines.pop().startswith("log: ")
+    assert "\n".join(lines).endswith(f"\nfix: {OTHER_FORMAT_STEP}")
     assert tree_snapshot(materialized.root) == before
 
 

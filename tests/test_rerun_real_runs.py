@@ -522,7 +522,7 @@ def test_status_tells_a_killed_run_from_a_live_one(harness: _Harness) -> None:
 def test_a_stopped_run_ends_with_the_next_step_once(
     harness: _Harness, sig: signal.Signals, persistent: bool
 ) -> None:
-    """After SIGINT, SIGHUP or SIGTERM the last line says to rerun, and what that keeps."""
+    """After SIGINT, SIGHUP or SIGTERM the line before the log path says to rerun, and what that keeps."""
     phase = Phase(
         name="p",
         n_trials=2,
@@ -552,6 +552,7 @@ def test_a_stopped_run_ends_with_the_next_step_once(
         "no completed trials."
     )
     lines = harness.log.read_text().splitlines()
-    assert lines[-1] == expected
+    assert lines[-2] == expected
+    assert lines[-1].startswith("log: ") and lines[-1].endswith("run.log")
     assert lines.count(expected) == 1
     assert "Aborted." not in lines

@@ -7,8 +7,10 @@ import logging
 import os
 import shlex
 import sys
+import time
 import traceback
 from collections.abc import Iterator, Sequence
+from contextvars import ContextVar
 from importlib import resources
 from pathlib import Path
 
@@ -44,7 +46,10 @@ from phasesweep.engine.locking import experiment_is_busy
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_dir,
+    _generation_summary_path,
     _generation_winner_path,
+    _phase_dir,
+    _run_log_path,
     _trial_dir_for,
 )
 from phasesweep.engine.preview import validate_trial_targets
@@ -64,7 +69,7 @@ from phasesweep.engine.read import (
     require_study,
     unpublished_winner_step,
 )
-from phasesweep.engine.run import run_experiment
+from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.engine.study_policy import _require_launch_target
 from phasesweep.errors import (
     OperatorAction,
@@ -82,6 +87,7 @@ from phasesweep.mcp.registry import (
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.tool_names import TOOL_NAMES
 from phasesweep.reporting import _progress_values, report_objective
+from phasesweep.run_report import banner, nothing_to_run, report, summary
 from phasesweep.runtime.console import ConsoleHandler
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
@@ -99,7 +105,14 @@ from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     install_signal_handlers,
 )
-from phasesweep.runtime.terminal import plural, terminal_width, use_color
+from phasesweep.runtime.terminal import (
+    ReportBlock,
+    display_path,
+    paint,
+    plural,
+    terminal_width,
+    use_color,
+)
 from phasesweep.trial_table import render_trial_tables, unsettled_running_comment
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
@@ -135,6 +148,9 @@ _ABORT_EXIT = 130  # 128 + SIGINT
 # Column limits for the `explain` listing.
 _SIGNATURE_COLUMN_CAP = 40
 _SUMMARY_WIDTH = 72
+
+#: The ``run.log`` of the run in progress, which :func:`main` names last on every exit.
+_RUN_LOG: ContextVar[Path | None] = ContextVar("phasesweep_run_log", default=None)
 
 
 @contextlib.contextmanager
@@ -184,14 +200,50 @@ def _operational_error_text(exc: PhaseSweepError) -> str:
 
 
 def main() -> None:
-    """Run the CLI behind a process-level error boundary.
+    """Run the CLI behind a process-level error boundary, then name the run's log.
 
-    Click exceptions reach this boundary; explicit ``SystemExit`` statuses pass through.
+    Click exceptions reach this boundary; explicit ``SystemExit`` statuses pass through. A
+    ``run`` that went past its config prints ``log: <path>`` last, after its error or resume
+    lines, whenever ``run.log`` exists, so the file is named however the command ended.
 
     :raises SystemExit: Always, carrying one of ``_USAGE_EXIT`` (bad input),
         ``_FAILURE_EXIT`` (the run failed), ``_INTERNAL_EXIT`` (a phasesweep
         bug), ``_ABORT_EXIT`` (interrupted), or the status the command or
         Click chose.
+    """
+    _RUN_LOG.set(None)
+    try:
+        _error_boundary()
+    finally:
+        run_log = _RUN_LOG.get()
+        if run_log is not None and _is_readable_file(run_log):
+            color = use_color(sys.stderr)
+            click.echo(
+                f"{paint('log:', 'label', color=color)} "
+                f"{paint(str(run_log.resolve()), 'path', color=color)}",
+                err=True,
+            )
+
+
+def _is_readable_file(path: Path) -> bool:
+    """Tell whether ``path`` is an existing file, treating an unreachable one as absent.
+
+    The exit path runs after a failure that may be an inaccessible directory, so asking about
+    the file must not raise a second error over the first.
+
+    :param Path path: The file to look for.
+    :return bool: ``True`` when it exists as a file and can be examined.
+    """
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _error_boundary() -> None:
+    """Run the CLI and turn each kind of failure into its message and exit status.
+
+    :raises SystemExit: Always, with the status :func:`main` documents.
     """
     try:
         status = cli.main(standalone_mode=False)
@@ -457,7 +509,9 @@ def report_objective_cmd(
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Run configured phases. Use --from-phase to skip earlier phases; only the winners "
-        "inherited by the remaining phases are required."
+        "inherited by the remaining phases are required. The console shows what will run, "
+        "each trial and winner as it finishes, warnings and a summary; run.log in the "
+        "experiment's directory holds the full timestamped log."
     ),
     short_help="Run configured phases.",
 )
@@ -518,8 +572,24 @@ def run(
             if from_phase not in valid:
                 click.echo(f"--from-phase={from_phase!r} not in {valid}", err=True)
                 sys.exit(2)
+        run_log = _run_log_path(config)
+        if not dry_run:
+            _RUN_LOG.set(run_log)
+            report.info(
+                banner(
+                    config,
+                    config_path=display_path(config_path),
+                    workdir=display_path(_experiment_dir(config)),
+                    log_path=str(run_log.resolve()),
+                    from_phase=from_phase,
+                )
+            )
+        finished: list[TerminalReport] = []
+        wall_start, started = time.time(), time.monotonic()
         try:
-            run_experiment(config, from_phase=from_phase, dry_run=dry_run)
+            run_experiment(
+                config, from_phase=from_phase, dry_run=dry_run, terminal_callback=finished.append
+            )
         except PhaseSweepShutdown as exc:
             if exc.published_result_committed:
                 click.echo(
@@ -530,6 +600,69 @@ def run(
             elif not dry_run:
                 click.echo(_resume_hint(config), err=True)
             raise
+        if not dry_run and finished:
+            report.info(
+                _closing_block(
+                    config,
+                    finished[-1],
+                    elapsed=time.monotonic() - started,
+                    wall_start=wall_start,
+                    config_path=config_path,
+                    settings=settings,
+                    from_phase=from_phase,
+                )
+            )
+
+
+def _closing_block(
+    config: Experiment,
+    outcome: TerminalReport,
+    *,
+    elapsed: float,
+    wall_start: float,
+    config_path: Path,
+    settings: tuple[str, ...],
+    from_phase: str | None,
+) -> ReportBlock:
+    """Build what a successful run closes with: its summary, or that it had nothing to run.
+
+    :param Experiment config: The config that ran.
+    :param TerminalReport outcome: The engine's report of the finished invocation.
+    :param float elapsed: Seconds the engine took.
+    :param float wall_start: ``time.time()`` when the engine started, to tell the files this
+        run wrote from those it found.
+    :param Path config_path: The config path as typed.
+    :param tuple[str, ...] settings: The ``--set`` assignments as typed.
+    :param str | None from_phase: The ``--from-phase`` value, if given.
+    :return ReportBlock: The block to log.
+    """
+    if outcome.replayed_generation_id is not None:
+        return nothing_to_run(
+            elapsed=elapsed,
+            counts=outcome.phase_counts,
+            generation_id=outcome.replayed_generation_id,
+        )
+    root = _experiment_dir(config)
+    candidates = [
+        _generation_summary_path(config, outcome.generation_id),
+        *(_phase_dir(config, phase.name) / "trials.csv" for phase in config.phases),
+    ]
+    written = [
+        path.relative_to(root).as_posix()
+        for path in candidates
+        if path.is_relative_to(root) and path.is_file() and path.stat().st_mtime >= wall_start
+    ]
+    arguments = [str(config_path), *(part for item in settings for part in ("--set", item))]
+    return summary(
+        config,
+        elapsed=elapsed,
+        counts=outcome.phase_counts,
+        winners=outcome.winners or {},
+        from_phase=from_phase,
+        written_root=display_path(root),
+        written=written,
+        next_command=shlex.join(["phasesweep", "status", *arguments, "--trials"]),
+    )
 
 
 def _resume_hint(config: Experiment) -> str:

@@ -13,7 +13,7 @@ from phasesweep.engine.read import _read_generation_selection, read_result
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import LogRegexExtractor
-from tests.conftest import invoke_cli_boundary, make_experiment
+from tests.conftest import after_banner, invoke_cli_boundary, make_experiment
 from tests.experiments import phase_payload, write_experiment
 
 
@@ -172,7 +172,7 @@ def test_cli_from_phase_into_a_workdir_without_results_names_the_fix(
     )
 
     assert status == 1
-    error = capsys.readouterr().err
+    error = after_banner(capsys.readouterr().err)
     assert error.startswith("phasesweep: Winner file missing for phase 'parent'")
     assert "operational error" not in error
     assert "no generation has been published" in error

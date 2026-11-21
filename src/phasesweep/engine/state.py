@@ -161,6 +161,28 @@ class Winner:
     placeholder_keys: frozenset[str] = frozenset()
 
 
+@dataclass(frozen=True)
+class PhaseCounts:
+    """A phase's trials by recorded state when the phase ended, as the run's summary reports them.
+
+    ``earlier`` counts the trials, in any of those states, that a previous run recorded.
+    """
+
+    complete: int = 0
+    infeasible: int = 0
+    failed: int = 0
+    interrupted: int = 0
+    earlier: int = 0
+
+    @property
+    def total(self) -> int:
+        """Count every trial in a reported state.
+
+        :return int: Complete, infeasible, failed and interrupted trials together.
+        """
+        return self.complete + self.infeasible + self.failed + self.interrupted
+
+
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"
 GENERATION_ID_ATTR = "phasesweep_generation_id"
 ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
