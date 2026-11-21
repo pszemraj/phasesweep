@@ -12,7 +12,15 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.runtime.terminal import display_path, paint, plural, terminal_width, use_color, wrap
+from phasesweep.runtime.terminal import (
+    display_path,
+    paint,
+    plural,
+    terminal_width,
+    use_color,
+    wrap,
+    wrap_labeled,
+)
 
 
 class _Stream:
@@ -119,6 +127,21 @@ def test_wrap_never_cuts_a_word_at_a_hyphen_or_a_slash() -> None:
         name,
         "(the trainer writes it)",
     ]
+
+
+def test_wrap_labeled_hangs_every_later_line_and_paragraph_under_the_text() -> None:
+    """The label leads the first line only, and a path wider than the line stays whole."""
+    path = "/data/" + "x" * 40
+    lines = wrap_labeled("fix:", f"Open {path} and rerun the failed trial.\nThen check it.", 30)
+
+    assert lines == [
+        "fix: Open",
+        f"     {path}",
+        "     and rerun the failed",
+        "     trial.",
+        "     Then check it.",
+    ]
+    assert wrap_labeled("fix:", "", 30) == ["fix:"]
 
 
 def test_wrap_keeps_a_minimum_text_width_on_a_very_narrow_terminal() -> None:

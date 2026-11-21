@@ -118,6 +118,25 @@ def wrap(text: str, width: int, *, indent: str = "", subsequent_indent: str = ""
     )
 
 
+def wrap_labeled(label: str, text: str, width: int) -> list[str]:
+    """Wrap ``text`` after ``label``, every later line hanging under the text.
+
+    A line break in ``text`` starts a new paragraph, which hangs under the text too. A word
+    wider than the line is kept whole, as :func:`wrap` does.
+
+    :param str label: Leading text of the first line, such as ``fix:``.
+    :param str text: Prose that follows the label.
+    :param int width: Maximum visible width of each line, except for a word wider than that.
+    :return list[str]: The lines; the label alone when ``text`` has no words.
+    """
+    hanging = " " * (len(label) + 1)
+    paragraphs = text.splitlines() or [""]
+    lines = wrap(paragraphs[0], width, indent=f"{label} ", subsequent_indent=hanging) or [label]
+    for paragraph in paragraphs[1:]:
+        lines.extend(wrap(paragraph, width, indent=hanging, subsequent_indent=hanging) or [""])
+    return lines
+
+
 def display_path(path: Path) -> str:
     """Show ``path`` relative to the working directory, else under ``~``, else in full.
 

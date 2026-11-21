@@ -119,6 +119,7 @@ from phasesweep.runtime.terminal import (
     terminal_width,
     use_color,
     wrap,
+    wrap_labeled,
 )
 from phasesweep.trial_table import render_trial_tables, unsettled_running_comment
 
@@ -208,6 +209,27 @@ def _operational_error_text(exc: PhaseSweepError) -> str:
     return f"{exc}\nfix: {operator_step(exc)}"
 
 
+def _print_operational_error(exc: PhaseSweepError) -> None:
+    """Write ``phasesweep: <diagnosis>`` and its ``fix:`` step to stderr.
+
+    On a terminal each wraps at word boundaries to the width with its text hanging under the
+    label. Redirected, each stays one logical line: scripts and agents match on these sentences,
+    and a refusal may have no ``run.log`` copy to read them from.
+
+    :param PhaseSweepError exc: Operational failure to report.
+    """
+    stream = sys.stderr
+    if not stream.isatty():
+        click.echo(f"phasesweep: {_operational_error_text(exc)}", err=True)
+        return
+    width = terminal_width(stream)
+    lines = [
+        *wrap_labeled("phasesweep:", str(exc), width),
+        *wrap_labeled("fix:", operator_step(exc), width),
+    ]
+    click.echo("\n".join(lines), err=True)
+
+
 def main() -> None:
     """Run the CLI behind a process-level error boundary, then name the run's log.
 
@@ -276,7 +298,7 @@ def _error_boundary() -> None:
         click.echo(f"phasesweep: {exc}", err=True)
         sys.exit(_USAGE_EXIT)
     except PhaseSweepError as exc:
-        click.echo(f"phasesweep: {_operational_error_text(exc)}", err=True)
+        _print_operational_error(exc)
         sys.exit(_FAILURE_EXIT)
     except OSError as exc:
         click.echo(f"phasesweep: operational error: {exc}", err=True)

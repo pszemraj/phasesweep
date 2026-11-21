@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import logging
 import os
 import shutil
 import signal
 import stat
+import struct
 import sys
+import termios
 import textwrap
+import threading
 import time
+import tty
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NoReturn, ParamSpec, TypeVar
@@ -798,6 +804,59 @@ def invoke_cli_boundary(argv: list[str], monkeypatch: pytest.MonkeyPatch) -> int
         logger.setLevel(previous_level)
     code = excinfo.value.code
     return 0 if code is None else int(code)
+
+
+@dataclass
+class TerminalOutput:
+    """What a pseudo-terminal's reader collected, complete once the ``terminal_stderr`` block exits."""
+
+    text: str = ""
+
+    @property
+    def lines(self) -> list[str]:
+        """Return the output split at line ends."""
+        return self.text.split("\n")
+
+
+@contextlib.contextmanager
+def terminal_stderr(columns: int) -> Iterator[TerminalOutput]:
+    """Make ``sys.stderr`` a pseudo-terminal that is ``columns`` wide and collect what it receives.
+
+    ``COLUMNS`` is removed so the width is the terminal's own, the way a person's shell has it, and
+    output processing is off so the text reads back exactly as written. Both are restored on exit.
+
+    :param int columns: Window width the terminal reports.
+    :return Iterator[TerminalOutput]: The collector; its ``text`` is filled when the block exits.
+    """
+    master, slave = os.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
+    tty.setraw(slave)
+    chunks: list[bytes] = []
+
+    def drain() -> None:
+        while True:
+            try:
+                data = os.read(master, 65536)
+            except OSError:
+                return
+            if not data:
+                return
+            chunks.append(data)
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    stream = os.fdopen(slave, "w", encoding="utf-8")
+    output = TerminalOutput()
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.delenv("COLUMNS", raising=False)
+            patch.setattr(sys, "stderr", stream)
+            yield output
+    finally:
+        stream.close()
+        reader.join(timeout=5)
+        os.close(master)
+        output.text = b"".join(chunks).decode("utf-8")
 
 
 def stub_run_command(
