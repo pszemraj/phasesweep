@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -203,7 +204,7 @@ def test_stale_recovery_records_interrupted_unless_the_objective_recorded_a_fail
     study = optuna.create_study()
     _finished(study, 1, "failure")
     _finished(study, 2, "failure")
-    trial = _running_trial(study, recorded)
+    trial = _running_trial(study, deepcopy(recorded))
     predicted = _recovered_trial_state(trial, _parsed_trial_outcome(recorded))
     expected = (
         recorded if recorded is not None else trial_outcome(3, "interrupted", cause=_STALE_CAUSE)
@@ -239,13 +240,16 @@ def test_an_interruption_between_two_failures_leaves_the_streak_at_two() -> None
 def test_recovery_refuses_duplicate_sequences_without_erasing_outcomes(holder: str) -> None:
     """Disputed completion order leaves both saved measurements and aborts intact."""
     phase = make_experiment(max_consecutive_failures=2).phases[0]
-    study = optuna.create_study()
+    study = optuna.create_study(study_name="example::p")
     _finished(study, 1, "failure")
     failed = _running_trial(study, trial_outcome(2, "failure", metric=3.0, abort=_abort(2)))
     succeeded = _running_trial(study, trial_outcome(2, "success", metric=4.0))
     pending = _running_trial(study, None) if holder == "peer" else failed
     before = [trial.user_attrs for trial in study.get_trials()]
-    with pytest.raises(StudySchemaMismatchError, match="both use completion sequence"):
+    with pytest.raises(
+        StudySchemaMismatchError,
+        match="study 'example::p', trials 1 and 2 both use completion sequence 2",
+    ):
         _record_stale_trial_outcome(study, pending, "failure", cause="crashed", policy_phase=phase)
     assert [trial.user_attrs for trial in study.get_trials()] == before
     assert all(trial.state == optuna.trial.TrialState.RUNNING for trial in (failed, succeeded))

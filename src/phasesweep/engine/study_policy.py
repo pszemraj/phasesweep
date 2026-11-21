@@ -267,7 +267,7 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
     recovery_boundary = 0 if recovery is None else recovery.start_after_sequence
 
     trials = study.get_trials(deepcopy=False)
-    outcomes = _unique_trial_outcomes(trials)
+    outcomes = _unique_trial_outcomes(study.study_name, trials)
     for trial in trials:
         if trial.state.is_finished() and trial.number not in outcomes:
             raw = trial.user_attrs.get(TRIAL_OUTCOME_ATTR)

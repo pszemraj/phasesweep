@@ -738,7 +738,7 @@ def _phase_trial_stats(
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_TrialRef] = []
     published_trial_available = False
-    outcomes = _unique_trial_outcomes(trials)
+    outcomes = _unique_trial_outcomes(study_name, trials)
     for trial in trials:
         if published_trial is not None and _published_trial_matches(trial, published_trial):
             published_trial_available = True

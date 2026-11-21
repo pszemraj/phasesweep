@@ -422,10 +422,13 @@ def _parsed_trial_outcome(value: object) -> _ParsedTrialOutcome | None:
     )
 
 
-def _unique_trial_outcomes(trials: Iterable[FrozenTrial]) -> dict[int, _ParsedTrialOutcome]:
+def _unique_trial_outcomes(
+    study_name: str, trials: Iterable[FrozenTrial]
+) -> dict[int, _ParsedTrialOutcome]:
     """Read valid outcomes and reject duplicate completion sequences.
 
-    :param Iterable[FrozenTrial] trials: Trials from one study.
+    :param str study_name: Study to name if its completion order is ambiguous.
+    :param Iterable[FrozenTrial] trials: Trials from that study.
     :raises StudySchemaMismatchError: Two outcomes share a completion sequence.
     :return dict[int, _ParsedTrialOutcome]: Parsed outcomes keyed by trial number.
     """
@@ -438,7 +441,8 @@ def _unique_trial_outcomes(trials: Iterable[FrozenTrial]) -> dict[int, _ParsedTr
         other = sequences.get(parsed.sequence)
         if other is not None:
             raise StudySchemaMismatchError(
-                f"trials {other} and {trial.number} both use completion sequence {parsed.sequence}"
+                f"In study {study_name!r}, trials {other} and {trial.number} "
+                f"both use completion sequence {parsed.sequence}."
             )
         sequences[parsed.sequence] = trial.number
         outcomes[trial.number] = parsed

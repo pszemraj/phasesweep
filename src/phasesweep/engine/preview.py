@@ -131,14 +131,15 @@ def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
 
 
 def _recovered_running_states(
-    trials: Sequence[optuna.trial.FrozenTrial],
+    study_name: str, trials: Sequence[optuna.trial.FrozenTrial]
 ) -> list[RecoveredTrialState]:
     """Predict what a launch's recovery settles each RUNNING attempt as.
 
-    :param Sequence[optuna.trial.FrozenTrial] trials: A phase study's trials.
+    :param str study_name: Phase study being previewed.
+    :param Sequence[optuna.trial.FrozenTrial] trials: The same study's trials.
     :return list[RecoveredTrialState]: One prediction per RUNNING trial, in trial order.
     """
-    outcomes = _unique_trial_outcomes(trials)
+    outcomes = _unique_trial_outcomes(study_name, trials)
     return [
         _recovered_trial_state(trial, outcomes.get(trial.number))
         for trial in trials
@@ -159,7 +160,7 @@ def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
     if study is None:
         return RecordedPhase(finished=0, measured=0, running=0, reruns=0, study=None)
     trials = study.get_trials(deepcopy=False)
-    recovered = _recovered_running_states(trials)
+    recovered = _recovered_running_states(study.study_name, trials)
     if "EVIDENCE_PENDING" in recovered:
         raise PhaseSweepError(
             f"Phase {phase.name!r} has completed trainer evidence awaiting recovery; "
@@ -235,7 +236,7 @@ def validate_trial_targets(experiment: Experiment) -> None:
     for phase in phases:
         study = studies[phase.name]
         trials = [] if study is None else study.get_trials(deepcopy=False)
-        recovered = _recovered_running_states(trials)
+        recovered = [] if study is None else _recovered_running_states(study.study_name, trials)
         _validate_fixed_configuration_target(
             phase,
             finished=_finished_trial_count(trials)

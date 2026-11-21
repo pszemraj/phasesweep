@@ -1357,7 +1357,9 @@ def _fail_stale_running_trial(
     """
     try:
         trial = study._storage.get_trial(trial._trial_id)
-        outcome = _unique_trial_outcomes(study.get_trials(deepcopy=False)).get(trial.number)
+        outcome = _unique_trial_outcomes(study.study_name, study.get_trials(deepcopy=False)).get(
+            trial.number
+        )
     except StudySchemaMismatchError:
         raise
     except Exception as exc:
