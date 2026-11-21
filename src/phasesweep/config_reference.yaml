@@ -7,6 +7,7 @@
 # The file is one UTF-8 YAML mapping. An unknown or duplicate key, or a value that breaks a constraint stated here, fails config load with an error naming it.
 # Paths: a relative workdir, journal path or execution.cwd resolves against the config file's directory, after symlinks. A leading ~ expands from HOME.
 # Trial paths (extractor path and file, gate path) are relative to the attempt directory, nonempty, without NUL or .. segments, and name a file below it.
+# A file read for a value or a digest must also resolve inside the attempt directory: a symlink out of it fails the read, while one that stays inside works.
 # JSON evidence is parsed strictly: duplicate names or NaN and Infinity tokens invalidate the file. A JSON key is a dotted path of nonempty object keys.
 # YAML scalars follow PyYAML (YAML 1.1) typing: 1e-3 and 1.0e3 load as strings, 1.0e-3, 0.001 and 1.0e+3 as floats.
 # Numeric keys accept numeric strings, reject booleans and must be finite. Bounds are inclusive, and a lower bound may not exceed its upper bound.
@@ -284,6 +285,7 @@ phases: list[object] (required)
 
         # Trial path, which names a directory when source is directory. There . names the attempt directory itself.
         # Warning: . counts the files PhaseSweep writes there, such as stdout.log, stderr.log, command.txt and the trainer input.
+        # With source json the file must resolve inside the attempt directory, so a symlink out of it fails the gate. file and directory sizes read no value.
         path: string (required)
 
         # JSON key of the byte count, for example artifact.bytes.
@@ -298,7 +300,7 @@ phases: list[object] (required)
       # Variant json_equals: require a JSON value to equal a scalar of the same JSON type, so true, 1 and 1.0 differ. A missing file or key fails the gate.
       - type: "json_equals" (required)
 
-        # JSON file to read, for example result.json.
+        # JSON file to read, for example result.json. It must resolve inside the attempt directory, so a symlink out of it fails the gate.
         path: string (required)
 
         # JSON key of the value, for example eval.loss.
@@ -310,7 +312,7 @@ phases: list[object] (required)
       # Variant json_scalar_bound: require a finite JSON number within min and max, at least one of which is set. A boolean or a string fails the gate.
       - type: "json_scalar_bound" (required)
 
-        # JSON file holding the number, for example result.json.
+        # JSON file holding the number, for example result.json. It must resolve inside the attempt directory, so a symlink out of it fails the gate.
         path: string (required)
 
         # JSON key of the number, for example eval.loss.
@@ -345,7 +347,7 @@ phases: list[object] (required)
       # Variant sha256: require the exact SHA-256 digest of a file, hashed after the trainer exits. A directory or a missing file fails the gate.
       - type: "sha256" (required)
 
-        # File to hash, for example model.safetensors.
+        # File to hash, for example model.safetensors. It must resolve inside the attempt directory, so a symlink out of it fails the gate.
         path: string (required)
 
         # Expected digest: 64 hexadecimal characters. Uppercase is accepted and lowercased. A mismatch fails the gate.
@@ -527,6 +529,7 @@ JsonExtractor:
   type: "json" (required)
 
   # JSON file, for example result.json. The trainer finds the attempt directory through {trial_dir} or PHASESWEEP_TRIAL_DIR.
+  # It must resolve inside the attempt directory, so a symlink to a results file outside it fails the read; copy such a file in instead.
   path: string (required)
 
   # JSON key of the number, for example eval.loss. List indexes and keys that contain a dot cannot be addressed.
@@ -541,6 +544,7 @@ JsonEnvelopeExtractor:
 
   # Envelope file. report_objective() writes the metric.extractor path, exported as PHASESWEEP_OBJECTIVE_PATH only for a json_envelope metric.extractor.
   # A constraint's or observation's envelope at another path is the trainer's to write. At the same path it reads the metric's envelope.
+  # It must resolve inside the attempt directory, so a symlink out of it fails the read.
   path: string = "result.json"
 
   # Exact nonempty objective.name the envelope must report, for example eval_loss.
@@ -570,6 +574,7 @@ LogRegexExtractor:
   type: "log_regex" (required)
 
   # Log file, for example stdout.log. stdout.log and stderr.log hold the trainer's two streams, and Python logging writes to stderr by default.
+  # It must resolve inside the attempt directory, so a symlink out of it, including one a trainer puts in place of stdout.log, fails the read.
   file: string = "stdout.log"
 
   # Python regular expression whose required group (?P<value>...) captures the whole metric token. Use loss=(?P<value>\S+) for whitespace delimiters or loss=(?P<value>[^\s,]+) when a comma can follow.

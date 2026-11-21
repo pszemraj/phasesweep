@@ -82,6 +82,37 @@ def _file_digest(raw: bytes) -> dict[str, Any]:
     return {"sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}
 
 
+class OutsideAttemptError(OSError):
+    """A trial-relative evidence path resolves outside its attempt directory."""
+
+
+def attempt_file(trial_dir: Path, relative: str | Path) -> Path:
+    """Return a trial-relative evidence path, refusing one that resolves outside the attempt.
+
+    PhaseSweep reads a trial's objective, constraints, observations, gate values and
+    digests only from files inside that attempt's directory. Config load already refuses
+    absolute and ``..`` paths, so a link is the only way out, and several trials whose
+    links name one shared file would all be scored from whichever trainer wrote it last.
+    A link that stays inside the attempt, such as ``latest -> checkpoint-500``, reads as
+    usual. A missing file resolves inside and keeps the caller's own not-found handling.
+
+    :param Path trial_dir: The attempt directory the file must resolve inside.
+    :param str | Path relative: Configured trial-relative path.
+    :raises OutsideAttemptError: The path resolves outside ``trial_dir``.
+    :return Path: ``trial_dir / relative``, unchanged, for the caller to read.
+    """
+    path = trial_dir / relative
+    resolved = path.resolve()
+    if not resolved.is_relative_to(trial_dir.resolve()):
+        raise OutsideAttemptError(
+            f"`{relative}` in attempt directory {trial_dir} resolves to {resolved}, outside the "
+            "attempt. PhaseSweep scores a trial only from files inside its own attempt directory. "
+            f"Have the trainer write `{relative}` under PHASESWEEP_TRIAL_DIR, copying it there if "
+            "it saves results elsewhere."
+        )
+    return path
+
+
 def load_json_value(
     trial_dir: Path,
     relative_path: str,
@@ -97,6 +128,7 @@ def load_json_value(
     :param dict[str, Any] | None digest: Optional sink that receives the
         ``sha256``/``size_bytes`` of the exact bytes parsed, for evidence
         provenance.
+    :raises OutsideAttemptError: If ``relative_path`` resolves outside ``trial_dir``.
     :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular
         file under ``trial_dir``.
     :raises KeyError: If a segment of the dotted ``key`` path is missing, with the
@@ -107,7 +139,7 @@ def load_json_value(
         duplicate object keys, or a rejected JSON constant).
     :return tuple[Path, Any]: Resolved JSON file path and loaded value.
     """
-    target = trial_dir / relative_path
+    target = attempt_file(trial_dir, relative_path)
     if not target.is_file():
         raise FileNotFoundError(target)
     raw = target.read_bytes()
@@ -164,11 +196,14 @@ def _trial_json_read_errors(target: Path, *, noun: str) -> Iterator[None]:
 
     :param Path target: Trial-relative file being read.
     :param str noun: ``JSON`` or ``JSON envelope`` diagnostic label.
-    :raises ExtractorError: The file is missing, unreadable, or malformed.
+    :raises ExtractorError: The file is missing, unreadable, malformed, or outside the
+        attempt; the last carries the refusal's own text as the trial's failure reason.
     :return Iterator[None]: Context covering the read and parse of the same bytes.
     """
     try:
         yield
+    except OutsideAttemptError as exc:
+        raise ExtractorError(str(exc)) from exc
     except FileNotFoundError as exc:
         missing = (
             f"JSON file not found: {exc.args[0]}"
@@ -219,7 +254,8 @@ def _extract_json(
     :param TrialContext ctx: Trial identity; the file is read from its ``trial_dir``.
     :param JsonExtractor cfg: Relative file path and dotted numeric key.
     :param dict | None provenance: Optional source-evidence sink.
-    :raises ExtractorError: The file or key is missing, JSON is invalid, or the value is nonnumeric.
+    :raises ExtractorError: The file or key is missing, the file resolves outside the attempt,
+        JSON is invalid, or the value is nonnumeric.
     :return float: Configured numeric value.
     """
     digest: dict[str, Any] = {}
@@ -253,13 +289,13 @@ def _extract_json_envelope(
     :param dict[str, Any] | None provenance: Optional sink that receives the
         frozen evidence ``source`` payload — envelope digest plus the
         validated evaluation metadata — on success.
-    :raises ExtractorError: If the envelope is missing, malformed, or belongs to
-        another execution attempt.
+    :raises ExtractorError: If the envelope is missing, resolves outside the attempt
+        directory, is malformed, or belongs to another execution attempt.
     :return float: Validated objective value from the envelope.
     """
     target = ctx.trial_dir / cfg.path
     with _trial_json_read_errors(target, noun="JSON envelope"):
-        raw = target.read_bytes()
+        raw = attempt_file(ctx.trial_dir, cfg.path).read_bytes()
         data = strict_json_loads(raw.decode("utf-8"))
 
     if not isinstance(data, dict):
@@ -361,14 +397,17 @@ def _extract_log_regex(
     :param TrialContext ctx: Trial identity; the log is read from its ``trial_dir``.
     :param LogRegexExtractor cfg: Log path, named value group, and first/last/min/max selector.
     :param dict | None provenance: Optional source-evidence sink.
-    :raises ExtractorError: The log is missing, unreadable, has no numeric match,
-        has a non-finite match under ``min`` or ``max``, or a line eligible for
-        matching is invalid UTF-8.
+    :raises ExtractorError: The log is missing, outside the attempt, unreadable, has no
+        numeric match, has a non-finite match under ``min`` or ``max``, or a line eligible
+        for matching is invalid UTF-8.
     :return float: Selected match value.
     """
     import re
 
-    target = ctx.trial_dir / cfg.file
+    try:
+        target = attempt_file(ctx.trial_dir, cfg.file)
+    except OutsideAttemptError as exc:
+        raise ExtractorError(str(exc)) from exc
     if not target.is_file():
         raise ExtractorError(f"Log file not found: {target}")
 
@@ -961,8 +1000,8 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
     :param Sha256Gate gate: Gate config naming the file and expected digest.
     :return GateResult: Pass/fail result and human-readable detail.
     """
-    path = ctx.trial_dir / gate.path
     try:
+        path = attempt_file(ctx.trial_dir, gate.path)
         if not path.is_file():
             return GateResult(gate.type, False, f"{gate.path} is missing")
         digest = file_sha256(path)
