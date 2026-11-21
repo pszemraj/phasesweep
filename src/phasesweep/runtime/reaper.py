@@ -621,7 +621,7 @@ def _apply_stale_process_decision(
     return _terminate_process_group(decision.pgid, grace_seconds=grace_seconds)
 
 
-def _guardian_exit_timeout() -> float:
+def guardian_exit_timeout() -> float:
     """Return how long the controller waits for a guardian whose trainer root has exited.
 
     Such a guardian ignores cancellation, waits out its helper settle, then gives survivors its
@@ -663,7 +663,7 @@ def _terminate_process_groups(
     the grace period, receives SIGTERM directly; after the grace period it receives SIGKILL
     once a probe finds it still alive. While a guardian still
     runs after the grace period, the confirmation window grows to the rest of
-    :func:`_guardian_exit_timeout`: a guardian whose trainer root already exited ignores
+    :func:`guardian_exit_timeout`: a guardian whose trainer root already exited ignores
     cancellation, waits out the helper settle, then gives survivors its own SIGTERM grace.
 
     :param tuple[int, ...] pgids: Target process-group IDs.
@@ -783,7 +783,7 @@ def _terminate_process_groups(
     # guards gets what is left of the guardian-exit allowance after the grace spent here.
     kill_window = 2.0
     if any(pgid in active_guardians for pgid in survivors):
-        kill_window = max(kill_window, _guardian_exit_timeout() - grace_seconds)
+        kill_window = max(kill_window, guardian_exit_timeout() - grace_seconds)
     kill_deadline = time.monotonic() + kill_window
     while survivors and time.monotonic() < kill_deadline:
         still_alive = []

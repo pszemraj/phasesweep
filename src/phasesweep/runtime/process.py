@@ -31,9 +31,9 @@ from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
     StaleProcessIdentity,
-    _guardian_exit_timeout,
     _process_group_alive,
     _terminate_process_groups,
+    guardian_exit_timeout,
     read_boot_id,
     read_pid_namespace,
     read_proc_starttime,
@@ -115,7 +115,7 @@ def _kill_group(pgid: int, proc: subprocess.Popen[bytes]) -> bool:
 
 
 def _wait_for_guardian_exit(proc: subprocess.Popen[bytes]) -> bool:
-    """Wait :func:`~phasesweep.runtime.reaper._guardian_exit_timeout` for the GPU-lease guardian to exit.
+    """Wait :func:`~phasesweep.runtime.reaper.guardian_exit_timeout` for the GPU-lease guardian to exit.
 
     An uncertain group cleanup leaves the guardian holding its leases; a wait
     that expires must preserve that uncertainty.
@@ -123,7 +123,7 @@ def _wait_for_guardian_exit(proc: subprocess.Popen[bytes]) -> bool:
     :param subprocess.Popen[bytes] proc: Guardian process whose trainer-status pipe became ready or closed.
     :return bool: Whether the guardian exited inside its cleanup allowance.
     """
-    timeout = _guardian_exit_timeout()
+    timeout = guardian_exit_timeout()
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:

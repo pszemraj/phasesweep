@@ -793,7 +793,7 @@ def test_the_guarded_shutdown_window_allows_what_the_guardian_exit_wait_allows(
     )
     assert process._wait_for_guardian_exit(SimpleNamespace(pid=4321, wait=wait))
 
-    allowance = reaper._guardian_exit_timeout()
+    allowance = reaper.guardian_exit_timeout()
     assert (verdict, signalled, waited) == ({1234: False}, [signal.SIGTERM], [allowance])
     assert allowance <= clock[0] < allowance + 0.5
     assert allowance < RUNNER_STOP_GRACE_SECONDS
