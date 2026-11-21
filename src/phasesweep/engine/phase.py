@@ -1216,17 +1216,21 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         trial.set_user_attr(DURATION_ATTR, executed.process.duration_seconds)
         trial.set_user_attr(RETURN_CODE_ATTR, executed.process.return_code)
 
-    def preserve_trainer_on_shutdown() -> None:
-        """Leave extraction pending when shutdown has already cleaned this process slot.
+    def check_shutdown_after_trainer_exit() -> None:
+        """Preserve finished training and classify a stopped trainer as interrupted.
 
-        :raises PhaseSweepShutdown: Shutdown is being serviced after trainer cleanup.
+        :raises PhaseSweepShutdown: Shutdown prevents extraction of a successful trainer's result.
+        :raises TrialExecutionError: Shutdown stopped the trainer before it finished.
         """
         signum = servicing_shutdown_signal()
-        if signum is not None and _completed_trainer_duration(trial, None) is not None:
+        if signum is None:
+            return
+        if _completed_trainer_duration(trial, None) is not None:
             raise PhaseSweepShutdown(signum, ShutdownCleanupReport(signum, True, ()))
+        raise TrialExecutionError(interruption_cause(signum))
 
     # Extraction releases the GPU but still consumes the phase/run budget.
-    preserve_trainer_on_shutdown()
+    check_shutdown_after_trainer_exit()
     try:
         result = extract_trial_result(
             experiment=experiment,
@@ -1236,7 +1240,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         )
     except ShutdownLaunchRefusedError as exc:
         raise PhaseSweepShutdown(exc.signum, ShutdownCleanupReport(exc.signum, True, ())) from exc
-    preserve_trainer_on_shutdown()
+    check_shutdown_after_trainer_exit()
     if result.evidence_unreadable and not result.deadline_exhausted and experiment.persistent:
         # No answer from the tracker says nothing about the training, so no outcome
         # is recorded: recovery extracts it once the tracker answers. An in-memory
@@ -1316,16 +1320,18 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             raise
         except TrialExecutionError as exc:
             signum = servicing_shutdown_signal()
+            cause = str(exc) if signum is None else interruption_cause(signum)
             if signum is None:
-                _record_outcome(run, trial, "failure", cause=str(exc))
+                _record_outcome(run, trial, "failure", cause=cause)
             else:
                 # Under n_jobs > 1 the shutdown handler runs in the main thread and
                 # kills this worker's trainer, which ends here as a trainer error.
-                _record_outcome(run, trial, "interrupted", cause=interruption_cause(signum))
+                _record_outcome(run, trial, "interrupted", cause=cause)
             # An earlier diagnostic would prevent recovery from reading a finished trainer's
             # evidence if its outcome could not be committed.
-            if FAILURE_REASON_ATTR not in trial.user_attrs:
-                trial.set_user_attr(FAILURE_REASON_ATTR, str(exc))
+            if signum is not None or FAILURE_REASON_ATTR not in trial.user_attrs:
+                with _persist_trial_evidence(run, trial):
+                    trial.set_user_attr(FAILURE_REASON_ATTR, cause)
             raise
         except UnsafeProcessCleanupError as exc:
             run.record_fatal(exc)

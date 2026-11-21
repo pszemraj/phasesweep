@@ -520,6 +520,14 @@ def test_a_shutdown_waits_for_parallel_workers_to_record_their_own_trials(
     trials = phase_trials(exp)
     assert [_trial_count_state(trial) for trial in trials] == ["INTERRUPTED", "INTERRUPTED"]
     assert [_cause(trial) for trial in trials] == [_SIGINT_CAUSE, _SIGINT_CAUSE]
+    with (_phase_dir(exp, "p") / "trials.csv").open(newline="") as handle:
+        assert [row[f"user_attr:{FAILURE_REASON_ATTR}"] for row in csv.DictReader(handle)] == [
+            _SIGINT_CAUSE,
+            _SIGINT_CAUSE,
+        ]
+    (table,) = read_trial_tables(exp).phases
+    assert [row["reason"] for row in table.rows] == [_SIGINT_CAUSE, _SIGINT_CAUSE]
+    assert "the trainer exited with code" not in caplog.text
     assert not any("FATAL OBJECTIVE ERROR" in record.getMessage() for record in caplog.records)
 
 
