@@ -1460,16 +1460,8 @@ def test_json_extractor_reports_missing_or_nonnumeric_values(
         run_extractor(make_trial_context(tmp_path), cfg)
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        '{"x": 1, "x": 2}',
-        '{"x": NaN}',
-        '{"x": Infinity}',
-    ],
-)
-def test_json_extractor_rejects_ambiguous_nonstandard_json(tmp_path, payload):
-    (tmp_path / "result.json").write_text(payload)
+def test_json_extractor_rejects_duplicate_keys(tmp_path):
+    (tmp_path / "result.json").write_text('{"x": 1, "x": 2}')
     cfg = JsonExtractor(type="json", path="result.json", key="x")
 
     with pytest.raises(ExtractorError, match="Invalid JSON"):

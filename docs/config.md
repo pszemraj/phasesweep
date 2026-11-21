@@ -299,7 +299,7 @@ Review `phasesweep validate hf_sst2.yaml` and `phasesweep run hf_sst2.yaml --dry
 
 The metric is a finite scalar extracted after the trainer exits successfully. Use the reader that matches the trainer's existing reporting:
 
-- `json` reads a finite JSON number at a saved trial-relative path and dotted key, for example `{type: json, path: result.json, key: eval.loss}`.
+- `json` reads a finite JSON number at a saved trial-relative path and dotted key, for example `{type: json, path: result.json, key: eval.loss}`. A file holding `NaN` or `Infinity`, which Python's `json.dumps` writes for a diverged run, fails the trial with a reason that says so, and a missing file fails it with the file the trainer must write under `PHASESWEEP_TRIAL_DIR`.
 - `wandb` reads an exact scalar key such as `eval/loss` from the finished run whose ID is the immutable trial attempt ID. It requires the optional `wandb` extra and an authorized entity/project.
 - `mlflow` reads native metric history from the bound finished run. It requires the optional `mlflow` extra, an existing experiment in the top-level `mlflow` block, and an explicit `select: last | min | max | step`. See the [MLflow guide](mlflow.md) for ownership, selection, and result delivery.
 - `json_envelope` reads an attempt-bound versioned envelope from a trial-relative path. Python trainers can call `phasesweep.report_objective` to write it to the managed `PHASESWEEP_OBJECTIVE_PATH` (the [call, its file and its behavior outside a trial](#reporting-an-objective)). It is the extractor that binds the evaluation policy, checkpoint and step.

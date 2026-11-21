@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import stat
 import time
 from collections.abc import Iterator, Mapping
@@ -190,12 +191,50 @@ class MlflowObjectiveMissingError(ExtractorError):
     """Raised when a finished managed MLflow run lacks the configured objective metric."""
 
 
+# How the strict parser refuses the constants Python's ``json.dumps`` writes for a diverged run.
+_NON_FINITE_CONSTANT = re.compile(r"non-standard JSON constant '(NaN|-?Infinity)'")
+
+
+def _non_finite_constant(exc: Exception) -> str | None:
+    """Return the NaN or Infinity token the strict JSON parser refused, if ``exc`` is that refusal.
+
+    :param Exception exc: Failure raised while reading a trial's JSON file.
+    :return str | None: ``NaN``, ``Infinity`` or ``-Infinity``, or ``None`` for any other failure.
+    """
+    match = _NON_FINITE_CONSTANT.fullmatch(str(exc)) if isinstance(exc, ValueError) else None
+    return None if match is None else match.group(1)
+
+
+def _non_finite_text(constant: str) -> str:
+    """Say what a file holding NaN or Infinity means, for a trial's failure reason.
+
+    :param str constant: The refused token.
+    :return str: A clause that follows the file's subject.
+    """
+    return f"holds {constant}, which is not a finite number; a diverged run writes it"
+
+
+def _gate_unavailable(path: str, key: str, exc: Exception) -> str:
+    """Describe a JSON gate whose value could not be read.
+
+    :param str path: Trial-relative file the gate reads.
+    :param str key: Dotted key the gate reads.
+    :param Exception exc: Failure raised while reading it.
+    :return str: The gate result's detail.
+    """
+    constant = _non_finite_constant(exc)
+    reason = f"the file {_non_finite_text(constant)}" if constant is not None else str(exc)
+    return f"{path}:{key} unavailable: {reason}"
+
+
 @contextmanager
-def _trial_json_read_errors(target: Path, *, noun: str) -> Iterator[None]:
+def _trial_json_read_errors(target: Path, *, noun: str, trainer_step: str) -> Iterator[None]:
     """Translate file-read and JSON-decoding failures into extractor diagnostics.
 
     :param Path target: Trial-relative file being read.
     :param str noun: ``JSON`` or ``JSON envelope`` diagnostic label.
+    :param str trainer_step: What the trainer must do for the file to exist, appended to a
+        missing-file diagnostic, since a trainer that exits 0 without it fails here.
     :raises ExtractorError: The file is missing, unreadable, malformed, or outside the
         attempt; the last carries the refusal's own text as the trial's failure reason.
     :return Iterator[None]: Context covering the read and parse of the same bytes.
@@ -210,10 +249,13 @@ def _trial_json_read_errors(target: Path, *, noun: str) -> Iterator[None]:
             if noun == "JSON"
             else f"{noun} not found: {target}"
         )
-        raise ExtractorError(missing) from exc
+        raise ExtractorError(f"{missing}. {trainer_step}") from exc
     except UnicodeError as exc:
         raise ExtractorError(f"{noun} at {target} is not valid UTF-8: {exc}") from exc
     except ValueError as exc:
+        constant = _non_finite_constant(exc)
+        if constant is not None:
+            raise ExtractorError(f"{noun} at {target} {_non_finite_text(constant)}.") from exc
         raise ExtractorError(f"Invalid {noun} at {target}: {exc}") from exc
     except OSError as exc:
         raise ExtractorError(f"Could not read {noun} at {target}: {exc}") from exc
@@ -261,7 +303,14 @@ def _extract_json(
     digest: dict[str, Any] = {}
     target = ctx.trial_dir / cfg.path
     try:
-        with _trial_json_read_errors(target, noun="JSON"):
+        with _trial_json_read_errors(
+            target,
+            noun="JSON",
+            trainer_step=(
+                f"The trainer must write `{cfg.path}` under PHASESWEEP_TRIAL_DIR before it exits, "
+                f"with the numeric key `{cfg.key}`."
+            ),
+        ):
             _, cur = load_json_value(ctx.trial_dir, cfg.path, cfg.key, digest=digest)
     except KeyError as exc:
         raise ExtractorError(
@@ -294,7 +343,14 @@ def _extract_json_envelope(
     :return float: Validated objective value from the envelope.
     """
     target = ctx.trial_dir / cfg.path
-    with _trial_json_read_errors(target, noun="JSON envelope"):
+    with _trial_json_read_errors(
+        target,
+        noun="JSON envelope",
+        trainer_step=(
+            "The trainer must call `phasesweep.report_objective(...)` before it exits, from rank "
+            f"0 only; it writes `{cfg.path}` under PHASESWEEP_TRIAL_DIR."
+        ),
+    ):
         raw = attempt_file(ctx.trial_dir, cfg.path).read_bytes()
         data = strict_json_loads(raw.decode("utf-8"))
 
@@ -402,14 +458,15 @@ def _extract_log_regex(
         for matching is invalid UTF-8.
     :return float: Selected match value.
     """
-    import re
-
     try:
         target = attempt_file(ctx.trial_dir, cfg.file)
     except OutsideAttemptError as exc:
         raise ExtractorError(str(exc)) from exc
     if not target.is_file():
-        raise ExtractorError(f"Log file not found: {target}")
+        raise ExtractorError(
+            f"Log file not found: {target}. The trainer must write `{cfg.file}` under "
+            "PHASESWEEP_TRIAL_DIR; `stdout.log` and `stderr.log` are written automatically."
+        )
 
     pattern = re.compile(cfg.pattern)
 
@@ -892,7 +949,7 @@ def _json_equals(ctx: TrialContext, gate: JsonEqualsGate) -> GateResult:
     try:
         _, actual = load_json_value(ctx.trial_dir, gate.path, gate.key)
     except Exception as exc:
-        return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
+        return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
     if type(actual) is type(gate.value) and actual == gate.value:
         return GateResult(gate.type, True, f"{gate.key} == {gate.value!r}")
     return GateResult(
@@ -914,7 +971,7 @@ def _json_scalar_bound(ctx: TrialContext, gate: JsonScalarBoundGate) -> GateResu
         _, raw_value = load_json_value(ctx.trial_dir, gate.path, gate.key)
         value = json_float(raw_value, label=gate.key)
     except Exception as exc:
-        return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
+        return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
     if not math.isfinite(value):
         return GateResult(gate.type, False, f"{gate.key} was non-finite: {value!r}")
     if gate.min is not None and value < gate.min:
@@ -979,7 +1036,7 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
         try:
             _, raw_size = load_json_value(ctx.trial_dir, gate.path, gate.key)
         except Exception as exc:
-            return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
+            return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
         if not isinstance(raw_size, int) or isinstance(raw_size, bool):
             return GateResult(gate.type, False, f"{gate.key} was not an integer byte count")
         if raw_size < 0:
