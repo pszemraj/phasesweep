@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.engine.errors import StudySchemaMismatchError
-from phasesweep.runtime.json import JsonObject, json_object
+from phasesweep.runtime.json import JsonObject, json_object, progress_position
 
 if TYPE_CHECKING:
     from optuna.trial import FrozenTrial, Trial
@@ -498,18 +498,10 @@ def _completed_trainer_duration(
     duration = trial.user_attrs.get(
         DURATION_ATTR, None if lifecycle is None else lifecycle.duration_seconds
     )
-    if (
-        type(return_code) is not int
-        or return_code != 0
-        or isinstance(duration, bool)
-        or not isinstance(duration, (int, float))
-        or duration < 0
-    ):
+    if type(return_code) is not int or return_code != 0:
         return None
-    try:
-        return float(duration) if math.isfinite(duration) else None
-    except OverflowError:
-        return None
+    seconds = progress_position(duration)
+    return None if seconds is None else float(seconds)
 
 
 def _recovered_trial_state(
