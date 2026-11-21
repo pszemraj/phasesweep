@@ -1148,6 +1148,36 @@ def test_wandb_finished_run_missing_a_key_fails_after_the_settle_window(monkeypa
     assert len(reads) == _FINISH_SETTLE_SECONDS / 5 + 1
 
 
+@pytest.mark.parametrize("recovers", [False, True], ids=["outage", "recovers"])
+def test_wandb_unanswered_lookup_at_settle_boundary_keeps_polling(monkeypatch, recovers):
+    """An incomplete summary does not prove that the keys are missing through an outage."""
+    from phasesweep.evidence.wandb import _FINISH_SETTLE_SECONDS, WandbPollTimeout
+
+    clock = _fake_wandb_clock(monkeypatch)
+    recovered_at = _FINISH_SETTLE_SECONDS + 5
+    timeout = recovered_at + 5
+
+    def summary(read: int) -> dict[str, float]:
+        if read == 0:
+            return _RUNTIME_SUMMARY
+        if recovers and clock.now == recovered_at:
+            return {**_RUNTIME_SUMMARY, "loss": 0.25}
+        raise ConnectionError("tracker offline")
+
+    reads = _wandb_reads(monkeypatch, lambda read: "finished", summary)
+    if recovers:
+        capture = _wandb_poll(required_keys=["loss"], poll_seconds=5, timeout_seconds=timeout)
+        assert capture["values"] == {"loss": 0.25}
+        assert clock.now == recovered_at
+    else:
+        with pytest.raises(WandbPollTimeout) as caught:
+            _wandb_poll(required_keys=["loss"], poll_seconds=5, timeout_seconds=timeout)
+        assert not caught.value.reached
+        assert "ConnectionError" in str(caught.value.last_error)
+        assert clock.now == timeout
+    assert len(reads) == recovered_at / 5 + 1
+
+
 def test_wandb_missing_key_failure_reason_names_missing_and_available_keys(tmp_path, monkeypatch):
     """Worker failures retain missing-key details and the run URL."""
     from phasesweep.evidence import wandb as wandb_evidence

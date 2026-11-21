@@ -492,10 +492,10 @@ def _poll_wandb_summary(
 
     No lookup starts after the deadline, but the answer to one in flight is used. A finished
     summary may still gain values while the public API catches up,
-    so missing required keys are polled for ``_FINISH_SETTLE_SECONDS`` from the
-    first finished read that lacked them; once that window passes before the
-    deadline, the latest finished summary's missing and available keys are
-    reported instead of waiting out the deadline.
+    so a finished summary can establish missing required keys only once
+    ``_FINISH_SETTLE_SECONDS`` have passed since the first finished read that
+    lacked them. An unanswered poll at that boundary keeps polling until the
+    tracker answers or the deadline arrives.
 
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
@@ -526,7 +526,6 @@ def _poll_wandb_summary(
     last_error: Exception | None = None
     # Whether the latest poll got an answer about the run rather than failing in transport.
     reached = False
-    missing_keys: WandbMissingKeysError | None = None
     settle_by = math.inf
     required = tuple(required_keys)
     while time.monotonic() < deadline:
@@ -581,17 +580,18 @@ def _poll_wandb_summary(
                         }
                     missing = sorted(key for key in required if key not in summary)
                     available = sorted(summary)
-                    missing_keys = WandbMissingKeysError(run_id, missing, available)
+                    observed_at = time.monotonic()
+                    settle_by = min(settle_by, observed_at + _FINISH_SETTLE_SECONDS)
+                    # An earlier incomplete summary cannot establish absence while reads fail.
+                    if settle_by <= observed_at < deadline:
+                        raise WandbMissingKeysError(run_id, missing, available)
                     last_error = RuntimeError(
                         f"Missing required summary keys: {missing!r}; "
                         f"available summary keys: {available!r}."
                     )
-                    settle_by = min(settle_by, time.monotonic() + _FINISH_SETTLE_SECONDS)
-        # A window still open at the deadline ends as a timeout, like any late read.
-        if missing_keys is not None and settle_by <= time.monotonic() < deadline:
-            raise missing_keys
-        wake_by = min(deadline, settle_by)
-        time.sleep(min(poll_seconds, max(0.0, wake_by - time.monotonic())))
+        now = time.monotonic()
+        wake_by = min(deadline, settle_by) if now < settle_by else deadline
+        time.sleep(min(poll_seconds, max(0.0, wake_by - now)))
     if isinstance(last_error, WandbRunMissingError):
         raise last_error
     raise WandbPollTimeout(run_id, timeout_seconds, reached=reached, last_error=last_error)
