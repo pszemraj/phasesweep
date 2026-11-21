@@ -255,3 +255,23 @@ def test_validate_says_what_it_left_to_the_dry_run_and_gives_its_command_whole(
     ]
     assert all(len(line) <= columns for line in sentence)
     assert sum(line.startswith("Checked the config alone") for line in lines) == 1
+
+
+def test_a_from_phase_naming_no_phase_is_a_usage_error_that_lists_the_phases_in_words(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The refusal is click's usage error with exit status 2, naming the real phases without Python list syntax."""
+    config = tmp_path / "experiment.yaml"
+    assert invoke_cli_boundary(["init", "-o", str(config)], monkeypatch) == 0
+    capsys.readouterr()
+
+    status = invoke_cli_boundary(["run", str(config), "--from-phase", "nope"], monkeypatch)
+
+    assert status == 2
+    assert capsys.readouterr().err.splitlines() == [
+        "Usage: phasesweep run [OPTIONS] CONFIG",
+        "Try 'phasesweep run --help' for help.",
+        "",
+        "Error: Invalid value for --from-phase: 'nope' is not a phase of this config; "
+        "its phases are `depth`, `learning_rate`.",
+    ]

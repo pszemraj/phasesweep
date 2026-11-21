@@ -833,7 +833,7 @@ def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path)
     topped_up = experiment.model_copy(update={"phases": [topped_up_parent, experiment.phases[1]]})
 
     with pytest.raises(
-        StudyContextConflictError, match="dependent phase study.*inheritance"
+        StudyContextConflictError, match=r"1 dependent phase \(`lr`\) is already bound"
     ) as refused:
         run_experiment(topped_up)
 
@@ -865,7 +865,7 @@ def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
     parent_study = _fake_top_up_study(completed=1)
     grandchild_study = _fake_top_up_study(completed=1, fingerprint="bound-grandchild")
 
-    with pytest.raises(RuntimeError, match=r"dependent phase study/studies \['final'\]"):
+    with pytest.raises(RuntimeError, match=r"1 dependent phase \(`final`\) is already bound"):
         _reject_bound_descendant_topups(
             experiment,
             from_phase=None,

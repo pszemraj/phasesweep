@@ -77,6 +77,7 @@ from phasesweep.errors import (
     OperatorAction,
     PhaseSweepError,
     operator_step,
+    phase_names,
 )
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
@@ -590,8 +591,9 @@ def run(
     :param tuple[str, ...] settings: ``KEY=VALUE`` assignments with YAML values.
     :param bool verbose: Record ``DEBUG`` messages in ``run.log``; the console is unchanged.
     :raises ConfigError: The config file cannot be parsed or fails model validation.
-    :raises SystemExit: With code 2 when ``from_phase`` names no configured phase; a
-        ``PhaseSweepShutdown`` from an interrupted run is re-raised unchanged.
+    :raises click.BadParameter: ``from_phase`` names no configured phase; the usage error exits
+        with status 2.
+    :raises PhaseSweepShutdown: An interrupted run is re-raised unchanged.
     """
     with _console_logging(verbose, dry_run=dry_run):
         # Install before config parsing so CLI SIGINT/SIGTERM behavior and exit
@@ -602,8 +604,11 @@ def run(
         if from_phase is not None:
             valid = [p.name for p in config.phases]
             if from_phase not in valid:
-                click.echo(f"--from-phase={from_phase!r} not in {valid}", err=True)
-                sys.exit(2)
+                raise click.BadParameter(
+                    f"{from_phase!r} is not a phase of this config; its phases are "
+                    f"{phase_names(valid)}.",
+                    param_hint="--from-phase",
+                )
         run_log = _run_log_path(config)
         if not dry_run:
             _RUN_LOG.set(run_log)

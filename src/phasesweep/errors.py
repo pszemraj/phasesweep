@@ -103,6 +103,15 @@ FRESH_STUDY = f"set{_FRESH_STUDY_TAIL}"
 NEW_STUDY_STEP = f"Set{_FRESH_STUDY_TAIL}; the old study stays readable with its original config."
 
 
+def phase_names(names: Sequence[str]) -> str:
+    """List phase names the way every step that names phases does.
+
+    :param Sequence[str] names: Phase names, in the order to list them.
+    :return str: Each name in backticks, separated by commas.
+    """
+    return ", ".join(f"`{name}`" for name in names)
+
+
 def rename_phase_step(dependents: Sequence[str] | None) -> str:
     """Say how to start one phase over when a setting of that phase changes.
 
@@ -117,7 +126,7 @@ def rename_phase_step(dependents: Sequence[str] | None) -> str:
     """
     if dependents is not None and not dependents:
         return "give the phase a new `name`"
-    named = "" if dependents is None else f" ({', '.join(f'`{name}`' for name in dependents)})"
+    named = "" if dependents is None else f" ({phase_names(dependents)})"
     return (
         f"give the phase, and each phase that inherits it{named}, a new `name`, updating "
         "every `inherits` to match"

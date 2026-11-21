@@ -664,7 +664,7 @@ def test_raised_upstream_target_over_a_bound_descendant_is_refused_as_a_run_refu
         raised,
         tmp_path,
         StudyContextConflictError,
-        r"dependent phase study/studies \['b', 'c'\] are already bound",
+        r"1 top-up trial remaining, but 2 dependent phases \(`b`, `c`\) are already bound",
     )
 
     # The one rename step comes first, naming the dependents, then the new experiment name.
@@ -674,6 +674,23 @@ def test_raised_upstream_target_over_a_bound_descendant_is_refused_as_a_run_refu
         "new `name`, updating every `inherits` to match; each renamed phase starts a new study "
         "and runs again, and every other phase keeps its results. To rerun every phase, "
         f"{FRESH_STUDY}."
+    )
+
+
+def test_the_bound_descendant_refusal_counts_in_the_singular_without_list_syntax(
+    tmp_path: Path,
+) -> None:
+    """One bound dependent and several top-up trials read as plain words, with the phase named as the rename step names it."""
+    recorded = _persistent(tmp_path, _phase("a", 2), _phase("b", 2, inherits=("a",)))
+    for name in ("a", "b"):
+        _record(recorded, name, _STATE.FAIL, _STATE.FAIL, target=2)
+    raised = _persistent(tmp_path, _phase("a", 5), _phase("b", 2, inherits=("a",)))
+
+    refusal = _refusals_match(raised, tmp_path, StudyContextConflictError, "top-up")
+
+    assert str(refusal) == (
+        "Phase 'a' has 3 top-up trials remaining, but 1 dependent phase (`b`) is already bound "
+        "to its published winner via inheritance."
     )
 
 
