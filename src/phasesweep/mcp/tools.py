@@ -159,8 +159,8 @@ _PRE_IMPORT_CODE_ENV_VARS = (
 def _runner_env() -> dict[str, str]:
     """Remove interpreter startup hooks while preserving other operator environment variables.
 
-    The user site stays importable, so a runner finds a PhaseSweep this server imported from
-    there, and trainers inherit the same site setting as from a shell.
+    It sets no ``PYTHONNOUSERSITE``, so a runner finds a PhaseSweep this server imported from
+    the user site, and trainers inherit the same site setting as from a shell.
 
     :return dict[str, str]: Copy of this server's environment with the pre-import code hooks
         removed.
@@ -1791,6 +1791,9 @@ class PhaseSweepMCP:
         ack_read, ack_write = os.pipe()
         cmd = [
             sys.executable,
+            # The runner must import the PhaseSweep this server imported, so it keeps or drops
+            # the user site as this server does.
+            *(["-s"] if sys.flags.no_user_site else []),
             # Keep the script's own directory off sys.path during interpreter startup.
             "-P",
             str(RUNNER_SCRIPT_PATH),

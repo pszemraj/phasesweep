@@ -12,6 +12,7 @@ import sys
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -1169,10 +1170,18 @@ def test_launch_spawns_runner_in_neutral_dir_and_passes_project_cwd(
     assert cmd[cmd.index("--cwd") + 1] == str(runner_cwd.resolve())
 
 
+@pytest.mark.parametrize("no_user_site", [0, 1], ids=["server-user-site", "server-no-user-site"])
 def test_launch_hardens_runner_interpreter_flags_and_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    no_user_site: int,
 ) -> None:
+    """The runner keeps the server's user-site setting, as ``-s`` or ``-I`` set it, and drops the startup-path overrides."""
+    # Only the module that builds the command sees the server's flags; sys itself stays real.
+    server_sys = SimpleNamespace(
+        executable=sys.executable, flags=SimpleNamespace(no_user_site=no_user_site)
+    )
+    monkeypatch.setattr(mcp_tools, "sys", server_sys)
     config = write_srv_config(tmp_path)
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "attacker"))
     monkeypatch.setenv("PYTHONHOME", str(tmp_path / "attacker"))
@@ -1189,8 +1198,9 @@ def test_launch_hardens_runner_interpreter_flags_and_environment(
 
     cmd = captured["cmd"]
     assert cmd[0] == sys.executable
-    # The flag must precede the script, or the interpreter passes it to the script.
-    assert cmd[1:3] == ["-P", str(RUNNER_SCRIPT_PATH)]
+    # The flags must precede the script, or the interpreter passes them to the script.
+    flags = ["-s", "-P"] if no_user_site else ["-P"]
+    assert cmd[1 : 2 + len(flags)] == [*flags, str(RUNNER_SCRIPT_PATH)]
     env = captured["env"]
     assert "PYTHONPATH" not in env
     assert "PYTHONHOME" not in env
