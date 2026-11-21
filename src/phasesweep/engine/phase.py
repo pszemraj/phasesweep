@@ -1395,7 +1395,12 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     raise exc from lifecycle_error
             if _completed_trainer_duration(trial, lifecycle) is None:
                 _record_outcome(run, trial, "interrupted", cause=interruption_cause(exc.signum))
-            elif isinstance(attempt_id, str):
+            elif isinstance(attempt_id, str) and not (
+                run.experiment.persistent and trial.number in run.recorded_outcomes
+            ):
+                # A persistent trial whose outcome is already recorded needs no extraction:
+                # the exit settlement commits it and logs it as kept. Only training that
+                # nothing recorded is left to the next run.
                 _warn_deferred_extraction(
                     attempt_id,
                     run.phase.name,
