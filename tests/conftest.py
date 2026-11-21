@@ -642,6 +642,14 @@ def console_script(name: str) -> Path:
     return script
 
 
+#: The names of a short trial directory and of a real one, which is wider than a terminal; the
+#: report and trial-table tests each put them under their own parent.
+SHORT_TRIAL_NAME = "trial_00001"
+ATTEMPT_TRIAL_NAME = (
+    "trial_00001__generation_6413d5c1edd5475998cfadd4d3b59980"
+    "__attempt_0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+)
+
 #: The objective the packaged ``fake_train`` example writes to ``result.json``.
 FAKE_TRAIN_METRIC = Metric(
     name="eval_loss",
@@ -763,6 +771,15 @@ def write_experiment_config(path: Path, experiment: Experiment) -> Path:
         yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False), encoding="utf-8"
     )
     return path
+
+
+def run_log_text(experiment: Experiment) -> str:
+    """Read the ``run.log`` the experiment's runs wrote.
+
+    :param Experiment experiment: The experiment whose artifact root holds the log.
+    :return str: The log's text.
+    """
+    return _run_log_path(experiment).read_text(encoding="utf-8")
 
 
 def write_yaml(tmp_path: Path, body: str) -> Path:

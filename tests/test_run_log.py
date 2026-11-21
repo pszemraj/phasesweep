@@ -35,6 +35,7 @@ from tests.conftest import (
     patch_rejected_trial_user_attr,
     phase_study,
     phase_trials,
+    run_log_text,
     trial_outcome,
     write_constant_trainer,
     write_experiment_config,
@@ -144,7 +145,7 @@ def test_trial_write_error_reports_cause_and_storage_specific_recovery(
 
     for diagnostic in (
         capsys.readouterr().err,
-        (_experiment_dir(experiment) / "run.log").read_text(encoding="utf-8"),
+        run_log_text(experiment),
     ):
         assert "RuntimeError: injected trial write fault" in diagnostic
         if persistent:
@@ -412,7 +413,7 @@ def test_cli_verbose_deepens_run_log_and_leaves_the_console_alone(
     assert "reason: non-zero exit code 3; stderr: second line" in result.stderr
     for internals in ("A new study created", "Trial 0 failed", "Traceback", "JournalFileStorage"):
         assert internals not in result.stderr
-    log = (_experiment_dir(experiment) / "run.log").read_text(encoding="utf-8")
+    log = run_log_text(experiment)
     assert (" D phasesweep.engine.ledger Using JournalFileStorage" in log) is verbose
     assert ("Traceback (most recent call last):" in log) is verbose
 
@@ -503,7 +504,7 @@ def test_run_log_reports_abort_after_its_triggering_trial(tmp_path: Path, n_jobs
         trial for trial in study.trials if "abort" in trial.user_attrs[TRIAL_OUTCOME_ATTR]
     )
     abort = triggering.user_attrs[TRIAL_OUTCOME_ATTR]["abort"]
-    lines = (_experiment_dir(experiment) / "run.log").read_text().splitlines()
+    lines = run_log_text(experiment).splitlines()
     abort_lines = [index for index, line in enumerate(lines) if "phase=p ABORTED:" in line]
     trial_index = next(
         index for index, line in enumerate(lines) if f" p  trial {triggering.number}  " in line
@@ -528,7 +529,6 @@ def test_each_run_marks_its_start_in_run_log_and_never_on_the_console(
         search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
     )
     config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
-    run_log = _experiment_dir(experiment) / "run.log"
 
     override = ["--set", "provenance.note=SECRET-TOKEN"]
     assert invoke_cli_boundary(["run", str(config), *override], monkeypatch) == 0
@@ -537,7 +537,7 @@ def test_each_run_marks_its_start_in_run_log_and_never_on_the_console(
     assert invoke_cli_boundary(resumed, monkeypatch) == 0
     second_console = capsys.readouterr().err
 
-    lines = run_log.read_text(encoding="utf-8").splitlines()
+    lines = run_log_text(experiment).splitlines()
     starts = [index for index, line in enumerate(lines) if "Run started" in line]
     assert len(starts) == 2
     first, second = (lines[index] for index in starts)
@@ -546,7 +546,7 @@ def test_each_run_marks_its_start_in_run_log_and_never_on_the_console(
         r" I phasesweep\.engine\.run Run started: experiment t, pid \d+, from phase p$", second
     )
     assert any(" p  trial 0  COMPLETE  " in line for line in lines[starts[0] : starts[1]])
-    assert "SECRET-TOKEN" not in run_log.read_text(encoding="utf-8")
+    assert "SECRET-TOKEN" not in run_log_text(experiment)
     assert "Run started" not in first_console + second_console
 
     ends = [index for index, line in enumerate(lines) if "Run finished" in line]
@@ -581,7 +581,7 @@ def test_a_run_that_fails_leaves_its_start_line_without_a_finish_line(
 
     assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 1
 
-    text = (_experiment_dir(experiment) / "run.log").read_text(encoding="utf-8")
+    text = run_log_text(experiment)
     assert "Run started" in text
     assert "Run finished" not in text
 

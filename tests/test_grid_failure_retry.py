@@ -803,6 +803,7 @@ def test_validate_refuses_an_oversized_fresh_persistent_grid(
     assert "old study" not in error
 
 
+@pytest.mark.integration
 def test_oversized_grid_target_over_a_recorded_study_points_at_a_new_phase_name(
     tmp_path: Path,
 ) -> None:

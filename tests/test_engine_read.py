@@ -1000,6 +1000,7 @@ def _trial_id_trainer(tmp_path: Path, *, mem: dict[str, str] | None = None) -> P
 _X_METRIC = LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
 
 
+@pytest.mark.integration
 def test_read_trial_tables_marks_winner_and_infeasible(tmp_path: Path) -> None:
     """Each trial reads under its real state, and only the published winner is starred."""
     experiment = make_experiment(
@@ -1049,6 +1050,7 @@ def test_read_trial_tables_marks_winner_and_infeasible(tmp_path: Path) -> None:
     assert "non-zero exit code 1" in str(rows[2]["reason"])
 
 
+@pytest.mark.integration
 def test_read_trial_tables_adds_one_column_per_observed_name(tmp_path: Path) -> None:
     """Every ``observed:<name>`` any trial recorded is a column, empty where a trial lacked it."""
     experiment = make_experiment(

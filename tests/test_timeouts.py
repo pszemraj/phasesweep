@@ -979,6 +979,7 @@ def test_timeout_remedy_matches_storage_and_budget(
     assert failure["remediation"].startswith(f"Ask the operator: {remedy} ")
 
 
+@pytest.mark.integration
 def test_a_per_trial_timeout_abort_names_the_rename_that_the_raised_timeout_needs(
     tmp_path: Path,
 ) -> None:

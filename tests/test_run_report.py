@@ -18,13 +18,14 @@ import pytest
 
 from phasesweep.cli import _console_logging, _rerun_command, _resume_hint
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
-from phasesweep.config.search import CategoricalParam, IntParam, Sampler
-from phasesweep.engine.paths import _run_log_path
+from phasesweep.config.search import CategoricalParam, IntParam, Repeats, Sampler
+from phasesweep.engine.paths import _phase_dir
+from phasesweep.engine.read import read_trial_tables
 from phasesweep.engine.repeats import RepeatsRecord, spread
 from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import PhaseCounts, Winner
 from phasesweep.errors import UnsafeProcessCleanupError, operator_step
-from phasesweep.evidence.models import WandbExtractor
+from phasesweep.evidence.models import RequiredFileGate, WandbExtractor
 from phasesweep.run_report import (
     LogLine,
     Summary,
@@ -43,12 +44,16 @@ from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupRepor
 from phasesweep.runtime.terminal import REPORT_LOGGER, ReportBlock, ReportText
 from phasesweep.tracking.models import MlflowSettings
 from tests.conftest import (
+    ATTEMPT_TRIAL_NAME,
     FAKE_TRAIN_METRIC,
+    SHORT_TRIAL_NAME,
     invoke_cli_boundary,
     make_experiment,
+    run_log_text,
     stub_run_command,
     write_constant_trainer,
     write_experiment_config,
+    write_param_echo_trainer,
 )
 
 STAMP = "12:00:00  "
@@ -631,6 +636,7 @@ def _console_text(err: str, tmp_path: Path, name: str) -> str:
     return re.sub(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])", "ID", text).replace(name, "NAME")
 
 
+@pytest.mark.integration
 def test_verbose_leaves_the_console_unchanged_and_deepens_run_log(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -964,12 +970,10 @@ def test_summary_omits_the_written_section_when_nothing_was_written() -> None:
     assert "Written under" not in "\n".join(block.render(80, color=False))
 
 
-SHORT_TRIAL_DIR = Path("/data/runs/depth/trial_00001")
-ATTEMPT_TRIAL_DIR = Path(
-    "/data/sweeps/phasesweep_starter/runs/phasesweep_starter/depth/trial_00001"
-    "__generation_6413d5c1edd5475998cfadd4d3b59980__attempt_0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+SHORT_TRIAL_DIR = Path("/data/runs/depth") / SHORT_TRIAL_NAME
+ATTEMPT_TRIAL_DIR = (
+    Path("/data/sweeps/phasesweep_starter/runs/phasesweep_starter/depth") / ATTEMPT_TRIAL_NAME
 )
-ATTEMPT_NAME = ATTEMPT_TRIAL_DIR.name
 
 
 def _summary_with_dirs(
@@ -1015,7 +1019,7 @@ def _summary_with_dirs(
             ATTEMPT_TRIAL_DIR,
             [
                 "                 /data/sweeps/phasesweep_starter/runs/phasesweep_starter/depth/",
-                f"                 {ATTEMPT_NAME}",
+                f"                 {ATTEMPT_TRIAL_NAME}",
             ],
             id="long-80",
         ),
@@ -1027,7 +1031,7 @@ def _summary_with_dirs(
                 "                         model.n_layers=8",
                 "                 /data/sweeps/phasesweep_starter/runs/",
                 "                 phasesweep_starter/depth/",
-                f"                 {ATTEMPT_NAME}",
+                f"                 {ATTEMPT_TRIAL_NAME}",
             ],
             id="long-60",
         ),
@@ -1496,11 +1500,6 @@ def test_no_log_line_when_the_engine_never_wrote_a_log(
     assert "log:" not in capsys.readouterr().err
 
 
-def _run_log_text(experiment: Experiment) -> str:
-    """Read the ``run.log`` the experiment's run wrote."""
-    return _run_log_path(experiment).read_text(encoding="utf-8")
-
-
 def test_a_phase_abort_prints_once_and_stays_in_run_log(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1521,30 +1520,71 @@ def test_a_phase_abort_prints_once_and_stays_in_run_log(
     assert "ABORTED" not in err
     assert "error:" not in err
     cause = "2 consecutive failed/infeasible trials reached max_consecutive_failures=2."
-    assert f" I phasesweep.engine.phase phase=p ABORTED: {cause}" in _run_log_text(experiment)
+    assert f" I phasesweep.engine.phase phase=p ABORTED: {cause}" in run_log_text(experiment)
 
 
-def test_a_failed_extraction_prints_once_as_the_trials_reason(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("objective_key", "gates", "non_finite", "reason", "logged"),
+    [
+        pytest.param(
+            "not_the_objective",
+            [],
+            False,
+            "reason: metric extractor:",
+            " I phasesweep.engine.trial [p/trial_0] metric extraction failed: ",
+            id="missing-objective",
+        ),
+        pytest.param(
+            "x",
+            [],
+            True,
+            "reason: metric extractor returned non-finite value: inf",
+            " I phasesweep.engine.trial [p/trial_0] metric extractor returned non-finite value: inf",
+            id="non-finite-objective",
+        ),
+        pytest.param(
+            "x",
+            [RequiredFileGate(type="required_file", path="never_written.txt")],
+            False,
+            "reason: evidence gates failed: never_written.txt is missing",
+            " I phasesweep.engine.trial [p/trial_0] evidence gate(s) failed: "
+            "never_written.txt is missing",
+            id="failing-gate",
+        ),
+    ],
+)
+def test_a_trial_failure_the_reason_states_prints_once_and_stays_in_run_log_at_info(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    objective_key: str,
+    gates: list[RequiredFileGate],
+    non_finite: bool,
+    reason: str,
+    logged: str,
 ) -> None:
-    """A trainer that wrote no objective fails the trial; its cause is the reason, not also a warning."""
+    """The failed trial's ``reason:`` is the console's account; the same cause is INFO in ``run.log``."""
     monkeypatch.setenv("COLUMNS", "500")
     experiment = make_experiment(
         persistent=tmp_path,
-        trainer=write_constant_trainer(tmp_path, key="not_the_objective"),
+        trainer=write_constant_trainer(tmp_path, key=objective_key),
         n_trials=2,
         max_consecutive_failures=5,
+        gates=gates,
     )
-    config = write_experiment_config(tmp_path / "missing.yaml", experiment)
+    if non_finite:
+        monkeypatch.setattr(
+            "phasesweep.engine.trial.run_extractor", lambda *_args, **_kwargs: float("inf")
+        )
+    config = write_experiment_config(tmp_path / "failing.yaml", experiment)
 
     assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 1
 
     err = capsys.readouterr().err
-    assert err.count("reason: metric extractor:") == 2
+    assert err.count(reason) == 2
     assert "warning:" not in err
-    assert " I phasesweep.engine.trial [p/trial_0] metric extraction failed: " in _run_log_text(
-        experiment
-    )
+    assert logged in run_log_text(experiment)
 
 
 def test_a_fatal_objective_error_prints_once_and_stays_in_run_log(
@@ -1568,7 +1608,47 @@ def test_a_fatal_objective_error_prints_once_and_stays_in_run_log(
     assert (
         " I phasesweep.engine.phase phase=p FATAL OBJECTIVE ERROR (UnsafeProcessCleanupError): "
         "trainer group may still be alive"
-    ) in _run_log_text(experiment)
+    ) in run_log_text(experiment)
+
+
+@pytest.mark.integration
+def test_a_repeats_run_summary_lists_each_winning_member_under_one_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A real repeats phase names every member of its winning group, in trial order, under one parent."""
+    monkeypatch.setenv("COLUMNS", "500")
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_param_echo_trainer(tmp_path),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=4,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": IntParam(type="int", low=3, high=9)},
+                repeats=Repeats(key="seed", values=[0, 1]),
+            )
+        ],
+    )
+    config = write_experiment_config(tmp_path / "repeats.yaml", experiment)
+
+    assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 0
+
+    lines = capsys.readouterr().err.splitlines()
+    members = sorted(
+        row["trial"]
+        for row in read_trial_tables(experiment, latest=True).phases[0].rows
+        if row["winner"] == "*"
+    )
+    assert len(members) == 2
+    written = next(i for i, line in enumerate(lines) if line.startswith("Written under"))
+    summary_lines = lines[lines.index("  p  4 complete") : written - 1]
+    names = [line for line in summary_lines if "__generation_" in line]
+    assert [int(name.strip().split("__")[0].removeprefix("trial_")) for name in names] == members
+    assert all(re.fullmatch(r"\s+trial_\d{5}__generation_\w{32}__attempt_\w{32}", n) for n in names)
+    parent = str(_phase_dir(experiment, "p")) + "/"
+    assert summary_lines.count(f"     {parent}") == 1
+    assert not any(parent + "trial_" in line for line in summary_lines)
 
 
 def test_a_live_run_opens_with_the_banner_and_closes_with_summary_then_log(

@@ -62,6 +62,7 @@ def _refusal(study: optuna.Study, experiment: Experiment) -> StudyFingerprintMis
     return caught.value
 
 
+@pytest.mark.integration
 def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
     """Widening one bound refuses the study, names that key with both values, and offers the phase rename that then runs."""
     project = project_directory(tmp_path)
@@ -100,6 +101,7 @@ def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
     assert set(run_experiment(load_experiment(config))) == {"wider"}
 
 
+@pytest.mark.integration
 def test_refusal_for_an_inherited_phase_names_the_dependents_to_rename(tmp_path: Path) -> None:
     """A changed phase that another inherits reruns by renaming both, and the fix line names the dependent."""
     project = project_directory(tmp_path)

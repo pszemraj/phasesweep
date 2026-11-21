@@ -13,7 +13,13 @@ from phasesweep.engine.read import RepeatGroupView, TrialTable, TrialTables
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.trial_table import render_trial_tables, unsettled_running_comment
-from tests.conftest import invoke_cli_boundary, make_experiment, terminal_stream
+from tests.conftest import (
+    ATTEMPT_TRIAL_NAME,
+    SHORT_TRIAL_NAME,
+    invoke_cli_boundary,
+    make_experiment,
+    terminal_stream,
+)
 
 GENERATION = "6413d5c1edd5475998cfadd4d3b59980"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -590,11 +596,8 @@ def test_the_unsettled_running_comment_wraps_as_comment_lines(width: int) -> Non
     assert " ".join(line.removeprefix("# ") for line in lines) == single.removeprefix("# ")
 
 
-SHORT_DIR = "runs/depth/trial_00001"
-ATTEMPT_DIR = (
-    "runs/phasesweep_starter/depth/trial_00001__generation_6413d5c1edd5475998cfadd4d3b59980"
-    "__attempt_0f1e2d3c4b5a69788796a5b4c3d2e1f0"
-)
+SHORT_DIR = f"runs/depth/{SHORT_TRIAL_NAME}"
+ATTEMPT_DIR = f"runs/phasesweep_starter/depth/{ATTEMPT_TRIAL_NAME}"
 
 
 def _winner_tables(trial_dir: str | None, *, winner: bool = True) -> tuple[TrialTables, Phase]:
