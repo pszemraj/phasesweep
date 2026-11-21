@@ -208,7 +208,9 @@ def _interrupt_text(signum: int, running: Sequence[str]) -> str:
     others = [plural(count, label) for label, count in counts.items()]
     if not trials:
         stopping = f"; stopping {' and '.join(others)}" if others else ""
-        return f"Interrupted ({name}): no trainer is running{stopping}."
+        # "trial" keeps the commonest worker-only line, one MLflow request, within 80 columns
+        # behind the report's time prefix.
+        return f"Interrupted ({name}): no trial is running{stopping}."
     # A trainer that ignores SIGTERM keeps the run silent until its grace period ends, so the
     # line says the run is waiting.
     pronoun = "it" if len(running) == 1 else "them"

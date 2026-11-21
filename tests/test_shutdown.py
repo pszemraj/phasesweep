@@ -852,7 +852,7 @@ def test_shutdown_handler_names_the_signal_it_services_until_the_next_run() -> N
             ["trial"] * 3,
             "Interrupted (SIGTERM): stopping 3 trials and waiting for them to exit.",
         ),
-        (signal.SIGHUP, [], "Interrupted (SIGHUP): no trainer is running."),
+        (signal.SIGHUP, [], "Interrupted (SIGHUP): no trial is running."),
         (
             99,
             ["trial"] * 2,
@@ -861,7 +861,7 @@ def test_shutdown_handler_names_the_signal_it_services_until_the_next_run() -> N
         (
             signal.SIGINT,
             ["MLflow request"],
-            "Interrupted (SIGINT): no trainer is running; stopping 1 MLflow request.",
+            "Interrupted (SIGINT): no trial is running; stopping 1 MLflow request.",
         ),
         (
             signal.SIGINT,
@@ -889,12 +889,51 @@ def test_the_recorded_cause_names_the_signal_as_the_interrupt_line_does(
 
 
 @pytest.mark.parametrize(
+    ("backend", "label"),
+    [("mlflow", "MLflow request"), ("wandb", "W&B request"), ("other", "other request")],
+)
+def test_a_tracker_worker_is_launched_under_the_name_the_interrupt_line_gives_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str, label: str
+) -> None:
+    """A tracker worker registers as its backend's request, so a signal during one never counts it as a trial."""
+    from phasesweep.runtime import process as runtime_process
+    from phasesweep.runtime.remote_worker import run_worker
+
+    labels: list[object] = []
+
+    def launch(_command: str, **options: object) -> runtime_process.ProcessResult:
+        labels.append(options["label"])
+        return runtime_process.ProcessResult(
+            return_code=0, timed_out=False, pid=0, duration_seconds=0.0
+        )
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(runtime_process, "run_supervised", launch)
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+
+    run_worker(
+        {},
+        tmp_path / "worker.py",
+        backend,
+        statuses=frozenset({"ok"}),
+        run_id="attempt",
+        trial_dir=trial_dir,
+        environment={},
+        deadline=time.monotonic() + 10,
+    )
+
+    assert labels == [label]
+    assert label != runtime_shutdown.TRAINER_LABEL
+
+
+@pytest.mark.parametrize(
     ("labels", "text"),
     [
         (["trial"], "Interrupted (SIGINT): stopping 1 trial and waiting for it to exit."),
         (
             ["MLflow request"],
-            "Interrupted (SIGINT): no trainer is running; stopping 1 MLflow request.",
+            "Interrupted (SIGINT): no trial is running; stopping 1 MLflow request.",
         ),
         (
             ["trial", "MLflow request"],
@@ -951,6 +990,26 @@ def test_the_longest_interrupt_line_wraps_within_an_80_column_terminal(
     assert max(len(line) for line in lines) <= 80
 
 
+@pytest.mark.parametrize(
+    "running", [["trial"] * 3, ["MLflow request"]], ids=["three-trials", "one-request"]
+)
+def test_the_usual_interrupt_lines_stay_on_one_line_of_an_80_column_terminal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], running: list[str]
+) -> None:
+    """Trainers alone, or one tracker request alone, print unbroken behind the time prefix, even for SIGTERM's longer name."""
+    monkeypatch.setenv("COLUMNS", "80")
+    text = _interrupt_text(signal.SIGTERM, running)
+    record = logging.LogRecord(
+        REPORT_LOGGER, logging.INFO, __file__, 0, ReportText(text), None, None
+    )
+
+    ConsoleHandler().emit(record)
+
+    [line] = capsys.readouterr().err.splitlines()
+    assert line.endswith(text)
+    assert len(line) <= 80
+
+
 def test_a_shutdown_prints_one_report_line_and_logs_the_confirmed_cleanup_quietly(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -958,7 +1017,7 @@ def test_a_shutdown_prints_one_report_line_and_logs_the_confirmed_cleanup_quietl
     with caplog.at_level(logging.INFO, logger="phasesweep"), pytest.raises(PhaseSweepShutdown):
         _shutdown_handler(signal.SIGINT, None)
     assert [(r.name, r.levelno, r.getMessage()) for r in caplog.records] == [
-        (REPORT_LOGGER, logging.INFO, "Interrupted (SIGINT): no trainer is running."),
+        (REPORT_LOGGER, logging.INFO, "Interrupted (SIGINT): no trial is running."),
         (
             "phasesweep.runtime.process",
             logging.INFO,
