@@ -775,16 +775,14 @@ def assert_invalid_experiment_yaml(tmp_path: Path, body: str, match: str) -> Non
         load_experiment(write_yaml(tmp_path, body))
 
 
-def invoke_cli_boundary(
-    argv: list[str], monkeypatch: pytest.MonkeyPatch, *, debug: bool = False
-) -> int:
+def invoke_cli_boundary(argv: list[str], monkeypatch: pytest.MonkeyPatch) -> int:
     """Run the console-script entry point exactly as the installed command does; return its exit status."""
     # ``CliRunner`` invokes the Click group directly and so bypasses the
     # process-level error boundary under test; a patched ``sys.argv`` reaches it.
     monkeypatch.setattr(sys, "argv", ["phasesweep", *argv])
     logger = logging.getLogger()
     previous_level = logger.level
-    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    logger.setLevel(logging.INFO)
     try:
         with pytest.raises(SystemExit) as excinfo:
             cli_boundary()

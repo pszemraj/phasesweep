@@ -62,8 +62,10 @@ from phasesweep.engine.study_policy import (
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.runtime.commands import render_command
 from phasesweep.runtime.gpu import GpuPool
+from phasesweep.runtime.terminal import REPORT_LOGGER
 
-log = logging.getLogger("phasesweep.engine.preview")
+# Every line of a preview is for the person reading the dry run, so all of it is report.
+log = logging.getLogger(REPORT_LOGGER)
 
 
 @dataclass(frozen=True, slots=True)

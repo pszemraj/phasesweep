@@ -1695,21 +1695,14 @@ def test_config_error_hints_stay_few_and_distinct(
     assert "see:" not in err
 
 
-@pytest.mark.parametrize(
-    ("verbose", "expects_traceback"),
-    [
-        pytest.param(False, False, id="concise"),
-        pytest.param(True, True, id="verbose"),
-    ],
-)
+@pytest.mark.parametrize("verbose", [False, True], ids=["concise", "verbose"])
 def test_cli_boundary_reports_expected_run_failure(
     verbose: bool,
-    expects_traceback: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Expected failures gain a traceback only when verbose logging is active."""
+    """An expected failure prints no traceback on the console, with or without ``-v``."""
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
     _stub_run_command(
@@ -1717,17 +1710,14 @@ def test_cli_boundary_reports_expected_run_failure(
         PhaseTrialsFailedError("no feasible trial in phase 'depth'"),
     )
 
-    argv = ["run", str(config_path)]
-    if verbose:
-        argv.append("-v")
-    exit_code = invoke_cli_boundary(argv, monkeypatch, debug=verbose)
+    exit_code = invoke_cli_boundary(
+        ["run", str(config_path), *(["-v"] if verbose else [])], monkeypatch
+    )
 
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "no feasible trial in phase 'depth'" in captured.err
-    assert ("Traceback" in captured.err) is expects_traceback
-    if not verbose:
-        assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err + captured.out
 
 
 @pytest.mark.parametrize(

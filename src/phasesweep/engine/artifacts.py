@@ -42,9 +42,9 @@ from phasesweep.runtime.files import atomic_text_writer
 
 log = logging.getLogger(__name__)
 
-# One log line shape for every destination. The date format differs on purpose: console
-# handlers print clock time (``%H:%M:%S``), while ``run.log`` and the MCP runner's captured
-# log carry the date as well (``%Y-%m-%d %H:%M:%S``) because those files outlive the day.
+# One log line shape for every file destination. ``run.log`` and the MCP runner's captured log
+# carry the date (``%Y-%m-%d %H:%M:%S``) because those files outlive the day; the CLI console
+# prints its own clock-time layout (``phasesweep.runtime.console``).
 LOG_FORMAT = "%(asctime)s %(levelname).1s %(name)s %(message)s"
 
 
@@ -76,6 +76,9 @@ def _write_yaml_atomic(path: Path, payload: Any) -> None:
 def _file_log_handler(path: Path) -> Iterator[None]:
     """Capture phasesweep logs, and a routed failure with its advice, in the run log.
 
+    The logger keeps a ``DEBUG`` level a caller set, so a verbose run records debug messages and
+    the traceback of a routed failure; otherwise it records from ``INFO``.
+
     :param Path path: Log file path to append to.
     :raises PhaseSweepError: The operational failure raised inside the context.
     :return Iterator[None]: Context manager that removes the handler on exit.
@@ -97,10 +100,14 @@ def _file_log_handler(path: Path) -> Iterator[None]:
     try:
         yield
     except PhaseSweepError as exc:
-        # The caller prints the error to its own stderr, so the log records it with its step.
-        for line in (str(exc), f"fix: {operator_step(exc)}"):
+        # The caller prints the error to its own stderr, so the log records it with its step,
+        # and with its traceback when DEBUG is on, which the console never shows.
+        error_info = (
+            (type(exc), exc, exc.__traceback__) if logger.isEnabledFor(logging.DEBUG) else None
+        )
+        for line, info in ((str(exc), error_info), (f"fix: {operator_step(exc)}", None)):
             handler.handle(
-                logger.makeRecord(logger.name, logging.ERROR, __file__, 0, "%s", (line,), None)
+                logger.makeRecord(logger.name, logging.ERROR, __file__, 0, "%s", (line,), info)
             )
         raise
     finally:

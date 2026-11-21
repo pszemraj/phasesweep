@@ -844,29 +844,6 @@ def test_abort_after_gpu_acquire_prevents_queued_trials(
     )
 
 
-def test_optuna_logging_verbosity_tracks_cli_verbose_flag() -> None:
-    """Default CLI output quiets Optuna; ``-v`` restores Optuna INFO logs."""
-    from phasesweep.cli import _configure_logging
-
-    cases = [
-        ("default_quiet", optuna.logging.INFO, False, optuna.logging.ERROR),
-        ("verbose", optuna.logging.WARNING, True, optuna.logging.INFO),
-    ]
-
-    # Logging state is process-global, and pytest's capture handlers sit on the root logger.
-    root, saved_verbosity = logging.getLogger(), optuna.logging.get_verbosity()
-    saved_handlers, saved_level = root.handlers[:], root.level
-    try:
-        for case, initial, verbose, expected in cases:
-            optuna.logging.set_verbosity(initial)
-            _configure_logging(verbose=verbose)
-            assert optuna.logging.get_verbosity() == expected, case
-    finally:
-        optuna.logging.set_verbosity(saved_verbosity)
-        root.handlers[:] = saved_handlers
-        root.setLevel(saved_level)
-
-
 def test_runtime_platform_gate_refuses_an_unsupported_host_but_not_dry_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

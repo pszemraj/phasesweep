@@ -382,8 +382,10 @@ def test_no_feasible_headline_covers_the_causes_of_infeasible_trials_too(tmp_pat
 
 @pytest.mark.parametrize("verbose", [False, True])
 @pytest.mark.integration
-def test_cli_failed_trial_tracebacks_require_verbose(tmp_path: Path, verbose: bool) -> None:
-    """Normal CLI failures keep the TRIAL cause; verbose restores Optuna diagnostics."""
+def test_cli_verbose_deepens_run_log_and_leaves_the_console_alone(
+    tmp_path: Path, verbose: bool
+) -> None:
+    """Debug messages and a failure's traceback reach run.log only under ``-v``, never the console."""
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=_x_trainer(tmp_path),
@@ -407,13 +409,11 @@ def test_cli_failed_trial_tracebacks_require_verbose(tmp_path: Path, verbose: bo
     assert result.returncode == 1, result.stdout + result.stderr
     assert "p  trial 0  FAIL  " in result.stderr
     assert "reason: non-zero exit code 3; stderr: second line" in result.stderr
-    if verbose:
-        assert "A new study created" in result.stderr
-        assert "Trial 0 failed" in result.stderr
-        assert "Traceback (most recent call last):" in result.stderr
-    else:
-        assert "Trial 0 failed" not in result.stderr
-        assert "Traceback (most recent call last):" not in result.stderr
+    for internals in ("A new study created", "Trial 0 failed", "Traceback", "JournalFileStorage"):
+        assert internals not in result.stderr
+    log = (_experiment_dir(experiment) / "run.log").read_text(encoding="utf-8")
+    assert (" D phasesweep.engine.ledger Using JournalFileStorage" in log) is verbose
+    assert ("Traceback (most recent call last):" in log) is verbose
 
 
 def _execution(tmp_path: Path) -> phase_ops._PhaseExecution:

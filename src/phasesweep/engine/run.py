@@ -676,12 +676,12 @@ def _run_experiment_inner(
         try:
             busy = locking_ops.experiment_is_busy(experiment)
         except (OSError, UnsafeLockPathError, PlatformCapabilityError) as exc:
-            log.warning("DRY RUN could not check whether the experiment is active: %s", exc)
+            report.warning("DRY RUN could not check whether the experiment is active: %s", exc)
             busy = None
         if busy is not False:
             preview_context = "hypothetical restart "
         if busy:
-            log.warning(
+            report.warning(
                 "DRY RUN another operation is active. Counts below assume a restart from this "
                 "snapshot. In-flight trials can still finish without a rerun."
             )
@@ -690,9 +690,9 @@ def _run_experiment_inner(
         for _phase, lines in experiment_disclosures(experiment):
             for warning, line in lines:
                 if warning:
-                    log.warning("DRY RUN warning: %s", line)
+                    report.warning("DRY RUN warning: %s", line)
                 else:
-                    log.info("DRY RUN %s", line)
+                    report.info("DRY RUN %s", line)
         preloaded_winners = resume_ops._preflight_skipped_winners(
             experiment, from_phase=from_phase, run_deadline=None
         )
@@ -748,8 +748,8 @@ def _run_experiment_inner(
         winners[phase.name] = winner
 
     if generation is None:
-        log.info("DRY RUN %s%s", preview_context, _dry_run_total_line(previews))
-        log.info("DRY RUN complete. No trials launched, no summary written.")
+        report.info("DRY RUN %s%s", preview_context, _dry_run_total_line(previews))
+        report.info("DRY RUN complete. No trials launched, no summary written.")
         return winners
 
     if not generation.claimed:

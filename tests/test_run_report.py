@@ -2,10 +2,21 @@
 
 from __future__ import annotations
 
+import io
+import logging
+import re
+import sys
+import threading
+import time
+from collections.abc import Callable
+from pathlib import Path
+
+import optuna
 import pytest
 
+from phasesweep.cli import _console_logging
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.config.search import IntParam
+from phasesweep.config.search import CategoricalParam, IntParam, Sampler
 from phasesweep.engine.state import Winner
 from phasesweep.run_report import (
     PhaseStart,
@@ -15,8 +26,15 @@ from phasesweep.run_report import (
     trial_line,
     winner_line,
 )
-from phasesweep.runtime.terminal import ReportBlock
-from tests.conftest import FAKE_TRAIN_METRIC, make_experiment
+from phasesweep.runtime.console import ConsoleHandler
+from phasesweep.runtime.terminal import REPORT_LOGGER, ReportBlock
+from tests.conftest import (
+    FAKE_TRAIN_METRIC,
+    invoke_cli_boundary,
+    make_experiment,
+    write_constant_trainer,
+    write_experiment_config,
+)
 
 STAMP = "12:00:00  "
 OOM = "non-zero exit code 1; stderr: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB"
@@ -308,3 +326,274 @@ def test_every_block_is_a_one_line_log_message(experiment: Experiment) -> None:
         rerun_line(experiment, experiment.phases[0], number=1, source=0, reason="cause"),
     ]
     assert all("\n" not in str(block) for block in blocks)
+
+
+class FakeStderr(io.StringIO):
+    """A stderr whose terminal-ness the test chooses."""
+
+    def __init__(self, *, tty: bool = False) -> None:
+        super().__init__()
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+NOON = time.mktime((2026, 1, 1, 12, 0, 0, 0, 0, -1))
+
+
+def record(
+    name: str,
+    level: int,
+    message: object,
+    *args: object,
+    exc_info: logging._SysExcInfoType | None = None,
+) -> logging.LogRecord:
+    """Build a record created at noon, as a logger would hand the handler."""
+    made = logging.LogRecord(name, level, __file__, 0, message, args, exc_info)
+    made.created = NOON
+    return made
+
+
+@pytest.fixture
+def redirect_stderr(monkeypatch: pytest.MonkeyPatch) -> Callable[..., FakeStderr]:
+    """Give a test a function that swaps ``sys.stderr`` for a stream 80 columns wide.
+
+    The swap happens in the test body because pytest's capture reinstalls its own stream at the
+    start of each test phase, after fixtures have run.
+    """
+
+    def redirect(*, tty: bool = False, no_color: str | None = None) -> FakeStderr:
+        fake = FakeStderr(tty=tty)
+        monkeypatch.setattr(sys, "stderr", fake)
+        monkeypatch.setenv("COLUMNS", "80")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        if no_color is not None:
+            monkeypatch.setenv("NO_COLOR", no_color)
+        return fake
+
+    return redirect
+
+
+def test_a_report_record_prints_bare_with_the_time(
+    redirect_stderr: Callable[..., FakeStderr], experiment: Experiment
+) -> None:
+    """A report block prints as the time and its text, with no level or logger name."""
+    stderr = redirect_stderr()
+    handler = ConsoleHandler()
+    start = phase_start(experiment, experiment.phases[1], finished=0, remaining=4, reruns=0)
+    handler.handle(record(REPORT_LOGGER, logging.INFO, start))
+    handler.handle(record(REPORT_LOGGER, logging.INFO, "DRY RUN example command:\n  run --x 1"))
+    assert stderr.getvalue() == (
+        "12:00:00  learning_rate  4 trials to run, 1 at a time\n"
+        "12:00:00  DRY RUN example command:\n"
+        "            run --x 1\n"
+    )
+
+
+def test_a_report_record_at_warning_level_is_still_a_report_line(
+    redirect_stderr: Callable[..., FakeStderr],
+) -> None:
+    """Dry-run warnings keep their own wording, so they print bare, not under a ``warning:`` label."""
+    stderr = redirect_stderr()
+    ConsoleHandler().handle(record(REPORT_LOGGER, logging.WARNING, "DRY RUN warning: %s", "x"))
+    assert stderr.getvalue() == "12:00:00  DRY RUN warning: x\n"
+
+
+def test_info_records_from_other_loggers_print_nothing(
+    redirect_stderr: Callable[..., FakeStderr],
+) -> None:
+    """Trainer commands, GPU notes and the like belong to run.log alone."""
+    stderr = redirect_stderr()
+    handler = ConsoleHandler()
+    handler.handle(record("phasesweep.engine.trial", logging.INFO, "[p/trial_0] train --x 1"))
+    handler.handle(record("phasesweep.runtime.gpu", logging.DEBUG, "GPU assigned"))
+    assert stderr.getvalue() == ""
+
+
+def test_a_warning_wraps_under_its_label(redirect_stderr: Callable[..., FakeStderr]) -> None:
+    """A long warning wraps to the terminal with a hanging indent under ``warning:``."""
+    stderr = redirect_stderr()
+    message = (
+        "[learning_rate] only 1 of 2 grid cells succeeded; the winner was chosen without a "
+        "successful trial for: {'optimizer.lr': 0.0003}."
+    )
+    handler = ConsoleHandler()
+    handler.handle(record("phasesweep.engine.selection", logging.WARNING, message))
+    assert stderr.getvalue() == (
+        "12:00:00  warning: [learning_rate] only 1 of 2 grid cells succeeded; the winner\n"
+        "          was chosen without a successful trial for: {'optimizer.lr': 0.0003}.\n"
+    )
+    stderr.truncate(0)
+    stderr.seek(0)
+    handler.handle(
+        record("phasesweep.engine.phase", logging.ERROR, "phase=%s ABORTED: %s", "p", "x")
+    )
+    assert stderr.getvalue() == "12:00:00  error: phase=p ABORTED: x\n"
+
+
+def test_a_failure_record_prints_no_traceback(redirect_stderr: Callable[..., FakeStderr]) -> None:
+    """The exception behind a logged failure stays in run.log."""
+    stderr = redirect_stderr()
+    try:
+        raise ValueError("secret detail")
+    except ValueError:
+        failed = record(
+            "phasesweep.engine.run",
+            logging.WARNING,
+            "MLflow delivery did not complete",
+            exc_info=sys.exc_info(),
+        )
+    ConsoleHandler().handle(failed)
+    assert stderr.getvalue() == "12:00:00  warning: MLflow delivery did not complete\n"
+
+
+@pytest.mark.parametrize("tty", [False, True])
+@pytest.mark.parametrize("no_color", [None, "1", ""], ids=["unset", "set", "empty"])
+def test_styling_needs_a_terminal_and_no_no_color(
+    redirect_stderr: Callable[..., FakeStderr],
+    experiment: Experiment,
+    tty: bool,
+    no_color: str | None,
+) -> None:
+    """Escapes appear only on a terminal with ``NO_COLOR`` absent; an empty value disables them too."""
+    fake = redirect_stderr(tty=tty, no_color=no_color)
+    failed = trial_line(
+        experiment,
+        experiment.phases[0],
+        number=3,
+        state="FAIL",
+        value=None,
+        seconds=0.5,
+        finished=3,
+        params={},
+        repeat=None,
+        rerun_of=None,
+        reason=None,
+    )
+    handler = ConsoleHandler()
+    handler.handle(record(REPORT_LOGGER, logging.INFO, failed))
+    handler.handle(record("phasesweep.engine.phase", logging.WARNING, "slow"))
+    handler.handle(record("phasesweep.engine.phase", logging.ERROR, "broken"))
+    styled = tty and no_color is None
+    assert ("\x1b[31mFAIL\x1b[0m" in fake.getvalue()) is styled
+    assert ("\x1b[33mwarning:\x1b[0m" in fake.getvalue()) is styled
+    assert ("\x1b[31merror:\x1b[0m" in fake.getvalue()) is styled
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", fake.getvalue())
+    assert plain.splitlines() == [
+        "12:00:00  depth          trial 3  FAIL  0.5s  3/4",
+        "12:00:00  warning: slow",
+        "12:00:00  error: broken",
+    ]
+
+
+class ThreeLines(ReportBlock):
+    """A block that always draws three lines, to expose any interleaving."""
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+    def render(self, width: int, *, color: bool) -> list[str]:
+        return [f"{self.tag} first", f"{self.tag} second", f"{self.tag} third"]
+
+    def __str__(self) -> str:
+        return self.tag
+
+
+def test_records_from_parallel_trials_stay_contiguous(
+    redirect_stderr: Callable[..., FakeStderr],
+) -> None:
+    """Workers log from threads; each record's lines reach the stream as one write."""
+    stderr = redirect_stderr()
+    handler = ConsoleHandler()
+
+    def worker(tag: str) -> None:
+        for _ in range(50):
+            handler.handle(record(REPORT_LOGGER, logging.INFO, ThreeLines(tag)))
+
+    threads = [threading.Thread(target=worker, args=(f"t{n}",)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    lines = stderr.getvalue().splitlines()
+    assert len(lines) == 8 * 50 * 3
+    for start in range(0, len(lines), 3):
+        tag = lines[start].split()[1]
+        assert lines[start] == f"12:00:00  {tag} first"
+        assert lines[start + 1] == f"          {tag} second"
+        assert lines[start + 2] == f"          {tag} third"
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_console_logging_is_scoped_and_keeps_optuna_at_error(verbose: bool) -> None:
+    """``-v`` changes only what run.log records; Optuna stays at ERROR, and nothing outlives the run."""
+    root, package = logging.getLogger(), logging.getLogger("phasesweep")
+    handlers, level = root.handlers[:], package.level
+    optuna.logging.set_verbosity(optuna.logging.INFO)
+    try:
+        with _console_logging(verbose):
+            assert optuna.logging.get_verbosity() == optuna.logging.ERROR
+            assert package.level == (logging.DEBUG if verbose else logging.INFO)
+            assert any(isinstance(handler, ConsoleHandler) for handler in root.handlers)
+        assert optuna.logging.get_verbosity() == optuna.logging.INFO
+        assert package.level == level
+        assert root.handlers == handlers
+    finally:
+        optuna.logging.set_verbosity(optuna.logging.INFO)
+
+
+def _run_config(tmp_path: Path, name: str) -> Path:
+    """Write a one-phase, two-trial config whose trials succeed, with its own workdir."""
+    experiment = make_experiment(
+        persistent=tmp_path / name,
+        trainer=write_constant_trainer(tmp_path),
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
+    )
+    return write_experiment_config(tmp_path / f"{name}.yaml", experiment)
+
+
+def _console_text(err: str) -> str:
+    """Normalize what varies between two runs of the same sweep: the time and trial durations."""
+    return re.sub(r"\d+\.\ds", "Ns", re.sub(r"(?m)^\d\d:\d\d:\d\d", "HH:MM:SS", err))
+
+
+def test_verbose_leaves_the_console_unchanged_and_deepens_run_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The same sweep prints the same console text with and without ``-v``; only run.log differs."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    transcripts = {}
+    logs = {}
+    for name, flags in (("plain", []), ("verbose", ["-v"])):
+        config = _run_config(tmp_path, name)
+        assert invoke_cli_boundary(["run", str(config), *flags], monkeypatch) == 0
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        transcripts[name] = _console_text(captured.err)
+        logs[name] = (tmp_path / name / "runs" / "t" / "run.log").read_text(encoding="utf-8")
+    assert transcripts["plain"] == transcripts["verbose"]
+    assert "trial 1  COMPLETE" in transcripts["plain"]
+    assert not re.search(r"^\S+ \S+ D ", logs["plain"], re.MULTILINE)
+    assert re.search(r"^\S+ \S+ D phasesweep\.", logs["verbose"], re.MULTILINE)
+
+
+def test_a_dry_run_prints_its_lines_on_stderr_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A dry run keeps its message text, prefixed only by the time, and prints nothing on stdout."""
+    config = _run_config(tmp_path, "dry")
+    assert invoke_cli_boundary(["run", str(config), "--dry-run"], monkeypatch) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    lines = [re.sub(r"^\d\d:\d\d:\d\d  ", "", line) for line in captured.err.splitlines()]
+    assert "phase=p study=t::p finished=0 remaining=2 reruns=0 n_jobs=1" in lines
+    assert "DRY RUN phase=p would launch 2 trials" in lines
+    assert lines[-1] == "DRY RUN complete. No trials launched, no summary written."

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import shlex
 import sys
 import traceback
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from importlib import resources
 from pathlib import Path
 
@@ -36,7 +37,6 @@ from phasesweep.config.reference import (
 )
 from phasesweep.config.run_overrides import CreatedKey, SetPathError, apply_set, created_key_notes
 from phasesweep.config.search import phase_draws
-from phasesweep.engine.artifacts import LOG_FORMAT
 from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.fingerprints import _recorded_config_matches
 from phasesweep.engine.ledger import validate_ledger
@@ -82,6 +82,7 @@ from phasesweep.mcp.registry import (
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.tool_names import TOOL_NAMES
 from phasesweep.reporting import _progress_values, report_objective
+from phasesweep.runtime.console import ConsoleHandler
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
     UnsafeLockPathError,
@@ -136,19 +137,32 @@ _SIGNATURE_COLUMN_CAP = 40
 _SUMMARY_WIDTH = 72
 
 
-def _configure_logging(verbose: bool) -> None:
-    """Initialize root logging and tune Optuna's verbosity.
+@contextlib.contextmanager
+def _console_logging(verbose: bool) -> Iterator[None]:
+    """Show a run's report and warnings on stderr, and leave the rest to ``run.log``.
 
-    :param bool verbose: If True, set root logger to ``DEBUG`` and Optuna to ``INFO``;
-        otherwise root is ``INFO`` and Optuna is quieted to ``ERROR``.
+    The ``phasesweep`` logger takes ``INFO``, or ``DEBUG`` under ``verbose``, which is the level
+    ``run.log`` records at; the console shows the same lines either way. Optuna stays at
+    ``ERROR`` in both modes. Everything is restored on exit, so a process that runs several
+    commands, as the tests do, keeps no handler or level behind.
+
+    :param bool verbose: Record ``DEBUG`` messages in ``run.log``.
+    :return Iterator[None]: Context manager for the command's lifetime.
     """
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format=LOG_FORMAT,
-        datefmt="%H:%M:%S",
-    )
-    optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.ERROR)
+    package = logging.getLogger("phasesweep")
+    root = logging.getLogger()
+    handler = ConsoleHandler()
+    previous_level = package.level
+    previous_verbosity = optuna.logging.get_verbosity()
+    package.setLevel(logging.DEBUG if verbose else logging.INFO)
+    optuna.logging.set_verbosity(optuna.logging.ERROR)
+    root.addHandler(handler)
+    try:
+        yield
+    finally:
+        root.removeHandler(handler)
+        optuna.logging.set_verbosity(previous_verbosity)
+        package.setLevel(previous_level)
 
 
 @click.group(
@@ -206,9 +220,6 @@ def main() -> None:
         sys.exit(_USAGE_EXIT)
     except PhaseSweepError as exc:
         click.echo(f"phasesweep: {_operational_error_text(exc)}", err=True)
-        # -v (see _configure_logging) means the operator asked for internals.
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
-            traceback.print_exc()
         sys.exit(_FAILURE_EXIT)
     except OSError as exc:
         click.echo(f"phasesweep: operational error: {exc}", err=True)
@@ -473,7 +484,7 @@ def report_objective_cmd(
     "--verbose",
     is_flag=True,
     show_default=True,
-    help="Show debug logs from phasesweep and INFO logs from Optuna.",
+    help="Record DEBUG messages in run.log; the console shows the same lines either way.",
 )
 def run(
     config_path: Path,
@@ -491,34 +502,34 @@ def run(
         run would refuse over the recorded trials, and render example commands, without
         launching subprocesses.
     :param tuple[str, ...] settings: ``KEY=VALUE`` assignments with YAML values.
-    :param bool verbose: Enable debug logging for phasesweep and INFO logging for Optuna.
+    :param bool verbose: Record ``DEBUG`` messages in ``run.log``; the console is unchanged.
     :raises ConfigError: The config file cannot be parsed or fails model validation.
     :raises SystemExit: With code 2 when ``from_phase`` names no configured phase; a
         ``PhaseSweepShutdown`` from an interrupted run is re-raised unchanged.
     """
-    _configure_logging(verbose)
-    # Install before config parsing so CLI SIGINT/SIGTERM behavior and exit
-    # codes remain structured throughout startup, including dry-run previews.
-    # run_experiment() repeats this idempotently for direct library callers.
-    install_signal_handlers()
-    config = _command_config(config_path, settings=settings)
-    if from_phase is not None:
-        valid = [p.name for p in config.phases]
-        if from_phase not in valid:
-            click.echo(f"--from-phase={from_phase!r} not in {valid}", err=True)
-            sys.exit(2)
-    try:
-        run_experiment(config, from_phase=from_phase, dry_run=dry_run)
-    except PhaseSweepShutdown as exc:
-        if exc.published_result_committed:
-            click.echo(
-                "phasesweep: shutdown was honored after the published result was committed; "
-                "the result is available for inspection.",
-                err=True,
-            )
-        elif not dry_run:
-            click.echo(_resume_hint(config), err=True)
-        raise
+    with _console_logging(verbose):
+        # Install before config parsing so CLI SIGINT/SIGTERM behavior and exit
+        # codes remain structured throughout startup, including dry-run previews.
+        # run_experiment() repeats this idempotently for direct library callers.
+        install_signal_handlers()
+        config = _command_config(config_path, settings=settings)
+        if from_phase is not None:
+            valid = [p.name for p in config.phases]
+            if from_phase not in valid:
+                click.echo(f"--from-phase={from_phase!r} not in {valid}", err=True)
+                sys.exit(2)
+        try:
+            run_experiment(config, from_phase=from_phase, dry_run=dry_run)
+        except PhaseSweepShutdown as exc:
+            if exc.published_result_committed:
+                click.echo(
+                    "phasesweep: shutdown was honored after the published result was committed; "
+                    "the result is available for inspection.",
+                    err=True,
+                )
+            elif not dry_run:
+                click.echo(_resume_hint(config), err=True)
+            raise
 
 
 def _resume_hint(config: Experiment) -> str:
