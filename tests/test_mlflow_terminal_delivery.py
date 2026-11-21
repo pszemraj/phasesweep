@@ -14,6 +14,7 @@ import yaml
 from optuna.trial import TrialState, create_trial
 
 from phasesweep.config.models import Experiment
+from phasesweep.engine.errors import TrackingSyncRefusedError
 from phasesweep.engine.generation import _recorded_generation
 from phasesweep.engine.ledger import (
     claim_ledger,
@@ -45,7 +46,11 @@ from phasesweep.engine.state import (
     _trial_interrupted,
     constraint_attr,
 )
-from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
+from phasesweep.errors import (
+    PhaseSweepError,
+    ProcessCleanupUncertainError,
+    UnsafeProcessCleanupError,
+)
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
@@ -1065,6 +1070,46 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
         publication.sync_tracking(experiment)
         assert _summaries(uploads) == [(generation, "KILLED")]
     assert read_record(record)["projection"]["summary"]["error_class"] is None
+
+
+@pytest.mark.parametrize("in_flight", [True, False], ids=["in-flight", "between-trials"])
+def test_a_run_with_another_mlflow_target_saves_no_recovered_outcome(
+    tmp_path, monkeypatch, caplog, in_flight
+):
+    """A run whose MLflow target is not the one the tree recorded saves no record of a killed sweep.
+
+    The changed launch is refused, and the killed sweep's attempt and summary-run outcomes,
+    whether recovery settled a trial or only found the summary run left open, wait unsaved
+    under one warning. sync-tracking with the config the sweep ran with then delivers each once.
+    """
+    experiment, uploads, attempts = killed_sweep(
+        tmp_path, monkeypatch, n_jobs=1, in_flight=in_flight
+    )
+    [generation] = [path.name for path in tracking_root(experiment).iterdir() if path.is_dir()]
+    delivery = tracking_root(experiment) / generation / "delivery"
+    recorded = sorted(delivery.glob("*.json"))
+    moved = experiment.model_copy(
+        update={
+            "mlflow": experiment.mlflow.model_copy(update={"tracking_uri": "http://moved:5000"})
+        }
+    )
+    uploads.clear()
+
+    # The moved target changes the trainer environment of a rerun or the evidence of a kept trial.
+    with pytest.raises(PhaseSweepError):
+        run_experiment(moved)
+
+    assert sorted(delivery.glob("*.json")) == recorded
+    assert uploads == []
+    assert "with the config the sweep ran with" in caplog.text
+    with pytest.raises(TrackingSyncRefusedError, match="belongs to a different target"):
+        publication.sync_tracking(moved)
+    assert (sorted(delivery.glob("*.json")), uploads) == (recorded, [])
+    assert publication.sync_tracking(experiment)["pending"] == 0
+    assert _sent(uploads, attempts) == (["KILLED"] if in_flight else [])
+    assert _summaries(uploads) == [(generation, "KILLED")]
+    for path in delivery.glob("*.json"):
+        assert read_record(path)["source"] == experiment.mlflow.evidence_identity()
 
 
 def test_recovery_sends_nothing_to_a_tracker_that_is_down(tmp_path, monkeypatch):

@@ -666,17 +666,38 @@ def generations_left_open(experiment: Experiment) -> set[str]:
     }
 
 
+def _target_recorded(experiment: Experiment) -> bool:
+    """Report whether the configured MLflow target is the one the tree's bound runs live in.
+
+    Searched runs and rebuilt records take the configured target, so a config naming another
+    one would stamp an earlier sweep's records with a target its runs are not in. A tree
+    without ``source.json`` has bound no run.
+
+    :param Experiment experiment: MLflow-backed experiment.
+    :raises OSError: ``source.json`` cannot be read.
+    :raises ValueError: ``source.json`` does not use the current format.
+    :return bool: Whether ``source.json`` is absent or records the configured target.
+    """
+    assert experiment.mlflow is not None
+    source = tracking_root(experiment) / "source.json"
+    return (
+        not source.exists()
+        or read_record(source)["source"] == experiment.mlflow.evidence_identity()
+    )
+
+
 def save_recovered_attempts(
     experiment: Experiment, ledger: ValidatedLedger, generation_ids: Iterable[str]
 ) -> list[Path]:
     """Save the records of attempts whose outcomes recovery committed, sending nothing.
 
     As for sync-tracking, only a generation whose summary run is bound has attempt runs to
-    finish, and a record already saved is kept as it is. A generation that is not published
-    also gets the record that ends its summary run, as its invocation is over. The
-    outcomes are already in the ledger and lifecycle records, from which sync-tracking rebuilds
-    any record left unsaved, so a record that cannot be written or read costs a warning, never
-    the caller's run or recovery.
+    finish, a record already saved is kept as it is, and nothing is saved unless the configured
+    target is the one the tree recorded: a run with a changed target is refused only after this
+    save. A generation that is not published also gets the record that ends its summary run,
+    as its invocation is over. The outcomes are already in the ledger and lifecycle records,
+    from which sync-tracking rebuilds any record left unsaved, so another target or a record
+    that cannot be written or read costs a warning, never the caller's run or recovery.
 
     :param Experiment experiment: Configured experiment.
     :param ValidatedLedger ledger: The experiment's validated ledger, holding the attempts' trials.
@@ -684,7 +705,8 @@ def save_recovered_attempts(
         those left open by an invocation killed outright, and for recover-run the run it
         recovers; never the caller's own.
     :return list[Path]: Those generations' attempt and summary-run records not yet delivered, in
-        generation order, or none when they could not all be saved and read.
+        generation order, or none when they could not all be saved and read or the target is
+        not the recorded one.
     """
     root = tracking_root(experiment)
     generations = sorted(
@@ -693,6 +715,13 @@ def save_recovered_attempts(
         if (root / generation_id / "generation-binding.json").is_file()
     )
     try:
+        if generations and not _target_recorded(experiment):
+            log.warning(
+                "The MLflow outcomes of recovered attempts were not saved: this config's MLflow "
+                "target is not the one the sweep's runs were created in. They wait for a run or "
+                "`phasesweep sync-tracking` with the config the sweep ran with."
+            )
+            return []
         _rebuild_attempt_intents(experiment, ledger, generations)
         summaries = set(_save_ended_summaries(experiment, generations))
         records: list[Path] = []
@@ -848,13 +877,7 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
             experiment, _PreflightCleanupReport(), confirm=True, tracking_only=True
         )
         root = tracking_root(experiment)
-        source = root / "source.json"
-        # Searched runs and rebuilt records take the configured target, so it
-        # must be the recorded one.
-        if (
-            source.exists()
-            and read_record(source)["source"] != experiment.mlflow.evidence_identity()
-        ):
+        if not _target_recorded(experiment):
             raise TrackingSyncRefusedError(
                 "Tracking delivery belongs to a different target or generation."
             )
