@@ -1607,6 +1607,27 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         raise
 
 
+def _shutdown_raised_over(exc: BaseException) -> PhaseSweepShutdown | None:
+    """Return the shutdown ``exc`` is, or was raised while handling or from.
+
+    :param BaseException exc: An exception leaving ``study.optimize``.
+    :return PhaseSweepShutdown | None: The first shutdown in its cause and context chains,
+        or ``None`` when they hold none.
+    """
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if isinstance(current, PhaseSweepShutdown):
+            return current
+        if id(current) not in seen:
+            seen.add(id(current))
+            pending.extend(
+                link for link in (current.__cause__, current.__context__) if link is not None
+            )
+    return None
+
+
 def _run_phase(
     experiment: Experiment,
     phase: Phase,
@@ -1653,7 +1674,8 @@ def _run_phase(
     :raises TimeoutError: The phase or run deadline expires before the requested trial budget
         completes and partial publication is disabled, or before any trial completes.
     :raises PhaseSweepShutdown: The orchestrator receives a handled shutdown signal;
-        propagated after recording a non-failure trial outcome.
+        propagated after recording a non-failure trial outcome, also when Optuna's own
+        cleanup raised another error over it.
     :raises RuntimeError: Optuna returned before the requested trial budget without a timeout,
         abort, or exception, which violates the runner invariant.
     :return Winner: The selected phase winner.
@@ -1758,7 +1780,13 @@ def _run_phase(
                 if phase.n_jobs > 1:
                     _await_worker_trials(run.workers, study)
                 if not isinstance(exc, _TrialLeftRunning):
-                    raise
+                    # The handler raises in the main thread at whatever bytecode is running,
+                    # and a library's cleanup code can raise over it: Optuna's tell raises
+                    # UnboundLocalError from its finally block. The run is still stopping.
+                    shutdown = _shutdown_raised_over(exc)
+                    if shutdown is None or shutdown is exc:
+                        raise
+                    raise shutdown from None
                 # A trial left RUNNING stops the phase with whichever recorded fatal
                 # error outranks it once every worker has recorded its own.
                 run.record_fatal(exc)
