@@ -159,16 +159,13 @@ def test_the_next_run_delivers_an_interrupted_runs_pending_records(
 ) -> None:
     """A run that reaches closeout sends what an interrupted earlier run saved, each record once.
 
-    The interrupted run saved its summary run's KILLED end, which no recovery of this run
-    settles, so it is not among the generations recovery hands on. A dry run writes and sends
-    nothing; the next real run ends the earlier summary run KILLED once, says so, and leaves
-    nothing for sync-tracking.
+    A dry run writes and sends nothing; the next real run ends the earlier summary run KILLED
+    once, says so, and leaves nothing for sync-tracking.
     """
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=persistent)
     experiment = sweep.experiment
     summary = read_record(sweep.summary)
     assert (summary["state"], summary["finish"]) == ("pending", "KILLED")
-    assert publication.generations_left_open(experiment) == set()
     assert publication.delivery_status(experiment) == {"pending": 2, "delivered": 0}
     tree = _listing(tracking_root(experiment))
 

@@ -16,7 +16,6 @@ from phasesweep.errors import (
     ProcessCleanupUncertainError,
     operator_step,
 )
-from phasesweep.runtime.files import UnsafePrivatePathError
 from phasesweep.runtime.json import (
     JsonObject,
     json_number,
@@ -30,7 +29,6 @@ from phasesweep.tracking.session import (
     BINDING_FILE,
     GENERATION_BINDING_FILE,
     NO_ANSWER,
-    PENDING_GENERATION_BINDING_FILE,
     call_tracking,
     pending_creation_records,
     read_binding,
@@ -838,26 +836,6 @@ def _save_ended_summaries(
     return paths
 
 
-def generations_left_open(experiment: Experiment) -> set[str]:
-    """Name unpublished generations whose summary creation or terminal delivery is missing.
-
-    A published generation is left out, as its record is built from its committed artifacts.
-
-    :param Experiment experiment: Configured experiment.
-    :return set[str]: Unpublished generations with a summary creation or binding and no
-        summary-run delivery record.
-    """
-    root = tracking_root(experiment)
-    parents = {path.parent for path in root.glob(f"*/{GENERATION_BINDING_FILE}")}
-    parents.update(path.parent for path in root.glob(f"*/{PENDING_GENERATION_BINDING_FILE}"))
-    return {
-        parent.name
-        for parent in parents
-        if not (parent / "delivery" / "generation.json").exists()
-        and not _published(experiment, parent.name)
-    }
-
-
 def _target_recorded(experiment: Experiment) -> bool:
     """Report whether the configured MLflow target is the one the tree's bound runs live in.
 
@@ -876,53 +854,6 @@ def _target_recorded(experiment: Experiment) -> bool:
         not source.exists()
         or read_record(source)["source"] == experiment.mlflow.evidence_identity()
     )
-
-
-def save_recovered_attempts(
-    experiment: Experiment, ledger: ValidatedLedger, generation_ids: Iterable[str]
-) -> None:
-    """Save the records of attempts whose outcomes recovery committed, sending nothing.
-
-    As for sync-tracking, only a generation whose summary run is bound has attempt runs to
-    finish, a record already saved is kept as it is, and nothing is saved unless the configured
-    target is the one the tree recorded: a run with a changed target is refused only after this
-    save. A generation that is not published also gets the record that ends its summary run,
-    as its invocation is over. The outcomes are already in the ledger and lifecycle records,
-    from which closeout and sync-tracking rebuild any record left unsaved, so another target or
-    a record that cannot be written or read costs a warning, never the caller's run or recovery.
-
-    :param Experiment experiment: Configured experiment.
-    :param ValidatedLedger ledger: The experiment's validated ledger, holding the attempts' trials.
-    :param Iterable[str] generation_ids: Ended generations: those whose trials recovery settled,
-        those left open by an invocation killed outright, and for recover-run the run it
-        recovers; never the caller's own.
-    """
-    root = tracking_root(experiment)
-    generations = sorted(
-        generation_id
-        for generation_id in set(generation_ids)
-        if (root / generation_id / GENERATION_BINDING_FILE).is_file()
-    )
-    try:
-        if generations and not _target_recorded(experiment):
-            log.warning(
-                "The MLflow outcomes of recovered attempts were not saved: this config's MLflow "
-                "target is not the one the sweep's runs were created in. They wait for a run or "
-                "`phasesweep sync-tracking` with the config the sweep ran with."
-            )
-            return
-        unresolved: dict[str, TrackingSyncRefusedError] = {}
-        _rebuild_attempt_intents(experiment, ledger, generations, unresolved=unresolved)
-        _save_ended_summaries(experiment, generations, unresolved=unresolved)
-        for error in unresolved.values():
-            log.warning("%s %s", error, error.remediation)
-    except (OSError, ValueError, UnsafePrivatePathError, TrackingSyncRefusedError) as exc:
-        log.warning(
-            "The MLflow outcomes of recovered attempts were not all saved (%s); the next run or "
-            "`phasesweep sync-tracking` with the same config rebuilds them from the ledger and "
-            "delivers them.",
-            exc,
-        )
 
 
 def _bound_generations(experiment: Experiment, scope: str | None, skip: str | None) -> list[str]:

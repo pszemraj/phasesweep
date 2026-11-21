@@ -954,7 +954,6 @@ def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_pa
     assert len(list(first_delivery.glob("attempt-*.json"))) == 4
     assert not any((first_delivery / name).exists() for name in intents)
     uploads.clear()  # the attempt uploads are already delivered; only sync's remain to count
-    assert publication.generations_left_open(experiment) == set()
 
     reports = []
     run_experiment(experiment, terminal_callback=reports.append)

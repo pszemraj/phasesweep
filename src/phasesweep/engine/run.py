@@ -390,18 +390,6 @@ def _run_experiment_outcome(
                 cleanup_report=cleanup,
                 from_phase=from_phase,
             )
-            if experiment.mlflow is not None:
-                from phasesweep.tracking.publication import (
-                    generations_left_open,
-                    save_recovered_attempts,
-                )
-
-                # The lock rules out a live invocation and this run has requested no summary,
-                # so every open summary binding or creation belongs to an earlier invocation.
-                cleanup.settled_generations.update(generations_left_open(experiment))
-                # Recovery sends nothing; what it settled waits as pending records until the
-                # run has reached the tracker.
-                save_recovered_attempts(experiment, claimed, cleanup.settled_generations)
             if cleanup.unreadable_evidence:
                 # New trials would bury finished training the tracker has yet to report.
                 raise attempt_ops._pending_evidence_refusal(cleanup.unreadable_evidence)
@@ -465,7 +453,6 @@ def _run_experiment_outcome(
                     reconciliation.recovered_attempt_generations
                 )
                 cleanup.uncertain_attempt_ids.update(reconciliation.uncertain_attempt_ids)
-                cleanup.settled_generations.update(reconciliation.settled_generations)
                 cleanup.cleanup_confirmed = reconciliation.cleanup_confirmed
                 cleanup.error = reconciliation.error
             original_cleanup_uncertain = isinstance(exc, ProcessCleanupUncertainError) or (
