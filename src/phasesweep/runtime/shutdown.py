@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import os
 import signal
 import subprocess
 import sys
@@ -565,20 +564,18 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
             absorbed.signum = drained
 
 
-def _register(proc: subprocess.Popen[bytes], *, label: str, pgid: int | None = None) -> int:
+def _register(proc: subprocess.Popen[bytes], *, label: str, pgid: int) -> int:
     """Add a freshly-launched subprocess to the global child registry.
 
-    :param subprocess.Popen[bytes] proc: Newly launched subprocess.
+    :param subprocess.Popen[bytes] proc: Newly launched guardian.
     :param str label: What the interrupt line calls this group, counted with others of its
         label: :data:`TRAINER_LABEL` for a trainer, a noun such as ``MLflow request`` for a worker.
-    :param int | None pgid: Explicit child process group guarded by ``proc``. When omitted,
-        register ``proc``'s own process group.
+    :param int pgid: The child process group ``proc`` guards, which is not ``proc``'s own.
     :return int: Registered process-group ID for removal and signal targeting.
     """
-    resolved_pgid = os.getpgid(proc.pid) if pgid is None else pgid
     with _lock:
-        _active_children[resolved_pgid] = _RegisteredGroup(proc, label)
-    return resolved_pgid
+        _active_children[pgid] = _RegisteredGroup(proc, label)
+    return pgid
 
 
 def _unregister(pgid: int) -> None:
