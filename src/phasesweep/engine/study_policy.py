@@ -37,7 +37,11 @@ from phasesweep.engine.fingerprints import (
     _render_changed_values,
     _render_value,
 )
-from phasesweep.engine.optuna import _finished_trial_count, _measured_trial_count
+from phasesweep.engine.optuna import (
+    _any_trial_timed_out,
+    _finished_trial_count,
+    _measured_trial_count,
+)
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
@@ -66,6 +70,7 @@ from phasesweep.errors import (
     RERUN_CLEANUP_RECOVERY,
     OperatorAction,
     format_mismatch,
+    timeout_step,
 )
 from phasesweep.runtime.json import JsonObject, json_text_map
 
@@ -819,11 +824,21 @@ def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, obje
             f"study identity. {results_stay} {NEW_STUDY_STEP} "
             f"{fingerprint_kept} For work under unchanged limits: {remedies}"
         )
-    remedies = _recovery_remedies(phase, study, abort, lead_in="Fix the cause, then ")
+    timeout_lead = (
+        f"{timeout_step(phase.name)} "
+        if _any_trial_timed_out(study.get_trials(deepcopy=False))
+        else ""
+    )
+    remedies = _recovery_remedies(
+        phase,
+        study,
+        abort,
+        lead_in="For any other cause, fix it, then " if timeout_lead else "Fix the cause, then ",
+    )
     if remedies is None:
         return None
     return (
-        f"{remedies} {results_stay} {fingerprint_kept} "
+        f"{timeout_lead}{remedies} {results_stay} {fingerprint_kept} "
         f"If the fix changes trial_command or the trainer's PATH, or the recorded results "
         f"are invalid, {FRESH_STUDY}."
     )

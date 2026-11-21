@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
+from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.artifacts import _load_winner
@@ -32,6 +33,7 @@ from tests.conftest import (
     make_experiment,
     make_trial_context,
     phase_study,
+    phase_trials,
     write_constant_trainer,
     write_trainer,
     write_trial_zero_trainer,
@@ -975,3 +977,49 @@ def test_timeout_remedy_matches_storage_and_budget(
     )
     assert failure["code"] == "timeout"
     assert failure["remediation"].startswith(f"Ask the operator: {remedy} ")
+
+
+def test_a_per_trial_timeout_abort_names_the_rename_that_the_raised_timeout_needs(
+    tmp_path: Path,
+) -> None:
+    """The supervisor's recorded timeout leads the abort advice, and that advice's rename runs."""
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json, time
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        time.sleep(1.5)
+        with open(args.out, "w") as f:
+            json.dump({"x": 1.0}, f)
+        print("x=1.0")
+        """,
+    )
+
+    def phase(name: str, timeout: float) -> Phase:
+        return Phase(
+            name=name,
+            n_trials=2,
+            max_consecutive_failures=2,
+            timeout_seconds_per_trial=timeout,
+            sampler=Sampler(type="random", seed=0),
+            search_space={"x": IntParam(type="int", low=0, high=10)},
+        )
+
+    short = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase("p", 0.5)])
+    with pytest.raises(NoFeasibleTrialError) as aborted:
+        run_experiment(short)
+    message = _operational_error_text(aborted.value)
+    assert message.index("A trial timed out under phases[p].timeout_seconds_per_trial") < (
+        message.index("For any other cause, fix it, then raise phases[p].n_trials")
+    )
+    assert "raising it in place is refused as a changed study" in message
+
+    raised = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase("p", 5.0)])
+    with pytest.raises(PhaseSweepError, match=r"phase\.timeout_seconds_per_trial: 0\.5 -> 5\.0"):
+        run_experiment(raised, dry_run=True)
+
+    renamed = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase("p2", 5.0)])
+    run_experiment(renamed)
+    assert [trial.state.name for trial in phase_trials(renamed, "p2")] == ["COMPLETE", "COMPLETE"]

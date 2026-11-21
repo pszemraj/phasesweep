@@ -31,6 +31,7 @@ from phasesweep.engine.confound import (
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
 from phasesweep.engine.optuna import (
+    _any_trial_timed_out,
     _draw_positions,
     _finished_trial_count,
     _measured_trial_count,
@@ -61,7 +62,14 @@ from phasesweep.engine.state import (
     _validate_observed_block,
     constraint_attr,
 )
-from phasesweep.errors import FRESH_STUDY, NEW_STUDY_STEP, OperatorAction, PhaseSweepError
+from phasesweep.errors import (
+    FRESH_STUDY,
+    NEW_STUDY_STEP,
+    RENAME_PHASE_STEP,
+    OperatorAction,
+    PhaseSweepError,
+    timeout_step,
+)
 from phasesweep.runtime.json import JsonObject, json_object, json_text_map
 
 log = logging.getLogger("phasesweep.engine.selection")
@@ -118,6 +126,7 @@ def _no_feasible_remedy(
     infeasible = any(_trial_count_state(trial) == "INFEASIBLE" for trial in trials)
     if infeasible:
         return f"{evidence} Changing metric.min, metric.max or constraints changes persistent study identity. {NEW_STUDY_STEP}"
+    timeout_lead = ""
     if phase_name is not None:
         phase = experiment.phase(phase_name)
         finished = _finished_trial_count(trials)
@@ -126,13 +135,33 @@ def _no_feasible_remedy(
         )
         target = f"above {phase.n_trials}" if ceiling is None else f"to {ceiling}"
         budget = f"phases[{phase.name}].n_trials {target}"
+        # A grid or fixed configuration retries its failed cells at a raised target; a sampler
+        # that draws only adds draws, so a failed configuration is never tried again.
+        outcome = (
+            " to draw new configurations; the failed ones are not retried"
+            if ceiling is None
+            else " to retry the failed attempts"
+        )
+        if _any_trial_timed_out(trials):
+            timeout_lead = f"{timeout_step(phase.name)} "
     else:
         budget = "the phase's n_trials"
+        outcome = ""
+    fix = "For any other failure, fix it" if timeout_lead else "Fix the failure"
+    # The timeout step already names the rename that a raised timeout needs.
+    timeout_identity = (
+        ""
+        if timeout_lead
+        else (
+            " A changed `timeout_seconds_per_trial` is part of the identity too; for it, "
+            f"{RENAME_PHASE_STEP}, which starts only this phase over."
+        )
+    )
     return (
-        f"{evidence} Fix the failure, then raise {budget} in the config and rerun to retry "
-        "the failed attempts. Run controls such as `n_jobs` can change on retry. "
-        "If the fix changes study identity "
-        f"(for example `trial_command`, `trainer_config` or `provenance`), {FRESH_STUDY}."
+        f"{evidence} {timeout_lead}{fix}, then raise {budget} in the config and rerun{outcome}. "
+        "Run controls such as `n_jobs` can change on retry. "
+        "If the fix changes study identity (for example `trial_command`, `trainer_config` or "
+        f"`provenance`), {FRESH_STUDY}.{timeout_identity}"
     )
 
 

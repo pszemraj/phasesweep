@@ -8,11 +8,13 @@ import optuna
 import pytest
 
 from phasesweep.config.models import Constraint, Phase
+from phasesweep.config.search import CategoricalParam, FloatParam, Sampler
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.repeats import RepeatAxis
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    FAILURE_REASON_ATTR,
     FEASIBLE_ATTR,
     GATES_ATTR,
     GENERATION_ID_ATTR,
@@ -497,6 +499,128 @@ def test_crashed_trials_remedy_names_the_next_attempt_budget(
     else:
         assert "storage: null starts fresh" in remedy
         assert "raise" not in remedy
+
+
+def _failed_study(reasons: list[str | None]) -> optuna.Study:
+    """Build a study whose trials all failed, each recording the given failure reason."""
+    study = optuna.create_study()
+    for reason in reasons:
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=optuna.trial.TrialState.FAIL,
+                user_attrs={} if reason is None else {FAILURE_REASON_ATTR: reason},
+            )
+        )
+    return study
+
+
+def _crashed_remedy(tmp_path: Path, phase: Phase, reasons: list[str | None]) -> str:
+    """Return the remedy a persistent experiment gives when every trial of ``phase`` failed."""
+    experiment = make_experiment(persistent=tmp_path, phases=[phase])
+    with pytest.raises(NoFeasibleTrialError) as refused:
+        select_winner(_failed_study(reasons), experiment, phase_name=phase.name)
+    remedy = refused.value.remediation
+    assert remedy is not None
+    return remedy
+
+
+def _sampled_phase(sampler: Sampler, *, n_trials: int = 2) -> Phase:
+    """Build a phase whose sampler draws configurations from a continuous space."""
+    return Phase(
+        name="p",
+        n_trials=n_trials,
+        sampler=sampler,
+        search_space={"x": FloatParam(type="float", low=0.1, high=1.0)},
+    )
+
+
+@pytest.mark.parametrize(
+    ("phase", "outcome"),
+    [
+        pytest.param(
+            Phase(
+                name="p",
+                n_trials=3,
+                sampler=Sampler(type="grid"),
+                search_space={"x": CategoricalParam(type="categorical", choices=[1, 2, 3])},
+            ),
+            "to 6 in the config and rerun to retry the failed attempts.",
+            id="grid-retries-failed-cells",
+        ),
+        pytest.param(
+            Phase(name="p", n_trials=2, sampler=Sampler(type="random", seed=0), search_space={}),
+            "to 3 in the config and rerun to retry the failed attempts.",
+            id="fixed-configuration-retries-its-cell",
+        ),
+        pytest.param(
+            _sampled_phase(Sampler(type="random", seed=0)),
+            "above 2 in the config and rerun to draw new configurations; the failed ones are "
+            "not retried.",
+            id="random-draws-new-ones",
+        ),
+        pytest.param(
+            _sampled_phase(Sampler(type="tpe", seed=0)),
+            "above 2 in the config and rerun to draw new configurations; the failed ones are "
+            "not retried.",
+            id="tpe-draws-new-ones",
+        ),
+    ],
+)
+def test_crashed_remedy_says_whether_a_raised_target_retries_or_draws(
+    tmp_path: Path, phase: Phase, outcome: str
+) -> None:
+    """A grid or fixed configuration retries its failed cells at a raised target; a sampler that draws never retries one."""
+    remedy = _crashed_remedy(tmp_path, phase, [None] * phase.n_trials)
+
+    assert outcome in remedy
+    assert "timed out" not in remedy
+
+
+def test_the_identity_list_names_the_per_trial_timeout_and_the_rename_that_follows_it(
+    tmp_path: Path,
+) -> None:
+    """A failure that was not a timeout still learns that raising the timeout later needs a rename."""
+    phase = _sampled_phase(Sampler(type="random", seed=0))
+
+    remedy = _crashed_remedy(tmp_path, phase, ["non-zero exit code 1", None])
+
+    assert "(for example `trial_command`, `trainer_config` or `provenance`)" in remedy
+    assert (
+        "A changed `timeout_seconds_per_trial` is part of the identity too; for it, give the "
+        "phase, and each phase that inherits it, a new `name`, updating every `inherits` to "
+        "match, which starts only this phase over."
+    ) in remedy
+    assert "timed out" not in remedy
+
+
+def test_a_timed_out_phase_is_told_to_rename_it_not_to_raise_the_timeout_in_place(
+    tmp_path: Path,
+) -> None:
+    """A recorded per-trial timeout leads the remedy: the raised timeout needs a new phase name."""
+    phase = _sampled_phase(Sampler(type="random", seed=0))
+
+    remedy = _crashed_remedy(tmp_path, phase, ["timeout after 5.0s", "timeout after 5.0s"])
+
+    assert "A trial timed out under phases[p].timeout_seconds_per_trial" in remedy
+    assert "raising it in place is refused as a changed study" in remedy
+    assert (
+        "Raise it and give the phase, and each phase that inherits it, a new `name`, updating "
+        "every `inherits` to match; each renamed phase starts a new study and runs again, and "
+        "every other phase keeps its results."
+    ) in remedy
+    assert "For any other failure, fix it, then raise phases[p].n_trials above 2" in remedy
+    assert remedy.count("give the phase, and each phase that inherits it") == 1
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["phase/run wallclock deadline exceeded", "non-zero exit code 1; stderr: timeout after"],
+)
+def test_other_failures_are_not_read_as_a_per_trial_timeout(tmp_path: Path, reason: str) -> None:
+    """Only the supervisor's per-trial wording counts; a deadline or a quoted stderr line does not."""
+    phase = _sampled_phase(Sampler(type="random", seed=0))
+
+    assert "timed out" not in _crashed_remedy(tmp_path, phase, [reason, reason])
 
 
 @pytest.mark.parametrize(

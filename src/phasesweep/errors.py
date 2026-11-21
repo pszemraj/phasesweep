@@ -101,6 +101,32 @@ FRESH_STUDY = f"set{_FRESH_STUDY_TAIL}"
 
 NEW_STUDY_STEP = f"Set{_FRESH_STUDY_TAIL}; the old study stays readable with its original config."
 
+#: The step that starts one phase over when a setting of that phase changes. A phase's study is
+#: named after the phase, so a new name is a new study for it, and a phase that inherits it records
+#: the name in its own study identity and follows. Worded as a clause for a step that offers it.
+RENAME_PHASE_STEP = (
+    "give the phase, and each phase that inherits it, a new `name`, updating every `inherits` "
+    "to match"
+)
+
+
+def timeout_step(phase_name: str) -> str:
+    """Say how to give a phase whose trials timed out a longer per-trial timeout.
+
+    The timeout is part of the phase's study identity, so a raised value is refused over the
+    recorded trials; a new phase name is the step that loses the least work.
+
+    :param str phase_name: Phase whose trials timed out.
+    :return str: The operator's step, a sentence pair.
+    """
+    return (
+        f"A trial timed out under phases[{phase_name}].timeout_seconds_per_trial, which is part "
+        "of the phase's study identity, so raising it in place is refused as a changed study. "
+        f"Raise it and {RENAME_PHASE_STEP}; each renamed phase starts a new study and runs "
+        "again, and every other phase keeps its results."
+    )
+
+
 #: The way out of an artifact root or ledger another PhaseSweep version wrote, on every
 #: command and under every `storage`. A ledger the config names holds every experiment's
 #: studies: a new `experiment` name leaves the unsupported study in it, and a new ledger alone

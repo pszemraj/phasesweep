@@ -32,6 +32,7 @@ from phasesweep.config.search import (
 )
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    FAILURE_REASON_ATTR,
     FEASIBLE_ATTR,
     FINISHED_TRIAL_STATES,
     GENERATION_ID_ATTR,
@@ -142,6 +143,25 @@ def _measured_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
     :return int: Number of trials in :attr:`optuna.trial.TrialState.COMPLETE`.
     """
     return sum(1 for trial in trials if trial.state == optuna.trial.TrialState.COMPLETE)
+
+
+#: How the supervisor words a trainer killed at ``timeout_seconds_per_trial``, as a trial's failure
+#: reason begins. The phase and run deadlines word theirs differently, and raising either is not
+#: a change of study identity.
+_TIMEOUT_REASON_PREFIX = "timeout after "
+
+
+def _any_trial_timed_out(trials: Iterable[optuna.trial.FrozenTrial]) -> bool:
+    """Say whether any trial was killed at the phase's per-trial timeout.
+
+    :param Iterable[optuna.trial.FrozenTrial] trials: Trials of one phase.
+    :return bool: ``True`` when a recorded failure reason says the trial timed out.
+    """
+    for trial in trials:
+        reason = trial.user_attrs.get(FAILURE_REASON_ATTR)
+        if isinstance(reason, str) and reason.startswith(_TIMEOUT_REASON_PREFIX):
+            return True
+    return False
 
 
 def _published_phase_trial_refs(

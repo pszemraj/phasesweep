@@ -18,6 +18,7 @@ from phasesweep.config.common import (
     _Frozen,
     _require_finite,
 )
+from phasesweep.errors import RENAME_PHASE_STEP
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Phase
@@ -539,9 +540,8 @@ def grid_target_refusal(
     # A recorded study refuses a changed search space, and a new phase name is the step that
     # loses the least work: it starts a new study for this phase and the phases that inherit it.
     enlarge = (
-        "change the search space and give the phase, and each phase that inherits it, a new "
-        "`name`, updating every `inherits` to match; each renamed phase starts a new study and "
-        "measures every cell again, the finished ones included"
+        f"change the search space and {RENAME_PHASE_STEP}; each renamed phase starts a new "
+        "study and measures every cell again, the finished ones included"
         if has_study
         else "change the search space"
     )
