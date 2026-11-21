@@ -567,6 +567,53 @@ def test_the_printed_steps_clear_a_run_whose_worker_sent_an_earlier_outcome(
 
 
 @pytest.mark.integration
+def test_the_printed_steps_clear_a_recovery_whose_target_check_worker_was_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker recover-run starts to resolve the target before it sends is that run's to recover.
+
+    recover-run resolves the target itself, as no check in its process covered it, and the
+    worker doing so is left with its cleanup unconfirmed. The run stays recovery-required with
+    a cleanup_uncertain failure; following the steps recover-run and MCP status print clears
+    it, and the outcomes reach their MLflow runs once.
+    """
+    run = _killed_run(tmp_path, monkeypatch)
+    leaked = leak_tracking_worker(monkeypatch, action="resolve")
+    run.uploads.clear()
+
+    failed = run.recover()
+
+    [operation] = leaked
+    assert failed.exit_code != 0
+    assert "fix: run `phasesweep run` again with the same config for a CLI run, or " in (
+        failed.output
+    )
+    assert (run.sent(), run.summaries()) == ([], [])
+    assert run.store.observe(run.handle).recovery_required
+    failure = run.app.status(_RUN_ID)["run"]["failure"]
+    assert failure["code"] == "cleanup_uncertain"
+    assert (
+        f"`phasesweep mcp recover-run --state-dir STATE_DIR --run-id {_RUN_ID}`"
+        in (failure["remediation"])
+    )
+    entry = _attempts_dir(run.experiment) / f"{operation}.json"
+    assert entry.is_file()
+
+    # The MCP step: read the preview, then repeat it with --confirm.
+    preview = run.recover(confirm=False)
+    assert preview.exit_code == 0, preview.output
+    confirmed = run.recover()
+
+    assert confirmed.exit_code == 0, confirmed.output
+    assert not entry.exists()
+    assert not run.store.observe(run.handle).recovery_required
+    assert not run.store.cleanup_uncertain(run.handle)
+    assert (run.sent(), run.summaries()) == (["KILLED"], ["KILLED"])
+    publication.sync_tracking(run.experiment)
+    assert (run.sent(), run.summaries()) == (["KILLED"], ["KILLED"])
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("target", ["published-winner", "recovered-attempt"])
 def test_recover_run_cleans_worker_before_finalizing_pending_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
