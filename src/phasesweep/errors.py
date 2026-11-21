@@ -113,6 +113,10 @@ _RENAMED_PHASE_RUNS_AGAIN = "each renamed phase starts a new study and runs agai
 #: compose with its own lead-in, so a restart is worded the same wherever it is offered.
 STORAGE_NULL_KEEPS_NOTHING = "storage: null keeps no completed trials between runs"
 
+#: The step after a run without storage stopped short of publishing, which every surface that
+#: reports that state gives.
+START_AGAIN_STEP = f"Rerun the same config to start the run again; {STORAGE_NULL_KEEPS_NOTHING}."
+
 #: The fact about a rerun under a persistent study, the counterpart of the clause above.
 PERSISTENT_STUDY_KEEPS_TRIALS = "completed trials are kept"
 

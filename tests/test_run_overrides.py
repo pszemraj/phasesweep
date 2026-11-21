@@ -654,7 +654,7 @@ def test_in_memory_unpublished_status_describes_a_full_restart(tmp_path: Path) -
     )
     assert experiment.resolved_storage is None
     config = write_experiment_config(tmp_path / "memory.yaml", experiment)
-    with pytest.raises(NoFeasibleTrialError):
+    with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(experiment)
 
     shown = CliRunner().invoke(cli, ["status", str(config)])
@@ -662,6 +662,8 @@ def test_in_memory_unpublished_status_describes_a_full_restart(tmp_path: Path) -
     assert (
         "start the run again; storage: null keeps no completed trials between runs" in shown.output
     )
+    # The run's own abort gives the step status gives.
+    assert f"# fix: {operator_step(aborted.value)}" in shown.output
     assert "resume and publish" not in shown.output
     assert "completed trials are kept" not in shown.output
     assert launches.read_text().splitlines() == ["a", "a", "b", "b"]

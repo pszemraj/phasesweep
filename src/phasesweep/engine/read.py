@@ -109,7 +109,7 @@ from phasesweep.engine.study_policy import (
 from phasesweep.errors import (
     NEW_STUDY_STEP,
     PERSISTENT_STUDY_KEEPS_TRIALS,
-    STORAGE_NULL_KEEPS_NOTHING,
+    START_AGAIN_STEP,
     OperatorAction,
 )
 from phasesweep.evidence.models import EXTRACTOR_KINDS
@@ -1076,10 +1076,7 @@ def unpublished_winner_step(
         or ``None`` if storage is unreadable.
     """
     if not experiment.persistent:
-        return UnpublishedWinnerStep(
-            None,
-            f"Rerun the same config to start the run again; {STORAGE_NULL_KEEPS_NOTHING}.",
-        )
+        return UnpublishedWinnerStep(None, START_AGAIN_STEP)
     try:
         studies = read_phase_studies(ledger)
     except StudyStorageUnavailableError:

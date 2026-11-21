@@ -113,6 +113,7 @@ from phasesweep.engine.trial import (
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import (
+    START_AGAIN_STEP,
     STORAGE_NULL_KEEPS_NOTHING,
     OperatorAction,
     PhaseSweepError,
@@ -1534,13 +1535,13 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         aborted_state = _load_phase_policy_state(study)
         abort = aborted_state.abort
         assert abort is not None  # an aborted run recorded its abort with the tripping outcome
-        # Without storage there is no study to continue, so only the logs are left to read.
+        # Without storage there is no study to continue, so the whole run starts again.
         advice = (
             _recovery_advice(
                 phase, study, abort, dependents=experiment.phases_inheriting(phase.name)
             )
             if experiment.persistent
-            else None
+            else START_AGAIN_STEP
         )
         all_infeasible = _streak_trials_all_infeasible(study, aborted_state)
         evidence = (
