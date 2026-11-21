@@ -31,6 +31,7 @@ from phasesweep.engine.cleanup import (
     _recover_cleanup_uncertain_trials,
 )
 from phasesweep.engine.errors import (
+    TRACKER_UNREADABLE_STEP,
     ArtifactRootConflictError,
     IncompleteJournalRecordError,
     PublishedStudyMissingError,
@@ -316,9 +317,8 @@ def recover_run(
                 first = next(iter(evidence.pending_evidence.values())).rstrip(".")
                 emit(
                     f"Left {len(evidence.pending_evidence)} completed trial(s) pending: the "
-                    f"tracker could not be read for their evidence ({first}). Restore access "
-                    "to the tracker, then start the run again; their training is kept and "
-                    "nothing is retrained."
+                    f"tracker could not be read for their evidence ({first}). "
+                    f"{TRACKER_UNREADABLE_STEP}"
                 )
             if tally is not None:
                 from phasesweep.tracking.publication import (
@@ -332,7 +332,7 @@ def recover_run(
                 try:
                     counts = delivery_counts(config)
                 except (OSError, ValueError) as exc:
-                    emit(f"MLflow pending records could not be counted ({exc}).")
+                    emit(f"MLflow: pending records could not be counted ({exc}).")
                 else:
                     done = delivered_text(tally.delivered, tally.settled)
                     sent = f"MLflow: {done}" if done else ""

@@ -28,6 +28,7 @@ from phasesweep.tracking.session import (
     BINDING_FILE,
     DELIVERY_DIR,
     GENERATION_BINDING_FILE,
+    ORIGINAL_TARGET_STEP,
     SOURCE_FILE,
     SUMMARY_RECORD,
     SYNC_TRACKING_STEP,
@@ -1026,7 +1027,7 @@ def _deliver_outstanding(
     assert experiment.mlflow is not None
     different = "Tracking delivery belongs to a different target or generation."
     if not _target_recorded(experiment):
-        raise TrackingSyncRefusedError(different)
+        raise TrackingSyncRefusedError(different, remediation=ORIGINAL_TARGET_STEP)
     unresolved: dict[str, TrackingSyncRefusedError] = {}
     try:
         _stage_outstanding(
@@ -1038,7 +1039,7 @@ def _deliver_outstanding(
                 delivery.source != experiment.mlflow.evidence_identity()
                 or delivery.generation_id != path.parent.parent.name
             ):
-                raise TrackingSyncRefusedError(different)
+                raise TrackingSyncRefusedError(different, remediation=ORIGINAL_TARGET_STEP)
         creations = pending_creation_records(experiment, scope, skip=skip)
         own_pending = [path for path in own or [] if not _read_delivery(path).delivered]
         pending = _pending_records(experiment, scope, skip=skip)
@@ -1191,9 +1192,8 @@ def deliver_ended_generations(
             if _owed(experiment, skip):
                 log.warning(
                     "MLflow: records of earlier runs were neither saved nor sent: this config's "
-                    "MLflow target is not the one those runs used. A run or `phasesweep "
-                    "sync-tracking CONFIG` with the config the sweep ran with sends what they "
-                    "left pending."
+                    "MLflow target is not the one those runs used. %s",
+                    ORIGINAL_TARGET_STEP,
                 )
             return
         _deliver_outstanding(

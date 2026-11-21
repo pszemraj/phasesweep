@@ -82,6 +82,12 @@ RequestFailure = Literal["shutdown", "no answer", "refused", "refused again", "o
 # also reach run.log and an MCP runner's log, where no command follows them, so they say in words
 # what the command needs; the CLI prints the command as typed after a run that leaves work pending.
 SYNC_TRACKING_STEP = "`phasesweep sync-tracking` with this run's config file and `--set` overrides"
+# The step for a config whose MLflow target is not the one the tree's runs used, as a run's
+# warning and sync-tracking's refusal both give it, in words for the same reason.
+ORIGINAL_TARGET_STEP = (
+    "Run `phasesweep sync-tracking`, or the sweep, with the config file and `--set` overrides "
+    "the sweep ran with; that sends what earlier runs left pending."
+)
 
 
 @dataclass

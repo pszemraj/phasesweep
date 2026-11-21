@@ -35,6 +35,7 @@ from phasesweep.engine.attempts import (
     _record_stale_trial_outcome,
 )
 from phasesweep.engine.errors import (
+    TRACKER_UNREADABLE_STEP,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrackingTargetUnavailableError,
@@ -1895,7 +1896,9 @@ def test_recovery_defers_a_killed_runs_finished_trial_while_its_tracker_is_unrea
             recovered_run = recover_run_cli(registry.state_dir, "orphan-generation", confirm=True)
             assert recovered_run.exit_code == 0, recovered_run.output
             assert "kept 0 completed trial result(s)" in recovered_run.output
+            # The run's own refusal and recover-run end with the same step.
             assert "Left 1 completed trial(s) pending" in recovered_run.output
+            assert f"). {TRACKER_UNREADABLE_STEP}\n" in recovered_run.output
         assert not reaper._process_group_alive(reader.pgid)
         (trial,) = phase_trials(experiment)
         _assert_evidence_pending(experiment, trial)

@@ -196,7 +196,7 @@ class TrackingTargetUnavailableError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
 
 
-_TRACKER_UNREADABLE_STEP = (
+TRACKER_UNREADABLE_STEP = (
     "Fix the reported cause (restore access to the tracker, or install its missing SDK), "
     "then run the same config again: the completed training is kept and nothing is "
     "retrained. If the tracker is gone for good, a fresh study gives up that training. "
@@ -210,7 +210,7 @@ def tracker_unreadable(message: str) -> TrackingTargetUnavailableError:
     :param str message: Diagnostic naming the pending trials and the tracker's failure.
     :return TrackingTargetUnavailableError: Refusal shared by the live run and recovery.
     """
-    return TrackingTargetUnavailableError(message, remediation=_TRACKER_UNREADABLE_STEP)
+    return TrackingTargetUnavailableError(message, remediation=TRACKER_UNREADABLE_STEP)
 
 
 class TrackingSyncRefusedError(PhaseSweepError):

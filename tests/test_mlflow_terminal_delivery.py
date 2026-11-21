@@ -1502,9 +1502,12 @@ def test_a_run_with_another_mlflow_target_saves_no_recovered_outcome(
 
     assert sorted(delivery.glob("*.json")) == recorded
     assert uploads == []
-    assert "with the config the sweep ran with" in caplog.text
-    with pytest.raises(TrackingSyncRefusedError, match="belongs to a different target"):
+    # The warning and the refusal give one step, which names the overrides as well as the file.
+    assert f"those runs used. {session.ORIGINAL_TARGET_STEP}" in caplog.text
+    with pytest.raises(TrackingSyncRefusedError, match="belongs to a different target") as refused:
         publication.sync_tracking(moved)
+    assert refused.value.remediation == session.ORIGINAL_TARGET_STEP
+    assert "`--set` overrides the sweep ran with" in session.ORIGINAL_TARGET_STEP
     assert (sorted(delivery.glob("*.json")), uploads) == (recorded, [])
     assert publication.sync_tracking(experiment)["pending"] == 0
     assert _sent(uploads, attempts) == (["KILLED"] if in_flight else [])
