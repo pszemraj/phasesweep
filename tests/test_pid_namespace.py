@@ -238,7 +238,7 @@ def test_a_reused_inode_with_another_pid_1_start_time_is_foreign(
 
     assert same_pid_namespace(reused)
     assert not same_pid_namespace(RECORDED)
-    with pytest.raises(ForeignPidNamespaceError, match="Nothing was signalled"):
+    with pytest.raises(ForeignPidNamespaceError, match="cannot be cleaned from here"):
         cleanup_stale_trial_process(_identity(pid_namespace=RECORDED))
 
     _app, _registry, store, handle = _stage_foreign_run(tmp_path, monkeypatch, reader=reused)
@@ -481,7 +481,7 @@ def test_cleanup_stale_trial_process_refuses_foreign_namespace_without_signallin
     assert caught.value.action is OperatorAction.FIX_CONFIG
     assert RECORDED in message
     assert NESTED_READER in message
-    assert "Nothing was signalled" in message
+    assert "cannot be cleaned from here" in message
     assert "kill -9" not in message
 
 
@@ -539,7 +539,7 @@ def test_cleanup_stale_trial_process_refuses_a_foreign_identity_before_checking_
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: NESTED_READER)
     _forbid_run_signals(monkeypatch, reaper)
 
-    with pytest.raises(ForeignPidNamespaceError, match="Nothing was signalled"):
+    with pytest.raises(ForeignPidNamespaceError, match="cannot be cleaned from here"):
         cleanup_stale_trial_process(
             _identity(pid_namespace=RECORDED, boot_id=None, proc_starttime=None)
         )

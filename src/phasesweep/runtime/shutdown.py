@@ -30,6 +30,9 @@ console = logging.getLogger(REPORT_LOGGER)
 #: What the interrupt line calls a registered trainer; every other label names a worker.
 TRAINER_LABEL = "trial"
 
+#: The one requirement both refusals to own shutdown signals off the main thread state.
+_INSTALL_FROM_MAIN_THREAD = "install_signal_handlers() must be called from the main thread"
+
 
 @dataclass(frozen=True)
 class _RegisteredGroup:
@@ -349,11 +352,7 @@ def install_signal_handlers() -> None:
     """
     global _process_lifetime_owner
     if threading.current_thread() is not threading.main_thread():
-        raise SignalOwnershipUnavailableError(
-            "install_signal_handlers() must be called from the main thread: "
-            "signal.signal and process-lifetime shutdown-signal ownership are "
-            "main-thread-only."
-        )
+        raise SignalOwnershipUnavailableError(f"{_INSTALL_FROM_MAIN_THREAD}.")
     owned = _owned_shutdown_signals(taking_ownership=True)
     if not all(signal.getsignal(sig) is _shutdown_handler for sig in owned):
         for sig in owned:
@@ -404,8 +403,7 @@ def _restore_host_signal_state(
     for sig, handler in prior_handlers.items():
         if handler is None:
             log.debug(
-                "%s had no Python-level handler before this scope "
-                "(a C-level default phasesweep cannot reinstall); leaving "
+                "%s had no Python-level handler before this scope; leaving "
                 "phasesweep's shutdown handler installed for it.",
                 signal_name(sig),
             )
@@ -447,11 +445,8 @@ def signal_handler_scope() -> Iterator[None]:
 
     if threading.current_thread() is not threading.main_thread():
         raise SignalOwnershipUnavailableError(
-            "Shutdown-signal handlers are not installed on this process, and "
-            "this thread is not the main thread, so they cannot be installed "
-            "here (signal.signal only works on the main thread). Call "
-            "install_signal_handlers() from the main thread at process "
-            "start, or run this from the main thread."
+            "Shutdown-signal handlers are not installed on this process and this is not the "
+            f"main thread; {_INSTALL_FROM_MAIN_THREAD} at process start."
         )
 
     if _scope_depth > 0:

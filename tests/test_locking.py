@@ -26,7 +26,7 @@ from phasesweep.engine.locking import (
     experiment_is_busy,
 )
 from phasesweep.engine.run import run_experiment
-from phasesweep.errors import PhaseSweepError
+from phasesweep.errors import PhaseSweepError, operator_step
 from phasesweep.runtime import files as runtime_files
 from tests.conftest import (
     make_experiment,
@@ -311,8 +311,9 @@ def test_lock_directory_os_failure_is_actionable(
     assert caught.value.__cause__ is denied
     assert str(lock_root) in str(caught.value)
     assert "Permission denied" in str(caught.value)
-    assert "PHASESWEEP_LOCK_DIR" in str(caught.value)
-    assert "same writable" in str(caught.value)
+    # The routed step carries the shared-directory rule once; the message states what failed.
+    assert "PHASESWEEP_LOCK_DIR" in operator_step(caught.value)
+    assert "shared by every shell" in operator_step(caught.value)
     assert not lock_root.exists()
 
 
@@ -332,8 +333,8 @@ def test_lock_file_os_failure_is_actionable(
 
     assert caught.value.__cause__ is denied
     assert str(lock_path) in str(caught.value)
-    assert "PHASESWEEP_LOCK_DIR" in str(caught.value)
-    assert "same writable" in str(caught.value)
+    assert "Permission denied" in str(caught.value)
+    assert "PHASESWEEP_LOCK_DIR" in operator_step(caught.value)
     assert not lock_path.exists()
 
 
@@ -397,6 +398,23 @@ def test_lock_dir_rejects_missing_or_unsafe_override(
     )
     assert stat.S_IMODE(override.stat().st_mode) == 0o750
     assert issubclass(runtime_files.UnsafeLockPathError, PhaseSweepError)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens any directory")
+def test_a_path_component_the_os_refuses_to_open_names_the_os_error(tmp_path: Path) -> None:
+    """A permission failure on a private path component says so rather than 'not a real directory'."""
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    blocked.chmod(0)
+    try:
+        with pytest.raises(runtime_files.UnsafePrivatePathError) as caught:
+            runtime_files.open_directory_fd(blocked / "inner", create=False, private_final=False)
+    finally:
+        blocked.chmod(0o700)
+
+    assert f"Private path component {blocked} cannot be accessed" in str(caught.value)
+    assert "Permission denied" in str(caught.value)
+    assert isinstance(caught.value.__cause__, PermissionError)
 
 
 def test_lock_open_rejects_symlink_before_gpu_diagnostics_write(

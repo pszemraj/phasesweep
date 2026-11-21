@@ -726,8 +726,7 @@ def run_supervised(
     pid_namespace = read_pid_namespace()
     if pid_namespace is None:
         raise PhaseSweepError(
-            "cannot read this process's host PID namespace. Refused to launch a trial "
-            "whose process identity could not be tied to it.",
+            "cannot launch a trial: this process's host PID namespace cannot be read.",
             action=OperatorAction.FIX_CONFIG,
         )
 
@@ -950,8 +949,7 @@ def run_supervised(
                     failure_reason = (
                         "trainer root exited with code 0, but the trainer still had live "
                         f"descendants {settle:g}s later{named}. They were terminated. Make "
-                        "the trainer wait for its children before exiting, and start any "
-                        "long-lived service it needs outside the trial"
+                        "the trainer wait for its children before exiting."
                     )
             # Root exit is insufficient: surviving descendants still require group cleanup.
             if failure_reason is None and _process_group_alive(pgid):

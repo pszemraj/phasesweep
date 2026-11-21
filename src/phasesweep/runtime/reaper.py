@@ -187,7 +187,7 @@ def group_members_command(pgid: str) -> str:
     return f"`pgrep -a -g {pgid}`"
 
 
-def recorded_process_check(identity_location: str) -> str:
+def recorded_process_check(identity_location: str, entry: str = "the entry file") -> str:
     """Word the manual check of a recorded trial process and the deletion it makes safe.
 
     The recorded group number means something only where the sweep ran: from a host shell,
@@ -195,13 +195,13 @@ def recorded_process_check(identity_location: str) -> str:
 
     :param str identity_location: Where the ``process_identity.json`` to read is, as a
         path or a description of the directory holding it.
+    :param str entry: The registry entry to delete, as a path or ``the entry file``.
     :return str: The step naming the file to read, where to run the command that lists
         every member of the recorded process group, and the entry deletion that follows.
     """
     return (
-        f"Look up pgid in {identity_location} and, on the host or in the container the sweep "
-        f"ran in, list that process group's members with {group_members_command('<pgid>')}; "
-        "once it lists none, delete the entry file."
+        f"Read pgid from {identity_location} and run {group_members_command('<pgid>')} on the "
+        f"host or in the container the sweep ran in; once it lists none, delete {entry}."
     )
 
 
@@ -306,7 +306,7 @@ def foreign_pid_namespace_reason(pid_namespace: str, blocker: str) -> str:
     current = read_pid_namespace() or "unreadable"
     return (
         f"it was recorded in PID namespace {pid_namespace}, but this process is in {current}, "
-        f"so its PID numbers name unrelated processes here, and {blocker}"
+        f"and {blocker}"
     )
 
 
@@ -580,8 +580,7 @@ def stale_trial_process_decision(identity: StaleProcessIdentity) -> StaleProcess
             )
         raise ForeignPidNamespaceError(
             f"Attempt {identity.attempt_id} (pid={identity.pid}) cannot be cleaned from here: "
-            f"{foreign_pid_namespace_reason(identity.pid_namespace, blocker)}. "
-            "Nothing was signalled."
+            f"{foreign_pid_namespace_reason(identity.pid_namespace, blocker)}."
         )
     if identity.boot_id is None or identity.proc_starttime is None or current_boot_id is None:
         return StaleProcessDecision("refuse", "robust process-birth identity is unavailable")

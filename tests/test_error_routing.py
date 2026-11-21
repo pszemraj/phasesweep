@@ -867,10 +867,10 @@ def test_unusable_attempt_entry_gets_the_process_check_and_the_deletion(
     error = excinfo.value
     assert f"registry entry {entries[0]} " in str(error)
     assert error.remediation is not None
-    assert error.remediation.startswith("Look up pgid in the process_identity.json")
+    assert error.remediation.startswith("Read pgid from the process_identity.json")
     assert (
-        "on the host or in the container the sweep ran in, list that process group's members "
-        "with `pgrep -a -g <pgid>`; once it lists none, delete the entry file."
+        "run `pgrep -a -g <pgid>` on the host or in the container the sweep ran in; once it "
+        "lists none, delete the entry file."
     ) in error.remediation
     assert error.remediation.endswith("delete the entry file.")
     assert error.remediation not in str(error)
@@ -1245,7 +1245,7 @@ ORIGIN_CASES = (
         trigger=_lock_dir_override_missing,
         raised=UnsafeLockPathError,
         action=OperatorAction.PROVISION_LOCK_DIR,
-        message="does not exist; provision it before setting PHASESWEEP_LOCK_DIR",
+        message="does not exist.",
     ),
     RoutingCase(
         id="lock_file_access_refused",

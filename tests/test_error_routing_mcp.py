@@ -428,7 +428,7 @@ CASES = (
         trigger=_recover_over_malformed_registry_entry,
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        message="Look up pgid in the process_identity.json in the directory under",
+        message="Read pgid from the process_identity.json in the directory under",
     ),
     RoutingCase(
         # Composed: the claim path routes this refusal to fixing the config,

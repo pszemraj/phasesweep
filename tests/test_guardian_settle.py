@@ -316,8 +316,7 @@ def test_a_persistent_child_is_terminated_after_the_settle_and_named(
         "trainer root exited with code 0, but the trainer still had live descendants 0.5s later"
     )
     assert result.failure_reason.endswith(
-        ". They were terminated. Make the trainer wait for its children before exiting, and "
-        "start any long-lived service it needs outside the trial"
+        ". They were terminated. Make the trainer wait for its children before exiting."
     )
     if sys.platform == "linux":
         assert f": {child_pid} ({_named_command(marks)[:40]}" in result.failure_reason
