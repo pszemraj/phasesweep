@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
-from phasesweep.engine.attempts import _attempt_process_resolution
+from phasesweep.engine.attempts import _attempt_process_resolution, _AttemptRecord, _resolve_attempt
+from phasesweep.errors import OperatorAction
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import (
     ATTEMPT_LIFECYCLE_FILE,
     ATTEMPT_LIFECYCLE_SCHEMA_VERSION,
     AttemptLifecycle,
     read_attempt_lifecycle,
+    write_attempt_lifecycle,
 )
 
 
@@ -100,3 +103,61 @@ def test_read_attempt_lifecycle_rejects_every_malformed_shape(
     (trial_dir / ATTEMPT_LIFECYCLE_FILE).write_text(payload)
     with pytest.raises(ValueError, match=message):
         read_attempt_lifecycle(trial_dir, expected_attempt_id="expected")
+
+
+@pytest.mark.parametrize(
+    ("state", "return_code", "cleanup_confirmed", "text"),
+    [
+        pytest.param(
+            "launching",
+            None,
+            None,
+            "lifecycle=launching with no process identity: no worker received its payload; "
+            "settles without signalling.",
+            id="payload-withheld",
+        ),
+        pytest.param(
+            "exited",
+            -15,
+            True,
+            "lifecycle=exited rc=-15 confirms cleanup without signalling.",
+            id="exited-with-cleanup",
+        ),
+    ],
+)
+def test_an_attempt_settled_without_signalling_is_routine_in_a_run_and_collected_in_a_preview(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    state: str,
+    return_code: int | None,
+    cleanup_confirmed: bool | None,
+    text: str,
+) -> None:
+    """A run logs the settlement at INFO, which the console leaves out; a preview collects it instead."""
+    write_attempt_lifecycle(
+        tmp_path,
+        attempt_id="a1",
+        state=state,
+        return_code=return_code,
+        cleanup_confirmed=cleanup_confirmed,
+    )
+    record = _AttemptRecord("a1", tmp_path, "generation", "p", 3)
+    expected = f"Attempt a1 phase='p' trial=3: {text}"
+
+    collected: dict[_AttemptRecord, str] = {}
+    with caplog.at_level(logging.INFO, logger="phasesweep"):
+        for messages in (collected, None):
+            settled = _resolve_attempt(
+                record,
+                context="RUNNING trial 3",
+                evidence_action=OperatorAction.RESTORE_TREE,
+                lifecycle_settles=True,
+                confirm=True,
+                inspection_messages=messages,
+            )
+            assert settled is False
+
+    assert collected == {record: expected}
+    assert [(entry.levelno, entry.getMessage()) for entry in caplog.records] == [
+        (logging.INFO, expected)
+    ]

@@ -1038,13 +1038,15 @@ def _resolve_attempt(
     )
     label = f"Attempt {record.attempt_id} phase={record.phase_name!r} trial={record.trial_number}"
 
-    def report(message: str) -> None:
+    def report(message: str, *, level: int = logging.WARNING) -> None:
         """Defer a preview until all discovery sources have inspected the attempt.
 
         :param str message: Operator-facing process or lifecycle decision.
+        :param int level: Level a real run logs it at; a settled attempt that needed no signal is
+            routine, so only a decision about a live process group warns.
         """
         if inspection_messages is None:
-            log.warning(message)
+            log.log(level, message)
         else:
             inspection_messages[record] = message
 
@@ -1062,14 +1064,16 @@ def _resolve_attempt(
         if resolution == "payload_withheld":
             report(
                 f"{label}: lifecycle=launching with no process identity: no worker received "
-                "its payload; settles without signalling."
+                "its payload; settles without signalling.",
+                level=logging.INFO,
             )
             return False
         if resolution != "identity":
             assert lifecycle is not None
             report(
                 f"{label}: lifecycle={lifecycle.state} rc={lifecycle.return_code} "
-                "confirms cleanup without signalling."
+                "confirms cleanup without signalling.",
+                level=logging.INFO,
             )
             return False
     try:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -25,11 +26,13 @@ from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     ShutdownLaunchRefusedError,
     SignalOwnershipUnavailableError,
+    _interrupt_text,
     _shutdown_handler,
     defer_shutdown_signals,
     install_signal_handlers,
     signal_handler_scope,
 )
+from phasesweep.runtime.terminal import REPORT_LOGGER
 from tests.conftest import (
     make_experiment,
     restored_signal_ownership,
@@ -603,6 +606,38 @@ def test_shutdown_handler_names_the_signal_it_services_until_the_next_run() -> N
     assert runtime_shutdown.servicing_shutdown_signal() == signal.SIGINT
     with restored_signal_ownership(), signal_handler_scope():
         assert runtime_shutdown.servicing_shutdown_signal() is None
+
+
+@pytest.mark.parametrize(
+    ("signum", "running", "text"),
+    [
+        (signal.SIGINT, 1, "Interrupted (SIGINT): stopping 1 running trial."),
+        (signal.SIGTERM, 3, "Interrupted (SIGTERM): stopping 3 running trials."),
+        (signal.SIGHUP, 0, "Interrupted (SIGHUP): no trainer is running."),
+        (99, 2, "Interrupted (signal 99): stopping 2 running trials."),
+    ],
+)
+def test_interrupt_text_names_the_signal_and_the_trials_it_stops(
+    signum: int, running: int, text: str
+) -> None:
+    """The line says in plain words which signal arrived and how many trainers it stops."""
+    assert _interrupt_text(signum, running) == text
+
+
+def test_a_shutdown_prints_one_report_line_and_logs_the_confirmed_cleanup_quietly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The console shows one plain line; the confirmed cleanup is INFO, which only run.log keeps."""
+    with caplog.at_level(logging.INFO, logger="phasesweep"), pytest.raises(PhaseSweepShutdown):
+        _shutdown_handler(signal.SIGINT, None)
+    assert [(r.name, r.levelno, r.getMessage()) for r in caplog.records] == [
+        (REPORT_LOGGER, logging.INFO, "Interrupted (SIGINT): no trainer is running."),
+        (
+            "phasesweep.runtime.process",
+            logging.INFO,
+            "Received signal 2; confirmed cleanup for 0 child group(s)",
+        ),
+    ]
 
 
 def test_shutdown_handler_wakes_registered_waiters_after_naming_the_signal(

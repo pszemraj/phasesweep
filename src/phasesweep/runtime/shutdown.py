@@ -20,9 +20,12 @@ from types import FrameType
 from typing import Any
 
 from phasesweep.runtime.reaper import _KILL_GRACE_SECONDS, _terminate_process_groups
+from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText, plural
 
 # Process supervision logs on one channel, whichever module does the work.
 log = logging.getLogger("phasesweep.runtime.process")
+# The one line a person reads when a signal arrives; everything else stays in run.log.
+console = logging.getLogger(REPORT_LOGGER)
 
 _lock = threading.Lock()
 _active_children: dict[int, subprocess.Popen[bytes]] = {}  # pgid -> Popen
@@ -133,6 +136,21 @@ def register_shutdown_waker(waker: Callable[[], None]) -> None:
     _shutdown_wakers.append(waker)
 
 
+def _interrupt_text(signum: int, running: int) -> str:
+    """Say in plain words that a shutdown signal arrived and what it stops.
+
+    :param int signum: Shutdown signal number.
+    :param int running: Process groups of running trainers the signal will stop.
+    :return str: For example ``Interrupted (SIGINT): stopping 2 running trials.``
+    """
+    try:
+        name = signal.Signals(signum).name
+    except ValueError:
+        name = f"signal {signum}"
+    what = f"stopping {plural(running, 'running trial')}" if running else "no trainer is running"
+    return f"Interrupted ({name}): {what}."
+
+
 def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     """Terminate all tracked process groups, then exit.
 
@@ -172,7 +190,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             guardians = dict(_active_children)
             pgids = tuple(guardians)
 
-        log.warning("Received signal %d — killing %d active child group(s)", signum, len(pgids))
+        console.info(ReportText(_interrupt_text(signum, len(pgids))))
 
         confirmed_by_pgid: dict[int, bool] = {}
         try:
@@ -191,7 +209,8 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             child_pgids=pgids,
         )
         if cleanup_confirmed:
-            log.warning(
+            # The expected outcome of a shutdown, so the console says nothing more about it.
+            log.info(
                 "Received signal %d; confirmed cleanup for %d child group(s)",
                 signum,
                 len(pgids),
