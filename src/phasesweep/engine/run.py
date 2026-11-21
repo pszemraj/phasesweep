@@ -458,8 +458,7 @@ def _run_experiment_outcome(
                     control_error = cleanup_exc
                     terminal_error = cleanup_exc
                 except Exception as cleanup_exc:
-                    if isinstance(cleanup_exc, ProcessCleanupUncertainError):
-                        reconciliation.mark_uncertain(cleanup_exc)
+                    reconciliation.mark_uncertain_if_unconfirmed(cleanup_exc)
                     log.exception("failed to reconcile all existing studies after run termination")
                 cleanup.recovered_attempt_ids.update(reconciliation.recovered_attempt_ids)
                 cleanup.recovered_attempt_generations.update(
