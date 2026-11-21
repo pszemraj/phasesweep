@@ -147,8 +147,15 @@ def _interrupt_text(signum: int, running: int) -> str:
         name = signal.Signals(signum).name
     except ValueError:
         name = f"signal {signum}"
-    what = f"stopping {plural(running, 'running trial')}" if running else "no trainer is running"
-    return f"Interrupted ({name}): {what}."
+    if running == 0:
+        return f"Interrupted ({name}): no trainer is running."
+    # A trainer that ignores SIGTERM keeps the run silent until its grace period ends, so the
+    # line says the run is waiting.
+    pronoun = "it" if running == 1 else "them"
+    return (
+        f"Interrupted ({name}): stopping {plural(running, 'running trial')} "
+        f"and waiting for {pronoun} to exit."
+    )
 
 
 def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
