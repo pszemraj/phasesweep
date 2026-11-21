@@ -1154,8 +1154,11 @@ else:
                     with pytest.raises(
                         TrialEvidenceMissingError,
                         match="bytes behind the published metric have changed",
-                    ):
+                    ) as refused:
                         run_experiment(experiment)
+                    assert refused.value.remediation is not None
+                    assert "restore the files" in refused.value.remediation
+                    assert "set a new `experiment` name" in refused.value.remediation
                     unchanged = phase_trials(experiment)[0]
                     assert unchanged.state.name == "RUNNING"
                     assert unchanged.user_attrs == pending.user_attrs

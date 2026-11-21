@@ -45,9 +45,11 @@ from phasesweep.engine.state import (
     _unique_trial_outcomes,
 )
 from phasesweep.errors import (
+    FRESH_STUDY,
     OperatorAction,
     ProcessCleanupUncertainError,
     format_mismatch,
+    operator_step,
 )
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
@@ -1374,14 +1376,21 @@ def _fail_stale_running_trial(
                 f"Trial {trial.number} in study {study.study_name!r} has a recorded measurement but no producing attempt to verify."
             )
         producing = _load_generation_experiment(_experiment_dir(experiment), record.generation_id)
-        _EvidenceVerification(producing, producing.phase(record.phase_name)).verify_trial(
-            trial,
-            record.trial_dir,
-            record.attempt_id,
-            outcome.metric,
-            subject=f"Phase {record.phase_name!r} trial {trial.number}",
-            verify_digest=True,
-        )
+        try:
+            _EvidenceVerification(producing, producing.phase(record.phase_name)).verify_trial(
+                trial,
+                record.trial_dir,
+                record.attempt_id,
+                outcome.metric,
+                subject=f"Phase {record.phase_name!r} trial {trial.number}",
+                verify_digest=True,
+            )
+        except TrialEvidenceMissingError as exc:
+            if exc.action is not OperatorAction.RESTORE_TREE:
+                raise
+            raise TrialEvidenceMissingError.rewrap(
+                exc, str(exc), remediation=f"{operator_step(exc).rstrip('.')}, or {FRESH_STUDY}."
+            ) from exc
         _tell_recovered_trial(study, trial, record, outcome.metric, report)
         recovered = True
     elif outcome is None and record is not None and experiment is not None:
