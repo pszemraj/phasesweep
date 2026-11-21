@@ -46,6 +46,8 @@ Configure your client's stdio server with the absolute `phasesweep-mcp` executab
 /absolute/path/to/phasesweep-mcp --catalog /absolute/path/to/catalog.yaml
 ```
 
+For a server on another machine, the client's command is an [SSH command](#over-ssh) instead.
+
 To run the stdio server directly instead:
 
 ```bash
@@ -61,7 +63,32 @@ codex mcp list
 
 To keep a client from connecting the server at all, disable it in that client's own MCP settings.
 
-The client starts the server with the client's environment, not your shell's, and trainers inherit it, so a `trial_command` program resolves on the `PATH` the client starts the server with, unless the experiment's `env` sets `PATH`, which wins. That `PATH` often lacks the Python environment your shell activates. Give `trial_command` an absolute interpreter path, such as `/absolute/path/to/python train.py --config {config_path}`, or set `PATH` in the client's server entry. A study whose trials ran from your shell continues only under the same tracked environment (`PATH`, `HOME`, `LANG` and the other variables a fingerprint mismatch names), so copy those into the client's server `env`, or start the MCP runs under a new `experiment` name. A run whose program is missing from that `PATH` is refused before any trial starts: its `failure.remediation` gives this fix, and its runner log, `<run-id>.log` under `state_dir/logs/`, names the program and the `PATH` it searched.
+The client starts the server with the client's environment, not your shell's, and trainers inherit it, so a `trial_command` program resolves on the `PATH` the client starts the server with, unless the experiment's `env` sets `PATH`, which wins. That `PATH` often lacks the Python environment your shell activates. Give `trial_command` an absolute interpreter path, such as `/absolute/path/to/python train.py --config {config_path}`, or set `PATH` in the environment the server is started with: the client entry's `env`, or the SSH command. A study whose trials ran from your shell continues only under the same tracked environment (`PATH`, `HOME`, `LANG` and the other variables a fingerprint mismatch names), so start the server with those values (in the client entry's `env` or the SSH command), or start the MCP runs under a new `experiment` name. A run whose program is missing from that `PATH` is refused before any trial starts: its `failure.remediation` gives this fix, and its runner log, `<run-id>.log` under `state_dir/logs/`, names the program and the `PATH` it searched.
+
+#### Over SSH
+
+To serve a catalog that lives on another machine, make the client's stdio command an SSH command that starts the server there, with both paths absolute and no terminal allocated:
+
+```text
+ssh -T HOST /absolute/path/to/phasesweep-mcp --catalog /absolute/path/to/catalog.yaml
+```
+
+A relative `--catalog` resolves against the server's working directory, and a bare `phasesweep-mcp` runs only if the session's `PATH` finds it; otherwise the client sees only the connection close. A terminal (`ssh -t`) mixes the server's log lines and echoed input into the protocol stream and breaks it.
+
+As above, trainers inherit the server's environment, which here is the SSH session's, not a login shell's: `ssh -T HOST printenv PATH LANG` shows it. Besides an absolute program path in `trial_command`, `PATH` can be set where the server starts: `ssh -T HOST env PATH=/absolute/path/to/env/bin:/usr/bin:/bin /absolute/path/to/phasesweep-mcp --catalog /absolute/path/to/catalog.yaml`. If the same study will also be run from a shell on that machine, pin `PATH` and `LANG` under the experiment's `env` instead: the trainer environment is then identical whoever starts the study. `env` is part of the study's identity, so put it in the config before the first trial.
+
+To verify, run the check and a dry run through the same SSH form, with the absolute `phasesweep` path rather than the bare command the setup steps print, and the same `env PATH=…` prefix if you use one:
+
+```bash
+ssh -T HOST /absolute/path/to/phasesweep mcp check --catalog /absolute/path/to/catalog.yaml
+ssh -T HOST /absolute/path/to/phasesweep run /absolute/path/to/experiment.yaml --dry-run
+```
+
+For a study with trials left, only the dry run shows a trial program missing from the session's `PATH`, because `mcp check` judges only a program written as a path; the dry run refuses and names the `PATH` it searched. Then confirm that nothing is printed before the server starts: `ssh -T HOST true | wc -c` must print `0`, because anything a shell start-up file writes to stdout corrupts the protocol stream.
+
+A dropped connection ends the server, not the run: the detached runner and its trainer keep going, and a server left over from the old connection is harmless beside the new one. After reconnecting, call `get_latest_run`, then `await_run` and `get_run_results` with the `run_id` it returns; never launch a replacement because a connection dropped. If the runner itself was killed, as when a host kills everything a session started, the tools report the run `running` with `recovery_required: true` and name a `phasesweep mcp recover-run …` command ([run state and recovery](mcp.md#run-state-and-recovery)). That command, like the other troubleshooting commands the tools and this page name, runs in a shell on the remote machine as the server's user.
+
+A study continues only under the tracked environment it started with, so one moved between an SSH session and a shell can differ in `PATH` or `LANG`. The run is then refused before anything launches and no result is dropped; the refusal lists the recorded and current values, which through MCP are in the run's log, `<run-id>.log` under `state_dir/logs/`, not in the tool's remediation. Run with the recorded values, or pin them under `env` and start a new `experiment` name ([environment-mismatch remedy](runtime.md#resolve-a-changed-study-or-trainer-environment)). A replay of a finished study under another environment is not refused: it reuses the recorded result and warns `reused winner ran under a different trainer environment` in the CLI output or the run's log, not in the tool's result. Confirm the difference cannot affect the metric, or rerun the phase under a new `experiment` name.
 
 ### 4. Verify the connection
 
@@ -77,20 +104,20 @@ See [shell calls](mcp.md#calling-a-tool-from-a-shell) for arguments, exit codes 
 
 ## Maintenance and troubleshooting
 
-Use `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` after a catalog edit or when diagnosing server startup. If you replace the environment that supplies `phasesweep-mcp`, update the client-owned entry to the new absolute executable path using that client's documentation.
+Use `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` after a catalog edit or when diagnosing server startup. If you replace the environment that supplies `phasesweep-mcp`, update the client-owned entry (or the SSH command) to the new absolute executable path using that client's documentation.
 
 - `MCP support is not installed`: install the MCP extra in the environment that supplies `phasesweep-mcp`.
-- The client cannot start the server: verify its client-owned stdio entry has absolute executable and catalog paths, then run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml`.
+- The client cannot start the server: verify its client-owned stdio entry has absolute executable and catalog paths, then run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml`. Over SSH, also check that the command uses `-T` and that `ssh -T HOST true | wc -c` prints `0` ([over SSH](#over-ssh)).
 - `action 'launch' is not permitted`, `action 'cancel' is not permitted` or `action 'from_phase' is not permitted`: check the [catalog permissions](mcp.md#the-catalog). For a refused cancellation, follow the operator step the error gives for that run.
 - `catalog_status.stale: true`, or a launch or inspection refused because a catalog entry `failed to load` or the catalog file `does not validate`: run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` and fix what it reports; the server's stderr log names the file. See [catalog reload behavior](mcp.md#the-catalog), including when a restart is required.
 - `concurrency limit reached` or an experiment that already has a running sweep: [run state and recovery](mcp.md#run-state-and-recovery) says which blockers to await and which need the operator.
 - `cannot prove available launch capacity`, or an unreadable or orphaned record for one run ID: `mcp check` lists the records blocking launch. Run the `phasesweep mcp recover-run` command it names for each pre-spawn orphan. For each other listed run ID, run `pgrep -af <run-id>` to list its runner and `ps axeww | awk '/[P]HASESWEEP_GENERATION_ID=<run-id>/ {print $1}'` to print its trial PIDs by environment. Run these on the server host as the server's user so `ps` can see the trial environment. Wait for the listed processes to exit or stop them. Move `runs/<run-id>.json` and `logs/<run-id>.*` out of `state_dir` only once both commands print nothing.
 - `another launch is in progress`: a launch sharing this `state_dir` holds the launch lock; retry in a moment.
 - Lock-directory access failure (`storage_unavailable`): set the same `PHASESWEEP_LOCK_DIR` for every participating shell, MCP server, and sandbox, following the [lock directory rules](runtime.md#storage-and-locks).
-- `recovery_required: true`, unresolved launch, or uncertain cleanup: stop agent activity and follow [run state and recovery](mcp.md#run-state-and-recovery).
+- `recovery_required: true`, unresolved launch, or uncertain cleanup: stop agent activity and follow [run state and recovery](mcp.md#run-state-and-recovery), running the command it names in a shell on the machine that holds the catalog.
 - Unavailable terminal snapshot: follow `failure.remediation` and inspect run/server diagnostics when it asks. [Historical results](mcp.md#reading-status-responses) cannot be reconstructed from the current ledger.
 - `runner_observable: false`, alone or with `recovery_required: true`, or a PID-namespace refusal: follow [PID namespace recovery](mcp.md#pid-namespaces).
 - Catalog path, storage, or working-directory rejection: follow [the catalog requirements](mcp.md#the-catalog).
-- Trainer environment cohort mismatch: the [launching server or `mcp call` shell](mcp.md#the-catalog) supplies the trainer's base environment; reconcile it using the [trainer contract](config.md#trainer-contract).
-- A run refused because its trial program is not on the trainer's `PATH`: the client's `PATH` lacks it; [configure the client](#3-configure-your-client) or name the program by absolute path in `trial_command`.
+- Trainer environment cohort mismatch: the [launching server or `mcp call` shell](mcp.md#the-catalog) supplies the trainer's base environment, so a study moved between an SSH session and a shell hits it; reconcile it using the [trainer contract](config.md#trainer-contract) and [over SSH](#over-ssh).
+- A run refused because its trial program is not on the trainer's `PATH`: the `PATH` the server was started with lacks it; set `PATH` where the server starts ([the client entry or the SSH command](#3-configure-your-client)), pin it under the experiment's `env` before the first trial, or name the program by absolute path in `trial_command`.
 - `its detached runner exited with code`: the runner failed before it started work; its own error is in `<run-id>.log` under `state_dir/logs/`.
