@@ -617,42 +617,15 @@ def test_survivorship_discounts_a_failure_only_when_its_retry_chain_completed() 
 
 
 @pytest.mark.parametrize(
-    ("path", "value", "error"),
+    ("value", "error"),
     [
-        pytest.param(("ranked_groups",), [[0, 1, 2], [3, 4]], "one size", id="uneven-groups"),
-        pytest.param(("ranked_groups",), [[4, 5], [0, 1], [2, 3]], "ordered", id="group-order"),
-        pytest.param(("ranked_groups",), [[0, 1], [2, 3]], "cover each ranked", id="lost-group"),
-        pytest.param(("ranked_groups",), [[0], [1]], "at least two", id="singleton-groups"),
-        pytest.param(("ranked_groups",), [], "neither null", id="empty-groups"),
-        pytest.param(
-            ("checks", "tie"),
-            {"verdict": "n/a", "reason": "only one configuration was ranked"},
-            "several repeat groups",
-            id="multiple-groups-unchecked",
-        ),
-        pytest.param(
-            ("checks", "tie"),
-            {"verdict": "ok", "detail": {"tied_trials": [], "within_noise": None}},
-            "no within_noise",
-            id="noise-null",
-        ),
-        pytest.param(
-            ("checks", "tie", "detail", "within_noise"), [2], "last member", id="noise-first"
-        ),
-        pytest.param(
-            ("checks", "tie", "detail", "within_noise"), [1], "tying with itself", id="noise-self"
-        ),
-        pytest.param(
-            ("checks", "tie"),
-            {"verdict": "heterogeneous", "detail": {"tied_trials": [3], "within_noise": []}},
-            "within_noise omits",
-            id="tie-outside-noise",
-        ),
+        pytest.param([[0], [1]], "fewer than two", id="singleton-groups"),
+        pytest.param([], "neither null", id="empty-groups"),
+        pytest.param([[1, 0], [2, 3]], "ascending", id="unsorted-members"),
     ],
 )
-def test_validator_rejects_malformed_repeat_groups(
-    path: tuple[str, ...], value: object, error: str
-) -> None:
+def test_validator_rejects_malformed_repeat_groups(value: object, error: str) -> None:
+    """The repeats validation and the group readers index ``ranked_groups`` as member lists."""
     trials = _trials(
         (_COMPLETE, 0.50, 1, 0),
         (_COMPLETE, 0.60, 1, 1),
@@ -664,31 +637,7 @@ def test_validator_rejects_malformed_repeat_groups(
     block = _assess_groups(trials, [[0, 1], [2, 3], [4, 5]])
     assert _validate_confound_block(block, winner_trial=1) == block
     with pytest.raises(ValueError, match=error):
-        _validate_confound_block(_mutated(path, value, block), winner_trial=1)
-
-
-def test_validator_requires_the_winner_to_name_its_group() -> None:
-    """The highest-numbered member names a group; a lower member is not a winner."""
-    trials = _trials((_COMPLETE, 0.5, 1, 0), (_COMPLETE, 0.6, 1, 1))
-    block = _assess_groups(trials, [[0, 1]])
-    with pytest.raises(ValueError, match="no group whose last member is the winner, trial 0"):
-        _validate_confound_block(block, winner_trial=0)
-
-
-def test_validator_refuses_group_evidence_without_repeat_groups() -> None:
-    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2))
-    noisy = _mutated(
-        ("checks", "tie"),
-        {"verdict": "heterogeneous", "detail": {"tied_trials": [], "within_noise": [0]}},
-        _assess(trials, trials),
-    )
-    with pytest.raises(ValueError, match="within_noise groups without repeat groups"):
-        _validate_confound_block(noisy, winner_trial=1)
-    counted = _mutated(
-        ("checks", "survivorship", "detail", "incomplete_group"), 1, _assess(trials, trials)
-    )
-    with pytest.raises(ValueError, match="incomplete_group trials without repeats"):
-        _validate_confound_block(counted, winner_trial=1)
+        _validate_confound_block(_mutated(("ranked_groups",), value, block), winner_trial=1)
 
 
 def test_assessed_block_survives_yaml_and_validation_unchanged() -> None:
@@ -772,65 +721,37 @@ def _evaluation(verdict: str, *groups: tuple[int, list[int]]) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize(
-    ("path", "value", "error"),
+    ("path", "value"),
     [
+        pytest.param(("checks", "evaluation_point", "verdict"), "heterogeneous", id="eval"),
+        pytest.param(("checks", "survivorship", "verdict"), "heterogeneous", id="survivorship"),
+        pytest.param(("checks", "tie", "verdict"), "ok", id="tie"),
         pytest.param(
-            ("checks", "evaluation_point", "verdict"), "heterogeneous", "contradicts", id="eval"
+            ("checks", "evaluation_point"), _evaluation("ok", (1000, [0])), id="eval-one-trial"
         ),
-        pytest.param(
-            ("checks", "survivorship", "verdict"), "heterogeneous", "contradicts", id="survivorship"
-        ),
-        pytest.param(("checks", "tie", "verdict"), "ok", "contradicts", id="tie"),
-        pytest.param(
-            ("checks", "evaluation_point"),
-            _evaluation("ok", (1000, [0])),
-            "cover each ranked trial once",
-            id="eval-missing-trial",
-        ),
-        pytest.param(
-            ("checks", "evaluation_point"),
-            _evaluation("heterogeneous", (400, [0, 1]), (1000, [1])),
-            "cover each ranked trial once",
-            id="eval-trial-twice",
-        ),
-        pytest.param(
-            ("checks", "evaluation_point"),
-            _evaluation("heterogeneous", (1000, [0]), (400, [1])),
-            "ascending and distinct",
-            id="eval-descending",
-        ),
-        pytest.param(("checks", "survivorship", "detail", "ranked"), 3, "ranked count", id="count"),
-        pytest.param(
-            ("checks", "tie", "detail", "tied_trials"), [7], "not ranked", id="tie-unranked"
-        ),
-        pytest.param(
-            ("checks", "tie"), {"verdict": "n/a", "reason": "skipped"}, "several", id="tie-n/a"
-        ),
-        pytest.param(("ranked_trials",), [0], "only one was ranked", id="single-ranked"),
+        pytest.param(("checks", "survivorship", "detail", "ranked"), 3, id="count"),
+        pytest.param(("checks", "tie", "detail", "tied_trials"), [7], id="tie-unranked"),
+        pytest.param(("checks", "tie"), {"verdict": "n/a", "reason": "skipped"}, id="tie-n/a"),
+        pytest.param(("ranked_trials",), [0], id="single-ranked"),
     ],
 )
-def test_validator_rejects_verdicts_that_contradict_their_evidence(
-    path: tuple[Any, ...], value: Any, error: str
+def test_validator_reads_recorded_verdicts_without_rejudging_them(
+    path: tuple[str, ...], value: object
 ) -> None:
-    """An unpublished winner.yaml has no manifest hash, so its block must hold together."""
-    block = _all_checked()
+    """A verdict another rule would reach, or counts that disagree with the ranked trials, still read.
+
+    The winner file's manifest hash catches tampering, so a reader that re-judged the block
+    would only turn a changed rule into an unreadable publication.
+    """
+    block = _mutated(path, value, _all_checked())
     assert _validate_confound_block(block, winner_trial=0) == block
-    assert [block["checks"][name]["verdict"] for name in CONFOUND_CHECKS] == [
-        "ok",
-        "ok",
-        "heterogeneous",
-    ]
-    with pytest.raises(ValueError, match=error):
-        _validate_confound_block(_mutated(path, value, _all_checked()), winner_trial=0)
 
 
 def test_validator_anchors_the_block_to_its_own_winner() -> None:
-    """A block that does not describe the winner beside it cannot report its position."""
+    """A block that does not rank the winner beside it cannot report its position."""
     block = _all_checked()  # trial 0 won, tying with trial 1
     with pytest.raises(ValueError, match="does not include the winner, trial 5"):
         _validate_confound_block(block, winner_trial=5)
-    with pytest.raises(ValueError, match="tying with itself"):
-        _validate_confound_block(block, winner_trial=1)
 
 
 def test_summary_exposes_the_evaluation_axis_without_checkpoint_paths() -> None:

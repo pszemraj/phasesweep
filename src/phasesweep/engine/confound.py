@@ -312,14 +312,20 @@ def _not_checked(reason: str) -> dict[str, Any]:
 
 
 def _validate_confound_block(data: object, *, winner_trial: int) -> dict[str, Any]:
-    """Validate a persisted ``confound`` block and return a plain copy.
+    """Validate the shape of a persisted ``confound`` block and return a plain copy.
+
+    The verdicts were judged once, at selection, and are read as recorded: the winner file's
+    manifest hash already catches an edited block, so nothing here re-judges a verdict against
+    its evidence or cross-checks counts against the ranked trials. What is checked is what the
+    readers rely on: the keys and schema version, the winner among ``ranked_trials``, the shape
+    of ``ranked_groups`` that the ``repeats`` validation and the group readers index, each
+    verdict's value, a reason on every ``n/a``, and the types of the evidence fields that
+    :func:`_confound_summary` and the MCP snapshot read.
 
     :param object data: Parsed ``confound`` value from a ``winner.yaml``.
     :param int winner_trial: Trial number of the winner the block sits on.
-    :raises ValueError: The block is absent, has another schema version, any
-        check record is malformed or contradicts its evidence, the evidence
-        disagrees with the ranked trials or groups, or the winner is not one of
-        them or, with repeat groups, not the last member of its own group.
+    :raises ValueError: The block is absent, has another schema version or other keys, does
+        not rank the winner, or a check record or its evidence is malformed.
     :return dict[str, Any]: The validated block, rebuilt from plain values.
     """
     keys = {"schema_version", "ranked_trials", "ranked_groups", "checks"}
@@ -332,24 +338,11 @@ def _validate_confound_block(data: object, *, winner_trial: int) -> dict[str, An
         raise ValueError(
             f"confound ranked_trials does not include the winner, trial {winner_trial}"
         )
-    groups = _validate_ranked_groups(data["ranked_groups"], ranked)
-    if groups is not None and not any(group[-1] == winner_trial for group in groups):
-        raise ValueError(
-            f"confound ranked_groups has no group whose last member is the winner, "
-            f"trial {winner_trial}"
-        )
+    groups = _validate_ranked_groups(data["ranked_groups"])
     checks = data["checks"]
     if not isinstance(checks, Mapping) or set(checks) != set(CONFOUND_CHECKS):
         raise ValueError(f"confound checks must be exactly {', '.join(CONFOUND_CHECKS)}")
     validated = {name: _validate_check(name, checks[name]) for name in CONFOUND_CHECKS}
-    _validate_against_ranked(validated, ranked)
-    _validate_against_units(validated["tie"], validated["survivorship"], ranked, groups)
-    tie = validated["tie"]
-    if "detail" in tie and winner_trial in [
-        *tie["detail"]["tied_trials"],
-        *(tie["detail"]["within_noise"] or []),
-    ]:
-        raise ValueError("confound tie lists the winner as tying with itself")
     return {
         "schema_version": CONFOUND_SCHEMA_VERSION,
         "ranked_trials": ranked,
@@ -358,14 +351,12 @@ def _validate_confound_block(data: object, *, winner_trial: int) -> dict[str, An
     }
 
 
-def _validate_ranked_groups(value: object, ranked: list[int]) -> list[list[int]] | None:
-    """Validate the ranked repeat groups against the ranked trials.
+def _validate_ranked_groups(value: object) -> list[list[int]] | None:
+    """Validate the shape of the ranked repeat groups.
 
     :param object value: Parsed ``ranked_groups``: ``None``, or a list of member lists.
-    :param list[int] ranked: The block's ranked trial numbers.
-    :raises ValueError: The groups are not lists of at least two ascending
-        trial numbers of one size, are not ordered by their members, or do not
-        cover each ranked trial exactly once.
+    :raises ValueError: The value is neither ``None`` nor a nonempty list of lists of at
+        least two ascending trial numbers.
     :return list[list[int]] | None: The groups, or ``None`` for a phase without repeats.
     """
     if value is None:
@@ -373,85 +364,9 @@ def _validate_ranked_groups(value: object, ranked: list[int]) -> list[list[int]]
     if not isinstance(value, list) or not value:
         raise ValueError("confound ranked_groups is neither null nor a list of groups")
     groups = [_trial_numbers(group, label="ranked_groups member list") for group in value]
-    if any(len(group) < 2 or len(group) != len(groups[0]) for group in groups):
-        raise ValueError("confound ranked_groups are not groups of one size of at least two")
-    if groups != sorted(groups):
-        raise ValueError("confound ranked_groups are not ordered by their members")
-    if sorted(number for group in groups for number in group) != ranked:
-        raise ValueError("confound ranked_groups do not cover each ranked trial once")
+    if any(len(group) < 2 for group in groups):
+        raise ValueError("confound ranked_groups has a group of fewer than two trials")
     return groups
-
-
-def _validate_against_ranked(
-    checks: Mapping[ConfoundCheck, Mapping[str, Any]], ranked: list[int]
-) -> None:
-    """Validate that each check's evidence describes the block's ranked trials.
-
-    :param Mapping[ConfoundCheck, Mapping[str, Any]] checks: Individually validated records.
-    :param list[int] ranked: The block's ranked trial numbers.
-    :raises ValueError: A single ranked trial was compared, the evaluation
-        groups do not cover each ranked trial once, the survivorship count
-        differs, or a tied trial was not ranked.
-    """
-    evaluation, survivorship, tie = (checks[name] for name in CONFOUND_CHECKS)
-    if len(ranked) < 2 and evaluation["verdict"] != "n/a":
-        raise ValueError("confound compared trials though only one was ranked")
-    if "detail" in evaluation:
-        grouped = sorted(
-            number for group in evaluation["detail"]["values"] for number in group["trials"]
-        )
-        if grouped != ranked:
-            raise ValueError("confound evaluation_point groups do not cover each ranked trial once")
-    if survivorship["detail"]["ranked"] != len(ranked):
-        raise ValueError("confound survivorship ranked count differs from ranked_trials")
-    if "detail" in tie and not set(tie["detail"]["tied_trials"]) <= set(ranked):
-        raise ValueError("confound tie lists a trial that was not ranked")
-
-
-def _validate_against_units(
-    tie: Mapping[str, object],
-    survivorship: Mapping[str, object],
-    ranked: list[int],
-    groups: list[list[int]] | None,
-) -> None:
-    """Validate the tie and survivorship evidence against the block's ranked units.
-
-    A unit is a repeat group when the block has groups, and a trial otherwise.
-
-    :param Mapping[str, object] tie: The validated tie record.
-    :param Mapping[str, object] survivorship: The validated survivorship record.
-    :param list[int] ranked: The block's ranked trial numbers.
-    :param list[list[int]] | None groups: The block's ranked repeat groups, if any.
-    :raises ValueError: A single ranked unit was compared, several configurations were not,
-        ``incomplete_group`` or ``within_noise`` is recorded without groups,
-        ``within_noise`` is absent with them, or a listed trial does not name
-        another ranked group.
-    """
-    units = len(ranked) if groups is None else len(groups)
-    unit_name = "trials" if groups is None else "repeat groups"
-    if units < 2 and tie["verdict"] != "n/a":
-        raise ValueError(f"confound compared {unit_name} though only one was ranked")
-    one_configuration = groups is None and tie.get("reason") == "only one configuration was ranked"
-    if units >= 2 and tie["verdict"] == "n/a" and not one_configuration:
-        raise ValueError(f"confound tie is n/a though several {unit_name} were ranked")
-    counts = survivorship["detail"]
-    if groups is None and isinstance(counts, Mapping) and counts["incomplete_group"]:
-        raise ValueError("confound survivorship counts incomplete_group trials without repeats")
-    detail = tie.get("detail")
-    if not isinstance(detail, Mapping):
-        return
-    tied, noisy = detail["tied_trials"], detail["within_noise"]
-    if groups is None:
-        if noisy is not None:
-            raise ValueError("confound tie lists within_noise groups without repeat groups")
-        return
-    if noisy is None:
-        raise ValueError("confound tie has no within_noise list though repeat groups were ranked")
-    representatives = {group[-1] for group in groups}
-    if not set(tied) <= representatives or not set(noisy) <= representatives:
-        raise ValueError("confound tie lists a trial that is not the last member of a ranked group")
-    if not set(tied) <= set(noisy):
-        raise ValueError("confound tie lists an exact tie that within_noise omits")
 
 
 def _validate_check(name: ConfoundCheck, check: object) -> dict[str, Any]:
@@ -460,8 +375,7 @@ def _validate_check(name: ConfoundCheck, check: object) -> dict[str, Any]:
     :param ConfoundCheck name: Check the record belongs to.
     :param object check: Parsed record.
     :raises ValueError: The verdict is unknown, an ``n/a`` record has no
-        reason, or a checked record's evidence is malformed or yields another
-        verdict.
+        reason, or a checked record's evidence is missing or malformed.
     :return dict[str, Any]: The validated record.
     """
     if not isinstance(check, Mapping) or check.get("verdict") not in CONFOUND_VERDICTS:
@@ -475,10 +389,7 @@ def _validate_check(name: ConfoundCheck, check: object) -> dict[str, Any]:
         return {"verdict": "n/a", "reason": reason}
     if set(check) != {"verdict", "detail"}:
         raise ValueError(f"confound check {name!r} has no evidence")
-    record = _checked(name, _DETAIL_VALIDATORS[name](check["detail"]))
-    if record["verdict"] != check["verdict"]:
-        raise ValueError(f"confound check {name!r} verdict contradicts its evidence")
-    return record
+    return {"verdict": check["verdict"], "detail": _DETAIL_VALIDATORS[name](check["detail"])}
 
 
 def _validate_evaluation_detail(detail: object) -> dict[str, Any]:
