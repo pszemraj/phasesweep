@@ -77,6 +77,7 @@ from phasesweep.engine.read import (
 from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.engine.study_policy import _require_launch_target
 from phasesweep.errors import (
+    STORAGE_NULL_KEEPS_NOTHING,
     OperatorAction,
     PhaseSweepError,
     operator_step,
@@ -857,8 +858,8 @@ def _resume_hint(config: Experiment, *, command: str, width: int) -> str:
         )
     else:
         sentence = (
-            "phasesweep: stopped. Rerun the same command to start over: storage: null keeps no "
-            "completed trials."
+            "phasesweep: stopped. Rerun the same command to start over: "
+            f"{STORAGE_NULL_KEEPS_NOTHING}."
         )
     return "\n".join([*wrap(sentence, width), command])
 

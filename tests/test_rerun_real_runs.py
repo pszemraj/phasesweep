@@ -552,7 +552,7 @@ def test_a_stopped_run_ends_with_the_next_step_once(
         "and interrupted ones rerun first."
         if persistent
         else "phasesweep: stopped. Rerun the same command to start over: storage: null keeps "
-        "no completed trials."
+        "no completed trials between runs."
     )
     lines = harness.log.read_text().splitlines()
     assert lines[-3] == expected

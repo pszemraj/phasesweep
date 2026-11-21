@@ -1605,7 +1605,7 @@ def test_the_stop_hint_repeats_the_command_quoted_with_its_settings(
             80,
             [
                 "phasesweep: stopped. Rerun the same command to start over: storage: null keeps",
-                "no completed trials.",
+                "no completed trials between runs.",
                 "phasesweep run sweep.yaml --set optimizer.lr=0.01",
             ],
             id="in-memory-80",
@@ -1615,7 +1615,7 @@ def test_the_stop_hint_repeats_the_command_quoted_with_its_settings(
             60,
             [
                 "phasesweep: stopped. Rerun the same command to start over:",
-                "storage: null keeps no completed trials.",
+                "storage: null keeps no completed trials between runs.",
                 "phasesweep run sweep.yaml --set optimizer.lr=0.01",
             ],
             id="in-memory-60",
