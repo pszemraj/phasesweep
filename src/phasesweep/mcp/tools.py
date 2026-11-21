@@ -1917,28 +1917,34 @@ class PhaseSweepMCP:
     def _runner_stop_step(self, handle: RunHandle) -> str | None:
         """Name the operator's route to stop a running run that cancel_run refuses.
 
-        A run whose runner is gone still reads as running until recovery settles it. Its
-        process group no longer exists and the number may belong to another group, so
-        the route is the run's recovery step, never a signal.
+        A signal step is given only while the runner may be alive. A runner that exited
+        leaves a run that reads as running until recovery settles it, as a pending result
+        snapshot does; its group no longer exists and the number may now lead another
+        job's group, so the route is the run's recovery step, never a signal.
 
         :param RunHandle handle: Run whose cancellation was refused.
-        :return str | None: The route, naming the runner's PID and group when this server
-            can probe them and its numbers are the host's, else the run id to find the runner
-            by; the recovery step when the runner is gone; or ``None`` when the run is not
-            running.
+        :return str | None: Where ``RunStore.runner_may_be_alive`` rules the runner out, the
+            remediation a read of the run reports, else its recover-run step. Otherwise the
+            route naming its PID and group when this server can probe them and its numbers
+            are the host's, else the run id to find the runner by, or the recorded failure's
+            remediation for an unobservable runner whose run requires recovery. ``None``
+            when the run is not running.
         """
         view = self._runs.runner_view(handle)
         observation = self._runs.observe(handle, view=view)
         if observation.state != "running":
             return None
-        if observation.recovery_required and (
-            view.visibility != "observable" or not self._runs.runner_may_be_alive(handle, view=view)
-        ):
+        if not self._runs.runner_may_be_alive(handle, view=view):
+            failure = response_failure(self._runs, handle, view=view, observation=observation)
+            if failure is not None:
+                return str(failure["remediation"])
+            return f"Its runner has exited; ask the operator to {recover_run_step(handle.run_id)}."
+        if view.visibility == "observable":
+            return runner_stop_step(handle.run_id, handle.pid, handle.pgid)
+        if observation.recovery_required:
             failure = run_failure_payload(self._runs, handle, view=view, observation=observation)
             if failure is not None:
                 return str(failure["remediation"])
-        if view.visibility == "observable":
-            return runner_stop_step(handle.run_id, handle.pid, handle.pgid)
         return runner_stop_step(handle.run_id, None, None)
 
     def _cancel_allowed(self, handle: RunHandle) -> bool:

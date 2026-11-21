@@ -42,6 +42,7 @@ from tests.mcp_helpers import (
     make_run_handle,
     side_effect_app,
     stage_dead_run,
+    stage_live_run,
     write_mcp_catalog,
     write_run_status,
     write_srv_catalog,
@@ -226,19 +227,76 @@ def test_cancel_requires_catalog_and_launch_time_permission(
     ) in str(denied.value)
 
 
-def test_cancel_refusal_for_a_dead_runner_names_recovery_not_a_signal(tmp_path: Path) -> None:
-    """A run whose runner is gone has no group to signal, so the refusal gives its recover-run step."""
+@pytest.mark.parametrize(
+    "dead_runner",
+    [
+        "cleanup-marker",
+        "pending-snapshot",
+        "pending-snapshot-with-recorded-failure",
+        "pending-snapshot-from-earlier-boot",
+        "exits-after-observation",
+    ],
+)
+def test_cancel_refusal_for_a_dead_runner_names_recovery_not_a_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dead_runner: str
+) -> None:
+    """A run whose runner is gone has no group to signal, so the refusal gives its recover-run step, also while a pending result snapshot reads the run as running."""
+    # A host-namespace server would name the recorded group, which may now lead another job's.
+    monkeypatch.setattr(mcp_errors, "in_initial_pid_namespace", lambda: True)
     config, app, registry, store = side_effect_app(tmp_path)
     run_id = "srv-denied-dead"
-    stage_dead_run(store, run_id, config, registry.get("srv").id, cleanup_uncertain=True)
+    experiment_id = registry.get("srv").id
+    if dead_runner == "exits-after-observation":
+        # The run's observation saw the runner alive; the stop step's own probe sees it exited.
+        stage_live_run(store, run_id, config, experiment_id)
+        observe, probe = store.observe, store.runner_may_be_alive
+        observed = False
+
+        def observe_then_exit(
+            handle: RunHandle, *, view: RunnerView | None = None
+        ) -> RunObservation:
+            nonlocal observed
+            observation = observe(handle, view=view)
+            observed = True
+            return observation
+
+        def exited_once_observed(handle: RunHandle, *, view: RunnerView | None = None) -> bool:
+            return not observed and probe(handle, view=view)
+
+        monkeypatch.setattr(store, "observe", observe_then_exit)
+        monkeypatch.setattr(store, "runner_may_be_alive", exited_once_observed)
+    else:
+        boot_id = earlier_boot_id() if dead_runner == "pending-snapshot-from-earlier-boot" else None
+        stage_dead_run(
+            store,
+            run_id,
+            config,
+            experiment_id,
+            cleanup_uncertain=dead_runner == "cleanup-marker",
+            boot_id=boot_id,
+        )
+    if dead_runner == "pending-snapshot-with-recorded-failure":
+        recorded = {
+            "code": "trials_failed",
+            "stage": "execution",
+            "retryable": False,
+            "actor": "agent",
+            "remediation": "Every trial failed; fix the trainer.",
+        }
+        write_run_status(
+            store, run_id, returncode=1, result_snapshot_state="pending", failure=recorded
+        )
+    elif dead_runner.startswith("pending-snapshot"):
+        write_run_status(store, run_id, returncode=0, result_snapshot_state="pending")
 
     with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted") as denied:
         app.cancel(run_id)
 
     message = str(denied.value)
-    assert "kill -TERM" not in message
+    assert "kill" not in message
     assert f"phasesweep mcp recover-run --state-dir STATE_DIR --run-id {run_id}" in message
-    assert app.status(run_id=run_id)["run"]["recovery_required"] is True
+    if dead_runner != "exits-after-observation":
+        assert app.status(run_id=run_id)["run"]["recovery_required"] is True
 
 
 def test_cancel_refusal_gives_no_pid_number_from_a_container_namespace(
