@@ -99,10 +99,6 @@ class _PreflightCleanupReport:
     """First reason a tracker could not be read in this pass, from an extraction or the run
     that just stopped on it. Once set, later extractions in the pass skip their read, so an
     outage costs one read."""
-    settled_generations: set[str] = field(default_factory=set)
-    """Generations whose trials this pass made terminal or confirmed clean, and those a run found
-    left open by an invocation killed outright. Recovery sends nothing to a tracker; the run
-    delivers those generations' MLflow outcomes once it has reached it."""
     error: BaseException | None = None
     process_actions: dict[_AttemptRecord, bool] = field(default_factory=dict)
     """Inspected attempts mapped to whether their live group needs termination."""
@@ -116,18 +112,18 @@ class _PreflightCleanupReport:
             self.error = error
 
     def record_generations(self, attempts: Mapping[str, _AttemptRecord]) -> None:
-        """Record the producing generation of each attempt that has one, as settled.
+        """Record the producing generation of each attempt that has one.
 
         :param Mapping[str, _AttemptRecord] attempts: Attempts whose trials this pass made
             terminal or confirmed clean, keyed by id.
         """
-        generations = {
-            attempt_id: record.generation_id
-            for attempt_id, record in attempts.items()
-            if record.generation_id is not None
-        }
-        self.recovered_attempt_generations.update(generations)
-        self.settled_generations.update(generations.values())
+        self.recovered_attempt_generations.update(
+            {
+                attempt_id: record.generation_id
+                for attempt_id, record in attempts.items()
+                if record.generation_id is not None
+            }
+        )
 
 
 def _pending_evidence_refusal(pending: Mapping[str, str]) -> TrackingTargetUnavailableError:
@@ -797,7 +793,6 @@ def _registry_attempt_fail_stale_trial(
         # In-memory storage died with its orchestrator, so no trial is left to update. The
         # attempt's cleanup is confirmed here, which is what lets its managed run be ended.
         resolve()
-        report.settled_generations.add(entry["generation_id"])
         return "terminal"
     try:
         study = open_registry_study(storage_url, entry["study_name"])
@@ -848,8 +843,6 @@ def _registry_attempt_fail_stale_trial(
             if not recovered:
                 _record_cleanup_recovery(study, trial)
                 report.cleanup_recovered_trials += 1
-            # A pass interrupted after the ledger write may not have saved the outcome record.
-            report.settled_generations.add(entry["generation_id"])
             return "recovered"
         return "terminal"
     if stored_attempt_id is None or stored_generation_id is None:
@@ -1442,8 +1435,6 @@ def _fail_stale_running_trial(
             study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
         except Exception as exc:
             raise StudyStorageUnavailableError(failure_message) from exc
-    if report is not None and record is not None and record.generation_id is not None:
-        report.settled_generations.add(record.generation_id)
     return True
 
 
