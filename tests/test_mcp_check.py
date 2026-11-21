@@ -110,6 +110,40 @@ def test_check_catalog_collects_failures_past_the_first(tmp_path: Path) -> None:
         Registry.load(catalog)
 
 
+@pytest.mark.parametrize("invalid_path", ["inaccessible", "unknown-home"])
+def test_catalog_keeps_healthy_entries_when_a_config_path_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid_path: str
+) -> None:
+    """A failed path inspection gives one entry an operator fix and leaves its sibling readable."""
+    catalog = write_mcp_config_catalog(
+        tmp_path, {name: mcp_experiment_config_text(tmp_path, name=name) for name in ("bad", "ok")}
+    )
+    blocked = tmp_path / "bad.yaml"
+    if invalid_path == "inaccessible":
+        stat_path = Path.stat
+
+        def stat_with_denial(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if path == blocked:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+            return stat_path(path, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(Path, "stat", stat_with_denial)
+    else:
+        catalog.write_text(
+            catalog.read_text().replace(str(blocked), "~missing-phasesweep-user/bad.yaml")
+        )
+
+    registry = Registry.load(catalog, collect_errors=True)
+    assert [entry.id for entry in registry] == ["ok"]
+    (failed,) = registry.failures
+    assert failed.experiment_id == "bad"
+    assert "bad.yaml" in (failed.error or "")
+    assert failed.suggestion
+    checked, healthy = check_catalog(catalog).entries
+    assert checked == failed
+    assert healthy.ok
+
+
 def test_check_catalog_flags_duplicate_and_missing_config(tmp_path: Path) -> None:
     config = tmp_path / "one.yaml"
     config.write_text(mcp_experiment_config_text(tmp_path, name="one"))

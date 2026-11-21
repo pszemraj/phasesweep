@@ -17,6 +17,7 @@ import shlex
 import stat
 import tempfile
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
@@ -210,6 +211,22 @@ def without_launch(capabilities: dict[str, bool]) -> dict[str, bool]:
     return {**capabilities, "launch": False, "from_phase": False}
 
 
+@contextmanager
+def _catalog_path_errors(label: str) -> Iterator[None]:
+    """Report filesystem access and pathlib home or symlink resolution errors to the operator.
+
+    :param str label: Catalog field or entry whose paths are being loaded.
+    :raises CatalogError: If a configured path cannot be resolved or accessed.
+    """
+    try:
+        yield
+    except (OSError, RuntimeError) as exc:
+        raise CatalogError(
+            f"cannot access paths for {label}: {exc}",
+            suggestion="Correct the path or restore access for the account running PhaseSweep.",
+        ) from exc
+
+
 def _resolve_catalog_relative_path(base: Path, path: Path) -> Path:
     """Resolve an operator path relative to the catalog file when not absolute.
 
@@ -217,10 +234,8 @@ def _resolve_catalog_relative_path(base: Path, path: Path) -> Path:
     :param Path path: Operator-authored path from the catalog.
     :return Path: Absolute, resolved filesystem path.
     """
-    expanded = path.expanduser()
-    if expanded.is_absolute():
-        return expanded.resolve()
-    return (base / expanded).resolve()
+    with _catalog_path_errors(str(path)):
+        return (base / path.expanduser()).resolve()
 
 
 def _resolve_existing_dir(base: Path, path: Path, *, label: str) -> Path:
@@ -376,7 +391,7 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
         raise CatalogError(
             f"{entry.id!r}: invalid config {cfg_path}: {detail}", suggestion=invalid_config_fix
         ) from exc
-    except (ValueError, OSError) as exc:
+    except ValueError as exc:
         raise CatalogError(
             f"{entry.id!r}: invalid config {cfg_path}: {exc}", suggestion=invalid_config_fix
         ) from exc
@@ -516,8 +531,10 @@ def _load_catalog_entries(
                     suggestion="give each catalog entry its own id",
                 )
             seen.add(entry.id)
-            registered = _load_entry(base, entry)
-            _claim_catalog_entry_identity(registered, namespace_owners, storage_owners)
+            with _catalog_path_errors(f"entry {entry.id!r} ({entry.config})"):
+                registered = _load_entry(base, entry)
+                trainer_cwd = registered.experiment.execution.resolved_cwd()
+                _claim_catalog_entry_identity(registered, namespace_owners, storage_owners)
             if check_trainers and registered.allow_launch:
                 try:
                     _require_launch_target(registered.experiment)
@@ -544,7 +561,7 @@ def _load_catalog_entries(
                 CatalogCheckEntry(
                     entry.id,
                     actions=_granted_actions(entry.allow),
-                    trainer_cwd=registered.experiment.execution.resolved_cwd(),
+                    trainer_cwd=trainer_cwd,
                 )
             )
     return items, tuple(verdicts)
