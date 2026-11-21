@@ -6,6 +6,7 @@ import errno
 import importlib
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,7 @@ from phasesweep.config.models import Experiment
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence.mlflow import observation_id, select_observation
 from phasesweep.evidence.models import MlflowExtractor, MlflowRequiredGate
+from phasesweep.runtime.shutdown import ShutdownLaunchRefusedError
 from phasesweep.tracking.mlflow import (
     ManagedObjectiveMissingError,
     OperationOutcomeUnknownError,
@@ -956,6 +958,49 @@ def test_sync_keeps_a_record_whose_search_fails(
         assert "still unresolved" in caplog.text
     assert path.exists()
     assert not path.with_name("generation-binding.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "searched"),
+    [
+        (TimeoutError("MLflow operation exceeded its deadline."), 1),
+        (OperationUnavailableError("tracking server unreachable"), 1),
+        (OperationOutcomeUnknownError("MLflow worker failed (exit 1)."), 1),
+        (ShutdownLaunchRefusedError(signal.SIGINT), 1),
+        (RuntimeError("MLflow find failed (MlflowException: PERMISSION_DENIED)."), 2),
+    ],
+    ids=["timeout", "unavailable", "outcome-unknown", "shutdown", "answered-failure"],
+)
+def test_a_creation_search_without_an_answer_ends_the_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: Exception, searched: int
+) -> None:
+    """A search MLflow gives no answer to leaves every later intent unsearched and pending.
+
+    A failure MLflow answered concerns that one record, so the next intent is still searched.
+    """
+    from phasesweep.tracking import session
+
+    experiment = native_experiment(tmp_path)
+    root = session.tracking_root(experiment)
+    paths = [
+        _write_pending(
+            root / generation / "generation-binding.pending.json",
+            attempt_identity(generation, generation),
+        )
+        for generation in ("1" * 32, "2" * 32)
+    ]
+    for path in paths:
+        os.utime(path, (0, 0))
+    sent: list[str] = []
+
+    def find(experiment: Experiment, generation_id: str, *args: object, **kwargs: object) -> None:
+        sent.append(generation_id)
+        raise outcome
+
+    monkeypatch.setattr(session, "call_tracking", find)
+    assert session.resolve_pending_creations(experiment, {}, None)
+    assert sent == ["1" * 32, "2" * 32][:searched]
+    assert all(path.exists() for path in paths)
 
 
 @pytest.mark.parametrize("failure", ["invalid-intent", "unsafe-binding", "full-disk"])
