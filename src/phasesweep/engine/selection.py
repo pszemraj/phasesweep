@@ -37,6 +37,7 @@ from phasesweep.engine.optuna import (
     _measured_trial_count,
     _trial_count_state,
 )
+from phasesweep.engine.paths import _phase_dir
 from phasesweep.engine.repeats import (
     _NOISE_STANDARD_ERRORS,
     RankedGroup,
@@ -71,6 +72,7 @@ from phasesweep.errors import (
     timeout_step,
 )
 from phasesweep.runtime.json import JsonObject, json_object, json_text_map
+from phasesweep.runtime.terminal import display_path
 
 log = logging.getLogger("phasesweep.engine.selection")
 
@@ -110,6 +112,19 @@ def tie_group_comparisons(
     ]
 
 
+def _inspect_step(experiment: Experiment, phase_name: str | None) -> str:
+    """Say where a phase's record of failed trials and the trainer's own logs are.
+
+    :param Experiment experiment: Config locating the artifact root.
+    :param str | None phase_name: Phase whose directory is named, if known.
+    :return str: The first sentence of a no-winner remedy.
+    """
+    if phase_name is None:
+        return "Inspect the phase's trials.csv and the trainer logs in its trial_* directories."
+    phase_dir = display_path(_phase_dir(experiment, phase_name))
+    return f"Inspect {phase_dir}/trials.csv and the trainer logs in its trial_* directories."
+
+
 def _no_feasible_remedy(
     experiment: Experiment, trials: Sequence[optuna.trial.FrozenTrial], phase_name: str | None
 ) -> str:
@@ -120,7 +135,7 @@ def _no_feasible_remedy(
     :param str | None phase_name: Phase supplying its accepted trial budget, if known.
     :return str: Operator steps appropriate to failures, bounds, and storage.
     """
-    evidence = "Inspect the phase's trials.csv and trial_* trainer logs."
+    evidence = _inspect_step(experiment, phase_name)
     if not experiment.persistent:
         return f"{evidence} Fix the trainer failure or adjust the metric bounds or constraints, then rerun; storage: null starts fresh."
     infeasible = any(_trial_count_state(trial) == "INFEASIBLE" for trial in trials)

@@ -27,6 +27,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.evidence.models import JsonExtractor
 from phasesweep.runtime.process import TIMEOUT_REASON_PREFIX
+from phasesweep.runtime.terminal import display_path
 from tests.conftest import log_regex_provenance, make_experiment, trial_outcome
 
 # Allocation writes both attrs on every trial before its trainer runs.
@@ -575,6 +576,20 @@ def test_crashed_remedy_says_whether_a_raised_target_retries_or_draws(
 
     assert outcome in remedy
     assert "timed out" not in remedy
+
+
+def test_a_no_winner_remedy_names_the_phase_directory_it_sends_the_operator_to(
+    tmp_path: Path,
+) -> None:
+    """The first step says where trials.csv and the trial directories are, not just that they exist."""
+    phase = _sampled_phase(Sampler(type="random", seed=0))
+    phase_dir = display_path(tmp_path / "runs" / "t" / "p")
+
+    remedy = _crashed_remedy(tmp_path, phase, ["non-zero exit code 1", None])
+
+    assert remedy.startswith(
+        f"Inspect {phase_dir}/trials.csv and the trainer logs in its trial_* directories. "
+    )
 
 
 def test_the_identity_list_names_the_per_trial_timeout_and_the_rename_that_follows_it(
