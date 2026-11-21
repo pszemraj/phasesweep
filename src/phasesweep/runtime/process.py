@@ -38,6 +38,7 @@ from phasesweep.runtime.reaper import (
     read_proc_starttime,
 )
 from phasesweep.runtime.shutdown import (
+    TRAINER_LABEL,
     PhaseSweepShutdown,
     ShutdownLaunchRefusedError,
     _launch_lock,
@@ -549,6 +550,7 @@ def _spawn_blocked_supervisor(
     deadline: float | None = None,
     gpu_lease_fds: Collection[int] = (),
     lifecycle_args: tuple[str, str, str] | tuple[()] = (),
+    label: str,
 ) -> tuple[subprocess.Popen[bytes], int, int, int]:
     """Spawn and register a supervisor whose trainer waits for a launch payload.
 
@@ -561,6 +563,7 @@ def _spawn_blocked_supervisor(
     :param Collection[int] gpu_lease_fds: Host GPU-lock descriptors inherited only by the
         guardian, keeping leases held after an orchestrator exit until cleanup finishes.
     :param tuple[str, str, str] | tuple[()] lifecycle_args: Optional attempt directory, identity, and monotonic start.
+    :param str label: What the interrupt line calls the registered group.
     :raises _LaunchDeadlineExpired: Readiness exceeded the launch deadline; the group was
         aborted and the exception carries cleanup confirmation.
     :raises RuntimeError: Supervisor readiness timed out or returned an invalid ready frame
@@ -625,7 +628,7 @@ def _spawn_blocked_supervisor(
         if trainer_pid <= 0:
             raise RuntimeError("trial supervisor reported an invalid trainer PID")
         pgid = trainer_pid
-        _register(proc, pgid=pgid)
+        _register(proc, label=label, pgid=pgid)
         status_read = ready_read
         ready_read = -1
         return proc, pgid, ack_write, status_read
@@ -662,6 +665,7 @@ def run_supervised(
     wallclock_deadline: float | None = None,
     cwd: str | None = None,
     gpu_lease_fds: Collection[int] = (),
+    label: str = TRAINER_LABEL,
 ) -> ProcessResult:
     """Launch a shell command in its own process group with durable ownership.
 
@@ -685,6 +689,8 @@ def run_supervised(
     :param float | None wallclock_deadline: Absolute ``time.monotonic()`` phase/run deadline.
     :param str | None cwd: Trainer working directory; ``None`` retains invocation cwd.
     :param Collection[int] gpu_lease_fds: GPU-lock descriptors inherited by the guardian alone.
+    :param str label: What the interrupt line calls this process while it runs, defaults to a
+        trial; a worker passes what it is doing for the run, such as ``MLflow request``.
     :raises PhaseSweepError: PID namespace is unreadable; nothing is recorded or launched.
     :raises ShutdownLaunchRefusedError: Shutdown blocks launch; the attempt is recorded exited.
     :raises RuntimeError: Supervisor readiness failed before creating a process group.
@@ -745,6 +751,7 @@ def run_supervised(
                 deadline=deadline,
                 gpu_lease_fds=gpu_lease_fds,
                 lifecycle_args=(str(trial_dir), attempt_id, str(started)),
+                label=label,
             )
             identity = _trial_process_identity(
                 attempt_id=attempt_id,

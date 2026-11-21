@@ -671,6 +671,7 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
             stderr=output,
             gpu_lease_fds=(held.fileno(),),
             lifecycle_args=(str(tmp_path), "held-lease", str(time.monotonic())),
+            label="trial",
         )
     try:
         process._write_all(

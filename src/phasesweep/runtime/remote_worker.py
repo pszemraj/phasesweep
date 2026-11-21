@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 # Workers run SDK clients on the orchestrator's behalf, so its usage-telemetry
 # opt-outs apply even when the composed trainer environment omits them.
 _TELEMETRY_OPT_OUTS = ("DO_NOT_TRACK", "MLFLOW_DISABLE_TELEMETRY")
+# How the interrupt line names each backend's running worker, which is no trial.
+_BACKEND_NAMES = {"mlflow": "MLflow", "wandb": "W&B"}
 
 
 def report_reserve(budget_seconds: float, report_seconds: float) -> float:
@@ -143,6 +145,7 @@ def run_worker(
                 wallclock_deadline=deadline,
                 trial_dir=trial_dir,
                 attempt_id=run_id,
+                label=f"{_BACKEND_NAMES.get(backend, backend)} request",
             )
         if not result.cleanup_confirmed:
             raise UnsafeProcessCleanupError(

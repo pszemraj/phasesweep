@@ -50,6 +50,7 @@ from phasesweep.runtime.reaper import (
 )
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
+    _RegisteredGroup,
     _shutdown_handler,
 )
 from tests.conftest import (
@@ -753,6 +754,7 @@ def test_spawn_blocked_supervisor_launch_argv_and_env(
         proc, pgid, ack_write, status_read = _spawn_blocked_supervisor(
             stdout=fout,
             stderr=ferr,
+            label="trial",
         )
     try:
         argv = captured["argv"]
@@ -799,7 +801,7 @@ def test_spawn_blocked_supervisor_invalidates_pipe_fd_before_close(
         (tmp_path / "err.log").open("w") as ferr,
         pytest.raises(InjectedClose),
     ):
-        process._spawn_blocked_supervisor(stdout=fout, stderr=ferr)
+        process._spawn_blocked_supervisor(stdout=fout, stderr=ferr, label="trial")
 
     assert close_calls
 
@@ -1619,7 +1621,8 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
     report.
     """
     terminated: list[int] = []
-    active = {1234: SimpleNamespace(pid=4321)}
+    guardian = SimpleNamespace(pid=4321)
+    active = {1234: _RegisteredGroup(guardian, "trial")}
 
     monkeypatch.setattr("phasesweep.runtime.shutdown._active_children", active)
 
@@ -1629,7 +1632,7 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
         grace_seconds: float,
         guardians: Mapping[int, subprocess.Popen[bytes]],
     ) -> dict[int, bool]:
-        assert guardians == active
+        assert guardians == {1234: guardian}
         terminated.extend(pgids)
         active.clear()
         return dict.fromkeys(pgids, True)
@@ -1648,7 +1651,8 @@ def test_shutdown_handler_reports_uncertain_when_group_termination_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "phasesweep.runtime.shutdown._active_children", {1234: SimpleNamespace(pid=4321)}
+        "phasesweep.runtime.shutdown._active_children",
+        {1234: _RegisteredGroup(SimpleNamespace(pid=4321), "trial")},
     )
     monkeypatch.setattr(
         "phasesweep.runtime.shutdown._terminate_process_groups",
@@ -1667,7 +1671,10 @@ def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The first shutdown signal owns cleanup evidence until its pass completes."""
-    active = {1234: SimpleNamespace(pid=4321), 5678: SimpleNamespace(pid=8765)}
+    active = {
+        pgid: _RegisteredGroup(SimpleNamespace(pid=pid), "trial")
+        for pgid, pid in ((1234, 4321), (5678, 8765))
+    }
     terminated: list[int] = []
     reentered = False
 
@@ -1679,7 +1686,7 @@ def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
         grace_seconds: float,
         guardians: Mapping[int, subprocess.Popen[bytes]],
     ) -> dict[int, bool]:
-        assert guardians == active
+        assert guardians == {pgid: group.guardian for pgid, group in active.items()}
         nonlocal reentered
         terminated.extend(pgids)
         if not reentered:

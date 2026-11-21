@@ -15,7 +15,8 @@ import signal
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Collection, Iterator
+from collections import Counter
+from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass
 from types import FrameType
 
@@ -27,8 +28,20 @@ log = logging.getLogger("phasesweep.runtime.process")
 # The one line a person reads when a signal arrives; everything else stays in run.log.
 console = logging.getLogger(REPORT_LOGGER)
 
+#: What the interrupt line calls a registered trainer; every other label names a worker.
+TRAINER_LABEL = "trial"
+
+
+@dataclass(frozen=True)
+class _RegisteredGroup:
+    """A live process group the shutdown handler stops, and what the interrupt line calls it."""
+
+    guardian: subprocess.Popen[bytes]
+    label: str
+
+
 _lock = threading.Lock()
-_active_children: dict[int, subprocess.Popen[bytes]] = {}  # pgid -> Popen
+_active_children: dict[int, _RegisteredGroup] = {}  # pgid -> its guardian and label
 
 # Serialize spawning and registration against the handler's child snapshot.
 # The handler waits until each in-flight launch registers its PGID or fails.
@@ -169,26 +182,29 @@ def register_shutdown_waker(waker: Callable[[], None]) -> None:
     _shutdown_wakers.append(waker)
 
 
-def _interrupt_text(signum: int, running: int) -> str:
+def _interrupt_text(signum: int, running: Sequence[str]) -> str:
     """Say in plain words that a shutdown signal arrived and what it stops.
 
     :param int signum: Shutdown signal number.
-    :param int running: Process groups of running trainers the signal will stop.
+    :param Sequence[str] running: The label of each process group the signal will stop, in
+        registration order; :data:`TRAINER_LABEL` marks a trainer.
     :return str: For example ``Interrupted (SIGINT): stopping 2 trials and waiting for them to exit.``
     """
     try:
         name = signal.Signals(signum).name
     except ValueError:
         name = f"signal {signum}"
-    if running == 0:
-        return f"Interrupted ({name}): no trainer is running."
+    counts = Counter(running)
+    trials = counts.pop(TRAINER_LABEL, 0)
+    others = [plural(count, label) for label, count in counts.items()]
+    if not trials:
+        stopping = f"; stopping {' and '.join(others)}" if others else ""
+        return f"Interrupted ({name}): no trainer is running{stopping}."
     # A trainer that ignores SIGTERM keeps the run silent until its grace period ends, so the
-    # line says the run is waiting. It stays short enough for one line of an 80-column terminal.
-    pronoun = "it" if running == 1 else "them"
-    return (
-        f"Interrupted ({name}): stopping {plural(running, 'trial')} "
-        f"and waiting for {pronoun} to exit."
-    )
+    # line says the run is waiting.
+    pronoun = "it" if len(running) == 1 else "them"
+    stopping = " and ".join([plural(trials, TRAINER_LABEL), *others])
+    return f"Interrupted ({name}): stopping {stopping} and waiting for {pronoun} to exit."
 
 
 def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
@@ -227,10 +243,13 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
                 log.exception("Failed to wake a waiting thread after signal %d", signum)
 
         with _launch_lock, _lock:
-            guardians = dict(_active_children)
-            pgids = tuple(guardians)
+            registered = dict(_active_children)
+        guardians = {pgid: group.guardian for pgid, group in registered.items()}
+        pgids = tuple(registered)
 
-        console.info(ReportText(_interrupt_text(signum, len(pgids))))
+        console.info(
+            ReportText(_interrupt_text(signum, [group.label for group in registered.values()]))
+        )
 
         confirmed_by_pgid: dict[int, bool] = {}
         try:
@@ -532,17 +551,19 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
             absorbed.signum = drained
 
 
-def _register(proc: subprocess.Popen[bytes], *, pgid: int | None = None) -> int:
+def _register(proc: subprocess.Popen[bytes], *, label: str, pgid: int | None = None) -> int:
     """Add a freshly-launched subprocess to the global child registry.
 
     :param subprocess.Popen[bytes] proc: Newly launched subprocess.
+    :param str label: What the interrupt line calls this group, counted with others of its
+        label: :data:`TRAINER_LABEL` for a trainer, a noun such as ``MLflow request`` for a worker.
     :param int | None pgid: Explicit child process group guarded by ``proc``. When omitted,
         register ``proc``'s own process group.
     :return int: Registered process-group ID for removal and signal targeting.
     """
     resolved_pgid = os.getpgid(proc.pid) if pgid is None else pgid
     with _lock:
-        _active_children[resolved_pgid] = proc
+        _active_children[resolved_pgid] = _RegisteredGroup(proc, label)
     return resolved_pgid
 
 

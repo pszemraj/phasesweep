@@ -14,12 +14,14 @@ import time
 from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from phasesweep import run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.runtime import shutdown as runtime_shutdown
+from phasesweep.runtime.console import ConsoleHandler
 from phasesweep.runtime.process import ATTEMPT_LIFECYCLE_FILE, fd_ready, run_supervised
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 from phasesweep.runtime.shutdown import (
@@ -32,7 +34,7 @@ from phasesweep.runtime.shutdown import (
     install_signal_handlers,
     signal_handler_scope,
 )
-from phasesweep.runtime.terminal import REPORT_LOGGER
+from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText
 from tests.conftest import (
     make_experiment,
     restored_signal_ownership,
@@ -820,27 +822,100 @@ def test_shutdown_handler_names_the_signal_it_services_until_the_next_run() -> N
     [
         (
             signal.SIGINT,
-            1,
+            ["trial"],
             "Interrupted (SIGINT): stopping 1 trial and waiting for it to exit.",
         ),
         (
             signal.SIGTERM,
-            3,
+            ["trial"] * 3,
             "Interrupted (SIGTERM): stopping 3 trials and waiting for them to exit.",
         ),
-        (signal.SIGHUP, 0, "Interrupted (SIGHUP): no trainer is running."),
+        (signal.SIGHUP, [], "Interrupted (SIGHUP): no trainer is running."),
         (
             99,
-            2,
+            ["trial"] * 2,
             "Interrupted (signal 99): stopping 2 trials and waiting for them to exit.",
+        ),
+        (
+            signal.SIGINT,
+            ["MLflow request"],
+            "Interrupted (SIGINT): no trainer is running; stopping 1 MLflow request.",
+        ),
+        (
+            signal.SIGINT,
+            ["W&B request", "trial", "W&B request"],
+            "Interrupted (SIGINT): stopping 1 trial and 2 W&B requests and waiting for them to exit.",
         ),
     ],
 )
 def test_interrupt_text_names_the_signal_and_the_trials_it_stops(
-    signum: int, running: int, text: str
+    signum: int, running: list[str], text: str
 ) -> None:
-    """The line says in plain words which signal arrived and how many trainers it stops."""
+    """The line names the signal, counts only trainers as trials, and names each worker by its label."""
     assert _interrupt_text(signum, running) == text
+
+
+@pytest.mark.parametrize(
+    ("labels", "text"),
+    [
+        (["trial"], "Interrupted (SIGINT): stopping 1 trial and waiting for it to exit."),
+        (
+            ["MLflow request"],
+            "Interrupted (SIGINT): no trainer is running; stopping 1 MLflow request.",
+        ),
+        (
+            ["trial", "MLflow request"],
+            "Interrupted (SIGINT): stopping 1 trial and 1 MLflow request and waiting for them to exit.",
+        ),
+    ],
+    ids=["trainer", "worker", "both"],
+)
+def test_the_handler_counts_registered_trainers_as_trials_and_names_workers(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    labels: list[str],
+    text: str,
+) -> None:
+    """The real handler prints what each registered group is, and stops every one of them."""
+    monkeypatch.setattr(runtime_shutdown, "_active_children", {})
+    stopped: list[dict[int, object]] = []
+
+    def terminate(
+        pgids: tuple[int, ...], *, grace_seconds: float, guardians: dict[int, object]
+    ) -> dict[int, bool]:
+        stopped.append(dict(guardians))
+        return dict.fromkeys(pgids, True)
+
+    monkeypatch.setattr(runtime_shutdown, "_terminate_process_groups", terminate)
+    registered: dict[int, object] = {}
+    for offset, label in enumerate(labels):
+        guardian = SimpleNamespace(pid=4321 + offset)
+        pgid = runtime_shutdown._register(guardian, label=label, pgid=1234 + offset)
+        registered[pgid] = guardian
+
+    with caplog.at_level(logging.INFO, logger=REPORT_LOGGER), pytest.raises(PhaseSweepShutdown):
+        _shutdown_handler(signal.SIGINT, None)
+
+    assert [r.getMessage() for r in caplog.records if r.name == REPORT_LOGGER] == [text]
+    assert stopped == [registered]
+
+
+def test_the_longest_interrupt_line_wraps_within_an_80_column_terminal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Three trials and a worker request under SIGTERM print on lines of at most 80 columns."""
+    monkeypatch.setenv("COLUMNS", "80")
+    text = _interrupt_text(signal.SIGTERM, ["trial"] * 3 + ["MLflow request"])
+    record = logging.LogRecord(
+        REPORT_LOGGER, logging.INFO, __file__, 0, ReportText(text), None, None
+    )
+
+    ConsoleHandler().emit(record)
+
+    lines = capsys.readouterr().err.splitlines()
+    assert " ".join(line.strip() for line in lines).endswith(text)
+    assert len(lines) > 1
+    assert max(len(line) for line in lines) <= 80
 
 
 def test_a_shutdown_prints_one_report_line_and_logs_the_confirmed_cleanup_quietly(

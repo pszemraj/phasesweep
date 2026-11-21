@@ -509,6 +509,7 @@ def _spawn_guardian(
             stdout=output,
             stderr=output,
             lifecycle_args=(str(tmp_path), "settle", str(time.monotonic())),
+            label="trial",
         )
     try:
         process._write_all(
