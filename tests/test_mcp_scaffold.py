@@ -323,3 +323,18 @@ def test_init_catalog_multiple_configs(tmp_path: Path) -> None:
     registry = Registry.load(output)
     assert registry.get("alpha").id == "alpha"
     assert registry.get("beta").id == "beta"
+
+
+def test_init_catalog_prints_its_check_command_quoted_for_a_shell(tmp_path: Path) -> None:
+    """A catalog path with a space is quoted in the header's command and in the ``next:`` line."""
+    project = tmp_path / "my project"
+    project.mkdir()
+    config = _write_config(project, "srv.yaml")
+    output = project / "catalog.yaml"
+
+    result = _init_catalog(config, output)
+
+    assert result.exit_code == 0, result.output
+    command = f"phasesweep mcp check --catalog '{output.resolve()}'"
+    assert f"#   {command}\n" in output.read_text()
+    assert f"`{command}`" in result.output

@@ -59,6 +59,7 @@ from phasesweep.runtime.files import (
 )
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.reaper import read_pid_namespace, read_proc_starttime
+from phasesweep.runtime.terminal import command_line
 
 VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
 
@@ -414,7 +415,7 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
         label=f"{entry.id!r}: cwd",
     )
     invalid_config_fix = (
-        f"correct the config until `phasesweep validate {shlex.quote(str(cfg_path))}` passes"
+        f"correct the config until `{command_line('validate', str(cfg_path))}` passes"
     )
     try:
         config_bytes = cfg_path.read_bytes()

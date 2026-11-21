@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from phasesweep.runtime.terminal import (
+    command_line,
     directory_lines,
     display_path,
     hang,
@@ -248,6 +249,15 @@ def test_display_path_prefers_the_working_directory_then_home_then_absolute(
     assert display_path(home) == "~"
     assert display_path(Path("/opt/elsewhere/trials.csv")) == "/opt/elsewhere/trials.csv"
     assert display_path(tmp_path / "other" / "a.yaml") == str(tmp_path / "other" / "a.yaml")
+
+
+def test_command_line_quotes_each_word_and_leaves_plain_ones_bare() -> None:
+    """Every printed command starts with the program name and pastes into a shell as typed."""
+    assert command_line("run", "sweep.yaml", "--dry-run") == "phasesweep run sweep.yaml --dry-run"
+    assert (
+        command_line("run", "my dir/a.yaml", "--set", "note=it's here")
+        == "phasesweep run 'my dir/a.yaml' --set 'note=it'\"'\"'s here'"
+    )
 
 
 def test_display_path_checks_the_working_directory_before_home(

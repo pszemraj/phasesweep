@@ -7,6 +7,7 @@ renderer's text is a pure function of its inputs and tests pin it without a term
 from __future__ import annotations
 
 import os
+import shlex
 import textwrap
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -184,6 +185,15 @@ def display_path(path: Path) -> str:
             relative = absolute.relative_to(base).as_posix()
             return f"{prefix}/{relative}" if prefix else relative
     return absolute.as_posix()
+
+
+def command_line(*words: str) -> str:
+    """Build a ``phasesweep`` command for the operator to paste, quoting each word for a shell.
+
+    :param str words: The subcommand and its arguments, each as one word.
+    :return str: The command, program name first.
+    """
+    return shlex.join(["phasesweep", *words])
 
 
 def plural(count: int, noun: str) -> str:

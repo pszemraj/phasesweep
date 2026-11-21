@@ -8,7 +8,6 @@ import io
 import logging
 import math
 import os
-import shlex
 import sys
 import time
 import traceback
@@ -121,6 +120,7 @@ from phasesweep.runtime.shutdown import (
     install_signal_handlers,
 )
 from phasesweep.runtime.terminal import (
+    command_line,
     display_path,
     plural,
     terminal_width,
@@ -501,17 +501,17 @@ def init(template: str, list_templates: bool, output: str) -> None:
         click.echo(f"phasesweep init: cannot write {target}: {exc}", err=True)
         raise click.exceptions.Exit(1) from None
 
-    # Quote the expanded path, never the raw option value: shell quoting
+    # Name the expanded path, never the raw option value: shell quoting
     # suppresses "~" expansion, so a quoted raw "~/x.yaml" would name a
     # different (nonexistent) file than the one just written.
-    config_arg = shlex.quote(str(expanded))
+    config_arg = str(expanded)
     click.echo(f"Wrote the {template} template to {target}")
     click.echo("\nNext: read the template header for prerequisites and trainer adaptation, then:")
-    click.echo(f"  phasesweep validate {config_arg}")
-    click.echo(f"  phasesweep run {config_arg} --dry-run")
-    click.echo(f"  phasesweep run {config_arg}")
-    click.echo(f"  phasesweep status {config_arg} --trials")
-    click.echo(f"  phasesweep mcp init-catalog --from {config_arg}")
+    click.echo(f"  {command_line('validate', config_arg)}")
+    click.echo(f"  {command_line('run', config_arg, '--dry-run')}")
+    click.echo(f"  {command_line('run', config_arg)}")
+    click.echo(f"  {command_line('status', config_arg, '--trials')}")
+    click.echo(f"  {command_line('mcp', 'init-catalog', '--from', config_arg)}")
     click.echo(
         "\nphasesweep explain lists the top-level config keys; phasesweep explain KEY describes one."
     )
@@ -754,9 +754,7 @@ def _closing_block(
     :param str | None from_phase: The ``--from-phase`` value, if given.
     :return Summary | NothingToRun: The block to print.
     """
-    next_command = shlex.join(
-        ["phasesweep", "status", *_config_arguments(config_path, settings), "--trials"]
-    )
+    next_command = command_line("status", *_config_arguments(config_path, settings), "--trials")
     if outcome.replayed_generation_id is not None:
         return nothing_to_run(
             elapsed=elapsed,
@@ -806,9 +804,7 @@ def _echo_sync_step(config: Experiment, config_path: Path, settings: tuple[str, 
     except (OSError, ValueError):
         return
     if pending:
-        command = shlex.join(
-            ["phasesweep", "sync-tracking", *_config_arguments(config_path, settings)]
-        )
+        command = command_line("sync-tracking", *_config_arguments(config_path, settings))
         click.echo(f"MLflow: to send what is pending without training, run:\n{command}", err=True)
 
 
@@ -817,7 +813,7 @@ def _config_arguments(config_path: Path, settings: tuple[str, ...]) -> list[str]
 
     :param Path config_path: The config path as typed.
     :param tuple[str, ...] settings: The ``--set`` assignments as typed.
-    :return list[str]: The path, then each ``--set`` and its assignment, ready for ``shlex.join``.
+    :return list[str]: The path, then each ``--set`` and its assignment, ready for :func:`command_line`.
     """
     return [str(config_path), *(part for item in settings for part in ("--set", item))]
 
@@ -832,13 +828,10 @@ def _rerun_command(config_path: Path, settings: tuple[str, ...], from_phase: str
     :param str | None from_phase: The ``--from-phase`` value, if given.
     :return str: The command, quoted so it can be pasted into a shell.
     """
-    return shlex.join(
-        [
-            "phasesweep",
-            "run",
-            *_config_arguments(config_path, settings),
-            *(() if from_phase is None else ("--from-phase", from_phase)),
-        ]
+    return command_line(
+        "run",
+        *_config_arguments(config_path, settings),
+        *(() if from_phase is None else ("--from-phase", from_phase)),
     )
 
 
@@ -937,7 +930,7 @@ def validate(config_path: Path, settings: tuple[str, ...]) -> None:
         "Checked the config alone. A dry run also compares it with the recorded study and the "
         "environment of its recorded trials, and checks the trial program on the trainer's PATH:"
     )
-    dry_run = f"{_rerun_command(config_path, settings, None)} --dry-run"
+    dry_run = command_line("run", *_config_arguments(config_path, settings), "--dry-run")
     click.echo("\n".join([*wrap(sentence, terminal_width(sys.stdout)), dry_run]))
 
 
@@ -1456,13 +1449,10 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
         refused_text,
     )
 
-    command = shlex.join(
-        [
-            "phasesweep",
-            "sync-tracking",
-            *_config_arguments(config_path, settings),
-            *(() if generation_id is None else ("--generation", generation_id)),
-        ]
+    command = command_line(
+        "sync-tracking",
+        *_config_arguments(config_path, settings),
+        *(() if generation_id is None else ("--generation", generation_id)),
     )
     tally = DeliveryTally()
     with _console_logging(verbose=False):
@@ -1798,7 +1788,7 @@ def init_catalog(ctx: click.Context, from_configs: tuple[Path, ...], output: Pat
     _echo_catalog_report(check_catalog(output))
     click.echo(
         "next: fill in each description, decide allow/visible_params, then run "
-        f"`phasesweep mcp check --catalog {output.resolve()}`"
+        f"`{command_line('mcp', 'check', '--catalog', str(output.resolve()))}`"
     )
 
 

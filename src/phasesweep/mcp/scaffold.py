@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import re
-import shlex
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -18,6 +17,7 @@ import yaml
 
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.runtime.files import UnsafePrivatePathError, phasesweep_home, xdg_home
+from phasesweep.runtime.terminal import command_line
 
 _UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
 
@@ -129,10 +129,10 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
     if root is None:
         root = xdg_home("XDG_STATE_HOME", Path.home() / ".local" / "state") / "phasesweep"
     state_dir = root / "mcp" / digest
-    catalog_arg = shlex.quote(str(output.resolve()))
+    check_command = command_line("mcp", "check", "--catalog", str(output.resolve()))
     header = f"""\
 # MCP catalog scaffolded by `phasesweep mcp init-catalog`. Edit the entries, then run:
-#   phasesweep mcp check --catalog {catalog_arg}
+#   {check_command}
 # Then configure your MCP client to run the absolute `phasesweep-mcp` executable
 # with `--catalog` and this absolute catalog path.
 #

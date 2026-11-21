@@ -14,7 +14,6 @@ import functools
 import importlib.resources
 import json
 import re
-import shlex
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, distribution
@@ -22,6 +21,7 @@ from importlib.resources.abc import Traversable
 from typing import Literal
 
 from phasesweep._metadata import __version__
+from phasesweep.runtime.terminal import command_line
 
 _SECTION = re.compile(r"# -{10} (.+?) -{10}")
 _ENTRY = re.compile(r"( *)(- )?([\w.-]+): (.+)")
@@ -655,7 +655,7 @@ def explain_command(path: str) -> str:
     :param str path: A documented key as :func:`loc_to_path` or :func:`closest` returns it.
     :return str: ``phasesweep explain`` and the quoted key, with nothing after it.
     """
-    return f"phasesweep explain {shlex.quote(path)}"
+    return command_line("explain", path)
 
 
 def loc_to_path(loc: Sequence[int | str]) -> str | None:
