@@ -109,6 +109,9 @@ def test_phase_start_says_what_will_run(experiment: Experiment) -> None:
     rerun = phase_start(experiment, depth, finished=3, remaining=1, reruns=1)
     assert str(rerun) == "depth  1 trial to run, 1 of them a rerun, 1 at a time, 3 already finished"
 
+    many = phase_start(experiment, depth, finished=0, remaining=1500, reruns=1200)
+    assert str(many) == "depth  1,500 trials to run, 1,200 of them reruns, 1 at a time"
+
     replay = phase_start(experiment, depth, finished=4, remaining=0, reruns=0)
     assert console(replay) == [
         "12:00:00  depth          nothing to run, 4 trials already finished,",

@@ -75,6 +75,7 @@ from phasesweep.errors import (
     unreadable_objective_step,
 )
 from phasesweep.runtime.json import JsonObject, json_text_map
+from phasesweep.runtime.terminal import plural
 
 _ALLOCATION_CONTEXT_ATTR = "phasesweep_allocation_context"
 _ALLOCATION_CONTEXT_SCHEMA_VERSION = 1
@@ -437,7 +438,7 @@ def _accepted_trial_target(study: optuna.Study) -> int:
     if type(stored) is not int or stored < 1 or finished > stored:
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} has invalid {TRIAL_TARGET_ATTR!r}={stored!r} "
-            f"for {finished} finished trial(s)."
+            f"for {plural(finished, 'finished trial')}."
         )
     recovery = _load_recovery_record(study)
     return stored if recovery is None else max(stored, recovery.trial_target)
@@ -460,8 +461,9 @@ def _validate_trial_target(study: optuna.Study, phase: Phase, *, dependents: Seq
     accepted_target = _accepted_trial_target(study)
     if phase.n_trials < accepted_target:
         raise TrialTargetRefusedError(
-            f"Phase {phase.name!r} has already accepted a target of {accepted_target} finished "
-            f"trial(s), but the current config requests {phase.n_trials}. Set "
+            f"Phase {phase.name!r} has already accepted a target of "
+            f"{plural(accepted_target, 'finished trial')}, but the current config requests "
+            f"{phase.n_trials}. Set "
             f"phases[{phase.name}].n_trials to at least {accepted_target} in the config.",
             remediation=f"Set phases[{phase.name}].n_trials to at least {accepted_target} and rerun.",
         )

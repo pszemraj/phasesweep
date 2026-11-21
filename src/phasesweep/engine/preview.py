@@ -60,9 +60,10 @@ from phasesweep.engine.study_policy import (
     _validate_trial_target,
 )
 from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.run_report import rerun_clause
 from phasesweep.runtime.commands import render_command
 from phasesweep.runtime.gpu import GpuPool
-from phasesweep.runtime.terminal import REPORT_LOGGER
+from phasesweep.runtime.terminal import REPORT_LOGGER, plural
 
 # Every line of a preview is for the person reading the dry run, so all of it is report.
 log = logging.getLogger(REPORT_LOGGER)
@@ -112,15 +113,6 @@ class PhasePreview:
     replays: bool
 
 
-def _reruns_phrase(reruns: int) -> str:
-    """Name a count of reruns in the singular or plural.
-
-    :param int reruns: Reruns counted.
-    :return str: For example ``"1 rerun"``.
-    """
-    return "1 rerun" if reruns == 1 else f"{reruns} reruns"
-
-
 def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
     """Total the trials a dry run would launch from the counts its phase lines print.
 
@@ -132,10 +124,10 @@ def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
     reruns = sum(preview.reruns for preview in previews)
     launching = sum(1 for preview in previews if preview.launches)
     replaying = sum(1 for preview in previews if preview.replays)
-    line = f"total: would launch {trials} {'trial' if trials == 1 else 'trials'} "
+    line = f"total: would launch {plural(trials, 'trial')} "
     if reruns:
-        line += f"({_reruns_phrase(reruns)}) "
-    line += f"across {launching} {'phase' if launching == 1 else 'phases'}"
+        line += f"({plural(reruns, 'rerun')}) "
+    line += f"across {plural(launching, 'phase')}"
     if replaying:
         line += f" ({replaying} other {'phase replays' if replaying == 1 else 'phases replay'})"
     return line
@@ -434,12 +426,12 @@ def _preview_phase(
         )
     elif recorded.running:
         warn_dry_run(
-            "phase=%s has %d RUNNING attempt(s) that a real run recovers "
+            "phase=%s has %s that a real run recovers "
             "before it checks the phase, as failed where the trial recorded a failure and "
             "otherwise as interrupted, which reruns; they are counted that way, and its "
             "accepted target, abort state and partial decision are not checked",
             phase.name,
-            recorded.running,
+            plural(recorded.running, "RUNNING attempt"),
         )
     if remaining == 0:
         log.info(
@@ -571,18 +563,8 @@ def _dry_run_phase(
     :return Winner: A placeholder built from the previewed sample, with the repeat key
         omitted, so downstream dry-run previews see consistent inherited context.
     """
-    of_them = ""
-    if reruns == 1:
-        of_them = ", 1 of them a rerun"
-    elif reruns:
-        of_them = f", {reruns} of them reruns"
-    log.info(
-        "DRY RUN phase=%s would launch %d %s%s",
-        phase.name,
-        remaining,
-        "trial" if remaining == 1 else "trials",
-        of_them,
-    )
+    of_them = f", {rerun_clause(reruns)}" if reruns else ""
+    log.info("DRY RUN phase=%s would launch %s%s", phase.name, plural(remaining, "trial"), of_them)
     sample_trial = study.ask()
     sampled: dict[str, object] = {
         name: _suggest(sample_trial, name, p) for name, p in sampler_search_space(phase).items()

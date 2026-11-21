@@ -41,6 +41,7 @@ from phasesweep.runtime.files import (
     canonical_storage_identity,
 )
 from phasesweep.runtime.json import strict_json_loads
+from phasesweep.runtime.terminal import plural
 
 log = logging.getLogger(__name__)
 
@@ -306,7 +307,7 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
         trial_count = len(study.get_trials(deepcopy=False))
         if trial_count:
             raise ArtifactRootConflictError(
-                f"Study {study.study_name!r} holds {trial_count} trial(s) but records no "
+                f"Study {study.study_name!r} holds {plural(trial_count, 'trial')} but records no "
                 "artifact root, which is unsupported PhaseSweep state. Nothing was written.",
             )
         return True

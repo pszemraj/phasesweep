@@ -19,6 +19,7 @@ from phasesweep.config.common import (
     _require_finite,
 )
 from phasesweep.errors import rename_phase_step
+from phasesweep.runtime.terminal import plural
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Phase
@@ -498,9 +499,8 @@ def fixed_configuration_target_refusal(
             "identical trials.",
             "Use n_trials: 1 for a fixed configuration, or repeats to measure seed noise.",
         )
-    plural = "" if finished == 1 else "s"
     return (
-        f"Phase {name!r} is a fixed configuration with {finished} failed attempt{plural} and "
+        f"Phase {name!r} is a fixed configuration with {plural(finished, 'failed attempt')} and "
         "no completed one; raising n_trials retries it one attempt at a time.",
         f"Use n_trials at most {finished + 1}, not {target}.",
     )
@@ -553,8 +553,8 @@ def grid_target_refusal(
     )
     return (
         f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid's available "
-        f"attempts: {finished} finished attempt{'s' if finished != 1 else ''} and "
-        f"{measured} COMPLETE or INFEASIBLE cell{'s' if measured != 1 else ''} "
+        f"attempts: {plural(finished, 'finished attempt')} and "
+        f"{plural(measured, 'COMPLETE or INFEASIBLE cell')} "
         f"in a {cardinality}-cell grid allow at most {maximum}. Raising n_trials retries "
         "failed cells once each; COMPLETE and INFEASIBLE cells are never repeated.",
         remedy,

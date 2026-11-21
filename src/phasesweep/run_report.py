@@ -96,6 +96,15 @@ def _lay_out_clauses(label: str, label_width: int, clauses: Sequence[str], width
     return hang(lead, pack(clauses, width - len(lead), separator=", "))
 
 
+def rerun_clause(reruns: int) -> str:
+    """Say how many of a phase's trials rerun an interrupted trial or retry a failed grid cell.
+
+    :param int reruns: Reruns among the trials to run, at least one.
+    :return str: ``1 of them a rerun``, or ``3 of them reruns``.
+    """
+    return f"{reruns:,} of them {'a rerun' if reruns == 1 else 'reruns'}"
+
+
 @dataclass(frozen=True)
 class PhaseStart(ReportBlock):
     """The line that opens a phase: how much is left to run, or that it replays a result."""
@@ -121,9 +130,7 @@ class PhaseStart(ReportBlock):
             ]
         clauses = [f"{plural(self.remaining, 'trial')} to run"]
         if self.reruns:
-            clauses.append(
-                "1 of them a rerun" if self.reruns == 1 else f"{self.reruns} of them reruns"
-            )
+            clauses.append(rerun_clause(self.reruns))
         clauses.append(f"{self.n_jobs} at a time")
         if self.finished:
             clauses.append(f"{self.finished} already finished")

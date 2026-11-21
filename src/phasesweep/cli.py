@@ -1040,7 +1040,7 @@ def _render_reference_index() -> None:
             click.echo(entry.section)
             section = entry.section
         count = sub_key_count(entry)
-        suffix = f" ({count} sub-key{'' if count == 1 else 's'})" if count else ""
+        suffix = f" ({plural(count, 'sub-key')})" if count else ""
         summary = first_sentence(entry, _SUMMARY_WIDTH)
         click.echo(f"  {entry.path:<{width}}  {entry.signature:<{sig_width}}  {summary}{suffix}")
     click.echo()
