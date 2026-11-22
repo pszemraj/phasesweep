@@ -285,13 +285,15 @@ class _StandardStreamFile(io.FileIO):
             raise
 
 
-def _discard_unreadable_output(stream: TextIO | None) -> TextIO | None:
-    """Rebuild a standard stream on :class:`_StandardStreamFile`, keeping its text settings.
+def _discard_unreadable_output(stream: TextIO | None) -> TextIO:
+    """Rebuild a standard stream without letting an absent reader interrupt the command.
 
     :param TextIO | None stream: ``sys.stdout`` or ``sys.stderr``.
-    :return TextIO | None: The rebuilt stream; ``stream`` itself when it has no descriptor,
-        as an in-memory capture has none, or is not set.
+    :return TextIO: A sink if Python started without the stream, the stream itself for captures
+        without a descriptor, or a rebuilt stream that preserves its text settings.
     """
+    if stream is None:
+        return Path(os.devnull).open("w", encoding="utf-8", errors="backslashreplace")
     if not isinstance(stream, io.TextIOWrapper):
         return stream
     try:
@@ -314,8 +316,8 @@ def main() -> None:
     Click exceptions reach this boundary; explicit ``SystemExit`` statuses pass through. A
     ``run`` that went past its config prints ``log: <path>`` last, after its error or resume
     lines, whenever ``run.log`` exists, so the file is named however the command ended. A path
-    wider than the terminal breaks after slashes. Output to a pipe whose reader exited or to a
-    terminal that hung up is discarded, so the status stays the command's own.
+    wider than the terminal breaks after slashes. Output to a closed stream, a pipe whose reader
+    exited or a terminal that hung up is discarded, so the status stays the command's own.
 
     :raises SystemExit: Always, carrying one of ``_USAGE_EXIT`` (bad input),
         ``_FAILURE_EXIT`` (the run failed), ``_INTERNAL_EXIT`` (a phasesweep

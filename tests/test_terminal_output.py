@@ -14,6 +14,7 @@ import pytest
 
 from phasesweep.config.models import Experiment
 from phasesweep.config.search import CategoricalParam, Sampler
+from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.selection import PhaseTrialsFailedError
 from tests.conftest import (
     console_script,
@@ -213,6 +214,36 @@ def test_a_run_with_nothing_to_run_still_names_the_command_that_reads_the_result
     after = lines[closing + 1 :]
     assert after[after.index("") + 1] == next_line
     assert after[after.index("") + 2].startswith("log: ")
+
+
+@pytest.mark.integration
+def test_a_run_started_with_stderr_closed_publishes_without_writing_to_stdout(
+    tmp_path: Path,
+) -> None:
+    """Closing stderr at launch preserves publication and keeps stdout empty."""
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=write_constant_trainer(tmp_path), n_trials=1, gpu_policy="none"
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    # Close the descriptor before exec so the CLI starts with sys.stderr unset.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os, sys; os.close(2); os.execv(sys.argv[1], sys.argv[1:])",
+            str(console_script("phasesweep")),
+            "run",
+            str(config),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+    assert _resolve_publication_pointer(experiment).state == "ok"
 
 
 # Makes the pseudo-terminal its controlling terminal and standard streams, sets SIGHUP's
