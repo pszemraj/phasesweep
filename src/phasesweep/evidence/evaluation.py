@@ -108,7 +108,12 @@ def attempt_file(trial_dir: Path, relative: str | Path) -> Path:
     :return Path: ``trial_dir / relative``, unchanged, for the caller to read.
     """
     path = trial_dir / relative
-    resolved = path.resolve()
+    try:
+        resolved = path.resolve()
+    except RuntimeError:
+        # A symlink loop, which raises here before Python 3.13. It names no file, so the
+        # caller's own not-found handling reports it, as on later versions.
+        return path
     if not resolved.is_relative_to(trial_dir.resolve()):
         raise OutsideAttemptError(
             f"`{relative}` in attempt directory {trial_dir} resolves to {resolved}, outside the "

@@ -231,6 +231,20 @@ def test_every_extractor_refuses_a_file_outside_the_attempt(
     assert str(refused.value) == _refusal(relative, attempt, outside)
 
 
+@pytest.mark.parametrize("cfg", _OUTSIDE_EXTRACTORS)
+def test_an_evidence_link_that_loops_fails_the_trial(
+    tmp_path: Path, cfg: ObjectiveExtractor
+) -> None:
+    """A link that points at itself is an evidence failure on every supported Python."""
+    relative = "stdout.log" if isinstance(cfg, LogRegexExtractor) else "result.json"
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    (attempt / relative).symlink_to(relative)
+
+    with pytest.raises(ExtractorError):
+        run_extractor(make_trial_context(attempt), cfg)
+
+
 @pytest.mark.parametrize(
     "gate",
     [
