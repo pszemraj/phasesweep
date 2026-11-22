@@ -1,9 +1,11 @@
-"""Command help text, the ``validate`` phase count and the quiet exit on a closed output pipe."""
+"""Command help text, the ``validate`` phase count, the quiet exit on a closed output pipe and the exit on a full output device."""
 
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -13,7 +15,7 @@ from click.testing import CliRunner
 from phasesweep.cli import cli, main
 from phasesweep.config.models import Phase
 from phasesweep.config.search import IntParam
-from tests.conftest import make_experiment, write_experiment_config
+from tests.conftest import console_script, make_experiment, write_experiment_config
 
 
 def test_top_level_help_shows_the_whole_sync_tracking_summary() -> None:
@@ -91,3 +93,26 @@ def test_a_closed_output_pipe_ends_quietly_with_the_commands_own_status(
 
     assert raised.value.code == 0
     assert capsys.readouterr().err == ""
+
+
+@pytest.mark.skipif(not Path("/dev/full").exists(), reason="needs /dev/full")
+def test_a_full_output_device_fails_the_command_once_with_status_1(tmp_path: Path) -> None:
+    """Output to a full device ends the command with the OS error and status 1, and nothing at exit.
+
+    The interpreter's last flush of the text the failed write left behind reports nothing more,
+    so the status stays the command's own instead of 120.
+    """
+    with Path("/dev/full").open("w") as full:
+        result = subprocess.run(
+            [str(console_script("phasesweep")), "explain", "--notes"],
+            stdout=full,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=tmp_path,
+            check=False,
+        )
+
+    assert (result.returncode, result.stderr) == (
+        1,
+        f"phasesweep: operational error: {OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))}\n",
+    )

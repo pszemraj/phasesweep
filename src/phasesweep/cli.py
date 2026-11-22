@@ -246,32 +246,42 @@ def _print_operational_error(exc: PhaseSweepError) -> None:
     click.echo("\n".join(lines), err=True)
 
 
-#: Write errors that mean nobody can read the stream any more: a pipe whose reader exited
-#: (``EPIPE``) and a terminal that hung up, as a dropped SSH session's does (``EIO``).
-_READER_GONE = frozenset({errno.EPIPE, errno.EIO})
-
-
 class _StandardStreamFile(io.FileIO):
-    """A standard stream's descriptor that discards what its gone reader can no longer receive.
+    """A standard stream's descriptor that discards what can no longer be written.
 
-    The write reports success, so the command carries on, no text stays buffered for
-    interpreter shutdown to fail on (which would turn any exit status into 120), and Click's
-    own handling of a broken pipe, which ends a command with status 1, is never reached.
+    Text for a gone reader is dropped as if written, so the command carries on, no text stays
+    buffered for interpreter shutdown to fail on (which would turn any exit status into 120),
+    and Click's own handling of a broken pipe, which ends a command with status 1, is never
+    reached. Any other write error, such as a full disk, is raised once, so the command ends
+    with it as an operational error and status 1; the stream then drops what it is given, so
+    the flush at interpreter exit neither reports the lost text again nor changes that status.
     """
 
+    #: Write errors that mean nobody can read the stream any more: a pipe whose reader exited
+    #: (``EPIPE``) and a terminal that hung up, as a dropped SSH session's does (``EIO``). A
+    #: class attribute, because a stream is flushed as it is destroyed at interpreter exit,
+    #: after module globals are cleared.
+    _READER_GONE = frozenset({errno.EPIPE, errno.EIO})
+
+    #: Set once a write error other than a gone reader has been raised.
+    _failed: bool = False
+
     def write(self, data: ReadableBuffer, /) -> int:
-        """Write ``data``, or drop it when the stream's reader is gone.
+        """Write ``data``, or drop it when the reader is gone or an earlier write failed.
 
         :param ReadableBuffer data: Encoded text from the stream's buffer.
-        :raises OSError: A write failure other than a gone reader, such as a full disk.
+        :raises OSError: The first write failure other than a gone reader, such as a full disk.
         :return int: The number of bytes the descriptor took, all of them when dropped.
         """
+        if self._failed:
+            return memoryview(data).nbytes
         try:
             return super().write(data)
         except OSError as exc:
-            if exc.errno not in _READER_GONE:
-                raise
-            return memoryview(data).nbytes
+            if exc.errno in self._READER_GONE:
+                return memoryview(data).nbytes
+            self._failed = True
+            raise
 
 
 def _discard_unreadable_output(stream: TextIO | None) -> TextIO | None:
