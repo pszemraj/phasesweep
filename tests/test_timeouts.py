@@ -16,7 +16,7 @@ from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.artifacts import _load_winner
-from phasesweep.engine.errors import WinnerIntegrityError
+from phasesweep.engine.errors import WinnerIntegrityError, phase_timeout
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.read import read_status
@@ -134,6 +134,20 @@ def test_wallclock_timeout_refuses_incomplete_winner(tmp_path: Path, guard: str)
         else "run guard",
     ):
         run_experiment(exp)
+
+
+@pytest.mark.parametrize(
+    ("scope", "key"), [("run", "timeout_seconds_per_run"), (None, "timeout_seconds_per_phase")]
+)
+def test_the_timeout_step_names_the_key_and_not_where_it_was_set(
+    tmp_path: Path, scope: str | None, key: str
+) -> None:
+    """The step stays true for a budget that came from ``--set``: it names the key, not the config."""
+    exp = _sleeping_score_experiment(tmp_path, experiment="timeout_step")
+
+    refused = phase_timeout("deadline", scope=scope, experiment=exp)
+
+    assert (refused.remediation or "").startswith(f"Raise {key} and rerun; ")
 
 
 @pytest.mark.integration

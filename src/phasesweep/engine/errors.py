@@ -160,9 +160,10 @@ def phase_timeout(message: str, *, scope: str | None, experiment: Experiment) ->
     :return PhaseTimeoutError: Routed timeout shared by CLI, run logs, and MCP failures.
     """
     key = "timeout_seconds_per_run" if scope == "run" else "timeout_seconds_per_phase"
-    # The step names no `--set`: an MCP launch has none, and a CLI rerun is the same command.
+    # The step names neither the config nor `--set`: an MCP launch has no `--set`, and a CLI
+    # rerun carries the override that set the key.
     kept = PERSISTENT_STUDY_KEEPS_TRIALS if experiment.persistent else STORAGE_NULL_KEEPS_NOTHING
-    return PhaseTimeoutError(message, remediation=f"Raise {key} in the config and rerun; {kept}.")
+    return PhaseTimeoutError(message, remediation=f"Raise {key} and rerun; {kept}.")
 
 
 class TrialTargetRefusedError(PhaseSweepError):
