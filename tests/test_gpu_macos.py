@@ -76,7 +76,11 @@ def test_macos_refuses_explicit_cuda_device_lists() -> None:
         GpuPool.create(n_jobs=1, explicit_ids=[0])
     with pytest.raises(GpuConfigurationError, match="unavailable on macOS") as devices_refused:
         GpuPool.create(n_jobs=1, explicit_devices=["GPU-example"])
-    assert operator_step(ids_refused.value) == operator_step(devices_refused.value) == "Omit them."
+    assert (
+        operator_step(ids_refused.value)
+        == operator_step(devices_refused.value)
+        == "Remove gpu_ids and gpu_devices from the phase."
+    )
 
 
 def test_mps_none_policy_does_not_take_a_host_lease(

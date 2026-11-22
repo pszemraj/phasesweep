@@ -164,7 +164,10 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
                 raise ExperimentLockBusyError(
                     f"Another phasesweep process holds the lock experiment "
                     f"{experiment.experiment!r} needs (lock file: {path}).",
-                    remediation="Wait for it to finish, then retry.",
+                    remediation=(
+                        "Wait for the process that holds this experiment's lock to finish, "
+                        "then retry."
+                    ),
                 )
             handles.append(handle)
         yield

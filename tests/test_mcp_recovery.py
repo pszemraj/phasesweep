@@ -605,7 +605,9 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
 
     assert result.exit_code != 0
     assert "Another phasesweep process" in result.output
-    assert "Wait for it to finish, then retry." in result.output
+    assert "Wait for the process that holds this experiment's lock" in " ".join(
+        result.output.split()
+    )
     assert "only if the user wants it stopped" not in result.output
     assert "MCP cannot cancel a CLI operation" not in result.output
     assert "start a new run" not in result.output

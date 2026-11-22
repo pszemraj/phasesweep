@@ -530,7 +530,7 @@ class GpuPool:
             if explicit_ids is not None or explicit_devices is not None:
                 raise GpuConfigurationError(
                     "gpu_ids and gpu_devices are unavailable on macOS.",
-                    remediation="Omit them.",
+                    remediation="Remove gpu_ids and gpu_devices from the phase.",
                 )
             if platform.machine().lower() in {"arm64", "aarch64"}:
                 devices = [GpuDevice("mps")]

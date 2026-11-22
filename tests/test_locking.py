@@ -52,7 +52,9 @@ def test_busy_probe_observes_run_locks_without_creating_paths(
         assert {path: path.read_bytes() for path in home.rglob("*") if path.is_file()} == before
         with pytest.raises(ExperimentLockBusyError) as busy, _experiment_lock(experiment):
             pytest.fail("the probe released the live operation's locks")
-        assert "Wait for it to finish, then retry" in str(busy.value.remediation)
+        assert busy.value.remediation == (
+            "Wait for the process that holds this experiment's lock to finish, then retry."
+        )
         assert "MCP" not in str(busy.value.remediation)
         assert "only if the user" not in str(busy.value.remediation)
     assert not experiment_is_busy(experiment)
@@ -110,7 +112,9 @@ def test_run_lock_held_past_the_retry_window_is_refused_as_busy(tmp_path: Path) 
         f"Another phasesweep process holds the lock experiment {experiment.experiment!r} needs "
         f"(lock file: {path})."
     )
-    assert busy.value.remediation == "Wait for it to finish, then retry."
+    assert busy.value.remediation == (
+        "Wait for the process that holds this experiment's lock to finish, then retry."
+    )
 
 
 @pytest.mark.parametrize(
