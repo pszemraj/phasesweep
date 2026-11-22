@@ -248,6 +248,7 @@ The principal test groups and what each covers:
 - TODO(tests): Mark the older tests whose call phase takes a second or more as `integration`, among them families in `tests/test_repeats_runtime.py`, `tests/test_grid_failure_retry.py`, `tests/test_fixed_configuration_retry.py` and `tests/test_mlflow_terminal_delivery.py`.
 - TODO(tracking): Distinguish unstaged or blocked terminal outcomes from an empty queue in `status`. A saved delivery count alone cannot represent either case, and a lock-free `status` cannot rederive them.
 - TODO(tracking): Recover the terminal verdict for a managed attempt whose binding appears after an in-memory generation has published. A published generation can contain both successful and failed trials.
+- TODO(tracking): Bound a managed attempt's MLflow run creation to one `timeout_seconds` during an outage. The create call times out and the reconciling search then spends a second full budget (`tracking/session.py`), so each trial that fails this way waits twice the configured timeout.
 
 ## Declined requests
 
