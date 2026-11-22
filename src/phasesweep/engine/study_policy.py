@@ -70,6 +70,7 @@ from phasesweep.errors import (
     RERUN_CLEANUP_RECOVERY,
     OperatorAction,
     format_mismatch,
+    restore_or_new_study,
     short_digest,
     timeout_step,
     unreadable_objective_step,
@@ -396,7 +397,8 @@ def _validate_study_direction(
 
     :param optuna.Study study: Existing or newly created single-objective study.
     :param Literal goal: Direction required by the experiment metric.
-    :raises StudySchemaMismatchError: The stored direction does not match ``goal``.
+    :raises StudySchemaMismatchError: The stored direction does not match ``goal``; the step
+        restores ``metric.goal`` to the stored direction when the study has one.
     """
     expected = (
         optuna.study.StudyDirection.MINIMIZE
@@ -406,9 +408,12 @@ def _validate_study_direction(
     if study.directions == [expected]:
         return
     stored = ", ".join(direction.name.lower() for direction in study.directions)
+    # Only a single-objective study's direction is one PhaseSweep can write back as metric.goal.
+    restorable = len(study.directions) == 1 and stored in ("minimize", "maximize")
     raise StudySchemaMismatchError(
         f"Study {study.study_name!r} optimizes {stored or 'no direction'}, but the config "
-        f"requires {goal}."
+        f"requires {goal}.",
+        remediation=restore_or_new_study(f"`metric.goal: {stored}`") if restorable else None,
     )
 
 
@@ -1258,18 +1263,23 @@ def _require_launch_target(experiment: Experiment, *, path: str | None = None) -
     :raises LaunchEnvironmentError: The trainer directory or plain program is known
         to be unavailable.
     """
+    # MCP shows a step without the diagnosis, so each step names its directory itself.
     try:
+        trainer_cwd = experiment.execution.resolved_cwd()
         missing = _missing_trainer_cwd(experiment)
         if missing is not None:
             raise LaunchEnvironmentError(
                 missing,
-                remediation="Create that directory, or set execution.cwd to an existing one.",
+                remediation=(
+                    f"Create {trainer_cwd}, or set execution.cwd to an existing directory."
+                ),
             )
-        cwd = experiment.execution.resolved_cwd() or Path.cwd()
+        cwd = trainer_cwd or Path.cwd()
     except PermissionError as exc:
+        where = exc.filename or "the trainer directory"
         raise LaunchEnvironmentError(
             f"Cannot access the trainer directory: {exc}.",
-            remediation="Restore access to the directory.",
+            remediation=f"Restore access to {where}.",
         ) from exc
     except OSError:
         return
@@ -1336,7 +1346,7 @@ def _trial_program_refusal(
         )
         return (
             f"The trial command's program {where}, which is not an executable file.",
-            "Correct the path in trial_command or make the file executable.",
+            f"Correct {program!r} in trial_command, or make {resolved} an executable file.",
         )
     if path is None:
         return None
@@ -1351,9 +1361,10 @@ def _trial_program_refusal(
         if path_from_config
         else "the PATH PhaseSweep is launched with"
     )
+    # MCP shows the step without the diagnosis, so the step names the program itself.
     return (
         f"The trial command's program {program!r} is not on the trainer's PATH.",
-        f"Put it on {source}.",
+        f"Put {program!r} on {source}.",
     )
 
 
@@ -1362,8 +1373,8 @@ def _launch_preflight(
 ) -> EnvironmentIdentity:
     """Refuse a phase launch whose trials could not start, before any trial is allocated.
 
-    The cohort check comes first, so a changed ``PATH`` reads as a cohort refusal that shows
-    the old and new values, not as a missing program.
+    The cohort check comes first, so a changed ``PATH`` reads as a cohort refusal that names
+    the entries that differ, not as a missing program.
 
     :param Experiment experiment: Experiment supplying the trainer environment, working
         directory and trial command.

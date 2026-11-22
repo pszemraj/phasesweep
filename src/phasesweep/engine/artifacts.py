@@ -371,17 +371,17 @@ def _load_winner(
     current_fp = fingerprint_ops._phase_fingerprint(experiment, phase, inherited_winners)
     stored_fp = data["phase_fingerprint"]
     if stored_fp != current_fp:
-        # A winner file records only the hash, so the refusal can name no changed key.
+        # A winner file records only the hash, so the refusal can name no changed key. MCP shows
+        # the step without the message, so the step names the winner it means.
+        produced = f"the config that produced the winner of `{phase.name}`"
         raise StudyFingerprintMismatchError(
             f"Winner file {path} was produced by a different config (stored fingerprint "
             f"{short_digest(stored_fp)} != current {short_digest(current_fp)}).",
             action=OperatorAction.FIX_CONFIG,
             remediation=(
-                fingerprint_ops.restore_or_rename_step(
-                    experiment, phase, recorded="the config that produced it"
-                )
+                fingerprint_ops.restore_or_rename_step(experiment, phase, recorded=produced)
                 if experiment.persistent
-                else f"Restore the config that produced it, or run {_WITHOUT_FROM_PHASE_IN_MEMORY}."
+                else f"Restore {produced}, or run {_WITHOUT_FROM_PHASE_IN_MEMORY}."
             ),
         )
 

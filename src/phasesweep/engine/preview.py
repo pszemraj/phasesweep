@@ -171,7 +171,8 @@ def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
             "dry run cannot count its trials.",
             action=OperatorAction.RUN_RECOVER_RUN,
             remediation=(
-                "Run `phasesweep run` with the same config, without --dry-run, to recover it."
+                "Run `phasesweep run` with the same config, without --dry-run, to recover the "
+                f"pending trial of `{phase.name}`."
             ),
         )
     recovered_as_failed = recovered.count("FAIL")

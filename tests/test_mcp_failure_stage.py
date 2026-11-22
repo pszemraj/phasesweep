@@ -87,12 +87,12 @@ def test_fingerprint_refusal_on_an_existing_tree_reports_preflight(
     [
         pytest.param(
             "program_missing",
-            "Put it on the PATH PhaseSweep is launched with.",
+            "Put 'phasesweep-no-such-trainer' on the PATH PhaseSweep is launched with.",
             id="program_missing",
         ),
         pytest.param(
             "trainer_cwd_missing",
-            "Create that directory, or set execution.cwd to an existing one.",
+            "Create {gone}, or set execution.cwd to an existing directory.",
             id="trainer_cwd_missing",
         ),
     ],
@@ -123,8 +123,8 @@ def test_a_refused_launch_environment_reports_its_own_code_and_fix(
         "retryable": False,
         "actor": "operator",
         "remediation": (
-            f"Ask the operator: {remediation} Details: `logs/refused.log` under the catalog's "
-            "`state_dir`."
+            f"Ask the operator: {remediation.format(gone=(tmp_path / 'gone').resolve())} "
+            "Details: `logs/refused.log` under the catalog's `state_dir`."
         ),
     }
 

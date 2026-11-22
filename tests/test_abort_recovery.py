@@ -184,7 +184,10 @@ def test_evidence_pending_preview_routes_to_resume(tmp_path: Path) -> None:
     error = caught.value
     assert error.action is OperatorAction.RUN_RECOVER_RUN
     advice = operator_step(error)
-    assert "`phasesweep run` with the same config, without --dry-run" in advice
+    assert advice == (
+        "Run `phasesweep run` with the same config, without --dry-run, to recover the pending "
+        "trial of `p`."
+    )
     assert "correct the experiment configuration" not in _operational_error_text(error)
     assert _operational_error_text(error).count(advice) == 1
     failure = mcp_runner._terminal_failure_payload(

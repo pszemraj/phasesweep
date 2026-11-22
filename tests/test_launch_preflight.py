@@ -80,7 +80,7 @@ def test_program_missing_from_the_path_is_refused_with_the_path_to_put_it_on(
     assert refusal is not None
     message, remediation = refusal
     assert message == f"The trial command's program {_MISSING!r} is not on the trainer's PATH."
-    assert remediation == "Put it on the PATH PhaseSweep is launched with."
+    assert remediation == f"Put {_MISSING!r} on the PATH PhaseSweep is launched with."
 
 
 def test_program_missing_from_a_path_the_config_sets_is_sent_to_the_config(tmp_path: Path) -> None:
@@ -90,7 +90,7 @@ def test_program_missing_from_a_path_the_config_sets_is_sent_to_the_config(tmp_p
     )
 
     assert refusal is not None
-    assert refusal[1] == "Put it on the PATH the config's `env` sets."
+    assert refusal[1] == f"Put {_MISSING!r} on the PATH the config's `env` sets."
 
 
 def test_relative_path_entry_resolves_against_the_trainer_directory(tmp_path: Path) -> None:
@@ -218,7 +218,7 @@ def test_fresh_tree_refuses_a_missing_program_before_creating_anything(tmp_path:
 
     assert type(caught.value) is LaunchEnvironmentError
     assert caught.value.action is OperatorAction.FIX_CONFIG
-    assert caught.value.remediation == "Put it on the PATH PhaseSweep is launched with."
+    assert caught.value.remediation == f"Put {_MISSING!r} on the PATH PhaseSweep is launched with."
     assert not _artifact_root_binding_path(experiment).exists()
     assert not (tmp_path / "studies.journal").exists()
 
@@ -235,9 +235,8 @@ def test_fresh_tree_refuses_a_missing_trainer_directory_before_creating_anything
         run_experiment(experiment)
 
     assert caught.value.action is OperatorAction.FIX_CONFIG
-    assert (
-        caught.value.remediation
-        == "Create that directory, or set execution.cwd to an existing one."
+    assert caught.value.remediation == (
+        f"Create {(tmp_path / 'gone').resolve()}, or set execution.cwd to an existing directory."
     )
     assert not _artifact_root_binding_path(experiment).exists()
 

@@ -1094,9 +1094,12 @@ def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path
     )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
 
-    with pytest.raises(StudySchemaMismatchError, match="config requires maximize"):
+    with pytest.raises(StudySchemaMismatchError, match="config requires maximize") as caught:
         run_experiment(experiment)
 
+    assert caught.value.remediation == (
+        "Restore `metric.goal: minimize`, or set a new `experiment` name to start a fresh study."
+    )
     assert study.get_trials(deepcopy=False) == []
 
 
@@ -1613,7 +1616,9 @@ def test_from_phase_rejects_stale_parent_winner(
         run_experiment(exp_v2, from_phase="lr")
     assert type(excinfo.value) is StudyFingerprintMismatchError
     assert excinfo.value.action is OperatorAction.FIX_CONFIG
-    assert operator_step(excinfo.value).startswith("Restore the config that produced it, or run ")
+    assert operator_step(excinfo.value).startswith(
+        "Restore the config that produced the winner of `arch`, or run "
+    )
     assert "Re-run phase" not in str(excinfo.value)
 
 

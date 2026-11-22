@@ -138,13 +138,14 @@ def test_from_phase_after_a_changed_parent_names_the_step_its_storage_allows(
     assert refused.value.action is OperatorAction.FIX_CONFIG
     if persistent:
         assert message.endswith(
-            "fix: Restore the config that produced it, or give `parent` and `child` new names "
-            "and update the `inherits` that name them, which runs them again from scratch."
+            "fix: Restore the config that produced the winner of `parent`, or give `parent` and "
+            "`child` new names and update the `inherits` that name them, which runs them again "
+            "from scratch."
         )
     else:
         assert message.endswith(
-            "fix: Restore the config that produced it, or run without --from-phase to start "
-            "every phase again."
+            "fix: Restore the config that produced the winner of `parent`, or run without "
+            "--from-phase to start every phase again."
         )
 
 
