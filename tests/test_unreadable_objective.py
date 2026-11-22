@@ -5,18 +5,23 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import optuna
 import pytest
 
 from phasesweep import run_experiment
 from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler
-from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
-from phasesweep.engine.state import FAILURE_REASON_ATTR, METRIC_EXTRACTOR_LABEL
+from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.state import METRIC_EXTRACTOR_LABEL
 from phasesweep.evidence.evaluation import ExtractorError, run_extractor
 from phasesweep.evidence.models import JsonEnvelopeExtractor, JsonExtractor
-from tests.conftest import make_experiment, make_trial_context, phase_trials, write_trainer
+from tests.conftest import (
+    make_experiment,
+    make_trial_context,
+    no_winner_remedy,
+    phase_trials,
+    write_trainer,
+)
 
 _UNREADABLE = "A trainer ran but its objective could not be read"
 _KEY_MISSING = f"{METRIC_EXTRACTOR_LABEL}: Key 'lossz' not found in r.json (failed at 'lossz')."
@@ -25,18 +30,7 @@ _KEY_MISSING = f"{METRIC_EXTRACTOR_LABEL}: Key 'lossz' not found in r.json (fail
 def _remedy(tmp_path: Path, reasons: list[str], *, persistent: bool) -> str:
     """Return the remedy an experiment gives when every trial of phase ``p`` failed with ``reasons``."""
     experiment = make_experiment(persistent=tmp_path if persistent else None, n_trials=len(reasons))
-    study = optuna.create_study()
-    for reason in reasons:
-        study.add_trial(
-            optuna.trial.create_trial(
-                state=optuna.trial.TrialState.FAIL, user_attrs={FAILURE_REASON_ATTR: reason}
-            )
-        )
-    with pytest.raises(NoFeasibleTrialError) as refused:
-        select_winner(study, experiment, phase_name="p")
-    remedy = refused.value.remediation
-    assert remedy is not None
-    return remedy
+    return no_winner_remedy(experiment, list(reasons))
 
 
 def test_an_unreadable_objective_says_which_fix_continues_the_study_and_which_starts_one(

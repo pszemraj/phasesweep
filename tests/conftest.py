@@ -50,8 +50,10 @@ from phasesweep.engine.confound import CONFOUND_SCHEMA_VERSION
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
 from phasesweep.engine.paths import _last_successful_generation_path, _run_log_path
+from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
+    FAILURE_REASON_ATTR,
     FEASIBLE_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
@@ -416,6 +418,37 @@ def phase_trials(experiment: Experiment, phase_name: str = "p") -> list[optuna.t
     :return list[optuna.trial.FrozenTrial]: Its trials in number order.
     """
     return phase_study(experiment, phase_name).get_trials(deepcopy=False)
+
+
+def no_winner_remedy(
+    experiment: Experiment,
+    reasons: list[str | None],
+    *,
+    phase_name: str = "p",
+    grid: bool = False,
+) -> str:
+    """Return the step selection gives when every trial of a phase failed with ``reasons``.
+
+    :param Experiment experiment: Experiment that holds the phase.
+    :param list[str | None] reasons: One failure reason per failed trial; ``None`` records none.
+    :param str phase_name: Phase whose trials failed.
+    :param bool grid: Give each trial its own grid point, as the grid sampler assigns them.
+    :return str: The remediation of the refusal selection raises.
+    """
+    study = optuna.create_study()
+    for index, reason in enumerate(reasons):
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=optuna.trial.TrialState.FAIL,
+                user_attrs={} if reason is None else {FAILURE_REASON_ATTR: reason},
+                system_attrs={"grid_id": index} if grid else {},
+            )
+        )
+    with pytest.raises(NoFeasibleTrialError) as refused:
+        select_winner(study, experiment, phase_name=phase_name)
+    remedy = refused.value.remediation
+    assert remedy is not None
+    return remedy
 
 
 def record_accepted_partial_timeout(study: optuna.Study, target: int) -> None:

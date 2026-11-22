@@ -15,7 +15,6 @@ from phasesweep.engine.repeats import RepeatAxis
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
-    FAILURE_REASON_ATTR,
     FEASIBLE_ATTR,
     GATES_ATTR,
     GENERATION_ID_ATTR,
@@ -29,7 +28,7 @@ from phasesweep.engine.state import (
 from phasesweep.evidence.models import JsonExtractor
 from phasesweep.runtime.process import TIMEOUT_REASON_PREFIX
 from phasesweep.runtime.terminal import display_path
-from tests.conftest import log_regex_provenance, make_experiment, trial_outcome
+from tests.conftest import log_regex_provenance, make_experiment, no_winner_remedy, trial_outcome
 
 # Allocation writes both attrs on every trial before its trainer runs.
 _ALLOCATION_ATTRS = {TRAINER_ENV_DIGEST_ATTR: "a" * 64, TRAINER_INPUT_ATTR: {"schema_version": 1}}
@@ -522,23 +521,6 @@ def test_crashed_trials_remedy_names_the_next_attempt_budget(
         assert "raise" not in remedy
 
 
-def _failed_study(reasons: list[str | None], *, grid: bool = False) -> optuna.Study:
-    """Build a study whose trials all failed, each recording the given failure reason.
-
-    With ``grid``, each trial holds its own grid point, as the grid sampler assigns them.
-    """
-    study = optuna.create_study()
-    for index, reason in enumerate(reasons):
-        study.add_trial(
-            optuna.trial.create_trial(
-                state=optuna.trial.TrialState.FAIL,
-                user_attrs={} if reason is None else {FAILURE_REASON_ATTR: reason},
-                system_attrs={"grid_id": index} if grid else {},
-            )
-        )
-    return study
-
-
 def _crashed_remedy(
     tmp_path: Path, phase: Phase, reasons: list[str | None], *, inheriting: Phase | None = None
 ) -> str:
@@ -547,13 +529,12 @@ def _crashed_remedy(
     :param Phase | None inheriting: A later phase that inherits ``phase``, if the experiment has one.
     """
     phases = [phase] if inheriting is None else [phase, inheriting]
-    experiment = make_experiment(persistent=tmp_path, phases=phases)
-    study = _failed_study(reasons, grid=phase.sampler.type == "grid")
-    with pytest.raises(NoFeasibleTrialError) as refused:
-        select_winner(study, experiment, phase_name=phase.name)
-    remedy = refused.value.remediation
-    assert remedy is not None
-    return remedy
+    return no_winner_remedy(
+        make_experiment(persistent=tmp_path, phases=phases),
+        reasons,
+        phase_name=phase.name,
+        grid=phase.sampler.type == "grid",
+    )
 
 
 def _sampled_phase(sampler: Sampler, *, n_trials: int = 2) -> Phase:
