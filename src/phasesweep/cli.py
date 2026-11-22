@@ -353,7 +353,9 @@ def _error_boundary() -> None:
     :raises SystemExit: Always, with the status :func:`main` documents.
     """
     try:
-        status = cli.main(standalone_mode=False)
+        # Click would take the program name from sys.argv[0], which is not "phasesweep"
+        # when the CLI is launched as a module or from a test runner.
+        status = cli.main(prog_name="phasesweep", standalone_mode=False)
     except click.ClickException as exc:
         # Includes UsageError, which already carries exit code 2.
         if (
