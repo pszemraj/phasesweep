@@ -10,11 +10,13 @@ from pathlib import Path
 import pytest
 
 from phasesweep.mcp.errors import (
+    NEW_RUN_RESUMES,
     ConcurrencyLimitError,
     ExperimentBusyError,
     McpToolError,
     RunCapacityUnknownError,
     RunNamespaceMismatchError,
+    check_catalog_command,
 )
 from phasesweep.mcp.failures import response_failure
 from phasesweep.mcp.runner import FailurePayload, _cleanup_uncertain_payload
@@ -191,8 +193,25 @@ def test_every_refusal_that_names_recover_run_gives_the_whole_command(
     text = str(refusal)
 
     assert "phasesweep mcp recover-run --state-dir STATE_DIR --run-id " in text
-    assert "the catalog's `state_dir` as STATE_DIR" in text
+    assert "STATE_DIR is the catalog's `state_dir`" in text
     assert BARE_RECOVER_RUN.search(text) is None
+
+
+def test_a_blocker_in_another_namespace_ends_with_a_whole_recover_run_step() -> None:
+    """The capacity refusal for a blocker in another PID namespace ends with the step, with no dangling "for it"."""
+    text = str(ConcurrencyLimitError(1, 1, [RUN_ID], unobservable_run_ids=[RUN_ID]))
+
+    assert text.endswith("then repeat it with `--confirm`.")
+    assert " for it" not in text
+
+
+def test_the_operators_catalog_check_command_quotes_a_path_for_the_shell() -> None:
+    """A catalog path with a space is one word of the command the operator pastes."""
+    assert (
+        check_catalog_command("/etc/my catalog.yaml")
+        == "phasesweep mcp check --catalog '/etc/my catalog.yaml'"
+    )
+    assert check_catalog_command() == "phasesweep mcp check --catalog CATALOG"
 
 
 def test_a_recovered_cleanup_failure_without_a_snapshot_keeps_one_level_of_cause(
@@ -247,10 +266,7 @@ def test_a_run_that_ended_without_status_says_a_new_run_resumes(tmp_path: Path, 
     assert run["failure"]["code"] == "result_snapshot_unavailable"
     remediation = run["failure"]["remediation"]
     assert "This run recorded no results" in remediation
-    assert (
-        "a new run of this experiment keeps its finished trials and reruns its interrupted "
-        "ones first" in remediation
-    )
+    assert NEW_RUN_RESUMES in remediation
     assert "substitute" not in remediation
 
 
@@ -274,6 +290,6 @@ def test_recover_run_tells_a_wrong_state_dir_how_a_relative_one_resolves(tmp_pat
     assert result.exit_code != 0
     assert "not an existing MCP state directory" in result.output
     assert (
-        "fix: Pass that `state_dir` as an absolute path: a relative one in the catalog resolves "
-        "against the catalog's directory, not the shell's."
+        "fix: Pass the catalog's `state_dir` as an absolute path (a relative one resolves "
+        "against the catalog's directory)."
     ) in " ".join(result.output.split())

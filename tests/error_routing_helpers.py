@@ -170,7 +170,7 @@ _STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(
         OperatorAction.PROVISION_LOCK_DIR: "point PHASESWEEP_LOCK_DIR at an existing writable",
         OperatorAction.RUN_RECOVER_RUN: "recover-run",
         OperatorAction.FIX_CONFIG: "correct the experiment configuration",
-        OperatorAction.INSPECT_LOGS: "inspect this run's log",
+        OperatorAction.INSPECT_LOGS: "inspect `logs/",
     }
 )
 
@@ -200,7 +200,7 @@ def assert_payload_follows(failure: Mapping[str, object], routed: list[OperatorA
     assert not [marker for marker in unrouted if marker in remediation], remediation
     # A step whose specifics are in the message points at the run log holding it.
     self_contained = {OperatorAction.RUN_RECOVER_RUN, OperatorAction.INSPECT_LOGS}
-    points_at_log = remediation.endswith("under the catalog's `state_dir`, gives the details.")
+    points_at_log = " Details: `logs/" in remediation
     assert points_at_log is not self_contained.issuperset(steps), remediation
 
 

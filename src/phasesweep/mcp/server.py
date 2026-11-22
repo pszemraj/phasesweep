@@ -1195,9 +1195,8 @@ def call(catalog: Path, tool: str, arguments: JsonObject) -> int:
     if tool == TOOL_LAUNCH_RUN and not in_initial_pid_namespace():
         print(
             "phasesweep mcp call: warning: this process is not in the host's initial PID "
-            "namespace, so a runner launched from it ends when that namespace does, such as "
-            "when a sandboxed command finishes; launch from a shell outside any sandbox for "
-            "a run that must outlive it.",
+            "namespace, so a runner launched here ends when that namespace does. Launch from "
+            "a host shell for a run that must outlive it.",
             file=sys.stderr,
         )
 

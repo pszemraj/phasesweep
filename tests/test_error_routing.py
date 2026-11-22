@@ -1537,8 +1537,7 @@ def test_runner_payload_follows_the_routed_steps() -> None:
     assert composed["remediation"] == (
         "Ask the operator to restore or repair the storage ledger and access to it, and restore "
         "the files and permissions identified in the error, then run `phasesweep mcp "
-        "recover-run --state-dir STATE_DIR --run-id r0` from a host shell, with the catalog's "
-        "`state_dir` as STATE_DIR, read its preview and repeat it with `--confirm` before "
-        "another launch. The error in this run's log, `logs/r0.log` under the catalog's "
-        "`state_dir`, gives the details."
+        "recover-run --state-dir STATE_DIR --run-id r0` on the server host (STATE_DIR is the "
+        "catalog's `state_dir`), then repeat it with `--confirm` before another launch. "
+        "Details: `logs/r0.log` under the catalog's `state_dir`."
     )

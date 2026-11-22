@@ -72,6 +72,7 @@ from phasesweep.mcp.errors import (
     UnknownExperimentError,
     UnknownRunError,
     UnreadableRunRecordError,
+    check_catalog_command,
     live_runner_step,
     recover_run_step,
     runner_stop_step,
@@ -445,11 +446,10 @@ class PhaseSweepMCP:
                 refusal = _CatalogReloadRefusal.from_failures(reloaded.failures)
             if refusal != self._reload_refusal:
                 log.warning(
-                    "catalog reload refused; reads keep the entries already loaded and "
-                    "launches are refused until %s: %s",
+                    "catalog reload refused; launches are refused until %s: %s",
                     "the MCP server restarts"
                     if refusal.reason == "state_dir_changed"
-                    else f"`phasesweep mcp check --catalog {registry.catalog_path}` passes",
+                    else f"`{check_catalog_command(str(registry.catalog_path))}` passes",
                     refusal.detail,
                     exc_info=None if error is None or isinstance(error, CatalogError) else error,
                 )
@@ -1521,8 +1521,8 @@ class PhaseSweepMCP:
                                     identity.pid, identity.pgid, handle.run_id
                                 )
                                 failure["remediation"] = (
-                                    "Cancellation could not stop the runner; trial cleanup is "
-                                    "unconfirmed. Stop monitoring and ask the operator: "
+                                    "Cancellation could not stop the runner, so trial cleanup "
+                                    "is unconfirmed. Stop monitoring and ask the operator: "
                                     f"{live_step} Then {recover_run_step(handle.run_id)}."
                                 )
                         if observation.terminal_status is None:
@@ -1793,10 +1793,7 @@ class PhaseSweepMCP:
         # Require the inherited PID namespace before allocating pipes or spawning.
         pid_namespace = read_pid_namespace()
         if pid_namespace is None:
-            raise RuntimeError(
-                "cannot read this process's PID namespace; refused launch because later "
-                "cancellation could not tell whether the runner's PID is visible"
-            )
+            raise RuntimeError("cannot read this process's PID namespace; launch refused")
         config_snapshot_path = preparation.config_snapshot_path
         log_path = self._runs.log_path(run_id)
         status_path = self._runs.status_path(run_id)
@@ -1868,15 +1865,9 @@ class PhaseSweepMCP:
                 boot_id = read_boot_id()
                 handle = replace(handle, boot_id=boot_id)
                 if handle.pid_starttime is None:
-                    raise RuntimeError(
-                        "spawned runner has no process start time; refused launch because "
-                        "later cancellation could not distinguish PID reuse"
-                    )
+                    raise RuntimeError("spawned runner has no process start time; launch refused")
                 if handle.boot_id is None:
-                    raise RuntimeError(
-                        "spawned runner has no boot id; refused launch because later "
-                        "cancellation could not distinguish PID reuse after reboot"
-                    )
+                    raise RuntimeError("spawned runner has no boot id; launch refused")
                 readable = fd_ready(ready_read, timeout=_RUNNER_READY_TIMEOUT_SECONDS)
                 ready = os.read(ready_read, 1) if readable else b""
                 if ready == b"" and readable:

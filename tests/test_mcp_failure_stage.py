@@ -123,8 +123,8 @@ def test_a_refused_launch_environment_reports_its_own_code_and_fix(
         "retryable": False,
         "actor": "operator",
         "remediation": (
-            f"Ask the operator: {remediation} The error in this run's log, `logs/refused.log` "
-            "under the catalog's `state_dir`, gives the details."
+            f"Ask the operator: {remediation} Details: `logs/refused.log` under the catalog's "
+            "`state_dir`."
         ),
     }
 

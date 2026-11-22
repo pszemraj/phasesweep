@@ -99,10 +99,7 @@ _RUN_EVIDENCE_SUFFIXES = (
 _UNREADABLE_RUN = "run:"
 _UNREADABLE_HANDLE_FILE = "handle:"
 #: The operator's step for a state directory in another format, which nothing migrates.
-FRESH_STATE_DIR_STEP = (
-    "Point the catalog's `state_dir` at a new directory; the PhaseSweep version that wrote "
-    "this one still reads it."
-)
+FRESH_STATE_DIR_STEP = "Point the catalog's `state_dir` at a new directory."
 MCP_STATE_FORMAT_VERSION = 11
 CLEANUP_UNCERTAINTY_SCHEMA_VERSION = 1
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
@@ -534,18 +531,18 @@ class RunStore:
         """Build the actionable refusal for unmarked or unsupported MCP state.
 
         :param str detail: Specific format-boundary failure observed.
-        :return UnsupportedStateFormatError: Refusal that directs the operator to a safe path.
+        :return UnsupportedStateFormatError: Refusal naming the directory and the detail; the
+            caller adds :data:`FRESH_STATE_DIR_STEP`.
         """
         return UnsupportedStateFormatError(
-            f"MCP state directory {self._format_marker_path.parent} {detail}; "
-            "use a fresh MCP state directory."
+            f"MCP state directory {self._format_marker_path.parent}: {detail}."
         )
 
     def _marker_version_refusal(self, version: int) -> UnsupportedStateFormatError:
         """Build the refusal for a well-formed marker that declares another format.
 
         :param int version: Format the marker declares.
-        :return UnsupportedStateFormatError: Refusal naming both formats and the fresh-directory step.
+        :return UnsupportedStateFormatError: Refusal naming both formats.
         """
         return self._format_refusal(
             f"format marker declares format {version}; "

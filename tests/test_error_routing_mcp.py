@@ -383,7 +383,7 @@ CASES = (
         trigger=_recover_over_unmarked_state,
         raised=RunRecoveryError,
         action=OperatorAction.FRESH_NAMESPACE,
-        message="use a fresh MCP state directory",
+        message="durable run data has no format marker",
     ),
     RoutingCase(
         # Composed: a path with no run-store layout is a wrong argument, even
@@ -468,7 +468,7 @@ CASES = (
         trigger=_recover_unsettled_launch,
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
-        message="The run remains reserved.",
+        message="The run stays reserved",
     ),
     # recover-run raises every RunRecoveryError itself, so none may route back
     # to it by default; only a confirmed run's own remedy names it.
@@ -623,8 +623,8 @@ def test_surviving_runner_refusal_names_the_runner_and_the_host_step(
         assert "`runner.py --run-id wrap-recover` line of `pgrep -af wrap-recover`" in step
         assert "runner PID" not in step
     assert ("cancel_run" in step) is runner_is_live
-    assert "is still running on the host, clear the cause there" in step
-    assert "uninterruptible I/O ignores SIGKILL until the I/O ends" in step
+    assert "is still running on the host, clear what blocks SIGKILL" in step
+    assert "uninterruptible I/O ignores it" in step
     assert step in _operational_error_text(excinfo.value)
 
 

@@ -49,7 +49,7 @@ from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.state import ATTEMPT_ID_ATTR, GENERATION_ID_ATTR, TrialStateName
 from phasesweep.errors import OperatorAction, PhaseSweepError
-from phasesweep.mcp.errors import live_runner_step
+from phasesweep.mcp.errors import NEW_RUN_RESUMES, live_runner_step, sync_tracking_command
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
     FRESH_STATE_DIR_STEP,
@@ -73,6 +73,7 @@ from phasesweep.runtime.reaper import (
     kill_stale_group,
     read_boot_id,
 )
+from phasesweep.runtime.terminal import command_line
 from phasesweep.runtime.time import utc_now_iso
 
 
@@ -147,8 +148,8 @@ def recover_run(
             str(exc),
             action=OperatorAction.FIX_CONFIG,
             remediation=(
-                "Pass that `state_dir` as an absolute path: a relative one in the catalog "
-                "resolves against the catalog's directory, not the shell's."
+                "Pass the catalog's `state_dir` as an absolute path (a relative one resolves "
+                "against the catalog's directory)."
             ),
         ) from None
     except UnsafePrivatePathError as exc:
@@ -182,16 +183,12 @@ def recover_run(
         raise RunRecoveryError(
             f"the runner of {run_id} cannot be inspected from here: {view.reason}",
             action=OperatorAction.FIX_CONFIG,
-            remediation=(
-                "Run this command from a host shell outside any sandbox or container, where "
-                "the runner's processes are visible."
-            ),
+            remediation="Run this command from a host shell outside any sandbox or container.",
         )
     current_boot = read_boot_id()
     if needs.cleanup_needed and (identity.boot_id is None or current_boot is None):
         raise RunRecoveryError(
-            "runner boot id is unavailable; refusing automated process-group cleanup "
-            "because PID reuse after reboot cannot be ruled out"
+            "runner boot id is unavailable; refusing automated process-group cleanup"
         )
     _require_dead_runner(identity, run_id, view=view, cleanup_needed=needs.cleanup_needed)
     config = _load_recovery_config(store, handle)
@@ -271,7 +268,7 @@ def recover_run(
                 publication_summary,
                 emit=emit,
             )
-            from phasesweep.tracking.session import SYNC_TRACKING_STEP, DeliveryTally
+            from phasesweep.tracking.session import DeliveryTally
 
             tally: DeliveryTally | None = None
             if delivering:
@@ -308,8 +305,8 @@ def recover_run(
                 emit(
                     f"Reconciled {evidence.registered_attempts_reconciled} registered MLflow "
                     f"tracking operation(s) for {run_id} and terminated {evidence.terminated} "
-                    "live process group(s). The next launch with this config, or "
-                    f"{SYNC_TRACKING_STEP}, sends any records still pending."
+                    f"live process group(s). Send any records still pending with "
+                    f"`{sync_tracking_command()}`."
                 )
             if evidence.pending_evidence:
                 # Cleanup is proven, so recovery succeeds; the next run refuses until
@@ -331,16 +328,15 @@ def recover_run(
                     emit(f"MLflow: pending records could not be counted ({exc}).")
                 else:
                     done = delivered_text(tally.delivered, tally.settled)
-                    sent = f"MLflow: {done}" if done else ""
                     if counts.pending:
+                        pending = f"{count_text(counts.records, counts.creations)} pending"
+                        head = f"{done}; {pending}" if done else pending
                         emit(
-                            (f"{sent}. " if sent else "")
-                            + f"MLflow: {count_text(counts.records, counts.creations)} pending. "
-                            f"The next launch with this config, or {SYNC_TRACKING_STEP}, sends "
-                            "them; delivery never retrains." + refused_text(tally.refused)
+                            f"MLflow: {head}. Send them with `{sync_tracking_command()}`."
+                            + refused_text(tally.refused)
                         )
-                    elif sent:
-                        emit(f"{sent}; none stay pending.")
+                    elif done:
+                        emit(f"MLflow: {done}; none stay pending.")
     except RunRecoveryError:
         raise
     except (PhaseSweepError, OSError) as exc:
@@ -384,8 +380,7 @@ def _recover_pre_spawn_orphan(
                     log_action = f" Runner log already preserved at {archive_path}."
                 emit(
                     f"Recovery preflight for {run_id}: would remove the abandoned launch "
-                    "preparation after verifying no runner can still start a trainer under "
-                    f"this identity.{log_action} Re-run with --confirm to perform that action."
+                    f"preparation.{log_action} Re-run with --confirm to perform that action."
                 )
                 return
             try:
@@ -403,10 +398,7 @@ def _recover_pre_spawn_orphan(
     raise RunRecoveryError(
         f"unknown run id: {run_id}; pass a run id this MCP state directory records.",
         action=OperatorAction.FIX_CONFIG,
-        remediation=(
-            "Pass a run id the server returned for this catalog; the state directory holds "
-            "one `runs/<run-id>.json` file per run it records."
-        ),
+        remediation="Pass a run id the server returned for this catalog.",
     )
 
 
@@ -434,11 +426,9 @@ def _resolve_launch_state(
                 terminal_status = refreshed_status
         if handle.launch_state == "launching" and terminal_status is None:
             raise RunRecoveryError(
-                "launch outcome is unresolved: the durable handle cannot distinguish a "
-                "pre-spawn failure from a child that has not persisted its process identity. "
-                "The run remains reserved. If this persists after a "
-                "server crash, inspect the host because automated recovery cannot safely "
-                "declare that no runner was spawned.",
+                "launch outcome is unresolved: the run handle cannot tell a failed spawn from "
+                "a runner that has not saved its process identity yet. The run stays reserved; "
+                "after a server crash, look for its runner on the host.",
                 action=OperatorAction.RETRY,
             )
     return handle, terminal_status
@@ -511,8 +501,8 @@ def _recovery_needs(
     )
     if not cleanup_needed and snapshot_unavailable and not snapshot_recovery_required:
         raise RunRecoveryError(
-            "this run has no immutable terminal result snapshot. Historical results cannot "
-            "be rebuilt from the current shared study because later runs may have changed it.",
+            "this run has no terminal result snapshot, and its results cannot be rebuilt from "
+            "the shared study, which later runs may have changed.",
             remediation="No further cleanup or result repair is available for this run.",
         )
     return _RecoveryNeeds(
@@ -578,8 +568,7 @@ def _require_dead_runner(
         return
     if cleanup_needed and identity.pid is not None and identity.pid_starttime is None:
         raise RunRecoveryError(
-            "runner process identity has no process start time; refusing automated "
-            "recovery because PID reuse cannot be ruled out"
+            "runner process identity has no process start time; refusing automated recovery"
         )
     # The live runner holds the run: once cancel_run stops it, the same request
     # can proceed, while another recover-run would stop at this same check.
@@ -721,7 +710,9 @@ def _load_recovery_studies(
     """
     # A storage refusal gains a recover-run retry here, but that retry cannot
     # succeed until the ledger is back, so these wraps route to restoring it.
-    recovery_step = " Retry phasesweep mcp recover-run after repairing the storage ledger."
+    recovery_step = (
+        f" Retry {command_line('mcp', 'recover-run')} after repairing the storage ledger."
+    )
     try:
         ledger = validate_ledger(config)
         if confirm:
@@ -963,14 +954,12 @@ def _require_cleanup_evidence(
             detail = "no existing Optuna studies could be loaded from the run snapshot storage"
         else:
             detail = (
-                "no RUNNING trials were reaped, no terminal trials recorded cleanup "
-                "uncertainty, and no prior recovery pass or tracking cleanup left "
-                "durable evidence"
+                "no RUNNING trial reaped, no cleanup-uncertain trial, no earlier recovery "
+                "pass or tracking cleanup"
             )
         raise RunRecoveryError(
-            "runner status recorded cleanup_confirmed=false, but recovery could not "
-            f"confirm any trial-level cleanup evidence ({detail}). Refusing to clear "
-            "cleanup uncertainty."
+            "runner status recorded cleanup_confirmed=false, but recovery found no "
+            f"trial-level cleanup evidence ({detail}), so cleanup uncertainty stays."
         )
 
 
@@ -988,17 +977,16 @@ def _preflight_message(
     actions = []
     if needs.cleanup_needed:
         actions.append(
-            "attempt runner process-group cleanup, "
+            "clean up the runner's process group, "
             f"reconcile {evidence.registered_attempts_reconciled} registered attempt(s), "
-            f"terminate {evidence.terminated} live process group(s) if still alive, "
-            f"settle {evidence.reaped} stale trial(s), retaining completed results when "
-            f"their evidence confirms success, and recover {evidence.cleanup_recovered} "
-            "cleanup-uncertain terminal trial(s)"
+            f"terminate {evidence.terminated} live process group(s), "
+            f"settle {evidence.reaped} stale trial(s) and recover "
+            f"{evidence.cleanup_recovered} cleanup-uncertain trial(s)"
         )
     elif evidence.registered_attempts_reconciled:
         actions.append(
             f"reconcile {evidence.registered_attempts_reconciled} registered MLflow tracking "
-            f"operation(s), terminating {evidence.terminated} live process group(s) if still alive"
+            f"operation(s) and terminate {evidence.terminated} live process group(s)"
         )
     if needs.snapshot_finalize_needed:
         if publication_action == "commit":
@@ -1116,9 +1104,8 @@ def _finish_result_recovery(
                 retryable=True,
                 actor="agent",
                 remediation=(
-                    "Report that recovery could not confirm this run as the current published "
-                    "result. A new run of this experiment reuses its finished trials and "
-                    "publishes their winners without training them again."
+                    "Recovery could not confirm this run as the published result; "
+                    f"{NEW_RUN_RESUMES}."
                 ),
             ).model_dump(mode="json", exclude_none=True)
             terminal_status.pop("result_publication_state", None)

@@ -38,7 +38,10 @@ from tests.mcp_helpers import (
 
 LOGGER = "phasesweep.mcp.server"
 #: The refusal of a catalog whose ``broken`` entry fails, which names it and every launch.
-BROKEN_NAMED = r"catalog entry 'broken' failed to load, so this server refuses launches of every"
+BROKEN_NAMED = (
+    r"catalog entry 'broken' failed to load, so launches and inspection of a changed config "
+    "are refused"
+)
 
 
 def _listed_ids(app: PhaseSweepMCP) -> list[str]:
@@ -107,7 +110,7 @@ def test_launch_refuses_a_config_edited_after_its_reread(
         return original_inventory()
 
     monkeypatch.setattr(store, "launch_inventory", edit_during_launch)
-    with pytest.raises(ConfigChangedError, match="retry this call once"):
+    with pytest.raises(ConfigChangedError, match="changed on disk during this call; retry once"):
         app.launch("srv")
     assert "cmd" not in captured
     assert store.list_handles() == []
@@ -141,11 +144,12 @@ def _break_catalog(tmp_path: Path, catalog: Path, config: Path, damage: str) -> 
 
 
 #: How the refusal of each damaging edit begins: it names the entries that fail to load.
+_REFUSED = ", so launches and inspection of a changed config are refused"
 REFUSALS = {
-    "catalog_yaml": "the catalog file does not validate, so this server refuses launches of every",
-    "invalid_config": "catalog entry 'srv' failed to load, so this server refuses launches of every",
-    "namespace_alias": "catalog entry 'alias' failed to load, so this server refuses launches of",
-    "missing_config": "catalog entry 'srv' failed to load, so this server refuses launches of every",
+    "catalog_yaml": f"the catalog file does not validate{_REFUSED}",
+    "invalid_config": f"catalog entry 'srv' failed to load{_REFUSED}",
+    "namespace_alias": f"catalog entry 'alias' failed to load{_REFUSED}",
+    "missing_config": f"catalog entry 'srv' failed to load{_REFUSED}",
 }
 
 
@@ -313,7 +317,7 @@ def test_granting_launch_takes_effect_on_the_next_call(
     """Flipping allow.launch to true needs no restart."""
     config = write_srv_config(tmp_path)
     app, _registry, store = make_mcp_app(write_srv_catalog(tmp_path, config))
-    with pytest.raises(PermissionDeniedError, match="applies on the next call"):
+    with pytest.raises(PermissionDeniedError, match=r"\(allow\.launch: true\)"):
         app.launch("srv")
 
     write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)

@@ -504,21 +504,20 @@ def test_run_store_marks_fresh_scaffolded_state(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("marker_text", "match"),
     [
-        ("not json\n", "format marker is unreadable or malformed; use a fresh MCP state directory"),
+        ("not json\n", "format marker is unreadable or malformed"),
         (
             json.dumps({"schema_version": mcp_runs.MCP_STATE_FORMAT_VERSION, "unexpected": True}),
-            "format marker is unreadable or malformed; use a fresh MCP state directory",
+            "format marker is unreadable or malformed",
         ),
         (
             '{"schema_version": 0}\n',
             f"format marker declares format 0; this PhaseSweep reads format "
-            f"{mcp_runs.MCP_STATE_FORMAT_VERSION}; use a fresh MCP state directory",
+            f"{mcp_runs.MCP_STATE_FORMAT_VERSION}",
         ),
         (
             json.dumps({"schema_version": mcp_runs.MCP_STATE_FORMAT_VERSION - 1}),
             f"format marker declares format {mcp_runs.MCP_STATE_FORMAT_VERSION - 1}; "
-            f"this PhaseSweep reads format {mcp_runs.MCP_STATE_FORMAT_VERSION}; "
-            "use a fresh MCP state directory",
+            f"this PhaseSweep reads format {mcp_runs.MCP_STATE_FORMAT_VERSION}",
         ),
     ],
 )
@@ -568,7 +567,7 @@ def test_run_store_refuses_unmarked_durable_state_before_initialization(
 
     monkeypatch.setattr(mcp_runs, "ensure_private_dir", fail_if_initialized)
 
-    with pytest.raises(ValueError, match="no format marker.*fresh MCP state directory"):
+    with pytest.raises(mcp_runs.UnsupportedStateFormatError, match="no format marker"):
         RunStore(state_dir)
 
     assert initialized == []

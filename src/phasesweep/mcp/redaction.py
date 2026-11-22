@@ -7,6 +7,7 @@ from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine.read import PhaseWinnerView, ResultContext
 from phasesweep.engine.state import FINISHED_TRIAL_STATES, TRIAL_STATE_NAMES
+from phasesweep.mcp.errors import sync_tracking_command
 from phasesweep.mcp.registry import VisibleParamsPolicy
 from phasesweep.mcp.snapshots import McpPublicationState, WinnerSnapshot
 from phasesweep.runtime.json import JsonObject, json_object
@@ -224,25 +225,15 @@ def _tracking_delivery_payload(counts: Mapping[str, int], run: Mapping[str, obje
         ``remedy``, the retry step when anything is pending after the run ended, otherwise
         ``None``.
     """
-    from phasesweep.tracking.session import count_text, refusal_rule
+    from phasesweep.tracking.session import count_text
 
     pending = counts["records"] + counts["creations"]
     remedy = None
     if pending and run["state"] != "running":
-        # The payload is path-free, so the warning is placed by the log the run wrote and by
-        # the retry, whose every pass warns again.
         remedy = (
-            f"MLflow: {count_text(counts['records'], counts['creations'])} pending for this run. "
-            "Its scores and winners are unaffected. "
-            "The next launch with this config sends them, or ask the operator "
-            f"to retry them with `phasesweep sync-tracking CONFIG --generation {run['run_id']}` "
-            "using the config this run launched with; delivery never retrains. If MLflow "
-            "refused a record, such as for a run deleted in MLflow, that record "
-            + refusal_rule(
-                ", in the engine's `run.log` in the experiment workdir when the run met it, or on "
-                "the console of the operator's `recover-run` or retry,"
-            )
-            + "."
+            f"MLflow: {count_text(counts['records'], counts['creations'])} pending for this "
+            "run; its scores and winners are unaffected. The operator can send them with "
+            f"`{sync_tracking_command(str(run['run_id']))}` (the config this run launched with)."
         )
     return {"pending": pending, "delivered": counts["delivered"], "remedy": remedy}
 

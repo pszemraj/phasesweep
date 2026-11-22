@@ -329,10 +329,9 @@ def test_recover_run_distinguishes_a_creation_miss_from_an_upload_failure(
     assert result.exit_code == 0, result.output
     # The summary record went out; the attempt's creation, inside its window, stays unconfirmed.
     assert (
-        "MLflow: delivered 1 record. MLflow: 1 unconfirmed run creation pending. The next launch"
-        in result.output
+        "MLflow: delivered 1 record; 1 unconfirmed run creation pending. Send them with "
+        "`phasesweep sync-tracking CONFIG`." in result.output
     )
-    assert _PENDING_STEP in result.output
     assert pending.is_file() and not bound.exists()
     assert not run.store.observe(run.handle).recovery_required
 
@@ -357,8 +356,9 @@ def test_recover_run_leaves_outcomes_pending_while_mlflow_is_down(
     assert requests == ["resolve"]
     assert run.sent() == []
     assert read_record(run.record)["state"] == "pending"
-    assert "MLflow: 2 records pending. The next launch" in confirmed.output
-    assert _PENDING_STEP in confirmed.output
+    assert "MLflow: 2 records pending. Send them with `phasesweep sync-tracking CONFIG`." in (
+        confirmed.output
+    )
     assert not run.store.observe(run.handle).recovery_required
     delivery = run.app.status(_RUN_ID)["tracking_delivery"]
     assert delivery["pending"] == 2
@@ -375,11 +375,11 @@ def test_recover_run_leaves_outcomes_pending_while_mlflow_is_down(
 def test_recover_run_and_mcp_status_say_what_keeps_a_refused_record_pending(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A record MLflow refuses during recover-run stays pending, and recover-run and MCP status say what clears it.
+    """A record MLflow refuses during recover-run stays pending, and recover-run names the refusal.
 
     MLflow refuses the attempt's outcome, as for a run deleted in MLflow, and accepts the
-    summary run's end. recover-run's line counts both and names the refusal; the run's MCP
-    remedy places the refusal's warning, as an MCP reader never sees the console.
+    summary run's end. recover-run's line counts both and names the refusal, and its warning
+    is on the console; the run's MCP remedy names the retry.
     """
     run = _killed_run(tmp_path, monkeypatch)
     respond = session.request_operation
@@ -398,13 +398,14 @@ def test_recover_run_and_mcp_status_say_what_keeps_a_refused_record_pending(
     assert confirmed.exit_code == 0, confirmed.output
     assert (run.sent(), run.summaries()) == ([], ["KILLED"])
     assert read_record(run.record)["state"] == "pending"
-    assert (
-        "MLflow: delivered 1 record. MLflow: 1 record pending. The next launch with this config, "
-        "or `phasesweep sync-tracking` with this run's config file and `--set` overrides, sends "
-        "them; delivery never retrains. MLflow refused 1 record; a refused record stays pending "
-        "until the cause given in its warning is fixed in MLflow, for example by restoring a "
-        "deleted run or its experiment." in confirmed.output.splitlines()
+    (line,) = [
+        line for line in confirmed.output.splitlines() if line.startswith("MLflow: delivered")
+    ]
+    assert line.startswith(
+        "MLflow: delivered 1 record; 1 record pending. "
+        "Send them with `phasesweep sync-tracking CONFIG`."
     )
+    assert "MLflow refused 1 record" in line
     # The refusal's warning is on recover-run's console, labelled and wrapped as a run's is.
     assert re.search(
         rf"\d\d:\d\d:\d\d warning: MLflow: attempt record attempt-{run.attempt} of generation "
@@ -414,14 +415,9 @@ def test_recover_run_and_mcp_status_say_what_keeps_a_refused_record_pending(
     assert not run.store.observe(run.handle).recovery_required
     delivery = run.app.status(_RUN_ID)["tracking_delivery"]
     assert delivery["remedy"] == (
-        "MLflow: 1 record pending for this run. Its scores and winners are unaffected. The "
-        "next launch with this config sends them, or ask the operator to retry them with "
-        f"`phasesweep sync-tracking CONFIG --generation {_RUN_ID}` using the config this run "
-        "launched with; delivery never retrains. If MLflow refused a record, such as for a run "
-        "deleted in MLflow, that record stays pending until the cause given in its warning, in "
-        "the engine's `run.log` in the experiment workdir when the run met it, or on the console "
-        "of the operator's `recover-run` or retry, is fixed in MLflow, for example by restoring a "
-        "deleted run or its experiment."
+        "MLflow: 1 record pending for this run; its scores and winners are unaffected. The "
+        f"operator can send them with `phasesweep sync-tracking CONFIG --generation {_RUN_ID}` "
+        "(the config this run launched with)."
     )
 
 

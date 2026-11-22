@@ -481,11 +481,12 @@ def test_the_delivery_remedy_counts_records_and_run_creations_apart() -> None:
 
     assert (both["pending"], both["delivered"]) == (3, 3)
     assert isinstance(both["remedy"], str) and both["remedy"].startswith(
-        "MLflow: 2 records and 1 unconfirmed run creation pending for this run. "
+        "MLflow: 2 records and 1 unconfirmed run creation pending for this run; "
     )
+    assert "`phasesweep sync-tracking CONFIG --generation run-1`" in both["remedy"]
     assert (creations["pending"], creations["delivered"]) == (1, 0)
     assert isinstance(creations["remedy"], str) and creations["remedy"].startswith(
-        "MLflow: 1 unconfirmed run creation pending for this run. "
+        "MLflow: 1 unconfirmed run creation pending for this run; "
     )
     assert (running["pending"], running["remedy"]) == (3, None)
 

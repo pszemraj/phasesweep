@@ -93,7 +93,7 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
     )
     store.create(pending)
 
-    with pytest.raises(RunLaunchUnsettledError, match="verified runner identity"):
+    with pytest.raises(RunLaunchUnsettledError, match="its runner identity"):
         app.cancel(pending.run_id)
 
     assert not store.cleanup_uncertain_path(pending.run_id).exists()
@@ -247,7 +247,7 @@ def test_cancel_requires_catalog_and_launch_time_permission(
     assert (
         f"To stop this run, the operator can check that `ps -p {handle.pid} -o args=` shows "
         f"`runner.py --run-id {run_id}`, then run `kill -TERM {handle.pid}` from a host shell. "
-        "The runner handles SIGTERM as cancellation. Do not retry."
+        "Do not retry."
     ) in str(denied.value)
 
 
@@ -385,8 +385,8 @@ def test_cancel_refusal_names_a_stop_route_only_it_can_give(
         assert "To stop this run" not in message
     else:
         assert (
-            f"find the PID of `runner.py --run-id {run_id}` in `ps -A -o pid=,args=`, "
-            "then run `kill -TERM PID` with that PID from a host shell."
+            f"find the PID of `runner.py --run-id {run_id}` in `ps -A -o pid=,args=` "
+            "and run `kill -TERM PID` from a host shell."
         ) in message
 
 
@@ -602,8 +602,8 @@ def test_cancel_cleanup_confirmation_policy(
             assert f"`pgrep -af {run_id}` from a host shell" in remedy
             assert str(handle.pid) not in remedy
             assert str(handle.pgid) not in remedy
-        assert "is still running on the host, clear the cause there" in remedy
-        assert "uninterruptible I/O ignores SIGKILL until the I/O ends" in remedy
+        assert "is still running on the host, clear what blocks SIGKILL" in remedy
+        assert "uninterruptible I/O ignores it" in remedy
         assert "cancel_run" not in remedy
         assert len(remedy.splitlines()) == 1
         for visibility in ("observable", "absent", "unobservable"):

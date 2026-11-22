@@ -446,8 +446,7 @@ _PUBLICATION_FAILURES = {
         "actor": "operator",
         "remediation": (
             "The experiment's last published result no longer validates. Ask the operator to "
-            "inspect it with `phasesweep status CONFIG` and restore it; until then a new run of "
-            "this experiment fails before its first trial."
+            "inspect it with `phasesweep status CONFIG` and restore it."
         ),
     },
     "permission_denied": {
@@ -456,10 +455,9 @@ _PUBLICATION_FAILURES = {
         "retryable": False,
         "actor": "operator",
         "remediation": (
-            "This server cannot read the experiment's published result to validate it, which is "
-            "not evidence of corruption. Ask the operator to read it as the publishing user or "
-            "restore the server's read permission; until then a new run of this experiment fails "
-            "before its first trial."
+            "This server cannot read the experiment's published result (not necessarily "
+            "corrupt). Ask the operator to read it as the publishing user or restore the "
+            "server's read permission."
         ),
     },
 }
