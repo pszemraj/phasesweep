@@ -187,9 +187,7 @@ def _preflight_existing_studies(
             if study is None:
                 continue
             try:
-                _validate_trial_target(
-                    study, phase, dependents=experiment.phases_inheriting(phase.name)
-                )
+                _validate_trial_target(study, phase)
                 partial_decision = _load_accepted_partial_decision(study)
                 finished_trials = _finished_trial_count(study.get_trials(deepcopy=False))
                 needs_new_trials = phase.n_trials > finished_trials and not (

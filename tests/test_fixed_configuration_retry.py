@@ -490,4 +490,4 @@ def test_a_phase_that_draws_is_not_limited_to_retries() -> None:
         search_space={"x": IntParam(type="int", low=0, high=10)},
     )
 
-    _validate_trial_target(study, drawing, dependents=())
+    _validate_trial_target(study, drawing)

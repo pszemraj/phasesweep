@@ -443,7 +443,7 @@ def _accepted_trial_target(study: optuna.Study) -> int:
     return stored if recovery is None else max(stored, recovery.trial_target)
 
 
-def _validate_trial_target(study: optuna.Study, phase: Phase, *, dependents: Sequence[str]) -> None:
+def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
     """Reject a target the study's durable state does not allow.
 
     A target lower than the accepted one is refused, and so is a fixed
@@ -452,7 +452,6 @@ def _validate_trial_target(study: optuna.Study, phase: Phase, *, dependents: Seq
 
     :param optuna.Study study: Existing study whose accepted target is checked.
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
-    :param Sequence[str] dependents: The phases that inherit ``phase``.
     :raises TrialTargetRefusedError: ``phase.n_trials`` is lower than the
         study's durable accepted target, or a fixed configuration or grid asks for more
         attempts than it may retry.
@@ -466,17 +465,11 @@ def _validate_trial_target(study: optuna.Study, phase: Phase, *, dependents: Seq
         )
     trials = study.get_trials(deepcopy=False)
     _validate_fixed_configuration_target(
-        phase,
-        finished=_finished_trial_count(trials),
-        measured=_measured_trial_count(trials),
-        has_study=True,
-        dependents=dependents,
+        phase, finished=_finished_trial_count(trials), measured=_measured_trial_count(trials)
     )
 
 
-def _validate_fixed_configuration_target(
-    phase: Phase, *, finished: int, measured: int, has_study: bool, dependents: Sequence[str]
-) -> None:
+def _validate_fixed_configuration_target(phase: Phase, *, finished: int, measured: int) -> None:
     """Reject a fixed configuration or grid target that would repeat measured cells.
 
     A fixed configuration draws nothing, so every attempt runs the same trial.
@@ -490,10 +483,6 @@ def _validate_fixed_configuration_target(
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
     :param int finished: Finished attempts the phase's study holds.
     :param int measured: How many of those are COMPLETE, feasible or not.
-    :param bool has_study: Whether the phase's study exists, which decides whether a grid
-        refusal points at a new study.
-    :param Sequence[str] dependents: The phases that inherit ``phase``, named by a grid
-        refusal's new-study step.
     :raises TrialTargetRefusedError: The fixed configuration asks for more
         attempts than it may retry; the message names the largest allowed target.
     """

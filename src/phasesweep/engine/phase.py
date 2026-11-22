@@ -633,7 +633,7 @@ def _judge_recorded_phase(
         accepted partial-timeout decision replays.
     """
     dependents = experiment.phases_inheriting(phase.name)
-    _validate_trial_target(study, phase, dependents=dependents)
+    _validate_trial_target(study, phase)
     partial_decision = _load_accepted_partial_decision(study)
     if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
         # Replay the accepted timeout boundary only while incomplete results remain enabled.

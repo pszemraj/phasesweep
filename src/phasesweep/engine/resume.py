@@ -245,13 +245,7 @@ def _reject_fixed_targets_without_study(
     """
     for _index, phase in experiment.phases_from(from_phase):
         if phase.name not in existing_studies:
-            study_policy_ops._validate_fixed_configuration_target(
-                phase,
-                finished=0,
-                measured=0,
-                has_study=False,
-                dependents=experiment.phases_inheriting(phase.name),
-            )
+            study_policy_ops._validate_fixed_configuration_target(phase, finished=0, measured=0)
 
 
 def _preflight_reached_fingerprint(
