@@ -12,8 +12,10 @@ from typing import Any
 import optuna
 import pytest
 import yaml
+from click.testing import CliRunner
 
 from phasesweep import run_experiment
+from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.confound import (
@@ -27,7 +29,7 @@ from phasesweep.engine.confound import (
     _noise_remedy,
     _validate_confound_block,
 )
-from phasesweep.engine.errors import TrialEvidenceMissingError
+from phasesweep.engine.errors import StudyContextConflictError, TrialEvidenceMissingError
 from phasesweep.engine.evidence import _validate_objective_provenance
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.paths import _generation_winner_path
@@ -50,12 +52,16 @@ from phasesweep.engine.state import (
 )
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from phasesweep.evidence.models import MlflowExtractor
+from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.runtime.json import JsonObject
 from tests.conftest import (
     log_regex_provenance,
     make_experiment,
+    phase_study,
     single_trial_confound,
     write_constant_trainer,
+    write_experiment_config,
+    write_trainer,
 )
 from tests.ledger_fixtures import published_generation_id, winner_payload
 
@@ -1072,22 +1078,32 @@ def test_summary_exposes_the_evaluation_axis_without_checkpoint_paths() -> None:
 
 
 @pytest.mark.parametrize(
-    ("failed", "untried", "persistent", "remedy"),
+    ("failed", "untried", "persistent", "dependents", "remedy"),
     [
-        (0, 0, True, None),
-        (0, 2, True, "Raise the phase's n_trials and rerun to run its untried cells."),
+        (0, 0, True, ("child",), None),
+        (0, 2, True, (), "Raise the phase's n_trials and rerun to run its untried cells."),
+        (
+            0,
+            2,
+            True,
+            ("child",),
+            "Raise the phase's n_trials and rerun to run its untried cells. Before rerunning, "
+            "if any phase that inherits this one already has trials, give `child` a new `name`, "
+            "which runs it again from scratch.",
+        ),
         (
             1,
             0,
             False,
+            ("child",),
             "Fix the failure and rerun; storage: null keeps no completed trials between runs.",
         ),
     ],
 )
 def test_survivorship_remedy_follows_the_configurations_left_and_the_storage(
-    failed: int, untried: int, persistent: bool, remedy: str | None
+    failed: int, untried: int, persistent: bool, dependents: tuple[str, ...], remedy: str | None
 ) -> None:
-    """A clean check has no remedy; untried cells need only more trials; nothing persists without storage."""
+    """The remedy accounts for missing results, storage, and the phase's dependents."""
     block = single_trial_confound(0)
     block["checks"]["survivorship"] = {
         "verdict": "heterogeneous" if failed or untried else "ok",
@@ -1101,12 +1117,83 @@ def test_survivorship_remedy_follows_the_configurations_left_and_the_storage(
     }
 
     summary = _confound_summary(
-        block, winner_trial=0, extractor_kind="json_envelope", persistent=persistent
+        block,
+        winner_trial=0,
+        extractor_kind="json_envelope",
+        persistent=persistent,
+        dependents=dependents,
     )
 
     survivorship = summary["survivorship"]
     assert isinstance(survivorship, dict)
     assert survivorship["remedy"] == remedy
+
+
+@pytest.mark.integration
+def test_published_survivorship_remedy_names_the_phases_that_must_be_renamed(
+    tmp_path: Path,
+) -> None:
+    """The CLI and MCP remedy explains how a top-up can keep the upstream trials."""
+    ready = tmp_path / "ready"
+    trainer = write_trainer(
+        tmp_path,
+        f"""
+        import argparse
+        from pathlib import Path
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--x", type=int, required=True)
+        args, _ = parser.parse_known_args()
+        if args.x == 2 and not Path({str(ready)!r}).exists():
+            raise SystemExit(1)
+        print(f"x={{args.x}}")
+        """,
+    )
+    parent = Phase(
+        name="parent",
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        search_space={"x": IntParam(type="int", low=1, high=2)},
+    )
+    child = Phase(name="child", inherits=["parent"], n_trials=1, gpu_policy="none")
+    grandchild = Phase(name="grandchild", inherits=["child"], n_trials=1, gpu_policy="none")
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=trainer, phases=[parent, child, grandchild]
+    )
+    winners = run_experiment(experiment)
+    assert list(winners) == ["parent", "child", "grandchild"]
+    assert winners["parent"].params == {"x": 1}
+    remedy_part = "give `child` and `grandchild` new names and update the `inherits` that name them"
+
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    shown = CliRunner().invoke(cli, ["show-winners", str(config)])
+    assert shown.exit_code == 0, shown.exception
+    parent_output = shown.output.split("=== parent ===", 1)[1].split("=== child ===", 1)[0]
+    cli_remedy = yaml.safe_load(parent_output)["confound"]["survivorship"]["remedy"]
+    assert remedy_part in cli_remedy
+
+    generation = published_generation_id(experiment)
+    mcp = capture_result_snapshot(experiment, generation_id=generation, engine_winners=winners)
+    assert mcp["winners"][0]["confound"]["survivorship"]["remedy"] == cli_remedy
+
+    ready.touch()
+    enlarged = parent.model_copy(update={"n_trials": 3})
+    topup = experiment.model_copy(update={"phases": [enlarged, child, grandchild]})
+    with pytest.raises(StudyContextConflictError, match="bound to its published winner"):
+        run_experiment(topup)
+
+    next_child = child.model_copy(update={"name": "child_retry"})
+    next_grandchild = grandchild.model_copy(
+        update={"name": "grandchild_retry", "inherits": ["child_retry"]}
+    )
+    result = run_experiment(
+        experiment.model_copy(update={"phases": [enlarged, next_child, next_grandchild]})
+    )
+    assert list(result) == ["parent", "child_retry", "grandchild_retry"]
+    trials = phase_study(experiment, "parent").trials
+    assert len(trials) == 3
+    assert trials[-1].state == _COMPLETE
+    assert trials[-1].params == {"x": 2}
 
 
 def test_summary_reports_unchecked_counts_as_null() -> None:

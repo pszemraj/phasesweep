@@ -27,7 +27,7 @@ from phasesweep.engine.repeats import (
     noise_band,
 )
 from phasesweep.engine.state import _unreplaced_attempts
-from phasesweep.errors import STORAGE_NULL_KEEPS_NOTHING
+from phasesweep.errors import STORAGE_NULL_KEEPS_NOTHING, rename_step
 from phasesweep.evidence.models import (
     POSITIONED_EXTRACTOR_KINDS,
     best_value_position_reason,
@@ -914,27 +914,37 @@ def _evaluation_point_remedy(kind: str, *, axis: str = "step") -> str:
     )
 
 
-def _survivorship_remedy(detail: SurvivorshipDetail, *, persistent: bool) -> str:
+def _survivorship_remedy(
+    detail: SurvivorshipDetail, *, persistent: bool, dependents: Sequence[str]
+) -> str:
     """Say how to give the configurations without a result one, for every sampler.
 
     The summary holds no phase config or trials, so it cannot name the exact target
     :func:`phasesweep.engine.study_policy._raised_target_step` names; a raised ``n_trials`` is
     the one step that is true for every sampler, and docs/runtime.md ("Retry fixed
-    configurations and grids") gives the ceiling. Without storage nothing is kept, so a rerun
-    tries every configuration again and the target need not move.
+    configurations and grids") gives the ceiling. A dependent study with trials must get a new
+    name before an upstream top-up. Without storage a rerun tries every configuration again.
 
     :param SurvivorshipDetail detail: Flagged survivorship evidence.
     :param bool persistent: Whether the display config keeps its trials between runs.
+    :param Sequence[str] dependents: Phases that inherit the phase being topped up.
     :return str: The step.
     """
     if not persistent:
         return f"Fix the failure and rerun; {STORAGE_NULL_KEEPS_NOTHING}."
-    if not detail["failed"]:
-        return "Raise the phase's n_trials and rerun to run its untried cells."
-    return (
-        "Fix the failure, then raise the phase's n_trials and rerun: a grid or fixed "
-        "configuration retries its failed cells, and another sampler draws new configurations."
-    )
+    if detail["failed"]:
+        step = (
+            "Fix the failure, then raise the phase's n_trials and rerun: a grid or fixed "
+            "configuration retries its failed cells, and another sampler draws new configurations."
+        )
+    else:
+        step = "Raise the phase's n_trials and rerun to run its untried cells."
+    if dependents:
+        step += (
+            " Before rerunning, if any phase that inherits this one already has trials, "
+            f"{rename_step(dependents)}."
+        )
+    return step
 
 
 def _noise_remedy() -> str:
@@ -998,7 +1008,12 @@ def _describe_group_tie(
 
 
 def _confound_summary(
-    block: ConfoundBlock, *, winner_trial: int, extractor_kind: str, persistent: bool
+    block: ConfoundBlock,
+    *,
+    winner_trial: int,
+    extractor_kind: str,
+    persistent: bool,
+    dependents: Sequence[str] = (),
 ) -> dict[str, object]:
     """Project a validated block onto the enums and numbers agents may see.
 
@@ -1010,6 +1025,7 @@ def _confound_summary(
     :param str extractor_kind: Objective reader that recorded the winner's provenance.
     :param bool persistent: Whether the display config keeps its trials between runs, which
         decides the survivorship remedy.
+    :param Sequence[str] dependents: Phases that inherit this one in the display config.
     :return dict[str, object]: The summary, one entry per check plus the ``flagged`` check names.
     """
     checks = block["checks"]
@@ -1045,7 +1061,9 @@ def _confound_summary(
         "survivorship": {
             "verdict": survivorship["verdict"],
             "remedy": (
-                _survivorship_remedy(survivorship["detail"], persistent=persistent)
+                _survivorship_remedy(
+                    survivorship["detail"], persistent=persistent, dependents=dependents
+                )
                 if survivorship["verdict"] == "heterogeneous"
                 else None
             ),

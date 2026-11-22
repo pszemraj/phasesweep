@@ -371,6 +371,7 @@ def _winner_snapshot(
             winner_trial=winner.trial_number,
             extractor_kind=kind if isinstance(kind, str) else "unknown",
             persistent=experiment.persistent,
+            dependents=experiment.phases_inheriting(phase),
         )
         repeats = None if winner.repeats is None else _repeats_summary(winner.repeats)
         view = PhaseWinnerView(

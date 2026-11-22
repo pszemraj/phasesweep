@@ -257,7 +257,11 @@ def _phase_status_payloads(
 
 
 def _winner_view(
-    winner: Mapping[str, object] | ValidatedWinner, phase_name: str, *, persistent: bool
+    winner: Mapping[str, object] | ValidatedWinner,
+    phase_name: str,
+    *,
+    persistent: bool,
+    dependents: Sequence[str] = (),
 ) -> PhaseWinnerView | None:
     """Reduce one decoded winner payload using the permissive read contract.
 
@@ -266,6 +270,7 @@ def _winner_view(
     :param str phase_name: Phase name exposed by the winner.
     :param bool persistent: Whether the display config keeps its trials between runs, which
         decides the survivorship remedy (:func:`phasesweep.engine.confound._confound_summary`).
+    :param Sequence[str] dependents: Phases that inherit this one in the display config.
     :return PhaseWinnerView | None: The winner view, or ``None`` when the
         payload is malformed.
     """
@@ -319,6 +324,7 @@ def _winner_view(
             winner_trial=trial_number,
             extractor_kind=kind if isinstance(kind, str) else "unknown",
             persistent=persistent,
+            dependents=dependents,
         )
         return PhaseWinnerView(
             phase=phase_name,
@@ -340,7 +346,9 @@ def _winner_view(
         return None
 
 
-def _read_winner_path(path: Path, phase_name: str, *, persistent: bool) -> PhaseWinnerView | None:
+def _read_winner_path(
+    path: Path, phase_name: str, *, persistent: bool, dependents: Sequence[str]
+) -> PhaseWinnerView | None:
     """Read one unvalidated winner file using the permissive read contract.
 
     Only a generation that is not the validated publication is read this way:
@@ -350,6 +358,7 @@ def _read_winner_path(path: Path, phase_name: str, *, persistent: bool) -> Phase
     :param Path path: Winner path in the represented generation.
     :param str phase_name: Phase name exposed by the winner.
     :param bool persistent: Whether the display config keeps its trials between runs.
+    :param Sequence[str] dependents: Phases that inherit this one in the display config.
     :return PhaseWinnerView | None: Parsed winner, or ``None`` when absent or malformed.
     """
     if not path.is_file():
@@ -357,7 +366,7 @@ def _read_winner_path(path: Path, phase_name: str, *, persistent: bool) -> Phase
     loaded = read_yaml_or_none(path)
     if not isinstance(loaded, Mapping):
         return None
-    return _winner_view(loaded, phase_name, persistent=persistent)
+    return _winner_view(loaded, phase_name, persistent=persistent, dependents=dependents)
 
 
 def _represented_winners(
@@ -389,12 +398,17 @@ def _represented_winners(
         return []
     validated = publication.validated
     comparison = comparison_experiment or experiment
-    # The next run is the current config's, so its storage decides the survivorship remedy.
+    # The next run uses the current config's storage and inheritance graph.
     persistent = comparison.persistent
     views: list[PhaseWinnerView | None]
     if validated is not None and validated.generation_id == represented_generation_id:
         views = [
-            _winner_view(validated.winners[name], name, persistent=persistent)
+            _winner_view(
+                validated.winners[name],
+                name,
+                persistent=persistent,
+                dependents=comparison.phases_inheriting(name),
+            )
             if name in validated.winners
             else None
             for name in phase_names
@@ -405,6 +419,7 @@ def _represented_winners(
                 _generation_winner_path(experiment, represented_generation_id, name),
                 name,
                 persistent=persistent,
+                dependents=comparison.phases_inheriting(name),
             )
             for name in phase_names
         ]
@@ -417,7 +432,12 @@ def _represented_winners(
             and validated is not None
             and name in validated.winners
         ):
-            view = _winner_view(validated.winners[name], name, persistent=persistent)
+            view = _winner_view(
+                validated.winners[name],
+                name,
+                persistent=persistent,
+                dependents=comparison.phases_inheriting(name),
+            )
             view_generation = validated.generation_id
         if view is not None:
             is_published = validated is not None and view_generation == validated.generation_id
