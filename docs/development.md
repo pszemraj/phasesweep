@@ -248,6 +248,17 @@ The principal test groups and what each covers:
 - TODO(runtime): Fit `validate`'s contract lines to the terminal and print the extractor without Python dict syntax. `run --dry-run` already wraps the same facts; `validate` prints them as single lines of up to several hundred columns.
 - TODO(runtime): Show a recorded phase abort in `status` and `status --trials`. After a failure-streak abort the phase reads as `3 of 8 trials` with three FAIL rows and no abort mark or `# fix:` line; only the next `run` or dry run says the phase is refused and prints the step.
 - TODO(runtime): Head `status --trials` with the metric the study recorded, or say that the config's differs. After `metric.name` or `metric.goal` is edited, the table labels the recorded values with the edited name and direction while still marking the recorded winner.
+- TODO(runtime): Account for repeated configuration–seed pairs so running the same seed twice does not inflate the pooled noise band's effective sample size.
+- TODO(runtime): Recheck process identity in `_signal_members` so PID reuse between enumeration and signalling cannot redirect a signal to another group.
+- TODO(runtime): Withhold edge advice when a restored journal cannot be matched to the population that selected the published winner.
+- TODO(runtime): Reuse the phase trial reads behind `status` when computing winner advisories.
+- TODO(runtime): Let `_phase_counts` use the trials from the completed phase instead of reopening the journal for the closing summary.
+- TODO(tracking): Share the phase trial reads used to match MLflow attempts across generations within a delivery pass.
+- TODO(cli): Preserve argument boundaries when a dry-run command contains an argument with a newline.
+- TODO(cli): Include W&B in the run banner when the only W&B reader is an evidence gate.
+- TODO(cli): Make the `--from-phase` remedy identify the earlier phase that must run when a skipped parent's winner is missing.
+- TODO(runtime): Show reordered `PATH` entries even when the same edit adds or removes another entry.
+- TODO(cli): Make printed commands usable when the config filename starts with a dash.
 - TODO(tests): Mark the older tests whose call phase takes a second or more as `integration`, among them families in `tests/test_repeats_runtime.py`, `tests/test_grid_failure_retry.py`, `tests/test_fixed_configuration_retry.py` and `tests/test_mlflow_terminal_delivery.py`.
 - TODO(tracking): Distinguish unstaged or blocked terminal outcomes from an empty queue in `status`. A saved delivery count alone cannot represent either case, and a lock-free `status` cannot rederive them.
 - TODO(tracking): Recover the terminal verdict for a managed attempt whose binding appears after an in-memory generation has published. A published generation can contain both successful and failed trials.
@@ -256,6 +267,12 @@ The principal test groups and what each covers:
 ## Declined requests
 
 These have been requested and declined. Check this list before proposing one again, and reopen an item only with a reason its entry does not already answer.
+
+- **Extending pooled noise calculations to objectives near `1e155`.** These values fall outside the numerical range targeted for sweep advice.
+- **Distinguishing integers past `2**53` in numeric edge advice.** Sweep reporting does not require that precision for integer hyperparameters.
+- **Escaping newlines inside a displayed categorical value.** Multiline categorical labels are outside the table's intended use.
+- **Special handling for `run --dry-run` output redirected to `/dev/full`.** A full output device is outside the closed-stream regression covered here.
+- **Changing the notice for an external GPU lock.** The branch preserves the existing lock behavior and its message.
 
 - **Reading or migrating trees and ledgers written in an older format.** PhaseSweep is still unstable and does not support backward compatibility until it stabilizes. Ledger and artifact format changes bump their record schemas and the respective study or artifact-root stamp; frozen MCP snapshot changes bump the MCP state-format marker. Older data is refused as an unsupported format with a fix line, and the checkout that produced it can still inspect it.
 - **Advice for removed config keys** such as `allow_seed_search`. A removed key fails as an unknown key, like any other; configs that use one stay on the revision that accepted it.
