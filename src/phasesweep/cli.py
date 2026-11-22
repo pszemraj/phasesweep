@@ -1123,7 +1123,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     """
     experiment = _command_config(config_path, settings=settings)
     require_study(experiment)
-    validate_ledger(experiment)
+    ledger = validate_ledger(experiment)
     _, generation_id, publication = _read_generation_selection(experiment, latest=True)
     raise_for_unusable_publication(
         experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
@@ -1145,6 +1145,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
         publication,
         generation_id,
         phase_names,
+        ledger=ledger,
         fallback_published=True,
     )
     winners = {view.phase: view for view in views}

@@ -366,6 +366,7 @@ def _represented_winners(
     represented_generation_id: str | None,
     phase_names: Sequence[str],
     *,
+    ledger: ValidatedLedger,
     fallback_published: bool = False,
     comparison_experiment: Experiment | None = None,
 ) -> list[PhaseWinnerView]:
@@ -378,6 +379,8 @@ def _represented_winners(
     :param str | None represented_generation_id: Generation whose winners are
         represented, or ``None`` when there is none.
     :param Sequence[str] phase_names: Safe phase names to enumerate.
+    :param ValidatedLedger ledger: Handle the command validated for ``experiment``, which
+        the read-time advice reads the phases' trials through (:func:`winner_advisories`).
     :param bool fallback_published: Fill missing latest phase winners from the publication.
     :param Experiment | None comparison_experiment: Current config for drift comparisons.
     :return list[PhaseWinnerView]: One view per named phase that has a usable winner.
@@ -433,7 +436,9 @@ def _represented_winners(
                     _experiment_semantic_fingerprint(producing),
                     phase_count=len(producing.phases),
                 )
-            advisories = winner_advisories(experiment, view, config_matches=config_matches is True)
+            advisories = winner_advisories(
+                experiment, view, config_matches=config_matches is True, ledger=ledger
+            )
             cost_status = advisories.cost_advisory_status
             if config_matches is not True and cost_status == "not_configured":
                 producing = _load_generation_experiment(
@@ -515,7 +520,11 @@ class WinnerAdvisories(typing.NamedTuple):
 
 
 def winner_advisories(
-    experiment: Experiment, winner: PhaseWinnerView, *, config_matches: bool
+    experiment: Experiment,
+    winner: PhaseWinnerView,
+    *,
+    config_matches: bool,
+    ledger: ValidatedLedger,
 ) -> WinnerAdvisories:
     """Recompute a winner's tie groups, cost advisory and edge advisory from its phase's trials.
 
@@ -529,11 +538,13 @@ def winner_advisories(
     :param Experiment experiment: Display config locating the retained phase ledger.
     :param PhaseWinnerView winner: Winner whose recorded population anchors the comparisons.
     :param bool config_matches: Whether ``experiment`` agrees with the producing config.
+    :param ValidatedLedger ledger: Handle the command validated for ``experiment``, so a read
+        of every winner's advice validates the ledger once.
     :return WinnerAdvisories: The advice and whether each could be checked.
     """
     phase = next((phase for phase in experiment.phases if phase.name == winner.phase), None)
     try:
-        read = read_phase_trials(validate_ledger(experiment), winner.phase)
+        read = read_phase_trials(ledger, winner.phase)
     except StudyStorageUnavailableError:
         read = None
     trials = None if read is None else read.trials
@@ -723,6 +734,7 @@ def read_status(
     generation_id: str | None = None,
     trial_generation_id: str | None = None,
     comparison_experiment: Experiment | None = None,
+    ledger: ValidatedLedger | None = None,
 ) -> EngineStatus:
     """Read path-free progress and represented-result status for one experiment.
 
@@ -757,6 +769,8 @@ def read_status(
         counts instead of the represented one.
     :param Experiment | None comparison_experiment: Current config for drift comparison
         and fallback semantics; reads still use ``experiment``.
+    :param ValidatedLedger | None ledger: Handle the caller already validated for ``experiment``,
+        so one command validates once; validated here when omitted.
     :raises ArtifactRootConflictError: The root is unreadable or has different ownership.
     :raises ValueError: ``generation_id`` or ``trial_generation_id`` is not a safe
         generation name.
@@ -768,6 +782,7 @@ def read_status(
         generation_id=generation_id,
         trial_generation_id=trial_generation_id,
         comparison_experiment=comparison_experiment,
+        ledger=ledger,
     )
     return status
 
@@ -778,6 +793,7 @@ def read_result(
     generation_id: str | None = None,
     comparison_experiment: Experiment | None = None,
     phase_names: Sequence[str] | None = None,
+    ledger: ValidatedLedger | None = None,
 ) -> tuple[EngineStatus, list[PhaseWinnerView]]:
     """Read status and represented-generation winners from one pointer resolution.
 
@@ -790,6 +806,8 @@ def read_result(
     :param Experiment | None comparison_experiment: Current config for drift comparison.
     :param Sequence[str] | None phase_names: Safe phase names in output order;
         an empty sequence selects none.
+    :param ValidatedLedger | None ledger: Handle the caller already validated for ``experiment``,
+        so one command validates once; validated here when omitted.
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
     :raises WinnerIntegrityError: An unpublished winner's producing snapshot is unavailable or invalid.
@@ -802,17 +820,20 @@ def read_result(
         if phase_names is None
         else [_validate_safe_name("phase", name) for name in phase_names]
     )
+    ledger = validate_ledger(experiment) if ledger is None else ledger
     status, publication = _read_status(
         experiment,
         generation_id=generation_id,
         trial_generation_id=None,
         comparison_experiment=comparison_experiment,
+        ledger=ledger,
     )
     winners = _represented_winners(
         experiment,
         publication,
         status["represented_generation_id"],
         status["result_phase_plan"] if names is None else names,
+        ledger=ledger,
         comparison_experiment=comparison_experiment,
     )
     return status, winners
@@ -950,6 +971,7 @@ def _read_status(
                 publication,
                 represented_generation_id,
                 result_phase_plan,
+                ledger=ledger,
                 fallback_published=True,
                 comparison_experiment=comparison_experiment,
             )
@@ -1450,6 +1472,7 @@ def read_trial_tables(
             publication,
             represented_generation_id,
             [phase.name for phase in experiment.phases],
+            ledger=ledger,
             fallback_published=latest and generation_id is None,
         )
     }

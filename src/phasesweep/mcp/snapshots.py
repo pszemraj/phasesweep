@@ -13,6 +13,7 @@ from phasesweep.config.models import Experiment, _metric_semantics_payload
 from phasesweep.engine.artifacts import read_yaml_or_none
 from phasesweep.engine.confound import ConfoundCheck, ConfoundVerdict, _confound_summary
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.ledger import ValidatedLedger, validate_ledger
 from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
 from phasesweep.engine.read import (
@@ -338,6 +339,7 @@ def _winner_snapshot(
     winner: PhaseWinnerView | Winner,
     *,
     experiment: Experiment,
+    ledger: ValidatedLedger,
 ) -> WinnerSnapshot:
     """Freeze either engine winner representation into one validated snapshot.
 
@@ -348,6 +350,7 @@ def _winner_snapshot(
     :param Experiment experiment: The config the runner executed, which produced an engine
         winner: it locates the trials the advice is recomputed from
         (:func:`phasesweep.engine.read.winner_advisories`) and decides the survivorship remedy.
+    :param ValidatedLedger ledger: Handle the snapshot validated once for ``experiment``.
     :raises RuntimeError: Either representation carries no confound verdicts or no source
         provenance.
     :return WinnerSnapshot: Validated path-free winner snapshot.
@@ -383,7 +386,7 @@ def _winner_snapshot(
             confound_detail=winner.confound,
             finished_trials=_recorded_count(winner.completion.get("finished_trials")),
         )
-        advisories = winner_advisories(experiment, view, config_matches=True)
+        advisories = winner_advisories(experiment, view, config_matches=True, ledger=ledger)
     else:
         gates_passed = winner.gates_passed
         incomplete = winner.incomplete
@@ -532,21 +535,26 @@ def capture_result_snapshot(
                 "capturing the terminal snapshot from the authoritative artifacts anyway",
                 generation_id,
             )
+    ledger = validate_ledger(experiment)
     if engine_winners is not None:
         status = read_status(
-            experiment, generation_id=generation_id, trial_generation_id=trial_generation_id
+            experiment,
+            generation_id=generation_id,
+            trial_generation_id=trial_generation_id,
+            ledger=ledger,
         )
         # The engine's winners count even where the generation holds no winner file.
         for phase in status["phases"]:
             phase["winner_present"] = phase["phase"] in engine_winners
         winner_snapshots = [
-            _winner_snapshot(phase_name, winner, experiment=experiment)
+            _winner_snapshot(phase_name, winner, experiment=experiment, ledger=ledger)
             for phase_name, winner in engine_winners.items()
         ]
     else:
-        status, winner_views = read_result(experiment, generation_id=generation_id)
+        status, winner_views = read_result(experiment, generation_id=generation_id, ledger=ledger)
         winner_snapshots = [
-            _winner_snapshot(winner.phase, winner, experiment=experiment) for winner in winner_views
+            _winner_snapshot(winner.phase, winner, experiment=experiment, ledger=ledger)
+            for winner in winner_views
         ]
     if not generation_claimed:
         status["represented_generation_id"] = None
