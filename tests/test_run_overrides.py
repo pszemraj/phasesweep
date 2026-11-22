@@ -299,31 +299,27 @@ def test_published_winner_survives_a_failed_later_generation(
     assert phase_payload["winner_is_published"] is (continuation != "append")
     assert str(expected_generation) in str(phase_payload["winner"])
     if continuation == "prepend_drift":
-        lead, published = winners.output.split("=== lead ===", 1)[1].split("=== p ===", 1)
-        assert "changed_metric: 0.5" in lead
+        # The changed metric and base change p's recorded config, so the run is refused
+        # before the prepended `lead` launches: p keeps its published winner, shown with
+        # the metric, annotation and base that produced it, and `lead` has no result.
+        assert "=== lead ===" not in winners.output
+        published = winners.output.split("=== p ===", 1)[1]
         assert "objective: 0.5" in published and "changed_metric:" not in published
         assert "# original annotation" in published and "changed annotation" not in published
         assert (
-            "# Historical published phase result: does not match the current config." in published
-        )
-        assert "# Historical experiment result: unpublished generation" not in winners.output
-        for generation, base in (
-            (published_id, "original-base"),
-            (status["current_generation_id"], "changed-base"),
-        ):
-            assert (
-                f"# Producing argparse trainer base for generation {generation}, before phase overrides.\n"
-                f"trainer_config:\n  caption: {base}"
-            ) in winners.output
-            assert winners.output.count(f"caption: {base}") == 1
+            f"# Historical experiment result: published generation {published_id} does not "
+            "match the current config."
+        ) in winners.output
+        assert (
+            "# Producing argparse trainer base, before phase overrides.\n"
+            "trainer_config:\n  caption: original-base"
+        ) in winners.output
+        assert "changed-base" not in winners.output
+        lead_payload = next(phase for phase in phases_payload if phase["name"] == "lead")
+        assert lead_payload["trials"] == {}, lead_payload
     table = CliRunner().invoke(cli, ["status", str(path), "--trials"])
     assert table.exit_code == 0, table.exception
-    if continuation == "prepend_drift":
-        # The new lead phase's winner is unpublished while p keeps its published one.
-        assert "winners come from different generations; each phase names its own" in table.output
-        assert f"winner from generation {expected_generation} ({expected_label})" in table.output
-    else:
-        assert f"{expected_label} generation {expected_generation}" in table.output
+    assert f"{expected_label} generation {expected_generation}" in table.output
 
 
 def test_show_winners_distinguishes_appended_phases_from_historical_results(tmp_path: Path) -> None:
