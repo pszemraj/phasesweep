@@ -72,7 +72,7 @@ from phasesweep.errors import (
     unreadable_objective_step,
 )
 from phasesweep.evidence.models import MlflowExtractor
-from phasesweep.runtime.json import JsonObject, json_object, json_text_map
+from phasesweep.runtime.json import JsonObject, float_or_none, json_object, json_text_map
 from phasesweep.runtime.terminal import (
     display_path,
     objective_text,
@@ -535,17 +535,6 @@ def _cost_advisory(
     return None
 
 
-def _number(value: object) -> float | None:
-    """Return a recorded param as a number, or ``None`` when it is not a non-boolean number.
-
-    :param object value: A sampled value or a configured choice.
-    :return float | None: The value, or ``None`` for booleans, strings and nulls.
-    """
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return None
-    return float(value)
-
-
 def _configured_end(param: SearchParam, *, upper: bool) -> float | None:
     """Return the most extreme value a numeric parameter's configuration allows on one side.
 
@@ -555,7 +544,7 @@ def _configured_end(param: SearchParam, *, upper: bool) -> float | None:
         all-numeric categorical, or ``None`` for choices that are not all numbers.
     """
     if isinstance(param, CategoricalParam):
-        choices = [_number(choice) for choice in param.choices]
+        choices = [float_or_none(choice) for choice in param.choices]
         numbers = [choice for choice in choices if choice is not None]
         if len(numbers) != len(choices):
             return None
@@ -602,12 +591,12 @@ def _edge_advisory(
     finished = [trial for trial in trials if _trial_count_state(trial) in FINISHED_TRIAL_STATES]
     clauses: list[str] = []
     for name, param in phase.search_space.items():
-        value = _number(params.get(name))
+        value = float_or_none(params.get(name))
         tried = sorted(
             {
                 number
                 for trial in finished
-                if (number := _number(trial.params.get(name))) is not None
+                if (number := float_or_none(trial.params.get(name))) is not None
             }
         )
         if value is None or len(tried) < 3 or value not in (tried[0], tried[-1]):

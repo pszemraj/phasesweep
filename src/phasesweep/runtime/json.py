@@ -100,6 +100,25 @@ def finite_nonnegative(value: object) -> int | float | None:
         return None
 
 
+def float_or_none(value: object) -> float | None:
+    """Return a non-boolean number as a float, or None when it is not one.
+
+    The trial tables read user attrs and the edge advisory reads params and configured choices
+    through it, so an integer too large for a float, such as ``10**400``, reads as no number
+    in each of them.
+
+    :param object value: A recorded param, a configured choice or a trial user attr.
+    :return float | None: The value as a float, or None for booleans, nonnumbers and an
+        integer that overflows a float.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        return float(value)
+    except OverflowError:
+        return None
+
+
 def json_value(value: object) -> JsonValue:
     """Rebuild decoded JSON containers with narrowed types.
 

@@ -114,7 +114,7 @@ from phasesweep.errors import (
     OperatorAction,
 )
 from phasesweep.evidence.models import EXTRACTOR_KINDS
-from phasesweep.runtime.json import JsonObject, JsonValue, json_object
+from phasesweep.runtime.json import JsonObject, JsonValue, float_or_none, json_object
 
 log = logging.getLogger(__name__)
 
@@ -1227,20 +1227,6 @@ def experiment_status(
     return json_object(payload)
 
 
-def _recorded_number(value: object) -> float | None:
-    """Return a recorded user-attr number when it is representable as a float.
-
-    :param object value: A trial user-attr value.
-    :return float | None: The value as a float, or ``None`` for nonnumbers or conversion overflow.
-    """
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return None
-    try:
-        return float(value)
-    except OverflowError:
-        return None
-
-
 def _recorded_count(value: object) -> int | None:
     """Read a count a winner file recorded, or ``None`` when it is not a non-negative integer.
 
@@ -1279,7 +1265,7 @@ _CORE_TRIAL_COLUMNS: tuple[tuple[str, Callable[[optuna.trial.FrozenTrial], JsonV
     ("state", _trial_count_state),
     ("value", lambda trial: trial.value),
     ("params", lambda trial: dict(trial.params)),
-    ("duration_s", lambda trial: _recorded_number(trial.user_attrs.get(DURATION_ATTR))),
+    ("duration_s", lambda trial: float_or_none(trial.user_attrs.get(DURATION_ATTR))),
     ("trial_dir", _trial_dir_text),
 )
 _REPEAT_GROUP_COLUMN = "repeat_group"
@@ -1340,7 +1326,7 @@ def _trial_table(
         if reruns:
             row[_RERUN_OF_COLUMN] = trial.user_attrs.get(RERUN_OF_ATTR)
         for name in observed:
-            row[name] = _recorded_number(trial.user_attrs.get(name))
+            row[name] = float_or_none(trial.user_attrs.get(name))
         if has_reason:
             row["reason"] = reasons[trial.number]
         row[_WINNER_COLUMN] = "*" if _stands_under_winner(trial, standing) else ""
@@ -1409,7 +1395,7 @@ def _repeat_group_views(
             if trial.state != optuna.trial.TrialState.COMPLETE:
                 continue
             for name, raw in trial.user_attrs.items():
-                value = _recorded_number(raw)
+                value = float_or_none(raw)
                 if name.startswith(OBSERVED_PREFIX) and value is not None and math.isfinite(value):
                     observations.setdefault(name[len(OBSERVED_PREFIX) :], []).append(value)
         group = eligible.get(label)
