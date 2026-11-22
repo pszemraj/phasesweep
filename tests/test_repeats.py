@@ -167,12 +167,28 @@ def test_noise_band_pools_every_group_and_compares_means_against_student_t() -> 
     assert band.within(winner, winner)
 
 
-@pytest.mark.parametrize(
-    ("df", "critical"),
-    [(1, 12.706205), (2, 4.302653), (30, 2.042272), (31, 1.959964), (500, 1.959964)],
-)
-def test_t_critical_reads_the_table_and_the_normal_value_past_it(df: int, critical: float) -> None:
+@pytest.mark.parametrize(("df", "critical"), [(1, 12.706205), (2, 4.302653), (30, 2.042272)])
+def test_t_critical_reads_the_table_up_to_thirty_degrees_of_freedom(
+    df: int, critical: float
+) -> None:
     assert t_critical(df) == critical
+
+
+@pytest.mark.parametrize(
+    ("df", "student"), [(31, 2.039513), (40, 2.021075), (60, 2.000298), (120, 1.979930)]
+)
+def test_t_critical_past_the_table_stays_near_students_t(df: int, student: float) -> None:
+    """The first correction to the normal value is within 0.15% of t from 31 on, never above it."""
+    assert t_critical(df) == pytest.approx(student, rel=0.0015)
+    assert t_critical(df) < student
+
+
+def test_t_critical_falls_smoothly_past_the_table_toward_the_normal_value() -> None:
+    """The threshold keeps falling at the table's end, by less than t itself falls from 30 to 31."""
+    assert 0 < t_critical(30) - t_critical(31) < 0.006
+    values = [t_critical(df) for df in range(31, 20000)]
+    assert values == sorted(values, reverse=True)
+    assert values[-1] == pytest.approx(1.959964, rel=1e-4)
 
 
 def test_t_critical_refuses_zero_degrees_of_freedom() -> None:

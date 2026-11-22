@@ -34,8 +34,9 @@ REDUCERS: tuple[ReduceName, ...] = get_args(ReduceName)
 RepeatValue: TypeAlias = str | int | float | bool | None
 """One value of the repeat axis, such as a seed."""
 
-# Two-sided 5% critical values of Student's t for 1 to 30 degrees of freedom. Past the table
-# the normal value stands in, which is within 4% of t from 31 degrees of freedom on.
+# Two-sided 5% critical values of Student's t for 1 to 30 degrees of freedom. Past the table,
+# t_critical adds the first term of the expansion of t about the normal value, which stays
+# within 0.15% of t from 31 degrees of freedom on and meets the table without a step.
 _T_CRITICAL = (
     12.706205,
     4.302653,
@@ -431,11 +432,15 @@ def t_critical(df: int) -> float:
 
     :param int df: Degrees of freedom, at least 1.
     :raises ValueError: ``df`` is below 1, which no ranked group of two or more members gives.
-    :return float: The tabulated value for 1 to 30 degrees of freedom, the normal value above.
+    :return float: The tabulated value for 1 to 30 degrees of freedom; above, the normal value
+        ``z`` plus the first correction, ``z + (z**3 + z) / (4 * df)``, which tends to ``z``.
     """
     if df < 1:
         raise ValueError(f"Student's t needs at least one degree of freedom, not {df}")
-    return _T_CRITICAL[df - 1] if df <= len(_T_CRITICAL) else _NORMAL_CRITICAL
+    if df <= len(_T_CRITICAL):
+        return _T_CRITICAL[df - 1]
+    z = _NORMAL_CRITICAL
+    return z + (z**3 + z) / (4 * df)
 
 
 def noise_band(groups: Sequence[RankedGroup]) -> NoiseBand | None:
