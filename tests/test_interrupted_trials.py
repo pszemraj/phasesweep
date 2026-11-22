@@ -782,6 +782,7 @@ def test_completed_orphan_evidence_survives_runner_sigkill(
     sdk_worker = recovery_stage in {"sdk", "sdk-interrupt", "sdk-interrupt-parallel"}
     shutdown_sdk = recovery_stage.startswith("sdk-interrupt")
     guardian_cancel = recovery_stage in {"shutdown-trainer", "timeout-trainer"}
+    direct_recovery = recovery_stage in {"interrupt-intent", "interrupt-termination"}
     terminated = recovery_stage in {
         "terminate",
         "mcp-terminate",
@@ -985,37 +986,15 @@ else:
                     )
                     assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds > 0
             assert (directory / "r.json").exists()
-            if terminated and not guardian_cancel:
-                terminate_group = reaper._terminate_process_group
-
-                def terminate_and_wait_for_guardian(
-                    pgid: int,
-                    *,
-                    grace_seconds: float,
-                ) -> bool:
-                    """Expose a handled SIGTERM's real zero exit before recovery reads evidence.
-
-                    :param int pgid: Trainer group selected for termination.
-                    :param float grace_seconds: SIGTERM grace before escalation.
-                    :return bool: Confirmed cleanup after the guardian records the trainer exit.
-                    """
-                    assert terminate_group(pgid, grace_seconds=grace_seconds)
-                    deadline = time.monotonic() + 5
-                    while time.monotonic() < deadline:
-                        exited = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
-                        if exited is not None and exited.state == "exited":
-                            break
-                        time.sleep(0.02)
-                    assert exited is not None and exited.state == "exited"
-                    assert exited.return_code == 0
-                    assert exited.cleanup_confirmed
-                    assert exited.duration_seconds is not None and exited.duration_seconds > 0
-                    assert (directory / "r.json").read_text() == '{"x": 0.25}'
-                    return True
-
-                monkeypatch.setattr(
-                    reaper, "_terminate_process_group", terminate_and_wait_for_guardian
-                )
+            if direct_recovery:
+                # Only the unguarded fallback records its interruption in Optuna before
+                # it signals. These cases exercise losing the recovery process there.
+                guardian_pid = orphan_identity.guardian_pid
+                os.kill(guardian_pid, signal.SIGKILL)
+                stop_deadline = time.monotonic() + 5
+                while reaper.is_same_live_process(guardian_pid, orphan_identity.guardian_starttime):
+                    assert time.monotonic() < stop_deadline, "guardian still owns cleanup"
+                    time.sleep(0.02)
             if recovery_stage.endswith("snapshot"):
                 snapshot = _generation_config_snapshot_path(
                     _experiment_dir(experiment), "orphan-generation"
@@ -1248,7 +1227,7 @@ else:
                     registry.state_dir, "orphan-generation", confirm=True
                 )
                 assert recovered_run.exit_code == 0, recovered_run.output
-                assert f"terminated {int(terminated)} live process group(s)" in recovered_run.output
+                assert "terminated 0 live process group(s)" in recovered_run.output
                 expected_kept = 0 if terminated else 1
                 assert f"kept {expected_kept} completed trial result(s)" in recovered_run.output
                 if expected_kept:
@@ -1287,7 +1266,7 @@ else:
             if terminated:
                 lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
                 assert lifecycle is not None and lifecycle.return_code == (
-                    -signal.SIGTERM if guardian_cancel else 0
+                    None if direct_recovery else -signal.SIGTERM
                 )
                 assert recovered.value is None
                 release.touch()
@@ -1923,7 +1902,7 @@ def test_recovery_preview_names_trial_group_liveness(
     )
     monkeypatch.setattr(reaper, "same_pid_namespace", lambda _: case != "foreign_absent")
     monkeypatch.setattr(reaper, "recorded_process_blocker", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(reaper, "is_pid_alive", lambda _: case == "live")
+    monkeypatch.setattr(reaper, "is_pid_alive", lambda pid: pid == 12345 and case == "live")
     monkeypatch.setattr(reaper, "read_proc_starttime", lambda _: 1)
     monkeypatch.setattr(reaper.os, "getpgid", lambda _: 12345)
     monkeypatch.setattr(reaper, "_process_group_exists", lambda _: case != "group_exited")
@@ -1931,7 +1910,11 @@ def test_recovery_preview_names_trial_group_liveness(
     monkeypatch.setattr(
         reaper,
         "_read_proc_stat",
-        lambda _: SimpleNamespace(pgrp=12345, starttime=2) if case == "reused_group" else None,
+        lambda entry: (
+            SimpleNamespace(pgrp=12345, starttime=2)
+            if entry.name == "12345" and case == "reused_group"
+            else None
+        ),
     )
     signalled: list[int] = []
     monkeypatch.setattr(

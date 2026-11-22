@@ -237,6 +237,7 @@ def _trial_process_identity(
     pid: int,
     pgid: int,
     pid_namespace: str,
+    guardian_pid: int,
 ) -> StaleProcessIdentity:
     """Build the identity persisted before a blocked supervisor may exec the trainer.
 
@@ -247,6 +248,7 @@ def _trial_process_identity(
     :param int pgid: Process-group ID that child was registered under.
     :param str pid_namespace: PID namespace ``pid`` and ``pgid`` are numbered in, from
         :func:`read_pid_namespace` before the launch.
+    :param int guardian_pid: Lease guardian PID in the same namespace.
     :return StaleProcessIdentity: The given fields combined with the current schema version,
         ``pid``'s kernel start time (``None`` if unreadable), and the current
         boot id (``None`` when unavailable).
@@ -259,6 +261,8 @@ def _trial_process_identity(
         proc_starttime=read_proc_starttime(pid),
         boot_id=read_boot_id(),
         pid_namespace=pid_namespace,
+        guardian_pid=guardian_pid,
+        guardian_starttime=read_proc_starttime(guardian_pid),
     )
 
 
@@ -759,6 +763,7 @@ def run_supervised(
                 pid=pgid,
                 pgid=pgid,
                 pid_namespace=pid_namespace,
+                guardian_pid=proc.pid,
             )
             _write_process_identity(identity_path, identity)
             if deadline is not None and time.monotonic() >= deadline:

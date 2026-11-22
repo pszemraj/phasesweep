@@ -104,6 +104,7 @@ from tests.conftest import (
     make_experiment,
     patch_published_trial_read_failure,
     phase_study,
+    reaped_pid,
     record_accepted_partial_timeout,
     requires_nonroot,
     trial_outcome,
@@ -1166,6 +1167,8 @@ def _clean_trial_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.Monk
             proc_starttime=111,
             boot_id="boot",
             pid_namespace="pid:[4026539001]@100",
+            guardian_pid=reaped_pid(),
+            guardian_starttime=1,
         )
     )
 

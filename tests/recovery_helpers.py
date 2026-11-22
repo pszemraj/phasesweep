@@ -47,7 +47,7 @@ def write_trial_identity(
     boot_id: str | None = None,
     pid_namespace: str | None = None,
 ) -> None:
-    """Leave the process identity file a launched trainer records.
+    """Leave the process identity file for a trainer whose guardian is already gone.
 
     ``pgid`` defaults to ``pid``, ``boot_id`` to this boot, and ``pid_namespace`` to this process's.
     """
@@ -61,6 +61,8 @@ def write_trial_identity(
             proc_starttime=starttime,
             boot_id=read_boot_id() if boot_id is None else boot_id,
             pid_namespace=read_pid_namespace() if pid_namespace is None else pid_namespace,
+            guardian_pid=reaped_pid(),
+            guardian_starttime=1,
         ),
     )
 

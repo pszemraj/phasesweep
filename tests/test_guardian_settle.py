@@ -11,6 +11,7 @@ starts in sessions of their own, reaps each one as it exits, and the same rules 
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import shlex
@@ -27,18 +28,20 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.engine.paths import _run_log_path
-from phasesweep.engine.state import FAILURE_REASON_ATTR
+from phasesweep.engine.state import ATTEMPT_ID_ATTR, FAILURE_REASON_ATTR, TRIAL_DIR_ATTR
 from phasesweep.errors import PhaseSweepError
 from phasesweep.mcp.runs import RUNNER_STOP_GRACE_SECONDS
 from phasesweep.runtime import process, reaper, supervisor
 from phasesweep.runtime.process import ProcessResult, read_attempt_lifecycle, run_supervised
-from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
+from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE, StaleProcessIdentity
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
     assert_descendant_dies,
+    console_script,
     make_experiment,
     phase_trials,
     use_guardian_timing,
+    write_experiment_config,
     write_trainer,
 )
 
@@ -963,6 +966,108 @@ def test_a_shutdown_during_the_settle_keeps_the_finished_result_for_the_next_run
     assert (trial.state, trial.value) == (optuna.trial.TrialState.COMPLETE, 0.5)
     assert winners["p"].metric == 0.5
     assert (marks / "calls").read_text().splitlines() == ["run"]
+
+
+@_LINUX_ADOPTION
+@pytest.mark.parametrize("older_kernel", [False, True], ids=["native", "no-pidfd-syscall"])
+def test_restart_during_the_settle_keeps_the_killed_controllers_finished_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, older_kernel: bool
+) -> None:
+    """Recovery waits for an escaped helper's guardian and retains the original objective."""
+    trainer, marks = _trainer(
+        tmp_path,
+        r"""
+        import os, signal, time
+        from pathlib import Path
+        marks = Path(__file__).parent / "marks"
+        with (marks / "calls").open("a") as calls:
+            calls.write("run\n")
+        print("x=0.5", flush=True)
+        parent = os.getpid()
+        if os.fork() == 0:
+            os.setsid()
+            signal.signal(signal.SIGTERM, lambda *_: (marks / "helper_sigterm").touch())
+            while os.getppid() == parent:
+                time.sleep(0.005)
+            (marks / "helper_pid").write_text(str(os.getpid()))
+            (marks / "root_gone").touch()
+            deadline = time.monotonic() + 30
+            while not (marks / "release").exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            (marks / "helper_done").touch()
+            os._exit(0)
+        os._exit(0)
+        """,
+    )
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=trainer, n_trials=1, gpu_policy="none"
+    )
+    experiment = experiment.model_copy(update={"trial_command": "exec " + experiment.trial_command})
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    with (tmp_path / "controller.log").open("w") as output:
+        controller = subprocess.Popen(
+            [str(console_script("phasesweep")), "run", str(config)],
+            stdout=output,
+            stderr=output,
+        )
+    try:
+        _wait_for_mark(marks / "root_gone")
+        helper_pid = int((marks / "helper_pid").read_text())
+        (trial,) = phase_trials(experiment)
+        assert trial.state == optuna.trial.TrialState.RUNNING
+        attempt = trial.user_attrs[ATTEMPT_ID_ATTR]
+        trial_dir = Path(trial.user_attrs[TRIAL_DIR_ATTR])
+        identity = reaper.read_stale_process_identity(trial_dir, expected_attempt_id=attempt)
+        assert identity.guardian_starttime is not None
+        assert _parent_of(helper_pid) == identity.guardian_pid
+        deadline = time.monotonic() + 5
+        while reaper._process_group_alive(identity.pgid):
+            assert time.monotonic() < deadline, "trainer group still lives"
+            time.sleep(0.01)
+        controller.kill()
+        assert controller.wait(timeout=5) == -signal.SIGKILL
+
+        if older_kernel:
+
+            def no_pidfd(pid: int) -> int:
+                raise OSError(errno.ENOSYS, "pidfd_open unavailable")
+
+            monkeypatch.setattr(os, "pidfd_open", no_pidfd, raising=False)
+
+        settle = reaper._stop_stale_guardian
+
+        def release_helper(stale: StaleProcessIdentity) -> bool:
+            """Release the helper only once recovery has found its guardian.
+
+            :param StaleProcessIdentity stale: Verified identity selected for guardian cleanup.
+            :return bool: Whether the guardian has exited.
+            """
+            assert stale == identity
+            assert reaper.is_pid_alive(helper_pid)
+            (marks / "release").touch()
+            return settle(stale)
+
+        monkeypatch.setattr(reaper, "_stop_stale_guardian", release_helper)
+        winners = run_experiment(experiment)
+        assert (marks / "helper_done").exists()
+        assert not (marks / "helper_sigterm").exists()
+        assert not reaper.is_pid_alive(helper_pid)
+        (recovered,) = phase_trials(experiment)
+        assert (recovered.state, recovered.value) == (optuna.trial.TrialState.COMPLETE, 0.5)
+        assert winners["p"].trial_number == trial.number
+        assert (marks / "calls").read_text().splitlines() == ["run"]
+        lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt)
+        assert lifecycle is not None
+        assert (lifecycle.state, lifecycle.return_code, lifecycle.cleanup_confirmed) == (
+            "exited",
+            0,
+            True,
+        )
+    finally:
+        (marks / "release").touch()
+        if controller.poll() is None:
+            controller.kill()
+            controller.wait(timeout=5)
 
 
 #: A rank its launcher starts in a session of its own: records its PID, then on SIGTERM

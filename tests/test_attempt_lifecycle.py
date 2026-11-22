@@ -11,16 +11,26 @@ import pytest
 
 from phasesweep.engine import attempts
 from phasesweep.engine.attempts import _attempt_process_resolution, _AttemptRecord, _resolve_attempt
+from phasesweep.engine.errors import StudyStorageUnavailableError
+from phasesweep.engine.paths import _attempts_dir
 from phasesweep.errors import OperatorAction
+from phasesweep.runtime import reaper
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import (
     ATTEMPT_LIFECYCLE_FILE,
     ATTEMPT_LIFECYCLE_SCHEMA_VERSION,
     AttemptLifecycle,
+    _write_process_identity,
     read_attempt_lifecycle,
     write_attempt_lifecycle,
 )
-from phasesweep.runtime.reaper import StaleProcessIdentity
+from phasesweep.runtime.reaper import (
+    PROCESS_IDENTITY_FILE,
+    PROCESS_IDENTITY_SCHEMA_VERSION,
+    StaleProcessIdentity,
+)
+from tests.conftest import make_experiment, reaped_pid
+from tests.recovery_helpers import fabricate_registered_attempt
 
 
 @pytest.mark.parametrize(
@@ -193,16 +203,20 @@ def test_a_stale_group_warns_only_when_cleanup_signalled_it(
 ) -> None:
     """Terminating a live group warns; confirming one that was already gone is routine."""
     identity = StaleProcessIdentity(
-        schema_version=1,
+        schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
         attempt_id="a1",
         pid=41,
         pgid=41,
         proc_starttime=None,
         boot_id=None,
         pid_namespace="pid:[1]@0",
+        guardian_pid=reaped_pid(),
+        guardian_starttime=1,
     )
 
-    def cleanup(_identity: StaleProcessIdentity, *, before_terminate: Callable[[], None]) -> bool:
+    def cleanup(
+        _identity: StaleProcessIdentity, *, before_terminate: Callable[[], None], **_kwargs: object
+    ) -> bool:
         if signalled:
             before_terminate()
         return True
@@ -227,3 +241,48 @@ def test_a_stale_group_warns_only_when_cleanup_signalled_it(
     assert [(entry.levelno, entry.getMessage()) for entry in caplog.records] == [
         (level, f"Attempt a1 phase='p' trial=3: {text}")
     ]
+
+
+def test_unreadable_ledger_blocks_stale_guardian_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live guardian receives no request while its owning study is unreadable."""
+    experiment = make_experiment(persistent=tmp_path)
+    stale = fabricate_registered_attempt(experiment, "p", attempt_id="a1")
+    identity = StaleProcessIdentity(
+        schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+        attempt_id="a1",
+        pid=41,
+        pgid=41,
+        proc_starttime=11,
+        boot_id="boot",
+        pid_namespace="pid:[1]@0",
+        guardian_pid=42,
+        guardian_starttime=10,
+    )
+    _write_process_identity(stale.trial_dir / PROCESS_IDENTITY_FILE, identity)
+    write_attempt_lifecycle(stale.trial_dir, attempt_id="a1", state="launching")
+    monkeypatch.setattr(reaper, "read_boot_id", lambda: identity.boot_id)
+    monkeypatch.setattr(reaper, "read_pid_namespace", lambda: identity.pid_namespace)
+    monkeypatch.setattr(reaper, "_stale_guardian_state", lambda _: "alive")
+    monkeypatch.setattr(
+        reaper, "_stop_stale_guardian", lambda _: pytest.fail("guardian received a signal")
+    )
+
+    def unreadable(storage_url: str, study_name: str) -> None:
+        """Fail the registry's owning study read.
+
+        :param str storage_url: Recorded storage locator.
+        :param str study_name: Recorded owning study.
+        :raises OSError: The ledger cannot answer.
+        """
+        raise OSError("ledger cannot be read")
+
+    monkeypatch.setattr(attempts, "open_registry_study", unreadable)
+    with pytest.raises(StudyStorageUnavailableError, match="Nothing was signalled"):
+        attempts._preflight_active_attempts(
+            experiment, attempts._PreflightCleanupReport(), confirm=True
+        )
+
+    assert (_attempts_dir(experiment) / "a1.json").is_file()
+    assert stale.study.get_trials()[0].state.name == "RUNNING"

@@ -80,6 +80,7 @@ from tests.conftest import (
     make_experiment,
     mark_current_format,
     patch_rejected_trial_user_attr,
+    reaped_pid,
     write_constant_trainer,
     write_trainer,
 )
@@ -700,6 +701,8 @@ def test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling(
         proc_starttime=111,
         boot_id="old-boot",
         pid_namespace=_RECORDED_NAMESPACE,
+        guardian_pid=reaped_pid(),
+        guardian_starttime=1,
     )
     monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: "current-boot")
     monkeypatch.setattr(
@@ -723,6 +726,8 @@ def test_cleanup_stale_trial_process_refuses_unverifiable_platform_identity(
         proc_starttime=None,
         boot_id=None,
         pid_namespace=_RECORDED_NAMESPACE,
+        guardian_pid=reaped_pid(),
+        guardian_starttime=1,
     )
     monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: None)
     monkeypatch.setattr("phasesweep.runtime.reaper.read_pid_namespace", lambda: _RECORDED_NAMESPACE)
@@ -1079,6 +1084,8 @@ def test_reaper_reports_storage_failures_after_cleanup(
             proc_starttime=12345,
             boot_id="test-boot",
             pid_namespace=_RECORDED_NAMESPACE,
+            guardian_pid=reaped_pid(),
+            guardian_starttime=1,
         )
 
     monkeypatch.setattr("phasesweep.engine.attempts.read_stale_process_identity", fake_identity)

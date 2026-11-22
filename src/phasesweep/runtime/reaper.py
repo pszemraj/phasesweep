@@ -14,6 +14,7 @@ stdlib-only copies of two liveness rules here: :func:`_has_exited` as
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import re
@@ -39,7 +40,7 @@ _KILL_GRACE_SECONDS = 10.0
 # scans, which a loaded machine stretches to over a second.
 _GUARDIAN_EXIT_MARGIN_SECONDS = 5.0
 PROCESS_IDENTITY_FILE = "process_identity.json"
-PROCESS_IDENTITY_SCHEMA_VERSION = 3
+PROCESS_IDENTITY_SCHEMA_VERSION = 4
 
 #: The kernel constant ``PROC_PID_INIT_INO``: the ``ns/pid`` link text of the
 #: initial PID namespace, fixed since Linux 3.8. That namespace is never freed.
@@ -52,7 +53,7 @@ _PROC = Path("/proc")
 
 @dataclass(frozen=True)
 class StaleProcessIdentity:
-    """Durable identity of one launched trial process group."""
+    """Durable identity of one launched trial process group and its lease guardian."""
 
     schema_version: int
     attempt_id: str
@@ -61,6 +62,8 @@ class StaleProcessIdentity:
     proc_starttime: int | None
     boot_id: str | None
     pid_namespace: str
+    guardian_pid: int
+    guardian_starttime: int | None
 
 
 def read_boot_id() -> str | None:
@@ -503,6 +506,8 @@ def read_stale_process_identity(
         "proc_starttime",
         "boot_id",
         "pid_namespace",
+        "guardian_pid",
+        "guardian_starttime",
     }
     if not required_fields.issubset(payload):
         raise ValueError(f"Trial process identity at {path} is partial.")
@@ -527,13 +532,14 @@ def read_stale_process_identity(
             raise ValueError(f"Trial process identity field {field!r} is invalid at {path}.")
         return value
 
-    proc_starttime = payload.get("proc_starttime")
-    if proc_starttime is not None and (
-        isinstance(proc_starttime, bool)
-        or not isinstance(proc_starttime, int)
-        or proc_starttime <= 0
-    ):
-        raise ValueError(f"Trial process identity field 'proc_starttime' is invalid at {path}.")
+    proc_starttime = None if payload["proc_starttime"] is None else positive_int("proc_starttime")
+    guardian_pid = positive_int("guardian_pid")
+    guardian_starttime = (
+        None if payload["guardian_starttime"] is None else positive_int("guardian_starttime")
+    )
+    pid, pgid = positive_int("pid"), positive_int("pgid")
+    if guardian_pid in {pid, pgid}:
+        raise ValueError(f"Trial process identity field 'guardian_pid' is invalid at {path}.")
     boot_id = payload.get("boot_id")
     if boot_id is not None and (not isinstance(boot_id, str) or not boot_id):
         raise ValueError(f"Trial process identity field 'boot_id' is invalid at {path}.")
@@ -543,11 +549,13 @@ def read_stale_process_identity(
     return StaleProcessIdentity(
         schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
         attempt_id=attempt_id,
-        pid=positive_int("pid"),
-        pgid=positive_int("pgid"),
+        pid=pid,
+        pgid=pgid,
         proc_starttime=proc_starttime,
         boot_id=boot_id,
         pid_namespace=pid_namespace,
+        guardian_pid=guardian_pid,
+        guardian_starttime=guardian_starttime,
     )
 
 
@@ -555,13 +563,13 @@ def read_stale_process_identity(
 class StaleProcessDecision:
     """One read-only cleanup decision, shared by inspection and termination."""
 
-    action: Literal["gone", "terminate", "refuse"]
+    action: Literal["gone", "guardian", "terminate", "refuse"]
     reason: str
     pgid: int | None = None
 
 
 def stale_trial_process_decision(identity: StaleProcessIdentity) -> StaleProcessDecision:
-    """Decide whether a recorded trial group is absent, safe to signal, or unsafe.
+    """Decide whether a guardian owns cleanup or the recorded trial group needs it.
 
     :param StaleProcessIdentity identity: Attempt-bound durable process identity.
     :raises ForeignPidNamespaceError: Another namespace's processes cannot be proven absent.
@@ -572,7 +580,9 @@ def stale_trial_process_decision(identity: StaleProcessIdentity) -> StaleProcess
         return StaleProcessDecision("gone", "an earlier host boot proves the process group gone")
     if not same_pid_namespace(identity.pid_namespace):
         blocker = recorded_process_blocker(
-            identity.pid_namespace, pids=(identity.pid,), pgids=(identity.pgid,)
+            identity.pid_namespace,
+            pids=(identity.pid, identity.guardian_pid),
+            pgids=(identity.pgid, identity.guardian_pid),
         )
         if blocker is None:
             return StaleProcessDecision(
@@ -582,7 +592,16 @@ def stale_trial_process_decision(identity: StaleProcessIdentity) -> StaleProcess
             f"Attempt {identity.attempt_id} (pid={identity.pid}) cannot be cleaned from here: "
             f"{foreign_pid_namespace_reason(identity.pid_namespace, blocker)}."
         )
-    if identity.boot_id is None or identity.proc_starttime is None or current_boot_id is None:
+    if identity.boot_id is None or current_boot_id is None:
+        return StaleProcessDecision("refuse", "robust process-birth identity is unavailable")
+    guardian = _stale_guardian_state(identity)
+    if guardian == "unknown":
+        return StaleProcessDecision("refuse", "the recorded lease guardian cannot be verified")
+    if guardian == "alive":
+        return StaleProcessDecision(
+            "guardian", f"lease guardian PID {identity.guardian_pid} owns descendant cleanup"
+        )
+    if identity.proc_starttime is None:
         return StaleProcessDecision("refuse", "robust process-birth identity is unavailable")
     return _stale_group_decision(identity.pid, identity.proc_starttime, pgid=identity.pgid)
 
@@ -591,21 +610,99 @@ def cleanup_stale_trial_process(
     identity: StaleProcessIdentity,
     *,
     grace_seconds: float = _KILL_GRACE_SECONDS,
+    before_signal: Callable[[], None] | None = None,
     before_terminate: Callable[[], None] | None = None,
+    guardian_completed: Callable[[], bool] | None = None,
 ) -> bool:
     """Apply the same boot, namespace and group decision used by recovery inspection.
 
     :param StaleProcessIdentity identity: Attempt-bound durable process identity.
     :param float grace_seconds: SIGTERM grace before SIGKILL.
+    :param Callable[[], None] | None before_signal: Check the caller's authority before any
+        signal to a guardian or trainer group.
     :param Callable[[], None] | None before_terminate: Commit recovery intent before signalling a live group; a raised exception prevents termination.
+    :param Callable[[], bool] | None guardian_completed: Read the guardian's durable verdict
+        after it exits. Process-only callers may omit this check.
     :raises ForeignPidNamespaceError: Another namespace's processes cannot be proven absent.
     :return bool: Whether cleanup is confirmed; unsafe identities remain untouched.
     """
-    return _apply_stale_process_decision(
-        stale_trial_process_decision(identity),
-        grace_seconds=grace_seconds,
-        before_terminate=before_terminate,
-    )
+    decision = stale_trial_process_decision(identity)
+    if decision.action in {"guardian", "terminate"} and before_signal is not None:
+        before_signal()
+    if decision.action != "guardian":
+        return _apply_stale_process_decision(
+            decision, grace_seconds=grace_seconds, before_terminate=before_terminate
+        )
+    # The guardian alone knows if its root is still running. It saves cancellation
+    # before signalling a live root and preserves a finished root's verdict.
+    log.info("Stale process cleanup: %s.", decision.reason)
+    if not _stop_stale_guardian(identity):
+        return False
+    return guardian_completed is None or guardian_completed()
+
+
+def _stale_guardian_state(identity: StaleProcessIdentity) -> Literal["alive", "gone", "unknown"]:
+    """Check the guardian's birth and session ownership in the verified namespace and boot.
+
+    :param StaleProcessIdentity identity: Identity recorded before the payload crossed.
+    :return str: Whether the recorded guardian lives, is gone, or cannot be verified.
+    """
+    pid = identity.guardian_pid
+    stat = _process_stat(pid)
+    if stat is None:
+        return "unknown" if is_pid_alive(pid) else "gone"
+    if _has_exited(pid, stat.state) or (
+        identity.guardian_starttime is not None and stat.starttime != identity.guardian_starttime
+    ):
+        return "gone"
+    if identity.guardian_starttime is None or stat.pgrp != pid:
+        return "unknown"
+    return "alive"
+
+
+def _stop_stale_guardian(identity: StaleProcessIdentity) -> bool:
+    """Ask the original guardian to settle and wait for its bounded cleanup window.
+
+    A pidfd pins the Linux signal target while its birth is rechecked. macOS uses the
+    native birth check immediately before signalling, as for its other recovered processes.
+    A guardian that vanishes during the request can still have finished its record.
+
+    :param StaleProcessIdentity identity: The same-boot, same-namespace attempt identity.
+    :return bool: Whether the guardian exited and its completion record can be examined.
+    """
+    pid = identity.guardian_pid
+    pidfd = None
+    try:
+        if (
+            sys.platform == "linux"
+            and hasattr(os, "pidfd_open")
+            and hasattr(signal, "pidfd_send_signal")
+        ):
+            try:
+                pidfd = os.pidfd_open(pid)
+            except OSError as exc:
+                # Python can expose pidfd_open while the running kernel predates it.
+                if exc.errno != errno.ENOSYS:
+                    raise
+        state = _stale_guardian_state(identity)
+        if state != "alive":
+            return state == "gone"
+        if pidfd is None:
+            os.kill(pid, signal.SIGTERM)
+        else:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError as exc:
+        log.warning("Could not request cleanup from lease guardian PID %d: %s", pid, exc)
+        return False
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
+    deadline = time.monotonic() + guardian_exit_timeout()
+    while (state := _stale_guardian_state(identity)) == "alive" and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return state == "gone"
 
 
 def _apply_stale_process_decision(

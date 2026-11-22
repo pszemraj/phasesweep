@@ -798,12 +798,16 @@ def _registry_attempt_fail_stale_trial(
         :param bool storage_unavailable: Whether durable interruption intent cannot be recorded.
         """
 
-        def before_terminate() -> None:
-            """Refuse signalling until a recoverable trainer interruption is durable."""
+        def require_owning_ledger() -> None:
+            """Keep a live attempt untouched until its owning ledger can be read."""
             if storage_unavailable:
                 raise StudyStorageUnavailableError(
-                    f"Attempt {record.attempt_id} has a live process group, but its study cannot be read to preserve interruption intent. Nothing was signalled; retry when its ledger is available."
+                    f"Cannot request cleanup for live attempt {record.attempt_id}: its study "
+                    "cannot be read. Nothing was signalled; retry when its ledger is available."
                 )
+
+        def before_terminate() -> None:
+            """Preserve interruption before directly signalling an unguarded trainer."""
             if study is not None and trial is not None:
                 _record_recovery_interruption(study, trial)
 
@@ -813,6 +817,7 @@ def _registry_attempt_fail_stale_trial(
             evidence_action=OperatorAction.RESTORE_TREE,
             lifecycle_settles=True,
             confirm=True,
+            before_signal=require_owning_ledger,
             before_terminate=before_terminate,
         )
 
@@ -1026,6 +1031,7 @@ def _resolve_attempt(
     evidence_action: OperatorAction,
     lifecycle_settles: bool,
     confirm: bool,
+    before_signal: Callable[[], None] | None = None,
     before_terminate: Callable[[], None] | None = None,
     inspection_messages: dict[_AttemptRecord, str] | None = None,
 ) -> bool:
@@ -1041,12 +1047,14 @@ def _resolve_attempt(
     :param OperatorAction evidence_action: Remedy for invalid lifecycle or identity evidence.
     :param bool lifecycle_settles: Whether lifecycle evidence can prove cleanup.
     :param bool confirm: Clean the process group; False validates evidence without signalling.
-    :param Callable[[], None] | None before_terminate: Preserve the owning trainer outcome before terminating a live group.
+    :param Callable[[], None] | None before_signal: Confirm authority before requesting any signal.
+    :param Callable[[], None] | None before_terminate: Preserve the owning trainer outcome before directly terminating a live group.
     :param dict[_AttemptRecord, str] | None inspection_messages: Collect one preview message per attempt instead of logging immediately.
     :raises ProcessCleanupUncertainError: Invalid or mismatched lifecycle/identity,
         or unconfirmed process cleanup.
     :raises StudyStorageUnavailableError: Recovery intent could not be recorded durably before signalling.
-    :return bool: Whether inspection would terminate a live group, or confirmation terminated one.
+    :return bool: Whether this pass would directly signal a group, or did so when confirmed.
+        A request to its guardian is reported separately.
     """
     context = (
         f"{context}: attempt={record.attempt_id} phase={record.phase_name!r} "
@@ -1066,16 +1074,18 @@ def _resolve_attempt(
         else:
             inspection_messages[record] = message
 
-    if lifecycle_settles:
+    def read_lifecycle() -> AttemptLifecycle | None:
+        """Read this attempt's current lifecycle under the discovery source's error policy."""
         try:
-            lifecycle = read_attempt_lifecycle(
-                record.trial_dir, expected_attempt_id=record.attempt_id
-            )
+            return read_attempt_lifecycle(record.trial_dir, expected_attempt_id=record.attempt_id)
         except ValueError as exc:
             raise ProcessCleanupUncertainError(
                 f"{context}: attempt lifecycle record is malformed or belongs to another attempt.",
                 action=evidence_action,
             ) from exc
+
+    if lifecycle_settles:
+        lifecycle = read_lifecycle()
         resolution = _record_process_resolution(record, lifecycle)
         if resolution == "payload_withheld":
             report(
@@ -1106,10 +1116,15 @@ def _resolve_attempt(
         decision = stale_trial_process_decision(identity)
         action = {
             "terminate": "--confirm will terminate it if still alive before reconciling this attempt",
+            "guardian": "--confirm will ask the guardian to settle before reconciling this attempt",
             "gone": "--confirm will reconcile this attempt without signalling",
             "refuse": "--confirm will refuse cleanup and leave this attempt unresolved",
         }[decision.action]
-        if decision.action == "terminate" and lifecycle_settles and record.trial_number is not None:
+        if (
+            decision.action in {"terminate", "guardian"}
+            and lifecycle_settles
+            and record.trial_number is not None
+        ):
             action += (
                 ". With persistent storage, wait for the trainer to exit successfully "
                 "to keep its result"
@@ -1120,6 +1135,19 @@ def _resolve_attempt(
         )
         return decision.action == "terminate"
     terminated = False
+    guardian_settled = False
+
+    def confirm_guardian_exit() -> bool:
+        """Read the verified guardian's final verdict before claiming cleanup."""
+        nonlocal guardian_settled
+        lifecycle = read_lifecycle()
+        guardian_settled = (
+            lifecycle is not None
+            and lifecycle.state == "exited"
+            and lifecycle.cleanup_confirmed is True
+            and lifecycle.duration_seconds is not None
+        )
+        return guardian_settled
 
     def record_termination() -> None:
         """Preserve interruption intent before marking the group for termination."""
@@ -1130,13 +1158,18 @@ def _resolve_attempt(
 
     if not cleanup_stale_trial_process(
         identity,
+        before_signal=before_signal,
         before_terminate=record_termination,
+        guardian_completed=confirm_guardian_exit,
     ):
         raise ProcessCleanupUncertainError(
             f"{context}: process cleanup could not be confirmed (pid={identity.pid} "
-            f"pgid={identity.pgid}). List the group's members with "
+            f"pgid={identity.pgid} guardian={identity.guardian_pid}). List the group's members with "
             f"{group_members_command(str(identity.pgid))}, then retry recovery."
         )
+    if guardian_settled:
+        log.info("%s: lease guardian confirmed descendant cleanup.", label)
+        return False
     _record_attempt_exited(record.trial_dir, attempt_id=record.attempt_id, return_code=None)
     # Signalling a live group is worth a warning; a group that was already gone is routine.
     log.log(

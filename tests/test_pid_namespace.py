@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -50,6 +51,7 @@ from phasesweep.runtime.reaper import (
     same_pid_namespace,
 )
 from phasesweep.runtime.time import utc_now_iso
+from tests.conftest import reaped_pid
 from tests.ledger_fixtures import tree_snapshot
 from tests.mcp_helpers import (
     claim_runner_handle,
@@ -145,6 +147,8 @@ def _identity(
         proc_starttime=proc_starttime,
         boot_id=boot_id,
         pid_namespace=pid_namespace,
+        guardian_pid=reaped_pid(),
+        guardian_starttime=1,
     )
 
 
@@ -407,11 +411,16 @@ def test_trial_process_identity_records_the_launching_namespace(tmp_path: Path) 
         pytest.skip("/proc is not this process's own procfs")
 
     identity = _trial_process_identity(
-        attempt_id="ns-attempt", pid=os.getpid(), pgid=os.getpid(), pid_namespace=namespace
+        attempt_id="ns-attempt",
+        pid=os.getpid(),
+        pgid=os.getpid(),
+        pid_namespace=namespace,
+        guardian_pid=os.getppid(),
     )
     _write_process_identity(tmp_path / PROCESS_IDENTITY_FILE, identity)
 
     assert identity.pid_namespace == namespace
+    assert identity.guardian_pid == os.getppid()
     assert json.loads((tmp_path / PROCESS_IDENTITY_FILE).read_text())["pid_namespace"] == namespace
     assert read_stale_process_identity(tmp_path, expected_attempt_id="ns-attempt") == identity
 
@@ -467,6 +476,21 @@ def test_read_stale_process_identity_requires_pid_namespace(tmp_path: Path) -> N
             read_stale_process_identity(tmp_path, expected_attempt_id="ns-attempt")
 
 
+@pytest.mark.parametrize("invalid_pid", [None, False, 0, -1, "65", 4242])
+def test_read_stale_process_identity_requires_a_distinct_positive_guardian_pid(
+    tmp_path: Path, invalid_pid: object
+) -> None:
+    """Every on-disk identity names a positive guardian PID distinct from the trainer group."""
+    path = tmp_path / PROCESS_IDENTITY_FILE
+    _write_process_identity(path, _identity(pid_namespace=RECORDED))
+    record = json.loads(path.read_text())
+    record["guardian_pid"] = invalid_pid
+    path.write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="guardian_pid"):
+        read_stale_process_identity(tmp_path, expected_attempt_id="ns-attempt")
+
+
 def test_cleanup_stale_trial_process_refuses_foreign_namespace_without_signalling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -513,13 +537,52 @@ def test_cleanup_stale_trial_process_names_what_blocks_the_absence_proof(
     assert "kill -9" not in str(caught.value)
 
 
+def test_foreign_guardian_blocks_absence_without_a_trainer_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A foreign guardian can retain escaped helpers even after its trainer group exits."""
+    proc = _fake_proc(tmp_path, monkeypatch)
+    _write_process(proc, 701, nspid=[701, 65], namespace=RECORDED)
+    identity = replace(_identity(pid_namespace=RECORDED), guardian_pid=65, guardian_starttime=111)
+    monkeypatch.setattr(reaper, "read_boot_id", lambda: identity.boot_id)
+    monkeypatch.setattr(
+        reaper, "_stop_stale_guardian", lambda _: pytest.fail("cannot signal a foreign guardian")
+    )
+
+    with pytest.raises(ForeignPidNamespaceError, match="701"):
+        cleanup_stale_trial_process(identity)
+
+
+def test_a_live_guardian_without_its_birth_identity_blocks_group_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unverifiable live guardian evidence blocks both guardian and direct group signals."""
+    identity = replace(_identity(pid_namespace=RECORDED), guardian_pid=65, guardian_starttime=None)
+    monkeypatch.setattr(reaper, "read_boot_id", lambda: identity.boot_id)
+    monkeypatch.setattr(reaper, "read_pid_namespace", lambda: RECORDED)
+    monkeypatch.setattr(reaper, "_process_stat", lambda _: None)
+    monkeypatch.setattr(reaper, "is_pid_alive", lambda _: True)
+    monkeypatch.setattr(
+        reaper,
+        "_stop_stale_guardian",
+        lambda _: pytest.fail("cannot signal an unverified guardian"),
+    )
+    monkeypatch.setattr(
+        reaper,
+        "_terminate_process_group",
+        lambda *_args, **_kwargs: pytest.fail("guardian may own more than the trainer group"),
+    )
+
+    assert cleanup_stale_trial_process(identity) is False
+
+
 def test_cleanup_stale_trial_process_signals_only_within_the_same_namespace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(reaper, "read_boot_id", lambda: "boot")
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: RECORDED)
     signalled: list[int] = []
-    monkeypatch.setattr(reaper, "is_pid_alive", lambda _: True)
+    monkeypatch.setattr(reaper, "is_pid_alive", lambda pid: pid == 4242)
     monkeypatch.setattr(reaper, "read_proc_starttime", lambda _: 111)
     monkeypatch.setattr(reaper.os, "getpgid", lambda _: 4242)
     monkeypatch.setattr(reaper, "_process_group_alive", lambda _: True)
