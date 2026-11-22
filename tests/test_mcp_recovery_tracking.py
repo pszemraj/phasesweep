@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
+import signal
+import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -19,12 +23,14 @@ from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
+from phasesweep.runtime import shutdown
 from phasesweep.runtime.json import JsonObject
+from phasesweep.runtime.shutdown import signal_name
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
 from phasesweep.tracking.mlflow import OperationRejectedError, OperationUnavailableError
 from phasesweep.tracking.session import read_record, tracking_root
-from tests.conftest import write_experiment_config
+from tests.conftest import invoke_cli_boundary, write_experiment_config
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     make_mcp_app,
@@ -36,6 +42,7 @@ from tests.mcp_helpers import (
 from tests.recovery_helpers import recover_run_cli
 from tests.tracking_helpers import (
     RunnerKilled,
+    hang_uploads_until_killed,
     killed_sweep,
     leak_tracking_worker,
     leave_cleanup_uncertain_attempt,
@@ -529,6 +536,74 @@ def test_a_recover_run_killed_before_its_uploads_end_is_settled_by_one_more_pass
     assert not run.store.cleanup_uncertain(run.handle)
     assert (run.sent(), run.summaries()) == (["KILLED"], ["KILLED"])
     publication.sync_tracking(run.experiment)
+    assert (run.sent(), run.summaries()) == (["KILLED"], ["KILLED"])
+
+
+@pytest.mark.integration
+@pytest.mark.signals_own_pid
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP], ids=signal_name)
+def test_a_shutdown_signal_during_recover_run_stops_its_worker_and_prints_the_command_that_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    signum: int,
+) -> None:
+    """A real SIGTERM or SIGHUP while recover-run --confirm uploads stops the worker and names the rerun.
+
+    The shutdown handler kills the upload worker in flight, and the command exits with 128 plus
+    the signal number after the interrupt line and the stop line, the command whole on the last
+    line. Nothing is sent and the run stays recovery-required; that command, run as printed,
+    clears it and sends each outcome once.
+    """
+    run = _killed_run(tmp_path, monkeypatch)
+    run.uploads.clear()
+    uploading: list[str] = []
+
+    def signal_once_the_upload_runs() -> None:
+        deadline = time.monotonic() + 30.0
+        while (not uploading or not shutdown._active_children) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        os.kill(os.getpid(), signum)
+
+    command = shlex.join(
+        [
+            "phasesweep",
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(run.state_dir),
+            "--run-id",
+            _RUN_ID,
+            "--confirm",
+        ]
+    )
+    with monkeypatch.context() as patch:
+        hang_uploads_until_killed(patch, uploading)
+        capsys.readouterr()
+        sender = threading.Thread(target=signal_once_the_upload_runs, daemon=True)
+        sender.start()
+        status = invoke_cli_boundary(shlex.split(command)[1:], monkeypatch)
+        sender.join(timeout=5)
+
+    error = capsys.readouterr().err
+    assert status == 128 + signum
+    assert len(uploading) == 1
+    assert not shutdown._active_children
+    assert re.search(
+        rf"^\d\d:\d\d:\d\d  Interrupted \({signal_name(signum)}\): no trial is running; "
+        r"stopping 1 MLflow request\.$",
+        error,
+        re.MULTILINE,
+    )
+    assert error.splitlines()[-2:] == [
+        "phasesweep: stopped. Rerun the same command to finish the recovery:",
+        command,
+    ]
+    assert run.store.observe(run.handle).recovery_required
+    assert (run.sent(), run.summaries()) == ([], [])
+
+    assert invoke_cli_boundary(shlex.split(command)[1:], monkeypatch) == 0
+    assert not run.store.observe(run.handle).recovery_required
     assert (run.sent(), run.summaries()) == (["KILLED"], ["KILLED"])
 
 

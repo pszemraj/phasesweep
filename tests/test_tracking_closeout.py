@@ -10,7 +10,6 @@ import shlex
 import signal
 import threading
 import time
-from collections.abc import Mapping
 from pathlib import Path
 from typing import NamedTuple
 
@@ -28,7 +27,7 @@ from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.errors import ProcessCleanupUncertainError
-from phasesweep.runtime import process, shutdown
+from phasesweep.runtime import shutdown
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
@@ -39,7 +38,6 @@ from phasesweep.runtime.terminal import REPORT_LOGGER, ReportBlock
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
 from phasesweep.tracking.mlflow import (
-    OperationOutcomeUnknownError,
     OperationRejectedError,
     OperationUnavailableError,
 )
@@ -48,6 +46,7 @@ from tests.conftest import invoke_cli_boundary, write_experiment_config
 from tests.tracking_helpers import (
     RunnerKilled,
     attempt_identity,
+    hang_uploads_until_killed,
     leak_tracking_worker,
     native_experiment,
     remote_mlflow_example,
@@ -179,52 +178,6 @@ def _listing(root: Path) -> dict[str, tuple[int, int]]:
         path.relative_to(root).as_posix(): (path.lstat().st_size, path.lstat().st_mtime_ns)
         for path in sorted(root.rglob("*"))
     }
-
-
-def _hang_uploads_until_killed(monkeypatch: pytest.MonkeyPatch, started: list[str]) -> None:
-    """Make every MLflow upload run a real supervised worker that only a signal ends.
-
-    The worker registers as ``runtime.remote_worker.run_worker`` registers a real one, so the
-    shutdown handler names and kills it as an MLflow request. Every other request is answered
-    as before.
-
-    :param pytest.MonkeyPatch monkeypatch: Replaces the request function for the test.
-    :param list[str] started: Receives the record name of each upload as it starts.
-    """
-    respond = session.request_operation
-
-    def upload_until_killed(
-        request: Mapping[str, object],
-        *,
-        operation_id: str,
-        directory: Path,
-        environment: Mapping[str, str],
-        deadline: float,
-    ) -> JsonObject:
-        if request["action"] != "publish":
-            return respond(
-                request,
-                operation_id=operation_id,
-                directory=directory,
-                environment=environment,
-                deadline=deadline,
-            )
-        started.append(str(request["name"]))
-        with Path(os.devnull).open("w") as sink:
-            result = process.run_supervised(
-                "sleep 30",
-                env=dict(os.environ),
-                stdout=sink,
-                stderr=sink,
-                timeout=60,
-                trial_dir=directory,
-                attempt_id=operation_id,
-                label="MLflow request",
-            )
-        raise OperationOutcomeUnknownError(f"MLflow worker failed (exit {result.return_code}).")
-
-    monkeypatch.setattr(session, "request_operation", upload_until_killed)
-    monkeypatch.setattr(worker, "request_operation", upload_until_killed)
 
 
 def _kill_at_summary_creation(monkeypatch: pytest.MonkeyPatch, experiment: Experiment) -> Path:
@@ -504,7 +457,7 @@ def test_a_ctrl_c_while_trials_upload_stops_delivery_without_blaming_mlflow(
             time.sleep(0.02)
         os.kill(os.getpid(), signal.SIGINT)
 
-    _hang_uploads_until_killed(monkeypatch, requests)
+    hang_uploads_until_killed(monkeypatch, requests)
     sender = threading.Thread(target=interrupt_once_every_upload_runs, daemon=True)
     caplog.set_level(logging.INFO)
     sender.start()
@@ -1133,7 +1086,7 @@ def test_a_ctrl_c_during_sync_tracking_says_what_stays_pending_and_exits_130(
             time.sleep(0.02)
         os.kill(os.getpid(), signal.SIGINT)
 
-    _hang_uploads_until_killed(monkeypatch, uploading)
+    hang_uploads_until_killed(monkeypatch, uploading)
     config = write_experiment_config(Path.cwd() / "experiment.yaml", sweep.experiment)
     capsys.readouterr()
     sender = threading.Thread(target=interrupt_once_the_upload_runs, daemon=True)

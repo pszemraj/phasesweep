@@ -1595,9 +1595,13 @@ def _catalog_error_text(exc: CatalogError) -> str:
 def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     """Recover cleanup, interrupted publication, or result finalization.
 
+    A shutdown signal during a confirmed pass stops its workers and prints the command that
+    finishes the recovery, then the command exits with the signal's status.
+
     :param Path state_dir: MCP state directory containing the run metadata.
     :param str run_id: Identifier of the run to recover.
     :param bool confirm: Whether to perform recovery instead of only reporting actions.
+    :raises PhaseSweepShutdown: A shutdown signal stopped a confirmed pass.
     :raises click.ClickException: If the host is not a supported MCP host, the state
         directory or run id is unknown, the launch outcome is still unresolved, no
         immutable terminal snapshot exists, an interrupted publication cannot
@@ -1621,6 +1625,15 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         except RunRecoveryError as exc:
             _print_operational_error(exc)
             raise click.exceptions.Exit(_FAILURE_EXIT) from None
+        except PhaseSweepShutdown:
+            # A stopped pass leaves the run recovery-required unless it had already cleared it,
+            # and either way the same command finishes or confirms the recovery.
+            command = command_line(
+                "mcp", "recover-run", "--state-dir", str(state_dir), "--run-id", run_id, "--confirm"
+            )
+            sentence = "phasesweep: stopped. Rerun the same command to finish the recovery:"
+            click.echo("\n".join([*wrap(sentence, terminal_width(sys.stderr)), command]), err=True)
+            raise
 
 
 @mcp.command(

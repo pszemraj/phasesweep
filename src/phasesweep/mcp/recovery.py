@@ -73,6 +73,7 @@ from phasesweep.runtime.reaper import (
     kill_stale_group,
     read_boot_id,
 )
+from phasesweep.runtime.shutdown import signal_handler_scope
 from phasesweep.runtime.terminal import command_line
 from phasesweep.runtime.time import utc_now_iso
 
@@ -128,11 +129,16 @@ def recover_run(
 ) -> None:
     """Inspect or perform recovery while retaining its lock and write ordering.
 
+    A confirmed pass can start evidence-read and MLflow workers, so it owns the shutdown
+    signals as sync-tracking does: SIGTERM, SIGINT or SIGHUP stops those workers and ends the
+    pass, and a pass stopped before it clears the run leaves it for another confirmed pass.
+
     :param Path state_dir: Existing, normalized MCP state directory.
     :param str run_id: Run identity to recover.
     :param bool confirm: Perform recovery instead of reporting the proposed actions.
     :param Callable emit: Report operator messages as each recovery step completes.
     :raises RunRecoveryError: The run cannot be inspected or safely recovered.
+    :raises PhaseSweepShutdown: A shutdown signal stopped a confirmed pass.
     """
     try:
         store = RunStore.open_existing(state_dir)
@@ -192,10 +198,11 @@ def recover_run(
         )
     _require_dead_runner(identity, run_id, view=view, cleanup_needed=needs.cleanup_needed)
     config = _load_recovery_config(store, handle)
+    signals = signal_handler_scope() if confirm else contextlib.nullcontext()
     recovery_lock = _experiment_lock(config) if confirm else contextlib.nullcontext()
     transition_lock = store.transition_lock(handle) if confirm else contextlib.nullcontext()
     try:
-        with recovery_lock, transition_lock:
+        with signals, recovery_lock, transition_lock:
             _cleanup_runner(
                 identity,
                 run_id,

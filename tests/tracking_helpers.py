@@ -9,6 +9,7 @@ import os
 import shlex
 import sys
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,9 +31,10 @@ from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanup
 from phasesweep.evidence.evaluation import TrialContext
 from phasesweep.evidence.mlflow import compile_query
 from phasesweep.runtime import process
+from phasesweep.runtime.json import JsonObject
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
-from phasesweep.tracking.mlflow import _capture
+from phasesweep.tracking.mlflow import OperationOutcomeUnknownError, _capture
 
 
 class ManualClock:
@@ -356,6 +358,52 @@ def leak_tracking_worker(monkeypatch, *, action="publish", name=None):
     monkeypatch.setattr(session, "request_operation", leaky)
     monkeypatch.setattr(worker, "request_operation", leaky)
     return leaked
+
+
+def hang_uploads_until_killed(monkeypatch: pytest.MonkeyPatch, started: list[str]) -> None:
+    """Make every MLflow upload run a real supervised worker that only a signal ends.
+
+    The worker registers as ``runtime.remote_worker.run_worker`` registers a real one, so the
+    shutdown handler names and kills it as an MLflow request. Every other request reaches the
+    request operation already in place.
+
+    :param pytest.MonkeyPatch monkeypatch: Replaces the request function for the test.
+    :param list[str] started: Receives the record name of each upload as it starts.
+    """
+    respond = session.request_operation
+
+    def upload_until_killed(
+        request: Mapping[str, object],
+        *,
+        operation_id: str,
+        directory: Path,
+        environment: Mapping[str, str],
+        deadline: float,
+    ) -> JsonObject:
+        if request["action"] != "publish":
+            return respond(
+                request,
+                operation_id=operation_id,
+                directory=directory,
+                environment=environment,
+                deadline=deadline,
+            )
+        started.append(str(request["name"]))
+        with Path(os.devnull).open("w") as sink:
+            result = process.run_supervised(
+                "sleep 30",
+                env=dict(os.environ),
+                stdout=sink,
+                stderr=sink,
+                timeout=60,
+                trial_dir=directory,
+                attempt_id=operation_id,
+                label="MLflow request",
+            )
+        raise OperationOutcomeUnknownError(f"MLflow worker failed (exit {result.return_code}).")
+
+    monkeypatch.setattr(session, "request_operation", upload_until_killed)
+    monkeypatch.setattr(worker, "request_operation", upload_until_killed)
 
 
 class RunnerKilled(BaseException):
