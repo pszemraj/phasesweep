@@ -42,8 +42,6 @@ _HELPER_SETTLE_SECONDS = 10.0
 # PIPE_BUF of 512 bytes: at most four ASCII entries of 100 characters each.
 _SURVIVOR_ENTRY_CHARS = 100
 _SURVIVOR_ENTRIES = 4
-# Read far enough into a command line to reach the script behind long path arguments.
-_SURVIVOR_CMDLINE_BYTES = 4096
 # prctl(2) option from <linux/prctl.h>.
 _PR_SET_CHILD_SUBREAPER = 36
 # The lifecycle record both the guardian and the controller write, shared with
@@ -348,35 +346,12 @@ def _trainer_alive(pgid: int, members: list[int] | None = None, *, adopts: bool)
     return group_alive or children_alive
 
 
-def _short_argument(argument: str) -> str:
-    """Cut an argument that is an absolute path to the path's last component.
-
-    The survivors are terminated before anyone reads their names, so the command line is
-    all that identifies them, and an interpreter or checkout prefix would otherwise fill
-    the entry before the script's name. An option keeps its name: ``--config=/a/b.yaml``
-    reads ``--config=b.yaml``. Anything else is kept whole: a relative value such as the
-    model ID ``meta-llama/Llama-3.1-8B`` names more than its last part, and an argument
-    with whitespace, such as inline code after ``-c``, is no single path.
-
-    :param str argument: One argument of a process's command line.
-    :return str: The argument with an absolute path's directory prefix removed.
-    """
-    option, separator, value = (
-        argument.partition("=") if argument.startswith("-") else ("", "", argument)
-    )
-    if not value.startswith("/") or len(value.split()) != 1:
-        return argument
-    return option + separator + (value.rstrip("/").rsplit("/", 1)[-1] or value)
-
-
 def _describe_members(pids: list[int]) -> str:
     """Name surviving group members for the trial's failure reason.
 
-    Each entry is the PID and the arguments of its ``/proc/<pid>/cmdline``, each cut by
-    :func:`_short_argument`, or its ``comm`` when the command line is empty or
-    unreadable, cut to ``_SURVIVOR_ENTRY_CHARS``. Control bytes read as spaces and
-    non-ASCII bytes as ``?``, so each character is one byte of the status frame. Without
-    procfs the scan that produced ``pids`` finds none, so the result is empty.
+    Read only the executable's basename because command arguments can contain credentials.
+    A PID alone identifies a process whose executable could not be read. Printable ASCII
+    keeps every character to one byte of the status frame.
 
     :param list[int] pids: Live or unreadable members found by :func:`_trainer_alive`.
     :return str: Up to ``_SURVIVOR_ENTRIES`` entries joined by ``", "``, then ``+N more``
@@ -384,26 +359,14 @@ def _describe_members(pids: list[int]) -> str:
     """
     entries: list[str] = []
     for pid in pids[:_SURVIVOR_ENTRIES]:
-        command = ""
-        for name in ("cmdline", "comm"):
-            try:
-                with open(f"/proc/{pid}/{name}", "rb") as source:
-                    raw = source.read(_SURVIVOR_CMDLINE_BYTES)
-            except OSError:
-                continue
-            arguments = (
-                "".join(" " if byte < 0x20 else chr(byte) if byte < 0x7F else "?" for byte in part)
-                for part in raw.split(b"\0")
-            )
-            command = " ".join(" ".join(map(_short_argument, arguments)).split())
-            if command:
-                break
         entry = str(pid)
-        if command:
+        with contextlib.suppress(OSError):
+            executable = Path(os.readlink(f"/proc/{pid}/exe")).name
+            name = "".join(char if " " <= char <= "~" else "?" for char in executable)
             room = _SURVIVOR_ENTRY_CHARS - len(entry) - len(" ()")
-            if len(command) > room:
-                command = command[: room - 3] + "..."
-            entry = f"{entry} ({command})"
+            if len(name) > room:
+                name = name[: room - 3] + "..."
+            entry = f"{entry} ({name})"
         entries.append(entry)
     if len(pids) > _SURVIVOR_ENTRIES:
         entries.append(f"+{len(pids) - _SURVIVOR_ENTRIES} more")

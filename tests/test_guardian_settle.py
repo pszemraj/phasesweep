@@ -66,12 +66,11 @@ if os.fork() == 0:
 os._exit(int(sys.argv[3]))
 """
 
-#: Records its PID, command line and the time each SIGTERM arrives, which it survives.
+#: Records its PID and the time each SIGTERM arrives, which it survives.
 _PERSISTENT_CHILD = """
 import pathlib, signal, sys, time, os
 marks = pathlib.Path(sys.argv[1])
 signal.signal(signal.SIGTERM, lambda *_: (marks / "child_sigterm").write_text(repr(time.monotonic())))
-(marks / "child_cmdline").write_bytes(pathlib.Path("/proc/self/cmdline").read_bytes() if sys.platform == "linux" else b"")
 (marks / "child_pid.tmp").write_text(str(os.getpid()))
 (marks / "child_pid.tmp").replace(marks / "child_pid")
 time.sleep(60)
@@ -286,16 +285,6 @@ def test_a_trials_time_ends_when_its_root_exits(tmp_path: Path) -> None:
     assert elapsed - lifecycle.duration_seconds > 2.0
 
 
-def _named_command(marks: Path) -> str:
-    """Return the start of the name the guardian gives the child that recorded its command line.
-
-    :param Path marks: Directory holding the child's ``child_cmdline`` (interpreter, ``-c``, code).
-    :return str: The interpreter's file name, the flag and the inline code, kept whole.
-    """
-    interpreter, flag, code = (marks / "child_cmdline").read_bytes().split(b"\0")[:3]
-    return f"{Path(interpreter.decode()).name} {flag.decode()} {' '.join(code.decode().split())}"
-
-
 def test_a_persistent_child_is_terminated_after_the_settle_and_named(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -319,7 +308,8 @@ def test_a_persistent_child_is_terminated_after_the_settle_and_named(
         ". They were terminated. Make the trainer wait for its children before exiting."
     )
     if sys.platform == "linux":
-        assert f": {child_pid} ({_named_command(marks)[:40]}" in result.failure_reason
+        executable = Path(sys.executable).resolve().name
+        assert f": {child_pid} ({executable})." in result.failure_reason
     named = [r.levelno for r in caplog.records if "still had live descendants" in r.getMessage()]
     assert named == [logging.INFO]
     _assert_exited(trial_dir, 1)
@@ -424,7 +414,8 @@ def test_a_killed_launchers_session_escaped_child_holds_the_lease_until_terminat
         None,
         True,
     )
-    named = f"still had live descendants 0.5s later ({child_pid} ({_named_command(marks)[:40]}"
+    executable = Path(sys.executable).resolve().name
+    named = f"still had live descendants 0.5s later ({child_pid} ({executable}))"
     assert [r.levelno for r in caplog.records if named in r.getMessage()] == [logging.INFO]
     _assert_exited(trial_dir, -signal.SIGKILL)
     root_exit = float((marks / "root_exit").read_text())
@@ -1041,66 +1032,36 @@ def test_the_next_trial_waits_for_the_rank_a_killed_launcher_left(
     assert not reaper.is_pid_alive(rank_pid)
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="reads Linux procfs command lines")
-def test_a_survivor_is_named_by_its_script_behind_long_paths(tmp_path: Path) -> None:
-    """Each absolute path shows its last component, an option keeping its name; a relative value such as a model ID stays whole."""
-    deep = tmp_path / ("d" * 80) / "run"
-    deep.mkdir(parents=True)
-    script = deep / "rank_train.py"
-    script.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
-    config = deep / "config.yaml"
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-u",
-            str(script),
-            "--config",
-            str(config),
-            "--model=meta-llama/Llama-3.1-8B",
-            f"--out={deep}/",
-        ]
-    )
+@pytest.mark.skipif(sys.platform != "linux", reason="reads the Linux procfs executable link")
+def test_survivor_description_omits_command_arguments() -> None:
+    """A helper is identified by PID and executable without leaking a credential in its arguments."""
+    argument = "--token=sentinel-argument-only"
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", argument])
     try:
         deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and str(config) not in Path(
-            f"/proc/{proc.pid}/cmdline"
-        ).read_text(errors="replace"):
+        cmdline = Path(f"/proc/{proc.pid}/cmdline")
+        while time.monotonic() < deadline and argument.encode() not in cmdline.read_bytes():
             time.sleep(0.01)
+        assert argument.encode() in cmdline.read_bytes()
         described = supervisor._describe_members([proc.pid])
     finally:
         proc.kill()
         proc.wait(timeout=5)
 
-    interpreter = Path(sys.executable).name
-    assert described == (
-        f"{proc.pid} ({interpreter} -u rank_train.py --config config.yaml "
-        "--model=meta-llama/Llama-3.1-8B --out=run)"
-    )
+    assert argument not in described
+    assert described == f"{proc.pid} ({Path(sys.executable).resolve().name})"
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="reads Linux procfs command lines")
-def test_survivor_descriptions_fit_one_pipe_write(tmp_path: Path) -> None:
-    """Four entries of at most 100 characters and a count of the rest stay under 512 bytes."""
-    argument = "x" * 300 + "é"
-    procs = [
-        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", argument])
-        for _ in range(6)
-    ]
-    try:
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and any(
-            argument not in Path(f"/proc/{proc.pid}/cmdline").read_text(errors="replace")
-            for proc in procs
-        ):
-            time.sleep(0.01)
-        described = supervisor._describe_members([proc.pid for proc in procs])
-    finally:
-        for proc in procs:
-            proc.kill()
-            proc.wait(timeout=5)
+def test_survivor_descriptions_fit_one_pipe_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Four entries with long executable names and a count of the rest stay under 512 bytes."""
+    executable = "xé" * 100
+    pids = [101, 102, 103, 104, 105, 106]
+    with monkeypatch.context() as patch:
+        patch.setattr(supervisor.os, "readlink", lambda _path: f"/bin/{executable}")
+        described = supervisor._describe_members(pids)
 
     entries = described.split(", ")
     assert entries[-1] == "+2 more"
-    assert [entry.split(" ", 1)[0] for entry in entries[:4]] == [str(p.pid) for p in procs[:4]]
+    assert [entry.split(" ", 1)[0] for entry in entries[:4]] == [str(pid) for pid in pids[:4]]
     assert all(len(entry) <= 100 and entry.endswith("...)") for entry in entries[:4])
     assert described.isascii() and len(supervisor._DESCENDANTS_REAPED) + len(described) < 512
