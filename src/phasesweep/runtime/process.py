@@ -24,7 +24,7 @@ from typing import IO, Any
 from phasesweep.errors import OperatorAction, PhaseSweepError, UnsafeProcessCleanupError
 from phasesweep.runtime import supervisor as _supervisor
 from phasesweep.runtime.files import atomic_write_text
-from phasesweep.runtime.json import progress_position, strict_json_loads
+from phasesweep.runtime.json import finite_nonnegative, strict_json_loads
 from phasesweep.runtime.reaper import (
     _KILL_GRACE_SECONDS,
     PROCESS_IDENTITY_FILE,
@@ -374,7 +374,7 @@ def read_attempt_lifecycle(
     if cleanup_confirmed is not None and not isinstance(cleanup_confirmed, bool):
         raise ValueError(f"Attempt lifecycle field 'cleanup_confirmed' is invalid at {path}.")
     recorded_duration = payload.get("duration_seconds")
-    duration = None if recorded_duration is None else progress_position(recorded_duration)
+    duration = None if recorded_duration is None else finite_nonnegative(recorded_duration)
     if recorded_duration is not None and duration is None:
         raise ValueError(f"Attempt lifecycle field 'duration_seconds' is invalid at {path}.")
     return AttemptLifecycle(

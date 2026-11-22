@@ -84,13 +84,13 @@ def strict_json_loads(text: str) -> JsonValue:
     return json_value(decoded)
 
 
-def progress_position(value: object) -> int | float | None:
+def finite_nonnegative(value: object) -> int | float | None:
     """Return a finite, nonnegative JSON number or None, excluding booleans.
 
-    Keep integers exact for evaluation-axis grouping.
+    Integers stay exact, which evaluation-axis grouping relies on.
 
-    :param object value: Candidate evaluation position.
-    :return int | float | None: The valid position unchanged, or None for an unsupported value.
+    :param object value: Candidate number, such as an evaluation position or a duration.
+    :return int | float | None: The number unchanged, or None for an unsupported value.
     """
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.engine.errors import StudySchemaMismatchError
-from phasesweep.runtime.json import JsonObject, json_object, progress_position
+from phasesweep.runtime.json import JsonObject, finite_nonnegative, json_object
 
 if TYPE_CHECKING:
     from optuna.trial import FrozenTrial, Trial
@@ -511,7 +511,7 @@ def _completed_trainer_duration(
     )
     if type(return_code) is not int or return_code != 0:
         return None
-    seconds = progress_position(duration)
+    seconds = finite_nonnegative(duration)
     return None if seconds is None else float(seconds)
 
 

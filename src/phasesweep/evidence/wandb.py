@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from phasesweep.runtime.json import json_text, json_text_list, progress_position
+from phasesweep.runtime.json import finite_nonnegative, json_text, json_text_list
 from phasesweep.runtime.remote_worker import report_reserve, run_worker
 
 _HistoryRead = Literal["settled", "lagging", "retry"]
@@ -376,7 +376,7 @@ def locate_wandb_position(
     )
     if result.timed_out or response.get("status") != "position":
         return None
-    return progress_position(response.get("value"))
+    return finite_nonnegative(response.get("value"))
 
 
 def _history_position(
@@ -412,7 +412,7 @@ def _history_position(
     """
     from phasesweep.evidence.evaluation import json_float
 
-    last_step = progress_position(summary.get("_step"))
+    last_step = finite_nonnegative(summary.get("_step"))
     if last_step is None:
         return "settled", None
     head, dot, aggregation = metric_key.rpartition(".")
@@ -448,10 +448,10 @@ def _history_position(
                 continue
             read += 1
             if series != metric_key:
-                position = progress_position(row.get(axis))
+                position = finite_nonnegative(row.get(axis))
                 continue
             final_value = None
-            final_position = progress_position(row.get(axis))
+            final_position = finite_nonnegative(row.get(axis))
             try:
                 logged = json_float(row[series], label=series)
             except ValueError:

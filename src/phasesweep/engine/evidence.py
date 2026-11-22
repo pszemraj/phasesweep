@@ -54,7 +54,7 @@ from phasesweep.runtime.commands import TRAINER_INPUT_FILENAMES
 from phasesweep.runtime.files import (
     file_sha256,
 )
-from phasesweep.runtime.json import progress_position
+from phasesweep.runtime.json import finite_nonnegative
 from phasesweep.runtime.process import (
     read_attempt_lifecycle,
 )
@@ -275,7 +275,7 @@ def _valid_progress_record(record: object, *, nullable: bool) -> TypeGuard[Mappi
         return False
     if record["value"] is None:
         return nullable
-    return progress_position(record["value"]) is not None
+    return finite_nonnegative(record["value"]) is not None
 
 
 def _verify_objective_source_evidence(

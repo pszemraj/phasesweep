@@ -48,7 +48,7 @@ from phasesweep.evidence.wandb import (
 from phasesweep.runtime.files import file_sha256
 from phasesweep.runtime.json import (
     NonFiniteJsonConstantError,
-    progress_position,
+    finite_nonnegative,
     strict_json_loads,
 )
 from phasesweep.runtime.time import utc_now_iso
@@ -420,7 +420,7 @@ def _extract_json_envelope(
         position: int | float | None = step
     else:
         reported = evaluation.get("progress")
-        position = progress_position(
+        position = finite_nonnegative(
             reported.get(cfg.evaluation_axis) if isinstance(reported, dict) else None
         )
         if position is None:

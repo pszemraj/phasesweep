@@ -32,7 +32,7 @@ from phasesweep.evidence.models import (
     best_value_position_reason,
     no_position_reason,
 )
-from phasesweep.runtime.json import progress_position
+from phasesweep.runtime.json import finite_nonnegative
 from phasesweep.runtime.terminal import objective_text, param_text, plural
 
 ConfoundVerdict = Literal["ok", "heterogeneous", "n/a"]
@@ -308,7 +308,7 @@ def _recorded_position(record: Mapping[str, object]) -> tuple[str, int | float |
     axis = progress.get("axis") if isinstance(progress, Mapping) else None
     if not isinstance(progress, Mapping) or not isinstance(axis, str):
         raise ValueError("positioned objective provenance records no evaluation axis")
-    return axis, progress_position(progress.get("value"))
+    return axis, finite_nonnegative(progress.get("value"))
 
 
 def _position_groups(pairs: Iterable[tuple[int, int | float]]) -> list[PositionGroup]:
@@ -646,7 +646,7 @@ def _validate_evaluation_detail(detail: object) -> EvaluationDetail:
     for group in groups:
         if not isinstance(group, Mapping) or set(group) != {"value", "trials"}:
             raise ValueError("confound evaluation_point value group is malformed")
-        value = progress_position(group["value"])
+        value = finite_nonnegative(group["value"])
         trials = _trial_numbers(group["trials"], label="evaluation_point trials")
         if value is None or not trials:
             raise ValueError("confound evaluation_point value group is malformed")
