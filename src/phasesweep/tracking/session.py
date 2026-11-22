@@ -246,19 +246,6 @@ def refused_text(refused: Collection[Path]) -> str:
     return f" MLflow refused {' and '.join(parts)}; {where} above."
 
 
-def refusal_rule(where: str = "") -> str:
-    """Say what keeps a record MLflow refused pending, for a reader who never saw the console.
-
-    A refused record is retried like any other, so a retry alone meets the same refusal; only
-    fixing its cause in MLflow helps.
-
-    :param str where: Where the record's warning is, with its leading separator, defaults to
-        none.
-    :return str: A clause that follows the record it is about, without a final period.
-    """
-    return f"stays pending until the cause given in its warning{where} is fixed in MLflow"
-
-
 def tracking_root(experiment: Experiment) -> Path:
     """Return mutable tracking state outside scientific generation manifests.
 
