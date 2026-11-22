@@ -17,14 +17,15 @@ from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
 from phasesweep.engine.read import (
     CostAdvisoryStatus,
+    EdgeAdvisoryStatus,
     EngineStatus,
     PhaseWinnerView,
     ResultContext,
-    cost_advisory_status,
+    WinnerAdvisories,
+    _recorded_count,
     read_result,
     read_status,
-    winner_cost_advisory,
-    winner_tie_groups,
+    winner_advisories,
 )
 from phasesweep.engine.repeats import _repeats_summary
 from phasesweep.engine.state import (
@@ -46,7 +47,7 @@ NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 McpPublicationState = PublicationState | Literal["unknown"]
 """Engine publication verdict plus the MCP snapshot-unavailable state."""
 
-RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[4] = 4
+RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[5] = 5
 
 
 class _SnapshotModel(BaseModel):
@@ -321,6 +322,8 @@ class WinnerSnapshot(_SnapshotModel):
     cost_advisory: str | None = None
     cost_advisory_status: CostAdvisoryStatus
     tie_groups: list[TieGroupSnapshot] | None
+    edge_advisory: str | None
+    edge_advisory_status: EdgeAdvisoryStatus
 
 
 def _winner_snapshot(
@@ -333,12 +336,13 @@ def _winner_snapshot(
 
     :param str phase: Phase under which the winner is exposed.
     :param PhaseWinnerView | Winner winner: Winner representation to serialize.
-    :param Experiment | None experiment: Producing config for recomputed repeat-cost advice.
+    :param Experiment | None experiment: Producing config for the advice recomputed from an
+        engine winner's trials (:func:`phasesweep.engine.read.winner_advisories`).
     :raises RuntimeError: Either representation carries no confound verdicts or no source
         provenance.
     :return WinnerSnapshot: Validated path-free winner snapshot.
     """
-    cost_status: CostAdvisoryStatus
+    advisories: WinnerAdvisories
     if isinstance(winner, Winner):
         gates_passed = (
             all(bool(gate.get("passed")) for gate in winner.gates) if winner.gates else None
@@ -366,13 +370,12 @@ def _winner_snapshot(
             repeats=repeats,
             repeats_detail=winner.repeats,
             confound_detail=winner.confound,
+            finished_trials=_recorded_count(winner.completion.get("finished_trials")),
         )
-        cost_advisory = winner_cost_advisory(experiment, view) if experiment is not None else None
-        tie_groups = winner_tie_groups(experiment, view) if experiment is not None else None
-        cost_status = (
-            cost_advisory_status(experiment, phase, cost_advisory, available=tie_groups is not None)
-            if experiment is not None
-            else "unavailable"
+        advisories = (
+            WinnerAdvisories(None, "unavailable", None, None, "unavailable")
+            if experiment is None
+            else winner_advisories(experiment, view, config_matches=True)
         )
     else:
         gates_passed = winner.gates_passed
@@ -381,9 +384,14 @@ def _winner_snapshot(
             raise RuntimeError("Current-format winner is missing confound verdicts.")
         confound = winner.confound
         repeats = winner.repeats
-        cost_advisory = winner.cost_advisory
-        tie_groups = winner.tie_groups
-        cost_status = winner.cost_advisory_status
+        advisories = WinnerAdvisories(
+            winner.cost_advisory,
+            winner.cost_advisory_status,
+            winner.tie_groups,
+            winner.edge_advisory,
+            winner.edge_advisory_status,
+        )
+    tie_groups = advisories.tie_groups
     source = winner.source
     if source is None:
         raise RuntimeError("Current-format winner is missing source provenance.")
@@ -400,18 +408,20 @@ def _winner_snapshot(
         confound=ConfoundSummary.model_validate(confound),
         observed=dict(winner.observed),
         repeats=None if repeats is None else RepeatsSpread.model_validate(repeats),
-        cost_advisory=cost_advisory,
-        cost_advisory_status=cost_status,
+        cost_advisory=advisories.cost_advisory,
+        cost_advisory_status=advisories.cost_advisory_status,
         tie_groups=(
             None if tie_groups is None else [TieGroupSnapshot.model_validate(g) for g in tie_groups]
         ),
+        edge_advisory=advisories.edge_advisory,
+        edge_advisory_status=advisories.edge_advisory_status,
     )
 
 
 class RunResultSnapshot(_SnapshotModel):
     """Terminal status and winners frozen for one MCP run id."""
 
-    schema_version: Literal[4]
+    schema_version: Literal[5]
     status: StatusSnapshot
     winners: list[WinnerSnapshot]
     represented_config_fingerprint: str | None = None

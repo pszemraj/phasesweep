@@ -30,7 +30,7 @@ if typing.TYPE_CHECKING:
 from phasesweep import __version__
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine.artifacts import LOG_FORMAT
-from phasesweep.engine.read import CostAdvisoryStatus
+from phasesweep.engine.read import CostAdvisoryStatus, EdgeAdvisoryStatus
 from phasesweep.engine.read import ResultContext as ResultContextLiteral
 from phasesweep.engine.state import TrialStateName, WinnerSourceKind
 from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND, agent_prompt_text
@@ -653,6 +653,12 @@ class WinnerPhasePayload(_ToolPayload):
     )
     tie_groups: list[TieGroupSnapshot] | None = Field(
         description="Other repeat configurations whose mean is within the phase's pooled noise band of the winner's, with params, gap, combined_se and threshold; null when retained trials are unavailable. Parameter values follow visible_params."
+    )
+    edge_advisory: str | None = Field(
+        description="Searched numeric parameters whose winning value is the lowest or highest of at least three the phase tried, so no trial ran beyond it; parameters follow visible_params policy."
+    )
+    edge_advisory_status: EdgeAdvisoryStatus = Field(
+        description="unavailable when the trials or the producing config cannot be read, not_at_edge when no parameter qualifies, available with an edge_advisory."
     )
     confound: ConfoundSummary = Field(
         description="Verdicts on the population this winner was selected from, frozen at selection."

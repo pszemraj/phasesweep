@@ -251,6 +251,8 @@ def test_winners_payload_applies_visible_params_policy(
             attempt_id="attempt-1",
         ),
         cost_advisory="one-standard-error cost advisory: params={'dataset': 'SECRET_DATASET'}",
+        edge_advisory="no trial ran above the winner's dataset_size=SECRET_SIZE (tried 1..9)",
+        edge_advisory_status="available",
         tie_groups=[
             {
                 "trial_number": 2,
@@ -266,6 +268,8 @@ def test_winners_payload_applies_visible_params_policy(
     assert phase["params_redacted"] is redacted
     assert "cost_advisory" in phase
     assert ("SECRET_DATASET" in phase["cost_advisory"]) == (policy == "all")
+    assert ("SECRET_SIZE" in phase["edge_advisory"]) == (policy == "all")
+    assert phase["edge_advisory_status"] == "available"
     assert phase["tie_groups"][0]["params"] == expected
     assert phase["tie_groups"][0]["threshold"] == 0.016
 

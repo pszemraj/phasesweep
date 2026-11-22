@@ -511,8 +511,9 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
 ) -> None:
     """A successful run's result is frozen even if studies became unloadable.
 
-    The one tolerant read replays a journal snapshot through ``optuna.load_study``,
-    so exactly one load succeeds and any reload after it fails.
+    The tolerant status read replays a journal snapshot through ``optuna.load_study``, so
+    exactly one load succeeds and any reload after it fails: the read of the winner's trials
+    for the advice recomputed at read, which is then unavailable instead of failing capture.
     """
     experiment = make_experiment(
         persistent=tmp_path, trainer=write_constant_trainer(tmp_path), n_trials=1
@@ -536,8 +537,8 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
         return real_load_study(*args, **kwargs)
 
     # Patched on Optuna itself rather than on a PhaseSweep helper, so no
-    # import binding can hide a study reload from this test. Every remaining
-    # storage read must be the tolerant one read_status performs.
+    # import binding can hide a study reload from this test. The status read
+    # and the winner's trial read are the only storage reads.
     monkeypatch.setattr(optuna, "load_study", fail_on_reload)
 
     snapshot = mcp_runner.capture_result_snapshot(
@@ -546,7 +547,7 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
         engine_winners=report.winners,
     )
 
-    assert loads == 1
+    assert loads == 2
     phase = snapshot["status"]["phases"][0]
     assert phase["trial_data_available"] is True
     assert phase["running_attempts"] == []
@@ -555,6 +556,7 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
     assert frozen["phase"] == "p"
     assert frozen["metric"] == report.winners["p"].metric
     assert frozen["trial_number"] == report.winners["p"].trial_number
+    assert (frozen["edge_advisory"], frozen["edge_advisory_status"]) == (None, "unavailable")
 
     status_path = tmp_path / "status.json"
     mcp_runner._write_status(

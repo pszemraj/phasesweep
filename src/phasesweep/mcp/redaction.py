@@ -195,6 +195,13 @@ def winners_payload(
                 ),
                 "cost_advisory_status": view.cost_advisory_status,
                 "tie_groups": _tie_groups_payload(view, visible_params),
+                "edge_advisory": (
+                    view.edge_advisory
+                    if visible_params == "all" or view.edge_advisory is None
+                    else "No trial ran beyond the winner's value of a searched parameter; the "
+                    "operator can inspect show-winners for which one."
+                ),
+                "edge_advisory_status": view.edge_advisory_status,
             }
         )
     return {

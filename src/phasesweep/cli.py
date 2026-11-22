@@ -1261,6 +1261,8 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                     if winner.tie_groups is None
                     else [json_object(dict(group)) for group in winner.tie_groups]
                 ),
+                "edge_advisory": winner.edge_advisory,
+                "edge_advisory_status": winner.edge_advisory_status,
             }
             if winner.repeats_detail is not None:
                 detail = winner.repeats_detail

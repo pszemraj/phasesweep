@@ -49,6 +49,7 @@ from phasesweep.runtime.terminal import significant
 from tests.conftest import (
     log_regex_provenance,
     make_experiment,
+    phase_study,
     phase_trials,
     trial_outcome,
     write_experiment_config,
@@ -252,6 +253,76 @@ def test_repeats_edge_warning_uses_the_winning_group_and_skips_the_repeat_axis(
         sampler_type="grid",
         repeats=Repeats(key="seed", values=[0, 1, 2]),
     ) == ["[p] no trial ran below the winner's x=1 (tried 1..3, at the configured lower bound)"]
+
+
+@pytest.mark.integration
+def test_edge_advisory_is_recomputed_at_read_over_the_trials_selection_saw(
+    tmp_path: Path,
+) -> None:
+    """show-winners and the MCP snapshot carry the edge warning, which nothing stores.
+
+    It is judged over the finished trials the phase held at selection, so a trial a later run
+    adds below the winner does not enter it, and a config that no longer matches the producing
+    one leaves it unavailable.
+    """
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--x', type=int)
+        args, _ = parser.parse_known_args()
+        print(f'x={args.x}')
+    """,
+    )
+    phase = Phase(
+        name="p",
+        n_trials=3,
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[2, 3, 4])},
+    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
+    winner = run_experiment(experiment)["p"]
+    expected = "no trial ran below the winner's x=2 (tried 2..4, at the configured lower bound)"
+    path = _generation_winner_path(experiment, winner.generation_id, "p")
+    assert "no trial ran" not in path.read_text(encoding="utf-8")
+
+    _, views = read_result(experiment)
+    assert (views[0].edge_advisory, views[0].edge_advisory_status) == (expected, "available")
+    generation = published_generation_id(experiment)
+    engine = capture_result_snapshot(
+        experiment, generation_id=generation, engine_winners={"p": winner}
+    )
+    read = capture_result_snapshot(experiment)
+    for snapshot in (engine, read):
+        assert snapshot["winners"][0]["edge_advisory"] == expected
+        assert snapshot["winners"][0]["edge_advisory_status"] == "available"
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    shown = CliRunner().invoke(cli, ["show-winners", str(config)])
+    assert shown.exit_code == 0, shown.exception
+    payload = yaml.safe_load(shown.output.split("=== p ===", 1)[1])
+    assert (payload["edge_advisory"], payload["edge_advisory_status"]) == (expected, "available")
+
+    phase_study(experiment).add_trial(
+        optuna.trial.create_trial(
+            state=optuna.trial.TrialState.FAIL,
+            params={"x": 1},
+            distributions={"x": optuna.distributions.CategoricalDistribution([1])},
+        )
+    )
+    _, later = read_result(experiment)
+    assert (later[0].edge_advisory, later[0].edge_advisory_status) == (expected, "available")
+
+    drifted = experiment.model_copy(
+        update={"metric": experiment.metric.model_copy(update={"goal": "maximize"})}
+    )
+    _, historical = read_result(drifted)
+    assert historical[0].config_matches_current is False
+    assert (historical[0].edge_advisory, historical[0].edge_advisory_status) == (
+        None,
+        "unavailable",
+    )
 
 
 @pytest.mark.parametrize(
