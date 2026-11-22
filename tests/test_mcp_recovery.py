@@ -698,7 +698,7 @@ def test_operator_recovery_keeps_unresolved_launch_reserved(
     assert "launch outcome is unresolved" in result.output
     assert "remains reserved" in result.output
     assert "automated recovery cannot safely" in result.output
-    assert "retry the same operation" in result.output
+    assert "fix: Retry once the reported blocker clears." in result.output
     assert "start a new run" not in result.output
     assert not store.cleanup_recovery_path(run_id).exists()
     assert not store.status_path(run_id).exists()
