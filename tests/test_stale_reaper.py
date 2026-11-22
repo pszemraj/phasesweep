@@ -241,7 +241,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     claimed = engine_ledger.claim_ledger(engine_ledger.validate_ledger(exp))
 
     # Will raise on fingerprint mismatch, but reap must have run first.
-    with pytest.raises(RuntimeError, match="different phase config"):
+    with pytest.raises(RuntimeError, match="different config"):
         _run_phase(
             exp,
             exp.phases[0],

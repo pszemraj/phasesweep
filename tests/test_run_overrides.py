@@ -276,7 +276,7 @@ def test_published_winner_survives_a_failed_later_generation(
                 "trainer_config": {"caption": "changed-base"},
             }
         )
-        with pytest.raises(StudyFingerprintMismatchError, match="different phase config"):
+        with pytest.raises(StudyFingerprintMismatchError, match="different config"):
             run_experiment(changed)
     else:
         with pytest.raises(NoFeasibleTrialError, match="aborted"):

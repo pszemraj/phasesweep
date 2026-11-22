@@ -854,7 +854,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
             )
         )
 
-    with pytest.raises(RuntimeError, match="different phase config"):
+    with pytest.raises(RuntimeError, match="different config"):
         run_experiment(
             changed,
             from_phase=from_phase,

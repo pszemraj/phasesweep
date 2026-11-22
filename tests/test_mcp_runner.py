@@ -678,7 +678,7 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
     snapshot_path = store.config_snapshot_path(run_id)
     snapshot_path.write_bytes(config.read_bytes())
 
-    with pytest.raises(StudyFingerprintMismatchError, match="different phase config"):
+    with pytest.raises(StudyFingerprintMismatchError, match="different config"):
         run_claimed_runner(store, run_id, snapshot_path)
 
     handle = store.get(run_id)

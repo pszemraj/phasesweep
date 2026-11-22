@@ -371,7 +371,7 @@ def _load_winner(
     if stored_fp != current_fp:
         # A winner file records only the hash, so the refusal can name no changed key.
         raise StudyFingerprintMismatchError(
-            f"Winner file {path} was produced by a different phase config (stored fingerprint "
+            f"Winner file {path} was produced by a different config (stored fingerprint "
             f"{short_digest(stored_fp)} != current {short_digest(current_fp)}).",
             action=OperatorAction.FIX_CONFIG,
             remediation=(

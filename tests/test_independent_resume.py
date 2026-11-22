@@ -133,7 +133,7 @@ def test_from_phase_after_a_changed_parent_names_the_step_its_storage_allows(
         run_experiment(changed, from_phase="child")
 
     message = _operational_error_text(refused.value)
-    assert "was produced by a different phase config" in message
+    assert "was produced by a different config" in message
     assert "Re-run phase" not in message
     assert refused.value.action is OperatorAction.FIX_CONFIG
     if persistent:

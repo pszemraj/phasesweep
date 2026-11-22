@@ -547,7 +547,7 @@ def _resume_phase(
         unsupported; what the recorded state contradicts is listed with
         :func:`_judge_recorded_phase`, whose other refusals also propagate.
     :raises StudyFingerprintMismatchError: The study was produced by a
-        different phase config.
+        different config.
     :raises ProcessCleanupUncertainError: A stale trial's process could not be
         proven gone.
     :return _PhaseResume | Winner: The validated state, or the winner an

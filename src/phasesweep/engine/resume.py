@@ -146,7 +146,7 @@ def _accept_skipped_winner(
     :raises WinnerIntegrityError: The winner is incompatible with the current
         partial-result policy.
     :raises StudyFingerprintMismatchError: The winner was produced by a
-        different phase config.
+        different config.
     :raises TrialEvidenceMissingError: The winner's source trial evidence is
         missing or changed.
     :return Winner: The accepted winner.

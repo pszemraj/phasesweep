@@ -213,7 +213,7 @@ def test_fingerprint_mismatch_raises(tmp_path):
     run_experiment(experiment([4, 8]))
 
     # Now change the search space and re-run — should fail.
-    with pytest.raises(RuntimeError, match="different phase config"):
+    with pytest.raises(RuntimeError, match="different config"):
         run_experiment(experiment([4, 8, 12]))
 
 
@@ -265,7 +265,7 @@ def test_late_child_fingerprint_failure_preserves_last_successful_results(
     )
     changed = experiment.model_copy(update={"phases": [experiment.phases[0], changed_child]})
 
-    with pytest.raises(RuntimeError, match="different phase config"):
+    with pytest.raises(RuntimeError, match="different config"):
         run_experiment(changed)
 
     assert {path: path.read_bytes() for path in protected_paths} == before
@@ -1608,7 +1608,7 @@ def test_from_phase_rejects_stale_parent_winner(
     run_experiment(exp_v1)
 
     exp_v2 = _two_phase_experiment(workdir=workdir, trainer=trainer, **after)
-    with pytest.raises(StudyFingerprintMismatchError, match="different phase config") as excinfo:
+    with pytest.raises(StudyFingerprintMismatchError, match="different config") as excinfo:
         run_experiment(exp_v2, from_phase="lr")
     assert type(excinfo.value) is StudyFingerprintMismatchError
     assert excinfo.value.action is OperatorAction.FIX_CONFIG
@@ -1922,5 +1922,5 @@ def test_fingerprint_mismatch_still_raises_once_a_trial_exists(tmp_path: Path) -
         )
 
     run_experiment(_exp(f"python {trainer} {{overrides}}"))
-    with pytest.raises(RuntimeError, match="different phase config"):
+    with pytest.raises(RuntimeError, match="different config"):
         run_experiment(_exp(f"python {trainer} --changed {{overrides}}"))

@@ -400,7 +400,7 @@ def _verify_fingerprint(
             else:
                 way_forward = restore_or_new_study(_RECORDED_VALUES)
         raise StudyFingerprintMismatchError(
-            f"Study {study.study_name!r} was created with a different phase config{found}",
+            f"Study {study.study_name!r} was created with a different config{found}",
             # Running from the original directory keeps the study; a new name does not.
             action=OperatorAction.FIX_CONFIG if cwd_unset else None,
             remediation=_CWD_FOLLOWS_INVOCATION if cwd_unset else way_forward,

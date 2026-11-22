@@ -209,7 +209,7 @@ def test_an_aborted_run_keeps_its_generation_and_the_refused_reruns_add_none(
 
     for refused_by, argv in (
         ("previously aborted", []),
-        ("different phase config", ["--set", "provenance.revision=rev-2"]),
+        ("different config", ["--set", "provenance.revision=rev-2"]),
     ):
         assert invoke_cli_boundary(["run", str(config), *argv], monkeypatch) != 0
         assert refused_by in capsys.readouterr().err

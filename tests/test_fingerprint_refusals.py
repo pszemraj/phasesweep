@@ -91,7 +91,7 @@ def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
         phases=[anchored_phase(4)],
     )
 
-    with pytest.raises(StudyFingerprintMismatchError, match="different phase config") as caught:
+    with pytest.raises(StudyFingerprintMismatchError, match="different config") as caught:
         run_experiment(load_experiment(config))
 
     assert "Changed: phase.search_space.x.high: 3 -> 4." in str(caught.value)
@@ -164,7 +164,7 @@ def test_refusal_names_the_trainer_cwd_when_the_same_config_runs_from_another_di
     monkeypatch.chdir(first_cwd)
     run_experiment(load_experiment(config))
     monkeypatch.chdir(second_cwd)
-    with pytest.raises(StudyFingerprintMismatchError, match="different phase config") as caught:
+    with pytest.raises(StudyFingerprintMismatchError, match="different config") as caught:
         run_experiment(load_experiment(config))
 
     message = _operational_error_text(caught.value)
@@ -260,7 +260,7 @@ def test_refusal_without_a_stored_payload_keeps_the_hash_only_message() -> None:
 
     fingerprint = _phase_fingerprint(experiment, experiment.phases[0], {})
     assert message == (
-        f"Study {study.study_name!r} was created with a different phase config "
+        f"Study {study.study_name!r} was created with a different config "
         f"(fingerprint {'0' * 12}... != {fingerprint[:12]}...)."
     )
     assert error.action is OperatorAction.FRESH_NAMESPACE
