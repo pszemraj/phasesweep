@@ -193,6 +193,12 @@ class SurvivorshipSummary(_SnapshotModel):
             "configurations never flag."
         )
     )
+    remedy: str | None = Field(
+        description=(
+            "How to give the configurations without a result one when the check flagged: a "
+            "raised n_trials with persistent storage, a rerun with storage: null; otherwise null."
+        )
+    )
     ranked: NonNegativeInt = Field(description="Configurations selection ranked.")
     infeasible: NonNegativeInt = Field(
         description="Configurations measured outside a metric bound or constraint."
@@ -330,14 +336,17 @@ def _winner_snapshot(
     phase: str,
     winner: PhaseWinnerView | Winner,
     *,
-    experiment: Experiment | None = None,
+    experiment: Experiment,
 ) -> WinnerSnapshot:
     """Freeze either engine winner representation into one validated snapshot.
 
+    A read view already carries its read-time advice; an engine winner gets it here.
+
     :param str phase: Phase under which the winner is exposed.
     :param PhaseWinnerView | Winner winner: Winner representation to serialize.
-    :param Experiment | None experiment: Producing config for the advice recomputed from an
-        engine winner's trials (:func:`phasesweep.engine.read.winner_advisories`).
+    :param Experiment experiment: The config the runner executed, which produced an engine
+        winner: it locates the trials the advice is recomputed from
+        (:func:`phasesweep.engine.read.winner_advisories`) and decides the survivorship remedy.
     :raises RuntimeError: Either representation carries no confound verdicts or no source
         provenance.
     :return WinnerSnapshot: Validated path-free winner snapshot.
@@ -357,6 +366,7 @@ def _winner_snapshot(
             winner.confound,
             winner_trial=winner.trial_number,
             extractor_kind=kind if isinstance(kind, str) else "unknown",
+            persistent=experiment.persistent,
         )
         repeats = None if winner.repeats is None else _repeats_summary(winner.repeats)
         view = PhaseWinnerView(
@@ -372,11 +382,7 @@ def _winner_snapshot(
             confound_detail=winner.confound,
             finished_trials=_recorded_count(winner.completion.get("finished_trials")),
         )
-        advisories = (
-            WinnerAdvisories(None, "unavailable", None, None, "unavailable")
-            if experiment is None
-            else winner_advisories(experiment, view, config_matches=True)
-        )
+        advisories = winner_advisories(experiment, view, config_matches=True)
     else:
         gates_passed = winner.gates_passed
         incomplete = winner.incomplete
@@ -538,7 +544,9 @@ def capture_result_snapshot(
         ]
     else:
         status, winner_views = read_result(experiment, generation_id=generation_id)
-        winner_snapshots = [_winner_snapshot(winner.phase, winner) for winner in winner_views]
+        winner_snapshots = [
+            _winner_snapshot(winner.phase, winner, experiment=experiment) for winner in winner_views
+        ]
     if not generation_claimed:
         status["represented_generation_id"] = None
     snapshot = RunResultSnapshot(

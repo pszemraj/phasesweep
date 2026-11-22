@@ -73,7 +73,6 @@ from phasesweep.errors import (
 from phasesweep.evidence.models import MlflowExtractor
 from phasesweep.runtime.json import JsonObject, json_object, json_text_map
 from phasesweep.runtime.terminal import (
-    command_line,
     display_path,
     objective_text,
     param_text,
@@ -81,10 +80,6 @@ from phasesweep.runtime.terminal import (
 )
 
 log = logging.getLogger("phasesweep.engine.selection")
-
-#: Where a selection warning's reader finds every check's counts and remedies; the engine
-#: does not know the config path the operator typed, so the command names it ``CONFIG``.
-SHOW_WINNERS_COMMAND = command_line("show-winners", "CONFIG")
 
 
 class TieGroupComparison(typing.TypedDict):
@@ -425,13 +420,9 @@ def select_winner(
         ),
     )
     if flagged and emit_advisories:
-        # show-winners carries the counts, the remedies and docs/runtime.md's retry step.
-        log.warning(
-            "[%s] %s. Details: %s",
-            phase_name or study.study_name,
-            "; ".join(flagged),
-            SHOW_WINNERS_COMMAND,
-        )
+        # The warning states what each check found; the run's closing summary gives the
+        # show-winners command as typed, which prints each flagged check's counts and remedy.
+        log.warning("[%s] %s", phase_name or study.study_name, "; ".join(flagged))
     if phase is not None and emit_advisories:
         edge = _edge_advisory(phase, trials, best.params if winning is None else winning.params)
         if edge is not None:

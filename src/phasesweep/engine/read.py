@@ -257,13 +257,15 @@ def _phase_status_payloads(
 
 
 def _winner_view(
-    winner: Mapping[str, object] | ValidatedWinner, phase_name: str
+    winner: Mapping[str, object] | ValidatedWinner, phase_name: str, *, persistent: bool
 ) -> PhaseWinnerView | None:
     """Reduce one decoded winner payload using the permissive read contract.
 
     :param Mapping[str, object] | ValidatedWinner winner: Decoded winner payload or
         captured publication facts.
     :param str phase_name: Phase name exposed by the winner.
+    :param bool persistent: Whether the display config keeps its trials between runs, which
+        decides the survivorship remedy (:func:`phasesweep.engine.confound._confound_summary`).
     :return PhaseWinnerView | None: The winner view, or ``None`` when the
         payload is malformed.
     """
@@ -316,6 +318,7 @@ def _winner_view(
             confound_block,
             winner_trial=trial_number,
             extractor_kind=kind if isinstance(kind, str) else "unknown",
+            persistent=persistent,
         )
         return PhaseWinnerView(
             phase=phase_name,
@@ -337,7 +340,7 @@ def _winner_view(
         return None
 
 
-def _read_winner_path(path: Path, phase_name: str) -> PhaseWinnerView | None:
+def _read_winner_path(path: Path, phase_name: str, *, persistent: bool) -> PhaseWinnerView | None:
     """Read one unvalidated winner file using the permissive read contract.
 
     Only a generation that is not the validated publication is read this way:
@@ -346,6 +349,7 @@ def _read_winner_path(path: Path, phase_name: str) -> PhaseWinnerView | None:
 
     :param Path path: Winner path in the represented generation.
     :param str phase_name: Phase name exposed by the winner.
+    :param bool persistent: Whether the display config keeps its trials between runs.
     :return PhaseWinnerView | None: Parsed winner, or ``None`` when absent or malformed.
     """
     if not path.is_file():
@@ -353,7 +357,7 @@ def _read_winner_path(path: Path, phase_name: str) -> PhaseWinnerView | None:
     loaded = read_yaml_or_none(path)
     if not isinstance(loaded, Mapping):
         return None
-    return _winner_view(loaded, phase_name)
+    return _winner_view(loaded, phase_name, persistent=persistent)
 
 
 def _represented_winners(
@@ -382,16 +386,22 @@ def _represented_winners(
         return []
     validated = publication.validated
     comparison = comparison_experiment or experiment
+    # The next run is the current config's, so its storage decides the survivorship remedy.
+    persistent = comparison.persistent
     views: list[PhaseWinnerView | None]
     if validated is not None and validated.generation_id == represented_generation_id:
         views = [
-            _winner_view(validated.winners[name], name) if name in validated.winners else None
+            _winner_view(validated.winners[name], name, persistent=persistent)
+            if name in validated.winners
+            else None
             for name in phase_names
         ]
     else:
         views = [
             _read_winner_path(
-                _generation_winner_path(experiment, represented_generation_id, name), name
+                _generation_winner_path(experiment, represented_generation_id, name),
+                name,
+                persistent=persistent,
             )
             for name in phase_names
         ]
@@ -404,7 +414,7 @@ def _represented_winners(
             and validated is not None
             and name in validated.winners
         ):
-            view = _winner_view(validated.winners[name], name)
+            view = _winner_view(validated.winners[name], name, persistent=persistent)
             view_generation = validated.generation_id
         if view is not None:
             is_published = validated is not None and view_generation == validated.generation_id

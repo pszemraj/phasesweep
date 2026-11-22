@@ -48,6 +48,7 @@ def test_summary_for_a_fresh_run() -> None:
             "learning_rate/trials.csv",
         ],
         next_command="phasesweep status starter.yaml --trials",
+        show_winners_command="phasesweep show-winners starter.yaml",
     )
     assert block.render(80, color=False) == [
         "",
@@ -80,6 +81,7 @@ def test_summary_of_a_resumed_run_with_failures_and_a_skipped_phase() -> None:
         written_root="runs/phasesweep_starter",
         written=["learning_rate/trials.csv"],
         next_command="phasesweep status 'my config.yaml' --set workdir=/data/x --trials",
+        show_winners_command="phasesweep show-winners 'my config.yaml' --set workdir=/data/x",
     )
     assert block.render(60, color=False) == [
         "",
@@ -156,6 +158,7 @@ def test_summary_counts_the_trials_toward_n_trials_and_names_interrupted_ones_ap
         written_root="runs/phasesweep_starter",
         written=[],
         next_command="phasesweep status starter.yaml --trials",
+        show_winners_command="phasesweep show-winners starter.yaml",
     )
 
     assert block.render(width, color=False) == expected
@@ -199,6 +202,7 @@ def _flagged_summary(depth: tuple[str, ...], learning_rate: tuple[str, ...]) -> 
         written_root="runs/x",
         written=[],
         next_command="phasesweep status c.yaml --trials",
+        show_winners_command="phasesweep show-winners c.yaml",
     )
 
 
@@ -210,11 +214,12 @@ def _flagged_summary(depth: tuple[str, ...], learning_rate: tuple[str, ...]) -> 
             [
                 "  depth          2 complete",
                 "                 winner  trial 0  eval_loss 0.3  model.n_layers=8",
-                "                         flagged: survivorship (see show-winners)",
+                "                         flagged: survivorship",
+                "                         details: phasesweep show-winners c.yaml",
                 "  learning_rate  2 complete",
                 "                 winner  trial 0  eval_loss 0.3  optimizer.lr=0.0003",
-                "                         flagged: evaluation_point, survivorship, tie (see",
-                "                                  show-winners)",
+                "                         flagged: evaluation_point, survivorship, tie",
+                "                         details: phasesweep show-winners c.yaml",
             ],
             id="80",
         ),
@@ -224,14 +229,14 @@ def _flagged_summary(depth: tuple[str, ...], learning_rate: tuple[str, ...]) -> 
                 "  depth          2 complete",
                 "                 winner  trial 0  eval_loss 0.3",
                 "                         model.n_layers=8",
-                "                         flagged: survivorship (see",
-                "                                  show-winners)",
+                "                         flagged: survivorship",
+                "                         details: phasesweep show-winners c.yaml",
                 "  learning_rate  2 complete",
                 "                 winner  trial 0  eval_loss 0.3",
                 "                         optimizer.lr=0.0003",
                 "                         flagged: evaluation_point,",
-                "                                  survivorship, tie (see",
-                "                                  show-winners)",
+                "                                  survivorship, tie",
+                "                         details: phasesweep show-winners c.yaml",
             ],
             id="60",
         ),
@@ -240,12 +245,13 @@ def _flagged_summary(depth: tuple[str, ...], learning_rate: tuple[str, ...]) -> 
 def test_summary_names_the_checks_a_winners_selection_flagged(
     width: int, expected: list[str]
 ) -> None:
-    """A flagged winner gets one line under its facts naming each check and where to read more."""
+    """A flagged winner's lines name each check, then the show-winners command, never broken."""
     block = _flagged_summary(("survivorship",), ("evaluation_point", "survivorship", "tie"))
     lines = block.render(width, color=False)
 
     assert lines[3:-2] == expected
-    assert all(len(line) <= width for line in lines)
+    # A command is pasted, so the details line is the one line that may pass the width.
+    assert all(len(line) <= width for line in lines if "details:" not in line)
 
 
 def test_summary_adds_no_flag_line_for_a_winner_without_flagged_checks() -> None:
@@ -263,9 +269,7 @@ def test_summary_paints_only_the_flag_label_yellow_on_a_terminal() -> None:
     block = _flagged_summary(("survivorship",), ())
     styled = block.render(80, color=True)
 
-    assert (
-        "                         \x1b[33mflagged:\x1b[0m survivorship (see show-winners)" in styled
-    )
+    assert "                         \x1b[33mflagged:\x1b[0m survivorship" in styled
     assert re.sub(r"\x1b\[[0-9;]*m", "", "\n".join(styled)) == "\n".join(
         block.render(80, color=False)
     )
@@ -282,6 +286,7 @@ def test_a_phase_that_only_holds_interrupted_trials_still_says_so() -> None:
         written_root="runs/phasesweep_starter",
         written=[],
         next_command="phasesweep status starter.yaml --trials",
+        show_winners_command="phasesweep show-winners starter.yaml",
     )
 
     assert "  depth          no trials (1 interrupted)" in block.render(80, color=False)
@@ -298,6 +303,7 @@ def test_summary_omits_the_written_section_when_nothing_was_written() -> None:
         written_root="runs/phasesweep_starter",
         written=[],
         next_command="phasesweep status starter.yaml --trials",
+        show_winners_command="phasesweep show-winners starter.yaml",
     )
     assert "Written under" not in "\n".join(block.render(80, color=False))
 
@@ -324,6 +330,7 @@ def _summary_with_dirs(
         written_root="runs/x",
         written=[],
         next_command="phasesweep status c.yaml --trials",
+        show_winners_command="phasesweep show-winners c.yaml",
     )
 
 
@@ -533,6 +540,7 @@ def test_banner_and_summary_style_only_labels_paths_and_the_winner_mark() -> Non
         written_root="runs/x",
         written=["depth/trials.csv"],
         next_command="phasesweep status c.yaml --trials",
+        show_winners_command="phasesweep show-winners c.yaml",
     ).render(80, color=True)
     plain = re.sub(r"\x1b\[[0-9;]*m", "", "\n".join(shown))
     assert plain.splitlines() == summary(
@@ -544,6 +552,7 @@ def test_banner_and_summary_style_only_labels_paths_and_the_winner_mark() -> Non
         written_root="runs/x",
         written=["depth/trials.csv"],
         next_command="phasesweep status c.yaml --trials",
+        show_winners_command="phasesweep show-winners c.yaml",
     ).render(80, color=False)
     text = "\n".join(shown)
     assert "\x1b[1;32mwinner\x1b[0m" in text

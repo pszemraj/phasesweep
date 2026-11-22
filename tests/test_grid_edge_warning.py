@@ -664,8 +664,7 @@ def test_overlap_warning_keeps_threshold_with_groups_and_leaves_the_remedy_to_sh
     )
     assert re.search(
         r"tie: 1 group is within noise of the winner, threshold 0\.0453392 \(sd 0\.02 pooled "
-        r"over 2 groups, df 4\): group \d+ at gap 0\.03\. Details: phasesweep show-winners "
-        r"CONFIG$",
+        r"over 2 groups, df 4\): group \d+ at gap 0\.03$",
         warning,
     )
     assert "report progress=" not in warning

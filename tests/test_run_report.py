@@ -1393,6 +1393,10 @@ def test_a_resumed_run_counts_the_trials_a_previous_run_recorded(
     assert re.search(r"p  2 trials to run, 1 at a time, 2 already finished", err)
     assert re.search(r"Finished in \d+\.\ds: 1 phase, 4 trials, 2 from a previous run", err)
     assert f"Next: phasesweep status {config} --set 'phases[p].n_trials=4' --trials" in err
+    # The constant trainer ties every trial, so the winner's flagged line gives the command
+    # that prints the tie's numbers, with the overrides the run was typed with.
+    assert "flagged: tie\n" in err
+    assert f"details: phasesweep show-winners {config} --set 'phases[p].n_trials=4'\n" in err
 
 
 def test_phase_counts_keep_an_interrupted_trial_out_of_the_counted_and_earlier_totals(

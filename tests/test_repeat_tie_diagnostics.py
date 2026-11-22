@@ -70,5 +70,5 @@ def test_repeat_tie_warning_names_the_group_gap_and_pooled_threshold(
     (message,) = messages
     assert message.endswith(
         "tie: 1 group is within noise of the winner, threshold 0.184197 (sd 0.0578792 pooled "
-        "over 3 groups, df 3): group 3 at gap 0.02. Details: phasesweep show-winners CONFIG"
+        "over 3 groups, df 3): group 3 at gap 0.02"
     )

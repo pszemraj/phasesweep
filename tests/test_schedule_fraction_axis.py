@@ -119,7 +119,9 @@ def test_training_length_recipe_preserves_evaluation_and_mcp_verdicts(
     block = _assess_population(trials, trials, trials[1], provenance=provenance)
 
     assert block["checks"]["evaluation_point"]["verdict"] == expected_verdict
-    summary = _confound_summary(block, winner_trial=1, extractor_kind="json_envelope")
+    summary = _confound_summary(
+        block, winner_trial=1, extractor_kind="json_envelope", persistent=True
+    )
     assert summary["evaluation_point"]["verdict"] == expected_verdict
     assert summary["flagged"] == (
         ["evaluation_point"] if expected_verdict == "heterogeneous" else []

@@ -804,6 +804,9 @@ def _closing_block(
         written_root=display_path(root),
         written=written,
         next_command=next_command,
+        show_winners_command=command_line(
+            "show-winners", *_config_arguments(config_path, settings)
+        ),
     )
 
 

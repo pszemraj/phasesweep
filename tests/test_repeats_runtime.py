@@ -460,7 +460,7 @@ def test_winner_view_projects_the_repeats_summary(
     assert view.params.keys() == {"x"}
 
     _members(winner)[1]["metric"] = 99.0
-    assert _winner_view(winner, "p") is None
+    assert _winner_view(winner, "p", persistent=True) is None
 
 
 def test_trial_tables_label_repeat_groups_and_star_every_winning_member(

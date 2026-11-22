@@ -27,6 +27,7 @@ from phasesweep.engine.repeats import (
     noise_band,
 )
 from phasesweep.engine.state import _unreplaced_attempts
+from phasesweep.errors import STORAGE_NULL_KEEPS_NOTHING
 from phasesweep.evidence.models import (
     POSITIONED_EXTRACTOR_KINDS,
     best_value_position_reason,
@@ -767,8 +768,8 @@ def _describe_flagged(
 ) -> list[str]:
     """Describe each flagged check with the numbers behind it, for operator logs.
 
-    Each sentence states what the check found; ``show-winners`` carries the remedies, and
-    docs/runtime.md ("Confound verdicts") how to retry the failed configurations.
+    Each sentence states what the check found; ``show-winners`` and the MCP results carry each
+    flagged check's remedy (:func:`_confound_summary`).
 
     :param ConfoundBlock block: A freshly assessed block.
     :param int winner_trial: The selected trial, one of the block's ranked trials.
@@ -913,6 +914,29 @@ def _evaluation_point_remedy(kind: str, *, axis: str = "step") -> str:
     )
 
 
+def _survivorship_remedy(detail: SurvivorshipDetail, *, persistent: bool) -> str:
+    """Say how to give the configurations without a result one, for every sampler.
+
+    The summary holds no phase config or trials, so it cannot name the exact target
+    :func:`phasesweep.engine.study_policy._raised_target_step` names; a raised ``n_trials`` is
+    the one step that is true for every sampler, and docs/runtime.md ("Retry fixed
+    configurations and grids") gives the ceiling. Without storage nothing is kept, so a rerun
+    tries every configuration again and the target need not move.
+
+    :param SurvivorshipDetail detail: Flagged survivorship evidence.
+    :param bool persistent: Whether the display config keeps its trials between runs.
+    :return str: The step.
+    """
+    if not persistent:
+        return f"Fix the failure and rerun; {STORAGE_NULL_KEEPS_NOTHING}."
+    if not detail["failed"]:
+        return "Raise the phase's n_trials and rerun to run its untried cells."
+    return (
+        "Fix the failure, then raise the phase's n_trials and rerun: a grid or fixed "
+        "configuration retries its failed cells, and another sampler draws new configurations."
+    )
+
+
 def _noise_remedy() -> str:
     """Return guidance for an exact tie between configurations measured once each.
 
@@ -974,7 +998,7 @@ def _describe_group_tie(
 
 
 def _confound_summary(
-    block: ConfoundBlock, *, winner_trial: int, extractor_kind: str
+    block: ConfoundBlock, *, winner_trial: int, extractor_kind: str, persistent: bool
 ) -> dict[str, object]:
     """Project a validated block onto the enums and numbers agents may see.
 
@@ -984,6 +1008,8 @@ def _confound_summary(
     :param ConfoundBlock block: A validated confound block.
     :param int winner_trial: Trial number of the winner the block belongs to.
     :param str extractor_kind: Objective reader that recorded the winner's provenance.
+    :param bool persistent: Whether the display config keeps its trials between runs, which
+        decides the survivorship remedy.
     :return dict[str, object]: The summary, one entry per check plus the ``flagged`` check names.
     """
     checks = block["checks"]
@@ -1016,7 +1042,15 @@ def _confound_summary(
                 )
             ),
         },
-        "survivorship": {"verdict": survivorship["verdict"], **survivorship["detail"]},
+        "survivorship": {
+            "verdict": survivorship["verdict"],
+            "remedy": (
+                _survivorship_remedy(survivorship["detail"], persistent=persistent)
+                if survivorship["verdict"] == "heterogeneous"
+                else None
+            ),
+            **survivorship["detail"],
+        },
         "tie": {
             "verdict": tie["verdict"],
             "remedy": (

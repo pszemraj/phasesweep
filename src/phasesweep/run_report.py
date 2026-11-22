@@ -592,6 +592,8 @@ class Summary:
     written_root: str
     written: tuple[str, ...]
     next_command: str
+    #: The ``show-winners`` command, as typed, that a flagged winner's line points to.
+    show_winners_command: str
 
     def render(self, width: int, *, color: bool) -> list[str]:
         """Draw the summary in sections separated by blank lines.
@@ -629,26 +631,28 @@ class Summary:
             lines.extend(self._written_lines(width, color=color))
         return [*lines, "", _next_line(self.next_command, color=color)]
 
-    @staticmethod
-    def _flagged_lines(phase: SummaryPhase, pad: str, width: int, *, color: bool) -> list[str]:
+    def _flagged_lines(
+        self, phase: SummaryPhase, pad: str, width: int, *, color: bool
+    ) -> list[str]:
         """Draw the confound checks a winner's selection flagged, under its facts.
 
         The one warning printed as the phase ended scrolls away in a long sweep, so the summary
-        names the checks again and says where the numbers behind them are.
+        names the checks again and gives the command that prints the numbers and remedies
+        behind them, on one line because it is pasted.
 
         :param SummaryPhase phase: The phase whose winner is drawn.
         :param str pad: Indent of the winner's label column.
         :param int width: Columns available to each line.
-        :param bool color: Whether to style the label.
+        :param bool color: Whether to style the labels.
         :return list[str]: The lines under the winner's text column, empty when none was flagged.
         """
         if not phase.flagged:
             return []
         indent = pad + " " * len(f"{_WINNER_WORD}{GAP}")
-        text = f"{', '.join(phase.flagged)} (see show-winners)"
-        lines = wrap_labeled("flagged:", text, width - len(indent))
+        lines = wrap_labeled("flagged:", ", ".join(phase.flagged), width - len(indent))
         lines[0] = paint_word(lines[0], "flagged:", "warning", color=color)
-        return [indent + line for line in lines]
+        details = f"{paint('details:', 'label', color=color)} {self.show_winners_command}"
+        return [indent + line for line in (*lines, details)]
 
     def _headline_lines(self, width: int, *, color: bool) -> list[str]:
         """Wrap the headline, styling its opening words.
@@ -767,6 +771,7 @@ def summary(
     written_root: str,
     written: Sequence[str],
     next_command: str,
+    show_winners_command: str,
 ) -> Summary:
     """Build the summary a successful run closes with.
 
@@ -779,6 +784,7 @@ def summary(
     :param str written_root: The directory the written files are under, as shown.
     :param Sequence[str] written: The files this run wrote, relative to ``written_root``.
     :param str next_command: The command that reads the result.
+    :param str show_winners_command: The ``show-winners`` command a flagged winner points to.
     :return Summary: The block to log.
     """
     reached = {phase.name for _index, phase in experiment.phases_from(from_phase)}
@@ -803,7 +809,9 @@ def summary(
                 directories = tuple(display_path(path) for path in counts[phase.name].winner_dirs)
         phases.append(SummaryPhase(phase.name, clauses, facts, directories, flagged))
     headline = f"Finished in {duration_text(elapsed)}: {run_totals(counts)}"
-    return Summary(headline, tuple(phases), written_root, tuple(written), next_command)
+    return Summary(
+        headline, tuple(phases), written_root, tuple(written), next_command, show_winners_command
+    )
 
 
 def _trial_total(counts: Mapping[str, PhaseCounts]) -> int:
