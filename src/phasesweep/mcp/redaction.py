@@ -232,7 +232,8 @@ def _tracking_delivery_payload(counts: Mapping[str, int], run: Mapping[str, obje
     if pending and run["state"] != "running":
         remedy = (
             f"MLflow: {count_text(counts['records'], counts['creations'])} pending for this "
-            "run; its scores and winners are unaffected. The operator can send them with "
+            "run; its scores and winners are unaffected. The operator can send "
+            f"{'it' if pending == 1 else 'them'} with "
             f"`{sync_tracking_command(str(run['run_id']))}` (the config this run launched with)."
         )
     return {"pending": pending, "delivered": counts["delivered"], "remedy": remedy}

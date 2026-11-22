@@ -423,7 +423,7 @@ def test_recover_run_and_mcp_status_say_what_keeps_a_refused_record_pending(
     delivery = run.app.status(_RUN_ID)["tracking_delivery"]
     assert delivery["remedy"] == (
         "MLflow: 1 record pending for this run; its scores and winners are unaffected. The "
-        f"operator can send them with `phasesweep sync-tracking CONFIG --generation {_RUN_ID}` "
+        f"operator can send it with `phasesweep sync-tracking CONFIG --generation {_RUN_ID}` "
         "(the config this run launched with)."
     )
 
