@@ -117,6 +117,10 @@ STORAGE_NULL_KEEPS_NOTHING = "storage: null keeps no completed trials between ru
 #: reports that state gives.
 START_AGAIN_STEP = f"Rerun the same config to start the run again; {STORAGE_NULL_KEEPS_NOTHING}."
 
+#: The same step after a failure-streak abort, which a rerun repeats until the cause is fixed,
+#: as the step of a persistent study's abort leads with.
+ABORT_START_AGAIN_STEP = f"Fix the cause, then {START_AGAIN_STEP[0].lower()}{START_AGAIN_STEP[1:]}"
+
 #: The fact about a rerun under a persistent study, the counterpart of the clause above.
 PERSISTENT_STUDY_KEEPS_TRIALS = "completed trials are kept"
 

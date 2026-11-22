@@ -114,8 +114,8 @@ from phasesweep.engine.trial import (
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import (
+    ABORT_START_AGAIN_STEP,
     ACCEPT_INCOMPLETE_STEP,
-    START_AGAIN_STEP,
     OperatorAction,
     PhaseSweepError,
     ProcessCleanupUncertainError,
@@ -1531,7 +1531,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
                 phase, study, abort, dependents=experiment.phases_inheriting(phase.name)
             )
             if experiment.persistent
-            else START_AGAIN_STEP
+            else ABORT_START_AGAIN_STEP
         )
         all_infeasible = _streak_trials_all_infeasible(study, aborted_state)
         evidence = (

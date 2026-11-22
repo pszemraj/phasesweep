@@ -30,7 +30,7 @@ from phasesweep.engine.read import experiment_status, read_result
 from phasesweep.engine.run import TerminalReport
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
-from phasesweep.errors import operator_step
+from phasesweep.errors import ABORT_START_AGAIN_STEP, START_AGAIN_STEP, operator_step
 from phasesweep.runtime.files import file_sha256
 from tests.conftest import (
     invoke_cli_boundary,
@@ -659,11 +659,10 @@ def test_in_memory_unpublished_status_describes_a_full_restart(tmp_path: Path) -
 
     shown = CliRunner().invoke(cli, ["status", str(config)])
     assert shown.exit_code == 0, shown.output
-    assert (
-        "start the run again; storage: null keeps no completed trials between runs" in shown.output
-    )
-    # The run's own abort gives the step status gives.
-    assert f"# fix: {operator_step(aborted.value)}" in shown.output
+    # Nothing is recorded about why the run stopped, so status gives the plain rerun; the
+    # abort's own step leads with fixing its cause.
+    assert f"# fix: {START_AGAIN_STEP}" in shown.output
+    assert operator_step(aborted.value) == ABORT_START_AGAIN_STEP
     assert "resume and publish" not in shown.output
     assert "completed trials are kept" not in shown.output
     assert launches.read_text().splitlines() == ["a", "a", "b", "b"]
