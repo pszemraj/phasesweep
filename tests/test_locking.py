@@ -375,13 +375,16 @@ def test_lock_dir_rejects_missing_or_unsafe_override(
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
     with pytest.raises(runtime_files.UnsafeLockPathError, match="does not exist") as missing:
         runtime_files.lock_dir()
+    assert f"Lock directory {override} (PHASESWEEP_LOCK_DIR) does not exist." == str(missing.value)
     assert f"`mkdir -p -m 700 '{override}'`" in (missing.value.remediation or "")
     assert not override.exists()
 
     override.write_text("")
     with pytest.raises(runtime_files.UnsafeLockPathError) as caught:
         runtime_files.lock_dir()
-    assert f"{override} is not a real directory" in str(caught.value)
+    assert f"Lock directory {override} (PHASESWEEP_LOCK_DIR) is not a real directory." == str(
+        caught.value
+    )
     assert caught.value.action.value == "provision_lock_dir"
     override.unlink()
 
@@ -392,6 +395,7 @@ def test_lock_dir_rejects_missing_or_unsafe_override(
     ) as wrong_mode:
         runtime_files.lock_dir()
     assert "mode 0750" in str(wrong_mode.value)
+    assert f"Unsafe lock directory {override} (PHASESWEEP_LOCK_DIR):" in str(wrong_mode.value)
     assert (
         wrong_mode.value.remediation
         == f"For an owner-only lock directory, run `chmod 700 '{override}'`."
@@ -415,6 +419,25 @@ def test_a_path_component_the_os_refuses_to_open_names_the_os_error(tmp_path: Pa
     assert f"Private path component {blocked} cannot be accessed" in str(caught.value)
     assert "Permission denied" in str(caught.value)
     assert isinstance(caught.value.__cause__, PermissionError)
+
+
+def test_a_lock_directory_under_a_symlinked_parent_names_the_parent_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal names the lock directory and the parent that fails, each once, and the variable."""
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    (tmp_path / "linked").symlink_to(real, target_is_directory=True)
+    override = tmp_path / "linked" / "locks"
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
+
+    with pytest.raises(runtime_files.UnsafeLockPathError) as caught:
+        runtime_files.lock_dir()
+
+    assert str(caught.value) == (
+        f"Lock directory {override} (PHASESWEEP_LOCK_DIR): "
+        f"Private path component {tmp_path / 'linked'} is a symlink."
+    )
 
 
 def test_lock_open_rejects_symlink_before_gpu_diagnostics_write(

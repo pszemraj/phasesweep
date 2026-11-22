@@ -186,7 +186,7 @@ def lock_dir(*, create: bool = True) -> Path:
             _lock_policy(path)
         except OSError as exc:
             raise UnsafeLockPathError(
-                f"Cannot access lock directory {path}: {exc}",
+                f"Cannot access lock directory {_lock_dir_name(path)}: {exc}",
                 action=OperatorAction.PROVISION_LOCK_DIR,
             ) from exc
         return path
@@ -244,19 +244,46 @@ def _lock_policy(path: Path) -> _LockPolicy:
         fd = open_directory_fd(path, create=False, private_final=False)
     except FileNotFoundError as exc:
         raise UnsafeLockPathError(
-            f"Lock directory {path} does not exist.",
+            f"Lock directory {_lock_dir_name(path)} does not exist.",
             action=OperatorAction.PROVISION_LOCK_DIR,
             remediation=f"Create it with `mkdir -p -m 700 {shlex.quote(str(path))}`.",
         ) from exc
     except UnsafePrivatePathError as exc:
         raise UnsafeLockPathError(
-            f"Lock directory {path}: {exc}",
+            _lock_dir_refusal(path, exc),
             action=OperatorAction.PROVISION_LOCK_DIR,
         ) from exc
     try:
         return _lock_policy_for_info(path, os.fstat(fd))
     finally:
         os.close(fd)
+
+
+def _lock_dir_name(path: Path) -> str:
+    """Name a lock directory in a refusal, with the variable that selected it when one did.
+
+    :param Path path: The lock directory.
+    :return str: ``path``, followed by ``(PHASESWEEP_LOCK_DIR)`` when that variable holds it.
+    """
+    override = os.environ.get(_LOCK_DIR_ENV)
+    return f"{path} ({_LOCK_DIR_ENV})" if override and Path(override) == path else str(path)
+
+
+def _lock_dir_refusal(path: Path, exc: UnsafePrivatePathError) -> str:
+    """Word the refusal of the walk to a lock directory, naming the directory once.
+
+    The walk names the component it stopped at. When that is the lock directory itself, the
+    refusal speaks of the directory and does not repeat its path.
+
+    :param Path path: The lock directory.
+    :param UnsafePrivatePathError exc: The walk's refusal.
+    :return str: The refusal, with the component named when it is a parent of ``path``.
+    """
+    name = f"Lock directory {_lock_dir_name(path)}"
+    problem = str(exc).removeprefix(_component_subject(path))
+    if problem != str(exc):
+        return f"{name}{problem}"
+    return f"{name}: {exc}"
 
 
 def _lock_policy_for_info(path: Path, info: os.stat_result) -> _LockPolicy:
@@ -276,7 +303,9 @@ def _lock_policy_for_info(path: Path, info: os.stat_result) -> _LockPolicy:
         owner/mode does not match either the private or shared policy.
     """
     if not stat.S_ISDIR(info.st_mode):
-        raise UnsafeLockPathError(f"Lock directory {path} must be a real directory, not a symlink.")
+        raise UnsafeLockPathError(
+            f"Lock directory {_lock_dir_name(path)} must be a real directory, not a symlink."
+        )
 
     mode = stat.S_IMODE(info.st_mode)
     euid = os.geteuid()
@@ -288,7 +317,7 @@ def _lock_policy_for_info(path: Path, info: os.stat_result) -> _LockPolicy:
         return _LockPolicy(True, info.st_uid, info.st_gid, SHARED_FILE_MODE)
 
     raise UnsafeLockPathError(
-        f"Unsafe lock directory {path}: found uid {info.st_uid}, gid {info.st_gid}, mode "
+        f"Unsafe lock directory {_lock_dir_name(path)}: found uid {info.st_uid}, gid {info.st_gid}, mode "
         f"{mode:04o}. Expected mode 0700 owned by uid {euid}, or mode 03770 owned by root "
         "in a group you belong to.",
         remediation=(
@@ -342,9 +371,11 @@ def _open_lock_file(path: Path) -> IO[str]:
     require_supported_runtime()
     try:
         parent_fd = open_directory_fd(path.parent, create=False, private_final=False)
-    except (FileNotFoundError, UnsafePrivatePathError) as exc:
+    except UnsafePrivatePathError as exc:
+        raise UnsafeLockPathError(_lock_dir_refusal(path.parent, exc)) from exc
+    except FileNotFoundError as exc:
         raise UnsafeLockPathError(
-            f"Lock directory {path.parent} is not safe to open: {exc}"
+            f"Lock directory {_lock_dir_name(path.parent)} is not safe to open: {exc}"
         ) from exc
     try:
         policy = _lock_policy_for_info(path.parent, os.fstat(parent_fd))
@@ -612,11 +643,20 @@ def _private_component_error(
     """
     if cause is None:
         return UnsafePrivatePathError(
-            f"Private path component {component_path} is not a real directory."
+            f"{_component_subject(component_path)} is not a real directory."
         )
     return UnsafePrivatePathError(
-        f"Private path component {component_path} cannot be accessed: {cause}"
+        f"{_component_subject(component_path)} cannot be accessed: {cause}"
     )
+
+
+def _component_subject(component_path: Path) -> str:
+    """Name a private path component as the subject of a refusal sentence.
+
+    :param Path component_path: The component, as an absolute path.
+    :return str: The subject every component refusal starts with.
+    """
+    return f"Private path component {component_path}"
 
 
 def _walk_directory_fd(
@@ -667,9 +707,7 @@ def _walk_directory_fd(
             except OSError as exc:
                 raise _private_component_error(component_path, exc) from exc
             if stat.S_ISLNK(before.st_mode):
-                raise UnsafePrivatePathError(
-                    f"Private path component {component_path} is a symlink."
-                )
+                raise UnsafePrivatePathError(f"{_component_subject(component_path)} is a symlink.")
             if not stat.S_ISDIR(before.st_mode):
                 raise _private_component_error(component_path)
             try:
@@ -680,7 +718,7 @@ def _walk_directory_fd(
             if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
                 os.close(next_fd)
                 raise UnsafePrivatePathError(
-                    f"Private path component {component_path} changed while it was opened."
+                    f"{_component_subject(component_path)} changed while it was opened."
                 )
             # Signals remain deferred through this ownership transfer. Assign first so a
             # close failure cannot make finally close the old descriptor again.
