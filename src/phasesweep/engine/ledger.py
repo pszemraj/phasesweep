@@ -400,7 +400,7 @@ def _truncate_incomplete_journal_record(lock: _JournalLock) -> tuple[Path, int] 
     except OSError as exc:
         raise IncompleteJournalRecordError(
             f"Journal storage {path} ends with an incomplete record that could not be "
-            f"repaired: {exc}. Nothing was appended."
+            f"repaired: {exc}"
         ) from exc
     try:
         repaired = _capture_journal(path)
