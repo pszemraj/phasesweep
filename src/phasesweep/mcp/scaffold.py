@@ -82,11 +82,7 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
                 f"configs {seen[experiment_id]} and {config} both derive the "
                 f"experiment id {experiment_id!r}",
                 # Nothing is written on this refusal, so there is no generated id to edit.
-                suggestion=(
-                    "rename one of the config files, since each entry's id comes from its file "
-                    "name, or leave one out and add its entry to the written catalog by hand "
-                    "with another id"
-                ),
+                suggestion="rename one of the config files; each entry's id comes from its file name",
             )
         seen[experiment_id] = config
         experiment_id_scalar = _yaml_string_scalar(experiment_id)
@@ -133,13 +129,9 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
     header = f"""\
 # MCP catalog scaffolded by `phasesweep mcp init-catalog`. Edit the entries, then run:
 #   {check_command}
-# Then configure your MCP client to run the absolute `phasesweep-mcp` executable
-# with `--catalog` and this absolute catalog path.
-#
-# Inspect and launch an experiment by its catalog `id`. Status, results, waiting,
-# and cancellation take the returned `run_id`. Tools accept no config paths,
-# commands, environment values, storage URLs, or workdir. Edit this file to choose
-# the available experiments and permissions.
+# Then point your MCP client at the absolute `phasesweep-mcp` executable with
+# `--catalog` and this file's absolute path. Entry fields:
+# https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md#the-catalog
 
 state_dir: {_yaml_string_scalar(state_dir)}   # run handles, logs, audit.jsonl (operator-owned)
 max_concurrent_runs: 1          # sweeps at once across all experiments; 1 keeps a single GPU sane

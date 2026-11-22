@@ -45,8 +45,7 @@ def test_scaffold_rejects_duplicate_ids(tmp_path: Path) -> None:
     with pytest.raises(CatalogError, match="both derive") as refused:
         scaffold_catalog_text(tmp_path / "catalog.yaml", [first, second])
     assert refused.value.suggestion == (
-        "rename one of the config files, since each entry's id comes from its file name, or "
-        "leave one out and add its entry to the written catalog by hand with another id"
+        "rename one of the config files; each entry's id comes from its file name"
     )
 
 

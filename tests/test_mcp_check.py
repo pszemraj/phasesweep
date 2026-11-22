@@ -172,7 +172,7 @@ experiments:
     ("alias_kind", "expected_error"),
     [
         ("output", "same experiment output namespace"),
-        ("storage", "same Optuna study namespace"),
+        ("storage", "same study namespace"),
     ],
 )
 def test_check_catalog_matches_server_cross_entry_identity_rejections(
