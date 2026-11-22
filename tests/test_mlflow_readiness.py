@@ -97,4 +97,6 @@ def test_a_target_that_gives_no_answer_gets_the_retry_step(
             experiment, generation_id="diagnostic", environment={}, deadline=None
         )
     assert refused.value.action is action
-    assert refused.value.remediation is None
+    # A refusal MLflow answered has no step of its own; no answer gets the server step.
+    expected = session.NO_ANSWER_STEP if action is OperatorAction.RETRY else None
+    assert refused.value.remediation == expected

@@ -84,6 +84,8 @@ RequestFailure = Literal["shutdown", "no answer", "refused", "refused again", "o
 # CONFIG; the CLI prints the command as typed, overrides included, after a run that leaves work
 # pending. Without the overrides a run used, sync-tracking's own refusals name them.
 SYNC_TRACKING_STEP = "`phasesweep sync-tracking CONFIG`"
+# The step for a target check MLflow gave no answer to: a down server and a wrong URI look alike.
+NO_ANSWER_STEP = "Start the MLflow server or correct `mlflow.tracking_uri`, then run again."
 # The step for a config whose MLflow target is not the one the tree's runs used, as a run's
 # warning and sync-tracking's refusal both give it. A ``--set`` override can move the target.
 ORIGINAL_TARGET_STEP = (
@@ -883,9 +885,11 @@ def require_tracking_target(
         # A server that gave no answer may give one to the same command later, and so may one
         # whose creation answer was lost; a refusal it answered, such as a missing experiment,
         # needs the configuration or MLflow fixed first.
+        unanswered = gave_no_answer(exc)
         raise TrackingTargetUnavailableError(
             unready_target_text(experiment, exc) + launch,
-            action=OperatorAction.RETRY if gave_no_answer(exc) else None,
+            action=OperatorAction.RETRY if unanswered else None,
+            remediation=NO_ANSWER_STEP if unanswered else None,
         ) from exc
 
 
