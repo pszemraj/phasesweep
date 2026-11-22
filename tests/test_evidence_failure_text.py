@@ -149,3 +149,51 @@ def test_no_log_match_ends_on_the_path_it_searched(tmp_path: Path) -> None:
         run_extractor(make_trial_context(tmp_path), extractor)
 
     assert str(missing.value).endswith(f" in {tmp_path / 'train.log'}")
+
+
+@pytest.mark.parametrize(
+    ("content", "key", "found"),
+    [
+        pytest.param(
+            '{"loss": 1, "step": 2}',
+            "eval_loss",
+            "failed at 'eval_loss'; the file has 'loss', 'step'",
+            id="top-level",
+        ),
+        pytest.param(
+            '{"m": {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7}}',
+            "m.loss",
+            "failed at 'loss'; 'm' has 'a', 'b', 'c', 'd', 'e' and 2 more",
+            id="nested-keys-capped",
+        ),
+        pytest.param('{"m": {}}', "m.loss", "failed at 'loss'; 'm' has no keys", id="empty-object"),
+        pytest.param('{"m": [1]}', "m.loss", "failed at 'loss'; 'm' is a list", id="not-an-object"),
+        pytest.param("[1, 2]", "loss", "failed at 'loss'; the file is a list", id="file-is-a-list"),
+    ],
+)
+def test_a_missing_json_key_says_what_the_file_holds_where_the_lookup_failed(
+    tmp_path: Path, content: str, key: str, found: str
+) -> None:
+    """The reason names the keys present at the failing level, a handful at most, so a misnamed key is visible."""
+    target = tmp_path / "result.json"
+    target.write_text(content)
+
+    with pytest.raises(ExtractorError) as missing:
+        run_extractor(
+            make_trial_context(tmp_path), JsonExtractor(type="json", path="result.json", key=key)
+        )
+
+    assert str(missing.value) == f"Key {key!r} not found in {target} ({found})."
+
+
+def test_a_gate_reading_a_missing_json_key_says_what_the_file_holds(tmp_path: Path) -> None:
+    """A JSON gate's detail names the missing key and the keys present, like the extractor's reason."""
+    (tmp_path / "result.json").write_text('{"loss": 1}')
+    gate = JsonEqualsGate(type="json_equals", path="result.json", key="eval_loss", value=1)
+
+    [result] = evaluate_gates(make_trial_context(tmp_path), [gate])
+
+    assert (
+        result.detail
+        == "result.json:eval_loss unavailable: no key 'eval_loss'; the file has 'loss'"
+    )

@@ -135,8 +135,8 @@ def load_json_value(
     :raises OutsideAttemptError: If ``relative_path`` resolves outside ``trial_dir``.
     :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular
         file under ``trial_dir``.
-    :raises KeyError: If a segment of the dotted ``key`` path is missing, with the
-        failing segment as the argument.
+    :raises JsonKeyMissingError: If a segment of the dotted ``key`` path is missing, with the
+        failing segment as the argument and what the file holds there.
     :raises OSError: If the resolved file exists but cannot be read.
     :raises UnicodeDecodeError: If the file bytes are not valid UTF-8.
     :raises ValueError: If the contents are not strict JSON (malformed document,
@@ -150,12 +150,71 @@ def load_json_value(
     if digest is not None:
         digest.update(_file_digest(raw))
     cur = strict_json_loads(raw.decode("utf-8"))
+    walked: list[str] = []
     for part in key.split("."):
         if isinstance(cur, dict) and part in cur:
             cur = cur[part]
+            walked.append(part)
             continue
-        raise KeyError(part)
+        raise JsonKeyMissingError(part, _level_text(".".join(walked), cur))
     return target, cur
+
+
+#: How many of an object's keys a missing-key diagnostic lists before it counts the rest.
+_KEYS_SHOWN = 5
+
+
+class JsonKeyMissingError(KeyError):
+    """A segment of a dotted key is missing from a JSON file, with what the file holds there.
+
+    :param str segment: The segment the lookup failed at, also ``args[0]``.
+    :param str found: What the file holds where the lookup failed, a clause for the diagnostic.
+    """
+
+    def __init__(self, segment: str, found: str) -> None:
+        super().__init__(segment)
+        self.segment = segment
+        self.found = found
+
+    def __str__(self) -> str:
+        """Say which key is missing and what the file holds there."""
+        return f"no key {self.segment!r}; {self.found}"
+
+
+def _level_text(path: str, level: object) -> str:
+    """Say what a JSON file holds at the level a key lookup failed.
+
+    :param str path: Dotted path of ``level`` within the file; empty for the file's top level.
+    :param object level: The value the lookup could not descend into or find its segment in.
+    :return str: ``the file has 'a', 'b' and 3 more``, ``'m' has no keys`` or ``'m' is a list``.
+    """
+    where = repr(path) if path else "the file"
+    if not isinstance(level, dict):
+        return f"{where} is {_json_noun(level)}"
+    if not level:
+        return f"{where} has no keys"
+    keys = [repr(name) for name in level]
+    more = len(keys) - _KEYS_SHOWN
+    return f"{where} has {', '.join(keys[:_KEYS_SHOWN])}" + (
+        f" and {more} more" if more > 0 else ""
+    )
+
+
+def _json_noun(value: object) -> str:
+    """Name the kind of a parsed JSON value that is not an object.
+
+    :param object value: A null, boolean, number, string or list.
+    :return str: ``null``, ``a boolean``, ``a number``, ``a string`` or ``a list``.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "a boolean"
+    if isinstance(value, int | float):
+        return "a number"
+    if isinstance(value, str):
+        return "a string"
+    return "a list"
 
 
 def json_float(value: Any, *, label: str) -> float:
@@ -302,9 +361,9 @@ def _extract_json(
             ),
         ):
             _, cur = load_json_value(ctx.trial_dir, cfg.path, cfg.key, digest=digest)
-    except KeyError as exc:
+    except JsonKeyMissingError as exc:
         raise ExtractorError(
-            f"Key {cfg.key!r} not found in {target} (failed at {exc.args[0]!r})."
+            f"Key {cfg.key!r} not found in {target} (failed at {exc.segment!r}; {exc.found})."
         ) from exc
 
     try:
