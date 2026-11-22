@@ -148,7 +148,8 @@ CONFIG_OVERRIDES = click.option(
     metavar="KEY=VALUE",
     help=(
         "Override a config value with a YAML VALUE; repeatable. KEY is dot-separated "
-        f"(env.NOTE); select a phase as phases[NAME] or phases[0]. {SET_SYNTAX}"
+        # The \b paragraph keeps the URL unwrapped, so a terminal never breaks it mid-word.
+        f"(env.NOTE); select a phase as phases[NAME] or phases[0].\n\n\b\n{SET_SYNTAX}"
     ),
 )
 MCP_CATALOG = click.option(
