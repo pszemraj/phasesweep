@@ -743,6 +743,12 @@ def test_repeats_median_reducer_flags_only_an_exact_tie_and_judges_no_noise() ->
         "pooled_sd": None,
         "df": None,
     }
+    # The tied group is listed for show-winners and MCP at gap 0, without a band to judge it by.
+    winner = ranked_group([(0, 1.0), (1, 1.0), (2, 1.0)], {"x": 1}, "median")
+    tied = ranked_group([(3, 1.0), (4, 1.0), (5, 3.0)], {"x": 2}, "median")
+    assert tie_group_comparisons(winner, [winner, tied]) == [
+        {"trial_number": 5, "params": {"x": 2}, "gap": 0.0, "combined_se": None, "threshold": None}
+    ]
     apart = _trials(
         (_COMPLETE, 1.0, 1, 0),
         (_COMPLETE, 1.0, 1, 1),
@@ -751,6 +757,8 @@ def test_repeats_median_reducer_flags_only_an_exact_tie_and_judges_no_noise() ->
         (_COMPLETE, 2.0, 2, 1),
         (_COMPLETE, 3.0, 2, 2),
     )
+    apart_tied = ranked_group([(3, 1.0), (4, 2.0), (5, 3.0)], {"x": 2}, "median")
+    assert tie_group_comparisons(winner, [winner, apart_tied]) == []
     assert _assess_groups(apart, groups, reduce="median")["checks"]["tie"] == {
         "verdict": "n/a",
         "reason": "reduce: median has no noise band, and no group matched the winner's median "

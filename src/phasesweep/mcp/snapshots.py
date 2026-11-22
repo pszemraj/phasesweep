@@ -300,14 +300,15 @@ class TieGroupSnapshot(_SnapshotModel):
     """Configuration whose mean is within the phase's pooled noise band of the winner's.
 
     ``combined_se`` is the pooled standard error of the difference between the two means and
-    ``threshold`` the Student-t critical value times it.
+    ``threshold`` the Student-t critical value times it. Groups ranked by median have no band:
+    one ties only when its median equals the winner's, at ``gap`` 0 with both fields null.
     """
 
     trial_number: NonNegativeInt
     params: dict[str, bool | int | float | str | None]
     gap: NonNegativeFloat
-    combined_se: NonNegativeFloat
-    threshold: NonNegativeFloat
+    combined_se: NonNegativeFloat | None
+    threshold: NonNegativeFloat | None
 
 
 class WinnerSnapshot(_SnapshotModel):

@@ -652,7 +652,7 @@ class WinnerPhasePayload(_ToolPayload):
         description="Whether cost_key is unset, comparison unavailable, no cheaper configuration qualifies, or advice is available."
     )
     tie_groups: list[TieGroupSnapshot] | None = Field(
-        description="Other repeat configurations whose mean is within the phase's pooled noise band of the winner's, with params, gap, combined_se and threshold; null when retained trials are unavailable. Parameter values follow visible_params."
+        description="Other repeat configurations whose mean is within the phase's pooled noise band of the winner's, with params, gap, combined_se and threshold; with reduce: median, those whose median equals the winner's, at gap 0 with combined_se and threshold null. Null when retained trials are unavailable. Parameter values follow visible_params."
     )
     edge_advisory: str | None = Field(
         description="Searched numeric parameters whose winning value is the lowest or highest of at least three the phase tried, so no trial ran beyond it; parameters follow visible_params policy."

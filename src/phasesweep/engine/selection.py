@@ -83,29 +83,44 @@ log = logging.getLogger("phasesweep.engine.selection")
 
 
 class TieGroupComparison(typing.TypedDict):
-    """One configuration compared with the selected repeat group."""
+    """One configuration compared with the selected repeat group.
+
+    ``combined_se`` and ``threshold`` are ``None`` for groups ranked by median, which have no
+    noise band and tie only exactly, at ``gap`` 0.
+    """
 
     trial_number: int
     params: JsonObject
     gap: float
-    combined_se: float
-    threshold: float
+    combined_se: float | None
+    threshold: float | None
 
 
 def tie_group_comparisons(
     winner: RankedGroup, groups: Sequence[RankedGroup]
 ) -> list[TieGroupComparison]:
-    """Describe the other configurations whose mean is within the phase's noise band of the winner's.
+    """Describe the other configurations that tie the winner: within its noise band, or exactly.
 
     :param RankedGroup winner: Selected repeat group.
     :param Sequence[RankedGroup] groups: Every group of the same ranked population, which the
         band pools (:func:`phasesweep.engine.repeats.noise_band`).
     :return list[TieGroupComparison]: Parameters, objective gap, standard error of the difference
-        and threshold for each overlap; empty for groups ranked by median, which have no band.
+        and threshold for each overlap; for groups ranked by median, which have no band, each
+        group whose median equals the winner's, without the two band fields.
     """
     band = noise_band(groups)
     if band is None:
-        return []
+        return [
+            {
+                "trial_number": group.representative,
+                "params": json_object(group.params),
+                "gap": 0.0,
+                "combined_se": None,
+                "threshold": None,
+            }
+            for group in groups
+            if dict(group.params) != dict(winner.params) and group.aggregate == winner.aggregate
+        ]
     return [
         {
             "trial_number": group.representative,
@@ -414,8 +429,9 @@ def select_winner(
             None
             if winning is None or ranking is None
             else {
-                comparison["trial_number"]: (comparison["gap"], comparison["threshold"])
+                comparison["trial_number"]: (comparison["gap"], threshold)
                 for comparison in tie_group_comparisons(winning, ranking.groups)
+                if (threshold := comparison["threshold"]) is not None
             }
         ),
     )
