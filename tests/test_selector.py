@@ -513,9 +513,7 @@ def test_crashed_trials_remedy_names_the_next_attempt_budget(
     remedy = refused.value.remediation
     assert remedy is not None
     if persistent:
-        assert remedy.endswith(
-            "Fix the failure, then raise phases[p].n_trials above 2 in the config and rerun."
-        )
+        assert remedy.endswith("Fix the failure, then raise phases[p].n_trials above 2 and rerun.")
     else:
         assert remedy.endswith("Fix the failure, or the metric bounds or constraints, then rerun.")
         assert "raise" not in remedy
@@ -557,24 +555,22 @@ def _sampled_phase(sampler: Sampler, *, n_trials: int = 2) -> Phase:
                 sampler=Sampler(type="grid"),
                 search_space={"x": CategoricalParam(type="categorical", choices=[1, 2, 3])},
             ),
-            "raise phases[p].n_trials from 3 to 6 in the config and rerun to retry its 3 failed "
-            "cells.",
+            "raise phases[p].n_trials from 3 to 6 and rerun to retry its 3 failed cells.",
             id="grid-retries-failed-cells",
         ),
         pytest.param(
             Phase(name="p", n_trials=2, sampler=Sampler(type="random", seed=0), search_space={}),
-            "raise phases[p].n_trials from 2 to 3 in the config and rerun to retry its failed "
-            "attempt.",
+            "raise phases[p].n_trials from 2 to 3 and rerun to retry its failed attempt.",
             id="fixed-configuration-retries-its-cell",
         ),
         pytest.param(
             _sampled_phase(Sampler(type="random", seed=0)),
-            "raise phases[p].n_trials above 2 in the config and rerun.",
+            "raise phases[p].n_trials above 2 and rerun.",
             id="random-draws-new-ones",
         ),
         pytest.param(
             _sampled_phase(Sampler(type="tpe", seed=0)),
-            "raise phases[p].n_trials above 2 in the config and rerun.",
+            "raise phases[p].n_trials above 2 and rerun.",
             id="tpe-draws-new-ones",
         ),
     ],

@@ -1367,7 +1367,7 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     assert "cleanup could not be confirmed" in message
     assert "First confirm the cleanup:" in message
     assert "phasesweep run" in message and "phasesweep mcp recover-run" in message
-    assert "Then raise phases[p].n_trials above 2 in the config" in message
+    assert "Then raise phases[p].n_trials above 2" in message
     # A preview of the larger target refuses the same way, as the live run below does,
     # and asks only for the cleanup that target still waits on.
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as raised:
@@ -1393,7 +1393,7 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     # Once the preflight has confirmed cleanup, only the target is left to raise.
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as confirmed:
         run_experiment(_exp(2))
-    assert "phases[p].n_trials above 2 in the config" in _operational_error_text(confirmed.value)
+    assert "phases[p].n_trials above 2" in _operational_error_text(confirmed.value)
     assert "mcp recover-run" not in _operational_error_text(confirmed.value)
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_exp(3))

@@ -1362,7 +1362,7 @@ ORIGIN_CASES = (
         trigger=_rerun_aborted_phase,
         raised=PhaseAbortRefusedError,
         action=OperatorAction.FIX_CONFIG,
-        message="phases[p].n_trials above 4 in the config",
+        message="phases[p].n_trials above 4",
     ),
     RoutingCase(
         # Raising the target does not retire an unsafe-cleanup abort; cleanup recovery does.
@@ -1378,14 +1378,14 @@ ORIGIN_CASES = (
         trigger=_abort_with_failed_cells,
         raised=PhaseTrialsFailedError,
         action=OperatorAction.FIX_CONFIG,
-        message="phases[p].n_trials from 2 to 4 in the config",
+        message="phases[p].n_trials from 2 to 4",
     ),
     RoutingCase(
         id="live_abort_with_unrun_cells",
         trigger=_abort_with_unrun_cells,
         raised=PhaseTrialsInfeasibleError,
         action=OperatorAction.FIX_CONFIG,
-        message="phases[p].max_consecutive_failures above 2 in the config",
+        message="phases[p].max_consecutive_failures above 2",
     ),
     RoutingCase(
         id="live_abort_with_every_cell_measured",
@@ -1399,7 +1399,7 @@ ORIGIN_CASES = (
         trigger=_finish_after_fatal_abort,
         raised=PhaseTrialsFailedError,
         action=OperatorAction.FIX_CONFIG,
-        message="phases[p].n_trials above 4 in the config",
+        message="phases[p].n_trials above 4",
     ),
     RoutingCase(
         id="live_abort_awaiting_cleanup_recovery",

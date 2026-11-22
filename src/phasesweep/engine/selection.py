@@ -154,7 +154,7 @@ def _no_feasible_remedy(
     if infeasible:
         return f"{evidence} To change metric.min, metric.max or constraints, {FRESH_STUDY}."
     timeout_lead = ""
-    step: str | None = "raise the phase's n_trials in the config and rerun."
+    step: str | None = "raise the phase's n_trials and rerun."
     if phase_name is not None:
         phase = experiment.phase(phase_name)
         step = _raised_target_step(phase, trials)

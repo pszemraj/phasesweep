@@ -101,9 +101,7 @@ def test_partly_failed_grid_retries_the_failed_cell_only(tmp_path: Path, repeats
     if repeats:
         with pytest.raises(NoFeasibleTrialError) as refused:
             run_experiment(original)
-        assert "raise phases[p].n_trials from 2 to 3 in the config" in str(
-            refused.value.remediation
-        )
+        assert "raise phases[p].n_trials from 2 to 3" in str(refused.value.remediation)
     else:
         assert run_experiment(original)["p"].metric == 1.0
     with pytest.raises(TrialTargetRefusedError):
@@ -192,8 +190,8 @@ def test_grid_seed_audit_retries_only_its_failed_repeat(tmp_path: Path) -> None:
 
 
 def _assert_advises_limit(message: str, above: int, left: int) -> None:
-    """Assert the message tells the operator to raise phase ``p``'s failure limit in the config."""
-    assert f"phases[p].max_consecutive_failures above {above} in the config" in message
+    """Assert the message tells the operator to raise phase ``p``'s failure limit."""
+    assert f"phases[p].max_consecutive_failures above {above}" in message
     assert f"run the {left} trials still left" in message
 
 
@@ -547,7 +545,7 @@ def test_sampling_phase_asks_for_a_higher_target_without_a_retry_rule(tmp_path: 
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(experiment)
     for message in (_operational_error_text(aborted.value), _operational_error_text(refused.value)):
-        assert "phases[p].n_trials above 2 in the config" in message
+        assert "phases[p].n_trials above 2" in message
         # Both trials are spent, so a higher limit would schedule nothing.
         assert "max_consecutive_failures above" not in message
 
@@ -570,7 +568,7 @@ def test_infeasible_sampling_streak_offers_the_raised_target_under_unchanged_lim
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(experiment)
     message = _operational_error_text(aborted.value)
-    assert "To keep them, raise phases[p].n_trials above 2 in the config" in message
+    assert "To keep them, raise phases[p].n_trials above 2" in message
     assert "Fix the cause" not in message
     assert message.index("new `experiment` name") < message.index("To keep them")
 

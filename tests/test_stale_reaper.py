@@ -1967,7 +1967,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     monkeypatch.setattr(phase_mod, "write_attempt_lifecycle", real_write_attempt_lifecycle)
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(_exp(2))
-    assert "phases[p].n_trials above 2 in the config" in _operational_error_text(refused.value)
+    assert "phases[p].n_trials above 2" in _operational_error_text(refused.value)
     assert not launched.exists()
 
     winners = run_experiment(_exp(3))

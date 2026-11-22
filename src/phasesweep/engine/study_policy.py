@@ -767,12 +767,10 @@ def _raised_target_step(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]
     finished = _finished_trial_count(trials)
     ceiling = retry_target_ceiling(phase, finished=finished, measured=_measured_trial_count(trials))
     if ceiling is None:
-        return f"raise phases[{name}].n_trials above {target} in the config and rerun."
+        return f"raise phases[{name}].n_trials above {target} and rerun."
     if ceiling <= target:
         return None
-    raise_to = (
-        f"raise phases[{name}].n_trials from {target} to {ceiling} in the config and rerun to"
-    )
+    raise_to = f"raise phases[{name}].n_trials from {target} to {ceiling} and rerun to"
     if not phase_draws(phase):
         return f"{raise_to} retry its failed attempt."
     failed = len(_failed_grid_cells(trials))
@@ -853,7 +851,7 @@ def _recovery_remedies(
         then = (
             f"Then n_trials={target} retires the abort."
             if isinstance(aborted_at, int) and target > aborted_at
-            else f"Then raise phases[{name}].n_trials above {target} in the config."
+            else f"Then raise phases[{name}].n_trials above {target}."
         )
         return f"First confirm the cleanup: {RERUN_CLEANUP_RECOVERY}. {then}"
     trials = study.get_trials(deepcopy=False)
@@ -863,8 +861,8 @@ def _recovery_remedies(
     step = _raised_target_step(phase, trials)
     if step is None and streak is not None and finished < target:
         step = (
-            f"raise phases[{name}].max_consecutive_failures above {streak} in the config and "
-            f"rerun to run the {plural(target - finished, 'trial')} still left."
+            f"raise phases[{name}].max_consecutive_failures above {streak} and rerun to run the "
+            f"{plural(target - finished, 'trial')} still left."
         )
     if step is not None:
         return f"{lead_in}{step}"

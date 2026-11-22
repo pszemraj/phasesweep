@@ -262,7 +262,7 @@ def _spawned_runner(
         pytest.param(
             ArtifactRootConflictError("bound to /a, offered /b"),
             "artifact_root_conflict",
-            "set a new `experiment` name in the config to start a fresh study",
+            "set a new `experiment` name to start a fresh study",
             id="artifact_root",
         ),
     ],
@@ -595,7 +595,7 @@ def test_prior_abort_refusal_is_a_refused_target_not_a_trainer_failure(
     assert (refused["code"], refused["stage"]) == ("trial_target_refused", "preflight")
     assert (refused["retryable"], refused["actor"]) == (False, "operator")
     for failure in (aborting, refused):
-        assert "phases[p].n_trials above 2 in the config" in failure["remediation"]
+        assert "phases[p].n_trials above 2" in failure["remediation"]
 
 
 @pytest.mark.integration
@@ -752,7 +752,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     # Unsupported state routes to starting fresh, rather than to archiving
     # this study and continuing under the current one.
     remediation = terminal["failure"]["remediation"]
-    assert "Set a new `experiment` name in the config" in remediation
+    assert "Set a new `experiment` name" in remediation
 
 
 @pytest.mark.integration

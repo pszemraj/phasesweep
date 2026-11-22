@@ -171,7 +171,7 @@ def test_fixed_configuration_retry_counts_every_failed_attempt(tmp_path: Path) -
 
 
 def _assert_advises_next_target(message: str, from_target: int) -> None:
-    """Assert the message tells the operator to raise phase ``p``'s target by one in the config."""
+    """Assert the message tells the operator to raise phase ``p``'s target by one."""
     assert_advises_target(message, from_target, from_target + 1, "retry its failed attempt.")
     # The one attempt the target allowed is spent, so a higher limit would schedule nothing.
     assert "max_consecutive_failures above" not in message

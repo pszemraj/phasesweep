@@ -1431,7 +1431,7 @@ def test_a_pending_trial_whose_tracker_sdk_is_missing_names_installing_it(
     assert refused.value.remediation == (
         "Restore access to the tracker or install its SDK, then run the same config again; the "
         "finished training is kept. If the tracker is gone for good, set a new `experiment` name "
-        "in the config to start a fresh study."
+        "to start a fresh study."
     )
     assert "its tracker could not be read: metric extractor: W&B evidence requires" in caplog.text
     (trial,) = phase_trials(experiment)

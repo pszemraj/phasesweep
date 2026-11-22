@@ -94,8 +94,8 @@ RERUN_CLEANUP_RECOVERY = (
 
 #: The one way to start over, worded as a clause for a step that offers it second. A new
 #: `workdir` and what happens to the old study are said once, in docs/runtime.md ("Storage and
-#: locks").
-FRESH_STUDY = "set a new `experiment` name in the config to start a fresh study"
+#: locks"). It names the key, not the file, since a `--set` override of it wins over the file.
+FRESH_STUDY = "set a new `experiment` name to start a fresh study"
 
 NEW_STUDY_STEP = f"{FRESH_STUDY[0].upper()}{FRESH_STUDY[1:]}."
 
@@ -202,9 +202,7 @@ def unreadable_objective_step(*, persistent: bool) -> str:
 #: command and under every `storage`. A ledger the config names holds every experiment's
 #: studies: a new `experiment` name leaves the unsupported study in it, and a new ledger alone
 #: leaves the artifact root bound to the old one, so there both change.
-OTHER_FORMAT_STEP = (
-    "Set a new `experiment` name in the config, and a new `storage` ledger if it names one."
-)
+OTHER_FORMAT_STEP = "Set a new `experiment` name, and a new ledger if `storage` names one."
 
 
 #: The step for a recorded result that stopped short at a timeout, on every surface that

@@ -348,7 +348,7 @@ def test_the_remediation_names_the_variables_that_differ(monkeypatch: pytest.Mon
 
     assert refusal.remediation == (
         "Run with the recorded `PATH`, `TZ` and without `PS_COHORT_ADDED` to continue this study, "
-        "or set a new `experiment` name in the config to start a fresh study."
+        "or set a new `experiment` name to start a fresh study."
     )
     assert "passthrough_env" not in str(refusal)
     assert "do not split cohorts" not in str(refusal)

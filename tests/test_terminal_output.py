@@ -30,16 +30,16 @@ _DIAGNOSIS = (
     "max_consecutive_failures=2. Inspect runs/exp/phase for stderr logs."
 )
 _STEP = (
-    "Fix the cause, then raise phases[phase].n_trials from 2 to 4 in the config and rerun to "
-    "retry its 2 failed cells."
+    "Fix the cause, then raise phases[phase].n_trials from 2 to 4 and rerun to retry its 2 "
+    "failed cells."
 )
 
 _AT_80 = [
     "phasesweep: Phase 'phase' aborted: 2 consecutive failed/infeasible trials",
     "            reached max_consecutive_failures=2. Inspect runs/exp/phase for",
     "            stderr logs.",
-    "fix: Fix the cause, then raise phases[phase].n_trials from 2 to 4 in the config",
-    "     and rerun to retry its 2 failed cells.",
+    "fix: Fix the cause, then raise phases[phase].n_trials from 2 to 4 and rerun to",
+    "     retry its 2 failed cells.",
 ]
 _AT_60 = [
     "phasesweep: Phase 'phase' aborted: 2 consecutive",
@@ -47,8 +47,7 @@ _AT_60 = [
     "            max_consecutive_failures=2. Inspect",
     "            runs/exp/phase for stderr logs.",
     "fix: Fix the cause, then raise phases[phase].n_trials from 2",
-    "     to 4 in the config and rerun to retry its 2 failed",
-    "     cells.",
+    "     to 4 and rerun to retry its 2 failed cells.",
 ]
 
 
