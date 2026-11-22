@@ -237,8 +237,8 @@ def _validate_device_token_shapes(devices: list[GpuDevice]) -> None:
         if token.isdigit() or token[:4].upper() in ("GPU-", "MIG-"):
             continue
         raise GpuConfigurationError(
-            f"CUDA device token {token!r} is not a numeric index, GPU- UUID or "
-            "MIG- instance ID. Fix gpu_ids, gpu_devices or CUDA_VISIBLE_DEVICES."
+            f"CUDA device token {token!r} is not a numeric index, GPU- UUID or MIG- instance ID.",
+            remediation="Fix gpu_ids, gpu_devices or CUDA_VISIBLE_DEVICES.",
         )
 
 
@@ -254,8 +254,8 @@ def _inventory_unusable(
     :return GpuConfigurationError: The refusal to raise.
     """
     return GpuConfigurationError(
-        f"{source} reported no usable {kind} inventory to validate {tokens}. "
-        f"Fix nvidia-smi or the configured {settings} value. {_GPU_HOST_ACCESS_HINT}"
+        f"{source} reported no usable {kind} inventory to validate {tokens}.",
+        remediation=f"Fix nvidia-smi or the configured {settings} value. {_GPU_HOST_ACCESS_HINT}",
     )
 
 
@@ -272,8 +272,8 @@ def _match_inventory_token(token: str, inventory: Iterable[str], kind: str) -> s
     if len(matches) != 1:
         detail = "matches multiple devices" if matches else "matches no device"
         raise GpuConfigurationError(
-            f"Configured CUDA {kind} token {token!r} {detail} in the nvidia-smi inventory. "
-            "Fix gpu_devices or CUDA_VISIBLE_DEVICES."
+            f"Configured CUDA {kind} token {token!r} {detail} in the nvidia-smi inventory.",
+            remediation="Fix gpu_devices or CUDA_VISIBLE_DEVICES.",
         )
     return matches[0]
 
@@ -289,8 +289,8 @@ def _no_gpus_parallel(n_jobs: int, *, host: str = "") -> GpuConfigurationError:
     :return GpuConfigurationError: The refusal to raise.
     """
     return GpuConfigurationError(
-        f"n_jobs={n_jobs} but no GPUs detected{host}. "
-        "Set allow_no_gpu_isolation: true for a CPU-only parallel sweep."
+        f"n_jobs={n_jobs} but no GPUs detected{host}.",
+        remediation="Set allow_no_gpu_isolation: true for a CPU-only parallel sweep.",
     )
 
 
@@ -369,8 +369,8 @@ def _bind_lock_identities(
         if uuid is None:
             raise GpuConfigurationError(
                 f"Configured CUDA device index {token} is not in the nvidia-smi inventory "
-                f"(resolvable indices: {sorted(uuid_map, key=int)}). "
-                "Fix gpu_ids, gpu_devices or CUDA_VISIBLE_DEVICES."
+                f"(resolvable indices: {sorted(uuid_map, key=int)}).",
+                remediation="Fix gpu_ids, gpu_devices or CUDA_VISIBLE_DEVICES.",
             )
         resolved.append(GpuDevice(visible_token=token, lock_token=uuid))
     return resolved
@@ -414,8 +414,8 @@ def _require_distinct_whole_node_devices(requested: list[str], bound: list[GpuDe
     mig_devices = [device for device in bound if device.lock_identity[:4].upper() == "MIG-"]
     if mig_devices and len(bound) > 1:
         raise GpuConfigurationError(
-            "gpu_policy='whole_node' cannot declare a multi-device world containing "
-            "MIG tokens. Configure exactly one MIG token, or use full-GPU tokens."
+            "gpu_policy='whole_node' cannot declare a multi-device world containing MIG tokens.",
+            remediation="Configure exactly one MIG token, or use full-GPU tokens.",
         )
 
     aliases: list[str] = []
@@ -437,8 +437,8 @@ def _require_distinct_whole_node_devices(requested: list[str], bound: list[GpuDe
     raise GpuConfigurationError(
         f"gpu_policy='whole_node' declares {plural(len(requested), 'CUDA device token')} "
         f"({requested}) that resolve to {plural(effective, 'distinct physical GPU')}: "
-        f"{detail or 'an empty token was dropped'}. "
-        "List one distinct GPU per world-size slot."
+        f"{detail or 'an empty token was dropped'}.",
+        remediation="List one distinct GPU per world-size slot.",
     )
 
 
@@ -529,7 +529,8 @@ class GpuPool:
         if sys.platform == "darwin":
             if explicit_ids is not None or explicit_devices is not None:
                 raise GpuConfigurationError(
-                    "gpu_ids and gpu_devices are unavailable on macOS; omit them."
+                    "gpu_ids and gpu_devices are unavailable on macOS.",
+                    remediation="Omit them.",
                 )
             if platform.machine().lower() in {"arm64", "aarch64"}:
                 devices = [GpuDevice("mps")]
@@ -616,8 +617,8 @@ class GpuPool:
             if (pinned is None or ambient_inventory_failure) and _nvidia_driver_reports_gpus():
                 if not allow_no_gpu:
                     raise GpuConfigurationError(
-                        f"{_NVIDIA_SMI_BLIND}, so no GPU locks can be derived. Fix nvidia-smi. "
-                        f"{_GPU_HOST_ACCESS_HINT}"
+                        f"{_NVIDIA_SMI_BLIND}, so no GPU locks can be derived.",
+                        remediation=f"Fix nvidia-smi. {_GPU_HOST_ACCESS_HINT}",
                     )
                 log.warning(
                     "%s; allow_no_gpu_isolation: true is set, so trials run without GPU host "

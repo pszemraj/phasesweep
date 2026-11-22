@@ -21,7 +21,7 @@ import pytest
 
 from phasesweep.config.models import GpuPolicy, Phase
 from phasesweep.config.search import IntParam
-from phasesweep.errors import GpuConfigurationError
+from phasesweep.errors import GpuConfigurationError, operator_step
 from phasesweep.runtime.files import open_lock_file
 from phasesweep.runtime.gpu import (
     GpuDevice,
@@ -57,12 +57,12 @@ def deterministic_gpu_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_gpu_pool_fails_on_missing_gpus_parallel(monkeypatch):
     """n_jobs > 1 with no GPUs and allow_no_gpu=False must raise, not silently degrade."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    with pytest.raises(RuntimeError) as refused:
+    with pytest.raises(GpuConfigurationError) as refused:
         GpuPool.create(n_jobs=4, allow_no_gpu=False)
     # Explicit gpu_ids resolve through the same empty inventory (see the unreadable-map test
     # below), so the one way out is the opt-in.
-    assert str(refused.value) == (
-        "n_jobs=4 but no GPUs detected. "
+    assert str(refused.value) == "n_jobs=4 but no GPUs detected."
+    assert operator_step(refused.value) == (
         "Set allow_no_gpu_isolation: true for a CPU-only parallel sweep."
     )
 

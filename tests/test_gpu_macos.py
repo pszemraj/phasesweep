@@ -11,7 +11,7 @@ import pytest
 from phasesweep.config.models import GpuPolicy, Phase
 from phasesweep.config.search import IntParam
 from phasesweep.engine.fingerprints import _semantic_phase_dump
-from phasesweep.errors import GpuConfigurationError
+from phasesweep.errors import GpuConfigurationError, operator_step
 from phasesweep.runtime.gpu import GpuLeaseTimeoutError, GpuPool, _gpu_lock_path
 
 
@@ -72,10 +72,11 @@ def test_mps_phase_configuration_uses_discovered_pool(policy: GpuPolicy) -> None
 
 def test_macos_refuses_explicit_cuda_device_lists() -> None:
     """macOS device leases always come from discovery, never CUDA tokens."""
-    with pytest.raises(GpuConfigurationError, match="unavailable on macOS; omit them"):
+    with pytest.raises(GpuConfigurationError, match="unavailable on macOS") as ids_refused:
         GpuPool.create(n_jobs=1, explicit_ids=[0])
-    with pytest.raises(GpuConfigurationError, match="unavailable on macOS; omit them"):
+    with pytest.raises(GpuConfigurationError, match="unavailable on macOS") as devices_refused:
         GpuPool.create(n_jobs=1, explicit_devices=["GPU-example"])
+    assert operator_step(ids_refused.value) == operator_step(devices_refused.value) == "Omit them."
 
 
 def test_mps_none_policy_does_not_take_a_host_lease(

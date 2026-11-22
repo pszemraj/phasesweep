@@ -10,7 +10,7 @@ from click.testing import CliRunner
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli
-from phasesweep.errors import GpuConfigurationError
+from phasesweep.errors import GpuConfigurationError, operator_step
 from tests.experiments import phase_payload, write_experiment
 
 
@@ -81,8 +81,8 @@ def test_gpu_preflight_inventory_refusal_explains_host_access(
         error = failure.value
 
     assert "nvidia-smi" in str(error)
-    assert "sandbox" in str(error)
-    assert "host shell with GPU access" in str(error)
+    assert "sandbox" in operator_step(error)
+    assert "host shell with GPU access" in operator_step(error)
     assert not workdir.exists()
 
 

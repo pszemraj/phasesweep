@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from phasesweep.errors import GpuConfigurationError, OperatorAction
+from phasesweep.errors import GpuConfigurationError, OperatorAction, operator_step
 from phasesweep.mcp.runner import _terminal_error, _terminal_failure_payload
 from phasesweep.runtime.files import UnsafeLockPathError
 from phasesweep.runtime.gpu import GpuPool
@@ -42,12 +42,15 @@ def test_gpu_enumeration_refusal_names_the_fix_and_the_host_shell_route(
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
 
-    with pytest.raises(GpuConfigurationError, match="Fix nvidia-smi") as failure:
+    with pytest.raises(GpuConfigurationError, match="could not enumerate GPUs") as failure:
         GpuPool.create(n_jobs=1)
 
-    assert "sandboxed shell" in str(failure.value)
-    assert "host shell with GPU access" in str(failure.value)
-    assert "gpu_policy" not in str(failure.value)
+    step = operator_step(failure.value)
+    assert step.startswith("Fix nvidia-smi.")
+    assert "sandboxed shell" in step
+    assert "host shell with GPU access" in step
+    assert "sandboxed shell" not in str(failure.value)
+    assert "gpu_policy" not in str(failure.value) + step
 
     with GpuPool.create(n_jobs=1, policy="none").acquire() as assignment:
         assert assignment.visible_devices is None
