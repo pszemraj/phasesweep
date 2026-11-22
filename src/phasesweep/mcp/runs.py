@@ -349,7 +349,6 @@ class RunStore:
         """
         store = cls.__new__(cls)
         store._set_paths(state_dir)
-        wrong_path = ". Pass the state_dir from the catalog the MCP server runs with."
         parent = absolute_path(state_dir).parent
         if parent != parent.parent:
             try:
@@ -357,24 +356,22 @@ class RunStore:
             except (OSError, UnsafePrivatePathError) as exc:
                 raise ValueError(
                     f"not an existing MCP state directory; {state_dir} is not reachable "
-                    f"through real directories: {exc}{wrong_path}"
+                    f"through real directories: {exc}"
                 ) from None
         try:
             os.lstat(store._format_marker_path)
         except (FileNotFoundError, NotADirectoryError):
             if store._has_run_handles():
                 raise store._format_refusal("durable run data has no format marker") from None
-            missing = [
-                str(path)
-                for path in (state_dir, store._runs_dir, store._logs_dir)
-                if not path.is_dir()
-            ]
+            # A missing state directory already says its subdirectories are missing.
+            layout = (store._runs_dir, store._logs_dir) if state_dir.is_dir() else (state_dir,)
+            missing = [str(path) for path in layout if not path.is_dir()]
             detail = (
                 "expected directories are missing: " + ", ".join(missing)
                 if missing
                 else f"it has no format marker and no run handles under {store._runs_dir}"
             )
-            raise ValueError(f"not an existing MCP state directory; {detail}{wrong_path}") from None
+            raise ValueError(f"not an existing MCP state directory; {detail}.") from None
         except OSError:
             # Marker presence is unknown until directory validation succeeds.
             pass

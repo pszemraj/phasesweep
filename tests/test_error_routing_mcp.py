@@ -392,7 +392,7 @@ CASES = (
         trigger=_recover_from_mistyped_state_dir,
         raised=RunRecoveryError,
         action=OperatorAction.FIX_CONFIG,
-        message="Pass the state_dir from the catalog the MCP server runs with.",
+        message="not an existing MCP state directory; expected directories are missing",
     ),
     RoutingCase(
         id="recover_run_shared_state_dir",

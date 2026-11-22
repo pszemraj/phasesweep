@@ -154,8 +154,8 @@ def recover_run(
             str(exc),
             action=OperatorAction.FIX_CONFIG,
             remediation=(
-                "Pass the catalog's `state_dir` as an absolute path (a relative one resolves "
-                "against the catalog's directory)."
+                "Pass the catalog's `state_dir`; a relative one there resolves against the "
+                "catalog's directory."
             ),
         ) from None
     except UnsafePrivatePathError as exc:

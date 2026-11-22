@@ -290,6 +290,7 @@ def test_recover_run_tells_a_wrong_state_dir_how_a_relative_one_resolves(tmp_pat
     assert result.exit_code != 0
     assert "not an existing MCP state directory" in result.output
     assert (
-        "fix: Pass the catalog's `state_dir` as an absolute path (a relative one resolves "
-        "against the catalog's directory)."
+        "fix: Pass the catalog's `state_dir`; a relative one there resolves against the "
+        "catalog's directory."
     ) in " ".join(result.output.split())
+    assert "Pass the state_dir" not in result.output
