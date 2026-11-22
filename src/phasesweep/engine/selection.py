@@ -25,6 +25,7 @@ from phasesweep.config.search import (
 )
 from phasesweep.engine.artifacts import _winner_common_payload
 from phasesweep.engine.confound import (
+    ConfoundBlock,
     _assess_population,
     _describe_flagged,
     _evaluation_point_remedy,
@@ -188,9 +189,8 @@ class SelectedTrial:
     trainer_env_digest: str
     # Versioned identity of the exact generated input consumed by the trainer.
     trainer_input: dict[str, Any]
-    # Advisory verdicts on the population this selection ranked
-    # (:class:`phasesweep.engine.confound.ConfoundBlock`).
-    confound: JsonObject
+    # Advisory verdicts on the population this selection ranked.
+    confound: ConfoundBlock
     # The tracked environment mapping behind ``trainer_env_digest``, or ``None`` when the
     # trial recorded none. Only the ledger trial holds it; winner.yaml keeps the digest.
     trainer_env: dict[str, str] | None = None
@@ -475,7 +475,7 @@ def select_winner(
         trainer_env_digest=str(best.user_attrs[TRAINER_ENV_DIGEST_ATTR]),
         trainer_env=json_text_map(best.user_attrs.get(TRAINER_ENV_ATTR)),
         trainer_input=dict(best.user_attrs[TRAINER_INPUT_ATTR]),
-        confound=json_object(confound),
+        confound=confound,
         observed=(
             _observed_values(best, subject=f"Winning trial {best.number}")
             if record is None
