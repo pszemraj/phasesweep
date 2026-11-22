@@ -336,7 +336,7 @@ def test_recover_run_distinguishes_a_creation_miss_from_an_upload_failure(
     assert result.exit_code == 0, result.output
     # The summary record went out; the attempt's creation, inside its window, stays unconfirmed.
     assert (
-        "MLflow: delivered 1 record; 1 unconfirmed run creation pending. Send them with "
+        "MLflow: delivered 1 record; 1 unconfirmed run creation pending. Send it with "
         "`phasesweep sync-tracking CONFIG`." in result.output
     )
     assert pending.is_file() and not bound.exists()
@@ -410,7 +410,7 @@ def test_recover_run_and_mcp_status_say_what_keeps_a_refused_record_pending(
     ]
     assert line.startswith(
         "MLflow: delivered 1 record; 1 record pending. "
-        "Send them with `phasesweep sync-tracking CONFIG`."
+        "Send it with `phasesweep sync-tracking CONFIG`."
     )
     assert "MLflow refused 1 record" in line
     # The refusal's warning is on recover-run's console, labelled and wrapped as a run's is.

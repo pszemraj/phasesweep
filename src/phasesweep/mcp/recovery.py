@@ -338,8 +338,9 @@ def recover_run(
                     if counts.pending:
                         pending = f"{count_text(counts.records, counts.creations)} pending"
                         head = f"{done}; {pending}" if done else pending
+                        them = "it" if counts.pending == 1 else "them"
                         emit(
-                            f"MLflow: {head}. Send them with `{sync_tracking_command()}`."
+                            f"MLflow: {head}. Send {them} with `{sync_tracking_command()}`."
                             + refused_text(tally.refused)
                         )
                     elif done:
