@@ -1,6 +1,6 @@
 schema_version: 6
 experiment: t
-generation_id: b365e57a2a5c4257bdc07bf2dd0caa25
+generation_id: 6c0e4bf66e2b44d69a3a199686a8ed04
 phasesweep_version: 0.3.14
 config_fingerprint: 510eb146e62737707cbf637293fedb6a7f213d3715b3bada974b7f90d629f027
 metric:
@@ -28,14 +28,14 @@ phases:
     incomplete: false
     reason: null
     timeout_scope: null
-  generation_id: b365e57a2a5c4257bdc07bf2dd0caa25
-  attempt_id: 1ae3ea25a9204f0ca86f9c76bd3e998c
+  generation_id: 6c0e4bf66e2b44d69a3a199686a8ed04
+  attempt_id: ad3b805718cd49e8be0167ab547025a1
   winner_source:
     kind: phase_trial
     phase: p
     trial_number: 0
-    generation_id: b365e57a2a5c4257bdc07bf2dd0caa25
-    attempt_id: 1ae3ea25a9204f0ca86f9c76bd3e998c
+    generation_id: 6c0e4bf66e2b44d69a3a199686a8ed04
+    attempt_id: ad3b805718cd49e8be0167ab547025a1
   trainer_input:
     schema_version: 1
     format: argparse
@@ -51,9 +51,7 @@ phases:
     checks:
       evaluation_point:
         verdict: n/a
-        reason: 'log_regex objectives report no evaluation position; json_envelope
-          (report_objective), wandb (evaluation_axis) or mlflow (select: last or step)
-          would bind one'
+        reason: log_regex objectives record no evaluation position
       survivorship:
         verdict: ok
         detail:
@@ -75,11 +73,11 @@ phases:
 artifacts:
 - kind: config_snapshot
   path: config.snapshot.yaml
-  sha256: 861aea020dceff029d246a56a7697e56b98f0f1e95332c72aeda5598cfe57d42
+  sha256: 66ca9aa184e8b9780c9695fcc9db655dba75f6b5117ab47144878daca599fc69
 - kind: reproducibility
   path: reproducibility.json
-  sha256: 4df6994a64982b362077e538d116fb8345bdb4aa25302e7c2d2e84a8175da1a4
+  sha256: 84c7881e5efe95d0ff099e205d0f20f6d3fe1af77213e9660859816a532acd10
 - kind: winner
   phase: p
-  sha256: 4f6562774301784f81f03fd11651dc409277bc714f6f4486781bb05387fd6218
+  sha256: b3c9a90a425d43d2dd9c3e346f4345102e46d91857f00be108c6a0dd1b76ff06
 trainer_config: {}
