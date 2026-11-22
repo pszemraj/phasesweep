@@ -288,8 +288,9 @@ def _warn_environment_drift(
 
     Skipped-phase loading and no-work replay reuse results without allocating trials;
     ordinary top-ups refuse cohort drift before allocation. The warning names the
-    variables that differ when the caller holds the winning trial's recorded mapping,
-    and shows the two digests otherwise.
+    variables that differ as the cohort refusal does
+    (:func:`phasesweep.engine.study_policy._describe_environment_changes`) when the caller
+    holds the winning trial's recorded mapping, and shows the two digests otherwise.
 
     :param Experiment experiment: Parsed experiment supplying the current contract.
     :param str phase_name: Phase whose winner was reused, used in the warn-once key.

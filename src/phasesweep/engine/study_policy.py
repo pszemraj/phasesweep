@@ -34,7 +34,6 @@ from phasesweep.engine.fingerprints import (
     _ABSENT,
     _MAX_REPORTED_CHANGES,
     _changed_payload_keys,
-    _render_changed_values,
     _render_value,
     _verify_recorded_identity,
 )
@@ -969,60 +968,63 @@ class _EnvironmentChange(NamedTuple):
     """One variable a tracked environment differs in, as the refusal shows it."""
 
     name: str
-    #: ``NAME old -> new``, ``added NAME=value`` or ``removed NAME (was value)``.
+    #: ``NAME old -> new``, ``NAME: only recorded: ...``, ``added NAME=value`` or
+    #: ``removed NAME (was value)``.
     text: str
     #: Whether the other cohort's trial recorded the variable, so that it can be restored.
     recorded: bool
 
 
-def _environment_entries(
-    old: dict[str, str], new: dict[str, str], *, full: bool
-) -> list[_EnvironmentChange]:
+def _environment_entries(old: dict[str, str], new: dict[str, str]) -> list[_EnvironmentChange]:
     """List each variable a tracked environment changed, with how it changed.
+
+    A variable present on both sides shows both values whole, so it can be restored, except
+    a search-path list such as ``PATH``, whose two values run to hundreds of characters
+    apiece and differ in an entry or two: it shows only the entries that differ
+    (:func:`_path_list_difference`).
 
     :param dict[str, str] old: Mapping a trial of the other cohort recorded.
     :param dict[str, str] new: Mapping this invocation composes.
-    :param bool full: Show every value whole; otherwise cut a long pair to the window
-        :func:`~phasesweep.engine.fingerprints._render_changed_values` applies to a phase
-        fingerprint refusal, so a long ``PATH`` shows where the two differ.
-    :return list[_EnvironmentChange]: Each differing variable as ``NAME old -> new``, then each
-        added name with its value and each removed name with its old value.
+    :return list[_EnvironmentChange]: Each differing variable, then each added name with its
+        value and each removed name with its old value.
     """
     changed: list[_EnvironmentChange] = []
     added: list[_EnvironmentChange] = []
     removed: list[_EnvironmentChange] = []
     for name, before, after in _changed_payload_keys(old, new):
-        old_text, new_text = (
-            (_render_value(before), _render_value(after))
-            if full
-            else _render_changed_values(before, after)
-        )
         if before is _ABSENT:
-            added.append(_EnvironmentChange(name, f"added {name}={new_text}", recorded=False))
+            added.append(
+                _EnvironmentChange(name, f"added {name}={_render_value(after)}", recorded=False)
+            )
         elif after is _ABSENT:
             removed.append(
-                _EnvironmentChange(name, f"removed {name} (was {old_text})", recorded=True)
+                _EnvironmentChange(
+                    name, f"removed {name} (was {_render_value(before)})", recorded=True
+                )
+            )
+        elif name.endswith("PATH") and isinstance(before, str) and isinstance(after, str):
+            changed.append(
+                _EnvironmentChange(
+                    name, f"{name}: {_path_list_difference(before, after)}", recorded=True
+                )
             )
         else:
-            entries = _path_list_difference(before, after) if full else ""
             changed.append(
-                _EnvironmentChange(name, f"{name} {old_text} -> {new_text}{entries}", recorded=True)
+                _EnvironmentChange(
+                    name, f"{name} {_render_value(before)} -> {_render_value(after)}", recorded=True
+                )
             )
     return [*changed, *added, *removed]
 
 
-def _path_list_difference(before: object, after: object) -> str:
-    """Name the entries two ``PATH``-like values do not share, which their whole text hides.
+def _path_list_difference(before: str, after: str) -> str:
+    """Name the entries two search-path lists do not share, or how the shared ones moved.
 
-    :param object before: Recorded value.
-    :param object after: Current value.
-    :return str: A parenthesised note led by a space, or an empty string when neither value
-        is a separator-joined list.
+    :param str before: Recorded value.
+    :param str after: Current value.
+    :return str: ``only recorded: a, b; only current: c``, with a side left out when it has
+        none, or for equal entries whether their order or their repeats changed.
     """
-    if not isinstance(before, str) or not isinstance(after, str):
-        return ""
-    if os.pathsep not in before and os.pathsep not in after:
-        return ""
     recorded, current = before.split(os.pathsep), after.split(os.pathsep)
     parts = [
         f"only {side}: {', '.join(entries)}"
@@ -1032,21 +1034,22 @@ def _path_list_difference(before: object, after: object) -> str:
         )
         if entries
     ]
-    return f" ({'; '.join(parts)})" if parts else " (the same entries in another order)"
+    if parts:
+        return "; ".join(parts)
+    if sorted(recorded) == sorted(current):
+        return "the same entries in another order"
+    return "the same entries, repeated differently"
 
 
-def _describe_environment_changes(
-    old: dict[str, str], new: dict[str, str], *, full: bool = False
-) -> str:
-    """Render how a tracked environment differs, with the values on both sides.
+def _describe_environment_changes(old: dict[str, str], new: dict[str, str]) -> str:
+    """Render how a tracked environment differs, for the cohort refusal and the drift warning.
 
     :param dict[str, str] old: Mapping a trial of the other cohort recorded.
     :param dict[str, str] new: Mapping this invocation composes.
-    :param bool full: Show every value whole instead of cut to where the two differ.
     :return str: The entries of :func:`_environment_entries` up to :data:`_MAX_REPORTED_CHANGES`
         and a count of the rest; empty when the mappings are equal.
     """
-    entries = [change.text for change in _environment_entries(old, new, full=full)]
+    entries = [change.text for change in _environment_entries(old, new)]
     shown = entries[:_MAX_REPORTED_CHANGES]
     if len(entries) > _MAX_REPORTED_CHANGES:
         shown.append(f"and {len(entries) - _MAX_REPORTED_CHANGES} more")
@@ -1064,20 +1067,20 @@ def _environment_difference(
     :param EnvironmentIdentity current: Environment this invocation composes.
     :param Sequence[optuna.trial.FrozenTrial] trials: Trials from other cohorts, oldest first.
     :return tuple[str, list[str], list[str]]: A sentence showing each differing, added and
-        removed variable with both values whole, or one saying no trial of the other cohort
-        recorded its environment; the names whose recorded value restores them; and the added
-        names, which restoring unsets. The lists are empty in the second case.
+        removed variable (:func:`_environment_entries`), or one saying no trial of the other
+        cohort recorded its environment; the names whose recorded value restores them; and the
+        added names, which restoring unsets. The lists are empty in the second case.
     """
     for trial in reversed(trials):
         recorded = json_text_map(trial.user_attrs.get(TRAINER_ENV_ATTR))
         if recorded is None:
             # Allocation stopped before recording the mapping, or the mapping is malformed.
             continue
-        changes = _environment_entries(recorded, current.tracked, full=True)
+        changes = _environment_entries(recorded, current.tracked)
         if changes:
             restore = [change.name for change in changes if change.recorded]
             unset = [change.name for change in changes if not change.recorded]
-            description = _describe_environment_changes(recorded, current.tracked, full=True)
+            description = _describe_environment_changes(recorded, current.tracked)
             return f"Compared with trial {trial.number}: {description}.", restore, unset
     return _NO_RECORDED_ENVIRONMENT, [], []
 
@@ -1114,8 +1117,8 @@ def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdenti
         no usable environment identity.
     :raises StudyFingerprintMismatchError: Recorded trials belong to another
         semantic environment cohort. The message shows each variable that differs,
-        was added or was removed, with its whole old and new value, and the remediation
-        names those to restore and those to unset.
+        was added or was removed (:func:`_environment_entries`), and the remediation names
+        those to restore and those to unset.
     """
     trials = study.get_trials(deepcopy=False)
     if not trials:

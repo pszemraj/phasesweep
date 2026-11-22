@@ -193,14 +193,15 @@ def test_program_check_skips_a_trainer_that_gets_no_path(tmp_path: Path) -> None
 
 
 def test_cohort_refusal_comes_before_the_program_check(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A changed PATH reads as a cohort change naming both values, not as a missing program."""
+    """A changed PATH reads as a cohort change naming both entries, not as a missing program."""
     experiment = make_experiment(trial_command=f"{_MISSING} {{overrides}}")
     monkeypatch.setenv("PATH", "/opt/old/bin")
     study = study_with_stamped_environment(_environment_identity(experiment, "p"))
     monkeypatch.setenv("PATH", "/opt/new/bin")
 
     with pytest.raises(
-        StudyFingerprintMismatchError, match='PATH "/opt/old/bin" -> "/opt/new/bin"'
+        StudyFingerprintMismatchError,
+        match="PATH: only recorded: /opt/old/bin; only current: /opt/new/bin",
     ):
         _launch_preflight(experiment, "p", study)
 
