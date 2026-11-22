@@ -418,7 +418,7 @@ def tracking_operation(experiment: Experiment, generation_id: str) -> Iterator[t
                 entry_path = _attempts_dir(experiment) / f"{operation_id}.json"
                 raise ProcessCleanupUncertainError(
                     f"Tracking operation {operation_id} has an unreadable lifecycle record in "
-                    f"{directory} ({exc}); its worker may still be running. "
+                    f"{directory} ({str(exc).rstrip('.')}); its worker may still be running. "
                     + recorded_process_check(
                         str(directory / PROCESS_IDENTITY_FILE), entry=str(entry_path)
                     ),
@@ -429,7 +429,7 @@ def tracking_operation(experiment: Experiment, generation_id: str) -> Iterator[t
                 "its attempt registry entry is kept.",
                 operation_id,
                 directory,
-                exc,
+                str(exc).rstrip("."),
             )
         else:
             if lifecycle is not None and (
@@ -728,7 +728,7 @@ def _reconcile_creation(
             log.warning(
                 "MLflow: %s is still unresolved (%s).%s",
                 record_name(pending),
-                exc,
+                str(exc).rstrip("."),
                 " MLflow did not answer, so later searches and uploads wait too."
                 if failure == "no answer"
                 else "",

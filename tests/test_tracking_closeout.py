@@ -53,6 +53,7 @@ from tests.tracking_helpers import (
 )
 
 _PENDING_STEP = f"results are saved locally. Send them with {SYNC_TRACKING_STEP}."
+_ONE_PENDING_STEP = _PENDING_STEP.replace("Send them", "Send it")
 _REFUSAL = "its cause is in its warning above."
 
 
@@ -617,8 +618,9 @@ def test_each_delivery_pass_sends_earlier_records_first_and_stops_at_the_first_u
         pending = 1 + len(intents)
         # The search answered that no run carries the identity yet, inside the creation window.
         creations = " and 1 unconfirmed run creation" if creation else ""
+        step = _PENDING_STEP if creation else _ONE_PENDING_STEP
         assert (
-            f"MLflow: 1 record{creations} pending ({pending} from earlier runs); {_PENDING_STEP} "
+            f"MLflow: 1 record{creations} pending ({pending} from earlier runs); {step} "
             f"MLflow refused 1 record; {_REFUSAL}" in caplog.text
         )
         assert (
@@ -989,7 +991,7 @@ def test_sync_tracking_names_what_keeps_its_records_pending(
         )
         assert (
             f"MLflow: attempt record {stem} of generation {sweep.generation} is pending (MLflow "
-            "run is deleted; restore it, or its experiment.)." in caplog.text
+            "run is deleted; restore it, or its experiment)." in caplog.text
         )
         [warning] = [line for line in error.splitlines() if "MLflow: attempt record" in line]
         assert re.fullmatch(r"\d\d:\d\d:\d\d  warning: MLflow: attempt record\b.*", warning)
@@ -1242,5 +1244,5 @@ def test_a_silent_search_names_a_creation_record_whatever_its_generation_id_hold
     assert (searches, errors, tally.sending) == (["find"], [], False)
     assert (
         f"MLflow: the run-creation record of attempt {attempts[0]} of generation {generation} is "
-        "still unresolved (MLflow operation exceeded its deadline.)." in caplog.text
+        "still unresolved (MLflow operation exceeded its deadline)." in caplog.text
     )

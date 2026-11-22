@@ -569,7 +569,7 @@ def _create(client: _SdkClient, request: CreateRequest) -> RunBinding:
         if not created:
             raise
         raise OperationOutcomeUnknownError(
-            f"MLflow created a run that failed verification ({exc}); it is not bound."
+            f"MLflow created a run that failed verification ({str(exc).rstrip('.')}); it is not bound."
         ) from exc
     return binding
 

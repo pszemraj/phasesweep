@@ -243,7 +243,7 @@ def _send(
             log.warning(
                 "MLflow: %s is pending (%s).%s",
                 record_name(path),
-                exc,
+                str(exc).rstrip("."),
                 f" MLflow did not answer, so {plural(later, 'later record')} must wait too."
                 if failure == "no answer" and later
                 else "",
@@ -493,7 +493,7 @@ def _attempt_trials(ledger: ValidatedLedger, phases: Iterable[str]) -> dict[str,
             log.warning(
                 "MLflow attempt outcomes of phase %s are unresolved: its study is unreadable (%s).",
                 phase,
-                exc,
+                str(exc).rstrip("."),
             )
             continue
         if phase_trials is None:
@@ -1293,7 +1293,7 @@ def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryT
         counts = delivery_counts(experiment)
         earlier = counts.pending - delivery_counts(experiment, generation_id).pending
     except (OSError, ValueError) as exc:
-        log.warning("MLflow: pending records could not be counted (%s).", exc)
+        log.warning("MLflow: pending records could not be counted (%s).", str(exc).rstrip("."))
         return
     done = delivered_text(tally.delivered, tally.settled)
     if done:
@@ -1301,9 +1301,10 @@ def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryT
         report.info(ReportText(f"MLflow: {done} left pending by earlier runs."))
     if counts.pending:
         log.warning(
-            "MLflow: %s pending%s; results are saved locally. Send them with %s.%s",
+            "MLflow: %s pending%s; results are saved locally. Send %s with %s.%s",
             count_text(counts.records, counts.creations),
             f" ({earlier} from earlier runs)" if earlier else "",
+            "it" if counts.pending == 1 else "them",
             SYNC_TRACKING_STEP,
             refused_text(tally.refused),
         )
