@@ -1115,12 +1115,11 @@ else:
             if shutdown_sdk or recovery_stage == "interrupt-extraction-signal":
                 log_text = (tmp_path / "runner.log").read_text()
                 assert (
-                    log_text.count("Trial 0 in phase p finished training; its result is retained.")
+                    log_text.count(
+                        "Trial 0 in phase p finished training; its result is retained. The "
+                        "next run extracts it without retraining."
+                    )
                     == 1
-                )
-                assert (
-                    "The next phasesweep run with the same config will extract the result without retraining."
-                    in log_text
                 )
             if return_code == 0 and not terminated:
                 assert (

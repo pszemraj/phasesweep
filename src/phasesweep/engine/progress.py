@@ -52,8 +52,8 @@ def _warn_deferred_extraction(
     """
     if persistent:
         message = (
-            "Trial %d in phase %s finished training; its result is retained. The next "
-            "phasesweep run with the same config will extract the result without retraining."
+            "Trial %d in phase %s finished training; its result is retained. The next run "
+            "extracts it without retraining."
         )
     else:
         message = (
