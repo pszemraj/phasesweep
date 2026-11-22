@@ -464,7 +464,8 @@ def _group_tie(
     names the groups whose mean lies within the noise band pooled over every
     ranked group (:func:`phasesweep.engine.repeats.noise_band`), exact ties
     included. Each group is named by its last member. A group with the winner's
-    params is another slot of the same configuration and is skipped.
+    params is another slot of the same configuration and is skipped, so with no other
+    configuration ranked the check is ``n/a``.
 
     Groups ranked by median have no band. An exact tie still flags the check; without one
     the check is ``n/a``, because seed noise was not judged and ``ok`` would claim it was.
@@ -479,6 +480,9 @@ def _group_tie(
     others = [
         group for group in groups if group is not best and dict(group.params) != dict(best.params)
     ]
+    if not others:
+        # Every other group is another slot of the winner's configuration: nothing to compare.
+        return _not_checked("only one configuration was ranked")
     tied = sorted(group.representative for group in others if group.aggregate == best.aggregate)
     band = noise_band(groups)
     if band is None:

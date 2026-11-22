@@ -484,7 +484,7 @@ def test_repeats_within_noise_flags_a_close_runner_up_and_clears_a_distant_one()
 
 
 def test_seeded_random_duplicate_configs_rank_as_separate_slots() -> None:
-    """Two slots that drew the same params are two groups, never one oversized group."""
+    """Two slots that drew the same params are two groups, never one oversized group, and with no other configuration the tie check is not run."""
     study = _make_study()
     _add_group(study, 1, [0.4, 0.4, 0.4])
     _add_group(study, 1, [0.3, 0.3, 0.3])
@@ -494,13 +494,9 @@ def test_seeded_random_duplicate_configs_rank_as_separate_slots() -> None:
     assert slotted.trial_number == 5
     assert slotted.metric == pytest.approx(0.3)
     assert slotted.confound["ranked_groups"] == [[0, 1, 2], [3, 4, 5]]
-    # The other slot repeats the winner's configuration, so it is not a tie candidate.
-    # The band still pools both slots' spread.
-    assert slotted.confound["checks"]["tie"]["detail"] == {
-        "tied_trials": [],
-        "within_noise": [],
-        "pooled_sd": 0.0,
-        "df": 4,
+    assert slotted.confound["checks"]["tie"] == {
+        "verdict": "n/a",
+        "reason": "only one configuration was ranked",
     }
     with pytest.raises(NoFeasibleTrialError, match="1 group\\(s\\) were incomplete"):
         select_winner(study, _make_exp(), repeats=_axis())
