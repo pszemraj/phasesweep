@@ -139,7 +139,7 @@ def test_from_phase_after_a_changed_parent_names_the_step_its_storage_allows(
     if persistent:
         assert message.endswith(
             "fix: Restore the config that produced it, or give `parent` and `child` new names "
-            "and update the `inherits` that name them."
+            "and update the `inherits` that name them, which runs them again from scratch."
         )
     else:
         assert message.endswith(

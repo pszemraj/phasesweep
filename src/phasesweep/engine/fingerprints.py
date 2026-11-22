@@ -178,14 +178,27 @@ def _phase_fingerprint_payload(
     :return JsonObject: Configured trial semantics normalized to the JSON representation being
         hashed.
     """
-    semantic_phase = _semantic_phase_dump(phase)
+    return _identity_payload(
+        experiment,
+        phase,
+        {parent: inherited_winners[parent].effective_overrides for parent in phase.inherits},
+    )
+
+
+def _identity_payload(experiment: Experiment, phase: Phase, inherited: object) -> JsonObject:
+    """Return the fingerprint payload of a phase with the given inherited overrides.
+
+    :param Experiment experiment: Experiment supplying the experiment-level semantics.
+    :param Phase phase: Phase whose semantic dump the payload holds.
+    :param object inherited: Effective overrides by parent, the payload's
+        ``inherited_effective_overrides``.
+    :return JsonObject: The payload, normalized to the JSON representation being hashed.
+    """
     payload = {
         "fingerprint_schema_version": FINGERPRINT_SCHEMA_VERSION,
         **_semantic_core(experiment),
-        "phase": semantic_phase,
-        "inherited_effective_overrides": {
-            parent: inherited_winners[parent].effective_overrides for parent in phase.inherits
-        },
+        "phase": _semantic_phase_dump(phase),
+        "inherited_effective_overrides": inherited,
     }
     return json_object(json.loads(json.dumps(payload, default=str)))
 
@@ -383,26 +396,78 @@ def _verify_fingerprint(
             )
             _stamp_fingerprint(study, fp, payload)
             return fp
-        stored = study.user_attrs.get(PHASE_FINGERPRINT_PAYLOAD_ATTR)
-        changes = _changed_payload_keys(stored, payload) if isinstance(stored, dict) else []
-        cwd_unset = experiment.execution.cwd is None and any(
-            path == "execution.cwd" for path, _old, _new in changes
-        )
-        # The message shows the recorded values only when the study kept the payload they came
-        # from; without them the two digests are all it can show.
-        if not changes:
-            way_forward = NEW_STUDY_STEP
-            found = f" (fingerprint {short_digest(str(existing))} != {short_digest(fp)})."
-        else:
-            found = f". {_describe_changed_keys(changes)}"
-            if all(path.startswith("phase.") for path, _old, _new in changes):
-                way_forward = restore_or_rename_step(experiment, phase, recorded=_RECORDED_VALUES)
-            else:
-                way_forward = restore_or_new_study(_RECORDED_VALUES)
-        raise StudyFingerprintMismatchError(
-            f"Study {study.study_name!r} was created with a different config{found}",
-            # Running from the original directory keeps the study; a new name does not.
-            action=OperatorAction.FIX_CONFIG if cwd_unset else None,
-            remediation=_CWD_FOLLOWS_INVOCATION if cwd_unset else way_forward,
-        )
+        raise _mismatch_refusal(study, experiment, phase, existing=str(existing), payload=payload)
     return fp
+
+
+def _verify_recorded_identity(study: optuna.Study, experiment: Experiment, phase: Phase) -> None:
+    """Refuse a populated study whose experiment or phase config changed, before any phase runs.
+
+    The phases it inherits from have not run yet, so their winners are held at the effective
+    overrides the study recorded: only a change to the study's own config refuses here, and
+    :func:`_verify_fingerprint` compares the inherited values once the phase is reached. A study
+    that kept no recorded payload, or no trials, is left to that comparison.
+
+    :param optuna.Study study: A reached phase's existing study, which this never writes.
+    :param Experiment experiment: Current experiment config.
+    :param Phase phase: Phase the study belongs to.
+    :raises StudyFingerprintMismatchError: The study's own config differs from the one it
+        recorded; the refusal :func:`_verify_fingerprint` gives for it.
+    """
+    stored = study.user_attrs.get(PHASE_FINGERPRINT_PAYLOAD_ATTR)
+    existing = study.user_attrs.get(PHASE_FINGERPRINT_ATTR)
+    if (
+        not isinstance(stored, dict)
+        or "inherited_effective_overrides" not in stored
+        or not isinstance(existing, str)
+        or not study.get_trials(deepcopy=False)
+    ):
+        return
+    payload = _identity_payload(experiment, phase, stored["inherited_effective_overrides"])
+    if _semantic_payload_digest(payload) != existing:
+        raise _mismatch_refusal(study, experiment, phase, existing=existing, payload=payload)
+
+
+def _mismatch_refusal(
+    study: optuna.Study,
+    experiment: Experiment,
+    phase: Phase,
+    *,
+    existing: str,
+    payload: JsonObject,
+) -> StudyFingerprintMismatchError:
+    """Build the refusal of a populated study whose recorded fingerprint differs from ``payload``.
+
+    :param optuna.Study study: The populated study.
+    :param Experiment experiment: Current experiment config.
+    :param Phase phase: Phase the study belongs to.
+    :param str existing: The fingerprint the study recorded.
+    :param JsonObject payload: The current payload, whose digest differs from ``existing``.
+    :return StudyFingerprintMismatchError: The refusal, naming the keys that changed when the
+        study kept the payload its fingerprint digests.
+    """
+    stored = study.user_attrs.get(PHASE_FINGERPRINT_PAYLOAD_ATTR)
+    changes = _changed_payload_keys(stored, payload) if isinstance(stored, dict) else []
+    cwd_unset = experiment.execution.cwd is None and any(
+        path == "execution.cwd" for path, _old, _new in changes
+    )
+    # The message shows the recorded values only when the study kept the payload they came
+    # from; without them the two digests are all it can show.
+    if not changes:
+        way_forward = NEW_STUDY_STEP
+        found = (
+            f" (fingerprint {short_digest(existing)} != "
+            f"{short_digest(_semantic_payload_digest(payload))})."
+        )
+    else:
+        found = f". {_describe_changed_keys(changes)}"
+        if all(path.startswith("phase.") for path, _old, _new in changes):
+            way_forward = restore_or_rename_step(experiment, phase, recorded=_RECORDED_VALUES)
+        else:
+            way_forward = restore_or_new_study(_RECORDED_VALUES)
+    return StudyFingerprintMismatchError(
+        f"Study {study.study_name!r} was created with a different config{found}",
+        # Running from the original directory keeps the study; a new name does not.
+        action=OperatorAction.FIX_CONFIG if cwd_unset else None,
+        remediation=_CWD_FOLLOWS_INVOCATION if cwd_unset else way_forward,
+    )

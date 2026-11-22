@@ -51,13 +51,14 @@ from phasesweep.engine.state import (
     _unique_trial_outcomes,
 )
 from phasesweep.engine.study_policy import (
+    ReachedStudy,
     _launch_preflight,
     _load_phase_policy_state,
     _pending_rerun_count,
+    _reached_study_refusals,
     _validate_fixed_configuration_target,
     _validate_study_direction,
     _validate_study_schema,
-    _validate_trial_target,
 )
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.run_report import rerun_clause
@@ -255,11 +256,13 @@ def _refuse_as_a_launch_would(
 ) -> None:
     """Apply claim, preflight, and top-up refusals to snapshots in launch order.
 
-    Combine per-study refusals as a launch does. For RUNNING studies, apply direction,
-    schema, and fixed-target checks using predicted recovery counts; defer target
-    and descendant checks requiring actual recovery. Preview inspects each study's
-    artifact-root claim without making it, and does not verify evidence;
-    :func:`_preview_phase` runs each launching phase's launch preflight.
+    The reached studies get the checks a launch gives them after its recovery, from the same
+    function (:func:`phasesweep.engine.study_policy._reached_study_refusals`): recorded
+    identity, then target, then the launch preflight of a phase that needs new trials. A
+    RUNNING study gets the fixed-target check on predicted recovery counts in place of its
+    accepted target, and stays out of the descendant check, which needs the recovered state.
+    Preview inspects each study's artifact-root claim without making it, and does not verify
+    evidence.
 
     :param Experiment experiment: Parsed experiment being previewed.
     :param Mapping[str, RecordedPhase] recorded: What the ledger holds for each phase.
@@ -270,8 +273,11 @@ def _refuse_as_a_launch_would(
     :raises PublicationIntegrityError: The last publication no longer validates.
     :raises ArtifactRootConflictError: A study publishes into another artifact root, or
         holds trials without recording one.
+    :raises LaunchEnvironmentError: A reached phase cannot start its trials.
     :raises StudySchemaMismatchError: A study's direction differs from the
         config's, or its failure-policy state is malformed.
+    :raises StudyFingerprintMismatchError: A reached study recorded another config, or its
+        trials ran under another trainer environment.
     :raises TrialTargetRefusedError: A study already accepted a higher target
         than its phase requests, or a fixed configuration asks for more
         attempts than it may retry.
@@ -282,26 +288,36 @@ def _refuse_as_a_launch_would(
     _check_published_phase_studies(experiment, studies, from_phase=from_phase)
     for bound_study in studies.values():
         _artifact_root_claim_needed(bound_study, experiment)
+    resume_ops._preflight_missing_reached_phase_environments(
+        experiment, studies, from_phase=from_phase
+    )
     errors: list[Exception] = []
-    reached = from_phase is None
+    checked: dict[str, optuna.Study] = {}
     for phase in experiment.phases:
-        if phase.name == from_phase:
-            reached = True
         study = studies.get(phase.name)
         if study is None:
             continue
-        record = recorded[phase.name]
         try:
             _validate_study_direction(study, experiment.metric.goal)
             _validate_study_schema(study)
-            if reached and record.running:
-                _validate_fixed_configuration_target(
-                    phase, finished=record.finished, measured=record.measured
-                )
-            elif reached:
-                _validate_trial_target(study, phase)
         except Exception as exc:
             errors.append(exc)
+        else:
+            checked[phase.name] = study
+    reached = [
+        ReachedStudy(
+            phase,
+            checked[phase.name],
+            predicted=(
+                (recorded[phase.name].finished, recorded[phase.name].measured)
+                if recorded[phase.name].running
+                else None
+            ),
+        )
+        for _index, phase in experiment.phases_from(from_phase)
+        if phase.name in checked
+    ]
+    errors.extend(_reached_study_refusals(experiment, reached))
     _raise_collected_errors(errors)
     settled = {name: study for name, study in studies.items() if not recorded[name].running}
     resume_ops._reject_bound_descendant_topups(
@@ -353,8 +369,9 @@ def _preview_phase(
         for phases earlier in the chain.
     :param RecordedPhase | None recorded: What the ledger holds for the phase,
         or ``None`` when that could not be read and the phase previews as fresh.
-    :raises PhaseSweepError: A launch would refuse the phase's recorded state, or its
-        launch preflight (:func:`phasesweep.engine.study_policy._launch_preflight`) refuses.
+    :raises PhaseSweepError: A launch would refuse the phase's recorded state, or, for a phase
+        previewed fresh from an unreadable ledger, its launch preflight
+        (:func:`phasesweep.engine.study_policy._launch_preflight`) refuses.
     :return PhasePreview: The winner a replay would publish or a placeholder, the
         trials a launch would run, and whether the phase replays.
     """
@@ -374,8 +391,9 @@ def _preview_phase(
                 recorded.study, experiment, phase, inherited_winners
             )
         else:
+            # Its own config was compared before any phase previewed (_reached_study_refusals).
             warn_dry_run(
-                "phase=%s fingerprint comparison awaits the inherited "
+                "phase=%s comparison of its inherited values awaits the parent "
                 "winner whose values are placeholders",
                 phase.name,
             )
@@ -439,8 +457,11 @@ def _preview_phase(
                 experiment, phase, inherited_winners, study, resume, verify_evidence=False
             )
         return PhasePreview(winner=winner, launches=0, reruns=0, replays=True)
-    # Recovery keeps each RUNNING attempt's environment, so the snapshot's cohort is the launch's.
-    _launch_preflight(experiment, phase.name, None if recorded is None else recorded.study)
+    if recorded is None:
+        # A readable ledger had every reached phase's launch preflighted before any phase
+        # previewed (_refuse_as_a_launch_would); one previewed fresh from an unreadable ledger
+        # gets it here.
+        _launch_preflight(experiment, phase.name, None)
     GpuPool.for_phase(phase, cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"))
     winner = _dry_run_phase(
         experiment,

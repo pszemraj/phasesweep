@@ -219,6 +219,34 @@ def _reject_bound_descendant_topups(
             )
 
 
+def _preflight_missing_reached_phase_environments(
+    experiment: Experiment,
+    existing_studies: Mapping[str, object],
+    *,
+    from_phase: str | None,
+) -> None:
+    """Check that each reached phase with no durable study could start its trials.
+
+    A phase absent from an otherwise bound tree has no completed trial to replay, so it must
+    be able to launch before this invocation tops up an earlier phase. A run calls this before
+    its recovery and its dry run before its study checks, so both refuse it first. Existing
+    studies are checked after recovery
+    (:func:`phasesweep.engine.study_policy._reached_study_refusals`), which can tell new work
+    from an offline-safe no-op.
+
+    :param Experiment experiment: Parsed experiment supplying phase environments.
+    :param Mapping[str, object] existing_studies: Durable studies found under the lock, or in the
+        dry run's capture.
+    :param str | None from_phase: Optional first phase this invocation can execute.
+    :raises LaunchEnvironmentError: A missing reached phase has an invalid launch environment, a
+        missing trainer directory or a trial program its trainer cannot find; see
+        :func:`phasesweep.engine.study_policy._launch_preflight`.
+    """
+    for _index, phase in experiment.phases_from(from_phase):
+        if phase.name not in existing_studies:
+            study_policy_ops._launch_preflight(experiment, phase.name, None)
+
+
 def _reject_fixed_targets_without_study(
     experiment: Experiment,
     *,

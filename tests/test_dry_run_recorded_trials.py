@@ -16,7 +16,7 @@ import pytest
 
 import phasesweep.engine.ledger as ledger_module
 from phasesweep import run_experiment
-from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.models import ExecutionContext, Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
@@ -24,6 +24,7 @@ from phasesweep.engine.errors import (
     PublishedStudyMissingError,
     ResumeWinnerMissingError,
     StudyContextConflictError,
+    StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     TrialEvidenceMissingError,
     TrialTargetRefusedError,
@@ -690,8 +691,78 @@ def test_raised_upstream_target_over_a_bound_descendant_is_refused_as_a_run_refu
     # The rename step names only the dependents, so the enlarged phase keeps its trials.
     assert isinstance(refusal, StudyContextConflictError)
     assert refusal.remediation == (
-        "Give `b` and `c` new names and update the `inherits` that name them; `a` keeps its "
-        "trials and runs the rest."
+        "Give `b` and `c` new names and update the `inherits` that name them, which runs them "
+        "again from scratch; `a` keeps its trials and runs the rest."
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("changed", ["a", "b"])
+def test_a_top_up_of_a_changed_phase_is_refused_as_a_changed_study_first(
+    tmp_path: Path, changed: str
+) -> None:
+    """A raised target on a phase whose search space also changed is refused as a changed study.
+
+    The top-up refusal says the phase keeps its trials, which a changed study does not, so the
+    run and its dry run both refuse the change first, for the first phase or a later one. With
+    the search space restored, the top-up refusal is what remains, and it is then true.
+    """
+    chain = {"a": (), "b": ("a",), "c": ("b",)}
+    run_experiment(
+        _persistent(tmp_path, *(_phase(name, 2, inherits=up) for name, up in chain.items()))
+    )
+
+    def edited(*, widen: bool) -> Experiment:
+        phases = []
+        for name, up in chain.items():
+            phase = _phase(name, 3 if name == changed else 2, inherits=up)
+            if widen and name == changed:
+                space = {f"{name}_x": IntParam(type="int", low=0, high=20)}
+                phase = phase.model_copy(update={"search_space": space})
+            phases.append(phase)
+        return _persistent(tmp_path, *phases)
+
+    refusal = _refusals_match(
+        edited(widen=True),
+        tmp_path,
+        StudyFingerprintMismatchError,
+        rf"Study 't::{changed}' was created with a different config\. Changed: "
+        rf"phase\.search_space\.{changed}_x\.high: 10 -> 20\.$",
+    )
+    assert isinstance(refusal, StudyFingerprintMismatchError)
+    assert refusal.remediation is not None
+    assert refusal.remediation.startswith("Restore the recorded value(s), or give ")
+    _refusals_match(
+        edited(widen=False),
+        tmp_path,
+        StudyContextConflictError,
+        rf"Phase '{changed}' has 1 top-up trial remaining",
+    )
+
+
+@pytest.mark.integration
+def test_a_top_up_under_another_environment_is_refused_for_the_environment_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run and its dry run refuse a changed trainer environment before a bound top-up."""
+
+    def experiment(n_trials: int) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            phases=[_phase("a", n_trials), _phase("b", 1, inherits=("a",))],
+            metric=bounded_metric(),
+            execution=ExecutionContext(inherit_env=["PHASESWEEP_DATASET_REV"]),
+        )
+
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-a")
+    run_experiment(experiment(2))
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-b")
+
+    _refusals_match(
+        experiment(3),
+        tmp_path,
+        StudyFingerprintMismatchError,
+        r"Study 't::a' ran its trials under a different trainer environment",
     )
 
 

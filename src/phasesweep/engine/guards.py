@@ -26,13 +26,11 @@ from phasesweep.engine.errors import (
     TrialTargetRefusedError,
 )
 from phasesweep.engine.ledger import ClaimedLedger, claim_ledger, validate_ledger
-from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.study_policy import (
+    ReachedStudy,
     _initialize_study_schema,
-    _launch_preflight,
-    _load_accepted_partial_decision,
+    _reached_study_refusals,
     _validate_study_direction,
-    _validate_trial_target,
 )
 from phasesweep.errors import (
     OperatorAction,
@@ -106,8 +104,10 @@ def _preflight_existing_studies(
         configuration asks for more attempts than its trials let it retry.
     :raises ProcessCleanupUncertainError: Stale-trial cleanup could not be
         confirmed safe for a phase's study.
-    :raises StudyFingerprintMismatchError: A reached phase that needs new trials holds
-        trials from another trainer-environment cohort.
+    :raises StudyFingerprintMismatchError: A reached study recorded another experiment or
+        phase config, or a reached phase that needs new trials holds trials from another
+        trainer-environment cohort; see
+        :func:`phasesweep.engine.study_policy._reached_study_refusals` for the order.
     :raises PhaseSweepError: A reached phase that needs new trials could not start them
         (see :func:`phasesweep.engine.study_policy._launch_preflight`), or multiple studies
         failed preflight for mixed expected reasons not covered by a more specific common
@@ -182,21 +182,16 @@ def _preflight_existing_studies(
     # An unreadable tracker leaves finished training pending. Until it answers, neither the
     # retry ceiling nor the need for a trainer is known, and the run reports pending evidence.
     if not report.unreadable_evidence:
-        for _, phase in experiment.phases_from(from_phase):
-            study = studies.get(phase.name)
-            if study is None:
-                continue
-            try:
-                _validate_trial_target(study, phase)
-                partial_decision = _load_accepted_partial_decision(study)
-                finished_trials = _finished_trial_count(study.get_trials(deepcopy=False))
-                needs_new_trials = phase.n_trials > finished_trials and not (
-                    partial_decision is not None and phase.n_trials == partial_decision.trial_target
-                )
-                if needs_new_trials:
-                    _launch_preflight(experiment, phase.name, study)
-            except Exception as exc:
-                errors.append(exc)
+        errors.extend(
+            _reached_study_refusals(
+                experiment,
+                [
+                    ReachedStudy(phase, studies[phase.name])
+                    for _, phase in experiment.phases_from(from_phase)
+                    if phase.name in studies
+                ],
+            )
+        )
     _raise_collected_errors(errors)
     return studies
 

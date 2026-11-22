@@ -1005,7 +1005,12 @@ _UNCONFIRMED_CLEANUP = ("unsafe_process_cleanup", "trial cleanup could not be co
 
 
 def _preview_unconfirmed_cleanup_abort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Preview a phase whose unsafe-cleanup abort no cleanup recovery has retired."""
+    """Preview a phase whose unsafe-cleanup abort no cleanup recovery has retired.
+
+    The raised target needs new trials, so the preview applies the cohort check a launch
+    applies first, which passes only from the fixture's pinned environment.
+    """
+    pin_fixture_environment(monkeypatch)
     experiment, phase = _record_fatal_abort(
         tmp_path, *_UNCONFIRMED_CLEANUP, {CLEANUP_CONFIRMED_ATTR: False}
     )

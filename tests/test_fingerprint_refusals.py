@@ -98,7 +98,9 @@ def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
     assert "execution.cwd" not in str(caught.value)
     assert caught.value.action is OperatorAction.FRESH_NAMESPACE
     assert caught.value.remediation is not None
-    assert caught.value.remediation == "Restore the recorded value(s), or give `p` a new `name`."
+    assert caught.value.remediation == (
+        "Restore the recorded value(s), or give `p` a new `name`, which runs it again from scratch."
+    )
 
     write_anchored_config(
         config,
@@ -134,7 +136,7 @@ def test_refusal_for_an_inherited_phase_names_the_dependents_to_rename(tmp_path:
     assert caught.value.remediation is not None
     assert caught.value.remediation == (
         "Restore the recorded value(s), or give `p` and `q` new names and update the `inherits` "
-        "that name them."
+        "that name them, which runs them again from scratch."
     )
 
     renamed = [
@@ -376,9 +378,10 @@ def test_a_study_bound_to_another_root_gets_a_step_that_fits(tmp_path: Path) -> 
 
 def test_the_rename_step_is_worded_once_and_names_every_phase_it_is_given() -> None:
     """Every site that offers the rename builds it here, and the reference's timeout entry says it with no phase named."""
-    assert rename_step(("p",)) == "give `p` a new `name`"
+    assert rename_step(("p",)) == "give `p` a new `name`, which runs it again from scratch"
     assert rename_step(("p", "q", "r")) == (
-        "give `p`, `q` and `r` new names and update the `inherits` that name them"
+        "give `p`, `q` and `r` new names and update the `inherits` that name them, which runs "
+        "them again from scratch"
     )
     (timeout,) = lookup("phases[].timeout_seconds_per_trial")
     assert (
@@ -417,8 +420,8 @@ def test_a_raised_target_is_run_by_renaming_only_the_phases_that_inherit_it(
         run_experiment(chain(a_trials=3, suffix=""))
     assert refused.value.remediation is not None
     assert refused.value.remediation == (
-        "Give `b` and `c` new names and update the `inherits` that name them; `a` keeps its "
-        "trials and runs the rest."
+        "Give `b` and `c` new names and update the `inherits` that name them, which runs them "
+        "again from scratch; `a` keeps its trials and runs the rest."
     )
 
     renamed = chain(a_trials=3, suffix="2")

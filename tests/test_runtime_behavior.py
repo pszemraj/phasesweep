@@ -585,7 +585,7 @@ def test_terminal_callback_reports_success_evidence(
         validated_environments.append(phase_name)
         return _launch_preflight(_experiment, phase_name, study)
 
-    monkeypatch.setattr("phasesweep.engine.run._launch_preflight", validate_environment)
+    monkeypatch.setattr("phasesweep.engine.study_policy._launch_preflight", validate_environment)
 
     def preflight(_ledger, *, cleanup_report, from_phase):
         del from_phase

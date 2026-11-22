@@ -140,19 +140,23 @@ def rename_step(names: Sequence[str]) -> str:
     A phase's study is named after the phase, so a new name is a new study for it, and a phase
     that inherits a renamed one records that name in its own study identity, so the caller
     passes every inheriting phase too. Only the ``inherits`` entries that name a renamed phase
-    change.
+    change. A new study keeps none of the old one's trials, so the clause says the renamed
+    phases run again.
 
     :param Sequence[str] names: The phases to rename, at least one: a phase followed by the
         phases inheriting it (:meth:`~phasesweep.config.models.Experiment.phases_inheriting`),
         or the inheriting phases alone.
     :return str: A clause for a step to lead into, such as ``give `a` and `b` new names and
-        update the `inherits` that name them``.
+        update the `inherits` that name them, which runs them again from scratch``.
     """
     quoted = [f"`{name}`" for name in names]
     if len(quoted) == 1:
-        return f"give {quoted[0]} a new `name`"
+        return f"give {quoted[0]} a new `name`, which runs it again from scratch"
     listed = f"{', '.join(quoted[:-1])} and {quoted[-1]}"
-    return f"give {listed} new names and update the `inherits` that name them"
+    return (
+        f"give {listed} new names and update the `inherits` that name them, which runs them "
+        "again from scratch"
+    )
 
 
 def timeout_step(phase_name: str, dependents: Sequence[str]) -> str:

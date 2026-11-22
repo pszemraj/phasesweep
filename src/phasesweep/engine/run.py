@@ -57,7 +57,6 @@ from phasesweep.engine.state import (
     _stands_under_winner,
     _winning_trials,
 )
-from phasesweep.engine.study_policy import _launch_preflight
 from phasesweep.errors import (
     OperatorAction,
     PhaseSweepError,
@@ -81,31 +80,6 @@ if TYPE_CHECKING:
     from phasesweep.tracking.session import DeliveryTally
 
 log = logging.getLogger("phasesweep.engine.run")
-
-
-def _preflight_missing_reached_phase_environments(
-    experiment: Experiment,
-    existing_studies: Mapping[str, object],
-    *,
-    from_phase: str | None,
-) -> None:
-    """Check that each reached phase with no durable study could start its trials.
-
-    A phase absent from an otherwise bound tree has no completed trial to
-    replay, so it must be able to launch before this invocation tops up an
-    earlier phase. Existing studies remain deferred to recovery, which can
-    distinguish new work from an offline-safe no-op.
-
-    :param Experiment experiment: Parsed experiment supplying phase environments.
-    :param Mapping[str, object] existing_studies: Durable studies found under the lock.
-    :param str | None from_phase: Optional first phase this invocation can execute.
-    :raises LaunchEnvironmentError: A missing reached phase has an invalid launch environment, a
-        missing trainer directory or a trial program its trainer cannot find; see
-        :func:`phasesweep.engine.study_policy._launch_preflight`.
-    """
-    for _index, phase in experiment.phases_from(from_phase):
-        if phase.name not in existing_studies:
-            _launch_preflight(experiment, phase.name, None)
 
 
 @dataclass(frozen=True)
@@ -276,7 +250,9 @@ def run_experiment(
         # A fresh tree holds no publication, so a resume that needs earlier winners cannot
         # succeed; refuse it before the run creates the tree.
         resume_ops._preflight_skipped_winners(experiment, from_phase=from_phase, run_deadline=None)
-        _preflight_missing_reached_phase_environments(experiment, {}, from_phase=from_phase)
+        resume_ops._preflight_missing_reached_phase_environments(
+            experiment, {}, from_phase=from_phase
+        )
     winners = _run_experiment_outcome(
         experiment,
         from_phase=from_phase,
@@ -361,7 +337,7 @@ def _run_experiment_outcome(
         if not environments_preflighted:
             # Checked before recovery, so a launch that a phase with no study would refuse
             # changes nothing; the next launch that passes recovers the registered attempts.
-            _preflight_missing_reached_phase_environments(
+            resume_ops._preflight_missing_reached_phase_environments(
                 experiment,
                 claimed.studies,
                 from_phase=from_phase,

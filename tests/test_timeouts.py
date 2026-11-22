@@ -1032,7 +1032,7 @@ def test_a_per_trial_timeout_abort_names_the_rename_that_the_raised_timeout_need
     message = _operational_error_text(aborted.value)
     assert message.index(
         "For the timed-out trials, raise phases[p].timeout_seconds_per_trial and give `p` a new "
-        "`name`."
+        "`name`, which runs it again from scratch."
     ) < message.index("For any other cause, fix it, then raise phases[p].n_trials")
 
     raised = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase("p", 5.0)])

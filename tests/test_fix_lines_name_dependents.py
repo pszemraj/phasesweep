@@ -77,7 +77,7 @@ def test_the_abort_fix_line_names_the_phases_that_inherit_the_timed_out_phase(
     assert status == 1
     assert (
         "raise phases[a].timeout_seconds_per_trial and give `a`, `b` and `c` new names and "
-        "update the `inherits` that name them."
+        "update the `inherits` that name them, which runs them again from scratch."
     ) in _printed(capsys.readouterr().err)
 
 
@@ -97,4 +97,7 @@ def test_status_names_the_phases_that_inherit_the_phase_that_aborted(
         for line in capsys.readouterr().out.splitlines()
         if line.startswith("# fix: For the timed-out trials")
     )
-    assert "give `b` and `c` new names and update the `inherits` that name them." in fix
+    assert (
+        "give `b` and `c` new names and update the `inherits` that name them, which runs them "
+        "again from scratch."
+    ) in fix

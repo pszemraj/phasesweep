@@ -773,7 +773,9 @@ def test_oversized_grid_target_over_a_recorded_study_names_the_maximum_and_a_lar
     enlarged = _grid(tmp_path, trainer, 4, cells=4)
     with pytest.raises(StudyFingerprintMismatchError) as changed:
         run_experiment(enlarged)
-    assert changed.value.remediation == "Restore the recorded value(s), or give `p` a new `name`."
+    assert changed.value.remediation == (
+        "Restore the recorded value(s), or give `p` a new `name`, which runs it again from scratch."
+    )
 
     # Following that step runs: the renamed phase is a new study and measures every cell again.
     (phase,) = enlarged.phases

@@ -616,7 +616,9 @@ def test_a_failure_that_was_not_a_timeout_says_nothing_about_the_timeout(
 @pytest.mark.parametrize(
     ("child", "rename"),
     [
-        pytest.param(None, "give `p` a new `name`", id="no-dependents"),
+        pytest.param(
+            None, "give `p` a new `name`, which runs it again from scratch", id="no-dependents"
+        ),
         pytest.param(
             Phase(
                 name="q",
@@ -625,7 +627,8 @@ def test_a_failure_that_was_not_a_timeout_says_nothing_about_the_timeout(
                 sampler=Sampler(type="random", seed=0),
                 search_space={"y": FloatParam(type="float", low=0.1, high=1.0)},
             ),
-            "give `p` and `q` new names and update the `inherits` that name them",
+            "give `p` and `q` new names and update the `inherits` that name them, which runs "
+            "them again from scratch",
             id="one-dependent",
         ),
     ],

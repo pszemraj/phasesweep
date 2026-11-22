@@ -36,6 +36,7 @@ from phasesweep.engine.fingerprints import (
     _changed_payload_keys,
     _render_changed_values,
     _render_value,
+    _verify_recorded_identity,
 )
 from phasesweep.engine.optuna import (
     _any_objective_unreadable,
@@ -1380,3 +1381,60 @@ def _launch_preflight(
         _validate_environment_cohort(study, identity)
     _require_launch_target(experiment, path=identity.values.get("PATH"))
     return identity
+
+
+class ReachedStudy(NamedTuple):
+    """A reached phase's existing study, as the continuation preflight checks it."""
+
+    phase: Phase
+    study: optuna.Study
+    #: Finished and measured counts a launch's recovery would leave, for a dry run's study whose
+    #: RUNNING attempts it has not recovered; ``None`` for a settled study, whose trials give them.
+    predicted: tuple[int, int] | None = None
+
+
+def _reached_study_refusals(
+    experiment: Experiment, reached: Sequence[ReachedStudy]
+) -> list[Exception]:
+    """Check each reached study before any phase runs: its recorded identity, its target, its launch.
+
+    A run (:func:`phasesweep.engine.guards._preflight_existing_studies`) and its dry run
+    (:func:`phasesweep.engine.preview._refuse_as_a_launch_would`) both call this, so they refuse
+    in one order, and each step assumes the ones before it passed. A changed config comes first
+    and alone, for the first study in phase order that recorded another, because restoring it or
+    renaming the phase decides every later check; so the bound-descendant top-up check that
+    follows (:func:`phasesweep.engine.resume._reject_bound_descendant_topups`) refuses only a
+    phase that keeps its trials. Target and launch refusals are collected per study.
+
+    :param Experiment experiment: Current experiment config.
+    :param Sequence[ReachedStudy] reached: The reached phases' studies, in phase order, each
+        already past its direction and schema checks.
+    :return list[Exception]: The refusals in phase order; empty when every study passes.
+    """
+    for item in reached:
+        try:
+            _verify_recorded_identity(item.study, experiment, item.phase)
+        except StudyFingerprintMismatchError as exc:
+            return [exc]
+    errors: list[Exception] = []
+    for item in reached:
+        phase, study = item.phase, item.study
+        try:
+            if item.predicted is None:
+                _validate_trial_target(study, phase)
+                partial = _load_accepted_partial_decision(study)
+                finished = _finished_trial_count(study.get_trials(deepcopy=False))
+                needs_new_trials = phase.n_trials > finished and not (
+                    partial is not None and phase.n_trials == partial.trial_target
+                )
+            else:
+                # Recovery keeps each RUNNING attempt's environment, so the snapshot's cohort
+                # is the one a launch checks after recovering them.
+                finished, measured = item.predicted
+                _validate_fixed_configuration_target(phase, finished=finished, measured=measured)
+                needs_new_trials = phase.n_trials > finished
+            if needs_new_trials:
+                _launch_preflight(experiment, phase.name, study)
+        except Exception as exc:
+            errors.append(exc)
+    return errors
