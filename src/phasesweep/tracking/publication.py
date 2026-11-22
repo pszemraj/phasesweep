@@ -172,7 +172,7 @@ def _read_delivery(path: Path) -> _Delivery:
     state = record.get("state")
     finish = record.get("finish")
     generation_id = record.get("generation_id")
-    if state not in {"pending", "delivered"}:
+    if not isinstance(state, str) or state not in {"pending", "delivered"}:
         raise ValueError(f"MLflow delivery record {path} has unknown state {state!r}.")
     if not isinstance(generation_id, str) or not isinstance(finish, str | None):
         raise ValueError(f"MLflow delivery record {path} has a malformed generation or finish.")

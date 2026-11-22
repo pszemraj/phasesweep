@@ -28,7 +28,7 @@ from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.errors import ProcessCleanupUncertainError
 from phasesweep.runtime import shutdown
-from phasesweep.runtime.json import JsonObject
+from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     ShutdownCleanupReport,
@@ -698,12 +698,14 @@ def test_an_unconfirmed_worker_of_the_early_pass_still_ends_the_run_with_its_cou
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("damage", ["no-source", "unknown-state"])
+@pytest.mark.parametrize(
+    "bad_state", [None, "refused", [], {}], ids=["no-source", "unknown-state", "list", "object"]
+)
 def test_a_malformed_earlier_record_costs_a_warning_naming_it_and_the_run_trains_on(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    damage: str,
+    bad_state: JsonValue,
 ) -> None:
     """An earlier run's record that lost its target, or holds an unknown state, is refused by name.
 
@@ -715,8 +717,8 @@ def test_a_malformed_earlier_record_costs_a_warning_naming_it_and_the_run_trains
     record = read_record(attempt)
     damaged = (
         {key: value for key, value in record.items() if key != "source"}
-        if damage == "no-source"
-        else {**record, "state": "refused"}
+        if bad_state is None
+        else {**record, "state": bad_state}
     )
     session.write_record(attempt, damaged)
     caplog.set_level(logging.INFO)
