@@ -92,22 +92,22 @@ RERUN_CLEANUP_RECOVERY = (
 )
 
 
-_FRESH_STUDY_TAIL = (
-    " a new `experiment` name in the config to start a fresh study "
-    "(a new `workdir` also works unless `storage` names a ledger)"
-)
+#: The one way to start over, worded as a clause for a step that offers it second. A new
+#: `workdir` and what happens to the old study are said once, in docs/runtime.md ("Storage and
+#: locks").
+FRESH_STUDY = "set a new `experiment` name in the config to start a fresh study"
 
-#: The one way to start over, worded as a clause for a step that offers it second.
-FRESH_STUDY = f"set{_FRESH_STUDY_TAIL}"
+NEW_STUDY_STEP = f"{FRESH_STUDY[0].upper()}{FRESH_STUDY[1:]}."
 
-NEW_STUDY_STEP = f"Set{_FRESH_STUDY_TAIL}; the old study stays readable with its original config."
 
-#: The step that reruns every phase, which every step that offers a narrower rerun ends with.
-RERUN_EVERY_PHASE_STEP = f"To rerun every phase, {FRESH_STUDY}."
+def restore_or_new_study(recorded: str) -> str:
+    """Offer restoring what a refusal found changed, or starting a fresh study.
 
-#: What a rename costs the renamed phases, which each step that offers one follows with the
-#: consequence for the phases it leaves alone.
-_RENAMED_PHASE_RUNS_AGAIN = "each renamed phase starts a new study and runs again"
+    :param str recorded: What to restore, such as ``the recorded value(s)``.
+    :return str: The step.
+    """
+    return f"Restore {recorded}, or {FRESH_STUDY}."
+
 
 #: The fact about a rerun under `storage: null`, as a clause for each step that offers one to
 #: compose with its own lead-in, so a restart is worded the same wherever it is offered.
@@ -122,7 +122,7 @@ PERSISTENT_STUDY_KEEPS_TRIALS = "completed trials are kept"
 
 
 def phase_names(names: Sequence[str]) -> str:
-    """List phase names the way every step that names phases does.
+    """List phase names, each in backticks, the way a message that lists phases does.
 
     :param Sequence[str] names: Phase names, in the order to list them.
     :return str: Each name in backticks, separated by commas.
@@ -130,42 +130,25 @@ def phase_names(names: Sequence[str]) -> str:
     return ", ".join(f"`{name}`" for name in names)
 
 
-def rename_phase_step(dependents: Sequence[str]) -> str:
-    """Say how to start one phase over when a setting of that phase changes.
+def rename_step(names: Sequence[str]) -> str:
+    """Say how to start phases over under new names, which give them new studies.
 
     A phase's study is named after the phase, so a new name is a new study for it, and a phase
-    that inherits it records the name in its own study identity and follows. The clause is
-    worded for a step that offers it, so the caller adds what the rename costs.
+    that inherits a renamed one records that name in its own study identity, so the caller
+    passes every inheriting phase too. Only the ``inherits`` entries that name a renamed phase
+    change.
 
-    :param Sequence[str] dependents: The phases that inherit the phase, from
-        :meth:`~phasesweep.config.models.Experiment.phases_inheriting`.
-    :return str: A clause that gives the phase, and the dependents it names, a new ``name``.
+    :param Sequence[str] names: The phases to rename, at least one: a phase followed by the
+        phases inheriting it (:meth:`~phasesweep.config.models.Experiment.phases_inheriting`),
+        or the inheriting phases alone.
+    :return str: A clause for a step to lead into, such as ``give `a` and `b` new names and
+        update the `inherits` that name them``.
     """
-    if not dependents:
-        return "give the phase a new `name`"
-    return (
-        f"give the phase, and each phase that inherits it ({phase_names(dependents)}), a new "
-        "`name`, updating every `inherits` to match"
-    )
-
-
-def rename_dependents_step(phase_name: str, dependents: Sequence[str]) -> str:
-    """Say how to run a larger budget for a phase whose dependents are bound to its winner.
-
-    The target is no part of a phase's study identity, so the enlarged phase keeps its finished
-    trials and runs the rest. The studies of the phases that inherit it hold trials bound to its
-    old winner, and a new name gives each of them a new study that binds to the new one.
-
-    :param str phase_name: The phase whose ``n_trials`` was raised.
-    :param Sequence[str] dependents: The phases that inherit it, from
-        :meth:`~phasesweep.config.models.Experiment.phases_inheriting`.
-    :return str: A clause that gives each dependent a new ``name`` and says what the rename costs.
-    """
-    return (
-        f"give each phase that inherits it ({phase_names(dependents)}) a new `name`, updating "
-        f"every `inherits` to match; {_RENAMED_PHASE_RUNS_AGAIN}, while `{phase_name}` keeps its "
-        "finished trials and runs the rest"
-    )
+    quoted = [f"`{name}`" for name in names]
+    if len(quoted) == 1:
+        return f"give {quoted[0]} a new `name`"
+    listed = f"{', '.join(quoted[:-1])} and {quoted[-1]}"
+    return f"give {listed} new names and update the `inherits` that name them"
 
 
 def timeout_step(phase_name: str, dependents: Sequence[str]) -> str:
@@ -176,13 +159,11 @@ def timeout_step(phase_name: str, dependents: Sequence[str]) -> str:
 
     :param str phase_name: Phase whose trials timed out.
     :param Sequence[str] dependents: The phases that inherit it.
-    :return str: The operator's step, a sentence pair.
+    :return str: The operator's step, one sentence.
     """
     return (
-        f"A trial timed out under phases[{phase_name}].timeout_seconds_per_trial, which is part "
-        "of the phase's study identity, so raising it in place is refused as a changed study. "
-        f"Raise it and {rename_phase_step(dependents)}; {_RENAMED_PHASE_RUNS_AGAIN}, and every "
-        "other phase keeps its results."
+        f"For the timed-out trials, raise phases[{phase_name}].timeout_seconds_per_trial and "
+        f"{rename_step([phase_name, *dependents])}."
     )
 
 
@@ -191,36 +172,40 @@ def unreadable_objective_step(*, persistent: bool) -> str:
 
     The cause is the trainer's output or the config's ``metric`` settings. The settings are
     part of a persistent study's identity, so correcting them is refused over the recorded
-    trials and starts a fresh study instead; the trainer's output retries in place.
+    trials and starts a fresh study instead; a fixed trainer output retries in place, by the
+    retry step that follows this sentence in a persistent study.
 
     :param bool persistent: Whether the study is recorded, which decides whether a corrected
         ``metric`` can continue it.
     :return str: One sentence that leads the retry step.
     """
-    settings = (
-        "the config's `metric` settings (for example the extractor's path, key or objective name)"
-    )
     if not persistent:
         return (
-            "A trial's trainer ran, but its objective could not be read; fix the trainer's "
-            f"output or {settings}, then rerun; {STORAGE_NULL_KEEPS_NOTHING}."
+            "A trainer ran but its objective could not be read: fix the trainer's output or the "
+            "`metric` settings, then rerun."
         )
     return (
-        "A trial's trainer ran, but its objective could not be read; if the trainer wrote the "
-        "wrong output, fix the trainer and retry as the step below says; if "
-        f"{settings} are wrong, correcting them changes the study's identity, so {FRESH_STUDY}."
+        "A trainer ran but its objective could not be read; if the `metric` settings are wrong, "
+        "correct them under a new `experiment` name."
     )
 
 
 #: The way out of an artifact root or ledger another PhaseSweep version wrote, on every
 #: command and under every `storage`. A ledger the config names holds every experiment's
 #: studies: a new `experiment` name leaves the unsupported study in it, and a new ledger alone
-#: leaves the artifact root bound to the old one, so there both change. "Version" covers a
-#: source checkout between releases, which no release can stand in for.
+#: leaves the artifact root bound to the old one, so there both change.
 OTHER_FORMAT_STEP = (
-    f"Set{_FRESH_STUDY_TAIL}, and a new `storage` ledger too if the config names one. "
-    "The PhaseSweep version that wrote the old data still reads it."
+    "Set a new `experiment` name in the config, and a new `storage` ledger if it names one."
 )
+
+
+def short_digest(digest: str) -> str:
+    """Shorten a SHA-256 digest the way every message that prints one does.
+
+    :param str digest: Hex digest.
+    :return str: Its first 12 characters followed by ``...``.
+    """
+    return f"{digest[:12]}..."
 
 
 def format_found(version: object) -> str:
@@ -263,9 +248,7 @@ OPERATOR_STEPS: dict[OperatorAction, str] = {
     ),
     OperatorAction.RUN_RECOVER_RUN: RERUN_CLEANUP_RECOVERY,
     OperatorAction.FIX_CONFIG: "correct the experiment configuration or the environment it runs in",
-    OperatorAction.RETRY: (
-        "Wait briefly, then retry the same operation once the reported blocker is resolved"
-    ),
+    OperatorAction.RETRY: "Retry once the reported blocker clears",
     OperatorAction.INSPECT_LOGS: "inspect the PhaseSweep run log and the logs its error points to",
 }
 

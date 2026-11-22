@@ -1365,19 +1365,17 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         run_experiment(_exp(2), dry_run=True)
     message = _operational_error_text(previewed.value)
     assert "cleanup could not be confirmed" in message
-    assert "A larger n_trials does not retire this abort" in message
+    assert "First confirm the cleanup:" in message
     assert "phasesweep run" in message and "phasesweep mcp recover-run" in message
     assert "Then raise phases[p].n_trials above 2 in the config" in message
-    assert "Raising n_trials does not change the study fingerprint." in message
-    assert "The recorded trial results stay in the study." in message
     # A preview of the larger target refuses the same way, as the live run below does,
     # and asks only for the cleanup that target still waits on.
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as raised:
         run_experiment(_exp(3), dry_run=True)
     message = _operational_error_text(raised.value)
-    assert "A larger n_trials does not retire" in message
+    assert "First confirm the cleanup:" in message
     assert "phasesweep mcp recover-run" in message
-    assert "Then n_trials=3 retires it." in message
+    assert "Then n_trials=3 retires the abort." in message
 
     # A larger target is not cleanup authority and launches no new trial.
     before = len(study.trials)

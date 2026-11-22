@@ -28,7 +28,6 @@ from phasesweep.engine.confound import (
     ConfoundBlock,
     _assess_population,
     _describe_flagged,
-    _evaluation_point_remedy,
 )
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
@@ -39,7 +38,7 @@ from phasesweep.engine.optuna import (
     _finished_trial_count,
     _trial_count_state,
 )
-from phasesweep.engine.paths import _phase_dir
+from phasesweep.engine.paths import TRIALS_CSV_FILENAME, _trials_csv_path
 from phasesweep.engine.repeats import (
     RankedGroup,
     RepeatAxis,
@@ -66,7 +65,6 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import _raised_target_step
 from phasesweep.errors import (
     FRESH_STUDY,
-    NEW_STUDY_STEP,
     OperatorAction,
     PhaseSweepError,
     timeout_step,
@@ -74,9 +72,19 @@ from phasesweep.errors import (
 )
 from phasesweep.evidence.models import MlflowExtractor
 from phasesweep.runtime.json import JsonObject, json_object, json_text_map
-from phasesweep.runtime.terminal import display_path, objective_text, param_text
+from phasesweep.runtime.terminal import (
+    command_line,
+    display_path,
+    objective_text,
+    param_text,
+    plural,
+)
 
 log = logging.getLogger("phasesweep.engine.selection")
+
+#: Where a selection warning's reader finds every check's counts and remedies; the engine
+#: does not know the config path the operator typed, so the command names it ``CONFIG``.
+SHOW_WINNERS_COMMAND = command_line("show-winners", "CONFIG")
 
 
 class TieGroupComparison(typing.TypedDict):
@@ -117,22 +125,24 @@ def tie_group_comparisons(
 
 
 def _inspect_step(experiment: Experiment, phase_name: str | None) -> str:
-    """Say where a phase's record of failed trials and the trainer's own logs are.
+    """Point at a phase's record of its trials, which gives each failed trial's reason.
 
     :param Experiment experiment: Config locating the artifact root.
-    :param str | None phase_name: Phase whose directory is named, if known.
+    :param str | None phase_name: Phase whose ``trials.csv`` is named, if known.
     :return str: The first sentence of a no-winner remedy.
     """
     if phase_name is None:
-        return "Inspect the phase's trials.csv and the trainer logs in its trial_* directories."
-    phase_dir = display_path(_phase_dir(experiment, phase_name))
-    return f"Inspect {phase_dir}/trials.csv and the trainer logs in its trial_* directories."
+        return f"Inspect the phase's {TRIALS_CSV_FILENAME}."
+    return f"Inspect {display_path(_trials_csv_path(experiment, phase_name))}."
 
 
 def _no_feasible_remedy(
     experiment: Experiment, trials: Sequence[optuna.trial.FrozenTrial], phase_name: str | None
 ) -> str:
     """Name the failed-trial retry or infeasible-bound remedy for the recorded population.
+
+    A fix that changes the study's identity, such as its ``metric`` or ``trial_command``, meets
+    the fingerprint refusal on the next run, which gives that change's own step.
 
     :param Experiment experiment: Config whose storage controls trial retention.
     :param Sequence[optuna.trial.FrozenTrial] trials: Recorded phase attempts.
@@ -144,10 +154,10 @@ def _no_feasible_remedy(
     if not experiment.persistent:
         if unreadable:
             return f"{evidence} {unreadable_objective_step(persistent=False)}"
-        return f"{evidence} Fix the trainer failure or adjust the metric bounds or constraints, then rerun; storage: null starts fresh."
+        return f"{evidence} Fix the failure, or the metric bounds or constraints, then rerun."
     infeasible = any(_trial_count_state(trial) == "INFEASIBLE" for trial in trials)
     if infeasible:
-        return f"{evidence} Changing metric.min, metric.max or constraints changes persistent study identity. {NEW_STUDY_STEP}"
+        return f"{evidence} To change metric.min, metric.max or constraints, {FRESH_STUDY}."
     timeout_lead = ""
     step: str | None = "raise the phase's n_trials in the config and rerun."
     if phase_name is not None:
@@ -162,12 +172,7 @@ def _no_feasible_remedy(
         if step is not None
         else f"{fix}; every configuration was measured, so no larger n_trials retries one."
     )
-    return (
-        f"{evidence} {timeout_lead}{objective_lead}{then} "
-        "Run controls such as `n_jobs` can change on retry. "
-        "If the fix changes study identity (for example `metric`, `trial_command`, "
-        f"`trainer_config` or `provenance`), {FRESH_STUDY}."
-    )
+    return f"{evidence} {timeout_lead}{objective_lead}{then}"
 
 
 @dataclass
@@ -287,7 +292,7 @@ def select_winner(
         (minimize/maximize), the metric bounds, and the constraint definitions used to
         filter trials.
     :param str | None phase_name: Phase label used in log messages and to find the phase for
-        the edge advisory, a grid's untried cells and the survivorship retry step. Log
+        the edge advisory, a grid's untried cells and the no-winner remedy's retry step. Log
         messages fall back to the study name when ``None``, and the others are skipped.
     :param RepeatAxis | None repeats: The phase's repeat axis
         (:func:`phasesweep.engine.repeats.repeat_axis`), or ``None`` for a phase without repeats.
@@ -314,21 +319,21 @@ def select_winner(
         else [t for group in ranking.groups for t in ranking.members[group.representative]]
     )
 
+    # The remedy points at trials.csv, which gives each failed trial's reason and, with
+    # repeats, its repeat_group.
     if repeats is not None and ranking is not None and not ranking.groups:
+        incomplete = ranking.incomplete_groups
         raise _no_feasible_error_type(trials)(
             f"No complete repeat group: a configuration ranks only when all "
             f"{len(repeats.values)} trials (one per repeats.values of {repeats.key!r}) are "
-            f"COMPLETE, feasible and within bounds; {ranking.incomplete_groups} group(s) were "
-            "incomplete. The phase's trials.csv labels each trial's repeat_group and records "
-            "why each failed or infeasible trial finished that way."
+            f"COMPLETE, feasible and within bounds; {plural(incomplete, 'group')} "
+            f"{'was' if incomplete == 1 else 'were'} incomplete."
             + _metric_bounds_note(trials, experiment),
             remediation=_no_feasible_remedy(experiment, trials, phase_name),
         )
     if not survivors:
         raise _no_feasible_error_type(trials)(
-            "No completed trials in phase. The phase's trials.csv records why each "
-            "failed or infeasible trial finished that way; trainer output is in its "
-            "trial_* directory." + _metric_bounds_note(trials, experiment),
+            "No completed trials in phase." + _metric_bounds_note(trials, experiment),
             remediation=_no_feasible_remedy(experiment, trials, phase_name),
         )
 
@@ -405,17 +410,11 @@ def select_winner(
             else None
         ),
     )
-    survivorship = confound["checks"]["survivorship"]
     flagged = _describe_flagged(
         confound,
         winner_trial=best.number,
         trials=trials,
         untried_cells=untried_cells,
-        retry_step=(
-            _raised_target_step(phase, trials)
-            if phase is not None and survivorship["verdict"] == "heterogeneous"
-            else None
-        ),
         noise_gaps=(
             None
             if winning is None or ranking is None
@@ -425,23 +424,13 @@ def select_winner(
             }
         ),
     )
-    evaluation = confound["checks"]["evaluation_point"]
-    remedy = (
-        " "
-        + _evaluation_point_remedy(
-            experiment.metric.extractor.type, axis=evaluation["detail"]["axis"]
-        )
-        if evaluation["verdict"] == "heterogeneous"
-        else ""
-    )
     if flagged and emit_advisories:
+        # show-winners carries the counts, the remedies and docs/runtime.md's retry step.
         log.warning(
-            "[%s] potential confounds in the %d ranked trials (verdicts recorded in the "
-            "winner's confound block): %s.%s",
+            "[%s] %s. Details: %s",
             phase_name or study.study_name,
-            len(survivors),
-            "; ".join(fragment.rstrip(".") for fragment in flagged),
-            remedy,
+            "; ".join(flagged),
+            SHOW_WINNERS_COMMAND,
         )
     if phase is not None and emit_advisories:
         edge = _edge_advisory(phase, trials, best.params if winning is None else winning.params)

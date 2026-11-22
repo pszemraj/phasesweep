@@ -1704,7 +1704,7 @@ def test_sync_refuses_a_tree_of_another_format_as_run_does_and_writes_nothing(
     with pytest.raises(ArtifactRootSchemaMismatchError) as sync_refusal:
         publication.sync_tracking(experiment)
     assert str(sync_refusal.value) == str(run_refusal.value)
-    assert "Nothing was written" in str(sync_refusal.value)
+    assert "this PhaseSweep reads format" in str(sync_refusal.value)
     assert uploads == []
     assert (_tree_listing(_experiment_dir(experiment)), journal.read_bytes()) == before
 

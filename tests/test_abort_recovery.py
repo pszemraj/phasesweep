@@ -159,9 +159,10 @@ def test_cli_abort_advice_is_logged_once_per_invocation(
         ]
         assert len(fixes) == 1
         advice = fixes[0]
-        assert "phases[p].n_trials above 1 in the config" in advice
-        assert "fix changes metric, trial_command or the trainer's PATH" in advice
-        assert "new `experiment` name" in advice
+        assert (
+            advice
+            == "Fix the cause, then raise phases[p].n_trials above 1 in the config and rerun."
+        )
         assert (output.err + output.out + caplog.text).count(advice) == 1
         assert run_log.read_text(encoding="utf-8").count(advice) == invocation + 1
     assert len(phase_study(experiment).trials) == 1
@@ -460,7 +461,7 @@ def _with_limit(experiment: Experiment, limit: int) -> Experiment:
 
 
 def test_raised_failure_limit_retires_a_streak_abort_while_trials_remain(tmp_path: Path) -> None:
-    """A limit above the recorded streak recovers the abort and runs the trials the target left."""
+    """A limit above the recorded streak recovers the abort and runs the trials the target left, though the fix line offers the raised target."""
     flag = tmp_path / "resume_enabled"
     initial = make_experiment(
         persistent=tmp_path,
@@ -474,9 +475,8 @@ def test_raised_failure_limit_retires_a_streak_abort_while_trials_remain(tmp_pat
         run_experiment(initial)
     assert [trial.state.name for trial in phase_study(initial).trials] == ["FAIL", "FAIL"]
     message = _operational_error_text(aborted.value)
-    assert "phases[p].max_consecutive_failures above 2 in the config" in message
-    assert "run the 2 trials still left at n_trials=4" in message
     assert "phases[p].n_trials above 4 in the config" in message
+    assert "max_consecutive_failures above" not in message
 
     # A limit that is not above the recorded streak leaves the abort in place, preview and run.
     flag.touch()

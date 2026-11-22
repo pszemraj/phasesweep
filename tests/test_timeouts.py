@@ -197,7 +197,7 @@ def test_incomplete_timeout_winner_is_accepted_only_under_current_opt_in(tmp_pat
         timeout_seconds_per_phase=6.0,
         sleep_seconds=1.0,
     )
-    with pytest.raises(RuntimeError, match="incomplete phase result"):
+    with pytest.raises(RuntimeError, match="records an incomplete result for skipped phase"):
         _load_winner(
             current,
             current.phases[0],
@@ -1012,10 +1012,10 @@ def test_a_per_trial_timeout_abort_names_the_rename_that_the_raised_timeout_need
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(short)
     message = _operational_error_text(aborted.value)
-    assert message.index("A trial timed out under phases[p].timeout_seconds_per_trial") < (
-        message.index("For any other cause, fix it, then raise phases[p].n_trials")
-    )
-    assert "raising it in place is refused as a changed study" in message
+    assert message.index(
+        "For the timed-out trials, raise phases[p].timeout_seconds_per_trial and give `p` a new "
+        "`name`."
+    ) < message.index("For any other cause, fix it, then raise phases[p].n_trials")
 
     raised = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase("p", 5.0)])
     with pytest.raises(PhaseSweepError, match=r"phase\.timeout_seconds_per_trial: 0\.5 -> 5\.0"):

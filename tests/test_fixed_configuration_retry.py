@@ -48,7 +48,7 @@ from tests.ledger_fixtures import published_survivorship
 from tests.recovery_helpers import fabricate_stale_trial
 
 _FRESH_THREE = "Phase 'p': n_trials=3 with an empty search_space would run 3 identical trials."
-_FRESH_THREE_REMEDY = "Use n_trials: 1 for a fixed configuration, or repeats to measure seed noise."
+_FRESH_THREE_REMEDY = "Use n_trials: 1."
 _WARNING = (
     "phase 'p' is a fixed configuration: n_trials above 1 only retries failed attempts, and a "
     "launch refuses more than one past the failed ones."
@@ -138,7 +138,7 @@ def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
         "Phase 'p' is a fixed configuration that already has a COMPLETE or INFEASIBLE trial; "
         "n_trials=3 would run the same configuration again."
     )
-    assert repeated.value.remediation == "Keep n_trials at 2, or use repeats to measure seed noise."
+    assert repeated.value.remediation == "Keep n_trials at 2."
     assert _call_count(calls) == 2
 
     # The finished target still replays its result without launching.
@@ -172,9 +172,7 @@ def test_fixed_configuration_retry_counts_every_failed_attempt(tmp_path: Path) -
 
 def _assert_advises_next_target(message: str, from_target: int) -> None:
     """Assert the message tells the operator to raise phase ``p``'s target by one in the config."""
-    assert_advises_target(
-        message, from_target, from_target + 1, "retry its failed attempt once more"
-    )
+    assert_advises_target(message, from_target, from_target + 1, "retry its failed attempt.")
     # The one attempt the target allowed is spent, so a higher limit would schedule nothing.
     assert "max_consecutive_failures above" not in message
 
@@ -237,7 +235,6 @@ def test_measured_infeasible_fixed_configuration_says_nothing_can_continue(tmp_p
         assert "Its configuration was measured and is not feasible" in message
         assert "phases[p]" not in message
         assert "new `experiment` name" in message
-        assert "a new `workdir` also works unless `storage` names a ledger" in message
     assert _call_count(calls) == 1
 
 

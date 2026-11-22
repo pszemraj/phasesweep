@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, ClassVar
 
 from phasesweep.errors import (
-    NEW_STUDY_STEP,
+    FRESH_STUDY,
     PERSISTENT_STUDY_KEEPS_TRIALS,
     STORAGE_NULL_KEEPS_NOTHING,
     OperatorAction,
@@ -160,18 +160,9 @@ def phase_timeout(message: str, *, scope: str | None, experiment: Experiment) ->
     :return PhaseTimeoutError: Routed timeout shared by CLI, run logs, and MCP failures.
     """
     key = "timeout_seconds_per_run" if scope == "run" else "timeout_seconds_per_phase"
-    continuation = (
-        f"resume the phase; {PERSISTENT_STUDY_KEEPS_TRIALS}."
-        if experiment.persistent
-        else f"start the run again; {STORAGE_NULL_KEEPS_NOTHING}."
-    )
-    return PhaseTimeoutError(
-        message,
-        remediation=(
-            f"Raise {key} in the config and rerun with the same config and --set "
-            f"overrides to {continuation}"
-        ),
-    )
+    # The step names no `--set`: an MCP launch has none, and a CLI rerun is the same command.
+    kept = PERSISTENT_STUDY_KEEPS_TRIALS if experiment.persistent else STORAGE_NULL_KEEPS_NOTHING
+    return PhaseTimeoutError(message, remediation=f"Raise {key} in the config and rerun; {kept}.")
 
 
 class TrialTargetRefusedError(PhaseSweepError):
@@ -197,10 +188,8 @@ class TrackingTargetUnavailableError(PhaseSweepError):
 
 
 TRACKER_UNREADABLE_STEP = (
-    "Fix the reported cause (restore access to the tracker, or install its missing SDK), "
-    "then run the same config again: the completed training is kept and nothing is "
-    "retrained. If the tracker is gone for good, a fresh study gives up that training. "
-    f"{NEW_STUDY_STEP}"
+    "Restore access to the tracker or install its SDK, then run the same config again; the "
+    f"finished training is kept. If the tracker is gone for good, {FRESH_STUDY}."
 )
 
 

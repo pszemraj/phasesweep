@@ -208,10 +208,9 @@ def patch_published_trial_read_failure(monkeypatch: pytest.MonkeyPatch, error: E
 
 
 def assert_advises_target(message: str, before: int, after: int, action: str) -> None:
-    """Assert phase p's retry target, action and failure-count reset advice."""
+    """Assert phase p's retry target and what it retries."""
     assert f"phases[p].n_trials from {before} to {after} in the config" in message
     assert action in message
-    assert "the failure count starts again from zero" in message
 
 
 def patch_rejected_trial_user_attr(

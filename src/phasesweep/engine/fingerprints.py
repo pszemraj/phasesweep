@@ -15,11 +15,11 @@ from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, PHASE_FINGERPRINT_PAYLOAD_ATTR, Winner
 from phasesweep.errors import (
-    FRESH_STUDY,
     NEW_STUDY_STEP,
-    RERUN_EVERY_PHASE_STEP,
     OperatorAction,
-    rename_phase_step,
+    rename_step,
+    restore_or_new_study,
+    short_digest,
 )
 from phasesweep.runtime.json import JsonObject, json_object
 
@@ -214,14 +214,10 @@ _MAX_REPORTED_CHANGES = 10
 _MAX_REPORTED_VALUE_CHARS = 80
 _REPORTED_VALUE_LEAD_CHARS = 24
 #: The refusal shows each recorded value, so restoring it is the first way out.
-_RESTORE_OR_NEW_STUDY_STEP = (
-    f"Restore the recorded value(s) to continue this study, or {FRESH_STUDY}; "
-    "the old study stays readable with its original config."
-)
+_RECORDED_VALUES = "the recorded value(s)"
 _CWD_FOLLOWS_INVOCATION = (
-    "The trainer working directory follows the directory phasesweep runs from when "
-    "execution.cwd is unset; run from the original directory or set execution.cwd in the "
-    "config (relative paths resolve against the config file)."
+    "execution.cwd is unset, so the trainer runs where phasesweep is started: run from the "
+    "original directory, or set execution.cwd to it."
 )
 
 
@@ -314,7 +310,7 @@ def _describe_changed_keys(changes: list[tuple[str, object, object]]) -> str:
     return f"Changed: {'; '.join(shown)}."
 
 
-def restore_or_rename_step(experiment: Experiment, phase: Phase) -> str:
+def restore_or_rename_step(experiment: Experiment, phase: Phase, *, recorded: str) -> str:
     """Offer the rename that reruns a phase whose own keys changed, beside restoring them.
 
     A phase's study is named after the phase, so a new name starts a new study and leaves
@@ -324,15 +320,11 @@ def restore_or_rename_step(experiment: Experiment, phase: Phase) -> str:
 
     :param Experiment experiment: Experiment whose phases may inherit ``phase``.
     :param Phase phase: Phase whose own configuration differs from its study's.
+    :param str recorded: What to restore, as the refusal can name it.
     :return str: The operator's step.
     """
-    dependents = experiment.phases_inheriting(phase.name)
-    rename = rename_phase_step(dependents)
-    rerun = "this phase and the phases that inherit it" if dependents else "this phase"
-    return (
-        "Restore the recorded value(s) to continue this study. "
-        f"To rerun only {rerun}, {rename}. {RERUN_EVERY_PHASE_STEP}"
-    )
+    names = [phase.name, *experiment.phases_inheriting(phase.name)]
+    return f"Restore {recorded}, or {rename_step(names)}."
 
 
 def _stamp_fingerprint(study: optuna.Study, fingerprint: str, payload: JsonObject) -> None:
@@ -373,8 +365,7 @@ def _verify_fingerprint(
     if existing is None:
         if trials:
             raise StudyFingerprintMismatchError(
-                f"Phase {phase.name!r} study {study.study_name!r} has no semantic "
-                "fingerprint. Its populated state is unsupported by this release.",
+                f"Phase {phase.name!r} study {study.study_name!r} has no semantic fingerprint.",
                 remediation=NEW_STUDY_STEP,
             )
         _stamp_fingerprint(study, fp, payload)
@@ -387,8 +378,8 @@ def _verify_fingerprint(
                 "Rebinding the fingerprint of empty study %s (%s -> %s): no trial "
                 "ever ran under the previous config.",
                 study.study_name,
-                existing,
-                fp,
+                short_digest(str(existing)),
+                short_digest(fp),
             )
             _stamp_fingerprint(study, fp, payload)
             return fp
@@ -397,16 +388,19 @@ def _verify_fingerprint(
         cwd_unset = experiment.execution.cwd is None and any(
             path == "execution.cwd" for path, _old, _new in changes
         )
-        # The message shows the recorded values only when the study kept the payload they came from.
+        # The message shows the recorded values only when the study kept the payload they came
+        # from; without them the two digests are all it can show.
         if not changes:
             way_forward = NEW_STUDY_STEP
-        elif all(path.startswith("phase.") for path, _old, _new in changes):
-            way_forward = restore_or_rename_step(experiment, phase)
+            found = f" (fingerprint {short_digest(str(existing))} != {short_digest(fp)})."
         else:
-            way_forward = _RESTORE_OR_NEW_STUDY_STEP
+            found = f". {_describe_changed_keys(changes)}"
+            if all(path.startswith("phase.") for path, _old, _new in changes):
+                way_forward = restore_or_rename_step(experiment, phase, recorded=_RECORDED_VALUES)
+            else:
+                way_forward = restore_or_new_study(_RECORDED_VALUES)
         raise StudyFingerprintMismatchError(
-            f"Study {study.study_name!r} was created with a different phase config "
-            f"(fingerprint {existing} != {fp}). {_describe_changed_keys(changes)}",
+            f"Study {study.study_name!r} was created with a different phase config{found}",
             # Running from the original directory keeps the study; a new name does not.
             action=OperatorAction.FIX_CONFIG if cwd_unset else None,
             remediation=_CWD_FOLLOWS_INVOCATION if cwd_unset else way_forward,

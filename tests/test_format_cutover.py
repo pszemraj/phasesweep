@@ -105,7 +105,7 @@ def test_unmarked_output_root_is_refused_before_mutation(
 
     with pytest.raises(
         ArtifactRootConflictError,
-        match=r"unmarked PhaseSweep state.*Nothing was written",
+        match=r"unmarked PhaseSweep state entry .* but no supported format marker\.$",
     ) as excinfo:
         run_experiment(experiment)
 
@@ -131,7 +131,7 @@ def test_unsupported_artifact_binding_version_is_refused_before_mutation(
         ArtifactRootConflictError,
         match=(
             f"uses format {previous}; this PhaseSweep reads format "
-            f"{ARTIFACT_ROOT_BINDING_SCHEMA_VERSION}. Nothing was written"
+            f"{ARTIFACT_ROOT_BINDING_SCHEMA_VERSION}\\.$"
         ),
     ) as excinfo:
         run_experiment(experiment)
@@ -206,7 +206,7 @@ def test_artifact_binding_without_a_version_is_refused_as_unversioned(tmp_path: 
         ArtifactRootConflictError,
         match=(
             "has no format version; this PhaseSweep reads format "
-            f"{ARTIFACT_ROOT_BINDING_SCHEMA_VERSION}. Nothing was written"
+            f"{ARTIFACT_ROOT_BINDING_SCHEMA_VERSION}\\.$"
         ),
     ):
         run_experiment(materialized.experiment)
@@ -1116,7 +1116,7 @@ def test_repair_never_truncates_under_or_releases_a_lock_another_process_took_ov
             repair_incomplete_journal_record(validate_ledger(materialized.experiment))
         assert excinfo.value.action == OperatorAction.RETRY
         rendered = _operational_error_text(excinfo.value)
-        assert "retry the same operation once the reported blocker is resolved" in rendered
+        assert "fix: Retry once the reported blocker clears." in rendered
         assert "start a new run" not in rendered
         assert journal.read_bytes() == (damaged if taken_over == "before truncation" else complete)
         assert successor[0].held()

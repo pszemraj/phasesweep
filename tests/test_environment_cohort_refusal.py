@@ -80,7 +80,9 @@ def _refused(study: optuna.Study, current: EnvironmentIdentity) -> StudyFingerpr
         _validate_environment_cohort(study, current)
     assert type(caught.value) is StudyFingerprintMismatchError
     assert caught.value.action is OperatorAction.FIX_CONFIG
-    assert "No trial was allocated." in str(caught.value)
+    assert str(caught.value).startswith(
+        f"Study {study.study_name!r} ran its trials under a different trainer environment"
+    )
     assert caught.value.remediation is not None
     assert caught.value.remediation not in str(caught.value)
     return caught.value
@@ -98,7 +100,7 @@ def _refusal(study: optuna.Study, current: EnvironmentIdentity) -> str:
             {},
             {"TZ": "Asia/Tokyo"},
             [],
-            'Compared with trial 0: TZ "Europe/Berlin" -> "Asia/Tokyo". No trial was allocated.',
+            'environment. Compared with trial 0: TZ "Europe/Berlin" -> "Asia/Tokyo".',
             id="changed-timezone",
         ),
         pytest.param(
@@ -249,8 +251,8 @@ def test_a_trial_that_recorded_no_mapping_gets_the_generic_sentence(
     assert "Compared with" not in str(refusal)
     assert refusal.remediation is not None
     assert refusal.remediation.startswith(
-        "Run in the environment that created this study to continue it "
-        "(for an MCP run, start the MCP server in that environment), or set a new `experiment` name"
+        "Run in the environment that created this study to continue it, or set a new "
+        "`experiment` name"
     )
     assert "`TZ`" not in refusal.remediation
 
@@ -345,12 +347,8 @@ def test_the_remediation_names_the_variables_that_differ(monkeypatch: pytest.Mon
     refusal = _refused(study, _identity(experiment))
 
     assert refusal.remediation == (
-        "Run with the recorded `PATH`, `TZ` and without `PS_COHORT_ADDED` to continue this study "
-        "(for an MCP run, do the same in the environment the MCP server is started with), or set "
-        "a new `experiment` name in the config to start a fresh study (a new `workdir` also works "
-        "unless `storage` names a ledger). Pinning a variable under `env` or listing "
-        "it under `execution.passthrough_env` changes the study's identity, so that edit needs the "
-        "new `experiment` name too."
+        "Run with the recorded `PATH`, `TZ` and without `PS_COHORT_ADDED` to continue this study, "
+        "or set a new `experiment` name in the config to start a fresh study."
     )
     assert "passthrough_env" not in str(refusal)
     assert "do not split cohorts" not in str(refusal)
@@ -371,15 +369,11 @@ def test_the_remediation_restores_a_changed_variable_and_unsets_an_added_one_alo
 
     assert changed.remediation is not None
     assert changed.remediation.startswith(
-        "Run with the recorded `TZ` to continue this study "
-        "(for an MCP run, do the same in the environment the MCP server is started with), "
-        "or set a new `experiment` name"
+        "Run with the recorded `TZ` to continue this study, or set a new `experiment` name"
     )
     assert added.remediation is not None
     assert added.remediation.startswith(
-        "Run without `PS_COHORT_ADDED` to continue this study "
-        "(for an MCP run, do the same in the environment the MCP server is started with), "
-        "or set a new `experiment` name"
+        "Run without `PS_COHORT_ADDED` to continue this study, or set a new `experiment` name"
     )
 
 
@@ -641,7 +635,6 @@ def test_two_lowered_targets_carry_both_steps_in_a_run_and_a_dry_run(
         run_experiment(_with_targets(experiment, 1), dry_run=dry_run)
 
     assert caught.value.remediation == (
-        "Set phases[a].n_trials to at least 2 and rerun. "
-        "Set phases[b].n_trials to at least 2 and rerun."
+        "Set phases[a].n_trials to at least 2. Set phases[b].n_trials to at least 2."
     )
     assert _operational_error_text(caught.value).endswith(f"\nfix: {caught.value.remediation}")

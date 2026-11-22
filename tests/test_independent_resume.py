@@ -11,7 +11,7 @@ from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import ResumeWinnerMissingError, StudyFingerprintMismatchError
 from phasesweep.engine.read import _read_generation_selection, read_result
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.errors import FRESH_STUDY, OperatorAction
+from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import after_banner, invoke_cli_boundary, make_experiment
 from tests.experiments import phase_payload, write_experiment
@@ -96,11 +96,7 @@ def test_from_phase_into_a_workdir_without_results_refuses_before_creating_it(
     message = _operational_error_text(refused.value)
     assert "Winner file missing for phase 'parent'" in message
     assert "no generation has been published" in message
-    assert "--from-phase requires published predecessors" in message
-    assert (
-        "fix: Run without --from-phase so the earlier phases run first (completed trials are "
-        "reused), or use the workdir that holds the publication."
-    ) in message
+    assert message.endswith("fix: Run without --from-phase so the earlier phases run first.")
     assert refused.value.action is OperatorAction.FIX_CONFIG
     assert not workdir.exists()
 
@@ -117,11 +113,8 @@ def test_from_phase_without_publication_in_memory_does_not_promise_reused_trials
 
     message = _operational_error_text(refused.value)
     assert "Winner file missing for phase 'parent'" in message
-    assert "reuse completed trials" not in message
-    assert (
-        "fix: Run without --from-phase to start every phase again, because storage: null keeps "
-        "no completed trials between runs, or use the workdir that holds the publication."
-    ) in message
+    assert "earlier phases run first" not in message
+    assert message.endswith("fix: Run without --from-phase to start every phase again.")
 
 
 @pytest.mark.parametrize("persistent", [False, True], ids=["memory", "persistent"])
@@ -144,15 +137,15 @@ def test_from_phase_after_a_changed_parent_names_the_step_its_storage_allows(
     assert "Re-run phase" not in message
     assert refused.value.action is OperatorAction.FIX_CONFIG
     if persistent:
-        assert (
-            "fix: Restore the recorded value(s) to continue this study. To rerun only " in message
+        assert message.endswith(
+            "fix: Restore the config that produced it, or give `parent` and `child` new names "
+            "and update the `inherits` that name them."
         )
-        assert f"To rerun every phase, {FRESH_STUDY}." in message
     else:
-        assert (
+        assert message.endswith(
             "fix: Restore the config that produced it, or run without --from-phase to start "
-            "every phase again, because storage: null keeps no completed trials between runs."
-        ) in message
+            "every phase again."
+        )
 
 
 def test_from_phase_names_the_phase_a_published_generation_lacks(tmp_path: Path) -> None:
@@ -169,7 +162,6 @@ def test_from_phase_names_the_phase_a_published_generation_lacks(tmp_path: Path)
     message = _operational_error_text(refused.value)
     assert "Winner file missing for phase 'parent'" in message
     assert "holds no winner for it" in message
-    assert "--from-phase requires published predecessors" in message
     assert "Run without --from-phase so the earlier phases run first" in message
     assert refused.value.action is OperatorAction.FIX_CONFIG
 
@@ -207,12 +199,7 @@ def test_cli_from_phase_into_a_workdir_without_results_names_the_fix(
     assert error.startswith("phasesweep: Winner file missing for phase 'parent'")
     assert "operational error" not in error
     assert "no generation has been published" in error
-    assert "--from-phase requires published predecessors" in error
-    assert "Run without --from-phase so the earlier phases run first" in error
-    assert error.rstrip().endswith(
-        "fix: Run without --from-phase so the earlier phases run first (completed trials are "
-        "reused), or use the workdir that holds the publication."
-    )
+    assert error.rstrip().endswith("fix: Run without --from-phase so the earlier phases run first.")
     assert not (tmp_path / "alt").exists()
 
 
@@ -243,7 +230,6 @@ def test_from_phase_refusal_explains_an_inspectable_unpublished_predecessor(
     error = refused.value
     message = _operational_error_text(error)
     assert "Winner file missing for phase 'parent'" in message
-    assert "--from-phase requires published predecessors" in message
     assert "Run without --from-phase so the earlier phases run first" in message
     assert "so it runs first" not in message
     assert "winner.yaml" not in message

@@ -35,7 +35,13 @@ from phasesweep.engine.publication import (
     raise_for_unusable_publication,
 )
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
-from phasesweep.errors import FRESH_STUDY, OTHER_FORMAT_STEP, OperatorAction, format_mismatch
+from phasesweep.errors import (
+    FRESH_STUDY,
+    OTHER_FORMAT_STEP,
+    OperatorAction,
+    format_mismatch,
+    restore_or_new_study,
+)
 from phasesweep.runtime.files import (
     atomic_write_text,
     canonical_storage_identity,
@@ -129,9 +135,7 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
         ) from exc
 
 
-_MOVED_TREE_STEP = (
-    f"Use the tree at the recorded path (move it back if it was moved), or {FRESH_STUDY}."
-)
+_MOVED_TREE_STEP = f"Use the tree at the recorded path, or {FRESH_STUDY}."
 
 
 def _binding_mismatch(
@@ -156,8 +160,7 @@ def _binding_mismatch(
         )
     if raw.get("artifact_root") != root:
         return ArtifactRootConflictError(
-            f"The artifact tree at {root!r} was created at {raw.get('artifact_root')!r}. "
-            "Nothing was written.",
+            f"The artifact tree at {root!r} was created at {raw.get('artifact_root')!r}.",
             action=OperatorAction.FIX_CONFIG,
             remediation=_MOVED_TREE_STEP,
         )
@@ -176,12 +179,9 @@ def _binding_mismatch(
             action=OperatorAction.RESTORE_TREE,
         )
     return ArtifactRootConflictError(
-        f"Artifact root {root!r} was created {', and '.join(causes)}. Nothing was written.",
+        f"Artifact root {root!r} was created {', and '.join(causes)}.",
         action=OperatorAction.FIX_CONFIG,
-        remediation=(
-            f"Restore the {' and '.join(names)} this tree was created with to continue this "
-            f"study, or {FRESH_STUDY}."
-        ),
+        remediation=restore_or_new_study(f"the {' and '.join(names)} this tree was created with"),
     )
 
 
@@ -235,8 +235,7 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
         if durable_entry is not None:
             raise ArtifactRootConflictError(
                 f"Artifact root {expected['artifact_root']!r} contains unmarked "
-                f"PhaseSweep state entry {durable_entry!r} but no supported format marker. "
-                "Nothing was written.",
+                f"PhaseSweep state entry {durable_entry!r} but no supported format marker.",
             ) from None
         return "unbound"
     except PermissionError as exc:
@@ -249,8 +248,7 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
     if isinstance(raw, dict) and raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION:
         raise ArtifactRootSchemaMismatchError(
             f"Artifact root {expected['artifact_root']!r} "
-            f"{format_mismatch(raw.get('schema_version'), ARTIFACT_ROOT_BINDING_SCHEMA_VERSION)}. "
-            "Nothing was written.",
+            f"{format_mismatch(raw.get('schema_version'), ARTIFACT_ROOT_BINDING_SCHEMA_VERSION)}.",
             remediation=OTHER_FORMAT_STEP,
         )
     if raw != expected:
@@ -273,7 +271,7 @@ def _write_artifact_root_binding(experiment: Experiment) -> None:
     except OSError as exc:
         raise ArtifactRootConflictError(
             f"Could not bind fresh artifact root {expected['artifact_root']!r} to "
-            f"its storage ledger: {exc}. No trial ran and nothing was published.",
+            f"its storage ledger: {exc}.",
             action=OperatorAction.RESTORE_TREE,
         ) from exc
 
@@ -308,7 +306,7 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
         if trial_count:
             raise ArtifactRootConflictError(
                 f"Study {study.study_name!r} holds {plural(trial_count, 'trial')} but records no "
-                "artifact root, which is unsupported PhaseSweep state. Nothing was written.",
+                "artifact root, which is unsupported PhaseSweep state.",
             )
         return True
     _check_study_artifact_root(study, experiment)
@@ -334,11 +332,10 @@ def _check_study_artifact_root(study: optuna.Study, experiment: Experiment) -> N
         return
     raise ArtifactRootConflictError(
         f"Study {study.study_name!r} publishes into artifact root {bound!r}, but this "
-        f"config offers {offered!r}. No trial ran and nothing was published.",
+        f"config offers {offered!r}.",
         action=OperatorAction.FIX_CONFIG,
-        remediation=(
-            "Restore the `workdir` and `experiment` that give the recorded artifact root to "
-            f"continue this study, or {FRESH_STUDY}."
+        remediation=restore_or_new_study(
+            "the `workdir` and `experiment` that give the recorded artifact root"
         ),
     )
 
@@ -444,5 +441,5 @@ def _check_published_phase_studies(
                         )
         raise PublishedStudyMissingError(
             f"Published generation {publication.generation_id!r} records a selected trial for "
-            f"phase {phase_name!r}, but its persistent study {missing}. Nothing was written."
+            f"phase {phase_name!r}, but its persistent study {missing}."
         )

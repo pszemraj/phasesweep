@@ -14,12 +14,11 @@ from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import FAILURE_REASON_ATTR, METRIC_EXTRACTOR_LABEL
-from phasesweep.errors import FRESH_STUDY
 from phasesweep.evidence.evaluation import ExtractorError, run_extractor
 from phasesweep.evidence.models import JsonEnvelopeExtractor, JsonExtractor
 from tests.conftest import make_experiment, make_trial_context, phase_trials, write_trainer
 
-_UNREADABLE = "A trial's trainer ran, but its objective could not be read"
+_UNREADABLE = "A trainer ran but its objective could not be read"
 _KEY_MISSING = f"{METRIC_EXTRACTOR_LABEL}: Key 'lossz' not found in r.json (failed at 'lossz')."
 
 
@@ -50,11 +49,9 @@ def test_an_unreadable_objective_says_which_fix_continues_the_study_and_which_st
         "Fix the failure, then raise phases[p].n_trials"
     )
     assert (
-        "if the trainer wrote the wrong output, fix the trainer and retry as the step below says; "
-        "if the config's `metric` settings (for example the extractor's path, key or objective "
-        f"name) are wrong, correcting them changes the study's identity, so {FRESH_STUDY}."
+        f"{_UNREADABLE}; if the `metric` settings are wrong, correct them under a new "
+        "`experiment` name."
     ) in remedy
-    assert "(for example `metric`, `trial_command`, `trainer_config` or `provenance`)" in remedy
     assert "lossz" not in remedy
 
 
@@ -64,11 +61,9 @@ def test_an_unreadable_objective_in_memory_names_the_trainer_and_the_metric_sett
     """With `storage: null` nothing continues, so the step names both causes and the rerun."""
     remedy = _remedy(tmp_path, [_KEY_MISSING], persistent=False)
 
-    assert (
-        f"{_UNREADABLE}; fix the trainer's output or the config's `metric` settings (for "
-        "example the extractor's path, key or objective name), then rerun; "
-        "storage: null keeps no completed trials between runs."
-    ) in remedy
+    assert remedy.endswith(
+        f"{_UNREADABLE}: fix the trainer's output or the `metric` settings, then rerun."
+    )
     assert "metric bounds" not in remedy
 
 
@@ -136,7 +131,7 @@ def test_an_aborted_phase_with_an_unreadable_objective_gives_steps_that_work(
     assert message.index(_UNREADABLE) < message.index(
         "Fix the cause, then raise phases[p].n_trials"
     )
-    assert "If the fix changes metric, trial_command or the trainer's PATH" in message
+    assert "correct them under a new `experiment` name" in message
 
     renamed = experiment("t_fixed", "loss", 4)
     run_experiment(renamed)

@@ -115,7 +115,7 @@ def test_numeric_config_fields_reject_yaml_booleans(
 )
 def test_int_param_rejects_bounds_optuna_cannot_round_trip(low: int, high: int) -> None:
     """Numeric integer domains must survive Optuna's float representation."""
-    with pytest.raises(ValidationError, match="round-trip exactly through Optuna"):
+    with pytest.raises(ValidationError, match=r"must stay within \[-9007199254740992, "):
         IntParam(type="int", low=low, high=high)
 
 
@@ -252,8 +252,7 @@ def test_validate_rejects_invalid_grid_configs() -> None:
             "over_budget",
             {"x": {"type": "categorical", "choices": [1, 2]}},
             3,
-            r"n_trials=3 exceeds the grid cardinality 2\. Set phases\[p\]\.n_trials to at most 2\. "
-            "To enlarge the grid instead, change the search space.",
+            r"n_trials=3 exceeds the grid cardinality 2\. Set phases\[p\]\.n_trials to at most 2\.",
         ),
     ]
 

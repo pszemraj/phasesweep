@@ -69,22 +69,18 @@ def test_program_on_the_path_is_found(tmp_path: Path, program: str) -> None:
     )
 
 
-def test_program_missing_from_the_path_is_refused_with_the_path_it_searched(
+def test_program_missing_from_the_path_is_refused_with_the_path_to_put_it_on(
     tmp_path: Path,
 ) -> None:
-    """The refusal names the PATH it searched and the way to put the program on it."""
+    """The refusal names the program and sends it to the PATH PhaseSweep is launched with."""
     refusal = _trial_program_refusal(
         f"{_MISSING} --lr 1", path="/nowhere:/also/nowhere", cwd=tmp_path
     )
 
     assert refusal is not None
     message, remediation = refusal
-    assert f"program {_MISSING!r} is not on the trainer's PATH (/nowhere:/also/nowhere)" in message
-    assert remediation == (
-        "Put the program on the PATH used to launch PhaseSweep (activate the environment containing "
-        "the program for CLI runs, or set PATH where the MCP server is started), set `env.PATH` in "
-        "the config, or name it by absolute path in trial_command."
-    )
+    assert message == f"The trial command's program {_MISSING!r} is not on the trainer's PATH."
+    assert remediation == "Put it on the PATH PhaseSweep is launched with."
 
 
 def test_program_missing_from_a_path_the_config_sets_is_sent_to_the_config(tmp_path: Path) -> None:
@@ -94,10 +90,7 @@ def test_program_missing_from_a_path_the_config_sets_is_sent_to_the_config(tmp_p
     )
 
     assert refusal is not None
-    assert refusal[1] == (
-        "Put the program on the PATH the config's `env` sets, or name it by absolute path in "
-        "trial_command."
-    )
+    assert refusal[1] == "Put it on the PATH the config's `env` sets."
 
 
 def test_relative_path_entry_resolves_against_the_trainer_directory(tmp_path: Path) -> None:
@@ -224,7 +217,7 @@ def test_fresh_tree_refuses_a_missing_program_before_creating_anything(tmp_path:
 
     assert type(caught.value) is LaunchEnvironmentError
     assert caught.value.action is OperatorAction.FIX_CONFIG
-    assert "Starting new trials requires this program" in str(caught.value)
+    assert caught.value.remediation == "Put it on the PATH PhaseSweep is launched with."
     assert not _artifact_root_binding_path(experiment).exists()
     assert not (tmp_path / "studies.journal").exists()
 
@@ -349,7 +342,7 @@ def test_dry_run_refuses_a_top_up_under_another_environment_cohort(
     for dry_run in (True, False):
         with pytest.raises(
             StudyFingerprintMismatchError,
-            match='PHASESWEEP_DATASET_REV "revision-a" -> "revision-b". No trial was allocated.',
+            match='PHASESWEEP_DATASET_REV "revision-a" -> "revision-b".',
         ):
             run_experiment(_with_target(experiment, 2), dry_run=dry_run)
 
@@ -423,7 +416,6 @@ def test_validate_refuses_a_program_written_with_a_slash_that_is_not_executable(
     assert isinstance(result.exception, PhaseSweepError)
     assert repr(program) in str(result.exception)
     assert "which is not an executable file" in str(result.exception)
-    assert "Starting new trials requires this program" in str(result.exception)
 
     _executable(tmp_path / "train.sh")
     result = CliRunner().invoke(cli_main, ["validate", str(config)])

@@ -87,9 +87,7 @@ def test_fingerprint_refusal_on_an_existing_tree_reports_preflight(
     [
         pytest.param(
             "program_missing",
-            "Put the program on the PATH used to launch PhaseSweep (activate the environment "
-            "containing the program for CLI runs, or set PATH where the MCP server is started), "
-            "set `env.PATH` in the config, or name it by absolute path in trial_command.",
+            "Put it on the PATH PhaseSweep is launched with.",
             id="program_missing",
         ),
         pytest.param(
@@ -147,4 +145,4 @@ def test_an_unreadable_tracker_stops_the_live_run_and_refuses_the_next_at_prefli
             run_claimed_runner(store, run_id, config_path, experiment_id="t", cwd=tmp_path)
         failure = json.loads(store.status_path(run_id).read_text())["failure"]
         assert (failure["code"], failure["stage"]) == ("tracking_unavailable", stage)
-        assert "nothing is retrained" in failure["remediation"]
+        assert "the finished training is kept" in failure["remediation"]

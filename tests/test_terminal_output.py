@@ -15,7 +15,6 @@ import pytest
 from phasesweep.config.models import Experiment
 from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.selection import PhaseTrialsFailedError
-from phasesweep.errors import FRESH_STUDY
 from tests.conftest import (
     console_script,
     invoke_cli_boundary,
@@ -27,46 +26,29 @@ from tests.conftest import (
 )
 
 _DIAGNOSIS = (
-    "No completed trials in phase. The phase's trials.csv records why each failed or "
-    "infeasible trial finished that way; trainer output is in its trial_* directory."
+    "Phase 'phase' aborted: 2 consecutive failed/infeasible trials reached "
+    "max_consecutive_failures=2. Inspect runs/exp/phase for stderr logs."
 )
 _STEP = (
-    "Inspect runs/exp/phase/trials.csv and the trainer logs in its trial_* directories. Fix the "
-    "failure, then raise phases[phase].n_trials from 2 to 4 in the config and rerun to retry its "
-    "failed attempt once more; a COMPLETE or INFEASIBLE attempt is not repeated. Run controls "
-    "such as `n_jobs` can change on retry. If the fix changes study identity (for example "
-    f"`metric`, `trial_command`, `trainer_config` or `provenance`), {FRESH_STUDY}."
+    "Fix the cause, then raise phases[phase].n_trials from 2 to 4 in the config and rerun to "
+    "retry its 2 failed cells."
 )
 
 _AT_80 = [
-    "phasesweep: No completed trials in phase. The phase's trials.csv records why",
-    "            each failed or infeasible trial finished that way; trainer output is",
-    "            in its trial_* directory.",
-    "fix: Inspect runs/exp/phase/trials.csv and the trainer logs in its trial_*",
-    "     directories. Fix the failure, then raise phases[phase].n_trials from 2 to 4",
-    "     in the config and rerun to retry its failed attempt once more; a COMPLETE",
-    "     or INFEASIBLE attempt is not repeated. Run controls such as `n_jobs` can",
-    "     change on retry. If the fix changes study identity (for example `metric`,",
-    "     `trial_command`, `trainer_config` or `provenance`), set a new `experiment`",
-    "     name in the config to start a fresh study (a new `workdir` also works",
-    "     unless `storage` names a ledger).",
+    "phasesweep: Phase 'phase' aborted: 2 consecutive failed/infeasible trials",
+    "            reached max_consecutive_failures=2. Inspect runs/exp/phase for",
+    "            stderr logs.",
+    "fix: Fix the cause, then raise phases[phase].n_trials from 2 to 4 in the config",
+    "     and rerun to retry its 2 failed cells.",
 ]
 _AT_60 = [
-    "phasesweep: No completed trials in phase. The phase's",
-    "            trials.csv records why each failed or infeasible",
-    "            trial finished that way; trainer output is in",
-    "            its trial_* directory.",
-    "fix: Inspect runs/exp/phase/trials.csv and the trainer logs",
-    "     in its trial_* directories. Fix the failure, then raise",
-    "     phases[phase].n_trials from 2 to 4 in the config and",
-    "     rerun to retry its failed attempt once more; a COMPLETE",
-    "     or INFEASIBLE attempt is not repeated. Run controls",
-    "     such as `n_jobs` can change on retry. If the fix",
-    "     changes study identity (for example `metric`,",
-    "     `trial_command`, `trainer_config` or `provenance`), set",
-    "     a new `experiment` name in the config to start a fresh",
-    "     study (a new `workdir` also works unless `storage`",
-    "     names a ledger).",
+    "phasesweep: Phase 'phase' aborted: 2 consecutive",
+    "            failed/infeasible trials reached",
+    "            max_consecutive_failures=2. Inspect",
+    "            runs/exp/phase for stderr logs.",
+    "fix: Fix the cause, then raise phases[phase].n_trials from 2",
+    "     to 4 in the config and rerun to retry its 2 failed",
+    "     cells.",
 ]
 
 

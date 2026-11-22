@@ -27,10 +27,9 @@ from phasesweep.engine.repeats import (
     noise_band,
 )
 from phasesweep.engine.state import _unreplaced_attempts
-from phasesweep.errors import FRESH_STUDY
 from phasesweep.evidence.models import POSITIONED_EXTRACTOR_KINDS
 from phasesweep.runtime.json import progress_position
-from phasesweep.runtime.terminal import objective_text, param_text
+from phasesweep.runtime.terminal import objective_text, param_text, plural
 
 ConfoundVerdict = Literal["ok", "heterogeneous", "n/a"]
 """Outcome of one check. ``ok``: the check ran and found nothing.
@@ -255,11 +254,8 @@ def _evaluation_point(
     records = [(trial.number, provenance[trial.number]) for trial in ranked]
     kinds = sorted({_extractor_kind(record) for _, record in records})
     if len(kinds) != 1 or kinds[0] not in POSITIONED_EXTRACTOR_KINDS:
-        return _not_checked(
-            f"{', '.join(kinds)} objectives report no evaluation position; json_envelope "
-            "(report_objective), wandb (evaluation_axis) or mlflow (select: last or step) "
-            "would bind one"
-        )
+        # docs/runtime.md ("Confound verdicts") says which extractors record a position.
+        return _not_checked(f"{', '.join(kinds)} objectives report no evaluation position")
     positions = [(number, _recorded_position(record)) for number, record in records]
     axes = sorted({axis for _, (axis, _) in positions})
     if len(axes) != 1:
@@ -766,10 +762,12 @@ def _describe_flagged(
     winner_trial: int,
     trials: Sequence[optuna.trial.FrozenTrial] = (),
     untried_cells: Sequence[Mapping[str, object]] = (),
-    retry_step: str | None = None,
     noise_gaps: Mapping[int, tuple[float, float]] | None = None,
 ) -> list[str]:
     """Describe each flagged check with the numbers behind it, for operator logs.
+
+    Each sentence states what the check found; ``show-winners`` carries the remedies, and
+    docs/runtime.md ("Confound verdicts") how to retry the failed configurations.
 
     :param ConfoundBlock block: A freshly assessed block.
     :param int winner_trial: The selected trial, one of the block's ranked trials.
@@ -777,16 +775,14 @@ def _describe_flagged(
         params name the failed configurations, defaults to none.
     :param Sequence[Mapping[str, object]] untried_cells: The untried grid cells passed to
         :func:`_assess_population`, defaults to none.
-    :param str | None retry_step: The raised ``n_trials`` that retries the failed
-        configurations (:func:`phasesweep.engine.study_policy._raised_target_step`), defaults
-        to None.
     :param Mapping[int, tuple[float, float]] | None noise_gaps: The gap and threshold of each
         group within noise of the winning group, by the group's last member
         (:func:`phasesweep.engine.selection.tie_group_comparisons`), which a repeats phase's
         flagged tie needs; defaults to None.
     :raises ValueError: A repeats phase's tie flags groups within noise without ``noise_gaps``
         for them.
-    :return list[str]: One sentence per flagged check; empty when none flagged.
+    :return list[str]: One sentence per flagged check, led by the check's name and without a
+        final period; empty when none flagged.
     """
     checks = block["checks"]
     lines: list[str] = []
@@ -800,7 +796,6 @@ def _describe_flagged(
                 survivorship["detail"],
                 trial_params={trial.number: trial.params for trial in trials},
                 untried_cells=untried_cells,
-                retry_step=retry_step,
             )
         )
     tie = checks["tie"]
@@ -820,9 +815,11 @@ def _describe_flagged(
 def _describe_evaluation_point(detail: EvaluationDetail, *, winner_trial: int) -> str:
     """Say where the winner was measured and which ranked trials fell short of the furthest.
 
+    The ordinary causes are in docs/runtime.md ("Confound verdicts").
+
     :param EvaluationDetail detail: Flagged evaluation-point evidence.
     :param int winner_trial: The selected trial, one of the ranked trials the evidence places.
-    :return str: The warning sentence, naming the ordinary causes without picking one.
+    :return str: The warning sentence.
     """
     axis, groups = detail["axis"], detail["values"]
     furthest = groups[-1]["value"]
@@ -837,12 +834,8 @@ def _describe_evaluation_point(detail: EvaluationDetail, *, winner_trial: int) -
         listed += f" and {len(short) - _LOGGED_VALUES} more"
     return (
         f"evaluation_point: the winner, trial {winner_trial}, was measured at {axis} "
-        f"{param_text(position[winner_trial])}; {len(short)} ranked "
-        f"{'trial' if len(short) == 1 else 'trials'} fell more than {_POSITION_TOLERANCE:.0%} "
-        f"short of the furthest, {param_text(furthest)}: {listed}. Ordinary causes are a "
-        "search space that sets training length (for example epochs or max_steps), a trainer "
-        "that stops early, and a trainer that reports its best checkpoint rather than how far "
-        "it trained"
+        f"{param_text(position[winner_trial])}; {plural(len(short), 'ranked trial')} fell more "
+        f"than {_POSITION_TOLERANCE:.0%} short of the furthest, {param_text(furthest)}: {listed}"
     )
 
 
@@ -851,14 +844,12 @@ def _describe_survivorship(
     *,
     trial_params: Mapping[int, Mapping[str, object]],
     untried_cells: Sequence[Mapping[str, object]],
-    retry_step: str | None,
 ) -> str:
     """Say which configurations have no result, so the winner was chosen among the rest.
 
     :param SurvivorshipDetail detail: Flagged survivorship evidence.
     :param Mapping[int, Mapping[str, object]] trial_params: Recorded params by trial number.
     :param Sequence[Mapping[str, object]] untried_cells: The untried grid cells.
-    :param str | None retry_step: The raised ``n_trials`` that retries them, if any.
     :return str: The warning sentence.
     """
     missing = detail["failed"] + detail["untried"]
@@ -870,11 +861,9 @@ def _describe_survivorship(
     listed = ", ".join(entries[:_LOGGED_VALUES])
     if len(entries) > _LOGGED_VALUES:
         listed += f" and {len(entries) - _LOGGED_VALUES} more"
-    step = "" if retry_step is None else f" {retry_step[0].upper()}{retry_step[1:]}"
     return (
-        f"survivorship: {missing} of {total} configurations "
-        f"{'has' if missing == 1 else 'have'} no result, so the winner was chosen among the "
-        f"rest: {listed}.{step}"
+        f"survivorship: {missing} of {plural(total, 'configuration')} "
+        f"{'has' if missing == 1 else 'have'} no result ({listed})"
     )
 
 
@@ -891,54 +880,49 @@ def _evaluation_point_remedy(kind: str, *, axis: str = "step") -> str:
     """Say how a phase that searches training length compares relative completion instead.
 
     Every branch is for that phase only: when the positions differ for another reason, the
-    trainer is what to fix. The axis and the metric key are extractor config, so each branch
-    also says that changing them starts a new study.
+    trainer is what to fix. The axis and the metric key are extractor config, part of the
+    study's identity, and the fingerprint refusal a changed one meets gives its own step;
+    docs/config.md ("Training-length comparison") has the rest.
 
     :param str kind: Objective extractor kind.
     :param str axis: Recorded evaluation axis, defaults to ``step``.
     :return str: Trainer reporting and evaluation-axis instructions.
     """
-    new_study = f"Changing evaluation_axis changes the study's identity, so {FRESH_STUDY}."
     if axis == "schedule_fraction":
         return (
-            "In a phase that searches training length, schedule_fraction already measures "
-            "actual_steps / planned_steps, so a fraction below 1 is a trial that stopped before "
-            "its own planned steps, and its trial log says why. Keep the lower fractions "
-            f"rather than rescaling them. {new_study}"
+            "A schedule_fraction below 1 is a trial that stopped before its planned steps; its "
+            "trial log says why."
         )
     if kind == "wandb":
         return (
             "For a phase that searches training length, log schedule_fraction=actual_steps / "
-            "planned_steps alongside the objective in the same wandb.log() call and set "
-            f"metric.extractor.evaluation_axis to schedule_fraction. {new_study}"
+            "planned_steps with the objective in one wandb.log() call and set "
+            "metric.extractor.evaluation_axis to schedule_fraction."
         )
     if kind == "mlflow":
         return (
-            "For a phase that searches training length, MLflow compares the selected metric's "
-            "integer step, so log the objective under a separate metric key (for example "
-            "objective_schedule_fraction) at step=int(10000 * actual_steps / planned_steps), "
-            "keeping native-step history under its original key; a trial that stopped early "
-            "logs a lower step. Set metric.extractor.metric_key to that key and select: last. "
-            f"Changing the metric key changes the study's identity, so {FRESH_STUDY}."
+            "For a phase that searches training length, log the objective under a separate "
+            "metric key at step=int(10000 * actual_steps / planned_steps) and set "
+            "metric.extractor.metric_key to it with select: last."
         )
     return (
         "For a phase that searches training length, report "
         'progress={"schedule_fraction": actual_steps / planned_steps} through report_objective '
-        "and set metric.extractor.evaluation_axis to schedule_fraction on the json_envelope "
-        f"metric. {new_study}"
+        "and set metric.extractor.evaluation_axis to schedule_fraction."
     )
 
 
 def _noise_remedy() -> str:
     """Return guidance for an exact tie between configurations measured once each.
 
+    It leads with coverage, not seeds: docs/config.md ("Noisy objectives and small budgets")
+    says when repeats are worth their budget.
+
     :return str: Configuration-comparison guidance shared by winner output and MCP results.
     """
     return (
-        "The tied configurations scored identically, so draw order chose the winner that "
-        "later phases inherit. First compare more distinct values and inspect trends across "
-        "neighboring configurations. Use phases[].repeats for a few discrete finalists or an "
-        "explicit noise check."
+        "The tied configurations scored identically, so draw order chose the winner; compare "
+        "more distinct values around them."
     )
 
 

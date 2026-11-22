@@ -34,7 +34,11 @@ from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.read import read_status
 from phasesweep.engine.repeats import ReduceName, RepeatAxis, ranked_group
-from phasesweep.engine.selection import select_winner, tie_group_comparisons
+from phasesweep.engine.selection import (
+    SHOW_WINNERS_COMMAND,
+    select_winner,
+    tie_group_comparisons,
+)
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
@@ -45,7 +49,6 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_ATTR,
     Winner,
 )
-from phasesweep.errors import FRESH_STUDY
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from phasesweep.evidence.models import MlflowExtractor
 from phasesweep.runtime.json import JsonObject
@@ -260,16 +263,10 @@ def test_evaluation_point_disagreement_is_heterogeneous(
     assert check == {"verdict": "heterogeneous", "detail": {"axis": axis, "values": groups}}
     assert _flagged_checks(block) == ["evaluation_point"]
     short, furthest = groups[0]["value"], groups[1]["value"]
-    assert _describe_flagged(block, winner_trial=2)[0].startswith(
+    assert _describe_flagged(block, winner_trial=2)[0] == (
         f"evaluation_point: the winner, trial 2, was measured at {axis} {short}; 1 ranked trial "
-        f"fell more than 1% short of the furthest, {furthest}: trial 2 at {short}. "
+        f"fell more than 1% short of the furthest, {furthest}: trial 2 at {short}"
     )
-
-
-_BINDING_TEXT = (
-    "json_envelope (report_objective), wandb (evaluation_axis) or mlflow (select: last or step) "
-    "would bind one"
-)
 
 
 @pytest.mark.parametrize(
@@ -277,12 +274,12 @@ _BINDING_TEXT = (
     [
         pytest.param(
             None,
-            f"log_regex objectives report no evaluation position; {_BINDING_TEXT}",
+            "log_regex objectives report no evaluation position",
             id="log_regex",
         ),
         pytest.param(
             {number: _json() for number in range(3)},
-            f"json objectives report no evaluation position; {_BINDING_TEXT}",
+            "json objectives report no evaluation position",
             id="json",
         ),
         pytest.param(
@@ -338,8 +335,8 @@ def test_mlflow_best_value_objective_leaves_evaluation_point_unchecked(select: s
         }
 
 
-def test_evaluation_point_line_names_the_winner_the_short_trials_and_every_ordinary_cause() -> None:
-    """The line says where the winner and each short trial stand, and does not pick a cause."""
+def test_evaluation_point_line_names_the_winner_and_the_short_trials() -> None:
+    """The line says where the winner and each short trial stand, and caps the list."""
     trials = _trials(*[(_COMPLETE, 0.5 - index / 100, index) for index in range(8)])
     steps = [1000, 400, 500, 600, 700, 800, 900, 995]
     block = _assess(
@@ -351,30 +348,25 @@ def test_evaluation_point_line_names_the_winner_the_short_trials_and_every_ordin
     assert line == (
         "evaluation_point: the winner, trial 7, was measured at step 995; 6 ranked trials fell "
         "more than 1% short of the furthest, 1000: trial 1 at 400, trial 2 at 500, trial 3 at "
-        "600, trial 4 at 700, trial 5 at 800 and 1 more. Ordinary causes are a search space "
-        "that sets training length (for example epochs or max_steps), a trainer that stops "
-        "early, and a trainer that reports its best checkpoint rather than how far it trained"
+        "600, trial 4 at 700, trial 5 at 800 and 1 more"
     )
 
 
 @pytest.mark.parametrize("kind", ["json_envelope", "wandb", "mlflow"])
 def test_evaluation_point_remedy_uses_the_current_reader(kind: str) -> None:
-    """Each reader's remedy is for a training-length phase and says the change starts a new study."""
+    """Each reader's remedy is for a training-length phase and names that reader's way to report progress."""
     remedy = _evaluation_point_remedy(kind)
     assert remedy.startswith("For a phase that searches training length, ")
-    assert remedy.endswith(f"changes the study's identity, so {FRESH_STUDY}.")
     assert "actual_steps / planned_steps" in remedy
     if kind == "wandb":
-        assert "same wandb.log() call" in remedy
+        assert "one wandb.log() call" in remedy
         assert "evaluation_axis" in remedy
         assert "json_envelope" not in remedy
     elif kind == "mlflow":
-        assert "integer step" in remedy
-        assert "int(10000 *" in remedy
+        assert "step=int(10000 *" in remedy
         assert "separate metric key" in remedy
         assert "metric.extractor.metric_key" in remedy
         assert "select: last" in remedy
-        assert "native-step history under its original key" in remedy
         assert "evaluation_axis" not in remedy
     else:
         assert "report_objective" in remedy
@@ -386,14 +378,10 @@ def test_evaluation_point_remedy_keeps_an_existing_relative_axis(kind: str) -> N
     """A fraction below 1 is a trial that stopped before its own planned steps, not a budget gap."""
     remedy = _evaluation_point_remedy(kind, axis="schedule_fraction")
 
-    assert remedy.startswith("In a phase that searches training length, ")
-    assert "already measures actual_steps / planned_steps" in remedy
-    assert (
-        "a fraction below 1 is a trial that stopped before its own planned steps, and its trial "
-        "log says why"
-    ) in remedy
-    assert remedy.endswith(f"so {FRESH_STUDY}.")
-    assert "set metric.extractor.evaluation_axis" not in remedy
+    assert remedy == (
+        "A schedule_fraction below 1 is a trial that stopped before its planned steps; its trial "
+        "log says why."
+    )
 
 
 @pytest.mark.parametrize(
@@ -453,8 +441,8 @@ def test_survivorship_counts_a_configuration_once_however_often_it_ran() -> None
     }
 
 
-def test_survivorship_warning_names_each_failed_configuration_and_the_retry_step() -> None:
-    """The warning lists failures by trial and params, caps the list, and ends with one step."""
+def test_survivorship_warning_names_each_failed_configuration() -> None:
+    """The warning lists failures by trial and params and caps the list."""
     trials = _trials(
         (_COMPLETE, 0.5, 1),
         *[(_FAIL, None, 10 + index) for index in range(6)],
@@ -466,17 +454,12 @@ def test_survivorship_warning_names_each_failed_configuration_and_the_retry_step
         provenance={0: log_regex_provenance()},
         untried_cells=[{"x": 99}],
     )
-    step = "raise phases[p].n_trials above 7 in the config and rerun to draw new configurations."
 
-    (line,) = _describe_flagged(
-        block, winner_trial=0, trials=trials, untried_cells=[{"x": 99}], retry_step=step
-    )
+    (line,) = _describe_flagged(block, winner_trial=0, trials=trials, untried_cells=[{"x": 99}])
 
     assert line == (
-        "survivorship: 7 of 8 configurations have no result, so the winner was chosen among "
-        "the rest: trial 1 x=10 failed, trial 2 x=11 failed, trial 3 x=12 failed, trial 4 "
-        "x=13 failed, trial 5 x=14 failed and 2 more. Raise phases[p].n_trials above 7 in "
-        "the config and rerun to draw new configurations."
+        "survivorship: 7 of 8 configurations have no result (trial 1 x=10 failed, trial 2 x=11 "
+        "failed, trial 3 x=12 failed, trial 4 x=13 failed, trial 5 x=14 failed and 2 more)"
     )
 
 
@@ -495,10 +478,7 @@ def test_survivorship_counts_a_grid_cell_no_trial_reached() -> None:
         "detail": {"ranked": 2, "infeasible": 0, "failed": 0, "untried": 1, "failed_trials": []},
     }
     (line,) = _describe_flagged(plain, winner_trial=1, untried_cells=[{"x": 3}])
-    assert line == (
-        "survivorship: 1 of 3 configurations has no result, so the winner was chosen among "
-        "the rest: x=3 was never tried."
-    )
+    assert line == "survivorship: 1 of 3 configurations has no result (x=3 was never tried)"
 
     members = _trials((_COMPLETE, 0.5, 1, 0), (_COMPLETE, 0.6, 1, 1), (_COMPLETE, 0.5, 2, 0))
     grouped = _assess_groups(
@@ -1059,9 +1039,9 @@ def test_summary_exposes_the_evaluation_axis_without_checkpoint_paths() -> None:
     rendered = json.dumps(summary)
     assert "/abs/ckpt.pt" not in rendered
     assert summary["evaluation_point"]["axis"] == "tokens"
-    assert _noise_remedy().index("First compare more distinct values") < _noise_remedy().index(
-        "phases[].repeats"
-    )
+    # The tie remedy asks for coverage, never for seeds.
+    assert _noise_remedy().endswith("compare more distinct values around them.")
+    assert "repeats" not in _noise_remedy()
 
 
 def test_summary_reports_unchecked_counts_as_null() -> None:
@@ -1185,18 +1165,13 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
     assert warnings[1:] == [
         "[p] no trial ran below the winner's x=0 (tried 0..6, at the configured lower bound)"
     ]
-    assert warnings[0].startswith("[p] potential confounds in the 2 ranked trials")
-    assert (
-        "evaluation_point: the winner, trial 0, was measured at step 1000; 1 ranked trial fell "
-        "more than 1% short of the furthest, 1000: trial 1 at 400."
-    ) in warnings[0]
-    assert (
-        "survivorship: 2 of 4 configurations have no result, so the winner was chosen among "
-        "the rest: trial 2 x=5 failed, trial 3 x=6 failed. Raise phases[p].n_trials above 3 "
-        "in the config and rerun to draw new configurations; the failed ones are not retried. "
-    ) in warnings[0]
-    assert warnings[0].endswith(". " + _evaluation_point_remedy("json_envelope"))
-    assert "metric.." not in warnings[0]
+    # One warning per phase: each flagged check's sentence, then the one pointer.
+    assert warnings[0] == (
+        "[p] evaluation_point: the winner, trial 0, was measured at step 1000; 1 ranked trial "
+        "fell more than 1% short of the furthest, 1000: trial 1 at 400; survivorship: 2 of 4 "
+        "configurations have no result (trial 2 x=5 failed, trial 3 x=6 failed). Details: "
+        "phasesweep show-winners CONFIG"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1326,7 +1301,7 @@ def _confound_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
         record.getMessage()
         for record in caplog.records
         if record.name == "phasesweep.engine.selection"
-        and "potential confounds" in record.getMessage()
+        and record.getMessage().endswith(f"Details: {SHOW_WINNERS_COMMAND}")
     ]
 
 
@@ -1369,5 +1344,5 @@ def test_inheriting_phases_keep_verdicts_without_repeating_warnings(
     # Only the parent's own selection warns; the child inherits its winner silently, and the
     # resume that skips the parent replays its verdicts without warning again.
     assert len(in_process) == 1
-    assert in_process[0].startswith("[parent] potential confounds in the 2 ranked trials")
+    assert in_process[0].startswith("[parent] tie: trial 1 matched the winner's value exactly")
     assert resumed == []

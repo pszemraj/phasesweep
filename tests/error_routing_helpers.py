@@ -156,7 +156,7 @@ def assert_routes_declared_action(
     if case.action is OperatorAction.RETRY:
         rendered = _operational_error_text(error)
         if error.remediation is None:
-            assert "retry the same operation once the reported blocker is resolved" in rendered
+            assert "fix: Retry once the reported blocker clears." in rendered
         else:
             assert error.remediation in rendered
         assert "start a new run" not in rendered

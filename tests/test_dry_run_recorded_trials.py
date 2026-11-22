@@ -46,7 +46,7 @@ from phasesweep.engine.state import (
     Winner,
 )
 from phasesweep.engine.trial import _environment_identity
-from phasesweep.errors import FRESH_STUDY, PhaseSweepError
+from phasesweep.errors import PhaseSweepError
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     bounded_metric,
@@ -564,8 +564,7 @@ def test_lowered_target_is_refused_as_a_run_refuses(tmp_path: Path, case: str) -
         experiment,
         tmp_path,
         TrialTargetRefusedError,
-        r"already accepted a target of 4 .* requests 2\. Set phases\[a\]\.n_trials to at least 4 "
-        "in the config",
+        r"already accepted a target of 4 finished trials; the config requests 2\.",
     )
 
 
@@ -684,16 +683,14 @@ def test_raised_upstream_target_over_a_bound_descendant_is_refused_as_a_run_refu
         raised,
         tmp_path,
         StudyContextConflictError,
-        r"1 top-up trial remaining, but 2 dependent phases \(`b`, `c`\) are already bound",
+        r"1 top-up trial remaining, but 2 dependent phases \(`b`, `c`\) are bound",
     )
 
-    # The one rename step comes first, naming only the dependents, then the new experiment name.
+    # The rename step names only the dependents, so the enlarged phase keeps its trials.
     assert isinstance(refusal, StudyContextConflictError)
     assert refusal.remediation == (
-        "To run the larger budget, give each phase that inherits it (`b`, `c`) a new `name`, "
-        "updating every `inherits` to match; each renamed phase starts a new study and runs "
-        "again, while `a` keeps its finished trials and runs the rest. To rerun every phase, "
-        f"{FRESH_STUDY}."
+        "Give `b` and `c` new names and update the `inherits` that name them; `a` keeps its "
+        "trials and runs the rest."
     )
 
 
@@ -709,8 +706,8 @@ def test_the_bound_descendant_refusal_counts_in_the_singular_without_list_syntax
     refusal = _refusals_match(raised, tmp_path, StudyContextConflictError, "top-up")
 
     assert str(refusal) == (
-        "Phase 'a' has 3 top-up trials remaining, but 1 dependent phase (`b`) is already bound "
-        "to its published winner via inheritance."
+        "Phase 'a' has 3 top-up trials remaining, but 1 dependent phase (`b`) is bound to its "
+        "published winner."
     )
 
 
@@ -757,7 +754,7 @@ def test_flipped_goal_is_refused_as_a_run_refuses(tmp_path: Path) -> None:
         _persistent(tmp_path, _phase("a", 2), maximize=True),
         tmp_path,
         StudySchemaMismatchError,
-        "optimizes minimize, but the current config requires maximize",
+        "optimizes minimize, but the config requires maximize",
     )
 
 

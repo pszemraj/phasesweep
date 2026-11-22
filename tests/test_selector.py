@@ -283,11 +283,8 @@ def test_metric_bounds_no_feasible_message_names_bound_and_best_value() -> None:
     with pytest.raises(NoFeasibleTrialError) as excinfo:
         select_winner(study, _with_bounds(_make_exp(), max=2.0))
     assert str(excinfo.value) == (
-        "No completed trials in phase. The phase's trials.csv records why each "
-        "failed or infeasible trial finished that way; trainer output is in its "
-        "trial_* directory. "
-        "Metric bounds: metric.max=2.0. The best value among COMPLETE and INFEASIBLE trials "
-        "with a finite value is 3.5 (trial 1)."
+        "No completed trials in phase. Metric bounds: metric.max=2.0. The best value among "
+        "COMPLETE and INFEASIBLE trials with a finite value is 3.5 (trial 1)."
     )
 
     with pytest.raises(NoFeasibleTrialError, match=r"metric\.min=6\.0.*is 7\.0 \(trial 2\)"):
@@ -413,9 +410,8 @@ def test_repeats_without_complete_group_names_incomplete_groups() -> None:
 
     assert str(excinfo.value).startswith(
         "No complete repeat group: a configuration ranks only when all 3 trials (one per "
-        "repeats.values of 'seed') are COMPLETE, feasible and within bounds; 2 group(s) were "
-        "incomplete. The phase's trials.csv labels each trial's repeat_group and records "
-        "why each failed or infeasible trial finished that way. Metric bounds: metric.min=0.01."
+        "repeats.values of 'seed') are COMPLETE, feasible and within bounds; 2 groups were "
+        "incomplete. Metric bounds: metric.min=0.01."
     )
 
 
@@ -498,7 +494,7 @@ def test_seeded_random_duplicate_configs_rank_as_separate_slots() -> None:
         "verdict": "n/a",
         "reason": "only one configuration was ranked",
     }
-    with pytest.raises(NoFeasibleTrialError, match="1 group\\(s\\) were incomplete"):
+    with pytest.raises(NoFeasibleTrialError, match="1 group was incomplete"):
         select_winner(study, _make_exp(), repeats=_axis())
 
 
@@ -506,7 +502,7 @@ def test_seeded_random_duplicate_configs_rank_as_separate_slots() -> None:
 def test_crashed_trials_remedy_names_the_next_attempt_budget(
     tmp_path: Path, persistent: bool
 ) -> None:
-    """A crashed population retries with a raised persistent budget, a fresh study when the fix edits the config, or a fresh memory run."""
+    """A crashed population retries with a raised persistent budget, or with a plain rerun in memory."""
     from tests.conftest import make_experiment
 
     experiment = make_experiment(persistent=tmp_path if persistent else None, n_trials=2)
@@ -518,13 +514,11 @@ def test_crashed_trials_remedy_names_the_next_attempt_budget(
     remedy = refused.value.remediation
     assert remedy is not None
     if persistent:
-        assert "raise phases[p].n_trials above 2 in the config" in remedy
-        assert "Fix the failure" in remedy
-        assert "`n_jobs` can change on retry" in remedy
-        assert "changes study identity" in remedy
-        assert "set a new `experiment` name" in remedy
+        assert remedy.endswith(
+            "Fix the failure, then raise phases[p].n_trials above 2 in the config and rerun."
+        )
     else:
-        assert "storage: null starts fresh" in remedy
+        assert remedy.endswith("Fix the failure, or the metric bounds or constraints, then rerun.")
         assert "raise" not in remedy
 
 
@@ -582,52 +576,48 @@ def _sampled_phase(sampler: Sampler, *, n_trials: int = 2) -> Phase:
                 sampler=Sampler(type="grid"),
                 search_space={"x": CategoricalParam(type="categorical", choices=[1, 2, 3])},
             ),
-            "from 3 to 6 in the config and rerun to retry its 3 failed cells; COMPLETE and "
-            "INFEASIBLE cells are not repeated.",
+            "raise phases[p].n_trials from 3 to 6 in the config and rerun to retry its 3 failed "
+            "cells.",
             id="grid-retries-failed-cells",
         ),
         pytest.param(
             Phase(name="p", n_trials=2, sampler=Sampler(type="random", seed=0), search_space={}),
-            "from 2 to 3 in the config and rerun to retry its failed attempt once more; a "
-            "COMPLETE or INFEASIBLE attempt is not repeated.",
+            "raise phases[p].n_trials from 2 to 3 in the config and rerun to retry its failed "
+            "attempt.",
             id="fixed-configuration-retries-its-cell",
         ),
         pytest.param(
             _sampled_phase(Sampler(type="random", seed=0)),
-            "above 2 in the config and rerun to draw new configurations; the failed ones are "
-            "not retried.",
+            "raise phases[p].n_trials above 2 in the config and rerun.",
             id="random-draws-new-ones",
         ),
         pytest.param(
             _sampled_phase(Sampler(type="tpe", seed=0)),
-            "above 2 in the config and rerun to draw new configurations; the failed ones are "
-            "not retried.",
+            "raise phases[p].n_trials above 2 in the config and rerun.",
             id="tpe-draws-new-ones",
         ),
     ],
 )
-def test_crashed_remedy_says_whether_a_raised_target_retries_or_draws(
+def test_crashed_remedy_names_the_target_each_sampler_needs(
     tmp_path: Path, phase: Phase, outcome: str
 ) -> None:
-    """A grid or fixed configuration retries its failed cells at a raised target; a sampler that draws never retries one."""
+    """A grid or fixed configuration is raised to the target that retries its failed cells; a sampler that draws is raised above its target."""
     remedy = _crashed_remedy(tmp_path, phase, [None] * phase.n_trials)
 
-    assert outcome in remedy
+    assert remedy.endswith(f"Fix the failure, then {outcome}")
     assert "timed out" not in remedy
 
 
 def test_a_no_winner_remedy_names_the_phase_directory_it_sends_the_operator_to(
     tmp_path: Path,
 ) -> None:
-    """The first step says where trials.csv and the trial directories are, not just that they exist."""
+    """The first step says where trials.csv is, not just that it exists."""
     phase = _sampled_phase(Sampler(type="random", seed=0))
-    phase_dir = display_path(tmp_path / "runs" / "t" / "p")
+    trials_csv = display_path(tmp_path / "runs" / "t" / "p" / "trials.csv")
 
     remedy = _crashed_remedy(tmp_path, phase, ["non-zero exit code 1", None])
 
-    assert remedy.startswith(
-        f"Inspect {phase_dir}/trials.csv and the trainer logs in its trial_* directories. "
-    )
+    assert remedy.startswith(f"Inspect {trials_csv}. ")
 
 
 def test_a_failure_that_was_not_a_timeout_says_nothing_about_the_timeout(
@@ -638,14 +628,14 @@ def test_a_failure_that_was_not_a_timeout_says_nothing_about_the_timeout(
 
     remedy = _crashed_remedy(tmp_path, phase, ["non-zero exit code 1", None])
 
-    assert "(for example `metric`, `trial_command`, `trainer_config` or `provenance`)" in remedy
+    assert "Fix the failure, then raise phases[p].n_trials above 2" in remedy
     assert "timeout" not in remedy
 
 
 @pytest.mark.parametrize(
     ("child", "rename"),
     [
-        pytest.param(None, "give the phase a new `name`", id="no-dependents"),
+        pytest.param(None, "give `p` a new `name`", id="no-dependents"),
         pytest.param(
             Phase(
                 name="q",
@@ -654,8 +644,7 @@ def test_a_failure_that_was_not_a_timeout_says_nothing_about_the_timeout(
                 sampler=Sampler(type="random", seed=0),
                 search_space={"y": FloatParam(type="float", low=0.1, high=1.0)},
             ),
-            "give the phase, and each phase that inherits it (`q`), a new `name`, updating every "
-            "`inherits` to match",
+            "give `p` and `q` new names and update the `inherits` that name them",
             id="one-dependent",
         ),
     ],
@@ -669,14 +658,10 @@ def test_a_timed_out_phase_is_told_to_rename_it_and_the_phases_that_inherit_it(
 
     remedy = _crashed_remedy(tmp_path, phase, [timeout, timeout], inheriting=child)
 
-    assert "A trial timed out under phases[p].timeout_seconds_per_trial" in remedy
-    assert "raising it in place is refused as a changed study" in remedy
     assert (
-        f"Raise it and {rename}; each renamed phase starts a new study and runs again, and "
-        "every other phase keeps its results."
+        f"For the timed-out trials, raise phases[p].timeout_seconds_per_trial and {rename}. "
+        "For any other failure, fix it, then raise phases[p].n_trials above 2"
     ) in remedy
-    assert "For any other failure, fix it, then raise phases[p].n_trials above 2" in remedy
-    assert remedy.count("a new `name`") == 1
 
 
 @pytest.mark.parametrize(
@@ -698,10 +683,10 @@ def test_other_failures_are_not_read_as_a_per_trial_timeout(tmp_path: Path, reas
     ("feasible", "required", "excluded"),
     [
         pytest.param(
-            True, "raise phases[p].n_trials above 3", "Changing metric.min", id="crashed-member"
+            True, "raise phases[p].n_trials above 3", "To change metric.min", id="crashed-member"
         ),
         pytest.param(
-            False, "Changing metric.min", "raise phases[p].n_trials", id="infeasible-members"
+            False, "To change metric.min", "raise phases[p].n_trials", id="infeasible-members"
         ),
     ],
 )

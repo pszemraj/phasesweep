@@ -125,7 +125,7 @@ def test_training_length_recipe_preserves_evaluation_and_mcp_verdicts(
         ["evaluation_point"] if expected_verdict == "heterogeneous" else []
     )
     if axis == "schedule_fraction" and expected_verdict == "heterogeneous":
-        assert (
-            "already measures actual_steps / planned_steps" in summary["evaluation_point"]["remedy"]
+        assert summary["evaluation_point"]["remedy"] == (
+            "A schedule_fraction below 1 is a trial that stopped before its planned steps; its "
+            "trial log says why."
         )
-        assert "set metric.extractor.evaluation_axis" not in summary["evaluation_point"]["remedy"]

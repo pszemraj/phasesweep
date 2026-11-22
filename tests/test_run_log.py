@@ -27,6 +27,7 @@ from phasesweep.engine.state import (
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.gpu import GpuPool
+from phasesweep.runtime.terminal import display_path
 from tests.conftest import (
     bounded_metric,
     console_script,
@@ -358,7 +359,7 @@ def test_failed_trials_carry_their_stderr_cause_and_the_hint_only_for_the_enviro
 
 
 def test_no_feasible_headline_covers_the_causes_of_infeasible_trials_too(tmp_path: Path) -> None:
-    """The headline promises a cause for every failed or infeasible trial, and each row keeps its own."""
+    """The fix line sends the operator to trials.csv, where each failed or infeasible row keeps its own cause."""
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=_x_trainer(tmp_path),
@@ -369,8 +370,11 @@ def test_no_feasible_headline_covers_the_causes_of_infeasible_trials_too(tmp_pat
         search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
     )
 
-    with pytest.raises(NoFeasibleTrialError, match="records why each failed or infeasible trial"):
+    with pytest.raises(NoFeasibleTrialError, match="No completed trials in phase") as refused:
         run_experiment(experiment)
+    assert str(refused.value.remediation).startswith(
+        f"Inspect {display_path(_phase_dir(experiment, 'p') / 'trials.csv')}. "
+    )
 
     with (_phase_dir(experiment, "p") / "trials.csv").open(newline="") as handle:
         rows = {row["state"]: row for row in csv.DictReader(handle)}

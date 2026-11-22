@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import re
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,7 +66,6 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import (
-    FRESH_STUDY,
     OperatorAction,
     ProcessCleanupUncertainError,
     operator_step,
@@ -513,7 +513,7 @@ def test_changed_semantic_inherited_value_rejects_topup_before_allocation(
     run_experiment(experiment)
 
     monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-b")
-    with pytest.raises(StudyFingerprintMismatchError, match="No trial was allocated"):
+    with pytest.raises(StudyFingerprintMismatchError, match="different trainer environment"):
         run_experiment(_with_trial_target(experiment, 2))
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
@@ -571,8 +571,8 @@ def test_drift_warning_names_the_variable_where_the_trial_mapping_is_held(
     (replayed,) = [m for m in messages if m.startswith("[q]")]
     assert len(messages) == 2
     assert 'PHASESWEEP_DATASET_REV "revision-a" -> "revision-b"' in replayed
-    assert "but this process composes" not in replayed
-    assert "but this process composes" in skipped
+    assert re.search(r": [0-9a-f]{12}\.\.\. -> [0-9a-f]{12}\.\.\. ", replayed) is None
+    assert re.search(r": [0-9a-f]{12}\.\.\. -> [0-9a-f]{12}\.\.\. ", skipped)
     assert "revision-a" not in skipped
 
 
@@ -838,16 +838,13 @@ def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path)
     topped_up = experiment.model_copy(update={"phases": [topped_up_parent, experiment.phases[1]]})
 
     with pytest.raises(
-        StudyContextConflictError, match=r"1 dependent phase \(`lr`\) is already bound"
+        StudyContextConflictError, match=r"1 dependent phase \(`lr`\) is bound"
     ) as refused:
         run_experiment(topped_up)
 
-    # The one rename step comes first, naming only the dependent, then the new experiment name.
+    # The rename step names only the dependent, so the enlarged phase keeps its trials.
     assert refused.value.remediation == (
-        "To run the larger budget, give each phase that inherits it (`lr`) a new `name`, "
-        "updating every `inherits` to match; each renamed phase starts a new study and runs "
-        f"again, while `arch` keeps its finished trials and runs the rest. To rerun every phase, "
-        f"{FRESH_STUDY}."
+        "Give `lr` a new `name`; `arch` keeps its trials and runs the rest."
     )
 
     parent_after = optuna.load_study(study_name="t::arch", storage=_resolve_storage(storage)).trials
@@ -871,7 +868,7 @@ def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
     parent_study = _fake_top_up_study(completed=1)
     grandchild_study = _fake_top_up_study(completed=1, fingerprint="bound-grandchild")
 
-    with pytest.raises(RuntimeError, match=r"1 dependent phase \(`final`\) is already bound"):
+    with pytest.raises(RuntimeError, match=r"1 dependent phase \(`final`\) is bound"):
         _reject_bound_descendant_topups(
             experiment,
             from_phase=None,
@@ -1115,7 +1112,6 @@ def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
     message = str(excinfo.value)
     assert "records no artifact root" in message
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
-    assert "nothing was written" in message.lower()
     assert (
         ARTIFACT_ROOT_ATTR
         not in optuna.load_study(study_name="t::p", storage=_resolve_storage(storage)).user_attrs
@@ -1515,12 +1511,12 @@ def test_persistent_bound_root_rejects_an_in_memory_configuration(tmp_path: Path
         ArtifactRootConflictError, match="created with a different storage ledger"
     ) as excinfo:
         run_experiment(offered)
-    assert str(excinfo.value).endswith("Nothing was written.")
+    assert str(excinfo.value).endswith("than this config names.")
     with pytest.raises(
         ArtifactRootConflictError, match="created with a different storage ledger"
     ) as excinfo:
         read_status(offered)
-    assert str(excinfo.value).endswith("Nothing was written.")
+    assert str(excinfo.value).endswith("than this config names.")
 
     assert materialized.unchanged()
     assert read_status(owner) == status_before

@@ -635,9 +635,8 @@ def test_validate_says_an_in_memory_phase_cannot_resume(tmp_path: Path) -> None:
 
 
 _TPE_STARTUP_WARNING = (
-    "warning: Phase 'lr': tpe with n_trials=5 <= n_startup_trials=10, so every trial is "
-    "sampled at random and TPE never fits its model. Use sampler.type: random with a seed "
-    "(same coverage), or set sampler.n_startup_trials below n_trials."
+    "warning: Phase 'lr': tpe with n_trials=5 <= n_startup_trials=10 samples every trial at "
+    "random; set sampler.n_startup_trials below n_trials."
 )
 _LR_SPACE = "{ lr: { type: float, low: 0.1, high: 1.0 } }"
 
@@ -903,9 +902,8 @@ def test_validate_and_dry_run_warn_about_a_credential_in_inherit_env(
 
 
 _REPEATS_BUDGET_WARNING = (
-    "warning: Phase 'lr': max_consecutive_failures=3 <= 3 repeats.values, so one configuration "
-    "that fails on every repeat value can abort the phase by itself; under grid and seeded random its "
-    "repeats run back to back. Set max_consecutive_failures above 3."
+    "warning: Phase 'lr': max_consecutive_failures=3 <= 3 repeats.values, so one failing "
+    "configuration can abort the phase by itself. Set max_consecutive_failures above 3."
 )
 _REPEATS_BODY = (
     "n_trials: 6\nsampler: { type: random, seed: 0 }\nsearch_space: "
@@ -1738,7 +1736,7 @@ def test_cli_boundary_reports_expected_run_failure(
         ),
         (OperatorAction.RUN_RECOVER_RUN, "again with the same config for a CLI run"),
         (OperatorAction.FIX_CONFIG, "correct the experiment configuration"),
-        (OperatorAction.RETRY, "Wait briefly, then retry the same operation"),
+        (OperatorAction.RETRY, "Retry once the reported blocker clears"),
         (OperatorAction.INSPECT_LOGS, "inspect the PhaseSweep run log"),
     ],
 )

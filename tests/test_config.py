@@ -1039,7 +1039,7 @@ def test_in_memory_fixed_configuration_refuses_identical_trials(
         make_experiment(phases=[phase])
     assert (
         "Phase 'x': n_trials=3 with an empty search_space would run 3 identical trials. Use "
-        "n_trials: 1 for a fixed configuration, or repeats to measure seed noise."
+        "n_trials: 1."
     ) in str(excinfo.value)
 
     persistent = make_experiment(storage=f"journal:///{tmp_path}/phases.journal", phases=[phase])
@@ -1227,7 +1227,7 @@ def test_repeats_requires_grid_or_seeded_random(sampler: JsonObject, spelled: st
     with pytest.raises(
         ValidationError,
         match=f"Phase 'p': repeats needs sampler.type grid, or sampler.type random with a "
-        f"seed, and this phase uses {spelled}. Only those two keep",
+        f"seed; this phase uses {spelled}\\.",
     ):
         make_experiment(phases=[_repeats_phase(sampler=sampler, search_space=numeric)])
 
@@ -1334,8 +1334,7 @@ def test_repeats_values_follow_categorical_choice_rules(values: JsonValue, match
         pytest.param(
             {"sampler": {"type": "grid"}, "n_trials": 9},
             r"n_trials=9 exceeds the grid cardinality 6 \(2 configurations x 3 repeats\)\. "
-            r"Set phases\[[^\]]+\]\.n_trials to at most 6\. To enlarge the grid instead, "
-            r"change the search space\.",
+            r"Set phases\[[^\]]+\]\.n_trials to at most 6\.",
             id="grid-over",
         ),
         pytest.param(

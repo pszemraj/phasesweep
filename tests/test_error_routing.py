@@ -1423,7 +1423,7 @@ ORIGIN_CASES = (
         trigger=_resume_over_incomplete_winner,
         raised=WinnerIntegrityError,
         action=OperatorAction.FIX_CONFIG,
-        message="unless the current config sets allow_incomplete_on_timeout: true.",
+        message="Set allow_incomplete_on_timeout: true to use it.",
     ),
     RoutingCase(
         id="partial_decision_without_opt_in",

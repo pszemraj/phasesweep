@@ -538,10 +538,10 @@ def test_float_displays_share_precision_without_changing_recorded_values(
 
 
 @pytest.mark.integration
-def test_overlap_warning_keeps_threshold_with_groups_before_evaluation_remedy(
+def test_overlap_warning_keeps_threshold_with_groups_and_leaves_the_remedy_to_show_winners(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The pooled threshold stays beside the group's gap, followed by evaluation guidance.
+    """The pooled threshold stays beside the group's gap, and the evaluation guidance is in show-winners.
 
     Both groups have sd 0.02 over three seeds, so the band is sd 0.02 on 4 df and the threshold
     2.776445 * 0.02 * sqrt(2/3) = 0.0453392 holds the 0.03 gap.
@@ -589,18 +589,15 @@ def test_overlap_warning_keeps_threshold_with_groups_before_evaluation_remedy(
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
         run_experiment(experiment)
     warning = next(
-        record.getMessage()
-        for record in caplog.records
-        if "potential confounds" in record.getMessage()
+        record.getMessage() for record in caplog.records if "tie: " in record.getMessage()
     )
     assert re.search(
         r"tie: 1 group is within noise of the winner, threshold 0\.0453392 \(sd 0\.02 pooled "
-        r"over 2 groups, df 4\): group \d+ at gap 0\.03\. ",
+        r"over 2 groups, df 4\): group \d+ at gap 0\.03\. Details: phasesweep show-winners "
+        r"CONFIG$",
         warning,
     )
-    assert warning.index("group ") < warning.index(
-        ". For a phase that searches training length, report progress="
-    )
+    assert "report progress=" not in warning
     _, views = read_result(experiment)
     assert views[0].cost_advisory_status == "no_cheaper_configuration"
     config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
@@ -609,6 +606,9 @@ def test_overlap_warning_keeps_threshold_with_groups_before_evaluation_remedy(
     payload = yaml.safe_load(result.output.split("=== epochs ===", 1)[1])
     assert payload["repeats"]["sd"] == 0.02
     assert payload["tie_groups"][0]["gap"] == 0.03
+    assert payload["confound"]["evaluation_point"]["remedy"].startswith(
+        "For a phase that searches training length, report progress="
+    )
 
 
 @pytest.mark.parametrize("sampler", ["grid", "random"])

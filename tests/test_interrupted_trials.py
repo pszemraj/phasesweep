@@ -1388,8 +1388,7 @@ def test_unreadable_tracker_leaves_finished_training_pending_until_it_answers(
     tracker.switch("denied")
     with pytest.raises(TrackingTargetUnavailableError) as refused:
         run_experiment(experiment)
-    assert refused.value.remediation is not None
-    assert "nothing is retrained" in refused.value.remediation
+    assert refused.value.remediation == TRACKER_UNREADABLE_STEP
     trials = phase_trials(experiment)
     assert len(trials) == n_jobs
     for trial in trials:
@@ -1430,11 +1429,10 @@ def test_a_pending_trial_whose_tracker_sdk_is_missing_names_installing_it(
         "failure: metric extractor: W&B evidence requires the optional SDK; install "
         "phasesweep[wandb]. Their training is kept and no new trial was started."
     )
-    assert refused.value.remediation is not None
-    assert refused.value.remediation.startswith(
-        "Fix the reported cause (restore access to the tracker, or install its missing SDK), "
-        "then run the same config again: the completed training is kept and nothing is "
-        "retrained."
+    assert refused.value.remediation == (
+        "Restore access to the tracker or install its SDK, then run the same config again; the "
+        "finished training is kept. If the tracker is gone for good, set a new `experiment` name "
+        "in the config to start a fresh study."
     )
     assert "its tracker could not be read: metric extractor: W&B evidence requires" in caplog.text
     (trial,) = phase_trials(experiment)
@@ -1882,8 +1880,7 @@ def test_recovery_defers_a_killed_runs_finished_trial_while_its_tracker_is_unrea
                 TrackingTargetUnavailableError, match="1 completed trial"
             ) as refused:
                 run_experiment(experiment, terminal_callback=reports.append)
-            assert refused.value.remediation is not None
-            assert "nothing is retrained" in refused.value.remediation
+            assert refused.value.remediation == TRACKER_UNREADABLE_STEP
             (report,) = reports
             assert report.cleanup_confirmed
             assert report.failure_stage == "preflight"

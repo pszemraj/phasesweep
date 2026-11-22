@@ -1245,7 +1245,7 @@ def test_a_run_whose_target_gives_no_answer_ends_with_the_retry_step(
         f"phasesweep: MLflow tracking target experiment_name={experiment.mlflow.experiment_name!r} "
         f"at {experiment.mlflow.tracking_uri!r} is not ready: it did not answer within "
         "timeout_seconds; check that the server is reachable. No trial was started.\n"
-        "fix: Wait briefly, then retry the same operation once the reported blocker is resolved.\n"
+        "fix: Retry once the reported blocker clears.\n"
     ) in capsys.readouterr().err
 
 
