@@ -10,9 +10,10 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep.config.io import load_yaml_document
+from phasesweep.config.reference import pin_documentation_links
 from phasesweep.runtime.json import JsonObject, JsonValue, json_value
 
-SET_SYNTAX = (
+SET_SYNTAX = pin_documentation_links(
     "Syntax: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#run-time-overrides"
 )
 

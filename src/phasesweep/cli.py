@@ -41,7 +41,13 @@ from phasesweep.config.reference import (
     sub_key_count,
     top_level_entries,
 )
-from phasesweep.config.run_overrides import CreatedKey, SetPathError, apply_set, created_key_notes
+from phasesweep.config.run_overrides import (
+    SET_SYNTAX,
+    CreatedKey,
+    SetPathError,
+    apply_set,
+    created_key_notes,
+)
 from phasesweep.config.search import phase_draws
 from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.fingerprints import _recorded_config_matches
@@ -140,10 +146,9 @@ CONFIG_OVERRIDES = click.option(
     "settings",
     multiple=True,
     metavar="KEY=VALUE",
-    help=pin_documentation_links(
+    help=(
         "Override a config value with a YAML VALUE; repeatable. KEY is dot-separated "
-        "(env.NOTE); select a phase as phases[NAME] or phases[0]. Syntax: "
-        "https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#run-time-overrides"
+        f"(env.NOTE); select a phase as phases[NAME] or phases[0]. {SET_SYNTAX}"
     ),
 )
 MCP_CATALOG = click.option(

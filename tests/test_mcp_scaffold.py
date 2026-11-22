@@ -12,6 +12,7 @@ import yaml
 from click.testing import CliRunner, Result
 
 from phasesweep.cli import cli as cli_main
+from phasesweep.config import reference
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.scaffold import derive_experiment_id, scaffold_catalog_text
@@ -47,6 +48,17 @@ def test_scaffold_rejects_duplicate_ids(tmp_path: Path) -> None:
     assert refused.value.suggestion == (
         "rename one of the config files; each entry's id comes from its file name"
     )
+
+
+def test_scaffold_header_links_the_installed_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The catalog header's documentation link names the installed release's tag, not main."""
+    monkeypatch.setattr(reference, "_editable_install", lambda: False)
+    monkeypatch.setattr(reference, "__version__", "0.3.12")
+    text = scaffold_catalog_text(tmp_path / "catalog.yaml", [_write_config(tmp_path, "srv.yaml")])
+    assert "https://github.com/pszemraj/phasesweep/blob/v0.3.12/docs/mcp.md#the-catalog" in text
+    assert "blob/main" not in text
 
 
 def test_init_catalog_writes_read_only_catalog(tmp_path: Path) -> None:

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import yaml
 
+from phasesweep.config.reference import pin_documentation_links
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.runtime.files import UnsafePrivatePathError, phasesweep_home, xdg_home
 from phasesweep.runtime.terminal import command_line
@@ -126,12 +127,15 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
         root = xdg_home("XDG_STATE_HOME", Path.home() / ".local" / "state") / "phasesweep"
     state_dir = root / "mcp" / digest
     check_command = command_line("mcp", "check", "--catalog", str(output.resolve()))
+    catalog_docs = pin_documentation_links(
+        "https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md#the-catalog"
+    )
     header = f"""\
 # MCP catalog scaffolded by `phasesweep mcp init-catalog`. Edit the entries, then run:
 #   {check_command}
 # Then point your MCP client at the absolute `phasesweep-mcp` executable with
 # `--catalog` and this file's absolute path. Entry fields:
-# https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md#the-catalog
+# {catalog_docs}
 
 state_dir: {_yaml_string_scalar(state_dir)}   # run handles, logs, audit.jsonl (operator-owned)
 max_concurrent_runs: 1          # sweeps at once across all experiments; 1 keeps a single GPU sane
