@@ -250,7 +250,7 @@ def test_winners_payload_applies_visible_params_policy(
             generation_id="generation-1",
             attempt_id="attempt-1",
         ),
-        cost_advisory="one-standard-error cost advisory: params={'dataset': 'SECRET_DATASET'}",
+        cost_advisory="cost advisory: dataset=SECRET_DATASET is cheaper than the winner's ...",
         edge_advisory="no trial ran above the winner's dataset_size=SECRET_SIZE (tried 1..9)",
         edge_advisory_status="available",
         tie_groups=[

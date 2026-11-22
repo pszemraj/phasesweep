@@ -357,9 +357,9 @@ def test_cost_advisory_uses_the_pooled_standard_error_and_keeps_the_winner(
         assert advisory is None
     else:
         assert advisory == (
-            "cost advisory: params={'epochs': 8} has epochs=8 against the winner's 16 and a mean "
-            f"within one standard error of the winner's (gap {gap:g}, standard error "
-            f"{standard_error})"
+            "cost advisory: epochs=8 is cheaper than the winner's epochs=16, with a mean within "
+            f"one standard error of the winner's (gap {gap:g}, standard error {standard_error}); "
+            "the selected winner is unchanged"
         )
 
 
@@ -390,7 +390,7 @@ def test_cost_advisory_breaks_cost_ties_by_objective_then_trial_order(maximize: 
         )
     advisory = _cost_advisory(phase, winner, groups, goal="maximize" if maximize else "minimize")
     assert advisory is not None
-    assert "'lr': 0.2" in advisory
+    assert advisory.startswith("cost advisory: epochs=8 lr=0.2 is cheaper than")
     assert (
         _cost_advisory(phase.model_copy(update={"cost_key": None}), winner, groups, goal="minimize")
         is None
@@ -466,7 +466,9 @@ def test_cost_key_added_after_publication_is_visible_on_reads_and_replay(
     displayed = CliRunner().invoke(cli, ["show-winners", str(config_path)])
     assert displayed.exit_code == 0, displayed.exception
     shown = yaml.safe_load(displayed.output.split("=== epochs ===", 1)[1])
-    assert shown["cost_advisory"].startswith("cost advisory: params={'epochs': 8} has epochs=8")
+    assert shown["cost_advisory"].startswith(
+        "cost advisory: epochs=8 is cheaper than the winner's epochs=16"
+    )
     assert "tie_groups:" in displayed.output
     assert "cost_advisory_status: available" in displayed.output
     replayed = run_experiment(changed)["epochs"]

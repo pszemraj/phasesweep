@@ -28,6 +28,7 @@ from phasesweep.engine.confound import (
     ConfoundBlock,
     _assess_population,
     _describe_flagged,
+    _params_text,
 )
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
@@ -524,11 +525,12 @@ def _cost_advisory(
     sign = 1.0 if goal == "minimize" else -1.0
     cheapest = min(eligible, key=lambda group: (cost(group), sign * group.aggregate, group.numbers))
     if cost(cheapest) < cost(winner):
+        # The params carry the cheaper cost, so the winner's one value says by how much.
         return (
-            f"cost advisory: params={dict(cheapest.params)} has {key}={cost(cheapest):g} against "
-            f"the winner's {cost(winner):g} and a mean within one standard error of the "
-            f"winner's (gap {objective_text(abs(cheapest.aggregate - winner.aggregate))}, "
-            f"standard error {objective_text(winner_se)})"
+            f"cost advisory: {_params_text(cheapest.params).lstrip()} is cheaper than the "
+            f"winner's {key}={param_text(winner.params[key])}, with a mean within one standard "
+            f"error of the winner's (gap {objective_text(abs(cheapest.aggregate - winner.aggregate))}"
+            f", standard error {objective_text(winner_se)}); the selected winner is unchanged"
         )
     return None
 
