@@ -107,7 +107,7 @@ def test_run_lock_held_past_the_retry_window_is_refused_as_busy(tmp_path: Path) 
 
     assert time.monotonic() - started >= locking._PROBE_OUTLAST_SECONDS
     assert busy.value.args[0] == (
-        f"Another phasesweep process holds the lock for experiment {experiment.experiment!r} "
+        f"Another phasesweep process holds the lock experiment {experiment.experiment!r} needs "
         f"(lock file: {path})."
     )
     assert busy.value.remediation == "Wait for it to finish, then retry."
