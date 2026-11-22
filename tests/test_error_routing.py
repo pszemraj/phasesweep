@@ -75,6 +75,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import EnvironmentIdentity
 from phasesweep.errors import (
+    ACCEPT_INCOMPLETE_STEP,
     OTHER_FORMAT_STEP,
     ForeignPidNamespaceError,
     OperatorAction,
@@ -1422,14 +1423,14 @@ ORIGIN_CASES = (
         trigger=_resume_over_incomplete_winner,
         raised=WinnerIntegrityError,
         action=OperatorAction.FIX_CONFIG,
-        message="Set allow_incomplete_on_timeout: true to use it.",
+        message=ACCEPT_INCOMPLETE_STEP,
     ),
     RoutingCase(
         id="partial_decision_without_opt_in",
         trigger=_replay_partial_decision_without_opt_in,
         raised=WinnerIntegrityError,
         action=OperatorAction.FIX_CONFIG,
-        message="set allow_incomplete_on_timeout: true to replay it.",
+        message=ACCEPT_INCOMPLETE_STEP,
     ),
     RoutingCase(
         id="ledger_directory_path_unusable",

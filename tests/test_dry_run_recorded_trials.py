@@ -336,7 +336,9 @@ def test_accepted_partial_timeout_previews_a_replay_and_launches_nothing(
     assert _terminal_trials(accepting, "a") == 2
 
     refusing = _persistent(tmp_path, _phase("a", 4))
-    _refusals_match(refusing, tmp_path, WinnerIntegrityError, "allow_incomplete_on_timeout: true")
+    _refusals_match(
+        refusing, tmp_path, WinnerIntegrityError, "accepted an incomplete result at 2/4 finished"
+    )
 
 
 @pytest.mark.integration

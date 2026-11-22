@@ -25,7 +25,7 @@ from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import PHASE_DECISION_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
-from phasesweep.errors import PhaseSweepError
+from phasesweep.errors import ACCEPT_INCOMPLETE_STEP, PhaseSweepError
 from phasesweep.runtime.process import ProcessResult
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
@@ -197,13 +197,16 @@ def test_incomplete_timeout_winner_is_accepted_only_under_current_opt_in(tmp_pat
         timeout_seconds_per_phase=6.0,
         sleep_seconds=1.0,
     )
-    with pytest.raises(RuntimeError, match="records an incomplete result for skipped phase"):
+    with pytest.raises(
+        WinnerIntegrityError, match="records an incomplete result for skipped phase"
+    ) as refused:
         _load_winner(
             current,
             current.phases[0],
             {},
             publication=_published_for_resume(current),
         )
+    assert refused.value.remediation == ACCEPT_INCOMPLETE_STEP
 
 
 @pytest.mark.integration
@@ -236,8 +239,9 @@ def test_rerun_replays_an_accepted_partial_result_only_under_current_opt_in(
     strict = exp.model_copy(
         update={"phases": [exp.phases[0].model_copy(update={"allow_incomplete_on_timeout": False})]}
     )
-    with pytest.raises(WinnerIntegrityError, match="set allow_incomplete_on_timeout: true"):
+    with pytest.raises(WinnerIntegrityError, match="accepted an incomplete result at") as refused:
         run_experiment(strict)
+    assert refused.value.remediation == ACCEPT_INCOMPLETE_STEP
     assert len(load().trials) == trials_before
     assert load().user_attrs[PHASE_DECISION_ATTR] == decision_before
     assert _last_successful_generation_path(exp).read_text() == published_before

@@ -199,6 +199,11 @@ OTHER_FORMAT_STEP = (
 )
 
 
+#: The step for a recorded result that stopped short at a timeout, on every surface that
+#: refuses to use it while ``allow_incomplete_on_timeout`` is off.
+ACCEPT_INCOMPLETE_STEP = "Set allow_incomplete_on_timeout: true to use the incomplete result."
+
+
 def short_digest(digest: str) -> str:
     """Shorten a SHA-256 digest the way every message that prints one does.
 

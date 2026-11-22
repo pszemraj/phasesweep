@@ -114,6 +114,7 @@ from phasesweep.engine.trial import (
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import (
+    ACCEPT_INCOMPLETE_STEP,
     START_AGAIN_STEP,
     OperatorAction,
     PhaseSweepError,
@@ -639,9 +640,9 @@ def _judge_recorded_phase(
             raise WinnerIntegrityError(
                 f"Phase {phase.name!r} accepted an incomplete result at "
                 f"{partial_decision.finished_trials}/{partial_decision.trial_target} finished "
-                f"trials when its {partial_decision.timeout_scope} deadline expired; set "
-                "allow_incomplete_on_timeout: true to replay it.",
+                f"trials when its {partial_decision.timeout_scope} deadline expired.",
                 action=OperatorAction.FIX_CONFIG,
+                remediation=ACCEPT_INCOMPLETE_STEP,
             )
         completion = _partial_completion_for_replay(
             study,

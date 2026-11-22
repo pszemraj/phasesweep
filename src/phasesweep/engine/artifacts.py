@@ -38,6 +38,7 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import _describe_environment_changes
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import (
+    ACCEPT_INCOMPLETE_STEP,
     OperatorAction,
     PhaseSweepError,
     operator_step,
@@ -388,7 +389,7 @@ def _load_winner(
         raise WinnerIntegrityError(
             f"Winner file {path} records an incomplete result for skipped phase {phase.name!r}.",
             action=OperatorAction.FIX_CONFIG,
-            remediation="Set allow_incomplete_on_timeout: true to use it.",
+            remediation=ACCEPT_INCOMPLETE_STEP,
         )
 
     try:
