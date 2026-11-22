@@ -710,22 +710,26 @@ def run(
                     ),
                     err=True,
                 )
-            if not dry_run:
-                _echo_sync_step(config, config_path, settings)
             raise
-        if not dry_run and finished:
-            _print_block(
-                _closing_block(
-                    config,
-                    finished[-1],
-                    elapsed=time.monotonic() - started,
-                    wall_start=wall_start,
-                    config_path=config_path,
-                    settings=settings,
-                    from_phase=from_phase,
+        else:
+            if not dry_run and finished:
+                _print_block(
+                    _closing_block(
+                        config,
+                        finished[-1],
+                        elapsed=time.monotonic() - started,
+                        wall_start=wall_start,
+                        config_path=config_path,
+                        settings=settings,
+                        from_phase=from_phase,
+                    )
                 )
-            )
-            _echo_sync_step(config, config_path, settings)
+        finally:
+            # A terminal report means the engine logged its closing lines, which count what
+            # stays pending, however the run ended; a run refused before that, as by a live
+            # run's lock, gets no step to send records it may not own.
+            if not dry_run and finished:
+                _echo_sync_step(config, config_path, settings)
 
 
 def _print_block(block: Banner | Summary | NothingToRun | LogLine) -> None:

@@ -1044,7 +1044,7 @@ def test_sync_tracking_names_what_keeps_its_records_pending(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("ending", ["finished", "stopped"])
+@pytest.mark.parametrize("ending", ["finished", "failed", "stopped"])
 def test_a_run_started_with_overrides_prints_the_sync_command_that_sends_what_it_left(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1053,10 +1053,12 @@ def test_a_run_started_with_overrides_prints_the_sync_command_that_sends_what_it
 ) -> None:
     """A run that leaves MLflow work pending prints the sync-tracking command as typed, and it delivers.
 
-    Whether the run finishes with its uploads unanswered or a shutdown stops it, the last lines
-    before the log path give the command with the run's ``--set`` overrides, whole on a line of
-    its own; the closing warning says in words what that command needs. Run as printed, the
-    command finds the study the overrides named and sends everything.
+    Whether the run finishes with its uploads unanswered, fails when its tracker stops answering
+    before the second phase, or a shutdown stops it, the lines after the closing warning give
+    the command with the run's ``--set`` overrides, once, whole on a line of its own; only the
+    log path follows it, after the error when the run failed. The closing warning says in words
+    what that command needs. Run as printed, the command finds the study the overrides named
+    and sends everything.
     """
     config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["storage"] = "auto"
@@ -1065,11 +1067,17 @@ def test_a_run_started_with_overrides_prints_the_sync_command_that_sends_what_it
     )
     respond = session.request_operation
     stopped: list[int] = []
+    resolved: list[str] = []
 
     def unsent(request: dict[str, object], **kwargs: object) -> JsonObject:
+        if request["action"] == "resolve" and ending == "failed":
+            # The first phase's target check answers; the second phase's gets no answer.
+            resolved.append("resolve")
+            if len(resolved) > 1:
+                raise OperationUnavailableError("tracking server unreachable")
         if request["action"] != "publish":
             return respond(request, **kwargs)
-        if ending == "finished":
+        if ending != "stopped":
             raise OperationUnavailableError("tracking server unreachable")
         if stopped:
             raise ShutdownLaunchRefusedError(stopped[0])
@@ -1082,13 +1090,20 @@ def test_a_run_started_with_overrides_prints_the_sync_command_that_sends_what_it
         patch.setattr(worker, "request_operation", unsent)
         status = invoke_cli_boundary(["run", str(path), "--set", "experiment=tuned"], monkeypatch)
 
-    assert status == (0 if ending == "finished" else 130)
+    assert status == {"finished": 0, "failed": 1, "stopped": 130}[ending]
     lines = capsys.readouterr().err.splitlines()
     printed = shlex.join(["phasesweep", "sync-tracking", str(path), "--set", "experiment=tuned"])
     step = lines.index("MLflow: to send what is pending without training, run:")
-    # Only the log path, which may break after its slashes, follows the command.
-    assert (lines[step + 1], lines[step + 2][:5]) == (printed, "log: ")
+    assert lines[step + 1] == printed
     assert lines.count(printed) == 1
+    following = lines[step + 2 :]
+    if ending == "failed":
+        assert following[0].startswith("phasesweep: MLflow tracking target ")
+        assert following[0].endswith("tracking server unreachable. No trial was started.")
+        assert following[1].startswith("fix: ")
+        following = following[2:]
+    # The log path may break after its slashes.
+    assert following[0][:5] == "log: "
     # The closing warning wraps to the terminal.
     assert _PENDING_STEP in " ".join(" ".join(lines).split())
     assert uploads == []
