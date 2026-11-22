@@ -30,7 +30,7 @@ from phasesweep.runtime.json import (
 )
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE, recorded_process_check
 from phasesweep.runtime.shutdown import servicing_shutdown_signal
-from phasesweep.runtime.terminal import plural
+from phasesweep.runtime.terminal import command_line, plural
 from phasesweep.tracking.mlflow import (
     OperationOutcomeUnknownError,
     OperationRejectedError,
@@ -83,13 +83,13 @@ RequestFailure = Literal["shutdown", "no answer", "refused", "refused again", "o
 # also reach run.log and an MCP runner's log, where the config path is not known, so they write
 # CONFIG; the CLI prints the command as typed, overrides included, after a run that leaves work
 # pending. Without the overrides a run used, sync-tracking's own refusals name them.
-SYNC_TRACKING_STEP = "`phasesweep sync-tracking CONFIG`"
+SYNC_TRACKING_STEP = f"`{command_line('sync-tracking', 'CONFIG')}`"
 # The step for a target check MLflow gave no answer to: a down server and a wrong URI look alike.
 NO_ANSWER_STEP = "Start the MLflow server or correct `mlflow.tracking_uri`, then run again."
 # The step for a config whose MLflow target is not the one the tree's runs used, as a run's
 # warning and sync-tracking's refusal both give it. A ``--set`` override can move the target.
 ORIGINAL_TARGET_STEP = (
-    "Run `phasesweep sync-tracking CONFIG`, or the sweep, with the config and `--set` "
+    f"Run {SYNC_TRACKING_STEP}, or the sweep, with the config and `--set` "
     "overrides the sweep ran with."
 )
 
