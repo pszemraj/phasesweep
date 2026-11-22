@@ -351,7 +351,7 @@ def _error_boundary() -> None:
             )
         ):
             exc = click.UsageError(
-                f"{exc.message} Use --set workdir=PATH.",
+                f"{exc.message} Use --set workdir=PATH; relative paths resolve against the config file's directory.",
                 ctx=exc.ctx,
             )
         exc.show()
