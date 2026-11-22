@@ -1435,10 +1435,11 @@ def sync_tracking(
             raise TrackingSyncRefusedError(
                 "No tracking deliveries exist for this scope.",
                 remediation=(
-                    f"Check --generation {generation_id!r}; an MCP run's ID is its generation ID."
+                    f"Check --generation {generation_id!r} and pass the `--set` overrides the run "
+                    "used; an MCP run's ID is its generation ID."
                     if generation_id is not None
-                    else "Pass the config the sweep ran with; no run of this experiment has "
-                    "saved an MLflow record yet."
+                    else "Pass the config and `--set` overrides the sweep ran with; no run of this "
+                    "experiment has saved an MLflow record yet."
                 ),
             )
         counts = delivery_status(experiment, generation_id)

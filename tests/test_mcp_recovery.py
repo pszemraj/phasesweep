@@ -1074,8 +1074,14 @@ def test_sync_tracking_leaves_the_originating_runs_recovery_evidence(
     if scope == "own_generation":
         assert sync_tracking(experiment, run_id)["pending"] == 0
     else:
-        with pytest.raises(TrackingSyncRefusedError, match="No tracking deliveries exist"):
+        with pytest.raises(
+            TrackingSyncRefusedError, match="No tracking deliveries exist"
+        ) as refused:
             sync_tracking(experiment, "other-generation")
+        assert refused.value.remediation == (
+            "Check --generation 'other-generation' and pass the `--set` overrides the run used; "
+            "an MCP run's ID is its generation ID."
+        )
 
     study = _load_first_phase_study(config_path)
     _recovered_tracking_run(
