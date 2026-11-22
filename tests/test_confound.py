@@ -274,12 +274,12 @@ def test_evaluation_point_disagreement_is_heterogeneous(
     [
         pytest.param(
             None,
-            "log_regex objectives report no evaluation position",
+            "log_regex objectives record no evaluation position",
             id="log_regex",
         ),
         pytest.param(
             {number: _json() for number in range(3)},
-            "json objectives report no evaluation position",
+            "json objectives record no evaluation position",
             id="json",
         ),
         pytest.param(

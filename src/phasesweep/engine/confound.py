@@ -27,7 +27,11 @@ from phasesweep.engine.repeats import (
     noise_band,
 )
 from phasesweep.engine.state import _unreplaced_attempts
-from phasesweep.evidence.models import POSITIONED_EXTRACTOR_KINDS
+from phasesweep.evidence.models import (
+    POSITIONED_EXTRACTOR_KINDS,
+    best_value_position_reason,
+    no_position_reason,
+)
 from phasesweep.runtime.json import progress_position
 from phasesweep.runtime.terminal import objective_text, param_text, plural
 
@@ -242,10 +246,7 @@ def _evaluation_point(
     if len(ranked) < 2:
         return _not_checked("only one trial was ranked")
     if best_value_select is not None:
-        return _not_checked(
-            f"mlflow select: {best_value_select} records the step where the best value fell, "
-            "not how far each trial trained"
-        )
+        return _not_checked(best_value_position_reason(best_value_select))
     unreadable = [str(trial.number) for trial in ranked if trial.number not in provenance]
     if unreadable:
         return _not_checked(
@@ -255,7 +256,7 @@ def _evaluation_point(
     kinds = sorted({_extractor_kind(record) for _, record in records})
     if len(kinds) != 1 or kinds[0] not in POSITIONED_EXTRACTOR_KINDS:
         # docs/runtime.md ("Confound verdicts") says which extractors record a position.
-        return _not_checked(f"{', '.join(kinds)} objectives report no evaluation position")
+        return _not_checked(no_position_reason(kinds))
     positions = [(number, _recorded_position(record)) for number, record in records]
     axes = sorted({axis for _, (axis, _) in positions})
     if len(axes) != 1:
