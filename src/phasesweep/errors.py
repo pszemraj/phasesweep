@@ -16,7 +16,9 @@ class OperatorAction(StrEnum):
     directory every launching context shares, or moves the work to the host.
     RUN_RECOVER_RUN retries process cleanup through the appropriate CLI or MCP
     recovery entry point. FIX_CONFIG corrects configuration or environment;
-    RETRY repeats the operation after its blocker resolves; INSPECT_LOGS requires diagnosis.
+    RETRY repeats the operation after its blocker resolves, with no change to the command or
+    config, so the CLI exits 75 for it and a process supervisor can rerun the same command;
+    an error that needs an operator step first never carries it. INSPECT_LOGS requires diagnosis.
     Defects do not inherit PhaseSweepError or an operator remediation.
     """
 

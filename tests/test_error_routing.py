@@ -1454,14 +1454,14 @@ ORIGIN_CASES = (
         id="live_trial_tracker_unreadable",
         trigger=_run_while_tracker_unreadable,
         raised=TrackingTargetUnavailableError,
-        action=OperatorAction.FIX_CONFIG,
+        action=OperatorAction.RETRY,
         message="finished training, but the tracker could not be read",
     ),
     RoutingCase(
         id="pending_trial_tracker_unreadable",
         trigger=_resume_while_tracker_unreadable,
         raised=TrackingTargetUnavailableError,
-        action=OperatorAction.FIX_CONFIG,
+        action=OperatorAction.RETRY,
         message="1 completed trial(s) finished training, but the tracker could not be read",
     ),
     RoutingCase(

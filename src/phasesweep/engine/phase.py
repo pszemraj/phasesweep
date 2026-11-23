@@ -815,7 +815,7 @@ def _trial_recording_error(
     if not run.experiment.persistent:
         return StudyStorageUnavailableError(
             f"{message} The trial result was lost.",
-            action=OperatorAction.RETRY,
+            action=OperatorAction.INSPECT_LOGS,
             remediation="Resolve the error and rerun.",
         )
     return StudyStorageUnavailableError(

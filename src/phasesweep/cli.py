@@ -167,6 +167,7 @@ MCP_CATALOG = click.option(
 _USAGE_EXIT = 2  # bad input: config or arguments
 _FAILURE_EXIT = 1  # the run itself failed
 _INTERNAL_EXIT = 70  # sysexits EX_SOFTWARE: a phasesweep bug
+_RETRY_EXIT = 75  # sysexits EX_TEMPFAIL: the same command can succeed later, unchanged
 _ABORT_EXIT = 130  # 128 + SIGINT
 
 # Column limits for the `explain` listing.
@@ -223,6 +224,16 @@ def _operational_error_text(exc: PhaseSweepError) -> str:
     :return str: Diagnostic followed by its operator step.
     """
     return f"{exc}\nfix: {operator_step(exc)}"
+
+
+def _refusal_exit(exc: PhaseSweepError) -> int:
+    """Choose the exit status of a refusal from its routed action.
+
+    :param PhaseSweepError exc: Operational failure being reported.
+    :return int: ``_RETRY_EXIT`` when rerunning the same command later can succeed with no
+        operator change, otherwise ``_FAILURE_EXIT``.
+    """
+    return _RETRY_EXIT if exc.action is OperatorAction.RETRY else _FAILURE_EXIT
 
 
 def _print_operational_error(exc: PhaseSweepError) -> None:
@@ -322,9 +333,9 @@ def main() -> None:
     exited or a terminal that hung up is discarded, so the status stays the command's own.
 
     :raises SystemExit: Always, carrying one of ``_USAGE_EXIT`` (bad input),
-        ``_FAILURE_EXIT`` (the run failed), ``_INTERNAL_EXIT`` (a phasesweep
-        bug), ``_ABORT_EXIT`` (interrupted), or the status the command or
-        Click chose.
+        ``_FAILURE_EXIT`` (the run failed), ``_RETRY_EXIT`` (the same command can succeed
+        later), ``_INTERNAL_EXIT`` (a phasesweep bug), ``_ABORT_EXIT`` (interrupted), or the
+        status the command or Click chose.
     """
     _RUN_LOG.set(None)
     sys.stdout = _discard_unreadable_output(sys.stdout)
@@ -386,7 +397,7 @@ def _error_boundary() -> None:
         sys.exit(_USAGE_EXIT)
     except PhaseSweepError as exc:
         _print_operational_error(exc)
-        sys.exit(_FAILURE_EXIT)
+        sys.exit(_refusal_exit(exc))
     except OSError as exc:
         click.echo(f"phasesweep: operational error: {exc}", err=True)
         sys.exit(_FAILURE_EXIT)
@@ -1556,7 +1567,7 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
     raise PhaseSweepError(
         f"MLflow delivery remains pending: {count_text(records, len(creations))} could not be "
         "sent or settled; the warnings above give each cause.",
-        action=OperatorAction.RETRY,
+        action=OperatorAction.INSPECT_LOGS,
         remediation=f"Once those causes are resolved, {again}",
     )
 
@@ -1663,7 +1674,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             recover_run(state_dir, run_id, confirm=confirm, emit=click.echo)
         except RunRecoveryError as exc:
             _print_operational_error(exc)
-            raise click.exceptions.Exit(_FAILURE_EXIT) from None
+            raise click.exceptions.Exit(_refusal_exit(exc)) from None
         except PhaseSweepShutdown:
             # A stopped pass leaves the run recovery-required unless it had already cleared it,
             # and either way the same command finishes or confirms the recovery.

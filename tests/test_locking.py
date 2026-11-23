@@ -29,9 +29,11 @@ from phasesweep.engine.run import run_experiment
 from phasesweep.errors import PhaseSweepError, operator_step
 from phasesweep.runtime import files as runtime_files
 from tests.conftest import (
+    invoke_cli_boundary,
     make_experiment,
     patch_directory_fsync_failure,
     raise_after_first_successful_call,
+    write_experiment_config,
 )
 
 
@@ -115,6 +117,23 @@ def test_run_lock_held_past_the_retry_window_is_refused_as_busy(tmp_path: Path) 
     assert busy.value.remediation == (
         "Wait for the process that holds this experiment's lock to finish, then retry."
     )
+
+
+def test_run_refused_for_a_held_experiment_lock_exits_75(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run that finds its experiment locked exits 75 and names the wait, so a supervisor reruns it."""
+    experiment = make_experiment(persistent=tmp_path)
+    config = write_experiment_config(tmp_path / "exp.yaml", experiment)
+    holder = runtime_files.try_lock_file(_run_lock_paths(experiment)[0])
+    assert holder is not None
+    try:
+        status = invoke_cli_boundary(["run", str(config)], monkeypatch)
+    finally:
+        runtime_files.unlock_file(holder)
+
+    assert status == 75
+    assert "fix: Wait for the process that holds this experiment's lock" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

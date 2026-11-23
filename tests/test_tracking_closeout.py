@@ -974,7 +974,10 @@ def test_sync_tracking_names_what_keeps_its_records_pending(
     capsys.readouterr()
     arguments = [str(config), "--set", "phases.0.n_trials=2", "--generation", sweep.generation]
 
-    assert invoke_cli_boundary(["sync-tracking", *arguments], monkeypatch) == 1
+    # A tracker that gave no answer exits 75, which a later identical run can clear; a refusal
+    # MLflow answered exits 1.
+    expected_status = 75 if failure == "no-answer" else 1
+    assert invoke_cli_boundary(["sync-tracking", *arguments], monkeypatch) == expected_status
 
     error = capsys.readouterr().err
     command = shlex.join(["phasesweep", "sync-tracking", *arguments]) + "\n"
@@ -1047,7 +1050,7 @@ def test_a_run_started_with_overrides_prints_the_sync_command_that_sends_what_it
         patch.setattr(worker, "request_operation", unsent)
         status = invoke_cli_boundary(["run", str(path), "--set", "experiment=tuned"], monkeypatch)
 
-    assert status == {"finished": 0, "failed": 1, "stopped": 130}[ending]
+    assert status == {"finished": 0, "failed": 75, "stopped": 130}[ending]
     lines = capsys.readouterr().err.splitlines()
     printed = shlex.join(["phasesweep", "sync-tracking", str(path), "--set", "experiment=tuned"])
     step = lines.index("MLflow: to send what is pending without training, run:")
@@ -1157,7 +1160,7 @@ def test_sync_tracking_says_when_a_creation_inside_its_window_can_be_settled(
     config = write_experiment_config(Path.cwd() / "experiment.yaml", experiment)
     capsys.readouterr()
 
-    assert invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch) == 1
+    assert invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch) == 75
 
     error = capsys.readouterr().err
     until = time.strftime("%H:%M:%S", time.localtime(math.ceil(end)))
@@ -1189,7 +1192,8 @@ def test_a_run_whose_target_gives_no_answer_ends_with_the_retry_step(
     """`phasesweep run` against a tracker that gives no answer to its target check is told to retry.
 
     The refusal names the target and starts no trial, and the step is the retry `sync-tracking`
-    prints for the same tracker, not a configuration fix.
+    prints for the same tracker, not a configuration fix. The run exits 75, the status that tells
+    a process supervisor the same command can succeed later.
     """
     config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     experiment = Experiment.model_validate(config)
@@ -1203,7 +1207,7 @@ def test_a_run_whose_target_gives_no_answer_ends_with_the_retry_step(
     path = write_experiment_config(Path.cwd() / "experiment.yaml", experiment)
     capsys.readouterr()
 
-    assert invoke_cli_boundary(["run", str(path)], monkeypatch) == 1
+    assert invoke_cli_boundary(["run", str(path)], monkeypatch) == 75
 
     assert uploads == []
     assert (

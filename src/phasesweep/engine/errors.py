@@ -197,10 +197,14 @@ TRACKER_UNREADABLE_STEP = (
 def tracker_unreadable(message: str) -> TrackingTargetUnavailableError:
     """Attach the step that fixes the tracker read to a stop that keeps finished training pending.
 
+    The stop is a retry: the tracker answering again is all the same command needs.
+
     :param str message: Diagnostic naming the pending trials and the tracker's failure.
     :return TrackingTargetUnavailableError: Refusal shared by the live run and recovery.
     """
-    return TrackingTargetUnavailableError(message, remediation=TRACKER_UNREADABLE_STEP)
+    return TrackingTargetUnavailableError(
+        message, action=OperatorAction.RETRY, remediation=TRACKER_UNREADABLE_STEP
+    )
 
 
 class TrackingSyncRefusedError(PhaseSweepError):

@@ -14,6 +14,7 @@ from types import MappingProxyType
 
 import pytest
 
+import phasesweep.cli as cli_module
 import phasesweep.engine.ledger as engine_ledger
 from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment
@@ -21,6 +22,7 @@ from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.paths import _attempts_dir
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.mcp import runner as mcp_runner
+from tests.conftest import invoke_cli_boundary
 from tests.ledger_fixtures import Materialized, materialize
 
 Trigger = Callable[[Path, pytest.MonkeyPatch], object]
@@ -161,6 +163,11 @@ def assert_routes_declared_action(
         else:
             assert error.remediation in rendered
         assert "start a new run" not in rendered
+    # The CLI boundary exits 75 exactly for a retry and 1 for every other operator action.
+    with monkeypatch.context() as boundary:
+        boundary.setattr(cli_module.cli, "main", raiser(error))
+        expected_status = 75 if case.action is OperatorAction.RETRY else 1
+        assert invoke_cli_boundary([], boundary) == expected_status
 
 
 _STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(

@@ -1783,7 +1783,7 @@ def test_cli_boundary_renders_action_once(
         raise translated
 
     monkeypatch.setattr(cli_main, "main", fail)
-    assert invoke_cli_boundary([], monkeypatch) == 1
+    assert invoke_cli_boundary([], monkeypatch) == (75 if action is OperatorAction.RETRY else 1)
     captured = capsys.readouterr()
     assert captured.out == ""
     diagnostic_line, fix_line = captured.err.splitlines()
