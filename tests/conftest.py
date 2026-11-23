@@ -1006,6 +1006,7 @@ def single_trial_confound(trial_number: int) -> dict[str, Any]:
                 },
             },
             "tie": {"verdict": "n/a", "reason": "only one trial was ranked"},
+            "code_revision": {"verdict": "n/a", "reason": "only one trial was ranked"},
         },
     }
 

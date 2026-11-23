@@ -19,6 +19,7 @@ from typing import Literal, TypeAlias, TypedDict, get_args
 import optuna
 
 from phasesweep.engine.optuna import _trial_count_state
+from phasesweep.engine.provenance import CodeRevision
 from phasesweep.engine.repeats import (
     RankedGroup,
     RepeatAxis,
@@ -26,7 +27,7 @@ from phasesweep.engine.repeats import (
     configuration_slots,
     noise_band,
 )
-from phasesweep.engine.state import _unreplaced_attempts
+from phasesweep.engine.state import GENERATION_ID_ATTR, _unreplaced_attempts
 from phasesweep.errors import STORAGE_NULL_KEEPS_NOTHING, rename_step
 from phasesweep.evidence.models import (
     POSITIONED_EXTRACTOR_KINDS,
@@ -46,12 +47,12 @@ CONFOUND_VERDICTS: tuple[ConfoundVerdict, ...] = get_args(ConfoundVerdict)
 CheckedVerdict = Literal["ok", "heterogeneous"]
 """The verdict of a check that ran."""
 
-ConfoundCheck = Literal["evaluation_point", "survivorship", "tie"]
+ConfoundCheck = Literal["evaluation_point", "survivorship", "tie", "code_revision"]
 """One comparability dimension, in the order every surface reports them."""
 
 CONFOUND_CHECKS: tuple[ConfoundCheck, ...] = get_args(ConfoundCheck)
 
-CONFOUND_SCHEMA_VERSION = 5
+CONFOUND_SCHEMA_VERSION = 6
 
 
 class PositionGroup(TypedDict):
@@ -95,6 +96,27 @@ class TieDetail(TypedDict):
     df: int | None
 
 
+class GenerationRevision(TypedDict):
+    """The trainer revision one generation of ranked trials recorded.
+
+    ``record`` is ``recorded`` with the revision in ``commit`` and ``dirty``, ``unknown`` when
+    the generation found no git work tree to read, or ``unreadable`` when its record could
+    not be read; ``commit`` and ``dirty`` are ``None`` for the last two.
+    """
+
+    generation_id: str
+    record: Literal["recorded", "unknown", "unreadable"]
+    commit: str | None
+    dirty: bool | None
+    trials: list[int]
+
+
+class CodeRevisionDetail(TypedDict):
+    """Every generation the ranked trials ran in, ordered by its first ranked trial."""
+
+    generations: list[GenerationRevision]
+
+
 class NotChecked(TypedDict):
     """A check that could not run, and why."""
 
@@ -123,16 +145,28 @@ class TieChecked(TypedDict):
     detail: TieDetail
 
 
+class CodeRevisionChecked(TypedDict):
+    """A checked ``code_revision`` record."""
+
+    verdict: CheckedVerdict
+    detail: CodeRevisionDetail
+
+
 EvaluationCheck: TypeAlias = EvaluationChecked | NotChecked
 TieCheck: TypeAlias = TieChecked | NotChecked
+CodeRevisionCheck: TypeAlias = CodeRevisionChecked | NotChecked
+
+RevisionRead: TypeAlias = CodeRevision | Literal["unknown", "unreadable"]
+"""What selection read of one generation's recorded trainer revision."""
 
 
 class ConfoundChecks(TypedDict):
-    """The three check records, keyed by check name."""
+    """The four check records, keyed by check name."""
 
     evaluation_point: EvaluationCheck
     survivorship: SurvivorshipCheck
     tie: TieCheck
+    code_revision: CodeRevisionCheck
 
 
 class ConfoundBlock(TypedDict):
@@ -155,7 +189,7 @@ _PENDING_STATES = frozenset({"WAITING", "RUNNING"})
 # point: a fixed-token batch-size sweep stops each trial within a batch of its
 # budget, while a truncated trial falls short by far more.
 _POSITION_TOLERANCE = 0.01
-# Trials or configurations a log line spells out before counting the rest.
+# Trials, configurations or generations a log line spells out before counting the rest.
 _LOGGED_VALUES = 5
 
 
@@ -165,6 +199,7 @@ def _assess_population(
     winner: optuna.trial.FrozenTrial,
     *,
     provenance: Mapping[int, Mapping[str, object]],
+    revisions: Mapping[str, RevisionRead],
     axis: RepeatAxis | None = None,
     groups: Sequence[RankedGroup] | None = None,
     incomplete_group: Collection[int] = (),
@@ -183,6 +218,9 @@ def _assess_population(
     :param Mapping[int, Mapping[str, object]] provenance: Validated objective
         provenance keyed by trial number, for every ranked trial whose record
         could be read.
+    :param Mapping[str, RevisionRead] revisions: What selection read of the trainer revision each
+        ranked generation recorded, keyed by generation id; a generation without an entry
+        counts as unreadable.
     :param RepeatAxis | None axis: The phase's repeat axis, which keys configurations by
         repeat group, or ``None`` for a phase without repeats.
     :param Sequence[RankedGroup] | None groups: The complete repeat groups
@@ -218,6 +256,7 @@ def _assess_population(
             "tie": _tie(ordered, winner)
             if ordered_groups is None
             else _group_tie(ordered_groups, winner),
+            "code_revision": _code_revision_check(ordered, revisions),
         },
     }
 
@@ -504,6 +543,69 @@ def _group_tie(
     }
 
 
+def _code_revision_check(
+    ranked: Sequence[optuna.trial.FrozenTrial], revisions: Mapping[str, RevisionRead]
+) -> CodeRevisionCheck:
+    """Compare the trainer revisions of the generations the ranked trials ran in.
+
+    One generation is one recorded code state, so a population from one generation is never
+    flagged. Across generations the check flags more than one commit, any dirty tree (two
+    dirty trees at one commit may differ and the record cannot show them equal), and any
+    generation whose revision is unknown or unreadable. A changed commit stays allowed on
+    resume; this only says what the winner was chosen among.
+
+    :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials by number; each carries
+        its generation id, which selection requires.
+    :param Mapping[str, RevisionRead] revisions: The revision read for each generation.
+    :return CodeRevisionCheck: The check record.
+    """
+    if len(ranked) < 2:
+        return _not_checked("only one trial was ranked")
+    members: dict[str, list[int]] = {}
+    for trial in ranked:
+        members.setdefault(str(trial.user_attrs[GENERATION_ID_ATTR]), []).append(trial.number)
+    generations = [
+        _generation_revision(generation_id, revisions.get(generation_id, "unreadable"), numbers)
+        for generation_id, numbers in members.items()
+    ]
+    commits = {entry["commit"] for entry in generations if entry["commit"] is not None}
+    # A dirty flag of None is a generation with no revision to compare.
+    flagged = len(generations) > 1 and (
+        len(commits) > 1 or any(entry["dirty"] is not False for entry in generations)
+    )
+    return {
+        "verdict": "heterogeneous" if flagged else "ok",
+        "detail": {"generations": generations},
+    }
+
+
+def _generation_revision(
+    generation_id: str, read: RevisionRead, trials: list[int]
+) -> GenerationRevision:
+    """Record one generation's revision beside the ranked trials that ran in it.
+
+    :param str generation_id: The generation.
+    :param RevisionRead read: What selection read of its recorded revision.
+    :param list[int] trials: Ranked trials of the generation, ascending.
+    :return GenerationRevision: The generation's entry.
+    """
+    if isinstance(read, str):
+        return {
+            "generation_id": generation_id,
+            "record": read,
+            "commit": None,
+            "dirty": None,
+            "trials": trials,
+        }
+    return {
+        "generation_id": generation_id,
+        "record": "recorded",
+        "commit": read["commit"],
+        "dirty": read["dirty"],
+        "trials": trials,
+    }
+
+
 def _not_checked(reason: str) -> NotChecked:
     """Return the record of a check that could not run.
 
@@ -548,6 +650,7 @@ def _validate_confound_block(data: object, *, winner_trial: int) -> ConfoundBloc
         raise ValueError("confound check 'survivorship' always runs and cannot be n/a")
     evaluation = _checked_record("evaluation_point", checks["evaluation_point"])
     tie = _checked_record("tie", checks["tie"])
+    revision = _checked_record("code_revision", checks["code_revision"])
     return {
         "schema_version": CONFOUND_SCHEMA_VERSION,
         "ranked_trials": ranked,
@@ -569,6 +672,14 @@ def _validate_confound_block(data: object, *, winner_trial: int) -> ConfoundBloc
                 _not_checked(_reason(checks["tie"]))
                 if tie is None
                 else {"verdict": tie[0], "detail": _validate_tie_detail(tie[1])}
+            ),
+            "code_revision": (
+                _not_checked(_reason(checks["code_revision"]))
+                if revision is None
+                else {
+                    "verdict": revision[0],
+                    "detail": _validate_code_revision_detail(revision[1]),
+                }
             ),
         },
     }
@@ -723,6 +834,54 @@ def _validate_tie_detail(detail: object) -> TieDetail:
     }
 
 
+def _validate_code_revision_detail(detail: object) -> CodeRevisionDetail:
+    """Validate code-revision evidence: each generation's revision and its ranked trials.
+
+    :param object detail: Parsed evidence.
+    :raises ValueError: The generations are missing or malformed, or an entry's revision
+        fields disagree with its record state.
+    :return CodeRevisionDetail: The validated evidence.
+    """
+    if not isinstance(detail, Mapping) or set(detail) != {"generations"}:
+        raise ValueError("confound code_revision evidence must hold generations")
+    entries = detail["generations"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("confound code_revision has no generations")
+    fields = set(GenerationRevision.__annotations__)
+    generations: list[GenerationRevision] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping) or set(entry) != fields:
+            raise ValueError("confound code_revision generation is malformed")
+        generation_id, record = entry["generation_id"], entry["record"]
+        commit, dirty = entry["commit"], entry["dirty"]
+        trials = _trial_numbers(entry["trials"], label="code_revision trials")
+        if not isinstance(generation_id, str) or not generation_id or not trials:
+            raise ValueError("confound code_revision generation is malformed")
+        if record == "recorded" and isinstance(commit, str) and commit and isinstance(dirty, bool):
+            generations.append(
+                {
+                    "generation_id": generation_id,
+                    "record": "recorded",
+                    "commit": commit,
+                    "dirty": dirty,
+                    "trials": trials,
+                }
+            )
+        elif record in ("unknown", "unreadable") and commit is None and dirty is None:
+            generations.append(
+                {
+                    "generation_id": generation_id,
+                    "record": record,
+                    "commit": None,
+                    "dirty": None,
+                    "trials": trials,
+                }
+            )
+        else:
+            raise ValueError("confound code_revision generation record is inconsistent")
+    return {"generations": generations}
+
+
 def _trial_numbers(value: object, *, label: str) -> list[int]:
     """Validate a list of distinct trial numbers in ascending order.
 
@@ -754,6 +913,7 @@ def _flagged_checks(block: ConfoundBlock) -> list[ConfoundCheck]:
         "evaluation_point": checks["evaluation_point"]["verdict"],
         "survivorship": checks["survivorship"]["verdict"],
         "tie": checks["tie"]["verdict"],
+        "code_revision": checks["code_revision"]["verdict"],
     }
     return [name for name in CONFOUND_CHECKS if verdicts[name] == "heterogeneous"]
 
@@ -811,6 +971,9 @@ def _describe_flagged(
             )
         else:
             lines.append(_describe_group_tie(detail, groups=len(groups), noise_gaps=noise_gaps))
+    revision = checks["code_revision"]
+    if revision["verdict"] == "heterogeneous":
+        lines.append(_describe_code_revision(revision["detail"]))
     return lines
 
 
@@ -839,6 +1002,40 @@ def _describe_evaluation_point(detail: EvaluationDetail, *, winner_trial: int) -
         f"{param_text(position[winner_trial])}; {plural(len(short), 'ranked trial')} fell more "
         f"than {_POSITION_TOLERANCE:.0%} short of the furthest, {param_text(furthest)}: {listed}"
     )
+
+
+def _describe_code_revision(detail: CodeRevisionDetail) -> str:
+    """Say which trainer revisions the ranked trials ran under, generation by generation.
+
+    :param CodeRevisionDetail detail: Flagged code-revision evidence.
+    :return str: The warning sentence.
+    """
+    generations = detail["generations"]
+    listed = ", ".join(_generation_text(entry) for entry in generations[:_LOGGED_VALUES])
+    if len(generations) > _LOGGED_VALUES:
+        listed += f" and {len(generations) - _LOGGED_VALUES} more"
+    return (
+        f"code_revision: ranked trials span {plural(len(generations), 'generation')} whose "
+        f"trainer code may differ: {listed}"
+    )
+
+
+def _generation_text(entry: GenerationRevision) -> str:
+    """Write one generation's revision and its ranked trials, as the warning lists it.
+
+    :param GenerationRevision entry: The generation's evidence.
+    :return str: Such as ``1a2b3c4d5e6f dirty (trials 3, 4)``, with at most five trials named.
+    """
+    commit = entry["commit"]
+    if commit is None:
+        label = entry["record"]
+    else:
+        label = f"{commit[:12]}{' dirty' if entry['dirty'] else ''}"
+    trials = entry["trials"]
+    named = _numbered("trial", trials[:_LOGGED_VALUES])
+    if len(trials) > _LOGGED_VALUES:
+        named += f" and {len(trials) - _LOGGED_VALUES} more"
+    return f"{label} ({named})"
 
 
 def _describe_survivorship(
@@ -961,6 +1158,20 @@ def _noise_remedy() -> str:
     )
 
 
+def _code_revision_remedy() -> str:
+    """Say what the ranking compared when ranked trials may have run under different code.
+
+    A changed trainer commit stays allowed on resume, so this states the fact and leaves the
+    judgment to the reader: only they know whether the difference can move the objective.
+
+    :return str: The fact and what to weigh, shared by winner output and MCP results.
+    """
+    return (
+        "Ranked trials may have run under different trainer code; judge whether a difference "
+        "can move the objective."
+    )
+
+
 def _numbered(noun: str, numbers: Sequence[int]) -> str:
     """Name trials or groups by number, the noun in the plural for more than one.
 
@@ -1038,6 +1249,8 @@ def _confound_summary(
     tie = checks["tie"]
     tie_detail = None if tie["verdict"] == "n/a" else tie["detail"]
     survivorship = checks["survivorship"]
+    revision = checks["code_revision"]
+    generations = None if revision["verdict"] == "n/a" else revision["detail"]["generations"]
     return {
         "flagged": list(_flagged_checks(block)),
         "evaluation_point": {
@@ -1084,5 +1297,25 @@ def _confound_summary(
             ),
             "pooled_sd": None if tie_detail is None else tie_detail["pooled_sd"],
             "df": None if tie_detail is None else tie_detail["df"],
+        },
+        "code_revision": {
+            "verdict": revision["verdict"],
+            "remedy": _code_revision_remedy() if revision["verdict"] == "heterogeneous" else None,
+            "generations": None if generations is None else len(generations),
+            "commits": (
+                None
+                if generations is None
+                else len({entry["commit"] for entry in generations if entry["commit"]})
+            ),
+            "dirty": (
+                None
+                if generations is None
+                else sum(entry["dirty"] is True for entry in generations)
+            ),
+            "unknown": (
+                None
+                if generations is None
+                else sum(entry["record"] != "recorded" for entry in generations)
+            ),
         },
     }

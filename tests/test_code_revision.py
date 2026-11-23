@@ -8,7 +8,9 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import optuna
 import pytest
+import yaml
 from click.testing import CliRunner
 
 from phasesweep import run_experiment
@@ -20,14 +22,16 @@ from phasesweep.engine.paths import (
     _generation_reproducibility_path,
 )
 from phasesweep.engine.provenance import _code_revision
-from phasesweep.engine.state import REPRODUCIBILITY_SCHEMA_VERSION
+from phasesweep.engine.selection import _ranked_code_revisions
+from phasesweep.engine.state import GENERATION_ID_ATTR, REPRODUCIBILITY_SCHEMA_VERSION
 from tests.conftest import (
+    invoke_cli_boundary,
     make_experiment,
     write_experiment_config,
     write_param_echo_trainer,
     write_trial_zero_trainer,
 )
-from tests.ledger_fixtures import published_generation_id
+from tests.ledger_fixtures import published_generation_id, winner_payload
 
 
 @pytest.fixture
@@ -287,6 +291,84 @@ def _carried_winner_study(tmp_path: Path) -> tuple[Path, Experiment, str, str, s
     assert second_generation != first_generation
     config_path = write_experiment_config(tmp_path / "experiment.yaml", experiment)
     return config_path, experiment, first_generation, second_generation, first_head, second_head
+
+
+def test_a_ranked_generation_without_a_readable_record_reads_as_unreadable(
+    tmp_path: Path,
+) -> None:
+    """Selection never raises over a missing or damaged generation record; it reports ``unreadable``."""
+    experiment = make_experiment(persistent=tmp_path, trainer=tmp_path / "trainer.py")
+    study = optuna.create_study()
+    for number in range(2):
+        study.add_trial(
+            optuna.trial.create_trial(
+                value=0.5,
+                params={"x": number},
+                distributions={"x": optuna.distributions.IntDistribution(0, 9)},
+                user_attrs={GENERATION_ID_ATTR: f"missing-{number}"},
+            )
+        )
+    trials = study.get_trials(deepcopy=False)
+
+    assert _ranked_code_revisions(experiment, trials) == {
+        "missing-0": "unreadable",
+        "missing-1": "unreadable",
+    }
+    assert _ranked_code_revisions(experiment, trials[:1]) == {}
+
+
+@pytest.mark.integration
+def test_a_top_up_under_another_commit_is_disclosed_on_the_winner(
+    tmp_path: Path,
+    hermetic_git: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Trials ranked across two commits flag ``code_revision`` in the winner, the run summary and ``show-winners``."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("COLUMNS", "500")
+    repo = tmp_path / "repo"
+    first_head = _committed_repo(repo)
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_trial_zero_trainer(tmp_path, otherwise='print("x=9.0")'),
+        n_trials=1,
+        gpu_policy="none",
+        execution=ExecutionContext(cwd=str(repo)),
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 0
+    (repo / "tracked.txt").write_text("v2\n")
+    _git(repo, "commit", "-q", "-am", "change the trainer")
+    second_head = _git(repo, "rev-parse", "HEAD")
+    capsys.readouterr()
+
+    top_up = ["--set", "phases[p].n_trials=2"]
+    assert invoke_cli_boundary(["run", str(config), *top_up], monkeypatch) == 0
+
+    err = capsys.readouterr().err
+    assert (
+        "code_revision: ranked trials span 2 generations whose trainer code may differ: "
+        f"{first_head[:12]} (trial 0), {second_head[:12]} (trial 1)"
+    ) in err
+    assert "flagged: code_revision\n" in err
+    experiment = experiment.model_copy(
+        update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 2})]}
+    )
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    check = winner_payload(experiment, generation_id)["confound"]["checks"]["code_revision"]
+    assert check["verdict"] == "heterogeneous"
+    assert [(entry["commit"], entry["trials"]) for entry in check["detail"]["generations"]] == [
+        (first_head, [0]),
+        (second_head, [1]),
+    ]
+    shown = CliRunner().invoke(cli, ["show-winners", str(config), *top_up])
+    assert shown.exit_code == 0, shown.output
+    summary = yaml.safe_load(shown.output.split("=== p ===", 1)[1])["confound"]["code_revision"]
+    assert summary["verdict"] == "heterogeneous"
+    assert (summary["generations"], summary["commits"], summary["dirty"]) == (2, 2, 0)
+    assert "rename" not in summary["remedy"] and "retrain" not in summary["remedy"]
 
 
 @pytest.mark.integration

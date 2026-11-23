@@ -21,6 +21,7 @@ from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.confound import (
     CONFOUND_CHECKS,
     CONFOUND_VERDICTS,
+    RevisionRead,
     _assess_population,
     _confound_summary,
     _describe_flagged,
@@ -177,6 +178,7 @@ def _trials(
                 value=value,
                 params=params,
                 distributions=distributions,
+                user_attrs={GENERATION_ID_ATTR: "generation"},
             )
         )
     return study.get_trials(deepcopy=False)
@@ -187,11 +189,102 @@ def _assess(
     ranked: list[Any],
     *,
     provenance: dict[int, dict[str, Any]] | None = None,
+    revisions: dict[str, RevisionRead] | None = None,
 ) -> dict[str, Any]:
     """Assess ``ranked`` with the lowest value winning, as minimize selection does."""
     winner = min(ranked, key=lambda trial: (trial.value, trial.number))
     records = provenance or {trial.number: log_regex_provenance() for trial in ranked}
-    return _assess_population(trials, ranked, winner, provenance=records)
+    return _assess_population(trials, ranked, winner, provenance=records, revisions=revisions or {})
+
+
+def _generation_trials(*generations: str) -> list[optuna.trial.FrozenTrial]:
+    """Build one COMPLETE trial per entry, each ran in the named generation."""
+    study = optuna.create_study()
+    for number, generation in enumerate(generations):
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=_COMPLETE,
+                value=0.5 - number / 100,
+                params={"x": number},
+                distributions={"x": optuna.distributions.IntDistribution(0, 100)},
+                user_attrs={GENERATION_ID_ATTR: generation},
+            )
+        )
+    return study.get_trials(deepcopy=False)
+
+
+_COMMIT_A = "a" * 40
+_COMMIT_B = "b" * 40
+
+
+def test_code_revision_never_flags_one_generation_or_an_identical_clean_commit() -> None:
+    """One generation is one recorded code state; two generations at one clean commit agree."""
+    single = _generation_trials("g1", "g1", "g1")
+    block = _assess(single, single, revisions={"g1": {"commit": _COMMIT_A, "dirty": True}})
+    assert block["checks"]["code_revision"]["verdict"] == "ok"
+    assert _flagged_checks(block) == []
+
+    pair = _generation_trials("g1", "g2")
+    same = {
+        "g1": {"commit": _COMMIT_A, "dirty": False},
+        "g2": {"commit": _COMMIT_A, "dirty": False},
+    }
+    check = _assess(pair, pair, revisions=same)["checks"]["code_revision"]
+    assert check["verdict"] == "ok"
+    assert [entry["trials"] for entry in check["detail"]["generations"]] == [[0], [1]]
+
+    one = _generation_trials("g1")
+    assert _assess(one, one)["checks"]["code_revision"] == {
+        "verdict": "n/a",
+        "reason": "only one trial was ranked",
+    }
+
+
+def test_code_revision_flags_what_cannot_be_shown_equal_and_never_raises() -> None:
+    """Another commit, a dirty tree, an unknown revision and an unreadable record each flag the check."""
+    trials = _generation_trials("g1", "g1", "g2", "g3", "g4")
+    revisions = {
+        "g1": {"commit": _COMMIT_A, "dirty": False},
+        "g2": {"commit": _COMMIT_A, "dirty": True},
+        "g3": "unknown",
+    }
+    block = _assess(trials, trials, revisions=revisions)
+
+    check = block["checks"]["code_revision"]
+    assert check["verdict"] == "heterogeneous"
+    assert [(entry["record"], entry["trials"]) for entry in check["detail"]["generations"]] == [
+        ("recorded", [0, 1]),
+        ("recorded", [2]),
+        ("unknown", [3]),
+        ("unreadable", [4]),
+    ]
+    (line,) = _describe_flagged(block, winner_trial=4)
+    assert line == (
+        "code_revision: ranked trials span 4 generations whose trainer code may differ: "
+        f"{_COMMIT_A[:12]} (trials 0, 1), {_COMMIT_A[:12]} dirty (trial 2), unknown (trial 3), "
+        "unreadable (trial 4)"
+    )
+    assert _validate_confound_block(block, winner_trial=4) == block
+    summary = _confound_summary(
+        block, winner_trial=4, extractor_kind="json_envelope", persistent=True
+    )["code_revision"]
+    assert summary["verdict"] == "heterogeneous"
+    assert (summary["generations"], summary["commits"], summary["dirty"], summary["unknown"]) == (
+        4,
+        1,
+        1,
+        2,
+    )
+    assert "rename" not in summary["remedy"] and "retrain" not in summary["remedy"]
+
+    commits = _generation_trials("g1", "g2")
+    split = {
+        "g1": {"commit": _COMMIT_A, "dirty": False},
+        "g2": {"commit": _COMMIT_B, "dirty": False},
+    }
+    assert _assess(commits, commits, revisions=split)["checks"]["code_revision"]["verdict"] == (
+        "heterogeneous"
+    )
 
 
 def test_verdicts_are_three_distinct_values_and_not_checked_is_never_ok() -> None:
@@ -462,6 +555,7 @@ def test_survivorship_warning_names_each_failed_configuration() -> None:
         trials[:1],
         trials[0],
         provenance={0: log_regex_provenance()},
+        revisions={},
         untried_cells=[{"x": 99}],
     )
 
@@ -481,6 +575,7 @@ def test_survivorship_counts_a_grid_cell_no_trial_reached() -> None:
         trials,
         trials[1],
         provenance={trial.number: log_regex_provenance() for trial in trials},
+        revisions={},
         untried_cells=[{"x": 3}],
     )
     assert plain["checks"]["survivorship"] == {
@@ -579,6 +674,7 @@ def _assess_groups(
         ranked,
         by_number[best.representative],
         provenance={trial.number: log_regex_provenance() for trial in ranked},
+        revisions={},
         axis=RepeatAxis(key="seed", values=(0, 1, 2), reduce=reduce, slot_size=None),
         groups=ranked_groups,
         incomplete_group=incomplete,
@@ -1067,6 +1163,14 @@ def test_summary_exposes_the_evaluation_axis_without_checkpoint_paths() -> None:
             "within_noise": None,
             "pooled_sd": None,
             "df": None,
+        },
+        "code_revision": {
+            "verdict": "ok",
+            "remedy": None,
+            "generations": 1,
+            "commits": 0,
+            "dirty": 0,
+            "unknown": 1,
         },
     }
     rendered = json.dumps(summary)

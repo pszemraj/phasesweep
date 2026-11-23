@@ -66,7 +66,7 @@ phases:
 
 Use `storage: auto` to keep a local journal at `<workdir>/<experiment>/study.journal`, or set an explicit `journal:///...` URL. Omitting `storage` or setting it to `null` keeps the study in memory. Other storage values, including SQLite URLs, `:memory:` and external database URLs, are refused at load.
 
-Persistent storage requires a nonempty `provenance` mapping. Update it whenever an input outside the YAML changes, such as the dataset revision or a dependency version. The generation records the trainer's [git commit](runtime.md#output-layout) for inspection only. The study compares `provenance` when checking whether a continuation can reuse its results. When a change requires a fresh `experiment` name, the old study remains readable under its original name and configuration. See [storage and locks](runtime.md#storage-and-locks) for binding rules and starting a fresh study.
+Persistent storage requires a nonempty `provenance` mapping. Update it whenever an input outside the YAML changes, such as the dataset revision or a dependency version. The generation records the trainer's [git commit](runtime.md#output-layout). A resume never refuses a changed commit, and selection discloses ranked trials that ran under different commits as a [`code_revision` verdict](runtime.md#confound-verdicts). The study compares `provenance` when checking whether a continuation can reuse its results. When a change requires a fresh `experiment` name, the old study remains readable under its original name and configuration. See [storage and locks](runtime.md#storage-and-locks) for binding rules and starting a fresh study.
 
 ## Phase composition
 

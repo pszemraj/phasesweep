@@ -403,7 +403,7 @@ storage: string | null = null
 workdir: string = "./runs"
 
 # Operator-defined identifiers of inputs outside this YAML that git does not capture, such as dataset_revision and dependency versions.
-# Keys and values are nonblank strings. Each generation records the trainer's git revision apart and never compares it, so trainer code needs no entry.
+# Keys and values are nonblank strings. Each generation records the trainer's git revision apart and a resume never compares it, so trainer code needs no entry. Selection discloses a winner chosen among trials that ran under different revisions as a code_revision confound verdict.
 # Warning: values are copied into each generation's shareable reproducibility.json, so they must not hold secrets.
 # Recommended: change a value whenever its input changes. A study with trials then refuses the changed fingerprint, so run under a new experiment name.
 provenance: map[string, string] = {}

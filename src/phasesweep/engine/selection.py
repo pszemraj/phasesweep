@@ -27,11 +27,12 @@ from phasesweep.config.search import (
 from phasesweep.engine.artifacts import _winner_common_payload
 from phasesweep.engine.confound import (
     ConfoundBlock,
+    RevisionRead,
     _assess_population,
     _describe_flagged,
     _params_text,
 )
-from phasesweep.engine.errors import TrialEvidenceMissingError
+from phasesweep.engine.errors import TrialEvidenceMissingError, WinnerIntegrityError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
 from phasesweep.engine.optuna import (
     _any_objective_unreadable,
@@ -40,7 +41,8 @@ from phasesweep.engine.optuna import (
     _finished_trial_count,
     _trial_count_state,
 )
-from phasesweep.engine.paths import TRIALS_CSV_FILENAME, _trials_csv_path
+from phasesweep.engine.paths import TRIALS_CSV_FILENAME, _experiment_dir, _trials_csv_path
+from phasesweep.engine.provenance import _load_generation_code_revision
 from phasesweep.engine.repeats import (
     RankedGroup,
     RepeatAxis,
@@ -415,6 +417,7 @@ def select_winner(
         survivors,
         best,
         provenance=provenance,
+        revisions=_ranked_code_revisions(experiment, survivors),
         axis=repeats,
         groups=None if ranking is None else ranking.groups,
         incomplete_group=() if ranking is None else ranking.incomplete_group,
@@ -769,6 +772,35 @@ def _observed_values(trial: optuna.trial.FrozenTrial, *, subject: str) -> dict[s
         raise TrialEvidenceMissingError(
             f"{subject} has a malformed {OBSERVED_PREFIX!r} value: {exc}."
         ) from exc
+
+
+def _ranked_code_revisions(
+    experiment: Experiment, ranked: Sequence[optuna.trial.FrozenTrial]
+) -> dict[str, RevisionRead]:
+    """Read the trainer revision each ranked trial's generation recorded, once per generation.
+
+    A missing or invalid record is ``unreadable`` rather than an error: the check that uses
+    these is advisory, and a trial that lost must not fail selection.
+
+    :param Experiment experiment: Parsed experiment; locates the generation records.
+    :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials; selection requires each
+        to carry a generation id (:func:`_eligible`).
+    :return dict[str, RevisionRead]: Each ranked generation's revision, ``unknown`` when it
+        recorded none; empty for fewer than two ranked trials, which the check does not run on.
+    """
+    revisions: dict[str, RevisionRead] = {}
+    if len(ranked) < 2:
+        return revisions
+    artifact_root = _experiment_dir(experiment)
+    generation_ids = dict.fromkeys(str(trial.user_attrs[GENERATION_ID_ATTR]) for trial in ranked)
+    for generation_id in generation_ids:
+        try:
+            revision = _load_generation_code_revision(artifact_root, generation_id)
+        except WinnerIntegrityError:
+            revisions[generation_id] = "unreadable"
+        else:
+            revisions[generation_id] = "unknown" if revision is None else revision
+    return revisions
 
 
 def _eligible(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> bool:

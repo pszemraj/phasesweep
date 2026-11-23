@@ -48,7 +48,7 @@ NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 McpPublicationState = PublicationState | Literal["unknown"]
 """Engine publication verdict plus the MCP snapshot-unavailable state."""
 
-RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[5] = 5
+RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[6] = 6
 
 
 class _SnapshotModel(BaseModel):
@@ -262,6 +262,42 @@ class TieSummary(_SnapshotModel):
     )
 
 
+class CodeRevisionSummary(_SnapshotModel):
+    """Whether every ranked trial ran under one recorded trainer code state.
+
+    A generation is one recorded state: the trainer working directory's git commit, and
+    whether tracked files differed from it. Edits made during a generation, and differences
+    between two dirty trees, are not recorded. A changed commit is allowed on resume; this
+    only reports what the winner was chosen among.
+    """
+
+    verdict: ConfoundVerdict = Field(
+        description=(
+            f"{_VERDICT_DESCRIPTION} Heterogeneous when ranked trials span generations that "
+            "recorded more than one commit, a dirty tree, or no readable revision; a single "
+            "generation is never flagged."
+        )
+    )
+    remedy: str | None = Field(
+        description="What the ranking compared and what to weigh; null unless flagged."
+    )
+    generations: NonNegativeInt | None = Field(
+        description="Generations the ranked trials ran in; null when not checked."
+    )
+    commits: NonNegativeInt | None = Field(
+        description="Distinct commits those generations recorded; null when not checked."
+    )
+    dirty: NonNegativeInt | None = Field(
+        description="Generations that recorded a dirty tree; null when not checked."
+    )
+    unknown: NonNegativeInt | None = Field(
+        description=(
+            "Generations with no readable revision: not a git work tree, or an unreadable "
+            "record; null when not checked."
+        )
+    )
+
+
 class ConfoundSummary(_SnapshotModel):
     """Advisory verdicts on the population the winner was selected from.
 
@@ -276,6 +312,7 @@ class ConfoundSummary(_SnapshotModel):
     evaluation_point: EvaluationPointSummary
     survivorship: SurvivorshipSummary
     tie: TieSummary
+    code_revision: CodeRevisionSummary
 
 
 class RepeatsSpread(_SnapshotModel):
@@ -432,7 +469,7 @@ def _winner_snapshot(
 class RunResultSnapshot(_SnapshotModel):
     """Terminal status and winners frozen for one MCP run id."""
 
-    schema_version: Literal[5]
+    schema_version: Literal[6]
     status: StatusSnapshot
     winners: list[WinnerSnapshot]
     represented_config_fingerprint: str | None = None
