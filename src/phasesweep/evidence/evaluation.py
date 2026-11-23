@@ -130,6 +130,11 @@ def attempt_file(
         # caller's own not-found handling reports it, as on later versions.
         return path
     if not resolved.is_relative_to(trial_dir.resolve()):
+        if is_captured_stream(relative):
+            raise OutsideAttemptError(
+                f"Captured stream `{relative}` resolves to {resolved}, outside its attempt "
+                f"directory {trial_dir}. Restore the attempt's captured stream."
+            )
         raise OutsideAttemptError(
             f"`{relative}` in trial directory {trial_dir} resolves to {resolved}, outside the "
             "trial. Have the trainer write it under PHASESWEEP_TRIAL_DIR."
@@ -163,15 +168,15 @@ def trial_file(
     :param Path attempt_dir: The attempt's directory, holding its captured streams.
     :param str | Path relative: Configured trial-relative path.
     :param EvidenceBaseline | None baseline: Passed to :func:`attempt_file`.
-    :param bool checked: Apply :func:`attempt_file`'s checks to a trainer path. ``False``
+    :param bool checked: Check the path against the directory that owns it. ``False``
         only locates it: for a gate that tests an artifact wherever its links lead, or to
         name the file in a diagnostic.
-    :raises OutsideAttemptError: A checked trainer path resolves outside ``trial_dir``, or,
-        as :class:`StaleEvidenceError`, is unchanged since before the attempt ran.
+    :raises OutsideAttemptError: A checked path resolves outside its owning directory, or,
+        as :class:`StaleEvidenceError`, a trainer file is unchanged since before the attempt ran.
     :return Path: The path to read.
     """
     if is_captured_stream(relative):
-        return attempt_dir / relative
+        return attempt_file(attempt_dir, relative) if checked else attempt_dir / relative
     if not checked:
         return trial_dir / relative
     return attempt_file(trial_dir, relative, baseline=baseline)

@@ -18,7 +18,7 @@ from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.selection import PhaseTrialsFailedError, select_winner
-from phasesweep.engine.state import FAILURE_REASON_ATTR, TRIAL_DIR_ATTR
+from phasesweep.engine.state import FAILURE_REASON_ATTR, TRIAL_DIR_ATTR, _trial_attempt_dir
 from phasesweep.engine.trial import _observe
 from phasesweep.evidence.evaluation import ExtractorError, evaluate_gates, run_extractor
 from phasesweep.evidence.models import (
@@ -335,7 +335,7 @@ def test_a_trainer_file_named_stdout_log_is_not_the_captured_stream(tmp_path: Pa
     assert (Path(trial.user_attrs[TRIAL_DIR_ATTR]) / "stdout.log").resolve() == outside.resolve()
 
 
-@pytest.mark.parametrize("filename", ["r.json", "overrides_resolved.json"])
+@pytest.mark.parametrize("filename", ["r.json", "overrides_resolved.json", "stdout.log"])
 def test_verification_refuses_evidence_replaced_by_an_outside_link_with_identical_bytes(
     tmp_path: Path, filename: str
 ) -> None:
@@ -343,19 +343,33 @@ def test_verification_refuses_evidence_replaced_by_an_outside_link_with_identica
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=write_constant_trainer(tmp_path),
-        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        metric=(
+            Metric(extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.]+)"))
+            if filename == "stdout.log"
+            else Metric(extractor=JsonExtractor(type="json", path="r.json", key="x"))
+        ),
         n_trials=1,
     )
     run_experiment(experiment)
     (trial,) = phase_trials(experiment)
-    trial_dir = Path(trial.user_attrs[TRIAL_DIR_ATTR])
+    directory = (
+        _trial_attempt_dir(trial)
+        if filename == "stdout.log"
+        else Path(trial.user_attrs[TRIAL_DIR_ATTR])
+    )
+    assert directory is not None
     outside = tmp_path / "outside" / filename
     outside.parent.mkdir()
-    shutil.copyfile(trial_dir / filename, outside)
-    (trial_dir / filename).unlink()
-    (trial_dir / filename).symlink_to(outside)
+    shutil.copyfile(directory / filename, outside)
+    (directory / filename).unlink()
+    (directory / filename).symlink_to(outside)
     study = phase_study(experiment)
-    refusal = _refusal(filename, trial_dir, outside)
+    refusal = (
+        f"Captured stream `stdout.log` resolves to {outside.resolve()}, outside its attempt "
+        f"directory {directory}. Restore the attempt's captured stream."
+        if filename == "stdout.log"
+        else _refusal(filename, directory, outside)
+    )
 
     with pytest.raises(TrialEvidenceMissingError) as selection:
         evidence_ops._validate_selection_evidence(experiment, {"p": study})
