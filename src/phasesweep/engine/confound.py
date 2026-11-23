@@ -1027,6 +1027,7 @@ def _generation_text(entry: GenerationRevision) -> str:
     :return str: Such as ``1a2b3c4d5e6f dirty (trials 3, 4)``, with at most five trials named.
     """
     commit = entry["commit"]
+    label: str
     if commit is None:
         label = entry["record"]
     else:
