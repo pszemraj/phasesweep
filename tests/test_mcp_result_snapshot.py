@@ -19,7 +19,8 @@ from pydantic import ValidationError
 
 import phasesweep.mcp.recovery as mcp_recovery
 from phasesweep.config.io import load_experiment
-from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.models import Experiment, Phase, Repeats
+from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
@@ -44,7 +45,14 @@ from phasesweep.engine.state import (
 )
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.redaction import winners_payload
-from phasesweep.mcp.snapshots import RunResultSnapshot, capture_pre_generation_result_snapshot
+from phasesweep.mcp.registry import Registry
+from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.snapshots import (
+    RunResultSnapshot,
+    capture_pre_generation_result_snapshot,
+    capture_result_snapshot,
+)
+from phasesweep.mcp.tools import PhaseSweepMCP
 from tests.conftest import (
     fail_pointer_commit,
     make_experiment,
@@ -53,6 +61,7 @@ from tests.conftest import (
     single_trial_confound,
     trial_outcome,
     write_constant_trainer,
+    write_experiment_config,
     write_trainer,
 )
 from tests.experiments import write_experiment
@@ -60,10 +69,12 @@ from tests.ledger_fixtures import published_generation_id
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     SEEDED_RANDOM,
+    assert_no_sensitive,
     fail_prepared_snapshot_reads,
     make_mcp_app,
     run_claimed_runner,
     stage_dead_run,
+    stage_live_run,
     write_run_status,
     write_slow_mcp_config,
     write_srv_catalog,
@@ -987,3 +998,90 @@ def test_run_results_say_whether_the_run_wrote_its_generation(tmp_path: Path) ->
         assert results["run_wrote_generation"] == app.status(run_id)["run_wrote_generation"]
     assert replay["represented_generation_id"] == "srv-first"
     assert [phase["winner_generation"] for phase in replay["phases"]] == ["represented_generation"]
+
+
+def _repeats_run_read_live_then_frozen(
+    tmp_path: Path,
+) -> tuple[dict[str, object], dict[str, object], Path, Path, RunStore, str]:
+    """Read one repeats run's winners while it runs, then after its snapshot is frozen.
+
+    Its two grid cells tie within noise, so the winner carries a tie group whose params
+    include the configuration-only value ``SECRET_ARCH``.
+    """
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--epochs', type=int)
+        parser.add_argument('--seed', type=int)
+        args, _ = parser.parse_known_args()
+        print(f'x={(0.48 if args.seed == 1 else 0.52) + (0.005 if args.epochs == 8 else 0)}')
+        """,
+    )
+    phase = Phase(
+        name="epochs",
+        n_trials=4,
+        gpu_policy="none",
+        repeats=Repeats(key="seed", values=[1, 2]),
+        sampler=Sampler(type="grid", seed=0),
+        search_space={
+            "epochs": CategoricalParam(type="categorical", choices=[8, 16]),
+            "arch": CategoricalParam(type="categorical", choices=["SECRET_ARCH"]),
+        },
+    )
+    config = tmp_path / "srv.yaml"
+    write_experiment_config(
+        config, make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
+    )
+    catalog = write_srv_catalog(tmp_path, config, visible_params="all")
+    registry = Registry.load(catalog)
+    # The run executes the catalog's own config, so the catalog matches what it produced.
+    experiment = registry.get("srv").experiment
+    store = RunStore(registry.state_dir)
+    run_id = "srv-repeats"
+    stage_live_run(store, run_id, config, "srv", visible_params_at_launch="all")
+    run_experiment(experiment, generation_id=run_id)
+    app = PhaseSweepMCP(registry, store)
+    live = app.winners(run_id)
+    write_run_status(
+        store,
+        run_id,
+        returncode=0,
+        error_class=None,
+        result_snapshot_state="complete",
+        result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
+    )
+    return live, app.winners(run_id), catalog, config, store, run_id
+
+
+@pytest.mark.integration
+def test_live_and_frozen_results_of_one_run_are_the_same_payload(tmp_path: Path) -> None:
+    """get_run_results gives the same winners, advice and tie groups live as frozen; only result_source differs."""
+    live, frozen, *_ = _repeats_run_read_live_then_frozen(tmp_path)
+
+    assert (live["result_source"], frozen["result_source"]) == (
+        "current_shared_study",
+        "frozen_run_snapshot",
+    )
+    assert frozen["published_config_matches_current"] is True
+    (phase,) = frozen["phases"]
+    assert phase["tie_groups"][0]["params"] == {"epochs": 8, "arch": "SECRET_ARCH"}
+    assert {key: value for key, value in live.items() if key != "result_source"} == {
+        key: value for key, value in frozen.items() if key != "result_source"
+    }
+
+
+@pytest.mark.integration
+def test_frozen_tie_groups_follow_a_narrowed_catalog_policy(tmp_path: Path) -> None:
+    """A frozen run's tie-group params are redacted by the current catalog when it narrows visible_params."""
+    _live, _frozen, catalog, config, store, run_id = _repeats_run_read_live_then_frozen(tmp_path)
+
+    write_srv_catalog(tmp_path, config, visible_params=["epochs"])
+    payload = PhaseSweepMCP(Registry.load(catalog), store).winners(run_id)
+
+    assert payload["result_source"] == "frozen_run_snapshot"
+    (phase,) = payload["phases"]
+    assert phase["params_redacted"] is True
+    assert phase["tie_groups"][0]["params"] == {"epochs": 8, "arch": "<redacted>"}
+    assert_no_sensitive(payload, ["SECRET_ARCH"])
