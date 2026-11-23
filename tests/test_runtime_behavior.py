@@ -1744,7 +1744,7 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
         live[trial.number] = value
         return value
 
-    monkeypatch.setattr("phasesweep.engine.phase._suggest", recording_suggest)
+    monkeypatch.setattr("phasesweep.engine.optuna._suggest", recording_suggest)
 
     winners = run_experiment(exp)
 

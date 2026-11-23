@@ -18,7 +18,6 @@ from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import (
     _placeholder_values_for,
     retry_target_ceiling,
-    sampler_search_space,
 )
 from phasesweep.engine.artifact_roots import (
     _artifact_root_claim_needed,
@@ -32,7 +31,7 @@ from phasesweep.engine.optuna import (
     _finished_trial_count,
     _measured_trial_count,
     _phase_study_name,
-    _suggest,
+    _suggest_all,
 )
 from phasesweep.engine.paths import _phase_dir
 from phasesweep.engine.phase import (
@@ -579,9 +578,7 @@ def _dry_run_phase(
     of_them = f", {rerun_clause(reruns)}" if reruns else ""
     log.info("DRY RUN phase=%s would launch %s%s", phase.name, plural(remaining, "trial"), of_them)
     sample_trial = study.ask()
-    sampled: dict[str, object] = {
-        name: _suggest(sample_trial, name, p) for name, p in sampler_search_space(phase).items()
-    }
+    sampled = _suggest_all(sample_trial, phase)
     overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
     preview_dir = _phase_dir(experiment, phase.name) / "trial_dryrun"
     cmd = render_command(

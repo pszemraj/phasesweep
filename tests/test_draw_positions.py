@@ -477,6 +477,3 @@ def test_the_optuna_internals_the_position_samplers_build_on_exist() -> None:
         "cma:optimizer",
     )
     assert list(inspect.signature(cma._restore_optimizer).parameters) == ["completed_trials"]
-    grid = optuna.samplers.GridSampler({"x": [0, 1]}, seed=0)
-    assert grid._search_space == {"x": [0, 1]}
-    assert len(grid._all_grids) == 2

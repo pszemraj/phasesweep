@@ -13,15 +13,15 @@ import threading
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, assert_never
+from typing import TYPE_CHECKING, Any, Literal, assert_never
 
 import optuna
 from optuna.exceptions import ExperimentalWarning
 from optuna.samplers._lazy_random_state import LazyRandomState
 
-from phasesweep.config.common import StrictJsonScalar
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import (
+    _OPTUNA_EXACT_INT_LIMIT,
     CategoricalParam,
     FloatParam,
     IntParam,
@@ -29,7 +29,9 @@ from phasesweep.config.search import (
     Sampler,
     SearchParam,
     grid_search_space,
+    sampler_search_space,
 )
+from phasesweep.engine.grid_order import GridCell, grid_axis_names, grid_cell_order
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FAILURE_REASON_ATTR,
@@ -40,9 +42,12 @@ from phasesweep.engine.state import (
     RERUN_OF_ATTR,
     TRIAL_STATE_NAMES,
     RecoveredTrialState,
+    SearchSpaceEntry,
     TrialStateName,
+    _recorded_identity,
     _trial_interrupted,
 )
+from phasesweep.runtime.json import dump_json, json_object
 from phasesweep.runtime.process import TIMEOUT_REASON_PREFIX
 
 if TYPE_CHECKING:
@@ -386,38 +391,63 @@ class _PositionRandomSampler(optuna.samplers.RandomSampler):
 
 
 class _PositionGridSampler(optuna.samplers.GridSampler):
-    """Grid sampler that gives each trial the grid point at its draw position and never stops a study."""
+    """Grid sampler that gives each trial the cell at its draw position and never stops a study.
+
+    The cell order comes from the study's search-space history
+    (:func:`~phasesweep.engine.grid_order.grid_cell_order`), so a grown grid keeps every drawn
+    position's cell and runs only cells it has not drawn. A study with no recorded identity,
+    such as a dry run's in-memory sample, orders the sampler's own search space alone.
+    """
 
     def __init__(
         self,
-        search_space: Mapping[str, Sequence[StrictJsonScalar]],
+        search_space: Mapping[str, SearchParam],
         *,
         seed: int | None,
         repeats: Repeats | None = None,
     ) -> None:
         """Keep configurations shuffled and their repeat values consecutive.
 
-        :param Mapping[str, Sequence[StrictJsonScalar]] search_space: Enumerated grid axes.
+        :param Mapping[str, SearchParam] search_space: The phase's sampler search space,
+            repeat axis included.
         :param int | None seed: Seed for the configuration shuffle; None uses zero.
         :param Repeats | None repeats: Repeat axis to group in its configured value order.
         """
-        super().__init__(search_space, seed=seed)
-        self._grid_ids = list(range(len(self._all_grids)))
-        if repeats is not None:
-            repeat_index = self._param_names.index(repeats.key)
-            groups: dict[tuple[object, ...], dict[object, int]] = {}
-            for grid_id, point in enumerate(self._all_grids):
-                configuration = point[:repeat_index] + point[repeat_index + 1 :]
-                groups.setdefault(configuration, {})[point[repeat_index]] = grid_id
-            self._grid_ids = [group[value] for group in groups.values() for value in repeats.values]
+        super().__init__(grid_search_space(dict(search_space)), seed=seed)
+        self._seed = seed
+        self._repeats = repeats
+        own = {
+            name: dump_json(param)
+            for name, param in search_space.items()
+            if repeats is None or name != repeats.key
+        }
+        self._own_history: list[SearchSpaceEntry] = [
+            {"search_space": json_object(own), "first_position": 0}
+        ]
+        self._names = grid_axis_names(list(own), repeats)
+        self._orders: dict[str, list[GridCell]] = {}
+
+    def _order(self, study: optuna.Study) -> list[GridCell]:
+        """Return the study's cell order, computed once per recorded history.
+
+        :param optuna.Study study: The active study.
+        :return list[GridCell]: Cells by draw position.
+        """
+        record = _recorded_identity(study)
+        history = self._own_history if record is None else record["search_spaces"]
+        key = json.dumps(history, sort_keys=True, separators=(",", ":"))
+        if key not in self._orders:
+            self._orders[key] = grid_cell_order(
+                history, seed=self._seed, repeats=self._repeats, phase_name=study.study_name
+            )
+        return self._orders[key]
 
     def before_trial(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        """Assign the grid point at the trial's draw position, unless the trial already has one.
+        """Assign the cell at the trial's draw position, unless the trial already has one.
 
-        A rerun copies its source's ``grid_id``. New draws take positions
-        ``0..M-1`` in the grid's seeded configuration shuffle, with repeat values
-        consecutive, so no two trials that are not reruns share a point under
-        any ``n_jobs``.
+        The ``grid_id`` is the draw position itself, an index into the study's cell order. A
+        rerun copies its source's ``grid_id``. New draws take positions ``0..M-1``, so no two
+        trials that are not reruns share a cell under any ``n_jobs``.
 
         :param optuna.Study study: The active study.
         :param optuna.trial.FrozenTrial trial: The trial about to run.
@@ -427,14 +457,36 @@ class _PositionGridSampler(optuna.samplers.GridSampler):
         if "grid_id" in trial.system_attrs:
             return
         position = _draw_position(study, trial)
-        if position >= len(self._grid_ids):
+        cells = len(self._order(study))
+        if position >= cells:
             raise RuntimeError(
                 f"Trial {trial.number} of study {study.study_name!r} has draw position "
-                f"{position}, past the {len(self._all_grids)}-point grid."
+                f"{position}, past the {cells}-point grid."
             )
-        grid_id = self._grid_ids[position]
-        study._storage.set_trial_system_attr(trial._trial_id, "search_space", self._search_space)
-        study._storage.set_trial_system_attr(trial._trial_id, "grid_id", grid_id)
+        study._storage.set_trial_system_attr(trial._trial_id, "grid_id", position)
+
+    def sample_independent(
+        self,
+        study: optuna.Study,
+        trial: optuna.trial.FrozenTrial,
+        param_name: str,
+        param_distribution: optuna.distributions.BaseDistribution,
+    ) -> object:
+        """Return the value of ``param_name`` in the cell at the trial's ``grid_id``.
+
+        :param optuna.Study study: The active study.
+        :param optuna.trial.FrozenTrial trial: The trial being sampled for.
+        :param str param_name: Name of the axis being sampled.
+        :param optuna.distributions.BaseDistribution param_distribution: The axis's
+            distribution, which the cell's value lies in.
+        :raises RuntimeError: The trial has no ``grid_id``, which :meth:`before_trial` or its
+            rerun source always assigns.
+        :return object: The cell's value for the axis.
+        """
+        grid_id = trial.system_attrs.get("grid_id")
+        if type(grid_id) is not int:
+            raise RuntimeError(f"Trial {trial.number} has no grid_id to sample from.")
+        return self._order(study)[grid_id][self._names.index(param_name)]
 
     def after_trial(
         self,
@@ -678,7 +730,7 @@ def _build_sampler(
             return optuna.samplers.RandomSampler()
         return _PositionRandomSampler(seed=cfg.seed, repeats=repeats)
     if cfg.type == "grid":
-        return _PositionGridSampler(grid_search_space(search_space), seed=cfg.seed, repeats=repeats)
+        return _PositionGridSampler(search_space, seed=cfg.seed, repeats=repeats)
     if cfg.type == "cmaes":
         if cfg.seed is None:
             return optuna.samplers.CmaEsSampler()
@@ -702,6 +754,53 @@ def _suggest(trial: optuna.Trial, name: str, p: SearchParam) -> Any:
     if isinstance(p, CategoricalParam):
         return trial.suggest_categorical(name, p.choices)
     assert_never(p)
+
+
+GridAxisKind = Literal["int", "float", "categorical"]
+"""How a grid axis of choices is registered with Optuna."""
+
+
+def _grid_axis_kind(values: Sequence[object]) -> GridAxisKind:
+    """Say how a grid axis's choices are registered: as an int or float range, or as choices.
+
+    Optuna requires a categorical parameter's choices to be identical across a study's trials
+    but lets an int or float range change its bounds, so a numeric axis registered as a range
+    can gain values in place. Booleans are not numbers here, and an int past Optuna's exact
+    float range stays a choice.
+
+    :param Sequence[object] values: The axis's choices.
+    :return GridAxisKind: ``int`` when every choice is an int within +-2^53, ``float`` when
+        every choice is a float, otherwise ``categorical``.
+    """
+    if all(type(value) is int and abs(value) <= _OPTUNA_EXACT_INT_LIMIT for value in values):
+        return "int"
+    if all(type(value) is float for value in values):
+        return "float"
+    return "categorical"
+
+
+def _suggest_all(trial: optuna.Trial, phase: Phase) -> dict[str, object]:
+    """Suggest every sampler axis of a phase, the one path a trial's params are drawn through.
+
+    A grid's numeric choices register as an int or float range spanning them
+    (:func:`_grid_axis_kind`); the grid sampler returns the cell's value, so the trial records
+    the configured value with its type.
+
+    :param optuna.Trial trial: The active Optuna trial.
+    :param Phase phase: Phase whose ``search_space`` and repeat axis are drawn.
+    :return dict[str, object]: The drawn value of every axis, by name.
+    """
+    grid = phase.sampler.type == "grid"
+    sampled: dict[str, object] = {}
+    for name, param in sampler_search_space(phase).items():
+        kind = _grid_axis_kind(param.choices) if isinstance(param, CategoricalParam) else None
+        if grid and kind == "int":
+            sampled[name] = trial.suggest_int(name, min(param.choices), max(param.choices))
+        elif grid and kind == "float":
+            sampled[name] = trial.suggest_float(name, min(param.choices), max(param.choices))
+        else:
+            sampled[name] = _suggest(trial, name, param)
+    return sampled
 
 
 def _phase_study_name(experiment: Experiment, phase: Phase | str) -> str:

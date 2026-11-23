@@ -16,7 +16,6 @@ from uuid import uuid4
 import optuna
 
 from phasesweep.config.models import Constraint, Experiment, Metric, Phase
-from phasesweep.config.search import sampler_search_space
 from phasesweep.engine.artifacts import _warn_environment_drift, _write_trials_csv
 from phasesweep.engine.attempts import (
     _active_attempt_persistence_error,
@@ -42,7 +41,7 @@ from phasesweep.engine.ledger import ClaimedLedger, open_phase_study
 from phasesweep.engine.optuna import (
     _completed_trial_count,
     _finished_trial_count,
-    _suggest,
+    _suggest_all,
 )
 from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trials_csv_path
 from phasesweep.engine.progress import (
@@ -973,7 +972,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         raise _UnlaunchedAbortError(_UNLAUNCHED_ABORT_CAUSE)
     _refuse_launch_during_shutdown()
 
-    sampled = {name: _suggest(trial, name, p) for name, p in sampler_search_space(phase).items()}
+    sampled = _suggest_all(trial, phase)
     overrides = _composed_overrides(experiment, phase, sampled, run.inherited_winners)
 
     attempt_id = uuid4().hex
