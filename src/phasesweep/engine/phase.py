@@ -48,6 +48,7 @@ from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trials_csv_path
 from phasesweep.engine.progress import (
     _log_finished_trial,
     _log_reruns,
+    _log_trial_start,
     _warn_deferred_extraction,
 )
 from phasesweep.engine.repeats import repeat_axis
@@ -1070,6 +1071,13 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             _refuse_launch_during_shutdown()
 
             _refuse_launch_after_deadline(run)
+            _log_trial_start(
+                experiment,
+                phase,
+                trial,
+                gpu=gpu_assignment.visible_devices,
+                in_place=directory.opener_number != trial.number,
+            )
             try:
                 executed = launch_trial(
                     experiment=experiment,

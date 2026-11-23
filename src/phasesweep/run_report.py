@@ -323,6 +323,41 @@ def trial_line(
     )
 
 
+def trial_start_line(
+    experiment: Experiment,
+    phase: Phase,
+    *,
+    number: int,
+    gpu: str | None,
+    params: dict[str, object],
+    repeat: tuple[str, object] | None,
+    resumes: object,
+) -> FactLine:
+    """Build the line for a trial whose trainer is about to start.
+
+    :param Experiment experiment: The experiment, for the label width.
+    :param Phase phase: The trial's phase.
+    :param int number: Trial number within the phase.
+    :param str | None gpu: The devices the trainer sees, ``None`` or empty when it leases none.
+    :param dict[str, object] params: Sampled configuration, repeat key excluded.
+    :param tuple[str, object] | None repeat: Repeat key and value this trial runs, if any.
+    :param object resumes: The interrupted trial this rerun continues in its directory, ``None``
+        for a trial that starts in a directory of its own.
+    :return FactLine: The block to log.
+    """
+    head = [f"trial {number}", "RUNNING", *([f"gpu {gpu}"] if gpu else [])]
+    notes = [] if repeat is None else [f"repeat {repeat[0]}={param_text(repeat[1])}"]
+    if resumes is not None:
+        notes.append(f"resumes trial {resumes}")
+    return FactLine(
+        phase.name,
+        phase_label_width(experiment),
+        head=tuple(head),
+        tail=(*(f"{key}={param_text(item)}" for key, item in params.items()), *notes),
+        reason=None,
+    )
+
+
 def rerun_line(
     experiment: Experiment, phase: Phase, *, number: int, source: int, reason: str | None
 ) -> FactLine:

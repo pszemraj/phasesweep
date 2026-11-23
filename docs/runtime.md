@@ -91,11 +91,15 @@ phasesweep run  phasesweep_starter
   log       /home/you/project/runs/phasesweep_starter/run.log
 
 13:14:45  depth          2 trials to run, 1 at a time
+13:14:45  depth          trial 0  RUNNING  model.n_layers=8
 13:14:46  depth          trial 0  COMPLETE  eval_loss 0.3  0.7s  1/2  model.n_layers=8
+13:14:46  depth          trial 1  RUNNING  model.n_layers=6
 13:14:47  depth          trial 1  COMPLETE  eval_loss 0.5  0.7s  2/2  model.n_layers=6
 13:14:47  depth          winner: trial 0  eval_loss 0.3  model.n_layers=8
 13:14:47  learning_rate  2 trials to run, 1 at a time
+13:14:47  learning_rate  trial 0  RUNNING  optimizer.lr=0.0003
 13:14:47  learning_rate  trial 0  COMPLETE  eval_loss 0.3  0.7s  1/2  optimizer.lr=0.0003
+13:14:47  learning_rate  trial 1  RUNNING  optimizer.lr=0.0001
 13:14:48  learning_rate  trial 1  COMPLETE  eval_loss 0.413822  0.7s  2/2  optimizer.lr=0.0001
 13:14:48  learning_rate  winner: trial 0  eval_loss 0.3  optimizer.lr=0.0003
 
@@ -127,13 +131,17 @@ The path under each phase's `winner` line is the directory of the winning trial,
 2026-01-01 12:00:01 I phasesweep.engine.run Run started: experiment phasesweep_starter, pid 48213
 2026-01-01 12:00:02 I phasesweep.report lr  4 trials to run, 1 of them a rerun, 1 at a time, 2 already finished
 2026-01-01 12:00:02 I phasesweep.report lr  trial 3  RERUN of trial 2  reason: orchestrator interrupted by SIGINT
+2026-01-01 12:00:02 I phasesweep.report lr  trial 3  RUNNING  gpu 0  lr=0.0003  resumes trial 2
 2026-01-01 12:00:03 I phasesweep.report lr  trial 3  COMPLETE  eval_loss 0.3  0.4s  3/6  lr=0.0003  rerun of 2
+2026-01-01 12:00:03 I phasesweep.report lr  trial 4  RUNNING  gpu 0  lr=0.001
 2026-01-01 12:00:04 I phasesweep.report lr  trial 4  FAIL  0.5s  4/6  lr=0.001  reason: non-zero exit code 1; stderr: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB
 2026-01-01 12:00:09 I phasesweep.report lr  winner: trial 3  eval_loss 0.3  lr=0.0003
 2026-01-01 12:00:09 I phasesweep.engine.run Run finished: experiment phasesweep_starter, pid 48213, 1 phase, 6 trials, 2 from a previous run, 8.1s
 ```
 
 The phase start line counts the trials still to run, the parallelism, the trials already finished and the reruns it schedules, the last two only when nonzero. Reruns are [interrupted trials](#interrupted-trials-rerun) and the failed grid cells a raised `n_trials` retries; they are among the trials to run and run before any new draw. A phase with nothing left says `nothing to run` and that it replays its recorded result. Each rerun the run schedules gets a `RERUN` line naming the trial it reruns and the first line of that trial's cause, and the rerun's trial line ends with `rerun of N`; a rerun an earlier run queued but never started counts in the phase start line without a new `RERUN` line.
+
+A trial prints a `RUNNING` line as its trainer starts, once it holds its GPU lease, so a trial still queued for a device prints nothing yet. The line names the devices the trainer sees as `gpu <ids>`, left out when the phase leases none, and the sampled configuration; a rerun that [continues an interrupted trial in its directory](#interrupted-trials-rerun) adds `resumes trial N`.
 
 A trial line gives the trial number, its `state`, the objective under the metric's name, the trial's duration (GPU queue and evidence extraction included), `N/M` and the sampled configuration. `state` reads as in [`status --trials`](#inspection-commands). In `N/M`, `M` is `n_trials` and `N` is the trial's own place in the phase's completion order: the trials counting toward `n_trials` when its outcome was recorded, itself included unless it was interrupted. With `n_jobs` above 1 every finished trial therefore gets a distinct `N`, though the lines may print out of order. `FAIL` and `INFEASIBLE` trials count toward the phase's `max_consecutive_failures`, a `COMPLETE` one resets that count, and an `INTERRUPTED` one leaves it unchanged. The objective is left out when the trial produced none. The configuration excludes the repeat key and shares the line with the trial when the whole line fits the terminal, and otherwise moves to a line under it. A phase with [`repeats`](config.md#repeats) adds `repeat <key>=<value>`, which names the seed or other repeat value that trial ran. The winner line closing each phase gives the winning trial, its objective and its params. In a repeats phase it adds the reducer, repeat count, `sd`, range and member trials, and an accepted partial result adds `INCOMPLETE <finished>/<requested> finished` and the timeout scope.
 

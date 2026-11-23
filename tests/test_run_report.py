@@ -35,6 +35,7 @@ from phasesweep.run_report import (
     rerun_line,
     skipped_line,
     trial_line,
+    trial_start_line,
     winner_line,
 )
 from phasesweep.runtime.console import ConsoleHandler
@@ -330,6 +331,58 @@ def test_a_trial_recovery_settled_is_a_trial_line_marked_recovered(
         str(result)
         == "depth  trial 3  COMPLETE  eval_loss 0.3  0.5s  3/4  model.n_layers=8  recovered"
     )
+
+
+@pytest.mark.parametrize(
+    ("width", "fresh", "resumed"),
+    [
+        pytest.param(
+            80,
+            ["12:00:00  depth          trial 3  RUNNING  gpu 1  model.n_layers=8"],
+            [
+                "12:00:00  depth          trial 5  RUNNING  gpu 1",
+                "                         model.n_layers=8  resumes trial 3",
+            ],
+            id="80",
+        ),
+        pytest.param(
+            60,
+            [
+                "12:00:00  depth          trial 3  RUNNING  gpu 1",
+                "                         model.n_layers=8",
+            ],
+            [
+                "12:00:00  depth          trial 5  RUNNING  gpu 1",
+                "                         model.n_layers=8  resumes trial 3",
+            ],
+            id="60",
+        ),
+    ],
+)
+def test_a_launching_trial_names_its_gpu_and_the_trial_it_resumes(
+    experiment: Experiment, width: int, fresh: list[str], resumed: list[str]
+) -> None:
+    """A trial's start line names the devices it sees and, for a rerun in place, the trial it resumes."""
+    depth = experiment.phases[0]
+    started = trial_start_line(
+        experiment,
+        depth,
+        number=3,
+        gpu="1",
+        params={"model.n_layers": 8},
+        repeat=None,
+        resumes=None,
+    )
+    resuming = trial_start_line(
+        experiment, depth, number=5, gpu="1", params={"model.n_layers": 8}, repeat=None, resumes=3
+    )
+    assert console(started, width) == fresh
+    assert console(resuming, width) == resumed
+    for unleased in (None, ""):
+        cpu = trial_start_line(
+            experiment, depth, number=0, gpu=unleased, params={}, repeat=("seed", 1), resumes=None
+        )
+        assert str(cpu) == "depth  trial 0  RUNNING  repeat seed=1"
 
 
 def test_rerun_and_skipped_lines(experiment: Experiment) -> None:

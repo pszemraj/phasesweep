@@ -1,8 +1,8 @@
 """Engine progress lines and process-scoped warnings.
 
-A live phase reports one rerun line per rerun and one trial line per trial; recovery reports
-the trials it settles as trial lines marked recovered. A dry run previews its phases with the
-plain ``phase=… study=…`` header on the same report channel.
+A live phase reports one rerun line per rerun, and per trial a line as its trainer starts and
+one as it finishes; recovery reports the trials it settles as trial lines marked recovered. A
+dry run previews its phases with the plain ``phase=… study=…`` header on the same report channel.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     _parsed_trial_outcome,
 )
-from phasesweep.run_report import report, rerun_line, trial_line
+from phasesweep.run_report import report, rerun_line, trial_line, trial_start_line
 
 # Warnings keep the phase channel that run.log readers match on.
 log = logging.getLogger("phasesweep.engine.phase")
@@ -185,6 +185,36 @@ def _report_trial(
             rerun_of=trial.user_attrs.get(RERUN_OF_ATTR),
             reason=_first_cause_line(trial),
             recovered=recovered,
+        )
+    )
+
+
+def _log_trial_start(
+    experiment: Experiment,
+    phase: Phase,
+    trial: optuna.Trial,
+    *,
+    gpu: str | None,
+    in_place: bool,
+) -> None:
+    """Report a trial whose trainer is about to start, and the trial a rerun in place resumes.
+
+    :param Experiment experiment: The experiment the phase belongs to.
+    :param Phase phase: The phase the trial belongs to.
+    :param optuna.Trial trial: The trial about to launch.
+    :param str | None gpu: The devices its trainer sees, ``None`` or empty when it leases none.
+    :param bool in_place: Whether it continues its source's trial directory.
+    """
+    params, repeat = _repeat_split(phase, trial.params)
+    report.info(
+        trial_start_line(
+            experiment,
+            phase,
+            number=trial.number,
+            gpu=gpu,
+            params=params,
+            repeat=repeat,
+            resumes=trial.user_attrs.get(RERUN_OF_ATTR) if in_place else None,
         )
     )
 

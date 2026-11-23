@@ -46,8 +46,32 @@ from tests.conftest import (
 
 def _trial_lines(experiment_log: Path, phase: str) -> list[str]:
     """Return every ``run.log`` line the phase logged for a finished trial, in order."""
-    finished = re.compile(rf" {re.escape(phase)}  trial \d+  [A-Z]+  ")
+    finished = re.compile(rf" {re.escape(phase)}  trial \d+  (?!RUNNING)[A-Z]+  ")
     return [line for line in experiment_log.read_text().splitlines() if finished.search(line)]
+
+
+def test_run_log_records_each_trial_as_it_starts(tmp_path: Path) -> None:
+    """Each trial's start line precedes its finished line and names its configuration."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=_x_trainer(tmp_path),
+        name="p",
+        n_trials=2,
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 4])},
+    )
+
+    run_experiment(experiment)
+
+    lines = (_experiment_dir(experiment) / "run.log").read_text().splitlines()
+    trials = [match[1] for line in lines if (match := re.search(r" p  (trial \d+  .*)$", line))]
+    assert [line.split("  ")[:2] for line in trials] == [
+        ["trial 0", "RUNNING"],
+        ["trial 0", "COMPLETE"],
+        ["trial 1", "RUNNING"],
+        ["trial 1", "COMPLETE"],
+    ]
+    assert re.fullmatch(r"trial 0  RUNNING  x=[14]", trials[0])
 
 
 def _field(line: str, pattern: str) -> str:
@@ -153,7 +177,12 @@ def test_trial_write_error_reports_cause_and_storage_specific_recovery(
             assert "the next run recovers it" in diagnostic
         else:
             assert "The trial result was lost" in diagnostic
-            assert "RUNNING" not in diagnostic
+            # The trial's start line names RUNNING; nothing else may claim it is still running.
+            assert all(
+                "RUNNING" not in line
+                for line in diagnostic.splitlines()
+                if "trial 0  RUNNING" not in line
+            )
 
     if persistent:
         (original,) = phase_trials(experiment)
