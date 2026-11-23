@@ -383,10 +383,10 @@ def _cause(trial: optuna.trial.FrozenTrial) -> str | None:
 
 
 @pytest.mark.parametrize("serviced", [True, False], ids=["shutdown", "no-shutdown"])
-def test_a_trainer_that_fails_while_a_shutdown_is_serviced_is_interrupted_not_failed(
+def test_a_trainer_that_fails_while_a_shutdown_is_serviced_keeps_its_own_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, serviced: bool
 ) -> None:
-    """A worker sees its trainer die when the handler kills it; that counts as an interruption, not a failure."""
+    """A trainer that crashed by itself keeps its failure and stderr reason though a shutdown is serviced after it."""
     launched = tmp_path / "launched"
     trainer = write_trainer(
         tmp_path / "trainer.py",
@@ -394,6 +394,7 @@ def test_a_trainer_that_fails_while_a_shutdown_is_serviced_is_interrupted_not_fa
         import sys
         from pathlib import Path
         Path({str(launched)!r}).touch()
+        print("CUDA error: out of memory", file=sys.stderr)
         sys.exit(1)
         """,
     )
@@ -407,26 +408,16 @@ def test_a_trainer_that_fails_while_a_shutdown_is_serviced_is_interrupted_not_fa
         lambda: signal.SIGINT if serviced and launched.exists() else None,
     )
 
-    expected = (
-        (RuntimeError, "stopped after 0/1")
-        if serviced
-        else (NoFeasibleTrialError, "1 consecutive failed/infeasible trials")
-    )
-    with pytest.raises(expected[0], match=expected[1]):
+    with pytest.raises(NoFeasibleTrialError, match="1 consecutive failed/infeasible trials"):
         run_experiment(exp)
 
     (trial,) = phase_trials(exp)
     study = phase_study(exp)
     assert launched.exists()
-    if serviced:
-        assert _trial_count_state(trial) == "INTERRUPTED"
-        assert _cause(trial) == _SIGINT_CAUSE
-        assert _load_phase_policy_state(study).consecutive_failures == 0
-        assert _record_reruns(study) == [(0, 1)]
-    else:
-        assert _trial_count_state(trial) == "FAIL"
-        assert _load_phase_policy_state(study).consecutive_failures == 1
-        assert _record_reruns(study) == []
+    assert _trial_count_state(trial) == "FAIL"
+    assert _cause(trial) == "non-zero exit code 1; stderr: CUDA error: out of memory"
+    assert _load_phase_policy_state(study).consecutive_failures == 1
+    assert _record_reruns(study) == []
 
 
 @pytest.mark.parametrize("refusing_check", [1, 2], ids=["before-allocation", "inside-the-lease"])

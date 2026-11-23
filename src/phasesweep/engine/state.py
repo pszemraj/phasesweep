@@ -495,7 +495,8 @@ def _completed_trainer_duration(
     """Return completed trainer time without confusing SDK worker exits with trainer exits.
 
     Evidence workers reuse the process slot after trainer exit. The ledger records
-    trainer metadata before extraction; the guardian record covers an earlier runner death.
+    trainer metadata before extraction; the guardian record covers an earlier runner death,
+    and only a record of the trainer's own ending carries its exit.
 
     :param FrozenTrial | Trial trial: Trial carrying trainer exit attributes, when committed.
     :param AttemptLifecycle | None lifecycle: Current process-slot evidence, or None to require trainer ledger attributes.
@@ -503,11 +504,12 @@ def _completed_trainer_duration(
     """
     if FAILURE_REASON_ATTR in trial.user_attrs:
         return None
+    record = lifecycle if lifecycle is not None and lifecycle.ended_by == "trainer" else None
     return_code = trial.user_attrs.get(
-        RETURN_CODE_ATTR, None if lifecycle is None else lifecycle.return_code
+        RETURN_CODE_ATTR, None if record is None else record.return_code
     )
     duration = trial.user_attrs.get(
-        DURATION_ATTR, None if lifecycle is None else lifecycle.duration_seconds
+        DURATION_ATTR, None if record is None else record.duration_seconds
     )
     if type(return_code) is not int or return_code != 0:
         return None

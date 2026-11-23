@@ -22,6 +22,7 @@ from stat import S_ISDIR
 from typing import Any
 
 import optuna
+from optuna.trial import FrozenTrial
 
 from phasesweep.config.common import check_bounds
 from phasesweep.config.models import TRIAL_BOUND_ENV, Experiment, Observation, _wandb_query
@@ -30,6 +31,7 @@ from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.state import (
     CONSTRAINT_PREFIX,
     DURATION_ATTR,
+    FAILURE_REASON_ATTR,
     FEASIBLE_ATTR,
     GATES_ATTR,
     METRIC_EXTRACTOR_LABEL,
@@ -68,7 +70,12 @@ from phasesweep.runtime.commands import (
 )
 from phasesweep.runtime.files import atomic_write_text, private_atomic_write_text
 from phasesweep.runtime.json import JsonObject
-from phasesweep.runtime.process import ProcessResult, run_supervised
+from phasesweep.runtime.process import (
+    TIMEOUT_REASON_PREFIX,
+    AttemptLifecycle,
+    ProcessResult,
+    run_supervised,
+)
 
 log = logging.getLogger("phasesweep.engine.trial")
 
@@ -453,6 +460,63 @@ def _nonzero_exit_reason(return_code: int) -> str:
     if killer == signal.SIGKILL:
         reason += f"; {_OOM_KILLER_CLAUSE}"
     return reason
+
+
+def _trainer_failure_reason(
+    trial: FrozenTrial | optuna.Trial, lifecycle: AttemptLifecycle | None, attempt_dir: Path
+) -> str | None:
+    """Return the failure a trainer's own ending earned, for a trial PhaseSweep did not finish.
+
+    A trainer that crashed keeps its crash whether a shutdown lands right after it or the
+    runner dies before recording it; one PhaseSweep stopped or never started is interrupted.
+    A kill PhaseSweep did not send is the trainer's own ending: the OOM killer cannot be told
+    from a person, and calling it an interruption would rerun a configuration that OOMs every
+    time. The ledger's trainer exit attributes outrank the lifecycle record, whose process slot
+    an evidence worker reuses after a successful exit.
+
+    :param FrozenTrial | optuna.Trial trial: The trial, with any exit attributes the ledger holds.
+    :param AttemptLifecycle | None lifecycle: Its attempt's lifecycle record, if one was read.
+    :param Path attempt_dir: Directory holding the attempt's ``stderr.log``.
+    :return str | None: The failure reason, or ``None`` when the trainer was interrupted,
+        never started, or exited 0.
+    """
+    if lifecycle is not None and lifecycle.ended_by in {"cancelled", "not_started"}:
+        return None
+    recorded_code = trial.user_attrs.get(RETURN_CODE_ATTR)
+    ended_by = None if lifecycle is None else lifecycle.ended_by
+    if type(recorded_code) is not int and ended_by is None:
+        return None
+    recorded_reason = trial.user_attrs.get(FAILURE_REASON_ATTR)
+    if isinstance(recorded_reason, str) and recorded_reason:
+        return recorded_reason
+    if type(recorded_code) is int:
+        return_code = recorded_code
+    elif lifecycle is not None and ended_by == "trainer" and lifecycle.return_code is not None:
+        return_code = lifecycle.return_code
+    elif ended_by == "timed_out":
+        return _with_stderr(
+            f"{TIMEOUT_REASON_PREFIX}the phase's timeout_seconds_per_trial", attempt_dir
+        )
+    elif ended_by == "guardian_lost":
+        return _with_stderr(
+            "the lease guardian exited without recording how the trainer ended", attempt_dir
+        )
+    else:
+        return None
+    if return_code == 0:
+        return None
+    return _with_stderr(_nonzero_exit_reason(return_code), attempt_dir)
+
+
+def _with_stderr(reason: str, attempt_dir: Path) -> str:
+    """Append the attempt's last stderr line to a failure reason, as a live failure reads.
+
+    :param str reason: The failure reason.
+    :param Path attempt_dir: Directory holding the attempt's ``stderr.log``.
+    :return str: The reason, followed by ``; stderr: <line>`` when stderr has a printable line.
+    """
+    stderr_line = _stderr_last_line(attempt_dir)
+    return reason if stderr_line is None else f"{reason}; stderr: {stderr_line}"
 
 
 def _warn_narrowed_environment_exit(

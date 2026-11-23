@@ -3,12 +3,61 @@
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 import pytest
+from optuna.trial import FrozenTrial
 
+from phasesweep import run_experiment
+from phasesweep.config.models import Experiment
+from phasesweep.engine import phase as phase_module
+from phasesweep.engine.optuna import _trial_count_state
+from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.state import TRIAL_OUTCOME_ATTR, _parsed_trial_outcome
+from phasesweep.engine.study_policy import _load_phase_policy_state, _record_reruns
 from phasesweep.runtime.process import AttemptEnd, read_attempt_lifecycle, run_supervised
+from tests.conftest import (
+    make_experiment,
+    phase_study,
+    phase_trials,
+    write_experiment_config,
+    write_trainer,
+)
+
+_RUNNER = (
+    "import sys\n"
+    "from phasesweep import run_experiment\n"
+    "from phasesweep.config.io import load_experiment\n"
+    "run_experiment(load_experiment(sys.argv[1]))\n"
+)
+
+
+def _outcome(trial: FrozenTrial) -> tuple[str, str | None]:
+    """Return a finished trial's count state and recorded cause.
+
+    :param FrozenTrial trial: The trial.
+    :return tuple[str, str | None]: ``(state, cause)``.
+    """
+    parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+    return _trial_count_state(trial), None if parsed is None else parsed.cause
+
+
+def _exec_trainer(tmp_path: Path, body: str, **phase: object) -> Experiment:
+    """Build a one-trial persistent experiment whose trainer replaces its shell.
+
+    :param Path tmp_path: Scratch directory.
+    :param str body: Trainer script body.
+    :param object phase: Default-phase overrides.
+    :return Experiment: The experiment.
+    """
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=write_trainer(tmp_path / "trainer.py", body), **phase
+    )
+    return experiment.model_copy(update={"trial_command": "exec " + experiment.trial_command})
 
 
 @pytest.mark.parametrize(
@@ -56,3 +105,91 @@ def test_each_ending_leaves_its_own_record(
     assert lifecycle is not None
     assert (lifecycle.state, lifecycle.cleanup_confirmed) == ("exited", True)
     assert (lifecycle.ended_by, lifecycle.return_code) == (ending, return_code)
+
+
+@pytest.mark.parametrize(
+    ("body", "state", "cause"),
+    [
+        pytest.param(
+            """
+            import os, signal, sys, time
+            open(sys.argv[-1], "w").close()
+            os.kill(os.getppid(), signal.SIGTERM)
+            time.sleep(30)
+            """,
+            "INTERRUPTED",
+            "orchestrator interrupted by SIGINT",
+            id="cancelled-by-its-guardian",
+        ),
+        pytest.param(
+            """
+            import os, signal, sys
+            open(sys.argv[-1], "w").close()
+            os.kill(os.getpid(), signal.SIGKILL)
+            """,
+            "FAIL",
+            "killed by signal 9 (SIGKILL); the kernel's out-of-memory killer is a common sender",
+            id="killed-by-another-sender",
+        ),
+    ],
+)
+def test_a_shutdown_interrupts_only_a_trainer_phasesweep_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str, state: str, cause: str
+) -> None:
+    """While a shutdown is serviced, a guardian cancellation is an interruption and a kill nobody in PhaseSweep sent is a failure."""
+    started = tmp_path / "started"
+    experiment = _exec_trainer(tmp_path, body, n_trials=1, max_consecutive_failures=5)
+    experiment = experiment.model_copy(
+        update={"trial_command": f"{experiment.trial_command} {started}"}
+    )
+    monkeypatch.setattr(
+        phase_module,
+        "servicing_shutdown_signal",
+        lambda: signal.SIGINT if started.exists() else None,
+    )
+    with pytest.raises((RuntimeError, NoFeasibleTrialError)):
+        run_experiment(experiment)
+    (trial,) = phase_trials(experiment)
+    assert _outcome(trial) == (state, cause)
+
+
+@pytest.mark.integration
+def test_a_crash_keeps_its_failure_when_a_ctrl_c_lands_in_the_helper_settle(
+    tmp_path: Path,
+) -> None:
+    """A trainer that exited 1 keeps its failure and stderr reason when Ctrl-C reaches the run during the guardian's helper settle."""
+    exited = tmp_path / "exited"
+    experiment = _exec_trainer(
+        tmp_path,
+        f"""
+        import subprocess, sys
+        from pathlib import Path
+        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3)"])
+        print("loss went NaN at step 7", file=sys.stderr, flush=True)
+        Path({str(exited)!r}).touch()
+        sys.exit(1)
+        """,
+        n_trials=1,
+        max_consecutive_failures=5,
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    with (tmp_path / "runner.log").open("w") as output:
+        runner = subprocess.Popen(
+            [sys.executable, "-c", _RUNNER, str(config)], stdout=output, stderr=output
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while not exited.exists():
+                assert runner.poll() is None and time.monotonic() < deadline
+                time.sleep(0.02)
+            time.sleep(0.5)  # the root has exited; its helper keeps the guardian settling
+            runner.send_signal(signal.SIGINT)
+            assert runner.wait(timeout=30) == 128 + signal.SIGINT
+        finally:
+            if runner.poll() is None:
+                runner.kill()
+                runner.wait(timeout=5)
+    (trial,) = phase_trials(experiment)
+    assert _outcome(trial) == ("FAIL", "non-zero exit code 1; stderr: loss went NaN at step 7")
+    assert _load_phase_policy_state(phase_study(experiment)).consecutive_failures == 1
+    assert _record_reruns(phase_study(experiment)) == []

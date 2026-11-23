@@ -10,6 +10,7 @@ import threading
 import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 from uuid import uuid4
 
@@ -106,6 +107,7 @@ from phasesweep.engine.study_policy import (
 from phasesweep.engine.trial import (
     EnvironmentIdentity,
     TrialExecutionError,
+    _trainer_failure_reason,
     extract_trial_result,
     launch_trial,
     prepare_trainer_input,
@@ -130,7 +132,6 @@ from phasesweep.runtime.shutdown import (
     ShutdownCleanupReport,
     ShutdownLaunchRefusedError,
     interruption_cause,
-    launch_refusal_text,
     servicing_shutdown_signal,
     shutdown_raised_over,
 )
@@ -216,6 +217,13 @@ class _UnlaunchedAbortError(TrialExecutionError):
 
     The trial has no trainer outcome to count, so it is recorded as
     interrupted and reruns once the abort is recovered by raising ``n_trials``.
+    """
+
+
+class _InterruptedTrialError(TrialExecutionError):
+    """Raised when a shutdown stopped a trial's trainer, or kept it from starting.
+
+    A trainer that ended by itself keeps its own verdict even while a shutdown is serviced.
     """
 
 
@@ -916,12 +924,12 @@ def _refuse_launch_after_deadline(run: _PhaseExecution) -> None:
 def _refuse_launch_during_shutdown() -> None:
     """Refuse to start a trial while a shutdown signal is being serviced.
 
-    :raises TrialExecutionError: A shutdown is being serviced, so
+    :raises _InterruptedTrialError: A shutdown is being serviced, so
         :func:`_objective` records the trial as interrupted by that signal.
     """
     signum = servicing_shutdown_signal()
     if signum is not None:
-        raise TrialExecutionError(launch_refusal_text(signum))
+        raise _InterruptedTrialError(interruption_cause(signum))
 
 
 def _trial_recording_error(
@@ -1169,6 +1177,8 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                 run.record_fatal(exc)
                 raise _TrialLeftRunning(exc) from exc
             except (OSError, ValueError, RuntimeError) as exc:
+                # A shutdown stops the preparation worker too; that is no failure of the trial.
+                _refuse_launch_during_shutdown()
                 reason = f"MLflow run preparation: {exc}"
                 log.warning("[%s/trial_%d] %s", phase.name, trial.number, reason)
                 trial.set_user_attr(FAILURE_REASON_ATTR, reason)
@@ -1202,7 +1212,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                 )
             except ShutdownLaunchRefusedError as exc:
                 # The shutdown began between the check above and the launch lock.
-                raise TrialExecutionError(str(exc)) from exc
+                raise _InterruptedTrialError(interruption_cause(exc.signum)) from exc
 
             # Block queued launches before releasing a GPU whose process cleanup is uncertain.
             if not executed.process.cleanup_confirmed:
@@ -1236,17 +1246,25 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         trial.set_user_attr(RETURN_CODE_ATTR, executed.process.return_code)
 
     def check_shutdown_after_trainer_exit() -> None:
-        """Preserve finished training and classify a stopped trainer as interrupted.
+        """Preserve finished training, keep a crash's own failure, and interrupt a stopped trainer.
 
         :raises PhaseSweepShutdown: Shutdown prevents extraction of a successful trainer's result.
-        :raises TrialExecutionError: Shutdown stopped the trainer before it finished.
+        :raises _InterruptedTrialError: Shutdown stopped the trainer before it finished.
+        :raises TrialExecutionError: The trainer failed by itself before the shutdown.
         """
         signum = servicing_shutdown_signal()
         if signum is None:
             return
         if _completed_trainer_duration(trial, None) is not None:
             raise PhaseSweepShutdown(signum, ShutdownCleanupReport(signum, True, ()))
-        raise TrialExecutionError(interruption_cause(signum))
+        try:
+            lifecycle = _trial_lifecycle(trial)
+        except ValueError:
+            lifecycle = None
+        reason = _trainer_failure_reason(trial, lifecycle, trial_dir)
+        if reason is None:
+            raise _InterruptedTrialError(interruption_cause(signum))
+        raise TrialExecutionError(reason)
 
     # Extraction releases the GPU but still consumes the phase/run budget.
     check_shutdown_after_trainer_exit()
@@ -1337,17 +1355,14 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             _record_outcome(run, trial, "interrupted", cause=str(exc))
             raise
         except TrialExecutionError as exc:
-            signum = servicing_shutdown_signal()
-            cause = str(exc) if signum is None else interruption_cause(signum)
-            if signum is None:
-                _record_outcome(run, trial, "failure", cause=cause)
-            else:
-                # Under n_jobs > 1 the shutdown handler runs in the main thread and
-                # kills this worker's trainer, which ends here as a trainer error.
-                _record_outcome(run, trial, "interrupted", cause=cause)
+            # Under n_jobs > 1 the shutdown handler runs in the main thread and kills this
+            # worker's trainer; the worker's lifecycle check names that an interruption.
+            interrupted = isinstance(exc, _InterruptedTrialError)
+            cause = str(exc)
+            _record_outcome(run, trial, "interrupted" if interrupted else "failure", cause=cause)
             # An earlier diagnostic would prevent recovery from reading a finished trainer's
             # evidence if its outcome could not be committed.
-            if signum is not None or FAILURE_REASON_ATTR not in trial.user_attrs:
+            if interrupted or FAILURE_REASON_ATTR not in trial.user_attrs:
                 with _persist_trial_evidence(run, trial):
                     trial.set_user_attr(FAILURE_REASON_ATTR, cause)
             raise
@@ -1382,7 +1397,19 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             except ValueError as lifecycle_error:
                 raise exc from lifecycle_error
             if _completed_trainer_duration(trial, lifecycle) is None:
-                _record_outcome(run, trial, "interrupted", cause=interruption_cause(exc.signum))
+                directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
+                reason = (
+                    _trainer_failure_reason(trial, lifecycle, Path(directory))
+                    if isinstance(directory, str)
+                    else None
+                )
+                if reason is None:
+                    _record_outcome(run, trial, "interrupted", cause=interruption_cause(exc.signum))
+                else:
+                    # A trainer that crashed before the shutdown keeps its own failure.
+                    _record_outcome(run, trial, "failure", cause=reason)
+                    with contextlib.suppress(Exception):
+                        trial.set_user_attr(FAILURE_REASON_ATTR, reason)
             elif isinstance(attempt_id, str) and not (
                 run.experiment.persistent and trial.number in run.recorded_outcomes
             ):
