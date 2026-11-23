@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from phasesweep.errors import UnsafeProcessCleanupError
-from phasesweep.evidence.baseline import EvidenceBaseline, file_stamp
+from phasesweep.evidence.baseline import EvidenceBaseline, FileBaseline
 from phasesweep.evidence.models import (
     ArtifactSizeGate,
     Gate,
@@ -91,16 +91,14 @@ def _file_digest(raw: bytes) -> dict[str, Any]:
 
 
 class OutsideAttemptError(OSError):
-    """A trial-relative evidence path this attempt may not be scored from."""
+    """A trial-relative evidence path resolves outside its owning directory."""
 
 
-class StaleEvidenceError(OutsideAttemptError):
-    """A value file is exactly as it was before the attempt ran, so the attempt did not write it."""
+class StaleEvidenceError(OSError):
+    """The evidence cannot be attributed to the current attempt."""
 
 
-def attempt_file(
-    trial_dir: Path, relative: str | Path, *, baseline: EvidenceBaseline | None = None
-) -> Path:
+def attempt_file(trial_dir: Path, relative: str | Path) -> Path:
     """Return a trial-relative evidence path, refusing one the attempt may not be scored from.
 
     PhaseSweep reads a trial's objective, constraints, observations, gate values and
@@ -110,16 +108,9 @@ def attempt_file(
     A link that stays inside the trial, such as ``latest -> checkpoint-500``, reads as
     usual. A missing file resolves inside and keeps the caller's own not-found handling.
 
-    With a ``baseline``, a value file is also refused when its identity is the one it had
-    before the attempt ran: a rerun continues in its trial's directory, where an earlier
-    attempt may have left a result this one never wrote (:mod:`phasesweep.evidence.baseline`).
-
     :param Path trial_dir: The trial directory the file must resolve inside.
     :param str | Path relative: Configured trial-relative path.
-    :param EvidenceBaseline | None baseline: Value-file identities recorded before the
-        attempt ran, or ``None`` for a read that tests artifacts or verifies recorded evidence.
     :raises OutsideAttemptError: The path resolves outside ``trial_dir``.
-    :raises StaleEvidenceError: The file is unchanged since before the attempt ran.
     :return Path: ``trial_dir / relative``, unchanged, for the caller to read.
     """
     path = trial_dir / relative
@@ -139,13 +130,6 @@ def attempt_file(
             f"`{relative}` in trial directory {trial_dir} resolves to {resolved}, outside the "
             "trial. Have the trainer write it under PHASESWEEP_TRIAL_DIR."
         )
-    before = None if baseline is None else baseline.get(str(relative))
-    if before is not None and file_stamp(path) == before:
-        raise StaleEvidenceError(
-            f"`{relative}` in trial directory {trial_dir} was not written by this attempt: it "
-            "is unchanged since an earlier attempt left it. Have the trainer write it on every "
-            "run, including one that resumes from a checkpoint."
-        )
     return path
 
 
@@ -154,7 +138,6 @@ def trial_file(
     attempt_dir: Path,
     relative: str | Path,
     *,
-    baseline: EvidenceBaseline | None = None,
     checked: bool = True,
 ) -> Path:
     """Return where a configured trial path is read from.
@@ -167,19 +150,52 @@ def trial_file(
     :param Path trial_dir: The trial directory the trainer writes into.
     :param Path attempt_dir: The attempt's directory, holding its captured streams.
     :param str | Path relative: Configured trial-relative path.
-    :param EvidenceBaseline | None baseline: Passed to :func:`attempt_file`.
     :param bool checked: Check the path against the directory that owns it. ``False``
         only locates it: for a gate that tests an artifact wherever its links lead, or to
         name the file in a diagnostic.
-    :raises OutsideAttemptError: A checked path resolves outside its owning directory, or,
-        as :class:`StaleEvidenceError`, a trainer file is unchanged since before the attempt ran.
+    :raises OutsideAttemptError: A checked path resolves outside its owning directory.
     :return Path: The path to read.
     """
     if is_captured_stream(relative):
         return attempt_file(attempt_dir, relative) if checked else attempt_dir / relative
     if not checked:
         return trial_dir / relative
-    return attempt_file(trial_dir, relative, baseline=baseline)
+    return attempt_file(trial_dir, relative)
+
+
+def _prior_value_file(
+    baseline: EvidenceBaseline | None, relative: str, target: Path
+) -> FileBaseline | None:
+    """Return saved contents if the current evidence still has the prior file's identity.
+
+    :param EvidenceBaseline | None baseline: Value files and their contents at launch.
+    :param str relative: Configured trial-relative path.
+    :param Path target: Resolved evidence location.
+    :raises StaleEvidenceError: The earlier contents could not be read.
+    :raises OSError: The current file's identity could not be read.
+    :return FileBaseline | None: Prior contents to compare, if the same file existed.
+    """
+    if baseline is None or relative not in baseline:
+        return None
+    before = baseline[relative]
+    if before is None:
+        raise StaleEvidenceError(
+            f"`{target}` could not be inspected before this attempt, so its value "
+            "cannot be attributed to this attempt."
+        )
+    return before if before.same_file(target.stat()) else None
+
+
+def _unchanged_value(target: Path) -> StaleEvidenceError:
+    """Explain why a surviving file with identical contents cannot supply fresh evidence.
+
+    :param Path target: File the attempt's value was to come from.
+    :return StaleEvidenceError: The read's diagnostic.
+    """
+    return StaleEvidenceError(
+        f"`{target}` was not written by this attempt: it still names the same file with "
+        "unchanged contents. Have the trainer replace it when reporting an identical result."
+    )
 
 
 def load_json_value(
@@ -200,9 +216,9 @@ def load_json_value(
     :param dict[str, Any] | None digest: Optional sink that receives the
         ``sha256``/``size_bytes`` of the exact bytes parsed, for evidence
         provenance.
-    :param EvidenceBaseline | None baseline: Passed to :func:`trial_file`.
-    :raises OutsideAttemptError: If a trainer ``relative_path`` resolves outside ``trial_dir``,
-        or, as :class:`StaleEvidenceError`, is unchanged since before the attempt ran.
+    :param EvidenceBaseline | None baseline: Value files and their contents at launch.
+    :raises OutsideAttemptError: If a trainer ``relative_path`` resolves outside ``trial_dir``.
+    :raises StaleEvidenceError: If the current contents cannot be attributed to the attempt.
     :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular file.
     :raises JsonKeyMissingError: If a segment of the dotted ``key`` path is missing, with the
         failing segment as the argument and what the file holds there.
@@ -212,12 +228,17 @@ def load_json_value(
         duplicate object keys, or a rejected JSON constant).
     :return tuple[Path, Any]: Resolved JSON file path and loaded value.
     """
-    target = trial_file(trial_dir, attempt_dir, relative_path, baseline=baseline)
+    target = trial_file(trial_dir, attempt_dir, relative_path)
     if not target.is_file():
         raise FileNotFoundError(target)
+    before = _prior_value_file(baseline, relative_path, target)
     raw = target.read_bytes()
-    if digest is not None:
-        digest.update(_file_digest(raw))
+    if before is not None or digest is not None:
+        file_digest = _file_digest(raw)
+        if before is not None and before.sha256 == file_digest["sha256"]:
+            raise _unchanged_value(target)
+        if digest is not None:
+            digest.update(file_digest)
     cur = strict_json_loads(raw.decode("utf-8"))
     walked: list[str] = []
     for part in key.split("."):
@@ -360,7 +381,7 @@ def _trial_json_read_errors(target: Path, *, noun: str, trainer_step: str) -> It
     """
     try:
         yield
-    except OutsideAttemptError as exc:
+    except (OutsideAttemptError, StaleEvidenceError) as exc:
         raise ExtractorError(str(exc)) from exc
     except FileNotFoundError as exc:
         missing = (
@@ -404,8 +425,7 @@ class TrialContext:
     mlflow_query: MlflowQuery | None = None
     mlflow_environment: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
     mlflow_capture: JsonObject = field(default_factory=dict, compare=False)
-    # Value-file identities recorded before the attempt ran; a value file still matching
-    # its entry was left by an earlier attempt and is refused. ``None`` checks nothing.
+    # Value-file identities and contents recorded before the attempt ran.
     baseline: EvidenceBaseline | None = field(default=None, compare=False)
 
 
@@ -603,28 +623,31 @@ def _extract_log_regex(
 ) -> float:
     """Select a numeric regex match and digest the complete log file.
 
-    First selection stops matching after its first numeric hit but continues reading for
-    the digest. Warn when a numeric result leaves unparseable captures behind.
+    On an appended log, match only bytes added after the old contents. First selection
+    stops matching after its first numeric hit but continues reading for the digest.
+    Warn when a numeric result leaves unparseable captures behind.
     Provenance includes the selected 1-based line and numeric match count.
 
     :param TrialContext ctx: Trial identity; the log is read from its ``trial_dir``, or its
         ``attempt_dir`` for a captured stream.
     :param LogRegexExtractor cfg: Log path, named value group, and first/last/min/max selector.
     :param dict | None provenance: Optional source-evidence sink.
-    :raises ExtractorError: The log is missing, outside the attempt, unreadable, has no
-        numeric match, has a non-finite match under ``min`` or ``max``, or a line eligible
-        for matching is invalid UTF-8.
+    :raises ExtractorError: The log is missing, outside the attempt, unreadable, unchanged,
+        has no numeric match, has a non-finite match under ``min`` or ``max``, or a line
+        eligible for matching is invalid UTF-8.
     :return float: Selected match value.
     """
     try:
-        target = trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.file, baseline=ctx.baseline)
+        target = trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.file)
+        if not target.is_file():
+            raise ExtractorError(
+                f"Log file not found: {target} (the trainer must write `{cfg.file}` under "
+                "PHASESWEEP_TRIAL_DIR; `stdout.log` and `stderr.log` are written automatically)"
+            )
     except OutsideAttemptError as exc:
         raise ExtractorError(str(exc)) from exc
-    if not target.is_file():
-        raise ExtractorError(
-            f"Log file not found: {target} (the trainer must write `{cfg.file}` under "
-            "PHASESWEEP_TRIAL_DIR; `stdout.log` and `stderr.log` are written automatically)"
-        )
+    except OSError as exc:
+        raise ExtractorError(f"Could not inspect log file {cfg.file!r}: {exc}") from exc
 
     pattern = re.compile(cfg.pattern)
 
@@ -636,23 +659,30 @@ def _extract_log_regex(
     result_line: int | None = None
     count = 0
     first_unparseable: str | None = None
-    line_no = 0
     try:
+        before = _prior_value_file(ctx.baseline, cfg.file, target)
+        prefix_size = 0
+        if before is not None and file_sha256(target, limit_bytes=before.size) == before.sha256:
+            prefix_size = before.size
         with target.open("r", encoding="utf-8", errors="surrogateescape", newline="") as fh:
-            for raw_text in fh:
+            for line_no, raw_text in enumerate(fh, 1):
                 raw_line = raw_text.encode("utf-8", errors="surrogateescape")
+                line_start = size_bytes
                 hasher.update(raw_line)
                 size_bytes += len(raw_line)
+                if size_bytes <= prefix_size:
+                    continue
                 if cfg.select == "first" and result is not None:
                     # Value already selected; keep reading only to finish the
                     # whole-file digest.
                     continue
-                line = raw_line.decode("utf-8")
+                # An old line may have been interrupted midway. Match its new suffix
+                # without joining bytes from the two attempts into one value.
+                line = raw_line[max(prefix_size - line_start, 0) :].decode("utf-8")
                 if line.endswith("\r\n"):
                     line = line[:-2] + "\n"
                 elif line.endswith("\r"):
                     line = line[:-1] + "\n"
-                line_no += 1
                 for match in pattern.finditer(line):
                     captured = match.group("value")
                     try:
@@ -685,9 +715,14 @@ def _extract_log_regex(
                         break
     except UnicodeError as exc:
         raise ExtractorError(f"Log file is not valid UTF-8 at {target}: {exc}") from exc
+    except StaleEvidenceError as exc:
+        raise ExtractorError(str(exc)) from exc
     except OSError as exc:
         raise ExtractorError(f"Could not read log file at {target}: {exc}") from exc
 
+    sha256 = hasher.hexdigest()
+    if before is not None and before.sha256 == sha256:
+        raise ExtractorError(str(_unchanged_value(target)))
     if first_unparseable is not None:
         if result is None:
             raise ExtractorError(
@@ -706,7 +741,7 @@ def _extract_log_regex(
         provenance["source"] = {
             "kind": "file",
             "path": cfg.file,
-            "sha256": hasher.hexdigest(),
+            "sha256": sha256,
             "size_bytes": size_bytes,
             "matched_line": result_line,
             "match_count": count,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import signal
 import subprocess
 import sys
@@ -12,7 +13,7 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config.models import Experiment, Metric
+from phasesweep.config.models import Experiment, Metric, Observation
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _verify_winner_evidence
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
@@ -34,6 +35,7 @@ from phasesweep.errors import ProcessCleanupUncertainError
 from phasesweep.evidence.baseline import read_evidence_baseline, write_evidence_baseline
 from phasesweep.evidence.evaluation import ExtractorError, run_extractor
 from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
 from phasesweep.tracking import publication, session
 from tests.conftest import (
@@ -55,7 +57,7 @@ _JSON_METRIC = Metric(extractor=JsonExtractor(type="json", path="r.json", key="l
 def test_a_value_file_left_before_launch_fails_as_not_written_by_this_attempt(
     tmp_path: Path,
 ) -> None:
-    """A result file unchanged since before the attempt ran is refused; the attempt's own rewrite of it reads."""
+    """Metadata changes leave stale evidence, while changed contents and replacement qualify."""
     experiment = make_experiment(persistent=tmp_path, metric=_JSON_METRIC)
     trial_dir, attempt_dir = tmp_path / "trial", tmp_path / "attempt"
     trial_dir.mkdir()
@@ -70,14 +72,66 @@ def test_a_value_file_left_before_launch_fails_as_not_written_by_this_attempt(
         attempt_dir=attempt_dir,
         baseline=baseline,
     )
+    (trial_dir / "r.json").chmod(0o600)
+    (trial_dir / "r.json").touch()
     with pytest.raises(ExtractorError, match="was not written by this attempt"):
         run_extractor(ctx, _JSON_METRIC.extractor)
 
     (trial_dir / "r.json").write_text('{"loss": 0.25}', encoding="utf-8")
     assert run_extractor(ctx, _JSON_METRIC.extractor) == 0.25
 
+    replacement = trial_dir / "replacement.json"
+    replacement.write_text('{"loss": 0.1}', encoding="utf-8")
+    replacement.replace(trial_dir / "r.json")
+    assert run_extractor(ctx, _JSON_METRIC.extractor) == 0.1
 
-def _interrupt_first_attempt(tmp_path: Path, body: str, metric: Metric) -> Experiment:
+
+@pytest.mark.parametrize(
+    ("prior", "content", "expected_line"),
+    [
+        (b"x=0.1\r\nx=0.", b"x=0.1\r\nx=0.25\r\nx=0.8\n", 3),
+        (b"x=0.1\r\nunfinished ", b"x=0.1\r\nunfinished x=0.8\n", 2),
+        (b"x=0.1\r\nx=0.", b"x=0.8\n", 1),
+        (b"x=0.1\r\nx=0.", b"x=0.8\nnew log contents follow\n", 1),
+    ],
+    ids=["append", "partial-line", "truncate", "rewrite"],
+)
+def test_resumed_log_selects_fresh_lines_and_digests_the_complete_file(
+    tmp_path: Path, prior: bytes, content: bytes, expected_line: int
+) -> None:
+    """Regex selection reads the new bytes, with provenance covering the complete log."""
+    extractor = LogRegexExtractor(
+        type="log_regex", file="train.log", pattern=r"x=(?P<value>[0-9.]+)", select="first"
+    )
+    experiment = make_experiment(persistent=tmp_path, metric=Metric(extractor=extractor))
+    trial_dir, attempt_dir = tmp_path / "trial", tmp_path / "attempt"
+    trial_dir.mkdir()
+    attempt_dir.mkdir()
+    log_file = trial_dir / "train.log"
+    log_file.write_bytes(prior)
+    write_evidence_baseline(experiment, experiment.phases[0], trial_dir, attempt_dir)
+    ctx = dataclasses.replace(
+        make_trial_context(tmp_path),
+        trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
+        baseline=read_evidence_baseline(attempt_dir),
+    )
+    log_file.write_bytes(content)
+    provenance: JsonObject = {}
+    assert run_extractor(ctx, extractor, provenance=provenance) == 0.8
+    assert provenance["source"] == {
+        "kind": "file",
+        "path": "train.log",
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "size_bytes": len(content),
+        "matched_line": expected_line,
+        "match_count": 1,
+    }
+
+
+def _interrupt_first_attempt(
+    tmp_path: Path, body: str, metric: Metric, *, observe: list[Observation] | None = None
+) -> Experiment:
     """Run the trainer under a runner process, SIGKILL the runner once the first attempt is ready.
 
     The trainer touches ``tmp_path / "first"`` and then sleeps, so the next run's recovery
@@ -86,12 +140,14 @@ def _interrupt_first_attempt(tmp_path: Path, body: str, metric: Metric) -> Exper
     :param Path tmp_path: Scratch directory.
     :param str body: Trainer body; the first attempt touches the marker and sleeps.
     :param Metric metric: The experiment's metric.
+    :param list[Observation] | None observe: Optional observations, defaults to None.
     :return Experiment: The persistent one-trial experiment, its first trial left RUNNING.
     """
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=write_trainer(tmp_path / "trainer.py", body),
         metric=metric,
+        observe=observe,
         n_trials=1,
     )
     config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
@@ -146,8 +202,35 @@ def test_a_rerun_that_rewrites_no_result_fails_as_not_written_by_this_attempt(
     assert rerun.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
     outcome = _parsed_trial_outcome(rerun.user_attrs[TRIAL_OUTCOME_ATTR])
     assert outcome is not None and outcome.outcome == "failure"
-    assert "r.json` in trial directory" in str(outcome.cause)
+    assert f"{first.user_attrs[TRIAL_DIR_ATTR]}/r.json" in str(outcome.cause)
     assert "was not written by this attempt" in str(outcome.cause)
+
+
+@pytest.mark.integration
+def test_rerun_can_replace_an_unresolvable_observation(tmp_path: Path) -> None:
+    """An old observation symlink loop lets the resumed trainer repair the file."""
+    body = _trainer(
+        tmp_path,
+        '    (trial / "observe.json").symlink_to("observe.json")',
+        """
+(trial / "observe.json").unlink()
+(trial / "observe.json").write_text(json.dumps({"value": 8.0}))
+(trial / "r.json").write_text(json.dumps({"loss": 1.0}))
+""",
+    )
+    experiment = _interrupt_first_attempt(
+        tmp_path,
+        body,
+        _JSON_METRIC,
+        observe=[
+            Observation(
+                name="extra", extractor=JsonExtractor(type="json", path="observe.json", key="value")
+            )
+        ],
+    )
+    winner = run_experiment(experiment)["p"]
+    assert winner.metric == 1.0
+    assert winner.observed == {"extra": 8.0}
 
 
 @pytest.mark.integration

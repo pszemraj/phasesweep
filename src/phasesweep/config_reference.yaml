@@ -539,6 +539,7 @@ JsonExtractor:
   # JSON file, for example result.json. The trainer finds the trial directory through {trial_dir} or PHASESWEEP_TRIAL_DIR.
   # stdout.log and stderr.log name the attempt's own captured streams, for a trainer that prints one JSON document.
   # Any other file must resolve inside the trial directory, so a symlink to a results file outside it fails the read; copy such a file in instead.
+  # A rerun reporting byte-for-byte identical JSON in a trainer-owned file must replace it with a new one.
   path: string (required)
 
   # JSON key of the number, for example eval.loss. List indexes and keys that contain a dot cannot be addressed.
@@ -584,6 +585,7 @@ LogRegexExtractor:
 
   # Log file, for example stdout.log. stdout.log and stderr.log name the attempt's own captured streams, kept beside the trial directory; Python logging writes to stderr by default.
   # Any other file must resolve inside the trial directory, so a symlink out of it fails the read.
+  # If a rerun extends a log with its old bytes intact, only the appended bytes are searched.
   file: string = "stdout.log"
 
   # Python regular expression whose required group (?P<value>...) captures the whole metric token. Use loss=(?P<value>\S+) for whitespace delimiters or loss=(?P<value>[^\s,]+) when a comma can follow.
