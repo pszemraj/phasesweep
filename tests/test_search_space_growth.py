@@ -31,7 +31,7 @@ from phasesweep.engine.growth import CHOICES_ROUTE, CMAES_ROUTE, _search_space_g
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _build_sampler, _draw_positions, _suggest_all
 from phasesweep.engine.preview import validate_trial_targets
-from phasesweep.engine.state import RERUN_OF_ATTR, _recorded_identity
+from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_DIR_ATTR, _recorded_identity
 from phasesweep.runtime.json import dump_json
 from tests.conftest import make_experiment, phase_study, phase_trials, write_trainer
 from tests.test_rerun_real_runs import _Harness
@@ -189,21 +189,24 @@ def harness(tmp_path: Path) -> Iterator[_Harness]:
         built.release()
 
 
+def _gated_phase(values: list[float]) -> Phase:
+    """Build the grid phase over ``optimizer.lr``, the override the gated trainer accepts.
+
+    :param list[float] values: The grid's lr choices.
+    :return Phase: The phase.
+    """
+    return _phase(values).model_copy(
+        update={
+            "search_space": {"optimizer.lr": CategoricalParam(type="categorical", choices=values)}
+        }
+    )
+
+
 @pytest.mark.integration
 def test_grown_grid_resumed_after_sigkill_covers_each_new_cell_once(harness: _Harness) -> None:
     """A grown grid whose run is SIGKILLed on a new cell resumes and measures every cell exactly once."""
-
-    def phase(values: list[float]) -> Phase:
-        return _phase(values).model_copy(
-            update={
-                "search_space": {
-                    "optimizer.lr": CategoricalParam(type="categorical", choices=values)
-                }
-            }
-        )
-
-    run_experiment(harness.experiment("interrupted", phase(_ORIGINAL)))
-    grown = harness.experiment("interrupted", phase(_GROWN))
+    run_experiment(harness.experiment("interrupted", _gated_phase(_ORIGINAL)))
+    grown = harness.experiment("interrupted", _gated_phase(_GROWN))
     config = harness.config(grown)
 
     harness.interrupt(config, len(_ORIGINAL) + 1, signal.SIGKILL)
@@ -216,6 +219,26 @@ def test_grown_grid_resumed_after_sigkill_covers_each_new_cell_once(harness: _Ha
     assert [t.user_attrs[RERUN_OF_ATTR] for t in trials if RERUN_OF_ATTR in t.user_attrs] == [
         len(_ORIGINAL) + 1
     ]
+
+
+@pytest.mark.integration
+def test_interrupted_old_cell_reruns_in_place_before_the_grown_cells(harness: _Harness) -> None:
+    """A cell interrupted before its grid grew reruns first, in its source's directory with its params and grid_id, and the grown run then draws every other cell once."""
+    original = harness.experiment("interrupted", _gated_phase(_ORIGINAL))
+    harness.interrupt(harness.config(original), 1, signal.SIGKILL)
+    grown = harness.experiment("interrupted", _gated_phase(_GROWN))
+    harness.complete(harness.config(grown))
+
+    trials = phase_trials(grown)
+    source = trials[1]
+    rerun = next(t for t in trials if t.user_attrs.get(RERUN_OF_ATTR) == source.number)
+    assert rerun.number == 2
+    assert rerun.params == source.params
+    assert rerun.system_attrs["grid_id"] == source.system_attrs["grid_id"]
+    assert rerun.user_attrs[TRIAL_DIR_ATTR] == source.user_attrs[TRIAL_DIR_ATTR]
+    complete = [t for t in trials if t.state.name == "COMPLETE"]
+    assert sorted(t.params["optimizer.lr"] for t in complete) == sorted(_GROWN)
+    assert sorted(t.system_attrs["grid_id"] for t in complete) == list(range(len(_GROWN)))
 
 
 @pytest.mark.integration
