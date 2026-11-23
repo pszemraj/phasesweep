@@ -369,6 +369,19 @@ def test_a_json_objective_over_stdout_reads_and_verifies_the_captured_stream(
     assert (attempt_dir / "stdout.log").read_text() == f'{{"loss": {winner.metric}}}\n'
 
 
+def test_a_dotted_captured_stream_spelling_scores_the_captured_stream(tmp_path: Path) -> None:
+    """``log_regex`` with ``file: ./stdout.log`` reads the attempt's captured stdout."""
+    metric = Metric(
+        extractor=LogRegexExtractor(
+            type="log_regex", file="./stdout.log", pattern=r"--x[= ](?P<value>[0-9]+)"
+        )
+    )
+    experiment = make_experiment(workdir=tmp_path / "runs", metric=metric, n_trials=1)
+
+    winner = run_experiment(experiment)["p"]
+    assert winner.metric == float(winner.params["x"])
+
+
 def test_in_memory_runs_never_reuse_a_directory(tmp_path: Path) -> None:
     """Two ``storage: null`` runs restart trial numbers but open distinct directories, named by their attempts."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=0)

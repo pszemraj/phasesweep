@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ CAPTURED_STREAMS = frozenset({"stdout.log", "stderr.log"})
 def is_captured_stream(relative: str | Path) -> bool:
     """Say whether a configured path names one of the attempt's captured streams.
 
+    Config load normalizes every configured path, so an exact name match is the whole test.
+
     :param str | Path relative: Configured trial-relative path.
     :return bool: Whether it is in :data:`CAPTURED_STREAMS`.
     """
@@ -43,17 +46,25 @@ def is_captured_stream(relative: str | Path) -> bool:
 
 
 def _validate_trial_path(value: str) -> str:
-    """Require a non-empty path inside the trial directory.
+    """Require a non-empty path inside the trial directory, normalized.
+
+    The normalized spelling is the one stored and fingerprinted, so ``./stdout.log`` names
+    the captured stream exactly as ``stdout.log`` does and both are one config.
 
     :param str value: Candidate trial-relative path.
-    :raises ValueError: If ``value`` is empty, absolute, escapes upward, or
-        contains a NUL byte that no filesystem call can accept.
-    :return str: Validated trial-relative path.
+    :raises ValueError: If ``value`` is empty, contains a NUL byte that no filesystem call
+        can accept, or after normalization is absolute or escapes upward, which could only
+        fail the trial after it trained.
+    :return str: The normalized trial-relative path.
     """
-    path = Path(value)
-    if not value or "\0" in value or path.is_absolute() or ".." in path.parts:
+    if not value or "\0" in value:
         raise ValueError(f"trial-relative path required; got {value!r}.")
-    return value
+    normalized = Path(posixpath.normpath(value))
+    if normalized.is_absolute() or normalized.parts[:1] == ("..",):
+        raise ValueError(
+            f"trial-relative path required; {value!r} is absolute or leaves the trial directory."
+        )
+    return str(normalized)
 
 
 def _validate_trial_file_path(value: str) -> str:
@@ -64,7 +75,7 @@ def _validate_trial_file_path(value: str) -> str:
     :param str value: Candidate trial-relative file path.
     :raises ValueError: If ``value`` violates the shared path contract or
         resolves to the trial directory itself.
-    :return str: Validated descendant file path.
+    :return str: The normalized descendant file path.
     """
     validated = _validate_trial_path(value)
     if not Path(validated).parts:
@@ -399,11 +410,11 @@ class ArtifactSizeGate(_Frozen):
     @field_validator("path")
     @classmethod
     def _trial_path_is_relative(cls, value: str) -> str:
-        """Validate the trial-relative artifact path.
+        """Validate and normalize the trial-relative artifact path.
 
         :param str value: Candidate trial-relative path.
         :raises ValueError: The path is empty, absolute, escapes upward, or contains NUL.
-        :return str: Validated trial-relative path.
+        :return str: The normalized trial-relative path.
         """
         return _validate_trial_path(value)
 
