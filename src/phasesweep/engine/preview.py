@@ -400,13 +400,11 @@ def _preview_phase(
             )
             phase_fingerprint = verdict.fingerprint
             if verdict.gained:
-                unit = "new cell" if phase.sampler.type == "grid" else "new trial"
                 log.info(
-                    "DRY RUN phase=%s search_space gains %s: keeps its %s, would launch %s.",
+                    "DRY RUN phase=%s search_space gains %s: keeps its %s.",
                     phase.name,
                     describe_gains(verdict.gained, sampler=phase.sampler),
                     plural(finished, "finished trial"),
-                    plural(remaining, unit),
                 )
         else:
             # Its own config was compared before any phase previewed (_reached_study_refusals).

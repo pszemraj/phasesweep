@@ -341,15 +341,16 @@ def test_unused_growth_reverts_without_refusal(tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("retry", [False, True])
 def test_dry_run_of_grown_phase_leaves_the_journal_unchanged(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, retry: bool
 ) -> None:
-    """A dry run and a target validation of a grown phase write nothing and say what the phase keeps and would launch."""
-    trainer, calls = _trainer(tmp_path)
+    """A grown phase's preview counts retries in its launch budget and writes nothing."""
+    trainer, calls = _trainer(tmp_path, fail_once=_ORIGINAL[0] if retry else None)
     run_experiment(_experiment(tmp_path, trainer, _phase(_ORIGINAL)))
     journal = tmp_path / "studies.journal"
     before = journal.read_bytes()
-    grown = _experiment(tmp_path, trainer, _phase(_GROWN))
+    grown = _experiment(tmp_path, trainer, _phase(_GROWN, n_trials=len(_GROWN) + retry))
     caplog.set_level(logging.INFO, logger="phasesweep")
 
     run_experiment(grown, dry_run=True)
@@ -357,10 +358,12 @@ def test_dry_run_of_grown_phase_leaves_the_journal_unchanged(
 
     assert journal.read_bytes() == before
     assert len(_calls(calls)) == len(_ORIGINAL)
-    assert (
-        "DRY RUN phase=p search_space gains lr +1e-05, +0.01, +0.03: keeps its 4 finished trials, "
-        "would launch 3 new cells."
-    ) in caplog.messages
+    growth = [message for message in caplog.messages if "search_space gains" in message]
+    assert growth == [
+        "DRY RUN phase=p search_space gains lr +1e-05, +0.01, +0.03: keeps its 4 finished trials."
+    ]
+    launches = "would launch 4 trials, 1 of them a rerun" if retry else "would launch 3 trials"
+    assert f"DRY RUN phase=p {launches}" in caplog.messages
 
 
 @pytest.mark.integration
