@@ -1388,10 +1388,11 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     The payload is printed first and in full even when it reports a corrupt
     publication: the operator needs the trial counts and generation identity
     to decide what to inspect, and the boundary's one-line diagnostic follows
-    on stderr. A phase whose recorded abort or failure streak would refuse a run gets a
-    comment with that refusal and its fix, active run or not. Otherwise an unpublished winner
-    gets a comment explaining how to resume publication, and trials recorded RUNNING while no
-    run holds the experiment's locks get a comment saying that a rerun settles them; both
+    on stderr. A phase whose recorded abort, failure streak or invalid failure-policy state
+    would refuse a run gets a comment with that refusal and its fix, active run or not.
+    Otherwise an unpublished winner gets a comment explaining how to resume publication,
+    and trials recorded RUNNING while no run holds the experiment's locks get a comment
+    saying that a rerun settles them; both
     require a successful idle lock probe. ``--trials`` prints the trial tables in its place,
     from one publication resolution, with each refusal under its phase's heading, styled only
     on a terminal, and exits the same way.

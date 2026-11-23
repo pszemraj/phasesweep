@@ -29,12 +29,13 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.read import experiment_status, read_result
 from phasesweep.engine.run import TerminalReport
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import Winner
+from phasesweep.engine.state import PHASE_RECOVERY_ATTR, Winner
 from phasesweep.errors import ABORT_START_AGAIN_STEP, START_AGAIN_STEP, operator_step
 from phasesweep.runtime.files import file_sha256
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
+    phase_study,
     requires_nonroot,
     write_experiment_config,
     write_trainer,
@@ -618,6 +619,42 @@ def test_unreadable_unpublished_ledger_keeps_status_yaml_and_exit_code(tmp_path:
     finally:
         ledger.chmod(original_mode)
     assert ledger.read_bytes() == original_bytes
+
+
+@pytest.mark.integration
+def test_malformed_phase_policy_keeps_status_yaml_and_other_refusals(tmp_path: Path) -> None:
+    """A policy diagnostic leaves publication, trial counts and other phase refusals visible."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        "import os, sys\nprint('x=0.5')\nsys.exit(os.environ['PHASESWEEP_PHASE'] == 'next')",
+    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
+    run_experiment(experiment)
+    changed = experiment.model_copy(
+        update={
+            "phases": [
+                *experiment.phases,
+                Phase(name="next", n_trials=1, gpu_policy="none", max_consecutive_failures=1),
+            ]
+        }
+    )
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(changed)
+    config = write_experiment_config(tmp_path / "config.yaml", changed)
+    phase_study(experiment).set_user_attr(PHASE_RECOVERY_ATTR, {"malformed": True})
+    expected = experiment_status(changed)
+    ledger = Path(str(expected["ledger_path"]))
+    original = ledger.read_bytes()
+
+    shown = CliRunner().invoke(cli, ["status", str(config)])
+
+    assert shown.exit_code == 0, shown.output
+    assert "# Study 't::p' has invalid durable failure-policy state:" in shown.stdout
+    assert f"'{PHASE_RECOVERY_ATTR}' has malformed fields" in shown.stdout
+    assert "# Phase 'next' previously aborted at its accepted n_trials=1" in shown.stdout
+    assert yaml.safe_load(shown.stdout) == expected
+    assert expected["publication_integrity"] == "ok"
+    assert ledger.read_bytes() == original
 
 
 def test_in_memory_unpublished_status_describes_a_full_restart(tmp_path: Path) -> None:

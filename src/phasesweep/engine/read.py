@@ -29,7 +29,7 @@ from phasesweep.engine.confound import (
     _confound_summary,
     _validate_confound_block,
 )
-from phasesweep.engine.errors import StudyStorageUnavailableError
+from phasesweep.engine.errors import StudySchemaMismatchError, StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import (
     _experiment_semantic_fingerprint,
     _recorded_config_matches,
@@ -1194,14 +1194,17 @@ def _status_phase_refusal(
 
 def phase_refusals(
     experiment: Experiment, ledger: ValidatedLedger
-) -> dict[str, PhaseAbortRefusedError]:
-    """Give the refusal each phase's recorded abort or failure streak would meet on a run.
+) -> dict[str, PhaseAbortRefusedError | StudySchemaMismatchError]:
+    """Give the refusal each phase's recorded failure policy would meet on a run.
+
+    Invalid policy state is reported for its phase alongside other refusals. It does not
+    prevent status from reporting trial counts and publication facts.
 
     :param Experiment experiment: Current config, which decides whether a recorded abort is
         retired.
     :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
-    :return dict[str, PhaseAbortRefusedError]: The refusal :func:`phasesweep.engine.selection._phase_refusal`
-        builds, by phase name, for each phase that has one; empty without a readable ledger.
+    :return dict[str, PhaseAbortRefusedError | StudySchemaMismatchError]: Refusals or invalid
+        policy diagnostics by phase name; empty without a readable ledger.
     """
     if not experiment.persistent:
         return {}
@@ -1209,12 +1212,16 @@ def phase_refusals(
         studies = read_phase_studies(ledger)
     except StudyStorageUnavailableError:
         return {}
-    refusals: dict[str, PhaseAbortRefusedError] = {}
+    refusals: dict[str, PhaseAbortRefusedError | StudySchemaMismatchError] = {}
     for phase in experiment.phases:
         study = studies[phase.name]
         if study is None:
             continue
-        refusal = _status_phase_refusal(experiment, phase, study)
+        try:
+            refusal = _status_phase_refusal(experiment, phase, study)
+        except StudySchemaMismatchError as exc:
+            refusals[phase.name] = exc
+            continue
         if refusal is not None:
             refusals[phase.name] = refusal
     return refusals
