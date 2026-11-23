@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import typing
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -222,6 +223,18 @@ class _AcceptedPartialDecision:
     finished_trials: int
     completed_trials: int
     timeout_scope: str
+
+
+def _at_accepted_partial_target(
+    decision: _AcceptedPartialDecision | None, phase: Phase
+) -> typing.TypeGuard[_AcceptedPartialDecision]:
+    """Check whether the phase is still at its accepted partial target.
+
+    :param _AcceptedPartialDecision | None decision: Recorded decision, if any.
+    :param Phase phase: Phase whose current target is being judged.
+    :return bool: Whether the decision governs this target before failure-policy checks.
+    """
+    return decision is not None and phase.n_trials == decision.trial_target
 
 
 class _AllocationRecord(TypedDict):
@@ -1523,8 +1536,8 @@ def _reached_study_refusals(
                 _validate_trial_target(study, phase)
                 partial = _load_accepted_partial_decision(study)
                 finished = _finished_trial_count(study.get_trials(deepcopy=False))
-                needs_new_trials = phase.n_trials > finished and not (
-                    partial is not None and phase.n_trials == partial.trial_target
+                needs_new_trials = phase.n_trials > finished and not _at_accepted_partial_target(
+                    partial, phase
                 )
             else:
                 # Recovery keeps each RUNNING attempt's environment, so the snapshot's cohort

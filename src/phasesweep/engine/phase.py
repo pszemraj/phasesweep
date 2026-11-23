@@ -85,6 +85,7 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import (
     _abort_record,
     _AcceptedPartialDecision,
+    _at_accepted_partial_target,
     _consecutive_failure_threshold_tripped,
     _failure_policy_abort_record,
     _initialize_study_schema,
@@ -522,7 +523,7 @@ def _judge_recorded_phase(
     dependents = experiment.phases_inheriting(phase.name)
     _validate_trial_target(study, phase)
     partial_decision = _load_accepted_partial_decision(study)
-    if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
+    if _at_accepted_partial_target(partial_decision, phase):
         # Replay the accepted timeout boundary only while incomplete results remain enabled.
         if not phase.allow_incomplete_on_timeout:
             raise WinnerIntegrityError(

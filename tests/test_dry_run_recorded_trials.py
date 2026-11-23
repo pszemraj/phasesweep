@@ -50,13 +50,16 @@ from phasesweep.errors import PhaseSweepError
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     bounded_metric,
+    invoke_cli_boundary,
     make_experiment,
     phase_study,
     phase_trials,
     record_accepted_partial_timeout,
     requires_nonroot,
     trial_outcome,
+    write_experiment_config,
     write_flaky_trainer,
+    write_trial_zero_trainer,
 )
 from tests.ledger_fixtures import forbid_file_backed_storage, tree_changes, tree_snapshot
 from tests.recovery_helpers import new_phase_study, stamp_artifact_root
@@ -338,6 +341,36 @@ def test_accepted_partial_timeout_previews_a_replay_and_launches_nothing(
     _refusals_match(
         refusing, tmp_path, WinnerIntegrityError, "accepted an incomplete result at 2/4 finished"
     )
+
+
+@pytest.mark.integration
+def test_status_respects_accepted_partial_replay_before_reporting_a_failure_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Both status formats honor a phase's accepted target ahead of the current failure limit."""
+    trainer = write_trial_zero_trainer(tmp_path, otherwise="raise SystemExit(1)")
+    original = _persistent(tmp_path, _phase("a", 2), trainer=trainer)
+    run_experiment(original)
+    study = phase_study(original, "a")
+    accepting = _persistent(
+        tmp_path,
+        _phase("a", 4, allow_incomplete_on_timeout=True, max_consecutive_failures=1),
+        trainer=trainer,
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", accepting)
+
+    record_accepted_partial_timeout(study, 4)
+    assert _preview(accepting, tmp_path, caplog) == [
+        "DRY RUN phase=a accepted a partial result at 2 of 4 trials: would replay it and "
+        "launch no trials",
+    ]
+    for mode in ([], ["--trials"]):
+        assert invoke_cli_boundary(["status", str(config), *mode], monkeypatch) == 0
+        output = capsys.readouterr().out
+        assert "consecutive failed/infeasible trials" not in output
 
 
 @pytest.mark.integration

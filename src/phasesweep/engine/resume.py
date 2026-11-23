@@ -187,7 +187,7 @@ def _reject_bound_descendant_topups(
         if finished >= phase.n_trials:
             continue
         partial_decision = study_policy_ops._load_accepted_partial_decision(study)
-        if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
+        if study_policy_ops._at_accepted_partial_target(partial_decision, phase):
             # The phase has already committed a terminal accepted-timeout
             # decision at this exact target. Identical replay performs only
             # deterministic selection; its unused slots are not a top-up.
