@@ -25,7 +25,7 @@
 experiment: string (required)
 
 # Shell command template that runs one trainer attempt under /bin/sh -c in execution.cwd, with the trainer environment rather than the shell's. It must exit 0 and leave nothing it started running.
-# {trial_dir} is the absolute attempt directory, {trial_id} the phase's trial number, {phase} its name, {run_name} <experiment>-<phase>-<trial_id>-<attempt ID>.
+# {trial_dir} is the absolute trial directory, {trial_id} the phase's trial number, {phase} its name, {run_name} <experiment>-<phase>-<trial_id>-<attempt ID>; an interrupted trial's rerun keeps all four, those of the attempt that opened the directory.
 # {config_path}, {overrides} or {overrides_path} carries the trainer input, as override_format says, for example python train.py --config {config_path}.
 # PhaseSweep shell-quotes every placeholder but {trial_id}. Write {{ and }} for literal braces and $VAR or ${{VAR}} for a shell variable.
 # Unknown placeholders, attribute or index access, format specs such as {trial_id:05d}, conversions such as {phase!r}, or unbalanced braces fail config load.
@@ -77,7 +77,7 @@ phases: list[object] (required)
   - name: string (required)
 
     # Target number of finished attempts, an integer >= 1. COMPLETE, INFEASIBLE and FAIL attempts count, and interrupted ones do not.
-    # An interrupted attempt reruns from scratch as a new attempt in a new directory, so the trainer's own checkpoint-resume logic does not find the earlier attempt's files.
+    # An interrupted attempt reruns as a new attempt with the same command in the same trial directory, so the trainer's own checkpoint-resume logic continues it; the rerun must write its result files again.
     # When the target is reached with no eligible feasible attempt, the phase fails.
     # On persistent storage a raised target runs the remaining attempts in the same study, and a lowered one is refused.
     # While a phase that inherits from this one, even indirectly, has trials, a run that would add trials here is refused. Give each phase that inherits this one a new `name`, updating every `inherits` to match: this phase keeps its finished trials and runs the rest, and the renamed phases start new studies and run again. A new experiment name reruns every phase.

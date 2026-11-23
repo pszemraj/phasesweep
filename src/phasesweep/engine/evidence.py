@@ -15,7 +15,7 @@ from phasesweep.config.models import Experiment, Phase, _wandb_query
 from phasesweep.engine.errors import (
     TrialEvidenceMissingError,
 )
-from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trial_dir_for
+from phasesweep.engine.paths import _attempt_dir, _phase_dir
 from phasesweep.engine.repeats import evidence_members
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -28,6 +28,7 @@ from phasesweep.engine.state import (
     Winner,
     constraint_attr,
 )
+from phasesweep.engine.trial_dirs import _expected_trial_dir_name
 from phasesweep.errors import (
     NEW_STUDY_STEP,
     OTHER_FORMAT_STEP,
@@ -676,7 +677,8 @@ def _validate_selection_evidence(
         phase_dir = _phase_dir(experiment, phase_name)
         phase = experiment.phase(phase_name)
         verification = _EvidenceVerification(experiment, phase)
-        for trial in study.get_trials(deepcopy=False):
+        trials = {trial.number: trial for trial in study.get_trials(deepcopy=False)}
+        for trial in trials.values():
             identity = _selection_candidate_identity(trial)
             if identity is None:
                 continue
@@ -692,17 +694,16 @@ def _validate_selection_evidence(
                     f"{subject} records an invalid {TRIAL_DIR_ATTR!r} user attribute "
                     f"{stored!r}, so its evidence cannot be located."
                 )
-            # Identity binding: the persisted directory name must be exactly the
-            # one _trial_dir_for builds for this trial's number and attempt. A name
-            # that disagrees means the study record and the directory are not
-            # describing the same execution.
-            expected_name = _trial_dir_for(
-                experiment, phase_name, trial.number, attempt_id=attempt_id
-            ).name
-            if Path(stored).name != expected_name:
+            # Identity binding: the persisted directory name must be exactly the one
+            # _trial_dir_for builds for the trial and attempt that opened it, this trial's
+            # own or, for a rerun that continued an interrupted trial, that trial's. A name
+            # that disagrees means the study record and the directory are not describing
+            # the same execution.
+            expected_name = _expected_trial_dir_name(trials, trial)
+            if expected_name is None or Path(stored).name != expected_name:
                 raise TrialEvidenceMissingError(
                     f"{subject} records evidence directory {Path(stored).name!r}, which does "
-                    f"not name this trial's own attempt (expected {expected_name!r})."
+                    f"not name the attempt that opened it (expected {expected_name!r})."
                 )
             verification.verify_trial(
                 trial,

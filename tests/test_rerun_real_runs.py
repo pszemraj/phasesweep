@@ -75,10 +75,22 @@ class _Harness:
         self.trainer = write_trainer(
             root / "gated_train.py",
             f"""
-            import os, sys, time
+            import hashlib, os, sys, time
             from pathlib import Path
             gate = Path({str(self.gate)!r})
-            trial = os.environ["PHASESWEEP_TRIAL_ID"]
+            # A rerun sees the trial id of the trial whose directory it continues, so the
+            # gate counts each phase directory's launches instead: every trial number
+            # launches once, in order.
+            phase_dir = str(Path(os.environ["PHASESWEEP_TRIAL_DIR"]).parent)
+            launches = gate / "launches" / hashlib.sha256(phase_dir.encode()).hexdigest()
+            launches.mkdir(parents=True, exist_ok=True)
+            trial = 0
+            while True:
+                try:
+                    os.close(os.open(launches / str(trial), os.O_CREAT | os.O_EXCL))
+                    break
+                except FileExistsError:
+                    trial += 1
             if (gate / f"hold-{{trial}}").exists():
                 (gate / f"reached-{{trial}}").touch()
                 while (gate / f"hold-{{trial}}").exists():

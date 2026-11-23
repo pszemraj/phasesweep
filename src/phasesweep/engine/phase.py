@@ -20,6 +20,7 @@ from phasesweep.config.search import sampler_search_space
 from phasesweep.engine.artifacts import _warn_environment_drift, _write_trials_csv
 from phasesweep.engine.attempts import (
     _active_attempt_persistence_error,
+    _cleanup_recovered_trial_numbers,
     _register_active_attempt,
     _retire_active_attempt,
     _trial_requires_cleanup_recovery,
@@ -43,7 +44,7 @@ from phasesweep.engine.optuna import (
     _finished_trial_count,
     _suggest,
 )
-from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trial_dir_for, _trials_csv_path
+from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trials_csv_path
 from phasesweep.engine.progress import (
     _log_finished_trial,
     _log_reruns,
@@ -114,6 +115,7 @@ from phasesweep.engine.trial import (
     record_trial_result,
     trial_run_name,
 )
+from phasesweep.engine.trial_dirs import _trial_dir_for_attempt
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import (
     ABORT_START_AGAIN_STEP,
@@ -1112,7 +1114,22 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     overrides = _composed_overrides(experiment, phase, sampled, run.inherited_winners)
 
     attempt_id = uuid4().hex
-    trial_dir = _trial_dir_for(experiment, phase.name, trial.number, attempt_id=attempt_id)
+    # An interrupted trial's rerun continues in its directory, under the opener's names.
+    try:
+        trials = {frozen.number: frozen for frozen in run.study.get_trials(deepcopy=False)}
+        directory = _trial_dir_for_attempt(
+            experiment,
+            phase.name,
+            trials,
+            trials[trial.number],
+            attempt_id=attempt_id,
+            recovered=frozenset(_cleanup_recovered_trial_numbers(run.study)),
+        )
+    except ProcessCleanupUncertainError as exc:
+        run.record_fatal(exc)
+        raise _TrialLeftRunning(exc) from exc
+    trial_dir = directory.path
+    opened_by = (directory.opener_number, directory.opener_attempt_id)
     attempt_dir = _attempt_dir(_phase_dir(experiment, phase.name), attempt_id)
     # Persist allocated before discovery and GPU waiting; no identity then means no launch.
     try:
@@ -1147,8 +1164,8 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         prepared_input = prepare_trainer_input(
             experiment=experiment,
             phase_name=phase.name,
-            trial_id=trial.number,
-            attempt_id=attempt_id,
+            trial_id=opened_by[0],
+            attempt_id=opened_by[1],
             trial_dir=trial_dir,
             overrides=overrides,
         )
@@ -1162,7 +1179,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     phase=phase.name,
                     generation_id=run.generation_id,
                     attempt_id=attempt_id,
-                    run_name=trial_run_name(experiment, phase.name, trial.number, attempt_id),
+                    run_name=trial_run_name(experiment, phase.name, *opened_by),
                     overrides_sha256=prepared_input.sha256,
                     inherited=run.inherited_winners,
                     directory=attempt_dir,
@@ -1200,6 +1217,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     attempt_id=attempt_id,
                     trial_dir=trial_dir,
                     attempt_dir=attempt_dir,
+                    opened_by=opened_by,
                     overrides=overrides,
                     timeout_seconds=phase.timeout_seconds_per_trial,
                     wallclock_deadline=run.optimize_deadline,

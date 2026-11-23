@@ -728,6 +728,7 @@ def launch_trial(
     attempt_id: str,
     trial_dir: Path,
     attempt_dir: Path,
+    opened_by: tuple[int, str] | None = None,
     overrides: dict[str, Any],
     timeout_seconds: float | None,
     wallclock_deadline: float | None = None,
@@ -748,6 +749,10 @@ def launch_trial(
     :param Path trial_dir: Resolved trial directory, the trainer's; created if missing.
     :param Path attempt_dir: The attempt's records directory: command, streams, environment
         record, tracker bindings and process slot; created if missing.
+    :param tuple[int, str] | None opened_by: Trial number and attempt that opened
+        ``trial_dir``, whose names ``{trial_id}``, ``{run_name}``, ``PHASESWEEP_TRIAL_ID`` and
+        ``PHASESWEEP_RUN_NAME`` carry so a rerun continuing in it runs the same command;
+        defaults to this trial and attempt.
     :param dict overrides: Inherited, fixed, and sampled overrides.
     :param float | None timeout_seconds: Optional per-trial wallclock budget.
     :param float | None wallclock_deadline: Absolute phase/run deadline including launch
@@ -769,14 +774,15 @@ def launch_trial(
     workdir.mkdir(parents=True, exist_ok=True)
     attempt_dir.mkdir(parents=True, exist_ok=True)
     # Trial artifacts use ordinary paths in the operator-trusted workdir.
-    run_name = trial_run_name(experiment, phase_name, trial_id, attempt_id)
+    opener_number, opener_attempt = opened_by or (trial_id, attempt_id)
+    run_name = trial_run_name(experiment, phase_name, opener_number, opener_attempt)
     trainer_input = prepared_input
     cmd = render_command(
         experiment.trial_command,
         overrides,
         experiment.override_format,
         trial_dir=workdir,
-        trial_id=trial_id,
+        trial_id=opener_number,
         phase=phase_name,
         run_name=run_name,
         trainer_config=experiment.trainer_config,
@@ -806,7 +812,7 @@ def launch_trial(
         raise TrialExecutionError(missing_cwd)
     trainer_cwd = experiment.execution.resolved_cwd()
     env["PHASESWEEP_TRIAL_DIR"] = str(workdir)
-    env["PHASESWEEP_TRIAL_ID"] = str(trial_id)
+    env["PHASESWEEP_TRIAL_ID"] = str(opener_number)
     env["PHASESWEEP_PHASE"] = phase_name
     env["PHASESWEEP_RUN_NAME"] = run_name
     env["PHASESWEEP_GENERATION_ID"] = generation_id
