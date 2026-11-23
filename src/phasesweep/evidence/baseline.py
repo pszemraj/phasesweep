@@ -13,14 +13,23 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, assert_never
 
 from phasesweep.evidence.models import (
     ArtifactSizeGate,
+    Gate,
+    JsonEnvelopeExtractor,
     JsonEqualsGate,
     JsonExtractor,
     JsonScalarBoundGate,
     LogRegexExtractor,
+    MlflowExtractor,
+    MlflowRequiredGate,
+    ObjectiveExtractor,
+    RequiredFileGate,
+    Sha256Gate,
+    WandbExtractor,
+    WandbSummaryRequiredGate,
 )
 from phasesweep.runtime.files import atomic_write_text
 from phasesweep.runtime.json import strict_json_loads
@@ -46,34 +55,63 @@ class FileStamp(NamedTuple):
 EvidenceBaseline = Mapping[str, FileStamp]
 
 
+def _extractor_value_path(extractor: ObjectiveExtractor) -> str | None:
+    """Return the trial-relative file an extractor reads its value from, if it reads one.
+
+    Every extractor type is named, so a new one is a type error here until it says whether
+    it reads a file in the trial directory. ``json_envelope`` is left out: the envelope
+    names the attempt that wrote it. A captured stream is the attempt's own already.
+
+    :param ObjectiveExtractor extractor: A metric, constraint or observation extractor.
+    :return str | None: The path, or ``None`` when the value comes from no trial file.
+    """
+    from phasesweep.evidence.evaluation import CAPTURED_STREAMS
+
+    if isinstance(extractor, JsonExtractor):
+        return extractor.path
+    if isinstance(extractor, LogRegexExtractor):
+        return None if extractor.file in CAPTURED_STREAMS else extractor.file
+    if isinstance(extractor, JsonEnvelopeExtractor | WandbExtractor | MlflowExtractor):
+        return None
+    assert_never(extractor)
+
+
+def _gate_value_path(gate: Gate) -> str | None:
+    """Return the trial-relative file a gate reads a value from, if it reads one.
+
+    Every gate type is named, so a new one is a type error here until it says whether it
+    reads a value from a file in the trial directory. ``required_file``, ``sha256`` and file
+    or directory ``artifact_size`` gates test the trial's artifacts whichever attempt wrote
+    them, so they are left out.
+
+    :param Gate gate: A phase gate.
+    :return str | None: The path, or ``None`` when the gate reads no value from a trial file.
+    """
+    if isinstance(gate, JsonEqualsGate | JsonScalarBoundGate):
+        return gate.path
+    if isinstance(gate, ArtifactSizeGate):
+        return gate.path if gate.source == "json" else None
+    if isinstance(
+        gate, RequiredFileGate | Sha256Gate | WandbSummaryRequiredGate | MlflowRequiredGate
+    ):
+        return None
+    assert_never(gate)
+
+
 def _value_paths(experiment: Experiment, phase: Phase) -> Iterator[str]:
     """Yield every trial-relative path a value is read from.
-
-    The ``json_envelope`` extractor is left out: the envelope names the attempt that wrote
-    it. ``required_file``, ``sha256`` and file or directory ``artifact_size`` gates test the
-    trial's artifacts whichever attempt wrote them, so they are left out too.
 
     :param Experiment experiment: Metric, constraints and observations.
     :param Phase phase: Gates of the phase the attempt runs in.
     :return Iterator[str]: The paths, possibly repeated.
     """
-    from phasesweep.evidence.evaluation import CAPTURED_STREAMS
-
-    readers = [
-        experiment.metric.extractor,
-        *(constraint.extractor for constraint in experiment.constraints),
-        *(observation.extractor for observation in experiment.observe),
+    paths = [
+        _extractor_value_path(experiment.metric.extractor),
+        *(_extractor_value_path(constraint.extractor) for constraint in experiment.constraints),
+        *(_extractor_value_path(observation.extractor) for observation in experiment.observe),
+        *(_gate_value_path(gate) for gate in phase.gates),
     ]
-    for reader in readers:
-        if isinstance(reader, JsonExtractor):
-            yield reader.path
-        elif isinstance(reader, LogRegexExtractor) and reader.file not in CAPTURED_STREAMS:
-            yield reader.file
-    for gate in phase.gates:
-        if isinstance(gate, JsonEqualsGate | JsonScalarBoundGate) or (
-            isinstance(gate, ArtifactSizeGate) and gate.source == "json"
-        ):
-            yield gate.path
+    yield from (path for path in paths if path is not None)
 
 
 def file_stamp(path: Path) -> FileStamp | None:
