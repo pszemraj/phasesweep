@@ -17,9 +17,11 @@ from phasesweep.config.models import Experiment
 from phasesweep.engine import phase as phase_module
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.optuna import _trial_count_state
+from phasesweep.engine.paths import _run_log_path
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    DURATION_ATTR,
     TRIAL_OUTCOME_ATTR,
     _parsed_trial_outcome,
     _trial_attempt_dir,
@@ -164,7 +166,7 @@ def test_a_shutdown_interrupts_only_a_trainer_phasesweep_stopped(
 def test_a_crash_keeps_its_failure_when_a_ctrl_c_lands_in_the_helper_settle(
     tmp_path: Path,
 ) -> None:
-    """A trainer that exited 1 keeps its failure and stderr reason when Ctrl-C reaches the run during the guardian's helper settle."""
+    """A trainer that exited 1 keeps its failure and stderr reason when Ctrl-C reaches the run during the guardian's helper settle, and its trial line prints exactly once across the stopped run and the next."""
     exited = tmp_path / "exited"
     experiment = _exec_trainer(
         tmp_path,
@@ -188,13 +190,19 @@ def test_a_crash_keeps_its_failure_when_a_ctrl_c_lands_in_the_helper_settle(
     assert _outcome(trial) == ("FAIL", "non-zero exit code 1; stderr: loss went NaN at step 7")
     assert _load_phase_policy_state(phase_study(experiment)).consecutive_failures == 1
     assert _record_reruns(phase_study(experiment)) == []
+    # The failure's trial line prints once, whichever run settles it, and the rerun has
+    # nothing left to settle or run.
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+    run_log = _run_log_path(experiment).read_text()
+    assert run_log.count("phasesweep.report p  trial 0  FAIL  ") == 1
 
 
 @pytest.mark.integration
 def test_a_crash_whose_runner_was_killed_is_recovered_as_a_failure_that_trips_the_streak(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A trainer that exited 1 while its runner was SIGKILLed is recovered as that failure, and ``max_consecutive_failures: 1`` aborts instead of rerunning it."""
+    """A trainer that exited 1 while its runner was SIGKILLed is recovered as that failure with its trainer time, and ``max_consecutive_failures: 1`` aborts instead of rerunning it."""
     exited = tmp_path / "exited"
     experiment = _exec_trainer(
         tmp_path,
@@ -235,6 +243,8 @@ def test_a_crash_whose_runner_was_killed_is_recovered_as_a_failure_that_trips_th
         "FAIL",
         "non-zero exit code 1; stderr: assertion failed in data loader",
     )
+    # The trainer's time comes from its lifecycle record, as a recovered success's does.
+    assert trial.user_attrs[DURATION_ATTR] == lifecycle.duration_seconds
     # Recovery reports the crash as the trial's own line, noted recovered, not as a warning.
     (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("p  trial 0")]
     assert line.startswith("p  trial 0  FAIL  ")

@@ -49,6 +49,7 @@ from phasesweep.engine.state import (
 from phasesweep.errors import (
     FRESH_STUDY,
     OperatorAction,
+    PhaseSweepError,
     ProcessCleanupUncertainError,
     format_mismatch,
     operator_step,
@@ -62,7 +63,7 @@ from phasesweep.runtime.files import (
     read_private_text_at,
     storage_recovery_locator,
 )
-from phasesweep.runtime.json import json_text, strict_json_loads
+from phasesweep.runtime.json import finite_nonnegative, json_text, strict_json_loads
 from phasesweep.runtime.process import (
     AttemptLifecycle,
     _record_attempt_exited,
@@ -1504,6 +1505,13 @@ def _fail_stale_running_trial(
             crashed = _record_unfinished_trial_outcome(
                 study, trial, record=record, experiment=experiment
             )
+        elif outcome.outcome == "failure" and record is not None:
+            # A run stopped right after recording a crash leaves its settlement here, which
+            # times it and prints its line as for a crash recovery records itself. The line
+            # never blocks the settlement.
+            _save_failed_trainer_duration(study, trial, _attempt_lifecycle(record))
+            with contextlib.suppress(PhaseSweepError, StopIteration):
+                crashed = _producing_phase(record, experiment)
         _record_cleanup_recovery(study, trial)
         try:
             study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
@@ -1544,23 +1552,19 @@ def _record_unfinished_trial_outcome(
     from phasesweep.engine.trial import _trainer_failure_reason
 
     reason = None
+    lifecycle = None
     if record is not None:
-        try:
-            lifecycle = read_attempt_lifecycle(
-                record.attempt_dir, expected_attempt_id=record.attempt_id
-            )
-        except ValueError:
-            lifecycle = None
+        lifecycle = _attempt_lifecycle(record)
         reason = _trainer_failure_reason(trial, lifecycle, record.attempt_dir)
     if reason is None or record is None:
         _record_stale_trial_outcome(study, trial)
         return None
-    policy_phase = None
-    producing = experiment
-    if record.generation_id is not None and experiment is not None:
-        producing = _load_generation_experiment(_experiment_dir(experiment), record.generation_id)
-        policy_phase = producing.phase(record.phase_name)
+    # The failure counts under its producing phase's policy, known only with its generation.
+    known = record.generation_id is not None
+    crashed = _producing_phase(record, experiment) if known else None
+    policy_phase = None if crashed is None else crashed[0]
     _record_stale_trial_outcome(study, trial, "failure", cause=reason, policy_phase=policy_phase)
+    _save_failed_trainer_duration(study, trial, lifecycle)
     if FAILURE_REASON_ATTR not in trial.user_attrs:
         try:
             optuna.Trial(study, trial._trial_id).set_user_attr(FAILURE_REASON_ATTR, reason)
@@ -1569,9 +1573,65 @@ def _record_unfinished_trial_outcome(
                 f"The failure of stale RUNNING trial {trial.number} in study "
                 f"{study.study_name!r} was recorded, but its reason could not be saved."
             ) from exc
-    if producing is None:
+    return crashed if known else _producing_phase(record, experiment)
+
+
+def _attempt_lifecycle(record: _AttemptRecord) -> AttemptLifecycle | None:
+    """Read an attempt's lifecycle record, ``None`` when it is missing or unreadable.
+
+    :param _AttemptRecord record: The attempt, whose directory holds the record.
+    :return AttemptLifecycle | None: The validated record, if one could be read.
+    """
+    try:
+        return read_attempt_lifecycle(record.attempt_dir, expected_attempt_id=record.attempt_id)
+    except ValueError:
         return None
+
+
+def _producing_phase(
+    record: _AttemptRecord, experiment: Experiment | None
+) -> tuple[Phase, Experiment] | None:
+    """Return the configuration that produced an attempt, and its phase there.
+
+    :param _AttemptRecord record: The attempt, naming its generation and phase.
+    :param Experiment | None experiment: Recovery invocation supplying the artifact root.
+    :raises WinnerIntegrityError: The generation's configuration snapshot is unavailable.
+    :raises StopIteration: That configuration has no such phase.
+    :return tuple[Phase, Experiment] | None: The phase and configuration, the invocation's own
+        when the attempt names no generation, or ``None`` without an invocation.
+    """
+    if experiment is None:
+        return None
+    producing = experiment
+    if record.generation_id is not None:
+        producing = _load_generation_experiment(_experiment_dir(experiment), record.generation_id)
     return producing.phase(record.phase_name), producing
+
+
+def _save_failed_trainer_duration(
+    study: optuna.Study, trial: optuna.trial.FrozenTrial, lifecycle: AttemptLifecycle | None
+) -> None:
+    """Save a settled failure's trainer time from its lifecycle record, as a live failure saves it.
+
+    A time the trial already recorded is kept.
+
+    :param optuna.Study study: Owning study.
+    :param optuna.trial.FrozenTrial trial: The stale trial settled as a failure.
+    :param AttemptLifecycle | None lifecycle: Its attempt's lifecycle record, if one was read.
+    :raises StudyStorageUnavailableError: The time could not be saved.
+    """
+    if DURATION_ATTR in trial.user_attrs or lifecycle is None:
+        return
+    seconds = finite_nonnegative(lifecycle.duration_seconds)
+    if seconds is None:
+        return
+    try:
+        optuna.Trial(study, trial._trial_id).set_user_attr(DURATION_ATTR, float(seconds))
+    except Exception as exc:
+        raise StudyStorageUnavailableError(
+            f"The failure of stale RUNNING trial {trial.number} in study "
+            f"{study.study_name!r} was recorded, but its trainer time could not be saved."
+        ) from exc
 
 
 def _cleanup_recovered_trial_numbers(study: optuna.Study) -> set[int]:
