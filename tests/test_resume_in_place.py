@@ -15,6 +15,7 @@ from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _verify_winner_evidence
+from phasesweep.engine.ledger import read_phase_trials, validate_ledger
 from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trial_dir_for
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
@@ -30,6 +31,7 @@ from phasesweep.evidence.baseline import read_evidence_baseline, write_evidence_
 from phasesweep.evidence.evaluation import ExtractorError, run_extractor
 from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
+from phasesweep.tracking import publication, session
 from tests.conftest import (
     make_experiment,
     make_trial_context,
@@ -41,6 +43,7 @@ from tests.conftest import (
     write_trainer,
 )
 from tests.recovery_helpers import write_trial_identity
+from tests.tracking_helpers import killed_sweep
 
 _JSON_METRIC = Metric(extractor=JsonExtractor(type="json", path="r.json", key="loss"))
 _RUNNER = (
@@ -235,6 +238,39 @@ def test_a_reruns_winner_verifies_in_its_owners_directory(tmp_path: Path) -> Non
         TrialEvidenceMissingError, match="recorded its objective evidence in 'r.json'"
     ):
         _verify_winner_evidence(experiment, phase, winner)
+
+
+def test_each_attempt_in_a_directory_delivers_its_own_mlflow_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A killed run's attempt and the next run's in-place rerun each keep their own MLflow binding and run: the stopped one ends KILLED, the accepted rerun's is left to its trainer, and nothing stays pending."""
+    experiment, uploads, [stopped] = killed_sweep(tmp_path, monkeypatch, n_jobs=1)
+
+    run_experiment(experiment)
+
+    first, rerun = read_phase_trials(validate_ledger(experiment), "depth").trials
+    assert rerun.user_attrs[RERUN_OF_ATTR] == first.number
+    assert rerun.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
+    resumed = rerun.user_attrs[ATTEMPT_ID_ATTR]
+    phase_dir = _phase_dir(experiment, "depth")
+    bindings = {
+        path.parent.name: session.read_binding(path.parent)
+        for path in phase_dir.glob(f"attempts/*/{session.BINDING_FILE}")
+    }
+    assert set(bindings) == {stopped, resumed}
+    assert not (Path(first.user_attrs[TRIAL_DIR_ATTR]) / session.BINDING_FILE).exists()
+    # The rerun runs in a later generation than the attempt it replaces, under its own run.
+    assert bindings[stopped]["generation_id"] != bindings[resumed]["generation_id"]
+    assert bindings[stopped]["run_id"] != bindings[resumed]["run_id"]
+    # PhaseSweep finishes the stopped attempt's run; an accepted attempt's run is the
+    # trainer's to end, so its record carries the result and no status.
+    finishes = {
+        record["binding"]["attempt_id"]: record["finish"]
+        for record in uploads
+        if str(record["name"]).startswith("attempt-")
+    }
+    assert finishes == {stopped: "KILLED", resumed: None}
+    assert publication.sync_tracking(experiment)["pending"] == 0
 
 
 def test_a_retried_grid_cell_gets_a_fresh_directory(tmp_path: Path) -> None:
