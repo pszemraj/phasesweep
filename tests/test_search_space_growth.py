@@ -524,6 +524,30 @@ def test_repeat_values_change_refused() -> None:
     assert error.remediation == f"Restore the recorded value(s), or {_RENAME}."
 
 
+@pytest.mark.integration
+def test_singleton_float_range_grows_when_its_value_is_on_the_new_lattice(tmp_path: Path) -> None:
+    """A TPE study keeps its single-value trial when the wider stepped range includes it."""
+    sampler = Sampler(type="tpe", seed=0, n_startup_trials=1)
+    trainer, calls = _trainer(tmp_path)
+    original = _phase([], n_trials=1, sampler=sampler, param=_float(0.2, 0.2))
+    experiment = _experiment(tmp_path, trainer, original)
+    run_experiment(experiment)
+    before = phase_trials(experiment)
+
+    off_lattice = _phase([], n_trials=3, sampler=sampler, param=_float(0.1, 0.5, step=0.2))
+    with pytest.raises(StudyFingerprintMismatchError, match=r"search_space 'lr' dropped 0\.2"):
+        run_experiment(_experiment(tmp_path, trainer, off_lattice), dry_run=True)
+    assert _calls(calls) == [0.2]
+
+    grown = _phase([], n_trials=3, sampler=sampler, param=_float(0.1, 0.3, step=0.1))
+    experiment = _experiment(tmp_path, trainer, grown)
+    run_experiment(experiment, dry_run=True)
+    run_experiment(experiment)
+    trials = phase_trials(experiment)
+    assert trials[:1] == before
+    assert [trial.state for trial in trials] == [optuna.trial.TrialState.COMPLETE] * 3
+
+
 def test_partly_drawn_repeat_slot_keeps_its_range_after_growth() -> None:
     """A seeded random repeats configuration drawn partly before its range widened draws its other members from the old range."""
     repeats = Repeats(key="seed", values=[0, 1, 2])
@@ -603,10 +627,13 @@ def _choices(*values: object) -> SearchParam:
         (_float(0.0, 1.0, step=0.2), _float(0.0, 2.0, step=0.1), _RANDOM, "grows"),
         (_float(0.0, 1.0, step=0.2), _float(0.0, 1.2, step=0.3), _RANDOM, "dropped"),
         (_float(0.0, 1.0), _float(0.0, 1.0, step=0.5), _RANDOM, "dropped"),
+        (_float(0.2, 0.2, step=0.05), _float(0.1, 0.3, step=0.1), _RANDOM, "grows"),
         (_float(0.0, 1.0, step=0.5), _float(-1.0, 1.0), _RANDOM, "grows"),
         (_float(0.1, 1.0), _float(0.2, 1.0), _RANDOM, "dropped"),
         (_int(0, 10), _int(1, 10), _RANDOM, "dropped"),
         (_int(0, 10, 2), _int(1, 11, 2), _RANDOM, "dropped"),
+        (_int(2, 2), _int(0, 4, 2), _RANDOM, "grows"),
+        (_int(2, 2), _int(1, 5, 2), _RANDOM, "dropped"),
         (_float(0.1, 1.0, log=True), _float(0.1, 2.0), _RANDOM, "refused"),
         (_int(0, 10), _float(0.0, 10.0), _RANDOM, "refused"),
         (_choices(1, 2), _choices(1, 2, 3), Sampler(type="tpe", seed=0), CHOICES_ROUTE),

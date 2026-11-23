@@ -9,8 +9,9 @@ text, so ``1`` and ``1.0``, or ``true`` and ``1``, are a removal plus an additio
   fixes a categorical's choices for the life of a study, and its journal drops a param whose
   choices changed when another process replays it.
 - Seeded random and TPE gain values when an int or float range keeps its type and ``log``,
-  reaches at least as low and as high, and keeps the old step lattice inside the new one. TPE
-  re-encodes earlier trials with the current distribution, so it continues soundly. Choices
+  reaches at least as low and as high, and keeps its drawable values. A singleton contributes
+  one point to the new lattice regardless of its old step. TPE re-encodes earlier trials with
+  the current distribution, so it continues soundly. Choices
   under these samplers are categorical, so they cannot grow.
 - CMA-ES uses only the params whose distribution is the same in every trial, so a changed range
   would be sampled at random for the rest of the study; it never grows in place.
@@ -153,14 +154,15 @@ def _range_growth(old: SearchParam, new: SearchParam) -> _GrowthVerdict:
         dropped.append(f"low {_text(old.low)}")
     if new.high < old.high:
         dropped.append(f"high {_text(old.high)}")
-    if new.step is not None and (
-        old.step is None
-        or not _on_lattice(old.step, 0, new.step)
-        or not _on_lattice(old.low, new.low, new.step)
-    ):
-        dropped.append(
-            "its continuous values" if old.step is None else f"step {_text(old.step)} lattice"
-        )
+    if new.step is not None:
+        aligned = _on_lattice(old.low, new.low, new.step)
+        if old.low == old.high:
+            if not dropped and not aligned:
+                dropped.append(_text(old.low))
+        elif old.step is None:
+            dropped.append("its continuous values")
+        elif not aligned or not _on_lattice(old.step, 0, new.step):
+            dropped.append(f"step {_text(old.step)} lattice")
     if dropped:
         return _GrowthVerdict(dropped=tuple(dropped))
     step = "" if old.step == new.step else f" step {_text(old.step)} -> {_text(new.step)}"
