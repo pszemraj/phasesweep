@@ -1377,6 +1377,7 @@ def test_a_resumed_run_counts_the_trials_a_previous_run_recorded(
         n_trials=2,
         gpu_policy="none",
         sampler=Sampler(type="random", seed=0),
+        execution=ExecutionContext(cwd=str(tmp_path)),
     )
     config = write_experiment_config(tmp_path / "grown.yaml", experiment)
     assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 0
@@ -1391,9 +1392,9 @@ def test_a_resumed_run_counts_the_trials_a_previous_run_recorded(
     assert re.search(r"Finished in \d+\.\ds: 1 phase, 4 trials, 2 from a previous run", err)
     assert f"Next: phasesweep status {config} --set 'phases[p].n_trials=4' --trials" in err
     # The constant trainer ties every trial, so the winner's flagged line gives the command
-    # that prints the tie's numbers, with the overrides the run was typed with. The two
-    # generations also flag code_revision when the trainer's directory is dirty or no git tree.
-    assert re.search(r"flagged: tie(, code_revision)?\n", err)
+    # that prints the tie's numbers, with the overrides the run was typed with. The trainer's
+    # directory is no git work tree, so neither generation records a revision to compare.
+    assert "flagged: tie\n" in err
     assert f"details: phasesweep show-winners {config} --set 'phases[p].n_trials=4'\n" in err
 
 
