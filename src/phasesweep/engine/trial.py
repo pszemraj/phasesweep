@@ -495,28 +495,27 @@ def _trainer_failure_reason(
     elif lifecycle is not None and ended_by == "trainer" and lifecycle.return_code is not None:
         return_code = lifecycle.return_code
     elif ended_by == "timed_out":
-        return _with_stderr(
-            f"{TIMEOUT_REASON_PREFIX}the phase's timeout_seconds_per_trial", attempt_dir
-        )
+        # The live timeout names its budget in seconds, which no attempt record keeps.
+        return f"{TIMEOUT_REASON_PREFIX}the phase's timeout_seconds_per_trial"
     elif ended_by == "guardian_lost":
-        return _with_stderr(
-            "the lease guardian exited without recording how the trainer ended", attempt_dir
-        )
+        return "the lease guardian exited without recording how the trainer ended"
     else:
         return None
     if return_code == 0:
         return None
-    return _with_stderr(_nonzero_exit_reason(return_code), attempt_dir)
+    return _with_stderr(_nonzero_exit_reason(return_code), _stderr_last_line(attempt_dir))
 
 
-def _with_stderr(reason: str, attempt_dir: Path) -> str:
-    """Append the attempt's last stderr line to a failure reason, as a live failure reads.
+def _with_stderr(reason: str, stderr_line: str | None) -> str:
+    """Append the trainer's last stderr line to the reason its exit code gives.
 
-    :param str reason: The failure reason.
-    :param Path attempt_dir: Directory holding the attempt's ``stderr.log``.
-    :return str: The reason, followed by ``; stderr: <line>`` when stderr has a printable line.
+    Only a reason built from the exit code takes the quote: one the process layer states
+    itself, such as a timeout or a lost guardian, already says what happened.
+
+    :param str reason: The failure reason the trainer's exit code gives.
+    :param str | None stderr_line: The attempt's last printable stderr line, if any.
+    :return str: The reason, followed by ``; stderr: <line>`` when there is a line.
     """
-    stderr_line = _stderr_last_line(attempt_dir)
     return reason if stderr_line is None else f"{reason}; stderr: {stderr_line}"
 
 
@@ -939,9 +938,7 @@ def extract_trial_result(
 
     if rc != 0 and failure_reason is None:
         stderr_line = _stderr_last_line(executed.ctx.attempt_dir)
-        failure_reason = _nonzero_exit_reason(rc)
-        if stderr_line is not None:
-            failure_reason += f"; stderr: {stderr_line}"
+        failure_reason = _with_stderr(_nonzero_exit_reason(rc), stderr_line)
         # A signal death is not a missing-environment failure: the trainer never chose
         # to exit, so the inheritance hint would send the operator the wrong way.
         if rc > 0 and _shell_reported_signal(rc) is None:

@@ -801,6 +801,7 @@ def test_completed_orphan_evidence_survives_runner_sigkill(
         parser.add_argument("--out", required=True)
         args, _ = parser.parse_known_args()
         def terminate(*_):
+            print("stopping on SIGTERM", file=sys.stderr, flush=True)
             if {guardian_cancel!r}:
                 attempt_dir = _attempt_dir(
                     Path(args.out).parent.parent, os.environ["PHASESWEEP_ATTEMPT_ID"]
@@ -1268,10 +1269,11 @@ else:
                 # A crash or a per-trial timeout is the trainer's own failure, kept though
                 # the runner died before recording it.
                 assert not _trial_interrupted(recovered)
-                assert (_cause(recovered) or "").startswith(
-                    "timeout after "
+                # A timeout reads as the live one does, without the trainer's stderr.
+                assert (
+                    _cause(recovered) == "timeout after the phase's timeout_seconds_per_trial"
                     if recovery_stage == "timeout-trainer"
-                    else "non-zero exit code 7"
+                    else (_cause(recovered) or "").startswith("non-zero exit code 7")
                 )
             else:
                 assert _trial_interrupted(recovered)
