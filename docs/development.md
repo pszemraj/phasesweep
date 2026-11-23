@@ -148,7 +148,7 @@ Versions already uploaded to PyPI cannot be replaced; duplicate uploads fail vis
 
 - `phasesweep.config`: Pydantic Experiment models, strict YAML loading, and shared config `--set` path edits (`run_overrides`).
 - `phasesweep.engine`: phase orchestration, fingerprints, local persistence, immutable generation publication, and read-only status.
-- `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates.
+- `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates, and the baseline (`evidence/baseline.py`) of each value file's identity before an attempt runs, which lets a rerun in its trial's directory be scored only from files its own attempt wrote.
 - `phasesweep.reporting`: trainer-side JSON-envelope objective writer.
 - `phasesweep.tracking`: MLflow run bindings, supervised controller operations, result delivery, and upload retries.
 - `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, override rendering, and the terminal primitives of human-readable output (`runtime/terminal.py`: the colour decision, terminal width, prose wrapping, display paths). Keep `runtime/supervisor.py` stdlib-only; see the [launch ordering](invariants.md#9-nothing-runs-before-its-process-identity-is-durable).
@@ -181,7 +181,9 @@ Within `phasesweep.engine`, responsibilities map to modules as follows:
 | Ledger storage: the only module that constructs Optuna storage | `ledger` |
 | Locks and stale-attempt cleanup | `locking`, `attempts`, `cleanup` |
 | Root ownership and retained evidence checks | `artifact_roots`, `evidence` |
-| Paths, state records, and fingerprints | `paths`, `state`, `fingerprints`, `growth`, `grid_order` |
+| Paths, state records, and fingerprints | `paths`, `state`, `fingerprints` |
+| Which trial directory an attempt runs in: its own, or an interrupted trial's | `trial_dirs` |
+| Growing a search space in place, and the grid cell order across its recorded spaces | `growth`, `grid_order` |
 | Advisory confound verdicts on the ranked population, frozen at selection | `confound` |
 | Publication and read-only views | `generation`, `publication`, `publication_validation`, `read` |
 
@@ -222,6 +224,9 @@ The principal test groups and what each covers:
 - `tests/test_config_reference.py` and `tests/test_explain.py`: the configuration reference against the schema, its parser's shared blocks and section rules, and `phasesweep explain`.
 - `tests/test_extractors.py`, `tests/test_trial_evidence.py`, and `tests/test_trial_launch.py`: scalar evidence, shared W&B captures, gates, supervised trials, and durable input verification.
 - `tests/test_attempt_lifecycle.py`, `tests/test_process_supervision.py` and `tests/test_guardian_settle.py`: lifecycle parsing, process identity and launch ordering, descendant cleanup including descendants the guardian adopts after they leave the trainer's group, the helper settle after a trainer root exits, and guardian completion evidence.
+- `tests/test_attempt_endings.py`: the `ended_by` value each way an attempt can end records in its lifecycle record, and the verdict each earns live and in recovery, including a crash that a shutdown or a killed runner follows.
+- `tests/test_resume_in_place.py`: an interrupted trial's rerun in its own trial directory, scored only from files its attempt wrote, and the cases that get a fresh directory instead.
+- `tests/test_search_space_growth.py`: a search space that only gains values keeps its finished trials and runs only the added cells, and the refusals for a dropped value, `repeats.values` and CMA-ES.
 - `tests/test_mlflow.py` and `tests/test_mlflow_terminal_delivery.py`: native history selection, run bindings, shared captures, and terminal delivery retries.
 - `tests/test_mlflow_integration.py`: both ownership modes against a temporary HTTP server, stopped-server replay, worker cleanup, and delivery retries.
 - Storage, publication, recovery, interrupted trials and sampler resume: owning code and representative tests are listed by [durability invariant](invariants.md).
