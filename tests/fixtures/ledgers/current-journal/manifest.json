@@ -22,7 +22,7 @@
   "produced_by": {
     "cwd": "/home/pszemraj/workspace/projects/productivity/phasesweep/.claude/worktrees/agent-aee1aa3356593fd13",
     "optuna": "4.9.0",
-    "phasesweep_git": "v0.3.15-21-gf0eb1d77",
+    "phasesweep_git": "v0.3.15-29-gad6ad5a9",
     "python": "3.13.16",
     "sqlite": "3.54.0"
   }
