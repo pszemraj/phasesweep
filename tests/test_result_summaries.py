@@ -49,7 +49,7 @@ def _add_trial(
     feasible: bool = True,
     attrs: JsonObject | None = None,
 ) -> None:
-    """Record one measured or failed member without launching a trainer."""
+    """Record one measured or failed member with the outcome record every finished trial carries."""
     number = len(study.trials)
     study.add_trial(
         optuna.trial.create_trial(
@@ -68,6 +68,9 @@ def _add_trial(
                 FEASIBLE_ATTR: feasible,
                 GENERATION_ID_ATTR: "generation-a",
                 ATTEMPT_ID_ATTR: f"attempt-{number}",
+                TRIAL_OUTCOME_ATTR: trial_outcome(
+                    number + 1, "success" if value is not None else "failure"
+                ),
                 **(attrs or {}),
             },
         )

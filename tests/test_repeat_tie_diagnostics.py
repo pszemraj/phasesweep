@@ -17,6 +17,7 @@ from phasesweep.engine.state import (
     OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
+    TRIAL_DIR_ATTR,
 )
 from tests.conftest import log_regex_provenance, make_experiment
 
@@ -47,6 +48,7 @@ def test_repeat_tie_warning_names_the_group_gap_and_pooled_threshold(
                         FEASIBLE_ATTR: True,
                         GENERATION_ID_ATTR: "generation-a",
                         ATTEMPT_ID_ATTR: f"attempt-{number}",
+                        TRIAL_DIR_ATTR: f"/runs/p/trial_{number:05d}__attempt-{number}",
                         OBJECTIVE_PROVENANCE_ATTR: json.dumps(log_regex_provenance()),
                         TRAINER_ENV_DIGEST_ATTR: "a" * 64,
                         TRAINER_INPUT_ATTR: {"schema_version": 1},
