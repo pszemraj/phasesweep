@@ -21,7 +21,7 @@ import pytest
 
 from phasesweep.config.models import GpuPolicy, Phase
 from phasesweep.config.search import IntParam
-from phasesweep.errors import GpuConfigurationError
+from phasesweep.errors import GpuConfigurationError, operator_step
 from phasesweep.runtime.files import open_lock_file
 from phasesweep.runtime.gpu import (
     GpuDevice,
@@ -57,8 +57,14 @@ def deterministic_gpu_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_gpu_pool_fails_on_missing_gpus_parallel(monkeypatch):
     """n_jobs > 1 with no GPUs and allow_no_gpu=False must raise, not silently degrade."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    with pytest.raises(RuntimeError, match="no GPUs detected"):
+    with pytest.raises(GpuConfigurationError) as refused:
         GpuPool.create(n_jobs=4, allow_no_gpu=False)
+    # Explicit gpu_ids resolve through the same empty inventory (see the unreadable-map test
+    # below), so the one way out is the opt-in.
+    assert str(refused.value) == "n_jobs=4 but no GPUs detected."
+    assert operator_step(refused.value) == (
+        "Set allow_no_gpu_isolation: true for a CPU-only parallel sweep."
+    )
 
 
 def test_gpu_pool_allows_no_gpu_when_opted_in(monkeypatch):
@@ -219,7 +225,7 @@ def test_shutdown_wakes_a_lease_wait_blocked_on_a_busy_local_slot(tmp_path, monk
 
     assert len(result) == 1
     assert isinstance(result[0], GpuLeaseCancelledError)
-    assert "shutdown signal 2" in str(result[0])
+    assert "shutdown signal SIGINT" in str(result[0])
 
 
 def test_none_policy_disables_cuda_isolation(monkeypatch) -> None:
@@ -285,7 +291,7 @@ def test_single_job_fails_when_nvidia_smi_is_broken_on_gpu_host(
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
 
-    with pytest.raises(GpuConfigurationError, match="could not enumerate GPUs.*double-book"):
+    with pytest.raises(GpuConfigurationError, match="could not enumerate GPUs.*no GPU locks"):
         GpuPool.create(n_jobs=1)
 
 
@@ -297,15 +303,15 @@ def test_ambient_cuda_visibility_fails_when_nvidia_smi_is_broken_on_gpu_host(
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
 
-    with pytest.raises(GpuConfigurationError, match="could not enumerate GPUs.*double-book"):
+    with pytest.raises(GpuConfigurationError, match="could not enumerate GPUs.*no GPU locks"):
         GpuPool.create(n_jobs=1)
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
         pool = GpuPool.create(n_jobs=1, allow_no_gpu=True)
     with pool.acquire() as assignment:
         assert assignment.visible_devices == ""
-    assert "pinning CUDA_VISIBLE_DEVICES='' without GPU host locks" in caplog.text
-    assert "running without CUDA isolation" not in caplog.text
+    assert "trials run without GPU host locks and with CUDA_VISIBLE_DEVICES=''" in caplog.text
+    assert "or CUDA isolation" not in caplog.text
 
 
 def test_broken_nvidia_smi_requires_explicit_fail_open_opt_in(
@@ -613,14 +619,14 @@ def test_mig_token_locks_on_the_mig_instance(tmp_path, monkeypatch) -> None:
         pytest.param(
             [0, 1],
             None,
-            "Cannot validate configured CUDA device index",
+            r"no usable index-to-UUID inventory to validate \['0', '1'\]",
             "single_per_trial",
             id="numeric-indices",
         ),
         pytest.param(
             None,
             ["0", "GPU-deadbeef"],
-            "Cannot validate configured GPU UUID",
+            r"no usable GPU UUID inventory to validate \['GPU-deadbeef'\]",
             "single_per_trial",
             id="mixed-token-forms",
         ),
@@ -628,7 +634,7 @@ def test_mig_token_locks_on_the_mig_instance(tmp_path, monkeypatch) -> None:
         pytest.param(
             [0, 1],
             None,
-            "Cannot validate configured CUDA device index",
+            r"no usable index-to-UUID inventory to validate \['0', '1'\]",
             "whole_node",
             id="whole-node-numeric-indices",
         ),
@@ -661,7 +667,10 @@ def test_unknown_numeric_index_fails_closed(monkeypatch) -> None:
         lambda: ([], {"0": "GPU-deadbeef"}),
     )
 
-    with pytest.raises(RuntimeError, match="index 3 does not exist"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"index 3 is not in the nvidia-smi inventory \(resolvable indices: \['0'\]",
+    ):
         GpuPool.create(n_jobs=1, explicit_ids=[3])
 
 
@@ -801,7 +810,7 @@ def test_lowercase_mig_uuid_rebinds_trainer_visibility_to_inventory_spelling(
                 "GPU-2b234567-89ab-cdef-0123-456789abcdef",
                 "gpu-2b234567-89ab-cdef-0123-456789abcdef",
             ],
-            "only 1 distinct physical GPU",
+            "resolve to 1 distinct physical GPU",
             id="case-only-uuid-alias",
         ),
         pytest.param(
@@ -868,7 +877,11 @@ def test_configured_disable_sentinel_is_pinned_for_parallel_cpu_sweeps(
 @pytest.mark.parametrize(
     ("ambient", "log_fragment"),
     [
-        pytest.param("NoDevFiles", "treating it as empty visibility", id="scheduler-sentinel"),
+        pytest.param(
+            "NoDevFiles",
+            "cannot be resolved against the local GPU inventory",
+            id="scheduler-sentinel",
+        ),
         pytest.param("0,-1", "mixes the '-1' disable sentinel", id="mixed-disable-sentinel"),
     ],
 )
@@ -885,7 +898,10 @@ def test_ambient_sentinel_warns_and_becomes_empty_visibility(
 
     with pool.acquire() as gid:
         assert gid.visible_devices == ""
-    assert any(log_fragment in record.message for record in caplog.records)
+    assert any(
+        log_fragment in record.message and "trials get CUDA_VISIBLE_DEVICES=''" in record.message
+        for record in caplog.records
+    )
 
 
 @pytest.mark.parametrize(

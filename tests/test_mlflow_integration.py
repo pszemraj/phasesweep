@@ -341,9 +341,11 @@ def test_two_phases_native_http_then_offline(offline_server, tmp_path, monkeypat
     assert not list((tmp_path / "work").rglob("*.pending.json"))
     status = read_status(experiment)
     generation_id = status["published_generation_id"]
-    assert delivery_status(experiment, generation_id) == {"pending": 1, "delivered": 6}
-    assert sync_tracking(experiment, generation_id) == {"pending": 0, "delivered": 7}
+    # Closeout retries the upload the outage left pending, so nothing is left for sync-tracking.
+    assert uploads.count("publish") == 8
     assert delivery_status(experiment, generation_id) == {"pending": 0, "delivered": 7}
+    assert sync_tracking(experiment, generation_id) == {"pending": 0, "delivered": 7}
+    assert uploads.count("publish") == 8
     runs = client.search_runs(
         [experiment_id], filter_string="tags.`phasesweep.phase` != 'generation'"
     )
@@ -368,8 +370,8 @@ def test_two_phases_native_http_then_offline(offline_server, tmp_path, monkeypat
             summary[0].info.run_id if mode == "managed" else parent.info.run_id
         )
     assert summary[0].info.status == "FINISHED"
-    publication.publish_failed_generation(
-        experiment, generation_id, RuntimeError("late error"), validate_ledger(experiment)
+    publication.deliver_closeout(
+        experiment, validate_ledger(experiment), generation_id, error=RuntimeError("late error")
     )
     assert client.get_run(summary[0].info.run_id).info.status == "FINISHED"
     assert delivery_status(experiment, generation_id) == {"pending": 0, "delivered": 7}
@@ -519,7 +521,7 @@ def test_failed_trainer_http_summary_delivery_and_sync(local_server, tmp_path, m
     assert read_status(experiment)["phases"] == status["phases"]
 
 
-_OBJECTIVE_HINT = "logged under another key or logging went to another run"
+_OBJECTIVE_HINT = "run finished without the objective metric"
 
 
 def _managed_loss_experiment(
@@ -605,7 +607,7 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     assert read_status(experiment)["phases"][0]["trials"]["FAIL"] == 1
     if trainer_outcome in {"no_objective", "ended_then_logged"}:
         assert caplog.text.count(_OBJECTIVE_HINT) == 1
-        assert "read MLFLOW_RUN_ID before any MLflow call" in caplog.text
+        assert "run PhaseSweep supplies (MLFLOW_RUN_ID)" in caplog.text
         assert "loss" not in remote.data.metrics
     else:
         assert remote.data.metrics["loss"] == 0.01
@@ -616,11 +618,12 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     assert row[f"user_attr:{FAILURE_REASON_ATTR}"] == reason
     config = tmp_path / "sweep.yaml"
     write_experiment_config(config, experiment)
-    shown = CliRunner().invoke(cli, ["status", str(config), "--trials"])
+    shown = CliRunner().invoke(cli, ["status", str(config), "--trials"], env={"COLUMNS": "80"})
     assert shown.exit_code == 0, shown.output
-    assert shown.output.count(reason) == 1
-    header = next(line for line in shown.output.splitlines() if line.startswith("trial"))
-    assert header.index("reason") < 100
+    lines = shown.output.splitlines()
+    assert " ".join(shown.output.split()).count(reason) == 1
+    assert any(line.lstrip().startswith("reason: ") for line in lines)
+    assert max(map(len, lines)) <= 80
 
 
 def test_managed_missing_objective_hint_is_logged_once_per_phase(

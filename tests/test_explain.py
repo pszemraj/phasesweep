@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from click.testing import CliRunner
 import phasesweep.config.reference as reference
 from phasesweep.cli import cli as cli_main
 from phasesweep.config.reference import (
+    explain_command,
     reference_entries,
     reference_notes,
     rules_for,
@@ -312,17 +314,43 @@ def test_explain_unknown_key_exits_two_with_closest_matches() -> None:
     code, out, err = _explain("inherit_env")
     assert code == 2
     assert out == ""
-    assert (
-        err
-        == "phasesweep explain: no config key matches 'inherit_env'. Closest: execution.inherit_env.\n"
+    assert err == (
+        "phasesweep explain: no config key matches 'inherit_env'. Closest:\n"
+        "phasesweep explain execution.inherit_env\n"
     )
     code, out, err = _explain("phases.sampler.typ")
     assert code == 2
     assert out == ""
-    assert err.startswith(
-        "phasesweep explain: no config key matches 'phases.sampler.typ'. Closest: "
-    )
-    assert "phases[].sampler.type" in err
+    assert err.splitlines() == [
+        "phasesweep explain: no config key matches 'phases.sampler.typ'. Closest:",
+        "phasesweep explain 'phases[].sampler.type'",
+        "phasesweep explain 'phases[].sampler'",
+        "phasesweep explain 'phases[].sampler.seed'",
+    ]
+
+
+@pytest.mark.parametrize("key", ["n_trials", "sampler.sed", "phases.sampler.typ", "inherit_env"])
+def test_every_suggestion_is_a_whole_command_that_a_shell_runs_and_explain_accepts(
+    key: str,
+) -> None:
+    """Each suggestion is one line, quoted for the shell with nothing glued to it, and running it finds the key."""
+    _, _, err = _explain(key)
+
+    suggestions = err.splitlines()[1:]
+    assert suggestions
+    for line in suggestions:
+        words = shlex.split(line)
+        assert words[:2] == ["phasesweep", "explain"]
+        assert len(words) == 3
+        assert line == explain_command(words[2])
+        code, out, followed = _explain(words[2])
+        assert code == 0 and out and not followed
+
+
+def test_the_explain_command_quotes_only_a_key_the_shell_would_expand() -> None:
+    """A bracketed key is quoted, as the validation hints print it, and a plain key is not."""
+    assert explain_command("phases[].sampler") == "phasesweep explain 'phases[].sampler'"
+    assert explain_command("execution.inherit_env") == "phasesweep explain execution.inherit_env"
 
 
 @pytest.mark.parametrize("key", ["zzzzzz", ".", "[]", " "])

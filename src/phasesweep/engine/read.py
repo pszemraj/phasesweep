@@ -76,25 +76,30 @@ from phasesweep.engine.repeats import (
 from phasesweep.engine.selection import (
     TieGroupComparison,
     _cost_advisory,
+    _edge_advisory,
     _eligible,
     _no_feasible_remedy,
     _rank_groups,
     tie_group_comparisons,
 )
 from phasesweep.engine.state import (
-    ATTEMPT_ID_ATTR,
     DURATION_ATTR,
     FAILURE_REASON_ATTR,
+    FINISHED_TRIAL_STATES,
     GENERATION_SUMMARY_SCHEMA_VERSION,
     OBSERVED_PREFIX,
     RERUN_OF_ATTR,
     TRIAL_OUTCOME_ATTR,
+    TRIAL_STATE_NAMES,
     PublicationState,
     WinnerSource,
     _parse_winner_source,
     _parsed_trial_outcome,
-    _trial_interrupted,
+    _recorded_trial_dir,
+    _stands_under_winner,
+    _unreplaced_attempts,
     _validate_observed_block,
+    _winning_trials,
 )
 from phasesweep.engine.study_policy import (
     _awaits_cleanup_recovery,
@@ -102,9 +107,14 @@ from phasesweep.engine.study_policy import (
     _load_phase_policy_state,
     _recovery_advice,
 )
-from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
+from phasesweep.errors import (
+    NEW_STUDY_STEP,
+    PERSISTENT_STUDY_KEEPS_TRIALS,
+    START_AGAIN_STEP,
+    OperatorAction,
+)
 from phasesweep.evidence.models import EXTRACTOR_KINDS
-from phasesweep.runtime.json import JsonObject, JsonValue, json_object
+from phasesweep.runtime.json import JsonObject, JsonValue, float_or_none, json_object
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +130,9 @@ currently loaded config describes the status payload.
 CostAdvisoryStatus: TypeAlias = Literal[
     "not_configured", "unavailable", "no_cheaper_configuration", "available"
 ]
+
+EdgeAdvisoryStatus: TypeAlias = Literal["unavailable", "not_at_edge", "available"]
+"""Whether the edge advisory could be checked, and whether it found a parameter at an edge."""
 
 
 class EngineStatus(typing.TypedDict):
@@ -174,8 +187,13 @@ class PhaseWinnerView:
     cost_advisory: str | None = None
     cost_advisory_status: CostAdvisoryStatus = "not_configured"
     tie_groups: list[TieGroupComparison] | None = None
+    edge_advisory: str | None = None
+    edge_advisory_status: EdgeAdvisoryStatus = "unavailable"
     # Frozen population identity used to reconstruct display details from retained trials.
     confound_detail: Mapping[str, object] | None = None
+    # Finished trials the phase held at selection (``completion.finished_trials``); later
+    # trials have higher numbers, so the first this many finished ones are the ones it saw.
+    finished_trials: int | None = None
 
 
 def _phase_status_payloads(
@@ -239,13 +257,20 @@ def _phase_status_payloads(
 
 
 def _winner_view(
-    winner: Mapping[str, object] | ValidatedWinner, phase_name: str
+    winner: Mapping[str, object] | ValidatedWinner,
+    phase_name: str,
+    *,
+    persistent: bool,
+    dependents: Sequence[str] = (),
 ) -> PhaseWinnerView | None:
     """Reduce one decoded winner payload using the permissive read contract.
 
     :param Mapping[str, object] | ValidatedWinner winner: Decoded winner payload or
         captured publication facts.
     :param str phase_name: Phase name exposed by the winner.
+    :param bool persistent: Whether the display config keeps its trials between runs, which
+        decides the survivorship remedy (:func:`phasesweep.engine.confound._confound_summary`).
+    :param Sequence[str] dependents: Phases that inherit this one in the display config.
     :return PhaseWinnerView | None: The winner view, or ``None`` when the
         payload is malformed.
     """
@@ -287,7 +312,7 @@ def _winner_view(
             observed = _validate_observed_block(data.get("observed"))
         else:
             source = validated.source
-            confound_block = dict(validated.confound)
+            confound_block = validated.confound
             metric = validated.metric
             repeats = validated.repeats
             observed = dict(validated.observed)
@@ -298,6 +323,8 @@ def _winner_view(
             confound_block,
             winner_trial=trial_number,
             extractor_kind=kind if isinstance(kind, str) else "unknown",
+            persistent=persistent,
+            dependents=dependents,
         )
         return PhaseWinnerView(
             phase=phase_name,
@@ -310,6 +337,7 @@ def _winner_view(
             source=source,
             confound=confound,
             confound_detail=confound_block,
+            finished_trials=_recorded_count(completion.get("finished_trials")),
             observed=observed,
             repeats=None if repeats is None else _repeats_summary(repeats),
             repeats_detail=repeats,
@@ -318,7 +346,9 @@ def _winner_view(
         return None
 
 
-def _read_winner_path(path: Path, phase_name: str) -> PhaseWinnerView | None:
+def _read_winner_path(
+    path: Path, phase_name: str, *, persistent: bool, dependents: Sequence[str]
+) -> PhaseWinnerView | None:
     """Read one unvalidated winner file using the permissive read contract.
 
     Only a generation that is not the validated publication is read this way:
@@ -327,6 +357,8 @@ def _read_winner_path(path: Path, phase_name: str) -> PhaseWinnerView | None:
 
     :param Path path: Winner path in the represented generation.
     :param str phase_name: Phase name exposed by the winner.
+    :param bool persistent: Whether the display config keeps its trials between runs.
+    :param Sequence[str] dependents: Phases that inherit this one in the display config.
     :return PhaseWinnerView | None: Parsed winner, or ``None`` when absent or malformed.
     """
     if not path.is_file():
@@ -334,7 +366,7 @@ def _read_winner_path(path: Path, phase_name: str) -> PhaseWinnerView | None:
     loaded = read_yaml_or_none(path)
     if not isinstance(loaded, Mapping):
         return None
-    return _winner_view(loaded, phase_name)
+    return _winner_view(loaded, phase_name, persistent=persistent, dependents=dependents)
 
 
 def _represented_winners(
@@ -343,6 +375,7 @@ def _represented_winners(
     represented_generation_id: str | None,
     phase_names: Sequence[str],
     *,
+    ledger: ValidatedLedger,
     fallback_published: bool = False,
     comparison_experiment: Experiment | None = None,
 ) -> list[PhaseWinnerView]:
@@ -355,6 +388,8 @@ def _represented_winners(
     :param str | None represented_generation_id: Generation whose winners are
         represented, or ``None`` when there is none.
     :param Sequence[str] phase_names: Safe phase names to enumerate.
+    :param ValidatedLedger ledger: Handle the command validated for ``experiment``, which
+        the read-time advice reads the phases' trials through (:func:`winner_advisories`).
     :param bool fallback_published: Fill missing latest phase winners from the publication.
     :param Experiment | None comparison_experiment: Current config for drift comparisons.
     :return list[PhaseWinnerView]: One view per named phase that has a usable winner.
@@ -363,16 +398,28 @@ def _represented_winners(
         return []
     validated = publication.validated
     comparison = comparison_experiment or experiment
+    # The next run uses the current config's storage and inheritance graph.
+    persistent = comparison.persistent
     views: list[PhaseWinnerView | None]
     if validated is not None and validated.generation_id == represented_generation_id:
         views = [
-            _winner_view(validated.winners[name], name) if name in validated.winners else None
+            _winner_view(
+                validated.winners[name],
+                name,
+                persistent=persistent,
+                dependents=comparison.phases_inheriting(name),
+            )
+            if name in validated.winners
+            else None
             for name in phase_names
         ]
     else:
         views = [
             _read_winner_path(
-                _generation_winner_path(experiment, represented_generation_id, name), name
+                _generation_winner_path(experiment, represented_generation_id, name),
+                name,
+                persistent=persistent,
+                dependents=comparison.phases_inheriting(name),
             )
             for name in phase_names
         ]
@@ -385,7 +432,12 @@ def _represented_winners(
             and validated is not None
             and name in validated.winners
         ):
-            view = _winner_view(validated.winners[name], name)
+            view = _winner_view(
+                validated.winners[name],
+                name,
+                persistent=persistent,
+                dependents=comparison.phases_inheriting(name),
+            )
             view_generation = validated.generation_id
         if view is not None:
             is_published = validated is not None and view_generation == validated.generation_id
@@ -404,14 +456,10 @@ def _represented_winners(
                     _experiment_semantic_fingerprint(producing),
                     phase_count=len(producing.phases),
                 )
-            advisory = winner_cost_advisory(experiment, view) if config_matches is True else None
-            tie_groups = winner_tie_groups(experiment, view)
-            cost_status = cost_advisory_status(
-                experiment,
-                name,
-                advisory,
-                available=config_matches is True and tie_groups is not None,
+            advisories = winner_advisories(
+                experiment, view, config_matches=config_matches is True, ledger=ledger
             )
+            cost_status = advisories.cost_advisory_status
             if config_matches is not True and cost_status == "not_configured":
                 producing = _load_generation_experiment(
                     _experiment_dir(experiment), view_generation
@@ -423,9 +471,11 @@ def _represented_winners(
                     generation_id=view_generation,
                     is_published=is_published,
                     config_matches_current=config_matches,
-                    cost_advisory=advisory,
+                    cost_advisory=advisories.cost_advisory,
                     cost_advisory_status=cost_status,
-                    tie_groups=tie_groups,
+                    tie_groups=advisories.tie_groups,
+                    edge_advisory=advisories.edge_advisory,
+                    edge_advisory_status=advisories.edge_advisory_status,
                 )
             )
     return chosen
@@ -479,29 +529,105 @@ def cost_advisory_status(
     return "no_cheaper_configuration" if advisory is None else "available"
 
 
+class WinnerAdvisories(typing.NamedTuple):
+    """The advice recomputed at read from a winner's retained trials, never stored."""
+
+    cost_advisory: str | None
+    cost_advisory_status: CostAdvisoryStatus
+    tie_groups: list[TieGroupComparison] | None
+    edge_advisory: str | None
+    edge_advisory_status: EdgeAdvisoryStatus
+
+
+def winner_advisories(
+    experiment: Experiment,
+    winner: PhaseWinnerView,
+    *,
+    config_matches: bool,
+    ledger: ValidatedLedger,
+) -> WinnerAdvisories:
+    """Recompute a winner's tie groups, cost advisory and edge advisory from its phase's trials.
+
+    The phase's trials are read once for all three, and each is judged over the population
+    that selected the winner, never over trials a later run added: the recorded repeat groups,
+    and the first ``finished_trials`` finished trials. Tie groups need only that population.
+    Cost and edge advice also read the phase's config (its ``cost_key``, its search space), so
+    they are computed only when ``experiment`` is the config that produced the winner, and are
+    otherwise ``None`` with status ``unavailable``, as they are when the trials cannot be read.
+
+    :param Experiment experiment: Display config locating the retained phase ledger.
+    :param PhaseWinnerView winner: Winner whose recorded population anchors the comparisons.
+    :param bool config_matches: Whether ``experiment`` agrees with the producing config.
+    :param ValidatedLedger ledger: Handle the command validated for ``experiment``, so a read
+        of every winner's advice validates the ledger once.
+    :return WinnerAdvisories: The advice and whether each could be checked.
+    """
+    phase = next((phase for phase in experiment.phases if phase.name == winner.phase), None)
+    try:
+        read = read_phase_trials(ledger, winner.phase)
+    except StudyStorageUnavailableError:
+        read = None
+    trials = None if read is None else read.trials
+    ranking = _winner_ranked_groups(winner, trials)
+    tie_groups = (
+        []
+        if winner.repeats is None
+        else None
+        if ranking is None
+        else tie_group_comparisons(*ranking)
+    )
+    cost = (
+        _cost_advisory(phase, *ranking, goal=experiment.metric.goal)
+        if config_matches
+        and phase is not None
+        and phase.cost_key is not None
+        and ranking is not None
+        else None
+    )
+    finished = sorted(
+        (trial for trial in trials or () if _trial_count_state(trial) in FINISHED_TRIAL_STATES),
+        key=lambda trial: trial.number,
+    )
+    edge_status: EdgeAdvisoryStatus = "unavailable"
+    edge = None
+    if (
+        config_matches
+        and phase is not None
+        and trials is not None
+        and winner.finished_trials is not None
+        and winner.finished_trials <= len(finished)
+    ):
+        edge = _edge_advisory(phase, finished[: winner.finished_trials], winner.params)
+        edge_status = "not_at_edge" if edge is None else "available"
+    return WinnerAdvisories(
+        cost_advisory=cost,
+        cost_advisory_status=cost_advisory_status(
+            experiment, winner.phase, cost, available=config_matches and tie_groups is not None
+        ),
+        tie_groups=tie_groups,
+        edge_advisory=edge,
+        edge_advisory_status=edge_status,
+    )
+
+
 def _winner_ranked_groups(
-    experiment: Experiment, winner: PhaseWinnerView
+    winner: PhaseWinnerView, retained: Sequence[optuna.trial.FrozenTrial] | None
 ) -> tuple[RankedGroup, list[RankedGroup]] | None:
     """Reconstruct the exact repeat-group population that selected one winner.
 
-    :param Experiment experiment: Config locating the retained phase ledger.
     :param PhaseWinnerView winner: Winner carrying its frozen confound population and reducer.
+    :param Sequence[optuna.trial.FrozenTrial] | None retained: The phase's trials in the
+        ledger, or ``None`` when they could not be read.
     :return tuple[RankedGroup, list[RankedGroup]] | None: Winner and recorded groups, or null when unavailable.
     """
-    if winner.repeats is None or winner.confound_detail is None:
+    if winner.repeats is None or winner.confound_detail is None or retained is None:
         return None
     raw_groups = winner.confound_detail["ranked_groups"]
     if not isinstance(raw_groups, list):
         return None
     if winner.repeats_detail is None:
         return None
-    try:
-        read = read_phase_trials(validate_ledger(experiment), winner.phase)
-    except StudyStorageUnavailableError:
-        return None
-    if read is None:
-        return None
-    trials = {trial.number: trial for trial in read.trials}
+    trials = {trial.number: trial for trial in retained}
     groups = []
     for numbers in raw_groups:
         if not isinstance(numbers, list) or not all(isinstance(n, int) for n in numbers):
@@ -527,44 +653,6 @@ def _winner_ranked_groups(
         )
     winning = next((group for group in groups if group.representative == winner.trial_number), None)
     return None if winning is None else (winning, groups)
-
-
-def winner_tie_groups(
-    experiment: Experiment, winner: PhaseWinnerView
-) -> list[TieGroupComparison] | None:
-    """Compare overlapping configurations from the winner's recorded population.
-
-    :param Experiment experiment: Config locating the retained phase ledger.
-    :param PhaseWinnerView winner: Winner whose ranked groups anchor the comparisons.
-    :return list[TieGroupComparison] | None: Overlapping groups, or null when retained trials are unavailable.
-    """
-    if winner.repeats is None:
-        return []
-    ranking = _winner_ranked_groups(experiment, winner)
-    return None if ranking is None else tie_group_comparisons(*ranking)
-
-
-def winner_cost_advisory(experiment: Experiment, winner: PhaseWinnerView) -> str | None:
-    """Compare costs within the population that selected the represented winner.
-
-    :param Experiment experiment: Display config supplying the optional cost key.
-    :param PhaseWinnerView winner: Winner whose repeat group anchors the window.
-    :return str | None: Advisory text when a cheaper eligible group is in the window.
-    """
-    phase = next((phase for phase in experiment.phases if phase.name == winner.phase), None)
-    if phase is None or phase.cost_key is None or winner.repeats is None:
-        return None
-    ranking = _winner_ranked_groups(experiment, winner)
-    return (
-        None
-        if ranking is None
-        else _cost_advisory(
-            phase,
-            ranking[0],
-            ranking[1],
-            goal=experiment.metric.goal,
-        )
-    )
 
 
 def _published_generation_id(publication: PublicationPointer) -> str | None:
@@ -666,6 +754,7 @@ def read_status(
     generation_id: str | None = None,
     trial_generation_id: str | None = None,
     comparison_experiment: Experiment | None = None,
+    ledger: ValidatedLedger | None = None,
 ) -> EngineStatus:
     """Read path-free progress and represented-result status for one experiment.
 
@@ -700,6 +789,8 @@ def read_status(
         counts instead of the represented one.
     :param Experiment | None comparison_experiment: Current config for drift comparison
         and fallback semantics; reads still use ``experiment``.
+    :param ValidatedLedger | None ledger: Handle the caller already validated for ``experiment``,
+        so one command validates once; validated here when omitted.
     :raises ArtifactRootConflictError: The root is unreadable or has different ownership.
     :raises ValueError: ``generation_id`` or ``trial_generation_id`` is not a safe
         generation name.
@@ -711,6 +802,7 @@ def read_status(
         generation_id=generation_id,
         trial_generation_id=trial_generation_id,
         comparison_experiment=comparison_experiment,
+        ledger=ledger,
     )
     return status
 
@@ -721,6 +813,7 @@ def read_result(
     generation_id: str | None = None,
     comparison_experiment: Experiment | None = None,
     phase_names: Sequence[str] | None = None,
+    ledger: ValidatedLedger | None = None,
 ) -> tuple[EngineStatus, list[PhaseWinnerView]]:
     """Read status and represented-generation winners from one pointer resolution.
 
@@ -733,6 +826,8 @@ def read_result(
     :param Experiment | None comparison_experiment: Current config for drift comparison.
     :param Sequence[str] | None phase_names: Safe phase names in output order;
         an empty sequence selects none.
+    :param ValidatedLedger | None ledger: Handle the caller already validated for ``experiment``,
+        so one command validates once; validated here when omitted.
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
     :raises WinnerIntegrityError: An unpublished winner's producing snapshot is unavailable or invalid.
@@ -745,17 +840,20 @@ def read_result(
         if phase_names is None
         else [_validate_safe_name("phase", name) for name in phase_names]
     )
+    ledger = validate_ledger(experiment) if ledger is None else ledger
     status, publication = _read_status(
         experiment,
         generation_id=generation_id,
         trial_generation_id=None,
         comparison_experiment=comparison_experiment,
+        ledger=ledger,
     )
     winners = _represented_winners(
         experiment,
         publication,
         status["represented_generation_id"],
         status["result_phase_plan"] if names is None else names,
+        ledger=ledger,
         comparison_experiment=comparison_experiment,
     )
     return status, winners
@@ -893,6 +991,7 @@ def _read_status(
                 publication,
                 represented_generation_id,
                 result_phase_plan,
+                ledger=ledger,
                 fallback_published=True,
                 comparison_experiment=comparison_experiment,
             )
@@ -967,13 +1066,16 @@ class TrialTable:
     """One phase's trials as table rows, in trial-number order.
 
     ``columns`` lists the keys every row carries, in display order: ``trial``,
-    ``state``, ``value``, ``params``, ``duration_s``, then ``repeat_group`` for a
+    ``state``, ``value``, ``params``, ``duration_s``, ``trial_dir`` (the attempt directory the
+    trial recorded, ``None`` when it recorded none), then ``repeat_group`` for a
     repeats phase, ``rerun_of`` once any trial is a rerun, one ``observed:<name>``
     per report-only value any trial recorded, an optional ``reason`` when any
     trial has a recorded cause, and ``winner``. ``state`` is the Optuna state, except that a
     COMPLETE trial that violated a constraint or a metric bound reads
     ``INFEASIBLE``. ``winner`` is ``*`` on the trials the represented phase's
-    winner stands on and empty elsewhere.
+    winner stands on and empty elsewhere. ``finished`` is how many rows count toward the
+    phase's ``n_trials``, and ``uncounted`` pairs each state of the rows that do not with its
+    row count, in :data:`~phasesweep.engine.state.TRIAL_STATE_NAMES` order.
     """
 
     phase: str
@@ -981,6 +1083,8 @@ class TrialTable:
     available: bool
     columns: tuple[str, ...]
     rows: tuple[JsonObject, ...]
+    finished: int
+    uncounted: tuple[tuple[str, int], ...]
     groups: tuple[RepeatGroupView, ...] = ()
 
 
@@ -1061,10 +1165,7 @@ def unpublished_winner_step(
         or ``None`` if storage is unreadable.
     """
     if not experiment.persistent:
-        return UnpublishedWinnerStep(
-            None,
-            "Rerun the same config to start the run again; storage: null keeps no completed trials between runs.",
-        )
+        return UnpublishedWinnerStep(None, START_AGAIN_STEP)
     try:
         studies = read_phase_studies(ledger)
     except StudyStorageUnavailableError:
@@ -1080,7 +1181,12 @@ def unpublished_winner_step(
             or not _config_retires_abort(phase, trials, abort)
         ):
             cause = str(abort["cause"]).rstrip(".")
-            advice = _recovery_advice(phase, study, abort) or NEW_STUDY_STEP
+            advice = (
+                _recovery_advice(
+                    phase, study, abort, dependents=experiment.phases_inheriting(phase.name)
+                )
+                or NEW_STUDY_STEP
+            )
             return UnpublishedWinnerStep(f"Phase {phase.name!r}: {cause}.", advice)
         if _finished_trial_count(trials) < phase.n_trials:
             continue
@@ -1096,7 +1202,7 @@ def unpublished_winner_step(
                 _no_feasible_remedy(experiment, trials, phase.name),
             )
     return UnpublishedWinnerStep(
-        None, "Rerun the same config to resume and publish; completed trials are kept."
+        None, f"Rerun the same config to resume and publish; {PERSISTENT_STUDY_KEEPS_TRIALS}."
     )
 
 
@@ -1163,18 +1269,13 @@ def experiment_status(
     return json_object(payload)
 
 
-def _recorded_number(value: object) -> float | None:
-    """Return a recorded user-attr number when it is representable as a float.
+def _recorded_count(value: object) -> int | None:
+    """Read a count a winner file recorded, or ``None`` when it is not a non-negative integer.
 
-    :param object value: A trial user-attr value.
-    :return float | None: The value as a float, or ``None`` for nonnumbers or conversion overflow.
+    :param object value: The recorded value.
+    :return int | None: The count, or ``None``.
     """
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return None
-    try:
-        return float(value)
-    except OverflowError:
-        return None
+    return value if type(value) is int and value >= 0 else None
 
 
 def _trial_reason(trial: optuna.trial.FrozenTrial) -> str | None:
@@ -1190,38 +1291,28 @@ def _trial_reason(trial: optuna.trial.FrozenTrial) -> str | None:
     return None if outcome is None else outcome.cause
 
 
+def _trial_dir_text(trial: optuna.trial.FrozenTrial) -> str | None:
+    """Read the attempt directory a trial recorded, as text.
+
+    :param optuna.trial.FrozenTrial trial: Trial whose directory is displayed.
+    :return str | None: The directory, or ``None`` when none was recorded.
+    """
+    directory = _recorded_trial_dir(trial)
+    return None if directory is None else str(directory)
+
+
 #: Columns every trial table starts with, as ``(header, getter)`` pairs.
 _CORE_TRIAL_COLUMNS: tuple[tuple[str, Callable[[optuna.trial.FrozenTrial], JsonValue]], ...] = (
     ("trial", lambda trial: trial.number),
     ("state", _trial_count_state),
     ("value", lambda trial: trial.value),
     ("params", lambda trial: dict(trial.params)),
-    ("duration_s", lambda trial: _recorded_number(trial.user_attrs.get(DURATION_ATTR))),
+    ("duration_s", lambda trial: float_or_none(trial.user_attrs.get(DURATION_ATTR))),
+    ("trial_dir", _trial_dir_text),
 )
 _REPEAT_GROUP_COLUMN = "repeat_group"
 _RERUN_OF_COLUMN = "rerun_of"
 _WINNER_COLUMN = "winner"
-
-
-def _winning_trials(winner: PhaseWinnerView | None) -> dict[int, str | None]:
-    """Map the trial numbers a published winner stands on to the attempt each must carry.
-
-    A repeats winner stands on every member of its group; its scalar fields
-    name the highest-numbered member, so only that member's attempt is known
-    from the path-free view and the others are matched by number alone.
-
-    :param PhaseWinnerView | None winner: The phase's published winner, if any.
-    :return dict[int, str | None]: Attempt id to require by trial number, ``None`` where unchecked.
-    """
-    if winner is None:
-        return {}
-    standing: dict[int, str | None] = {
-        winner.trial_number: winner.source.attempt_id if winner.source is not None else None
-    }
-    if winner.repeats is not None:
-        for number in winner.repeats["member_trials"]:
-            standing.setdefault(number, None)
-    return standing
 
 
 def _trial_table(
@@ -1260,7 +1351,15 @@ def _trial_table(
         *(["reason"] if has_reason else []),
         _WINNER_COLUMN,
     )
-    standing = _winning_trials(winner)
+    standing = (
+        {}
+        if winner is None
+        else _winning_trials(
+            winner.trial_number,
+            None if winner.source is None else winner.source.attempt_id,
+            winner.repeats_detail,
+        )
+    )
     rows: list[JsonObject] = []
     for trial in trials:
         row: JsonObject = {header: getter(trial) for header, getter in _CORE_TRIAL_COLUMNS}
@@ -1269,20 +1368,23 @@ def _trial_table(
         if reruns:
             row[_RERUN_OF_COLUMN] = trial.user_attrs.get(RERUN_OF_ATTR)
         for name in observed:
-            row[name] = _recorded_number(trial.user_attrs.get(name))
+            row[name] = float_or_none(trial.user_attrs.get(name))
         if has_reason:
             row["reason"] = reasons[trial.number]
-        attempt = standing.get(trial.number)
-        marked = trial.number in standing and (
-            attempt is None or trial.user_attrs.get(ATTEMPT_ID_ATTR) == attempt
-        )
-        row[_WINNER_COLUMN] = "*" if marked else ""
+        row[_WINNER_COLUMN] = "*" if _stands_under_winner(trial, standing) else ""
         rows.append(row)
+    states = [_trial_count_state(trial) for trial in trials]
     return TrialTable(
         phase=phase.name,
         available=available,
         columns=columns,
         rows=tuple(rows),
+        finished=_finished_trial_count(trials),
+        uncounted=tuple(
+            (state, states.count(state))
+            for state in TRIAL_STATE_NAMES
+            if state not in FINISHED_TRIAL_STATES and state in states
+        ),
         groups=_repeat_group_views(experiment, phase, trials, rows),
     )
 
@@ -1307,17 +1409,19 @@ def _repeat_group_views(
     labels = group_labels_for(trials, axis)
     ranking = _rank_groups(trials, experiment, axis)
     eligible = {labels[group.representative]: group for group in ranking.groups}
-    replaced = {trial.user_attrs.get(RERUN_OF_ATTR) for trial in trials}
+    standing = {trial.number for trial in _unreplaced_attempts(trials, interrupted=False)}
     marked = {row["trial"] for row in rows if row["winner"] == "*"}
     members: dict[int, list[optuna.trial.FrozenTrial]] = {}
     params: dict[int, JsonObject] = {}
+    # Every labelled trial opens its group's entry, so a group whose members were all
+    # replaced or interrupted still gets a view; only the standing members are measured.
     for trial in trials:
         label = labels.get(trial.number)
         if label is None:
             continue
         members.setdefault(label, [])
         params[label] = {name: value for name, value in trial.params.items() if name != axis.key}
-        if trial.number not in replaced and not _trial_interrupted(trial):
+        if trial.number in standing:
             members[label].append(trial)
     views: list[RepeatGroupView] = []
     for label, found in sorted(members.items()):
@@ -1333,7 +1437,7 @@ def _repeat_group_views(
             if trial.state != optuna.trial.TrialState.COMPLETE:
                 continue
             for name, raw in trial.user_attrs.items():
-                value = _recorded_number(raw)
+                value = float_or_none(raw)
                 if name.startswith(OBSERVED_PREFIX) and value is not None and math.isfinite(value):
                     observations.setdefault(name[len(OBSERVED_PREFIX) :], []).append(value)
         group = eligible.get(label)
@@ -1388,6 +1492,7 @@ def read_trial_tables(
             publication,
             represented_generation_id,
             [phase.name for phase in experiment.phases],
+            ledger=ledger,
             fallback_published=latest and generation_id is None,
         )
     }

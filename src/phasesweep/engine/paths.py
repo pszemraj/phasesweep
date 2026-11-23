@@ -146,6 +146,19 @@ def _generation_summary_path(experiment: Experiment, generation_id: str) -> Path
     return _generation_dir(_experiment_dir(experiment), generation_id) / GENERATION_SUMMARY_FILENAME
 
 
+TRIALS_CSV_FILENAME = "trials.csv"
+
+
+def _trials_csv_path(experiment: Experiment, phase_name: str) -> Path:
+    """Return one phase's trials.csv snapshot path.
+
+    :param Experiment experiment: Configuration naming the experiment directory.
+    :param str phase_name: Phase whose trial table is addressed.
+    :return Path: The snapshot inside the phase directory.
+    """
+    return _phase_dir(experiment, phase_name) / TRIALS_CSV_FILENAME
+
+
 def _generation_winner_path(experiment: Experiment, generation_id: str, phase_name: str) -> Path:
     """Return the generation-scoped phases/<phase_name>/winner.yaml path.
 

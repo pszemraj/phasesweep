@@ -12,6 +12,7 @@ import yaml
 from click.testing import CliRunner, Result
 
 from phasesweep.cli import cli as cli_main
+from phasesweep.config import reference
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.scaffold import derive_experiment_id, scaffold_catalog_text
@@ -45,9 +46,19 @@ def test_scaffold_rejects_duplicate_ids(tmp_path: Path) -> None:
     with pytest.raises(CatalogError, match="both derive") as refused:
         scaffold_catalog_text(tmp_path / "catalog.yaml", [first, second])
     assert refused.value.suggestion == (
-        "rename one of the config files, since each entry's id comes from its file name, or "
-        "leave one out and add its entry to the written catalog by hand with another id"
+        "rename one of the config files; each entry's id comes from its file name"
     )
+
+
+def test_scaffold_header_links_the_installed_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The catalog header's documentation link names the installed release's tag, not main."""
+    monkeypatch.setattr(reference, "_editable_install", lambda: False)
+    monkeypatch.setattr(reference, "__version__", "0.3.12")
+    text = scaffold_catalog_text(tmp_path / "catalog.yaml", [_write_config(tmp_path, "srv.yaml")])
+    assert "https://github.com/pszemraj/phasesweep/blob/v0.3.12/docs/mcp.md#the-catalog" in text
+    assert "blob/main" not in text
 
 
 def test_init_catalog_writes_read_only_catalog(tmp_path: Path) -> None:
@@ -323,3 +334,18 @@ def test_init_catalog_multiple_configs(tmp_path: Path) -> None:
     registry = Registry.load(output)
     assert registry.get("alpha").id == "alpha"
     assert registry.get("beta").id == "beta"
+
+
+def test_init_catalog_prints_its_check_command_quoted_for_a_shell(tmp_path: Path) -> None:
+    """A catalog path with a space is quoted in the header's command and in the ``next:`` line."""
+    project = tmp_path / "my project"
+    project.mkdir()
+    config = _write_config(project, "srv.yaml")
+    output = project / "catalog.yaml"
+
+    result = _init_catalog(config, output)
+
+    assert result.exit_code == 0, result.output
+    command = f"phasesweep mcp check --catalog '{output.resolve()}'"
+    assert f"#   {command}\n" in output.read_text()
+    assert f"`{command}`" in result.output

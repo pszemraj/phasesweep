@@ -70,7 +70,9 @@ from phasesweep.runtime.shutdown import (
     absorb_shutdown_signals,
     defer_shutdown_signals,
     install_signal_handlers,
+    signal_name,
 )
+from phasesweep.runtime.terminal import command_line
 from phasesweep.runtime.time import utc_now_iso
 
 #: This module's file, which the MCP server launches by path as the detached runner.
@@ -133,7 +135,7 @@ def _run_log_details(run_id: str) -> str:
     :param str run_id: Run whose log holds the error.
     :return str: One sentence.
     """
-    return f"The error in {run_log_reference(run_id)}, gives the details."
+    return f"Details: {run_log_reference(run_id)}."
 
 
 def _operator_step_phrase(step: OperatorAction, *, run_id: str) -> str:
@@ -146,7 +148,7 @@ def _operator_step_phrase(step: OperatorAction, *, run_id: str) -> str:
     if step is OperatorAction.RUN_RECOVER_RUN:
         return recover_run_step(run_id)
     if step is OperatorAction.INSPECT_LOGS:
-        return f"inspect {run_log_reference(run_id)}, and the logs its error points to"
+        return f"inspect {run_log_reference(run_id)}"
     return OPERATOR_STEPS[step]
 
 
@@ -250,7 +252,7 @@ def _unrouted_failure_payload(
         "stage": stage,
         "retryable": False,
         "actor": "operator",
-        "remediation": f"Ask the operator to inspect {run_log_reference(run_id)}, before retrying.",
+        "remediation": f"Ask the operator to inspect {run_log_reference(run_id)}.",
     }
     if isinstance(error, TimeoutError):
         payload.update(
@@ -304,10 +306,7 @@ def _base_failure_payload(
         return _cleanup_uncertain_payload([error.action], run_id=run_id)
     steps = _routed_next_steps(error, run_id=run_id)
     if code == "experiment_busy":
-        steps["remediation"] = (
-            f"{steps['remediation']} MCP cannot cancel a CLI operation: only the interface "
-            "that started it can stop it."
-        )
+        steps["remediation"] = f"{steps['remediation']} MCP cannot cancel a CLI operation."
     return {"code": code, "stage": failure_stage, **steps}
 
 
@@ -637,8 +636,7 @@ def _write_status(
         except OSError:
             log.exception(
                 "failed to persist the finalized result snapshot state after every retry; "
-                "the durable pending record still holds the captured snapshot and remains "
-                "recoverable with `phasesweep mcp recover-run`"
+                f"recover it with `{command_line('mcp', 'recover-run')}`"
             )
             return True
         except Exception as exc:  # preserve a serializable failed state
@@ -942,10 +940,9 @@ def main(argv: list[str] | None = None) -> int:
                         )
             if absorbed.signum is not None:
                 logging.getLogger("phasesweep.mcp.runner").warning(
-                    "shutdown signal %d arrived while the terminal result snapshot was being "
-                    "captured; it was held until the snapshot was safe and will be honored "
-                    "once terminal status is durable",
-                    absorbed.signum,
+                    "shutdown signal %s arrived during result snapshot capture; it is held "
+                    "until terminal status is durable",
+                    signal_name(absorbed.signum),
                 )
 
         run_experiment(

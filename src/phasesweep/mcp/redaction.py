@@ -7,6 +7,7 @@ from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine.read import PhaseWinnerView, ResultContext
 from phasesweep.engine.state import FINISHED_TRIAL_STATES, TRIAL_STATE_NAMES
+from phasesweep.mcp.errors import sync_tracking_command
 from phasesweep.mcp.registry import VisibleParamsPolicy
 from phasesweep.mcp.snapshots import McpPublicationState, WinnerSnapshot
 from phasesweep.runtime.json import JsonObject, json_object
@@ -194,6 +195,13 @@ def winners_payload(
                 ),
                 "cost_advisory_status": view.cost_advisory_status,
                 "tie_groups": _tie_groups_payload(view, visible_params),
+                "edge_advisory": (
+                    view.edge_advisory
+                    if visible_params == "all" or view.edge_advisory is None
+                    else "No trial ran beyond the winner's value of a searched parameter; the "
+                    "operator can inspect show-winners for which one."
+                ),
+                "edge_advisory_status": view.edge_advisory_status,
             }
         )
     return {
@@ -217,19 +225,23 @@ def winners_payload(
 def _tracking_delivery_payload(counts: Mapping[str, int], run: Mapping[str, object]) -> JsonObject:
     """Attach the retry step to a run's tracking counts once sync can acquire the lock.
 
-    :param Mapping[str, int] counts: Pending creations and deliveries, and delivered uploads.
+    :param Mapping[str, int] counts: Pending ``records`` and unconfirmed ``creations``, and
+        ``delivered`` uploads.
     :param Mapping[str, object] run: Path-free detached-run state.
-    :return JsonObject: Counts plus ``remedy``, the retry step when records are pending after
-        the run ended, otherwise ``None``.
+    :return JsonObject: ``pending`` (records and creations together), ``delivered`` and
+        ``remedy``, the retry step when anything is pending after the run ended, otherwise
+        ``None``.
     """
-    pending = counts["pending"]
+    from phasesweep.tracking.session import count_text
+
+    pending = counts["records"] + counts["creations"]
     remedy = None
     if pending and run["state"] != "running":
         remedy = (
-            f"{pending} MLflow record(s) of this run are pending. Its scores and winners are "
-            "unaffected. Ask the operator to retry them with `phasesweep sync-tracking "
-            f"CONFIG --generation {run['run_id']}` using the config this run launched with; "
-            "delivery never retrains."
+            f"MLflow: {count_text(counts['records'], counts['creations'])} pending for this "
+            "run; its scores and winners are unaffected. The operator can send "
+            f"{'it' if pending == 1 else 'them'} with "
+            f"`{sync_tracking_command(str(run['run_id']))}` (the config this run launched with)."
         )
     return {"pending": pending, "delivered": counts["delivered"], "remedy": remedy}
 

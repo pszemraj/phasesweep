@@ -10,14 +10,15 @@ from __future__ import annotations
 
 import hashlib
 import re
-import shlex
 from collections.abc import Sequence
 from pathlib import Path
 
 import yaml
 
+from phasesweep.config.reference import pin_documentation_links
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.runtime.files import UnsafePrivatePathError, phasesweep_home, xdg_home
+from phasesweep.runtime.terminal import command_line
 
 _UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
 
@@ -82,11 +83,7 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
                 f"configs {seen[experiment_id]} and {config} both derive the "
                 f"experiment id {experiment_id!r}",
                 # Nothing is written on this refusal, so there is no generated id to edit.
-                suggestion=(
-                    "rename one of the config files, since each entry's id comes from its file "
-                    "name, or leave one out and add its entry to the written catalog by hand "
-                    "with another id"
-                ),
+                suggestion="rename one of the config files; each entry's id comes from its file name",
             )
         seen[experiment_id] = config
         experiment_id_scalar = _yaml_string_scalar(experiment_id)
@@ -129,17 +126,16 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
     if root is None:
         root = xdg_home("XDG_STATE_HOME", Path.home() / ".local" / "state") / "phasesweep"
     state_dir = root / "mcp" / digest
-    catalog_arg = shlex.quote(str(output.resolve()))
+    check_command = command_line("mcp", "check", "--catalog", str(output.resolve()))
+    catalog_docs = pin_documentation_links(
+        "https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md#the-catalog"
+    )
     header = f"""\
 # MCP catalog scaffolded by `phasesweep mcp init-catalog`. Edit the entries, then run:
-#   phasesweep mcp check --catalog {catalog_arg}
-# Then configure your MCP client to run the absolute `phasesweep-mcp` executable
-# with `--catalog` and this absolute catalog path.
-#
-# Inspect and launch an experiment by its catalog `id`. Status, results, waiting,
-# and cancellation take the returned `run_id`. Tools accept no config paths,
-# commands, environment values, storage URLs, or workdir. Edit this file to choose
-# the available experiments and permissions.
+#   {check_command}
+# Then point your MCP client at the absolute `phasesweep-mcp` executable with
+# `--catalog` and this file's absolute path. Entry fields:
+# {catalog_docs}
 
 state_dir: {_yaml_string_scalar(state_dir)}   # run handles, logs, audit.jsonl (operator-owned)
 max_concurrent_runs: 1          # sweeps at once across all experiments; 1 keeps a single GPU sane

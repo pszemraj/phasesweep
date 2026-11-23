@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import logging
 import os
 import shutil
 import signal
 import stat
+import struct
 import sys
+import termios
 import textwrap
+import threading
+import time
+import tty
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NoReturn, ParamSpec, TypeVar
+from typing import Any, Literal, NoReturn, ParamSpec, TypeVar
 
 import optuna
 import pytest
@@ -34,7 +41,7 @@ from phasesweep.config.models import (
     Observation,
     Phase,
 )
-from phasesweep.config.search import IntParam, Sampler
+from phasesweep.config.search import CategoricalParam, IntParam, Sampler
 from phasesweep.engine.artifact_roots import (
     _check_artifact_root_binding,
     _write_artifact_root_binding,
@@ -42,9 +49,11 @@ from phasesweep.engine.artifact_roots import (
 from phasesweep.engine.confound import CONFOUND_SCHEMA_VERSION
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
-from phasesweep.engine.paths import _last_successful_generation_path
+from phasesweep.engine.paths import _last_successful_generation_path, _run_log_path
+from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
+    FAILURE_REASON_ATTR,
     FEASIBLE_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
@@ -201,10 +210,9 @@ def patch_published_trial_read_failure(monkeypatch: pytest.MonkeyPatch, error: E
 
 
 def assert_advises_target(message: str, before: int, after: int, action: str) -> None:
-    """Assert phase p's retry target, action and failure-count reset advice."""
-    assert f"phases[p].n_trials from {before} to {after} in the config" in message
+    """Assert phase p's retry target and what it retries."""
+    assert f"phases[p].n_trials from {before} to {after} and rerun" in message
     assert action in message
-    assert "the failure count starts again from zero" in message
 
 
 def patch_rejected_trial_user_attr(
@@ -412,6 +420,37 @@ def phase_trials(experiment: Experiment, phase_name: str = "p") -> list[optuna.t
     return phase_study(experiment, phase_name).get_trials(deepcopy=False)
 
 
+def no_winner_remedy(
+    experiment: Experiment,
+    reasons: list[str | None],
+    *,
+    phase_name: str = "p",
+    grid: bool = False,
+) -> str:
+    """Return the step selection gives when every trial of a phase failed with ``reasons``.
+
+    :param Experiment experiment: Experiment that holds the phase.
+    :param list[str | None] reasons: One failure reason per failed trial; ``None`` records none.
+    :param str phase_name: Phase whose trials failed.
+    :param bool grid: Give each trial its own grid point, as the grid sampler assigns them.
+    :return str: The remediation of the refusal selection raises.
+    """
+    study = optuna.create_study()
+    for index, reason in enumerate(reasons):
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=optuna.trial.TrialState.FAIL,
+                user_attrs={} if reason is None else {FAILURE_REASON_ATTR: reason},
+                system_attrs={"grid_id": index} if grid else {},
+            )
+        )
+    with pytest.raises(NoFeasibleTrialError) as refused:
+        select_winner(study, experiment, phase_name=phase_name)
+    remedy = refused.value.remediation
+    assert remedy is not None
+    return remedy
+
+
 def record_accepted_partial_timeout(study: optuna.Study, target: int) -> None:
     """Record a phase timeout decision at the study's current outcome boundary.
 
@@ -489,8 +528,8 @@ def restored_signal_ownership() -> Iterator[None]:
 
     Restores, in order: the shutdown signals blocked, so none is delivered to
     a half-restored handler set; the prior OS handlers; the prior kernel mask;
-    and ``phasesweep.runtime.shutdown``'s ownership tokens and the signal its
-    handler is servicing.
+    and ``phasesweep.runtime.shutdown``'s ownership tokens, the owned signal set
+    the first ownership fixed, and the signal its handler is servicing.
 
     :return Iterator[None]: Context in which PhaseSweep may take signal ownership.
     """
@@ -501,6 +540,7 @@ def restored_signal_ownership() -> Iterator[None]:
     restore_mask = signal.pthread_sigmask
     prior_owner = shutdown._process_lifetime_owner
     prior_depth = shutdown._scope_depth
+    prior_owned = shutdown._owned_signals
     prior_servicing = shutdown._servicing_signum
     prior_handlers = {sig: signal.getsignal(sig) for sig in shutdown._SHUTDOWN_SIGNALS}
     prior_mask = restore_mask(signal.SIG_BLOCK, set())
@@ -513,6 +553,7 @@ def restored_signal_ownership() -> Iterator[None]:
         restore_mask(signal.SIG_SETMASK, prior_mask)
         shutdown._process_lifetime_owner = prior_owner
         shutdown._scope_depth = prior_depth
+        shutdown._owned_signals = prior_owned
         shutdown._servicing_signum = prior_servicing
 
 
@@ -520,9 +561,10 @@ def restored_signal_ownership() -> Iterator[None]:
 def isolate_signal_ownership_tokens() -> Iterator[None]:
     """Snapshot and restore PhaseSweep's process-level signal state per test.
 
-    ``phasesweep.runtime.shutdown._process_lifetime_owner`` and ``_scope_depth``
-    are plain module globals, deliberately not re-derived from OS ground truth
-    the way the actual signal handlers are.
+    ``phasesweep.runtime.shutdown._process_lifetime_owner``, ``_scope_depth`` and
+    ``_owned_signals`` are plain module globals, deliberately not re-derived from
+    OS ground truth the way the actual signal handlers are. Restoring
+    ``_owned_signals`` lets each test's first ownership decide the set afresh.
     A test that calls ``install_signal_handlers()`` (or drives a CLI/MCP main
     in-process) would otherwise permanently replace pytest's SIGTERM/SIGINT/
     SIGHUP handlers and unblock those signals, as well as flipping the private
@@ -631,6 +673,14 @@ def console_script(name: str) -> Path:
         pytest.fail(f"console script {name!r} is not installed beside {sys.executable}")
     return script
 
+
+#: The names of a short trial directory and of a real one, which is wider than a terminal; the
+#: report and trial-table tests each put them under their own parent.
+SHORT_TRIAL_NAME = "trial_00001"
+ATTEMPT_TRIAL_NAME = (
+    "trial_00001__generation_6413d5c1edd5475998cfadd4d3b59980"
+    "__attempt_0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+)
 
 #: The objective the packaged ``fake_train`` example writes to ``result.json``.
 FAKE_TRAIN_METRIC = Metric(
@@ -742,6 +792,26 @@ def make_experiment(
     return Experiment(**kwargs)
 
 
+def grid_experiment(name: str = "phasesweep_starter") -> Experiment:
+    """Build the starter's shape: two grid phases of two trials each on the CPU."""
+    grid = {"x": CategoricalParam(type="categorical", choices=[1, 2])}
+    return make_experiment(
+        experiment=name,
+        metric=FAKE_TRAIN_METRIC,
+        storage="auto",
+        phases=[
+            Phase(
+                name=phase,
+                n_trials=2,
+                gpu_policy="none",
+                sampler=Sampler(type="grid"),
+                search_space=grid,
+            )
+            for phase in ("depth", "learning_rate")
+        ],
+    )
+
+
 def write_experiment_config(path: Path, experiment: Experiment) -> Path:
     """Write an experiment model to a YAML config file.
 
@@ -753,6 +823,15 @@ def write_experiment_config(path: Path, experiment: Experiment) -> Path:
         yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False), encoding="utf-8"
     )
     return path
+
+
+def run_log_text(experiment: Experiment) -> str:
+    """Read the ``run.log`` the experiment's runs wrote.
+
+    :param Experiment experiment: The experiment whose artifact root holds the log.
+    :return str: The log's text.
+    """
+    return _run_log_path(experiment).read_text(encoding="utf-8")
 
 
 def write_yaml(tmp_path: Path, body: str) -> Path:
@@ -774,16 +853,19 @@ def assert_invalid_experiment_yaml(tmp_path: Path, body: str, match: str) -> Non
         load_experiment(write_yaml(tmp_path, body))
 
 
-def invoke_cli_boundary(
-    argv: list[str], monkeypatch: pytest.MonkeyPatch, *, debug: bool = False
-) -> int:
+def after_banner(console: str) -> str:
+    """Return what a live ``phasesweep run`` printed after its banner, which ends at a blank line."""
+    return console.split("\n\n", 2)[2]
+
+
+def invoke_cli_boundary(argv: list[str], monkeypatch: pytest.MonkeyPatch) -> int:
     """Run the console-script entry point exactly as the installed command does; return its exit status."""
     # ``CliRunner`` invokes the Click group directly and so bypasses the
     # process-level error boundary under test; a patched ``sys.argv`` reaches it.
     monkeypatch.setattr(sys, "argv", ["phasesweep", *argv])
     logger = logging.getLogger()
     previous_level = logger.level
-    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    logger.setLevel(logging.INFO)
     try:
         with pytest.raises(SystemExit) as excinfo:
             cli_boundary()
@@ -791,6 +873,91 @@ def invoke_cli_boundary(
         logger.setLevel(previous_level)
     code = excinfo.value.code
     return 0 if code is None else int(code)
+
+
+@dataclass
+class TerminalOutput:
+    """What a pseudo-terminal's reader collected, complete once the ``terminal_stream`` block exits."""
+
+    text: str = ""
+
+    @property
+    def lines(self) -> list[str]:
+        """Return the output split at line ends."""
+        return self.text.split("\n")
+
+
+@contextlib.contextmanager
+def terminal_stream(name: Literal["stdout", "stderr"], columns: int) -> Iterator[TerminalOutput]:
+    """Make ``sys.stdout`` or ``sys.stderr`` a pseudo-terminal ``columns`` wide and collect its text.
+
+    ``COLUMNS`` is removed so the width is the terminal's own, the way a person's shell has it, and
+    output processing is off so the text reads back exactly as written. Both are restored on exit.
+
+    :param Literal["stdout", "stderr"] name: The ``sys`` stream to replace.
+    :param int columns: Window width the terminal reports.
+    :return Iterator[TerminalOutput]: The collector; its ``text`` is filled when the block exits.
+    """
+    master, slave = os.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
+    tty.setraw(slave)
+    chunks: list[bytes] = []
+
+    def drain() -> None:
+        while True:
+            try:
+                data = os.read(master, 65536)
+            except OSError:
+                return
+            if not data:
+                return
+            chunks.append(data)
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    stream = os.fdopen(slave, "w", encoding="utf-8")
+    output = TerminalOutput()
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.delenv("COLUMNS", raising=False)
+            patch.setattr(sys, name, stream)
+            yield output
+    finally:
+        stream.close()
+        reader.join(timeout=5)
+        os.close(master)
+        output.text = b"".join(chunks).decode("utf-8")
+
+
+def stub_run_command(
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+    *,
+    config: Experiment | None = None,
+    writes_log: bool = False,
+) -> Path:
+    """Make ``phasesweep run`` load ``config`` and fail with ``error`` once it reaches the engine.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture used to replace the CLI's collaborators.
+    :param BaseException error: Exception ``run_experiment`` raises.
+    :param Experiment | None config: Experiment the stubbed loader returns; defaults to
+        :func:`make_experiment`'s.
+    :param bool writes_log: Have the stubbed engine write ``run.log`` before it fails.
+    :return Path: The experiment's ``run.log`` path, which exists only when ``writes_log``.
+    """
+    experiment = make_experiment() if config is None else config
+    log = _run_log_path(experiment)
+    monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
+    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: experiment)
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        if writes_log:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text("the engine's log\n", encoding="utf-8")
+        raise error
+
+    monkeypatch.setattr("phasesweep.cli.run_experiment", fail)
+    return log
 
 
 def trial_outcome(sequence: int, outcome: str, **extra: JsonValue) -> JsonObject:
@@ -833,8 +1000,9 @@ def single_trial_confound(trial_number: int) -> dict[str, Any]:
                 "detail": {
                     "ranked": 1,
                     "infeasible": 0,
-                    "incomplete_group": 0,
                     "failed": 0,
+                    "untried": 0,
+                    "failed_trials": [],
                 },
             },
             "tie": {"verdict": "n/a", "reason": "only one trial was ranked"},
@@ -854,6 +1022,72 @@ def write_trainer(path: Path, body: str) -> Path:
     path.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body))
     path.chmod(0o755)
     return path
+
+
+def assert_descendant_dies(pid: int, *, deadline_seconds: float = 5.0, on_timeout_msg: str) -> None:
+    """Poll until ``pid`` is gone; if it outlives the deadline, SIGKILL it and fail.
+
+    :param int pid: Descendant PID expected to be reaped by supervisor cleanup.
+    :param float deadline_seconds: How long to poll before giving up.
+    :param str on_timeout_msg: ``pytest.fail`` message used if still alive at the deadline.
+    """
+    deadline = time.monotonic() + deadline_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    # Kill before failing so the test run does not leak the process.
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    pytest.fail(on_timeout_msg)
+
+
+def use_guardian_timing(
+    monkeypatch: pytest.MonkeyPatch,
+    directory: Path,
+    *,
+    settle_seconds: float,
+    term_grace_seconds: float,
+    patch: str = "",
+) -> Path:
+    """Run every lease guardian this test spawns with shortened post-root timing.
+
+    The guardian runs under ``python -I -S`` without the package, so the wrapper loads
+    the real supervisor by file path, sets its helper settle and SIGTERM grace, runs
+    ``patch`` (dedented statements that see the loaded module as ``guardian``), and
+    calls its ``main``. This process's supervisor module takes the same two values, so
+    the controller's reason text and settle-aware shutdown window match the guardian.
+
+    :param pytest.MonkeyPatch monkeypatch: Undoes both overrides after the test.
+    :param Path directory: Where the wrapper script is written.
+    :param float settle_seconds: Replacement for ``_HELPER_SETTLE_SECONDS``.
+    :param float term_grace_seconds: Replacement for ``_GROUP_TERM_GRACE_SECONDS``.
+    :param str patch: Extra statements run against ``guardian`` before ``main``.
+    :return Path: The wrapper script the guardian now runs.
+    """
+    from phasesweep.runtime import process, supervisor
+
+    wrapper = directory / "guardian_timing.py"
+    loader = textwrap.dedent(
+        f"""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "phasesweep_guardian", {process._supervisor_script_path()!r}
+        )
+        assert spec is not None and spec.loader is not None
+        guardian = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guardian)
+        guardian._HELPER_SETTLE_SECONDS = {settle_seconds!r}
+        guardian._GROUP_TERM_GRACE_SECONDS = {term_grace_seconds!r}
+        """
+    )
+    wrapper.write_text(loader + textwrap.dedent(patch) + "\nraise SystemExit(guardian.main())\n")
+    monkeypatch.setattr(supervisor, "_HELPER_SETTLE_SECONDS", settle_seconds)
+    monkeypatch.setattr(supervisor, "_GROUP_TERM_GRACE_SECONDS", term_grace_seconds)
+    monkeypatch.setattr(process, "_SUPERVISOR_SCRIPT_PATH", str(wrapper))
+    return wrapper
 
 
 def write_flaky_trainer(tmp_path: Path, *, failures: int, value: float = 1.0) -> tuple[Path, Path]:

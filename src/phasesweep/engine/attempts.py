@@ -99,10 +99,6 @@ class _PreflightCleanupReport:
     """First reason a tracker could not be read in this pass, from an extraction or the run
     that just stopped on it. Once set, later extractions in the pass skip their read, so an
     outage costs one read."""
-    settled_generations: set[str] = field(default_factory=set)
-    """Generations whose trials this pass made terminal or confirmed clean, and those a run found
-    left open by an invocation killed outright. Recovery sends nothing to a tracker; the run
-    delivers those generations' MLflow outcomes once it has reached it."""
     error: BaseException | None = None
     process_actions: dict[_AttemptRecord, bool] = field(default_factory=dict)
     """Inspected attempts mapped to whether their live group needs termination."""
@@ -115,19 +111,35 @@ class _PreflightCleanupReport:
         if self.error is None:
             self.error = error
 
+    def mark_uncertain_if_unconfirmed(self, error: BaseException) -> bool:
+        """Mark the report uncertain when ``error`` left process cleanup unconfirmed.
+
+        That is a :class:`ProcessCleanupUncertainError`, or a :class:`PhaseSweepShutdown` whose
+        handler could not confirm that the groups it stopped are gone.
+
+        :param BaseException error: The error that ended or interrupted the work.
+        :return bool: Whether ``error`` left cleanup unconfirmed, so the report was marked.
+        """
+        unconfirmed = isinstance(error, ProcessCleanupUncertainError) or (
+            isinstance(error, PhaseSweepShutdown) and not error.report.cleanup_confirmed
+        )
+        if unconfirmed:
+            self.mark_uncertain(error)
+        return unconfirmed
+
     def record_generations(self, attempts: Mapping[str, _AttemptRecord]) -> None:
-        """Record the producing generation of each attempt that has one, as settled.
+        """Record the producing generation of each attempt that has one.
 
         :param Mapping[str, _AttemptRecord] attempts: Attempts whose trials this pass made
             terminal or confirmed clean, keyed by id.
         """
-        generations = {
-            attempt_id: record.generation_id
-            for attempt_id, record in attempts.items()
-            if record.generation_id is not None
-        }
-        self.recovered_attempt_generations.update(generations)
-        self.settled_generations.update(generations.values())
+        self.recovered_attempt_generations.update(
+            {
+                attempt_id: record.generation_id
+                for attempt_id, record in attempts.items()
+                if record.generation_id is not None
+            }
+        )
 
 
 def _pending_evidence_refusal(pending: Mapping[str, str]) -> TrackingTargetUnavailableError:
@@ -139,7 +151,7 @@ def _pending_evidence_refusal(pending: Mapping[str, str]) -> TrackingTargetUnava
     first = next(iter(pending.values())).rstrip(".")
     return tracker_unreadable(
         f"{len(pending)} completed trial(s) finished training, but the tracker could not be "
-        f"read. First failure: {first}. Their training is kept and no new trial was started."
+        f"read: {first}."
     )
 
 
@@ -177,20 +189,46 @@ def _trial_dir_from_attr(
 
     stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
     if not isinstance(stored, str) or not stored:
-        if fallback is None:
-            detail = (
-                f"Refusing to recover cleanup-uncertain trial {trial.number} in study "
-                f"{study_name}: missing or invalid {TRIAL_DIR_ATTR!r} user attribute "
-                f"{stored!r}. The process group cannot be tied to its identity files."
-            )
-        else:
-            detail = (
-                f"Refusing to reap RUNNING trial {trial.number}: invalid persisted "
-                f"{TRIAL_DIR_ATTR!r} user attribute {stored!r}. The trial cannot be "
-                "tied to its identity files."
-            )
-        raise ProcessCleanupUncertainError(detail, action=OperatorAction.RESTORE_LEDGER)
+        what = (
+            f"recover cleanup-uncertain trial {trial.number} in study {study_name}"
+            if fallback is None
+            else f"reap RUNNING trial {trial.number}"
+        )
+        raise _unusable_attribute_error(what, TRIAL_DIR_ATTR, stored)
     return Path(stored)
+
+
+def _active_attempt_persistence_error(
+    action: str, subject: str, path: Path, exc: Exception
+) -> ActiveAttemptPersistenceError:
+    """Refuse a launch whose attempt record could not be written.
+
+    :param str action: What could not be done, such as ``register``.
+    :param str subject: The record and its trial or phase.
+    :param Path path: Where the write failed.
+    :param Exception exc: The write failure, whose text names the OS error.
+    :return ActiveAttemptPersistenceError: Error raised before any trainer starts.
+    """
+    return ActiveAttemptPersistenceError(
+        f"Could not {action} {subject} at {path}: {exc}. No trainer was started."
+    )
+
+
+def _unusable_attribute_error(
+    what: str, attribute: str, stored: object | None = None
+) -> ProcessCleanupUncertainError:
+    """Refuse recovery of a trial whose durable user attribute cannot locate its process.
+
+    :param str what: The refused operation and its trial.
+    :param str attribute: Name of the missing or invalid user attribute.
+    :param object | None stored: The stored value, shown when there is one, defaults to None.
+    :return ProcessCleanupUncertainError: Error routed to restoring the ledger.
+    """
+    shown = "" if stored is None else f" ({stored!r})"
+    return ProcessCleanupUncertainError(
+        f"Cannot {what}: its {attribute!r} user attribute is missing or invalid{shown}.",
+        action=OperatorAction.RESTORE_LEDGER,
+    )
 
 
 def _trial_attempt_record(
@@ -237,10 +275,8 @@ def _require_trial_attempt(
     """
     record = _trial_attempt_record(trial, phase_name, trial_dir)
     if record is None:
-        raise ProcessCleanupUncertainError(
-            f"Refusing to recover trial {trial.number} in study {study_name}: missing or "
-            f"invalid {ATTEMPT_ID_ATTR!r} user attribute. Process identity is unknown.",
-            action=OperatorAction.RESTORE_LEDGER,
+        raise _unusable_attribute_error(
+            f"recover trial {trial.number} in study {study_name}", ATTEMPT_ID_ATTR
         )
     return record
 
@@ -399,11 +435,8 @@ def _register_active_attempt(
         }
         private_atomic_write_text(entry_path, json.dumps(entry, sort_keys=True) + "\n")
     except (OSError, UnsafePrivatePathError) as exc:
-        raise ActiveAttemptPersistenceError(
-            f"Could not register active attempt {attempt_id} for phase {phase_name!r} "
-            f"at {entry_path}: {exc}. No trainer was started and no GPU lease was "
-            "consumed. Persistent storage records a phase abort; retry requires "
-            "n_trials above its accepted target in the config."
+        raise _active_attempt_persistence_error(
+            "register", f"attempt {attempt_id} for phase {phase_name!r}", entry_path, exc
         ) from exc
 
 
@@ -447,9 +480,8 @@ def _open_attempt_registry(
         return
     except (OSError, UnsafePrivatePathError) as exc:
         raise ProcessCleanupUncertainError(
-            f"Attempt registry {attempts_dir} is not a real owner-only directory (mode 0700). "
-            "Recovery cannot trust process authority reached through a symlink or "
-            "shared path.",
+            f"Attempt registry {attempts_dir} is not a real owner-only directory (mode 0700): "
+            f"{exc}",
             action=OperatorAction.RESTORE_TREE,
         ) from exc
     try:
@@ -465,7 +497,25 @@ def _open_attempt_registry(
         os.close(directory_fd)
 
 
-_UNVERIFIABLE_ATTEMPT = "Recovery cannot prove whether a process from this attempt is still alive."
+_PARTIAL_SCHEMA = "has an unsupported or partial schema"
+
+
+def _unusable_entry_error(
+    entry_path: Path, problem: str, *, kind: str = "Attempt"
+) -> ProcessCleanupUncertainError:
+    """Refuse recovery over a registry entry it cannot use, with the check that clears it.
+
+    :param Path entry_path: Registry entry that recovery cannot use.
+    :param str problem: What is wrong with the entry.
+    :param str kind: ``Attempt`` or ``Tracking operation``, defaults to ``Attempt``.
+    :return ProcessCleanupUncertainError: Error routed to restoring the tree, whose fix line
+        is the process check and the deletion.
+    """
+    return ProcessCleanupUncertainError(
+        f"{kind} registry entry {entry_path} {problem}.",
+        action=OperatorAction.RESTORE_TREE,
+        remediation=_entry_removal_step(entry_path),
+    )
 
 
 def _entry_removal_step(entry_path: Path) -> str:
@@ -493,23 +543,14 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
     try:
         payload = strict_json_loads(read_private_text_at(directory_fd, entry_path.name, entry_path))
     except (OSError, UnsafePrivatePathError, ValueError) as exc:
-        raise ProcessCleanupUncertainError(
-            f"Attempt registry entry {entry_path} is unreadable or malformed. "
-            f"{_UNVERIFIABLE_ATTEMPT}",
-            action=OperatorAction.RESTORE_TREE,
-            remediation=_entry_removal_step(entry_path),
-        ) from exc
+        raise _unusable_entry_error(entry_path, f"is unreadable or malformed: {exc}") from exc
     if (
         isinstance(payload, dict)
         and "schema_version" in payload
         and payload["schema_version"] != ATTEMPT_REGISTRY_SCHEMA_VERSION
     ):
         found = format_mismatch(payload["schema_version"], ATTEMPT_REGISTRY_SCHEMA_VERSION)
-        raise ProcessCleanupUncertainError(
-            f"Attempt registry entry {entry_path} {found}. {_UNVERIFIABLE_ATTEMPT}",
-            action=OperatorAction.RESTORE_TREE,
-            remediation=_entry_removal_step(entry_path),
-        )
+        raise _unusable_entry_error(entry_path, found)
     if isinstance(payload, dict) and payload.get("kind") == "tracking":
         required = {
             "schema_version",
@@ -530,22 +571,13 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
             and SAFE_NAME_PATTERN.fullmatch(json_text(payload, "generation_id"))
         ):
             return payload
-        raise ProcessCleanupUncertainError(
-            f"Tracking operation registry entry {entry_path} is malformed. {_UNVERIFIABLE_ATTEMPT}",
-            action=OperatorAction.RESTORE_TREE,
-            remediation=_entry_removal_step(entry_path),
-        )
+        raise _unusable_entry_error(entry_path, "is malformed", kind="Tracking operation")
     locator_identity: str | None = None
     if isinstance(payload, dict) and isinstance(payload.get("storage_locator"), str):
         try:
             locator_identity = canonical_storage_identity(json_text(payload, "storage_locator"))
         except ValueError as exc:
-            raise ProcessCleanupUncertainError(
-                f"Attempt registry entry {entry_path} has an unsupported or partial schema. "
-                f"{_UNVERIFIABLE_ATTEMPT}",
-                action=OperatorAction.RESTORE_TREE,
-                remediation=_entry_removal_step(entry_path),
-            ) from exc
+            raise _unusable_entry_error(entry_path, _PARTIAL_SCHEMA) from exc
     if (
         not isinstance(payload, dict)
         or not _ATTEMPT_ENTRY_REQUIRED_FIELDS.issubset(payload)
@@ -566,12 +598,7 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
         or not payload.get("generation_id")
         or type(payload.get("trial_number")) is not int
     ):
-        raise ProcessCleanupUncertainError(
-            f"Attempt registry entry {entry_path} has an unsupported or partial schema. "
-            f"{_UNVERIFIABLE_ATTEMPT}",
-            action=OperatorAction.RESTORE_TREE,
-            remediation=_entry_removal_step(entry_path),
-        )
+        raise _unusable_entry_error(entry_path, _PARTIAL_SCHEMA)
     return payload
 
 
@@ -582,16 +609,27 @@ def _attempt_process_resolution(
 ) -> str:
     """Classify the fail-closed recovery authority for one interrupted attempt.
 
+    ``launching`` with no identity file settles without signalling. The launch writes
+    ``launching`` before it spawns the supervisor and sends the payload only after the
+    identity file is written, so a missing file means no payload crossed. Recovery acts on
+    this only under the experiment lock, which proves the controller holding the payload
+    pipe is dead, and a supervisor that reads end-of-file instead of a payload exits without
+    running the trainer. An identity file that exists at all, even partial, keeps the strict
+    read: its payload may have crossed.
+
     :param AttemptLifecycle | None lifecycle: Validated durable lifecycle, if present.
     :param bool identity_exists: Whether a retained process-identity file exists.
     :return str: ``"exited"`` for confirmed cleanup, ``"allocated"`` when launch
-        provably never began, or ``"identity"`` when the process identity must
-        be validated (and, outside inspection mode, cleaned).
+        provably never began, ``"payload_withheld"`` when a launch began but no worker
+        received its payload, or ``"identity"`` when the process identity must be
+        validated (and, outside inspection mode, cleaned).
     """
     if lifecycle is not None and lifecycle.state == "exited" and lifecycle.cleanup_confirmed:
         return "exited"
     if not identity_exists and lifecycle is not None and lifecycle.state == "allocated":
         return "allocated"
+    if not identity_exists and lifecycle is not None and lifecycle.state == "launching":
+        return "payload_withheld"
     return "identity"
 
 
@@ -760,12 +798,16 @@ def _registry_attempt_fail_stale_trial(
         :param bool storage_unavailable: Whether durable interruption intent cannot be recorded.
         """
 
-        def before_terminate() -> None:
-            """Refuse signalling until a recoverable trainer interruption is durable."""
+        def require_owning_ledger() -> None:
+            """Keep a live attempt untouched until its owning ledger can be read."""
             if storage_unavailable:
                 raise StudyStorageUnavailableError(
-                    f"Attempt {record.attempt_id} has a live process group, but its study cannot be read to preserve interruption intent. Nothing was signalled; retry when its ledger is available."
+                    f"Cannot request cleanup for live attempt {record.attempt_id}: its study "
+                    "cannot be read. Nothing was signalled; retry when its ledger is available."
                 )
+
+        def before_terminate() -> None:
+            """Preserve interruption before directly signalling an unguarded trainer."""
             if study is not None and trial is not None:
                 _record_recovery_interruption(study, trial)
 
@@ -775,6 +817,7 @@ def _registry_attempt_fail_stale_trial(
             evidence_action=OperatorAction.RESTORE_TREE,
             lifecycle_settles=True,
             confirm=True,
+            before_signal=require_owning_ledger,
             before_terminate=before_terminate,
         )
 
@@ -786,7 +829,6 @@ def _registry_attempt_fail_stale_trial(
         # In-memory storage died with its orchestrator, so no trial is left to update. The
         # attempt's cleanup is confirmed here, which is what lets its managed run be ended.
         resolve()
-        report.settled_generations.add(entry["generation_id"])
         return "terminal"
     try:
         study = open_registry_study(storage_url, entry["study_name"])
@@ -819,8 +861,7 @@ def _registry_attempt_fail_stale_trial(
         raise StudySchemaMismatchError(
             f"Attempt registry entry {entry_path} identifies generation "
             f"{entry['generation_id']!r}, but its trial {trial.number} in study "
-            f"{entry['study_name']!r} records {stored_generation_id!r}. Refusing to "
-            "overwrite conflicting recovery identity."
+            f"{entry['study_name']!r} records {stored_generation_id!r}."
         )
     resolve(study, trial)
     if trial.state != optuna.trial.TrialState.RUNNING:
@@ -829,16 +870,13 @@ def _registry_attempt_fail_stale_trial(
             if stored_attempt_id is None or stored_generation_id is None:
                 raise ProcessCleanupUncertainError(
                     f"Attempt registry entry {entry_path} cannot be matched to terminal "
-                    f"trial {trial.number} in study {entry['study_name']!r}: its durable "
-                    "attempt or generation identity is missing. The registry entry is "
-                    "retained; cleanup recovery cannot be attributed to this trial.",
+                    f"trial {trial.number} in study {entry['study_name']!r}: its attempt or "
+                    "generation identity is missing.",
                     action=OperatorAction.RESTORE_LEDGER,
                 )
             if not recovered:
                 _record_cleanup_recovery(study, trial)
                 report.cleanup_recovered_trials += 1
-            # A pass interrupted after the ledger write may not have saved the outcome record.
-            report.settled_generations.add(entry["generation_id"])
             return "recovered"
         return "terminal"
     if stored_attempt_id is None or stored_generation_id is None:
@@ -850,10 +888,9 @@ def _registry_attempt_fail_stale_trial(
                 active_trial.set_user_attr(GENERATION_ID_ATTR, entry["generation_id"])
         except Exception as exc:
             raise StudyStorageUnavailableError(
-                f"Process cleanup completed for registered attempt {entry['attempt_id']}, "
-                f"but its durable trial identity could not be restored in study "
-                f"{entry['study_name']!r}. The trial remains RUNNING and the registry "
-                "entry is retained for retry."
+                f"Process cleanup completed for attempt {entry['attempt_id']}, but its trial "
+                f"identity could not be restored in study {entry['study_name']!r}, so the "
+                f"trial stays RUNNING: {exc}"
             ) from exc
     settled = _fail_stale_running_trial(
         study,
@@ -861,12 +898,7 @@ def _registry_attempt_fail_stale_trial(
         record=_registry_attempt_record(entry, entry_path),
         experiment=experiment,
         report=report,
-        failure_message=(
-            f"Process cleanup completed for registered attempt {entry['attempt_id']}, "
-            f"but its stale RUNNING trial {trial.number} in study "
-            f"{entry['study_name']!r} could not be marked FAIL. Refusing to "
-            "continue with an inconsistent study."
-        ),
+        where=f"attempt {entry['attempt_id']}",
     )
     if not settled:
         return "pending"
@@ -980,6 +1012,18 @@ class _AttemptRecord:
     trial_number: int | None
 
 
+def _record_process_resolution(record: _AttemptRecord, lifecycle: AttemptLifecycle | None) -> str:
+    """Classify one attempt's process slot from its lifecycle and its identity file.
+
+    :param _AttemptRecord record: Attempt whose trial directory holds the identity file.
+    :param AttemptLifecycle | None lifecycle: Validated durable lifecycle, if present.
+    :return str: The :func:`_attempt_process_resolution` verdict for the attempt.
+    """
+    return _attempt_process_resolution(
+        lifecycle, identity_exists=(record.trial_dir / PROCESS_IDENTITY_FILE).exists()
+    )
+
+
 def _resolve_attempt(
     record: _AttemptRecord,
     *,
@@ -987,13 +1031,15 @@ def _resolve_attempt(
     evidence_action: OperatorAction,
     lifecycle_settles: bool,
     confirm: bool,
+    before_signal: Callable[[], None] | None = None,
     before_terminate: Callable[[], None] | None = None,
     inspection_messages: dict[_AttemptRecord, str] | None = None,
 ) -> bool:
     """Inspect or clean one attempt using its durable lifecycle and process identity.
 
-    Confirmed exited attempts and allocated attempts without identities need no signal
-    when ``lifecycle_settles`` is true. Terminal cleanup uncertainty requires a valid
+    When ``lifecycle_settles`` is true, three slots need no signal: confirmed exited
+    attempts, allocated attempts without an identity, and launching attempts without an
+    identity, whose payload never crossed. Terminal cleanup uncertainty requires a valid
     identity regardless of lifecycle. Confirmed resolution cleans the identified group.
 
     :param _AttemptRecord record: Attempt identity and evidence directory to resolve.
@@ -1001,12 +1047,14 @@ def _resolve_attempt(
     :param OperatorAction evidence_action: Remedy for invalid lifecycle or identity evidence.
     :param bool lifecycle_settles: Whether lifecycle evidence can prove cleanup.
     :param bool confirm: Clean the process group; False validates evidence without signalling.
-    :param Callable[[], None] | None before_terminate: Preserve the owning trainer outcome before terminating a live group.
+    :param Callable[[], None] | None before_signal: Confirm authority before requesting any signal.
+    :param Callable[[], None] | None before_terminate: Preserve the owning trainer outcome before directly terminating a live group.
     :param dict[_AttemptRecord, str] | None inspection_messages: Collect one preview message per attempt instead of logging immediately.
     :raises ProcessCleanupUncertainError: Invalid or mismatched lifecycle/identity,
         or unconfirmed process cleanup.
     :raises StudyStorageUnavailableError: Recovery intent could not be recorded durably before signalling.
-    :return bool: Whether inspection would terminate a live group, or confirmation terminated one.
+    :return bool: Whether this pass would directly signal a group, or did so when confirmed.
+        A request to its guardian is reported separately.
     """
     context = (
         f"{context}: attempt={record.attempt_id} phase={record.phase_name!r} "
@@ -1014,36 +1062,44 @@ def _resolve_attempt(
     )
     label = f"Attempt {record.attempt_id} phase={record.phase_name!r} trial={record.trial_number}"
 
-    def report(message: str) -> None:
+    def report(message: str, *, level: int = logging.WARNING) -> None:
         """Defer a preview until all discovery sources have inspected the attempt.
 
         :param str message: Operator-facing process or lifecycle decision.
+        :param int level: Level a real run logs it at; a settled attempt that needed no signal is
+            routine, so only a decision about a live process group warns.
         """
         if inspection_messages is None:
-            log.warning(message)
+            log.log(level, message)
         else:
             inspection_messages[record] = message
 
-    if lifecycle_settles:
+    def read_lifecycle() -> AttemptLifecycle | None:
+        """Read this attempt's current lifecycle under the discovery source's error policy."""
         try:
-            lifecycle = read_attempt_lifecycle(
-                record.trial_dir, expected_attempt_id=record.attempt_id
-            )
+            return read_attempt_lifecycle(record.trial_dir, expected_attempt_id=record.attempt_id)
         except ValueError as exc:
             raise ProcessCleanupUncertainError(
                 f"{context}: attempt lifecycle record is malformed or belongs to another attempt.",
                 action=evidence_action,
             ) from exc
-        # Only allocated with an absent identity settles without a strict identity read.
-        resolution = _attempt_process_resolution(
-            lifecycle,
-            identity_exists=(record.trial_dir / PROCESS_IDENTITY_FILE).exists(),
-        )
+
+    if lifecycle_settles:
+        lifecycle = read_lifecycle()
+        resolution = _record_process_resolution(record, lifecycle)
+        if resolution == "payload_withheld":
+            report(
+                f"{label}: lifecycle=launching with no process identity: no worker received "
+                "its payload; settles without signalling.",
+                level=logging.INFO,
+            )
+            return False
         if resolution != "identity":
             assert lifecycle is not None
             report(
                 f"{label}: lifecycle={lifecycle.state} rc={lifecycle.return_code} "
-                "confirms cleanup without signalling."
+                "confirms cleanup without signalling.",
+                level=logging.INFO,
             )
             return False
     try:
@@ -1060,10 +1116,15 @@ def _resolve_attempt(
         decision = stale_trial_process_decision(identity)
         action = {
             "terminate": "--confirm will terminate it if still alive before reconciling this attempt",
+            "guardian": "--confirm will ask the guardian to settle before reconciling this attempt",
             "gone": "--confirm will reconcile this attempt without signalling",
             "refuse": "--confirm will refuse cleanup and leave this attempt unresolved",
         }[decision.action]
-        if decision.action == "terminate" and lifecycle_settles and record.trial_number is not None:
+        if (
+            decision.action in {"terminate", "guardian"}
+            and lifecycle_settles
+            and record.trial_number is not None
+        ):
             action += (
                 ". With persistent storage, wait for the trainer to exit successfully "
                 "to keep its result"
@@ -1074,6 +1135,19 @@ def _resolve_attempt(
         )
         return decision.action == "terminate"
     terminated = False
+    guardian_settled = False
+
+    def confirm_guardian_exit() -> bool:
+        """Read the verified guardian's final verdict before claiming cleanup."""
+        nonlocal guardian_settled
+        lifecycle = read_lifecycle()
+        guardian_settled = (
+            lifecycle is not None
+            and lifecycle.state == "exited"
+            and lifecycle.cleanup_confirmed is True
+            and lifecycle.duration_seconds is not None
+        )
+        return guardian_settled
 
     def record_termination() -> None:
         """Preserve interruption intent before marking the group for termination."""
@@ -1084,17 +1158,22 @@ def _resolve_attempt(
 
     if not cleanup_stale_trial_process(
         identity,
+        before_signal=before_signal,
         before_terminate=record_termination,
+        guardian_completed=confirm_guardian_exit,
     ):
         raise ProcessCleanupUncertainError(
-            f"{context}: process cleanup could not be confirmed. "
-            f"pid={identity.pid} pgid={identity.pgid}. "
-            f"List the members of process group {identity.pgid} with "
-            f"{group_members_command(str(identity.pgid))} "
-            "and check GPU processes before retrying recovery."
+            f"{context}: process cleanup could not be confirmed (pid={identity.pid} "
+            f"pgid={identity.pgid} guardian={identity.guardian_pid}). List the group's members with "
+            f"{group_members_command(str(identity.pgid))}, then retry recovery."
         )
+    if guardian_settled:
+        log.info("%s: lease guardian confirmed descendant cleanup.", label)
+        return False
     _record_attempt_exited(record.trial_dir, attempt_id=record.attempt_id, return_code=None)
-    log.warning(
+    # Signalling a live group is worth a warning; a group that was already gone is routine.
+    log.log(
+        logging.WARNING if terminated else logging.INFO,
         "%s: %s (pid=%s pgid=%s).",
         label,
         "terminated training process group; confirmed process cleanup"
@@ -1116,10 +1195,12 @@ def _recover_completed_trial(
 ) -> bool | None:
     """Accept a finished orphan through the producing configuration's extraction path.
 
-    Confirmed group cleanup and successful trainer exit evidence permit acceptance.
-    Trainer ledger attributes precede SDK workers and take priority over the reused
-    process slot; the guardian covers a runner death before those attributes commit.
-    Recorded process failures and interruptions remain authoritative; a measured
+    An idle process slot and successful trainer exit evidence permit acceptance. The slot
+    is idle once its group's cleanup is confirmed or its last launch never delivered a
+    payload (see :func:`_attempt_process_resolution`). Trainer ledger attributes precede
+    SDK workers and take priority over the reused process slot; the guardian covers a
+    runner death before those attributes commit. A withheld payload carries no exit status,
+    so it proves a finished trainer only through those attributes. Recorded process failures and interruptions remain authoritative; a measured
     bound violation may still commit as COMPLETE and infeasible. Evidence that answers
     with a failure commits FAIL with that failure as the trial's outcome, as the live path
     records it, so finished training is never trained again. Either verdict counts toward the
@@ -1157,9 +1238,7 @@ def _recover_completed_trial(
     lifecycle = read_attempt_lifecycle(record.trial_dir, expected_attempt_id=record.attempt_id)
     trainer_duration = None if lifecycle is None else _completed_trainer_duration(trial, lifecycle)
     if (
-        lifecycle is None
-        or lifecycle.state != "exited"
-        or not lifecycle.cleanup_confirmed
+        _record_process_resolution(record, lifecycle) not in {"exited", "payload_withheld"}
         or trainer_duration is None
         or record.generation_id is None
     ):
@@ -1327,7 +1406,7 @@ def _fail_stale_running_trial(
     study: optuna.Study,
     trial: optuna.trial.FrozenTrial,
     *,
-    failure_message: str,
+    where: str,
     record: _AttemptRecord | None = None,
     experiment: Experiment | None = None,
     report: _PreflightCleanupReport | None = None,
@@ -1346,8 +1425,8 @@ def _fail_stale_running_trial(
     :param Experiment | None experiment: Recovery invocation supplying the artifact root and MLflow polling controls.
     :param _PreflightCleanupReport | None report: Collector for newly recovered completed
         results and for the generations whose trials were settled.
-    :param str failure_message: The refusal to raise when Optuna cannot
-        record ``FAIL``.
+    :param str where: What the finished cleanup is named by, quoted in the refusal when Optuna
+        cannot record ``FAIL``.
     :return bool: Whether the trial became terminal; False retains completed training during
         shutdown or while its tracker gives no answer.
     :raises WinnerIntegrityError: Completed trainer evidence requires an unavailable or invalid producing snapshot.
@@ -1409,9 +1488,10 @@ def _fail_stale_running_trial(
         try:
             study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
         except Exception as exc:
-            raise StudyStorageUnavailableError(failure_message) from exc
-    if report is not None and record is not None and record.generation_id is not None:
-        report.settled_generations.add(record.generation_id)
+            raise StudyStorageUnavailableError(
+                f"Process cleanup completed ({where}), but stale RUNNING trial {trial.number} "
+                f"in study {study.study_name!r} could not be marked FAIL: {exc}"
+            ) from exc
     return True
 
 
@@ -1442,6 +1522,5 @@ def _record_cleanup_recovery(study: optuna.Study, trial: optuna.trial.FrozenTria
     except Exception as exc:
         raise StudyStorageUnavailableError(
             f"Cleanup was confirmed for trial {trial.number} in study {study.study_name}, "
-            "but the study-level cleanup recovery ledger could not be updated. "
-            "Refusing to clear MCP cleanup uncertainty without consuming the trial evidence."
+            f"but the study's cleanup recovery ledger could not be updated: {exc}"
         ) from exc

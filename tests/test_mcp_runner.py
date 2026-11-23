@@ -66,7 +66,7 @@ from phasesweep.errors import (
     UnsafeProcessCleanupError,
 )
 from phasesweep.mcp import runner as mcp_runner
-from phasesweep.mcp.errors import ConcurrencyLimitError
+from phasesweep.mcp.errors import NEW_RUN_RESUMES, ConcurrencyLimitError
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
@@ -262,7 +262,7 @@ def _spawned_runner(
         pytest.param(
             ArtifactRootConflictError("bound to /a, offered /b"),
             "artifact_root_conflict",
-            "set a new `experiment` name in the config to start a fresh study",
+            "set a new `experiment` name to start a fresh study",
             id="artifact_root",
         ),
     ],
@@ -306,9 +306,8 @@ def test_attempt_registry_failure_routes_the_workdir_repair() -> None:
     assert failure["retryable"] is False
     assert failure["actor"] == "operator"
     assert failure["remediation"] == (
-        "Ask the operator to restore the files and permissions identified in the error. The "
-        "error in this run's log, `logs/r0.log` under the catalog's `state_dir`, gives the "
-        "details."
+        "Ask the operator to restore the files and permissions identified in the error. "
+        "Details: `logs/r0.log` under the catalog's `state_dir`."
     )
 
 
@@ -346,9 +345,8 @@ def test_missing_published_study_is_an_operator_preflight_failure(
         "retryable": False,
         "actor": "operator",
         "remediation": (
-            "Ask the operator to restore or repair the storage ledger and access to it. The "
-            f"error in this run's log, `logs/{run_id}.log` under the catalog's `state_dir`, "
-            "gives the details."
+            "Ask the operator to restore or repair the storage ledger and access to it. "
+            f"Details: `logs/{run_id}.log` under the catalog's `state_dir`."
         ),
     }
     assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
@@ -440,7 +438,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
             timeout=30,
         )
         assert refused_run.returncode != 0
-        assert "restore or repair the storage ledger and access to it" in refused_run.stderr
+        assert "fix: Restore or repair the storage ledger; for an MCP run" in refused_run.stderr
 
         run_id = "damaged-storage"
         digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
@@ -531,7 +529,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         store.status_path(run_id).write_text(json.dumps(unrelated))
         refused_recovery = recover_run_cli(state_dir, run_id)
         assert refused_recovery.exit_code != 0
-        assert "could not confirm any trial-level cleanup evidence" in refused_recovery.output
+        assert "found no trial-level cleanup evidence" in refused_recovery.output
         assert not store.cleanup_recovery_path(run_id).exists()
     store.status_path(run_id).write_bytes(terminal_before)
     preflight = recover_run_cli(state_dir, run_id)
@@ -597,9 +595,7 @@ def test_prior_abort_refusal_is_a_refused_target_not_a_trainer_failure(
     assert (refused["code"], refused["stage"]) == ("trial_target_refused", "preflight")
     assert (refused["retryable"], refused["actor"]) == (False, "operator")
     for failure in (aborting, refused):
-        assert "phases[p].n_trials above 2 in the config" in failure["remediation"]
-        assert "phases[p].max_consecutive_failures above 1 in the config" in failure["remediation"]
-        assert "run the 1 trial still left at n_trials=2" in failure["remediation"]
+        assert "phases[p].n_trials above 2" in failure["remediation"]
 
 
 @pytest.mark.integration
@@ -624,7 +620,6 @@ def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
     assert status["failure"]["stage"] == "preflight"
     assert status["failure"]["retryable"] is True
     assert status["failure"]["actor"] == "agent"
-    assert "only the interface that started it can stop it" in status["failure"]["remediation"]
     assert "MCP cannot cancel a CLI operation" in status["failure"]["remediation"]
     assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
     assert status["result_snapshot_state"] == "complete"
@@ -683,7 +678,7 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
     snapshot_path = store.config_snapshot_path(run_id)
     snapshot_path.write_bytes(config.read_bytes())
 
-    with pytest.raises(StudyFingerprintMismatchError, match="different phase config"):
+    with pytest.raises(StudyFingerprintMismatchError, match="different config"):
         run_claimed_runner(store, run_id, snapshot_path)
 
     handle = store.get(run_id)
@@ -757,7 +752,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     # Unsupported state routes to starting fresh, rather than to archiving
     # this study and continuing under the current one.
     remediation = terminal["failure"]["remediation"]
-    assert "to start a fresh study" in remediation
+    assert "Set a new `experiment` name" in remediation
 
 
 @pytest.mark.integration
@@ -1209,10 +1204,10 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     assert status["failure"]["code"] == "cleanup_uncertain"
     assert status["failure"]["remediation"] == (
         "Ask the operator to restore or repair the storage ledger and access to it, then "
-        f"run `phasesweep mcp recover-run --state-dir STATE_DIR --run-id {run_id}` from a host "
-        "shell, with the catalog's `state_dir` as STATE_DIR, read its preview and repeat it "
-        f"with `--confirm` before another launch. The error in this run's log, `logs/{run_id}.log` "
-        "under the catalog's `state_dir`, gives the details."
+        f"run `phasesweep mcp recover-run --state-dir STATE_DIR --run-id {run_id}` on the "
+        "server host (STATE_DIR is the catalog's `state_dir`), then repeat it with "
+        f"`--confirm` before another launch. Details: `logs/{run_id}.log` under the "
+        "catalog's `state_dir`."
     )
 
 
@@ -1580,9 +1575,7 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
             "retryable": True,
             "actor": "agent",
             "remediation": (
-                "Report that recovery could not confirm this run as the current published "
-                "result. A new run of this experiment reuses its finished trials and "
-                "publishes their winners without training them again."
+                f"Recovery could not confirm this run as the published result; {NEW_RUN_RESUMES}."
             ),
         }
 

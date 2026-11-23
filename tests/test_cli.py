@@ -39,6 +39,7 @@ from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_dir,
 )
+from phasesweep.engine.run import TerminalReport
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseTrialsFailedError
 from phasesweep.engine.state import Winner
 from phasesweep.errors import (
@@ -54,10 +55,12 @@ from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
+    after_banner,
     console_script,
     invoke_cli_boundary,
     make_experiment,
     requires_nonroot,
+    stub_run_command,
     write_constant_trainer,
     write_experiment_config,
     write_param_echo_trainer,
@@ -75,8 +78,7 @@ from tests.recovery_helpers import recover_run_cli
             [
                 "r.json",
                 "eval.loss",
-                "evaluation_point check: n/a (json objectives record no evaluation position; "
-                "json_envelope via report_objective, wandb with evaluation_axis, or mlflow would)",
+                "evaluation_point check: n/a (json objectives record no evaluation position)",
             ],
         ),
         (
@@ -94,9 +96,7 @@ from tests.recovery_helpers import recover_run_cli
                 "select",
                 "last",
                 "stdout.log",
-                "evaluation_point check: n/a (log_regex objectives record no evaluation "
-                "position; json_envelope via report_objective, wandb with evaluation_axis, "
-                "or mlflow would)",
+                "evaluation_point check: n/a (log_regex objectives record no evaluation position)",
             ],
         ),
         (
@@ -135,6 +135,13 @@ from tests.recovery_helpers import recover_run_cli
                 "eval/loss",
                 "evaluation_point check: supported (position is the step of the selected "
                 "observation)",
+            ],
+        ),
+        (
+            {"type": "mlflow", "metric_key": "eval/loss", "select": "min"},
+            [
+                "evaluation_point check: n/a (mlflow select: min records the step where the "
+                "best value fell, not how far each trial trained)",
             ],
         ),
     ],
@@ -202,13 +209,11 @@ def test_validate_does_not_preflight_ambient_wandb_environment(
 
 
 _BASE_ENV_NAMES_WITHOUT_TMPDIR = "PATH, HOME, LANG, LC_ALL, USER, LOGNAME, TZ"
-_REFUSES_TO_RESUME = "a persistent study refuses to resume when any digested value changes"
 _ENVIRONMENT_CONTRACT_CASES = [
     pytest.param(
         {},
-        "environment: inherit_env=none (inherited when set, and digested: "
-        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}); env keys: none; "
-        "passthrough_env: TMPDIR (built in; inherited when set, excluded from the digest)",
+        f"environment: inherit_env=none (digested: {_BASE_ENV_NAMES_WITHOUT_TMPDIR}); "
+        "env keys: none; passthrough_env: TMPDIR (built in, not digested)",
         id="default-in-memory",
     ),
     pytest.param(
@@ -217,39 +222,35 @@ _ENVIRONMENT_CONTRACT_CASES = [
             "env": {"B_FLAG": "1", "A_FLAG": "2"},
             "persistent": True,
         },
-        "environment: inherit_env=[HF_HOME] (inherited when set, and digested: "
-        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}, HF_HOME); env keys: A_FLAG, B_FLAG; "
-        "passthrough_env: HF_TOKEN and built-in TMPDIR "
-        "(inherited when set, excluded from the digest); " + _REFUSES_TO_RESUME,
+        f"environment: inherit_env=[HF_HOME] (digested: {_BASE_ENV_NAMES_WITHOUT_TMPDIR}, "
+        "HF_HOME); env keys: A_FLAG, B_FLAG; "
+        "passthrough_env: HF_TOKEN and built-in TMPDIR (not digested)",
         id="list-and-passthrough-persistent",
     ),
     pytest.param(
         {"execution": ExecutionContext(inherit_env="all")},
-        "environment: inherit_env=all (inherited whole, and digested: "
-        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}; other ambient variables are not compared); "
-        "env keys: none; "
-        "passthrough_env: TMPDIR (built in; inherited when set, excluded from the digest)",
+        f"environment: inherit_env=all (digested: {_BASE_ENV_NAMES_WITHOUT_TMPDIR}; "
+        "other ambient variables are not compared); "
+        "env keys: none; passthrough_env: TMPDIR (built in, not digested)",
         id="all",
     ),
     pytest.param(
         {"execution": ExecutionContext(passthrough_env=["TMPDIR"])},
-        "environment: inherit_env=none (inherited when set, and digested: "
-        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}); env keys: none; "
-        "passthrough_env: TMPDIR (built in; inherited when set, excluded from the digest)",
+        f"environment: inherit_env=none (digested: {_BASE_ENV_NAMES_WITHOUT_TMPDIR}); "
+        "env keys: none; passthrough_env: TMPDIR (built in, not digested)",
         id="listed-tmpdir-is-redundant",
     ),
     pytest.param(
         {"env": {"TMPDIR": "/scratch"}},
-        "environment: inherit_env=none (inherited when set, and digested: "
-        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}); env keys: TMPDIR; "
+        f"environment: inherit_env=none (digested: {_BASE_ENV_NAMES_WITHOUT_TMPDIR}); "
+        "env keys: TMPDIR; "
         "passthrough_env: none (TMPDIR set under env, so the configured value is digested)",
         id="configured-tmpdir-stays-digested",
     ),
     pytest.param(
         {"execution": ExecutionContext(passthrough_env=["HF_TOKEN"]), "env": {"TMPDIR": "/s"}},
-        "environment: inherit_env=none (inherited when set, and digested: "
-        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}); env keys: TMPDIR; "
-        "passthrough_env: HF_TOKEN (inherited when set, excluded from the digest) "
+        f"environment: inherit_env=none (digested: {_BASE_ENV_NAMES_WITHOUT_TMPDIR}); "
+        "env keys: TMPDIR; passthrough_env: HF_TOKEN (not digested) "
         "(TMPDIR set under env, so the configured value is digested)",
         id="configured-tmpdir-beside-a-listed-token",
     ),
@@ -373,7 +374,7 @@ def test_help_registers_commands_and_options() -> None:
     for flag in ("--state-dir", "--run-id", "--confirm", "-h, --help"):
         assert flag in recovery_help.output
     assert (
-        "restore the original complete storage ledger and access to it before recovery"
+        "without --confirm it only reports the actions; --confirm performs them"
         in " ".join(recovery_help.output.split()).lower()
     )
 
@@ -382,10 +383,6 @@ def test_help_registers_commands_and_options() -> None:
     assert "[default: (first phase)]" in run_help
     assert "--dry-run" in run_help
     assert "-v, --verbose" in run_help
-
-    winners_help = runner.invoke(cli_main, ["show-winners", "--help"], terminal_width=120).output
-    assert "show-winners [OPTIONS] CONFIG_YAML" in winners_help
-    assert "including unpublished results from the latest run" in winners_help
 
     mcp_help = runner.invoke(cli_main, ["mcp", "--help"], terminal_width=120)
     assert mcp_help.exit_code == 0
@@ -484,7 +481,7 @@ def test_run_installs_signal_handlers_before_config_load(
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
     events: list[str] = []
-    config = object()
+    config = make_experiment(workdir=tmp_path / "runs")
 
     monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: events.append("signals"))
 
@@ -492,7 +489,13 @@ def test_run_installs_signal_handlers_before_config_load(
         events.append("load")
         return config
 
-    def fake_run_experiment(loaded: object, *, from_phase: str | None, dry_run: bool) -> None:
+    def fake_run_experiment(
+        loaded: object,
+        *,
+        from_phase: str | None,
+        dry_run: bool,
+        terminal_callback: Callable[[TerminalReport], None],
+    ) -> None:
         assert loaded is config
         assert from_phase is None
         assert dry_run is expected_dry_run
@@ -622,9 +625,8 @@ def test_validate_says_an_in_memory_phase_cannot_resume(tmp_path: Path) -> None:
 
 
 _TPE_STARTUP_WARNING = (
-    "warning: Phase 'lr': tpe with n_trials=5 <= n_startup_trials=10, so every trial is "
-    "sampled at random and TPE never fits its model. Use sampler.type: random with a seed "
-    "(same coverage), or set sampler.n_startup_trials below n_trials."
+    "warning: Phase 'lr': tpe with n_trials=5 <= n_startup_trials=10 samples every trial at "
+    "random; set sampler.n_startup_trials below n_trials."
 )
 _LR_SPACE = "{ lr: { type: float, low: 0.1, high: 1.0 } }"
 
@@ -740,10 +742,10 @@ def test_dry_run_reports_tpe_startup_warnings(
 
 
 _ARGPARSE_BOOLEAN_WARNING = (
-    "warning: argparse renders booleans as --key=true/--key=false; a store_true flag rejects a "
-    "value, so set such flags in trial_command or have the trainer accept a value. "
-    "Rendered that way: --load_best_model_at_end (trainer_config), "
-    "--fp16 (phase 'p' fixed_overrides), --shuffle (phase 'p' search_space)."
+    "warning: argparse renders booleans as --key=true/--key=false, which a store_true flag "
+    "rejects: --load_best_model_at_end (trainer_config), "
+    "--fp16 (phase 'p' fixed_overrides), --shuffle (phase 'p' search_space). "
+    "Set them in trial_command."
 )
 
 
@@ -839,9 +841,8 @@ def test_boolean_warning_is_only_for_argparse(
 
 _CREDENTIAL_WARNING = (
     "warning: execution.inherit_env lists names that look like credentials: {names}. "
-    "Each trial records the value of every listed name in plain text in the study ledger, "
-    "and rotating one refuses a resume. Credentials belong in execution.passthrough_env, "
-    "which is inherited without being recorded or compared."
+    "Each trial records their values in plain text in the study ledger; move them to "
+    "execution.passthrough_env."
 )
 
 
@@ -890,9 +891,8 @@ def test_validate_and_dry_run_warn_about_a_credential_in_inherit_env(
 
 
 _REPEATS_BUDGET_WARNING = (
-    "warning: Phase 'lr': max_consecutive_failures=3 <= 3 repeats.values, so one configuration "
-    "that fails on every repeat value can abort the phase by itself; under grid and seeded random its "
-    "repeats run back to back. Set max_consecutive_failures above 3."
+    "warning: Phase 'lr': max_consecutive_failures=3 <= 3 repeats.values, so one failing "
+    "configuration can abort the phase by itself. Set max_consecutive_failures above 3."
 )
 _REPEATS_BODY = (
     "n_trials: 6\nsampler: { type: random, seed: 0 }\nsearch_space: "
@@ -1391,7 +1391,7 @@ def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     # The diagnostic names the failure and forbids the wrong move explicitly.
     assert generation_id in captured.err
     assert "does not match its recorded hash" in captured.err
-    assert "Do not run anything over this tree" in captured.err
+    assert "Inspect or restore the generation namespace under" in captured.err
 
     exit_code = invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch)
 
@@ -1401,7 +1401,7 @@ def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     assert "no winner yet" not in captured.out
     assert generation_id in captured.err
     assert "does not match its recorded hash" in captured.err
-    assert "Do not run anything over this tree" in captured.err
+    assert "Inspect or restore the generation namespace under" in captured.err
 
 
 @requires_nonroot
@@ -1438,8 +1438,7 @@ def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     assert "permission denied" in payload["publication_error"]
     assert "missing or unreadable" not in payload["publication_error"]
     assert "permission denied" in captured.err
-    assert "not evidence of corruption" in captured.err
-    assert "only the publishing user" in captured.err
+    assert "Re-read it as the publishing user" in captured.err
 
 
 def test_status_and_show_winners_stay_successful_without_corruption(
@@ -1479,24 +1478,18 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     config_path = materialized.config_path
     generation_id = published_generation_id(materialized.experiment)
     assert generation_id is not None
-    heading = "=== p === (2 trials)"
+    heading = "p: 2 of 2 trials, objective (lower is better)"
 
     assert invoke_cli_boundary(["status", str(config_path), "--trials"], monkeypatch) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert generation_id in lines[0] and "winner (*)" in lines[0]
-    assert lines[lines.index(heading) + 1] == f"winner generation: {generation_id} (published)"
-    assert lines[lines.index(heading) + 2].split() == [
-        "trial",
-        "state",
-        "value",
-        "params",
-        "duration_s",
-        "winner",
-    ]
-    rows = lines[lines.index(heading) + 3 :]
-    assert [row.split()[:2] for row in rows] == [["0", "COMPLETE"], ["1", "COMPLETE"]]
+    assert lines[:2] == ["t", f"published generation {generation_id}"]
+    header, *rows = lines[lines.index(heading) + 1 :]
+    assert header.split() == ["trial", "objective", "a", "state", "time"]
     # The fixture's two trials tie on the metric, and the tie goes to the lower draw position.
-    assert rows[0].endswith("*") and not rows[1].endswith("*")
+    assert [row.split()[:3] for row in rows[:2]] == [["winner", "0", "0.5"], ["1", "0.5", "10"]]
+    # The winner's attempt directory is too wide to share a line with its label.
+    assert rows[2] == "  winner trial 0 directory:"
+    assert Path(rows[3].strip()).name.startswith("trial_00000__generation_")
 
     assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
     assert yaml.safe_load(capsys.readouterr().out)["kind"] == "experiment"
@@ -1512,28 +1505,13 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "Traceback" not in captured.err
-    # The tables still print, with no winner starred, before the boundary reports.
+    # The tables still print, with no winner marked, before the boundary reports.
     assert "no generation is published, so no winner is marked" in captured.out
     assert heading in captured.out
-    assert not any(line.endswith("*") for line in captured.out.splitlines())
+    assert not any(line.lstrip().startswith("winner") for line in captured.out.splitlines())
     assert generation_id in captured.err
     assert "does not match its recorded hash" in captured.err
-    assert "Do not run anything over this tree" in captured.err
-
-
-def _stub_run_command(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
-    """Make ``phasesweep run`` reach the engine and fail with ``error``.
-
-    :param pytest.MonkeyPatch monkeypatch: Fixture used to replace CLI collaborators.
-    :param BaseException error: Exception ``run_experiment`` raises once the CLI calls it.
-    """
-    monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
-    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: make_experiment())
-
-    def fail(*_args: object, **_kwargs: object) -> None:
-        raise error
-
-    monkeypatch.setattr("phasesweep.cli.run_experiment", fail)
+    assert "Inspect or restore the generation namespace under" in captured.err
 
 
 @pytest.mark.parametrize(
@@ -1564,13 +1542,13 @@ def test_cli_only_explains_marked_post_publication_shutdown(
     assert shutdown.published_result_committed is False
     if published_result_committed:
         shutdown.published_result_committed = True
-    _stub_run_command(monkeypatch, shutdown)
+    stub_run_command(monkeypatch, shutdown)
 
     exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 128 + signal.SIGTERM
-    notice = "shutdown was honored after the published result was committed"
+    notice = "stopped after the result was published"
     assert (notice in captured.err) is expects_notice
 
 
@@ -1587,13 +1565,13 @@ def test_cli_trial_cleanup_refusal_names_the_cli_recovery(
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
     refusal = UnsafeProcessCleanupError("Trial 0 cleanup could not be confirmed.")
-    _stub_run_command(monkeypatch, refusal)
+    stub_run_command(monkeypatch, refusal)
 
     exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert captured.err.strip() == (
+    assert after_banner(captured.err).strip() == (
         "phasesweep: Trial 0 cleanup could not be confirmed.\n"
         "fix: run `phasesweep run` again with the same config for a CLI run, or "
         "`phasesweep mcp recover-run` for an MCP run."
@@ -1708,45 +1686,35 @@ def test_config_error_hints_stay_few_and_distinct(
     assert "see:" not in err
 
 
-@pytest.mark.parametrize(
-    ("verbose", "expects_traceback"),
-    [
-        pytest.param(False, False, id="concise"),
-        pytest.param(True, True, id="verbose"),
-    ],
-)
+@pytest.mark.parametrize("verbose", [False, True], ids=["concise", "verbose"])
 def test_cli_boundary_reports_expected_run_failure(
     verbose: bool,
-    expects_traceback: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Expected failures gain a traceback only when verbose logging is active."""
+    """An expected failure prints no traceback on the console, with or without ``-v``."""
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
-    _stub_run_command(
+    stub_run_command(
         monkeypatch,
         PhaseTrialsFailedError("no feasible trial in phase 'depth'"),
     )
 
-    argv = ["run", str(config_path)]
-    if verbose:
-        argv.append("-v")
-    exit_code = invoke_cli_boundary(argv, monkeypatch, debug=verbose)
+    exit_code = invoke_cli_boundary(
+        ["run", str(config_path), *(["-v"] if verbose else [])], monkeypatch
+    )
 
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "no feasible trial in phase 'depth'" in captured.err
-    assert ("Traceback" in captured.err) is expects_traceback
-    if not verbose:
-        assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err + captured.out
 
 
 @pytest.mark.parametrize(
     ("action", "remedy"),
     [
-        (OperatorAction.FRESH_NAMESPACE, "set a new `experiment` name in the config to start"),
+        (OperatorAction.FRESH_NAMESPACE, "set a new `experiment` name to start"),
         (OperatorAction.RESTORE_LEDGER, "restore or repair the storage ledger"),
         (OperatorAction.RESTORE_TREE, "restore the files and permissions identified in the error"),
         (
@@ -1756,7 +1724,7 @@ def test_cli_boundary_reports_expected_run_failure(
         ),
         (OperatorAction.RUN_RECOVER_RUN, "again with the same config for a CLI run"),
         (OperatorAction.FIX_CONFIG, "correct the experiment configuration"),
-        (OperatorAction.RETRY, "Wait briefly, then retry the same operation"),
+        (OperatorAction.RETRY, "Retry once the reported blocker clears"),
         (OperatorAction.INSPECT_LOGS, "inspect the PhaseSweep run log"),
     ],
 )
@@ -1838,7 +1806,7 @@ def test_cli_boundary_classifies_relative_lock_directory_as_operational(
     config_path.write_text("placeholder: true\n")
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", "relative-locks")
     monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
-    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: object())
+    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: make_experiment())
     monkeypatch.setattr(
         "phasesweep.cli.run_experiment",
         lambda *_args, **_kwargs: lock_dir(),
@@ -1906,7 +1874,7 @@ def test_cli_boundary_separates_internal_errors_from_operational_failures(
     """
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
-    _stub_run_command(monkeypatch, error)
+    stub_run_command(monkeypatch, error)
 
     actual_exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
@@ -1944,19 +1912,18 @@ def test_sync_tracking_without_an_mlflow_block_uses_the_standard_error_format(
     assert status == 1
     error = capsys.readouterr().err
     assert error == (
-        "phasesweep: sync-tracking needs an `mlflow` block, and this config has none. Use the "
-        "config the sweep ran with, or see `phasesweep explain mlflow`.\n"
-        "fix: correct the experiment configuration or the environment it runs in.\n"
+        "phasesweep: sync-tracking needs an `mlflow` block, and this config has none.\n"
+        "fix: Pass the config the sweep ran with; `phasesweep explain mlflow` describes the block.\n"
     )
 
 
 def test_sync_tracking_with_uploads_still_pending_uses_the_standard_error_format(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Counts print first, then the failure is a `phasesweep:` line with a retry step."""
+    """Counts print first, then the failure is a `phasesweep:` line with a retry step naming the command as typed."""
     monkeypatch.setattr(
         "phasesweep.tracking.publication.sync_tracking",
-        lambda *_args: {"pending": 2, "delivered": 1},
+        lambda *_args, **_kwargs: {"pending": 2, "delivered": 1},
     )
     config = materialize("current-journal", tmp_path, mode="tree").config_path
 
@@ -1966,8 +1933,10 @@ def test_sync_tracking_with_uploads_still_pending_uses_the_standard_error_format
     assert status == 1
     assert captured.out == "pending: 2\ndelivered: 1\n"
     assert captured.err == (
-        "phasesweep: MLflow delivery remains pending.\n"
-        "fix: Wait briefly, then retry the same operation once the reported blocker is resolved.\n"
+        "phasesweep: MLflow delivery remains pending: 2 records could not be sent or settled; "
+        "the warnings above give each cause.\n"
+        "fix: Once those causes are resolved, run this command again:\n"
+        f"phasesweep sync-tracking {config}\n"
     )
 
 

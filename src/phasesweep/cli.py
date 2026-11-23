@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import io
 import logging
+import math
 import os
-import shlex
 import sys
+import time
 import traceback
-from collections.abc import Sequence
-from decimal import Decimal
+from collections.abc import Iterator, Sequence
+from contextvars import ContextVar
 from importlib import resources
 from pathlib import Path
+from typing import TYPE_CHECKING, NoReturn, TextIO
 
 import click
 import optuna
@@ -26,6 +31,7 @@ from phasesweep.config.io import (
 from phasesweep.config.models import Experiment, experiment_disclosures
 from phasesweep.config.reference import (
     ReferenceEntry,
+    explain_command,
     first_sentence,
     lookup_or_suggest,
     pin_documentation_links,
@@ -35,9 +41,14 @@ from phasesweep.config.reference import (
     sub_key_count,
     top_level_entries,
 )
-from phasesweep.config.run_overrides import CreatedKey, SetPathError, apply_set, created_key_notes
+from phasesweep.config.run_overrides import (
+    SET_SYNTAX,
+    CreatedKey,
+    SetPathError,
+    apply_set,
+    created_key_notes,
+)
 from phasesweep.config.search import phase_draws
-from phasesweep.engine.artifacts import LOG_FORMAT
 from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.fingerprints import _recorded_config_matches
 from phasesweep.engine.ledger import validate_ledger
@@ -45,8 +56,11 @@ from phasesweep.engine.locking import experiment_is_busy
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_dir,
+    _generation_summary_path,
     _generation_winner_path,
+    _run_log_path,
     _trial_dir_for,
+    _trials_csv_path,
 )
 from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.provenance import (
@@ -58,7 +72,6 @@ from phasesweep.engine.publication import (
     raise_for_unusable_publication,
 )
 from phasesweep.engine.read import (
-    TrialTables,
     _read_generation_selection,
     _represented_winners,
     experiment_status,
@@ -66,12 +79,14 @@ from phasesweep.engine.read import (
     require_study,
     unpublished_winner_step,
 )
-from phasesweep.engine.run import run_experiment
+from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.engine.study_policy import _require_launch_target
 from phasesweep.errors import (
+    STORAGE_NULL_KEEPS_NOTHING,
     OperatorAction,
     PhaseSweepError,
     operator_step,
+    phase_names,
 )
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
@@ -84,6 +99,16 @@ from phasesweep.mcp.registry import (
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.tool_names import TOOL_NAMES
 from phasesweep.reporting import _progress_values, report_objective
+from phasesweep.run_report import (
+    Banner,
+    LogLine,
+    NothingToRun,
+    Summary,
+    banner,
+    nothing_to_run,
+    summary,
+)
+from phasesweep.runtime.console import ConsoleHandler
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
     UnsafeLockPathError,
@@ -93,7 +118,6 @@ from phasesweep.runtime.files import (
 from phasesweep.runtime.gpu import GpuPool
 from phasesweep.runtime.json import (
     JsonObject,
-    JsonValue,
     json_object,
     strict_json_loads,
 )
@@ -101,6 +125,19 @@ from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     install_signal_handlers,
 )
+from phasesweep.runtime.terminal import (
+    command_line,
+    display_path,
+    plural,
+    terminal_width,
+    use_color,
+    wrap,
+    wrap_labeled,
+)
+from phasesweep.trial_table import render_trial_tables, unsettled_running_comment
+
+if TYPE_CHECKING:
+    from _typeshed import ReadableBuffer
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 CONFIG_PATH = click.Path(exists=True, dir_okay=False, path_type=Path)
@@ -110,11 +147,9 @@ CONFIG_OVERRIDES = click.option(
     multiple=True,
     metavar="KEY=VALUE",
     help=(
-        "Override a config value with a YAML VALUE; repeat as needed. KEY is dot-separated "
-        "names (env.NOTE). Select a list element by zero-based index, as phases.0 or "
-        "phases[0], and a phase by name, as phases[NAME]. Write [KEY] to take a mapping key "
-        "verbatim when it contains dots: phases[NAME].search_space[model.n_layers].choices. "
-        "Paths resolve against the config file's directory, just as in the config."
+        "Override a config value with a YAML VALUE; repeatable. KEY is dot-separated "
+        # The \b paragraph keeps the URL unwrapped, so a terminal never breaks it mid-word.
+        f"(env.NOTE); select a phase as phases[NAME] or phases[0].\n\n\b\n{SET_SYNTAX}"
     ),
 )
 MCP_CATALOG = click.option(
@@ -136,20 +171,38 @@ _ABORT_EXIT = 130  # 128 + SIGINT
 _SIGNATURE_COLUMN_CAP = 40
 _SUMMARY_WIDTH = 72
 
+#: The ``run.log`` of the run in progress, which :func:`main` names last on every exit.
+_RUN_LOG: ContextVar[Path | None] = ContextVar("phasesweep_run_log", default=None)
 
-def _configure_logging(verbose: bool) -> None:
-    """Initialize root logging and tune Optuna's verbosity.
 
-    :param bool verbose: If True, set root logger to ``DEBUG`` and Optuna to ``INFO``;
-        otherwise root is ``INFO`` and Optuna is quieted to ``ERROR``.
+@contextlib.contextmanager
+def _console_logging(verbose: bool, *, dry_run: bool = False) -> Iterator[None]:
+    """Show a run's report and warnings on stderr, and leave the rest to ``run.log``.
+
+    The ``phasesweep`` logger takes ``INFO``, or ``DEBUG`` under ``verbose``, which is the level
+    ``run.log`` records at; the console shows the same lines either way. A dry run also shows
+    the package's INFO lines, which are part of the launch contract it prints. Optuna stays at
+    ``ERROR`` in both modes. Everything is restored on exit, so a process that runs several
+    commands, as the tests do, keeps no handler or level behind.
+
+    :param bool verbose: Record ``DEBUG`` messages in ``run.log``.
+    :param bool dry_run: Print the package's INFO lines on the console too.
+    :return Iterator[None]: Context manager for the command's lifetime.
     """
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format=LOG_FORMAT,
-        datefmt="%H:%M:%S",
-    )
-    optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.ERROR)
+    package = logging.getLogger("phasesweep")
+    root = logging.getLogger()
+    handler = ConsoleHandler(dry_run=dry_run)
+    previous_level = package.level
+    previous_verbosity = optuna.logging.get_verbosity()
+    package.setLevel(logging.DEBUG if verbose else logging.INFO)
+    optuna.logging.set_verbosity(optuna.logging.ERROR)
+    root.addHandler(handler)
+    try:
+        yield
+    finally:
+        root.removeHandler(handler)
+        optuna.logging.set_verbosity(previous_verbosity)
+        package.setLevel(previous_level)
 
 
 @click.group(
@@ -170,18 +223,142 @@ def _operational_error_text(exc: PhaseSweepError) -> str:
     return f"{exc}\nfix: {operator_step(exc)}"
 
 
-def main() -> None:
-    """Run the CLI behind a process-level error boundary.
+def _print_operational_error(exc: PhaseSweepError) -> None:
+    """Write ``phasesweep: <diagnosis>`` and its ``fix:`` step to stderr.
 
-    Click exceptions reach this boundary; explicit ``SystemExit`` statuses pass through.
+    On a terminal each wraps at word boundaries to the width with its text hanging under the
+    label. Redirected, each stays one logical line: scripts and agents match on these sentences,
+    and a refusal may have no ``run.log`` copy to read them from. A line the step sets off after
+    its sentence is a command to paste, so it prints whole and flush left either way.
+
+    :param PhaseSweepError exc: Operational failure to report.
+    """
+    stream = sys.stderr
+    if not stream.isatty():
+        click.echo(f"phasesweep: {_operational_error_text(exc)}", err=True)
+        return
+    width = terminal_width(stream)
+    step, *commands = operator_step(exc).split("\n")
+    lines = [
+        *wrap_labeled("phasesweep:", str(exc), width),
+        *wrap_labeled("fix:", step, width),
+        *commands,
+    ]
+    click.echo("\n".join(lines), err=True)
+
+
+class _StandardStreamFile(io.FileIO):
+    """A standard stream's descriptor that discards what can no longer be written.
+
+    Text for a gone reader is dropped as if written, so the command carries on, no text stays
+    buffered for interpreter shutdown to fail on (which would turn any exit status into 120),
+    and Click's own handling of a broken pipe, which ends a command with status 1, is never
+    reached. Any other write error, such as a full disk, is raised once, so the command ends
+    with it as an operational error and status 1; the stream then drops what it is given, so
+    the flush at interpreter exit neither reports the lost text again nor changes that status.
+    """
+
+    #: Write errors that mean nobody can read the stream any more: a pipe whose reader exited
+    #: (``EPIPE``) and a terminal that hung up, as a dropped SSH session's does (``EIO``). A
+    #: class attribute, because a stream is flushed as it is destroyed at interpreter exit,
+    #: after module globals are cleared.
+    _READER_GONE = frozenset({errno.EPIPE, errno.EIO})
+
+    #: Set once a write error other than a gone reader has been raised.
+    _failed: bool = False
+
+    def write(self, data: ReadableBuffer, /) -> int:
+        """Write ``data``, or drop it when the reader is gone or an earlier write failed.
+
+        :param ReadableBuffer data: Encoded text from the stream's buffer.
+        :raises OSError: The first write failure other than a gone reader, such as a full disk.
+        :return int: The number of bytes the descriptor took, all of them when dropped.
+        """
+        if self._failed:
+            return memoryview(data).nbytes
+        try:
+            return super().write(data)
+        except OSError as exc:
+            if exc.errno in self._READER_GONE:
+                return memoryview(data).nbytes
+            self._failed = True
+            raise
+
+
+def _discard_unreadable_output(stream: TextIO | None) -> TextIO:
+    """Rebuild a standard stream without letting an absent reader interrupt the command.
+
+    :param TextIO | None stream: ``sys.stdout`` or ``sys.stderr``.
+    :return TextIO: A sink if Python started without the stream, the stream itself for captures
+        without a descriptor, or a rebuilt stream that preserves its text settings.
+    """
+    if stream is None:
+        return Path(os.devnull).open("w", encoding="utf-8", errors="backslashreplace")
+    if not isinstance(stream, io.TextIOWrapper):
+        return stream
+    try:
+        descriptor = stream.fileno()
+    except OSError:
+        return stream
+    stream.flush()
+    return io.TextIOWrapper(
+        io.BufferedWriter(_StandardStreamFile(descriptor, "w", closefd=False)),
+        encoding=stream.encoding,
+        errors=stream.errors,
+        line_buffering=stream.line_buffering,
+        write_through=stream.write_through,
+    )
+
+
+def main() -> None:
+    """Run the CLI behind a process-level error boundary, then name the run's log.
+
+    Click exceptions reach this boundary; explicit ``SystemExit`` statuses pass through. A
+    ``run`` that went past its config prints ``log: <path>`` last, after its error or resume
+    lines, whenever ``run.log`` exists, so the file is named however the command ended. A path
+    wider than the terminal breaks after slashes. Output to a closed stream, a pipe whose reader
+    exited or a terminal that hung up is discarded, so the status stays the command's own.
 
     :raises SystemExit: Always, carrying one of ``_USAGE_EXIT`` (bad input),
         ``_FAILURE_EXIT`` (the run failed), ``_INTERNAL_EXIT`` (a phasesweep
         bug), ``_ABORT_EXIT`` (interrupted), or the status the command or
         Click chose.
     """
+    _RUN_LOG.set(None)
+    sys.stdout = _discard_unreadable_output(sys.stdout)
+    sys.stderr = _discard_unreadable_output(sys.stderr)
     try:
-        status = cli.main(standalone_mode=False)
+        _error_boundary()
+    finally:
+        run_log = _RUN_LOG.get()
+        if run_log is not None and _is_readable_file(run_log):
+            _print_block(LogLine(str(run_log.resolve())))
+
+
+def _is_readable_file(path: Path) -> bool:
+    """Tell whether ``path`` is an existing file, treating an unreachable one as absent.
+
+    The exit path runs after a failure that may be an inaccessible directory, so asking about
+    the file must not raise a second error over the first.
+
+    :param Path path: The file to look for.
+    :return bool: ``True`` when it exists as a file and can be examined.
+    """
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _error_boundary() -> None:
+    """Run the CLI and turn each kind of failure into its message and exit status.
+
+    :raises SystemExit: Always, with the status :func:`main` documents.
+    """
+    try:
+        # Click would take the program name from sys.argv[0], which is not "phasesweep"
+        # when the CLI is launched as a module or from a test runner.
+        status = cli.main(prog_name="phasesweep", standalone_mode=False)
     except click.ClickException as exc:
         # Includes UsageError, which already carries exit code 2.
         if (
@@ -206,10 +383,7 @@ def main() -> None:
         click.echo(f"phasesweep: {exc}", err=True)
         sys.exit(_USAGE_EXIT)
     except PhaseSweepError as exc:
-        click.echo(f"phasesweep: {_operational_error_text(exc)}", err=True)
-        # -v (see _configure_logging) means the operator asked for internals.
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
-            traceback.print_exc()
+        _print_operational_error(exc)
         sys.exit(_FAILURE_EXIT)
     except OSError as exc:
         click.echo(f"phasesweep: operational error: {exc}", err=True)
@@ -242,6 +416,16 @@ def _load_cli_config(path: Path) -> Experiment:
 
 _DEFAULT_TEMPLATE = "starter"
 _TEMPLATE_PURPOSE_PREFIX = "# phasesweep template: "
+
+
+def _refuse_init_overwrite(target: Path) -> NoReturn:
+    """Print that ``init`` will not replace ``target`` and exit with the usage status.
+
+    :param Path target: Destination that already exists, or appeared during publication.
+    :raises click.exceptions.Exit: Always, with code 2.
+    """
+    click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
+    raise click.exceptions.Exit(2)
 
 
 def _template_names() -> list[str]:
@@ -331,13 +515,11 @@ def init(template: str, list_templates: bool, output: str) -> None:
         expanded = expanded / f"{template}.yaml"
     target = expanded.absolute()
     if target.exists() or target.is_symlink():
-        click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
-        raise click.exceptions.Exit(2)
+        _refuse_init_overwrite(target)
     text = _template_text(template)
     try:
         if not atomic_create_text(target, text):
-            click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
-            raise click.exceptions.Exit(2)
+            _refuse_init_overwrite(target)
     except OSError as exc:
         # `phasesweep init` is the first command a new user runs; an unwritable
         # directory or a filesystem without hard links must report one line, not
@@ -345,17 +527,17 @@ def init(template: str, list_templates: bool, output: str) -> None:
         click.echo(f"phasesweep init: cannot write {target}: {exc}", err=True)
         raise click.exceptions.Exit(1) from None
 
-    # Quote the expanded path, never the raw option value: shell quoting
+    # Name the expanded path, never the raw option value: shell quoting
     # suppresses "~" expansion, so a quoted raw "~/x.yaml" would name a
     # different (nonexistent) file than the one just written.
-    config_arg = shlex.quote(str(expanded))
+    config_arg = str(expanded)
     click.echo(f"Wrote the {template} template to {target}")
     click.echo("\nNext: read the template header for prerequisites and trainer adaptation, then:")
-    click.echo(f"  phasesweep validate {config_arg}")
-    click.echo(f"  phasesweep run {config_arg} --dry-run")
-    click.echo(f"  phasesweep run {config_arg}")
-    click.echo(f"  phasesweep status {config_arg} --trials")
-    click.echo(f"  phasesweep mcp init-catalog --from {config_arg}")
+    click.echo(f"  {command_line('validate', config_arg)}")
+    click.echo(f"  {command_line('run', config_arg, '--dry-run')}")
+    click.echo(f"  {command_line('run', config_arg)}")
+    click.echo(f"  {command_line('status', config_arg, '--trials')}")
+    click.echo(f"  {command_line('mcp', 'init-catalog', '--from', config_arg)}")
     click.echo(
         "\nphasesweep explain lists the top-level config keys; phasesweep explain KEY describes one."
     )
@@ -446,8 +628,9 @@ def report_objective_cmd(
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Run configured phases. Use --from-phase to skip earlier phases; only the winners "
-        "inherited by the remaining phases are required."
+        "Run configured phases. --from-phase skips earlier phases and needs only the "
+        "winners the remaining phases inherit. The full log is run.log in the experiment's "
+        "directory."
     ),
     short_help="Run configured phases.",
 )
@@ -474,7 +657,7 @@ def report_objective_cmd(
     "--verbose",
     is_flag=True,
     show_default=True,
-    help="Show debug logs from phasesweep and INFO logs from Optuna.",
+    help="Record DEBUG messages in run.log; the console shows the same lines either way.",
 )
 def run(
     config_path: Path,
@@ -492,51 +675,211 @@ def run(
         run would refuse over the recorded trials, and render example commands, without
         launching subprocesses.
     :param tuple[str, ...] settings: ``KEY=VALUE`` assignments with YAML values.
-    :param bool verbose: Enable debug logging for phasesweep and INFO logging for Optuna.
+    :param bool verbose: Record ``DEBUG`` messages in ``run.log``; the console is unchanged.
     :raises ConfigError: The config file cannot be parsed or fails model validation.
-    :raises SystemExit: With code 2 when ``from_phase`` names no configured phase; a
-        ``PhaseSweepShutdown`` from an interrupted run is re-raised unchanged.
+    :raises click.BadParameter: ``from_phase`` names no configured phase; the usage error exits
+        with status 2.
+    :raises PhaseSweepShutdown: An interrupted run is re-raised unchanged.
     """
-    _configure_logging(verbose)
-    # Install before config parsing so CLI SIGINT/SIGTERM behavior and exit
-    # codes remain structured throughout startup, including dry-run previews.
-    # run_experiment() repeats this idempotently for direct library callers.
-    install_signal_handlers()
-    config = _command_config(config_path, settings=settings)
-    if from_phase is not None:
-        valid = [p.name for p in config.phases]
-        if from_phase not in valid:
-            click.echo(f"--from-phase={from_phase!r} not in {valid}", err=True)
-            sys.exit(2)
-    try:
-        run_experiment(config, from_phase=from_phase, dry_run=dry_run)
-    except PhaseSweepShutdown as exc:
-        if exc.published_result_committed:
-            click.echo(
-                "phasesweep: shutdown was honored after the published result was committed; "
-                "the result is available for inspection.",
-                err=True,
+    with _console_logging(verbose, dry_run=dry_run):
+        # Install before config parsing so CLI SIGINT/SIGTERM behavior and exit
+        # codes remain structured throughout startup, including dry-run previews.
+        # run_experiment() repeats this idempotently for direct library callers.
+        install_signal_handlers()
+        config = _command_config(config_path, settings=settings)
+        if from_phase is not None:
+            valid = [p.name for p in config.phases]
+            if from_phase not in valid:
+                raise click.BadParameter(
+                    f"{from_phase!r} is not a phase of this config; its phases are "
+                    f"{phase_names(valid)}.",
+                    param_hint="--from-phase",
+                )
+        run_log = _run_log_path(config)
+        if not dry_run:
+            _RUN_LOG.set(run_log)
+            _print_block(
+                banner(
+                    config,
+                    config_path=display_path(config_path),
+                    workdir=display_path(_experiment_dir(config)),
+                    log_path=str(run_log.resolve()),
+                    from_phase=from_phase,
+                )
             )
-        elif not dry_run:
-            click.echo(_resume_hint(config), err=True)
-        raise
+        finished: list[TerminalReport] = []
+        wall_start, started = time.time(), time.monotonic()
+        try:
+            run_experiment(
+                config, from_phase=from_phase, dry_run=dry_run, terminal_callback=finished.append
+            )
+        except PhaseSweepShutdown as exc:
+            if exc.published_result_committed:
+                click.echo("phasesweep: stopped after the result was published.", err=True)
+            elif not dry_run:
+                click.echo(
+                    _resume_hint(
+                        config,
+                        command=_rerun_command(config_path, settings, from_phase),
+                        width=terminal_width(sys.stderr),
+                    ),
+                    err=True,
+                )
+            raise
+        else:
+            if not dry_run and finished:
+                _print_block(
+                    _closing_block(
+                        config,
+                        finished[-1],
+                        elapsed=time.monotonic() - started,
+                        wall_start=wall_start,
+                        config_path=config_path,
+                        settings=settings,
+                        from_phase=from_phase,
+                    )
+                )
+        finally:
+            # A terminal report means the engine logged its closing lines, which count what
+            # stays pending, however the run ended; a run refused before that, as by a live
+            # run's lock, gets no step to send records it may not own.
+            if not dry_run and finished:
+                _echo_sync_step(config, config_path, settings)
 
 
-def _resume_hint(config: Experiment) -> str:
+def _print_block(block: Banner | Summary | NothingToRun | LogLine) -> None:
+    """Write a block the run prints but does not log to stderr, fitted to its width and colour.
+
+    :param Banner | Summary | NothingToRun | LogLine block: The block to draw.
+    """
+    stream = sys.stderr
+    lines = block.render(terminal_width(stream), color=use_color(stream))
+    click.echo("\n".join(lines), err=True)
+
+
+def _closing_block(
+    config: Experiment,
+    outcome: TerminalReport,
+    *,
+    elapsed: float,
+    wall_start: float,
+    config_path: Path,
+    settings: tuple[str, ...],
+    from_phase: str | None,
+) -> Summary | NothingToRun:
+    """Build what a successful run closes with: its summary, or that it had nothing to run.
+
+    :param Experiment config: The config that ran.
+    :param TerminalReport outcome: The engine's report of the finished invocation.
+    :param float elapsed: Seconds the engine took.
+    :param float wall_start: ``time.time()`` when the engine started, to tell the files this
+        run wrote from those it found.
+    :param Path config_path: The config path as typed.
+    :param tuple[str, ...] settings: The ``--set`` assignments as typed.
+    :param str | None from_phase: The ``--from-phase`` value, if given.
+    :return Summary | NothingToRun: The block to print.
+    """
+    next_command = command_line("status", *_config_arguments(config_path, settings), "--trials")
+    if outcome.replayed_generation_id is not None:
+        return nothing_to_run(
+            elapsed=elapsed,
+            counts=outcome.phase_counts,
+            generation_id=outcome.replayed_generation_id,
+            next_command=next_command,
+        )
+    root = _experiment_dir(config)
+    candidates = [
+        _generation_summary_path(config, outcome.generation_id),
+        *(_trials_csv_path(config, phase.name) for phase in config.phases),
+    ]
+    written = [
+        path.relative_to(root).as_posix()
+        for path in candidates
+        if path.is_relative_to(root) and path.is_file() and path.stat().st_mtime >= wall_start
+    ]
+    return summary(
+        config,
+        elapsed=elapsed,
+        counts=outcome.phase_counts,
+        winners=outcome.winners or {},
+        from_phase=from_phase,
+        written_root=display_path(root),
+        written=written,
+        next_command=next_command,
+        show_winners_command=command_line(
+            "show-winners", *_config_arguments(config_path, settings)
+        ),
+    )
+
+
+def _echo_sync_step(config: Experiment, config_path: Path, settings: tuple[str, ...]) -> None:
+    """Print the ``sync-tracking`` command as typed when a run leaves MLflow work pending.
+
+    The engine's closing warning says in words what that command needs, as it also goes to
+    ``run.log``; this line gives the command itself, whole so it pastes. Nothing is printed when
+    nothing is pending or the count fails, which the engine's closing lines already report.
+
+    :param Experiment config: The config the run was started with.
+    :param Path config_path: The config path as typed.
+    :param tuple[str, ...] settings: The ``--set`` assignments as typed.
+    """
+    if config.mlflow is None:
+        return
+    from phasesweep.tracking.publication import delivery_status
+
+    try:
+        pending = delivery_status(config)["pending"]
+    except (OSError, ValueError):
+        return
+    if pending:
+        command = command_line("sync-tracking", *_config_arguments(config_path, settings))
+        click.echo(f"MLflow: to send what is pending without training, run:\n{command}", err=True)
+
+
+def _config_arguments(config_path: Path, settings: tuple[str, ...]) -> list[str]:
+    """List the arguments that name an experiment's config on a command line, as typed.
+
+    :param Path config_path: The config path as typed.
+    :param tuple[str, ...] settings: The ``--set`` assignments as typed.
+    :return list[str]: The path, then each ``--set`` and its assignment, ready for :func:`command_line`.
+    """
+    return [str(config_path), *(part for item in settings for part in ("--set", item))]
+
+
+def _rerun_command(config_path: Path, settings: tuple[str, ...], from_phase: str | None) -> str:
+    """Build the shell-quoted ``phasesweep run`` command that repeats an invocation.
+
+    Only what decides which trials run is repeated; ``--verbose`` changes the log alone.
+
+    :param Path config_path: The config path as typed.
+    :param tuple[str, ...] settings: The ``--set`` assignments as typed.
+    :param str | None from_phase: The ``--from-phase`` value, if given.
+    :return str: The command, quoted so it can be pasted into a shell.
+    """
+    return command_line(
+        "run",
+        *_config_arguments(config_path, settings),
+        *(() if from_phase is None else ("--from-phase", from_phase)),
+    )
+
+
+def _resume_hint(config: Experiment, *, command: str, width: int) -> str:
     """Name the next step after a run was stopped by SIGINT, SIGHUP or SIGTERM.
 
     :param Experiment config: The config the stopped run was started with.
-    :return str: One line, printed last, so the cleanup log above it is not the final word.
+    :param str command: The shell-quoted command that repeats the run.
+    :param int width: Terminal columns the sentence wraps to; the command stays on one line.
+    :return str: The sentence, then the command on a line of its own, printed last so the
+        cleanup log above it is not the final word.
     """
     if config.persistent:
-        return (
-            "phasesweep: stopped. Rerun the same command to resume: finished trials are kept "
-            "and interrupted ones rerun first."
+        sentence = "phasesweep: stopped. Rerun the same command to resume."
+    else:
+        sentence = (
+            "phasesweep: stopped. Rerun the same command to start over: "
+            f"{STORAGE_NULL_KEEPS_NOTHING}."
         )
-    return (
-        "phasesweep: stopped. Rerun the same command to start over: storage: null keeps no "
-        "completed trials."
-    )
+    return "\n".join([*wrap(sentence, width), command])
 
 
 def _command_config(path: Path, *, settings: tuple[str, ...]) -> Experiment:
@@ -601,8 +944,19 @@ def validate(config_path: Path, settings: tuple[str, ...]) -> None:
     validate_trial_targets(config)
     for phase in config.phases:
         GpuPool.for_phase(phase, cuda_visible_devices=config.env.get("CUDA_VISIBLE_DEVICES"))
-    click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")
+    click.echo(f"OK: {config.experiment} ({plural(len(config.phases), 'phase')})")
     _render_experiment_phases(config)
+    # Validation never compares the config with a study's recorded identity or the environment
+    # of its recorded trials, and it leaves a trial program found through PATH to the launch's
+    # PATH, so an edit that a recorded study refuses and a program that is not installed both
+    # pass it. The ledger is read only for some targets, so this cannot tell whether a study is
+    # recorded and says it every time.
+    sentence = (
+        "Checked the config alone. A dry run also compares it with the recorded study and "
+        "its trials' environment, and checks the trial program on PATH:"
+    )
+    dry_run = command_line("run", *_config_arguments(config_path, settings), "--dry-run")
+    click.echo("\n".join([*wrap(sentence, terminal_width(sys.stdout)), dry_run]))
 
 
 def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> None:
@@ -641,12 +995,9 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Explain config keys from the packaged reference. Without KEY, list the top-level "
-        "keys; with a KEY such as 'phases[].sampler', print the section rules and shared-block "
-        "descriptions that govern it, then that key and every key below it. "
-        "The spellings phases[].sampler, phases.sampler and phases.0.sampler are equivalent. "
-        "The broad phases key prints the rules over the phase list and its immediate "
-        "children; narrow it for full details. With --notes, print the general notes on the "
-        "config file, paths, YAML typing and the study fingerprint instead."
+        "keys; with a KEY such as 'phases[].sampler' (quote brackets), print it and every "
+        "key below it with the rules that govern it. --notes prints the general notes on "
+        "the config file, paths, YAML typing and the study fingerprint."
     ),
     short_help="Explain config keys.",
 )
@@ -680,12 +1031,14 @@ def explain(key: str | None, notes: bool) -> None:
         return
     entries, near = lookup_or_suggest(key)
     if not entries:
-        hint = (
-            f"Closest: {', '.join(near)}."
-            if near
-            else "Run `phasesweep explain` to list the top-level keys."
-        )
-        click.echo(f"phasesweep explain: no config key matches {key!r}. {hint}", err=True)
+        miss = f"phasesweep explain: no config key matches {key!r}."
+        if near:
+            # Each suggestion is a whole command on a line of its own, so it can be pasted.
+            click.echo(
+                "\n".join([f"{miss} Closest:", *(explain_command(path) for path in near)]), err=True
+            )
+        else:
+            click.echo(f"{miss} Run `phasesweep explain` to list the top-level keys.", err=True)
         raise click.exceptions.Exit(_USAGE_EXIT)
     if plain_path(key) == "phases":
         # The compact index carries only the rules over the whole phase list.
@@ -731,7 +1084,7 @@ def _render_reference_index() -> None:
             click.echo(entry.section)
             section = entry.section
         count = sub_key_count(entry)
-        suffix = f" ({count} sub-key{'' if count == 1 else 's'})" if count else ""
+        suffix = f" ({plural(count, 'sub-key')})" if count else ""
         summary = first_sentence(entry, _SUMMARY_WIDTH)
         click.echo(f"  {entry.path:<{width}}  {entry.signature:<{sig_width}}  {summary}{suffix}")
     click.echo()
@@ -759,7 +1112,7 @@ def _code_revision_text(revision: CodeRevision | None) -> str:
     help="Print concise phase winners, including unpublished results from the latest run.",
     short_help="Print saved phase winners.",
 )
-@click.argument("config_path", metavar="CONFIG_YAML", type=CONFIG_PATH)
+@click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 @CONFIG_OVERRIDES
 def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     """Print concise winners from published or unfinished generation records.
@@ -772,7 +1125,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     """
     experiment = _command_config(config_path, settings=settings)
     require_study(experiment)
-    validate_ledger(experiment)
+    ledger = validate_ledger(experiment)
     _, generation_id, publication = _read_generation_selection(experiment, latest=True)
     raise_for_unusable_publication(
         experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
@@ -794,6 +1147,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
         publication,
         generation_id,
         phase_names,
+        ledger=ledger,
         fallback_published=True,
     )
     winners = {view.phase: view for view in views}
@@ -913,6 +1267,8 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                     if winner.tie_groups is None
                     else [json_object(dict(group)) for group in winner.tie_groups]
                 ),
+                "edge_advisory": winner.edge_advisory,
+                "edge_advisory_status": winner.edge_advisory_status,
             }
             if winner.repeats_detail is not None:
                 detail = winner.repeats_detail
@@ -964,100 +1320,6 @@ class _WinnerDumper(yaml.SafeDumper):
 _WinnerDumper.add_representer(float, _WinnerDumper.represent_float)
 
 
-def _param_text(value: JsonValue) -> str:
-    """Format one sampled param for a trial table, floats to four significant digits.
-
-    Four digits would drop the leading digits of a float from 10000 up, which prints in full
-    plain notation instead. The exact value stays in ``trials.csv`` and ``winner.yaml``.
-
-    :param JsonValue value: The recorded param value.
-    :return str: Terminal text for the value.
-    """
-    if isinstance(value, float):
-        text = f"{value:.4g}"
-        if "e+" not in text:
-            return text
-        return format(Decimal(repr(value)).normalize(), "f")
-    return str(value)
-
-
-def _trial_cell(value: JsonValue, column: str) -> str:
-    """Format one trial-table cell for the terminal.
-
-    Params print floats to four significant digits and ``duration_s`` to one decimal place;
-    every other float uses the shared display precision. A missing value prints as ``-``.
-
-    :param JsonValue value: The row's value for that column.
-    :param str column: Header of the column the value sits in.
-    :return str: Terminal text for the cell.
-    """
-    if value is None:
-        return "-"
-    if isinstance(value, dict):
-        return ", ".join(f"{name}={_param_text(item)}" for name, item in value.items()) or "-"
-    if isinstance(value, float):
-        return f"{value:.1f}" if column == "duration_s" else _display_float(value)
-    return str(value)
-
-
-#: Columns whose text is not a number, which a trial table left-aligns.
-_TEXT_TRIAL_COLUMNS = frozenset({"state", "params", "winner", "reduce", "eligible", "reason"})
-
-
-def _aligned_row(columns: Sequence[str], texts: Sequence[str], widths: Sequence[int]) -> str:
-    """Pad one table row to its column widths, text columns left and numbers right.
-
-    :param Sequence[str] columns: Column headers, which pick each column's alignment.
-    :param Sequence[str] texts: The row's cell texts, one per column.
-    :param Sequence[int] widths: Width of each column.
-    :return str: The row joined by two spaces, without trailing spaces.
-    """
-    padded = (
-        text.ljust(width) if column in _TEXT_TRIAL_COLUMNS else text.rjust(width)
-        for column, text, width in zip(columns, texts, widths, strict=True)
-    )
-    return "  ".join(padded).rstrip()
-
-
-def _table_lines(columns: Sequence[str], rows: Sequence[JsonObject]) -> list[str]:
-    """Render trial or group rows as aligned plain text.
-
-    :param Sequence[str] columns: Column names in display order.
-    :param Sequence[JsonObject] rows: Rows to display, with every named column present.
-    :return list[str]: The header line followed by one line per row, without trailing spaces.
-    """
-    cells = [[_trial_cell(row[column], column) for column in columns] for row in rows]
-    widths = [
-        max(len(column), *(len(row[index]) for row in cells))
-        for index, column in enumerate(columns)
-    ]
-    return [
-        _aligned_row(columns, columns, widths),
-        *(_aligned_row(columns, row, widths) for row in cells),
-    ]
-
-
-def _unsettled_running_comment(running: int) -> str:
-    """Say that trials recorded RUNNING belong to no live run and what a rerun does with them.
-
-    Such a trial was cut off, or finished with a result its run could not read. A rerun
-    settles both, and stops a trainer that outlived its run, so the comment says to let
-    one finish first.
-
-    :param int running: How many trials the ledger records as RUNNING while no run holds the locks.
-    :return str: One ``#`` comment line.
-    """
-    if running == 1:
-        subject, verb, pronoun = "the 1 trial", "was", "it"
-    else:
-        subject, verb, pronoun = f"the {running} trials", "were", "them"
-    return (
-        f"# No run is active, so {subject} recorded RUNNING {verb} left by a run that stopped "
-        f"before recording {pronoun}; rerun the same config to settle {pronoun}. A trainer "
-        "still running is stopped and its trial rerun, so wait for it to exit to keep its result."
-    )
-
-
 def _status_can_suggest_resume(config: Experiment) -> bool:
     """Check whether status can confirm the experiment is idle before suggesting a resume.
 
@@ -1072,89 +1334,11 @@ def _status_can_suggest_resume(config: Experiment) -> bool:
         return False
 
 
-def _render_trial_tables(tables: TrialTables, *, csv_root: Path | None) -> str:
-    """Render every phase's trial table under a header that names the winner marks' source.
-
-    :param TrialTables tables: The tables one publication resolution produced.
-    :param Path | None csv_root: The artifact directory of an experiment that keeps no ledger,
-        where each phase's ``trials.csv`` is the only record of its trials; ``None`` when a
-        ledger holds them.
-    :return str: The header line, then each phase's heading and table.
-    """
-    represented = tables.represented_generation_id or tables.published_generation_id
-    sources = set(tables.winner_generations.values())
-    if len(sources) == 1:
-        represented, published = next(iter(sources))
-        marks = f"winner (*) marks {'published' if published else 'unpublished'} generation {represented}"
-    elif len(sources) > 1:
-        marks = "winner (*) marks the phase generations listed below"
-    elif represented is None:
-        marks = "no generation is published, so no winner is marked"
-    elif represented != tables.published_generation_id:
-        marks = f"winner (*) marks unpublished generation {represented}"
-    else:
-        marks = f"winner (*) marks published generation {represented}"
-    lines = [f"experiment {tables.experiment}: {marks}"]
-    for table in tables.phases:
-        if not table.available:
-            note = "trial data unavailable"
-        elif csv_root is not None:
-            snapshot = csv_root / table.phase / "trials.csv"
-            note = "storage: null keeps no trial ledger"
-            if snapshot.is_file():
-                note += f"; the trials of this phase's last run are in {snapshot}"
-        elif not table.rows:
-            note = "no trials yet"
-        else:
-            note = f"{len(table.rows)} trial{'' if len(table.rows) == 1 else 's'}"
-        lines.extend(["", f"=== {table.phase} === ({note})"])
-        source = tables.winner_generations.get(table.phase)
-        if source is not None:
-            source_id, published = source
-            lines.append(
-                f"winner generation: {source_id} ({'published' if published else 'unpublished'})"
-            )
-        if table.rows:
-            lines.extend(_table_lines(table.columns, table.rows))
-        if table.groups:
-            groups: list[JsonObject] = [
-                {
-                    "group": group.group,
-                    "winner": "*" if group.winner else "",
-                    "params": group.params,
-                    "n/expected": f"{group.n}/{group.expected}",
-                    "reduce": group.reduce,
-                    "aggregate": group.aggregate,
-                    "mean": group.mean,
-                    "sd": group.sd,
-                    "min": group.min,
-                    "max": group.max,
-                    "eligible": "yes" if group.eligible else "no",
-                }
-                for group in table.groups
-            ]
-            observed_names = sorted({name for group in table.groups for name in group.observed})
-            for group, row in zip(table.groups, groups, strict=True):
-                for name in observed_names:
-                    row[f"observed:{name}"] = group.observed.get(name)
-                    row[f"observed_n:{name}"] = group.observed_n.get(name, 0)
-            lines.extend(
-                [
-                    "",
-                    "Repeat groups (statistics include infeasible measured members):",
-                    "Group numbers track the highest member trial number so far "
-                    "and can change as members arrive.",
-                ]
-            )
-            lines.extend(_table_lines(tuple(groups[0]), groups))
-    return "\n".join(lines)
-
-
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Print read-only trial counts and phase state for a phasesweep experiment, as YAML; "
-        "--trials prints trial and repeat-group tables per phase instead."
+        "--trials prints a table of trials per phase for reading instead."
     ),
     short_help="Print read-only run status.",
 )
@@ -1165,9 +1349,9 @@ def _render_trial_tables(tables: TrialTables, *, csv_root: Path | None) -> str:
     "show_trials",
     is_flag=True,
     help=(
-        "Print one aligned table of trials per phase (state, value, params, duration, "
-        "repeat group, observed values, failure reasons, winner) and repeat-group statistics "
-        "instead of YAML."
+        "Print one table per phase instead of YAML: a column per swept parameter, rows sorted "
+        "by value, the winner marked, repeat groups below. trials.csv in each phase's "
+        "directory is the machine-readable form."
     ),
 )
 def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> None:
@@ -1180,7 +1364,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     and trials recorded RUNNING while no run holds the experiment's locks get a comment
     saying that a rerun settles them. These comments require a successful idle lock probe.
     ``--trials`` prints the trial tables in its place, from one publication resolution,
-    and exits the same way.
+    styled only on a terminal, and exits the same way.
 
     :param Path config_path: Experiment YAML file to inspect.
     :param bool show_trials: Print per-phase trial tables instead of the YAML status.
@@ -1193,12 +1377,17 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     require_study(config)
     if show_trials:
         tables = read_trial_tables(config, latest=True)
+        width = terminal_width(sys.stdout)
         running = sum(row["state"] == "RUNNING" for table in tables.phases for row in table.rows)
         if running and _status_can_suggest_resume(config):
-            click.echo(_unsettled_running_comment(running))
+            click.echo(unsettled_running_comment(running, width))
         click.echo(
-            _render_trial_tables(
-                tables, csv_root=None if config.persistent else _experiment_dir(config)
+            render_trial_tables(
+                tables,
+                config,
+                csv_root=None if config.persistent else _experiment_dir(config),
+                width=width,
+                color=use_color(sys.stdout),
             )
         )
         raise_for_unusable_publication(
@@ -1227,7 +1416,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     # One probe serves both comments: flock cannot test a lock without taking it.
     suggest_resume = _status_can_suggest_resume(config) if running or retained else False
     if running and suggest_resume:
-        click.echo(_unsettled_running_comment(running))
+        click.echo(unsettled_running_comment(running))
     if retained and suggest_resume:
         step = unpublished_winner_step(config, ledger)
         if step is not None:
@@ -1249,6 +1438,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     "sync-tracking",
     context_settings=CONTEXT_SETTINGS,
     help="Reconcile MLflow run creations and retry uploads without training or selecting winners.",
+    short_help="Reconcile and retry MLflow uploads.",
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 @CONFIG_OVERRIDES
@@ -1261,23 +1451,121 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
 def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[str, ...]) -> None:
     """Reconcile pending native MLflow runs and retry result delivery.
 
+    Warnings print on the console as a run's do. Every step that ends with something pending
+    names this command as typed, on a line of its own; a shutdown signal prints how much is
+    still pending before the command exits with the signal's status.
+
     :param Path config_path: Matching experiment configuration.
     :param str | None generation_id: Generation to synchronize, or ``None`` for all.
     :param tuple[str, ...] settings: The same config overrides used by the run.
     :raises ClickException: The generation name or a delivery record is malformed.
-    :raises PhaseSweepError: Nothing matching can be synchronized, or records remain pending.
+    :raises PhaseSweepError: Nothing matching can be synchronized, or records remain pending;
+        its step is a retry when MLflow gave no answer or a creation's window is still open,
+        and fixing the causes when it refused.
     """
     from phasesweep.tracking.publication import sync_tracking as sync
+    from phasesweep.tracking.session import (
+        DeliveryTally,
+        count_text,
+        creation_window_end,
+        pending_creation_records,
+        refused_text,
+    )
 
-    config = _command_config(config_path, settings=settings)
-    require_study(config)
-    try:
-        counts = sync(config, generation_id)
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    command = command_line(
+        "sync-tracking",
+        *_config_arguments(config_path, settings),
+        *(() if generation_id is None else ("--generation", generation_id)),
+    )
+    tally = DeliveryTally()
+    with _console_logging(verbose=False):
+        config = _command_config(config_path, settings=settings)
+        require_study(config)
+        # Every creation search starts after this, so a window open now was open at its search.
+        started = time.time()
+        try:
+            counts = sync(config, generation_id, tally=tally)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+        except PhaseSweepShutdown:
+            click.echo(_sync_stopped_text(config, generation_id, command), err=True)
+            raise
     click.echo(yaml.safe_dump(counts, sort_keys=False).rstrip())
-    if counts["pending"]:
-        raise PhaseSweepError("MLflow delivery remains pending.", action=OperatorAction.RETRY)
+    if not counts["pending"]:
+        return
+    again = f"run this command again:\n{command}"
+    if tally.unanswered is not None:
+        raise PhaseSweepError(
+            f"MLflow delivery remains pending: {tally.unanswered}",
+            action=OperatorAction.RETRY,
+            remediation=f"Once the server answers, {again}",
+        )
+    if tally.refused:
+        raise PhaseSweepError(
+            "MLflow delivery remains pending:" + refused_text(tally.refused),
+            action=OperatorAction.FIX_CONFIG,
+            remediation=(
+                f"Fix {'each cause' if len(tally.refused) > 1 else 'the cause'} in MLflow, "
+                f"then {again}"
+            ),
+        )
+    creations = pending_creation_records(config, generation_id)
+    open_windows = [
+        end for end in (creation_window_end(config, path) for path in creations) if end > started
+    ]
+    if open_windows:
+        assert config.mlflow is not None
+        # MLflow answered that no run carries the identity yet, and the lost request may still
+        # make one, so only a search after the window can settle the creation. The time is
+        # rounded up, so a retry at the printed second is past the window.
+        until = math.ceil(max(open_windows))
+        left = math.ceil(until - time.time())
+        raise PhaseSweepError(
+            f"MLflow delivery remains pending: no run yet for {count_text(0, len(open_windows))}, "
+            "which may still be created until timeout_seconds "
+            f"({config.mlflow.timeout_seconds:g} s) after the request was sent.",
+            action=OperatorAction.RETRY,
+            remediation=(
+                f"Wait until {time.strftime('%H:%M:%S', time.localtime(until))}, about {left} s "
+                f"from now, then {again}"
+                if left > 0
+                else f"That window has closed since the search, so {again}"
+            ),
+        )
+    # The counts printed above, less the creations the window check just listed, so the line
+    # agrees with them without reading the records again.
+    records = counts["pending"] - len(creations)
+    raise PhaseSweepError(
+        f"MLflow delivery remains pending: {count_text(records, len(creations))} could not be "
+        "sent or settled; the warnings above give each cause.",
+        action=OperatorAction.RETRY,
+        remediation=f"Once those causes are resolved, {again}",
+    )
+
+
+def _sync_stopped_text(config: Experiment, generation_id: str | None, command: str) -> str:
+    """Say what a shutdown left pending in sync-tracking's scope, and how to send it.
+
+    :param Experiment config: The config sync-tracking ran with.
+    :param str | None generation_id: Its ``--generation`` value, if given.
+    :param str command: The shell-quoted command that repeats it.
+    :return str: The sentence, wrapped to the terminal, then the command on a line of its own.
+    """
+    from phasesweep.tracking.publication import delivery_counts
+    from phasesweep.tracking.session import count_text
+
+    try:
+        counts = delivery_counts(config, generation_id)
+    except (OSError, ValueError) as exc:
+        stopped = f"phasesweep: stopped; what stays pending could not be counted ({exc})."
+    else:
+        if not counts.pending:
+            return "phasesweep: stopped with nothing pending."
+        stopped = (
+            f"phasesweep: stopped with {count_text(counts.records, counts.creations)} pending."
+        )
+    sentence = f"{stopped} Rerun the same command to send what is left:"
+    return "\n".join([*wrap(sentence, terminal_width(sys.stderr)), command])
 
 
 @cli.group(
@@ -1304,10 +1592,9 @@ def _catalog_error_text(exc: CatalogError) -> str:
     name="recover-run",
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Operator-only recovery for MCP cleanup uncertainty, interrupted publication, or "
-        "terminal-result finalization. If study storage is unavailable, restore the original "
-        "complete storage ledger and access to it before recovery. "
-        "--confirm performs the reported actions."
+        "Recover an MCP run after uncertain cleanup, an interrupted publication or an "
+        "unfinished result snapshot. Without --confirm it only reports the actions; "
+        "--confirm performs them."
     ),
     short_help="Recover MCP cleanup or result finalization.",
 )
@@ -1329,9 +1616,13 @@ def _catalog_error_text(exc: CatalogError) -> str:
 def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     """Recover cleanup, interrupted publication, or result finalization.
 
+    A shutdown signal during a confirmed pass stops its workers and prints the command that
+    finishes the recovery, then the command exits with the signal's status.
+
     :param Path state_dir: MCP state directory containing the run metadata.
     :param str run_id: Identifier of the run to recover.
     :param bool confirm: Whether to perform recovery instead of only reporting actions.
+    :raises PhaseSweepShutdown: A shutdown signal stopped a confirmed pass.
     :raises click.ClickException: If the host is not a supported MCP host, the state
         directory or run id is unknown, the launch outcome is still unresolved, no
         immutable terminal snapshot exists, an interrupted publication cannot
@@ -1347,10 +1638,23 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         require_supported_mcp_host()
     except CatalogError as exc:
         raise click.ClickException(_catalog_error_text(exc)) from None
-    try:
-        recover_run(state_dir, run_id, confirm=confirm, emit=click.echo)
-    except RunRecoveryError as exc:
-        raise click.ClickException(_operational_error_text(exc)) from None
+    # The engine's warnings, such as a record MLflow refused, print on the console as
+    # sync-tracking's do; recovery writes no run.log of its own.
+    with _console_logging(verbose=False):
+        try:
+            recover_run(state_dir, run_id, confirm=confirm, emit=click.echo)
+        except RunRecoveryError as exc:
+            _print_operational_error(exc)
+            raise click.exceptions.Exit(_FAILURE_EXIT) from None
+        except PhaseSweepShutdown:
+            # A stopped pass leaves the run recovery-required unless it had already cleared it,
+            # and either way the same command finishes or confirms the recovery.
+            command = command_line(
+                "mcp", "recover-run", "--state-dir", str(state_dir), "--run-id", run_id, "--confirm"
+            )
+            sentence = "phasesweep: stopped. Rerun the same command to finish the recovery:"
+            click.echo("\n".join([*wrap(sentence, terminal_width(sys.stderr)), command]), err=True)
+            raise
 
 
 @mcp.command(
@@ -1392,13 +1696,12 @@ def _tool_arguments(ctx: click.Context, param: click.Parameter, value: str) -> J
     name="call",
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Run one MCP tool against a catalog in this process and print its result (JSON, or the "
-        "text of get_guide), through the same dispatch, validation, redaction and audit as "
-        "`mcp serve`. "
+        "Call one MCP tool against a catalog in this process and print its result (JSON, or "
+        "get_guide's text) through the path `mcp serve` uses. "
         f"TOOL is one of {', '.join(TOOL_NAMES)}. "
-        "JSON_ARGS is a JSON object of tool arguments and defaults to {}. Exit code 0 prints the "
-        "result; 1 prints the tool's error on stderr; 2 means bad input or a catalog that cannot "
-        "be loaded as a whole. The call is real: launch_run starts a detached run."
+        "JSON_ARGS is a JSON object of tool arguments, default {}. Exit status: 0 result, "
+        "1 tool error on stderr, 2 bad input or an unloadable catalog. "
+        "The call is real: launch_run starts a detached run."
     ),
     short_help="Call one MCP tool from the shell.",
 )
@@ -1423,10 +1726,9 @@ def mcp_call(ctx: click.Context, tool: str, json_args: JsonObject, catalog: Path
     name="check",
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Validate an MCP catalog and its enabled trainer launch paths, and print a "
-        "per-experiment ok/FAIL report. The check provisions and probes the configured "
-        "state directory and checks for run records that block launches. Exit code 0 when every "
-        "entry loads and the state passes, 2 otherwise."
+        "Check an MCP catalog: print an ok/FAIL line per experiment, then provision and probe "
+        "the state directory and report run records that block launches. Exit status 0 when "
+        "all pass, 2 otherwise."
     ),
     short_help="Preflight an MCP catalog.",
 )
@@ -1481,13 +1783,11 @@ def _echo_catalog_report(report: CatalogCheckReport) -> None:
     name="init-catalog",
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Write an annotated MCP catalog for existing experiment configs: absolute "
-        "state_dir under PHASESWEEP_HOME/mcp/<catalog-digest> or "
-        "${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>, one read-only "
-        "entry per --from config (visible_params: none, no allow block). The staged "
-        "catalog is validated with the server startup path before it is published. "
-        "Existing files are never overwritten; edit the result, then re-check it with "
-        "`phasesweep mcp check`."
+        "Write an annotated MCP catalog with one read-only entry per --from config "
+        "(visible_params: none, no allow block) and an absolute state_dir under "
+        "PHASESWEEP_HOME/mcp/<catalog-digest> or "
+        "${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>. Existing files "
+        "are never overwritten. Edit it, then run `phasesweep mcp check`."
     ),
     short_help="Scaffold an MCP catalog.",
 )
@@ -1522,8 +1822,22 @@ def init_catalog(ctx: click.Context, from_configs: tuple[Path, ...], output: Pat
     _echo_catalog_report(check_catalog(output))
     click.echo(
         "next: fill in each description, decide allow/visible_params, then run "
-        f"`phasesweep mcp check --catalog {output.resolve()}`"
+        f"`{command_line('mcp', 'check', '--catalog', str(output.resolve()))}`"
     )
+
+
+def _refuse_catalog_overwrite(output: Path) -> bool:
+    """Print that ``init-catalog`` will not replace ``output``.
+
+    :param Path output: Catalog destination that exists, or appeared during publication.
+    :return bool: Always False, the scaffold writer's "not written" result.
+    """
+    click.echo(
+        f"phasesweep mcp init-catalog: {output} already exists; refusing to overwrite. "
+        "Pass -o to choose another name.",
+        err=True,
+    )
+    return False
 
 
 def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> bool:
@@ -1534,12 +1848,7 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
     :return bool: True when the catalog was written; False after printing why not.
     """
     if output.is_symlink() or output.exists():
-        click.echo(
-            f"phasesweep mcp init-catalog: {output} already exists; refusing to overwrite. "
-            "Pass -o to choose another name.",
-            err=True,
-        )
-        return False
+        return _refuse_catalog_overwrite(output)
 
     try:
         text = scaffold_catalog_text(output, from_configs)
@@ -1550,12 +1859,7 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
             private_atomic_write_text(registry.state_dir / "origin", str(output.resolve()) + "\n")
 
         if not atomic_create_text(output, text, validate=validate_scaffold):
-            click.echo(
-                f"phasesweep mcp init-catalog: {output} already exists; refusing to "
-                "overwrite. Pass -o to choose another name.",
-                err=True,
-            )
-            return False
+            return _refuse_catalog_overwrite(output)
     except CatalogError as exc:
         click.echo(f"phasesweep mcp init-catalog: {_catalog_error_text(exc)}", err=True)
         return False

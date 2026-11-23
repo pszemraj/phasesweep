@@ -504,21 +504,20 @@ def test_run_store_marks_fresh_scaffolded_state(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("marker_text", "match"),
     [
-        ("not json\n", "format marker is unreadable or malformed; use a fresh MCP state directory"),
+        ("not json\n", "format marker is unreadable or malformed"),
         (
             json.dumps({"schema_version": mcp_runs.MCP_STATE_FORMAT_VERSION, "unexpected": True}),
-            "format marker is unreadable or malformed; use a fresh MCP state directory",
+            "format marker is unreadable or malformed",
         ),
         (
             '{"schema_version": 0}\n',
             f"format marker declares format 0; this PhaseSweep reads format "
-            f"{mcp_runs.MCP_STATE_FORMAT_VERSION}; use a fresh MCP state directory",
+            f"{mcp_runs.MCP_STATE_FORMAT_VERSION}",
         ),
         (
             json.dumps({"schema_version": mcp_runs.MCP_STATE_FORMAT_VERSION - 1}),
             f"format marker declares format {mcp_runs.MCP_STATE_FORMAT_VERSION - 1}; "
-            f"this PhaseSweep reads format {mcp_runs.MCP_STATE_FORMAT_VERSION}; "
-            "use a fresh MCP state directory",
+            f"this PhaseSweep reads format {mcp_runs.MCP_STATE_FORMAT_VERSION}",
         ),
     ],
 )
@@ -568,7 +567,7 @@ def test_run_store_refuses_unmarked_durable_state_before_initialization(
 
     monkeypatch.setattr(mcp_runs, "ensure_private_dir", fail_if_initialized)
 
-    with pytest.raises(ValueError, match="no format marker.*fresh MCP state directory"):
+    with pytest.raises(mcp_runs.UnsupportedStateFormatError, match="no format marker"):
         RunStore(state_dir)
 
     assert initialized == []
@@ -1503,6 +1502,28 @@ def test_confirmed_terminal_status_supersedes_stale_cleanup_marker(tmp_path: Pat
     assert not observation.cleanup_recovery_required
     assert not observation.recovery_required
     assert tree_snapshot(tmp_path / "state") == before
+
+
+@pytest.mark.parametrize(
+    ("returncode", "error_class", "state"),
+    [
+        (130, "cancelled", "cancelled"),
+        (143, "cancelled", "cancelled"),
+        (129, "cancelled", "cancelled"),
+        (143, "RuntimeError", "failed"),
+    ],
+    ids=["sigint", "sigterm", "sighup", "signal-code-without-cancellation"],
+)
+def test_a_run_reads_cancelled_from_the_runners_cancellation_record_alone(
+    tmp_path: Path, returncode: int, error_class: str, state: str
+) -> None:
+    """The runner records each shutdown signal it honours as ``error_class: cancelled``; an exit code alone makes no run cancelled."""
+    store = RunStore(tmp_path / "state")
+    handle = make_dead_run_handle(run_id="exp-1")
+    store.create(handle)
+    write_run_status(store, "exp-1", returncode=returncode, error_class=error_class)
+
+    assert store.observe(handle).state == state
 
 
 def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(

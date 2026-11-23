@@ -18,7 +18,13 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from phasesweep.mcp.errors import NEW_RUN_RESUMES, recover_run_step, run_log_reference
+from phasesweep.mcp.errors import (
+    NEW_RUN_RESUMES,
+    PUBLICATION_STEPS,
+    recover_run_step,
+    run_log_reference,
+    sync_tracking_command,
+)
 from phasesweep.mcp.runner import (
     FailureCode,
     FailurePayload,
@@ -77,8 +83,8 @@ def _validated(failure: JsonObject | None) -> JsonObject | None:
 
 
 _CLEANUP_SETTLED_REMEDIATION = (
-    "Operator recovery settled this run's process cleanup, so no recover-run step remains. The "
-    f"run itself still ended without completing; {NEW_RUN_RESUMES}."
+    "Operator recovery settled this run's process cleanup. The run ended without completing; "
+    f"{NEW_RUN_RESUMES}."
 )
 
 
@@ -99,16 +105,13 @@ _PUBLICATION_FAILURES: dict[str, JsonObject] = {
         "publication_corrupt",
         "preflight",
         "The experiment's last published result no longer validates. Ask the operator to "
-        "inspect it with `phasesweep status CONFIG` and restore it; until then a new run of "
-        "this experiment fails before its first trial.",
+        f"{PUBLICATION_STEPS['failed']}.",
     ),
     "permission_denied": operator_failure(
         "publication_unreadable",
         "preflight",
-        "This server cannot read the experiment's published result to validate it, which is "
-        "not evidence of corruption. Ask the operator to read it as the publishing user or "
-        "restore the server's read permission; until then a new run of this experiment fails "
-        "before its first trial.",
+        "This server cannot read the experiment's published result (not necessarily "
+        f"corrupt). Ask the operator to {PUBLICATION_STEPS['permission_denied']}.",
     ),
 }
 
@@ -174,9 +177,7 @@ def _recovery_failure(
             "cleanup_uncertain",
             "cleanup",
             "The server saved this run's launch but never recorded whether its runner "
-            "started. Stop monitoring. The next permitted launch clears this preparation "
-            "automatically if the launch lease proves it was abandoned. To check or remove it "
-            f"without launching, ask the operator to {recover_run_step(handle.run_id)}.",
+            f"started. {_stop_for_recovery(handle.run_id)}",
         )
     if observation.snapshot_recovery_required and not observation.cleanup_recovery_required:
         snapshot_unfinished = operator_failure(
@@ -275,11 +276,10 @@ def _diagnose(
         tracking_cleanup = operator_failure(
             "cleanup_uncertain",
             "cleanup",
-            "The run succeeded and its published results are unaffected, but cleanup of "
-            "its MLflow tracking worker is unconfirmed. Stop monitoring and ask the operator "
-            "to retry delivery and that cleanup with `phasesweep sync-tracking CONFIG`, using "
-            f"the config this run launched with, then {recover_run_step(handle.run_id)}, before "
-            "another launch.",
+            "The run succeeded and its results are unaffected, but cleanup of its MLflow "
+            "tracking worker is unconfirmed. Stop monitoring and ask the operator to run "
+            f"`{sync_tracking_command()}` (the config this run launched with), then "
+            f"{recover_run_step(handle.run_id)}.",
         )
         return _Diagnosis(tracking_cleanup, persisted, True)
     recorded = persisted
@@ -302,15 +302,13 @@ def _diagnose(
         recovery_required = observation.recovery_required or observation.runner_heartbeat_stale
         if runner_ended_with_boot:
             remedy = (
-                "The runner ended with an earlier host boot, so no process from that boot "
-                "remains and no recover-run step is needed. This run recorded no results; "
-                f"{NEW_RUN_RESUMES}."
+                "The runner ended with an earlier host boot, so no recover-run step is needed. "
+                f"This run recorded no results; {NEW_RUN_RESUMES}."
             )
         elif observation.runner_heartbeat_stale:
             remedy = (
                 "The runner is in another PID namespace and its heartbeat is stale; it may "
-                "have stopped, and only a shell outside the sandbox can check it and its "
-                f"trials. {_stop_for_recovery(handle.run_id, outside_sandbox=True)}"
+                f"have stopped. {_stop_for_recovery(handle.run_id, outside_sandbox=True)}"
             )
         else:
             remedy = (
@@ -332,8 +330,8 @@ def _diagnose(
         snapshot_unavailable = operator_failure(
             "result_snapshot_unavailable",
             "cleanup",
-            "Report that this run's results are unavailable, not another run's results in "
-            f"their place, and ask the operator to inspect {run_log_reference(handle.run_id)}.",
+            "This run's results are unavailable. Ask the operator to inspect "
+            f"{run_log_reference(handle.run_id)}.",
         )
         return _Diagnosis(_with_cause(snapshot_unavailable, persisted), recorded, False)
     # Other terminal diagnoses and remediations survive operator recovery; the live

@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar
 
-from phasesweep.errors import NEW_STUDY_STEP, OperatorAction, PhaseSweepError
+from phasesweep.errors import (
+    FRESH_STUDY,
+    PERSISTENT_STUDY_KEEPS_TRIALS,
+    STORAGE_NULL_KEEPS_NOTHING,
+    OperatorAction,
+    PhaseSweepError,
+)
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Experiment
@@ -154,18 +160,10 @@ def phase_timeout(message: str, *, scope: str | None, experiment: Experiment) ->
     :return PhaseTimeoutError: Routed timeout shared by CLI, run logs, and MCP failures.
     """
     key = "timeout_seconds_per_run" if scope == "run" else "timeout_seconds_per_phase"
-    continuation = (
-        "resume the phase; completed trials are kept."
-        if experiment.persistent
-        else "start the run again; storage: null keeps no completed trials between runs."
-    )
-    return PhaseTimeoutError(
-        message,
-        remediation=(
-            f"Raise {key} in the config and rerun with the same config and --set "
-            f"overrides to {continuation}"
-        ),
-    )
+    # The step names neither the config nor `--set`: an MCP launch has no `--set`, and a CLI
+    # rerun carries the override that set the key.
+    kept = PERSISTENT_STUDY_KEEPS_TRIALS if experiment.persistent else STORAGE_NULL_KEEPS_NOTHING
+    return PhaseTimeoutError(message, remediation=f"Raise {key} and rerun; {kept}.")
 
 
 class TrialTargetRefusedError(PhaseSweepError):
@@ -190,11 +188,9 @@ class TrackingTargetUnavailableError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
 
 
-_TRACKER_UNREADABLE_STEP = (
-    "Fix the reported cause (restore access to the tracker, or install its missing SDK), "
-    "then run the same config again: the completed training is kept and nothing is "
-    "retrained. If the tracker is gone for good, a fresh study gives up that training. "
-    f"{NEW_STUDY_STEP}"
+TRACKER_UNREADABLE_STEP = (
+    "Restore access to the tracker or install its SDK, then run the same config again; the "
+    f"finished training is kept. If the tracker is gone for good, {FRESH_STUDY}."
 )
 
 
@@ -204,7 +200,7 @@ def tracker_unreadable(message: str) -> TrackingTargetUnavailableError:
     :param str message: Diagnostic naming the pending trials and the tracker's failure.
     :return TrackingTargetUnavailableError: Refusal shared by the live run and recovery.
     """
-    return TrackingTargetUnavailableError(message, remediation=_TRACKER_UNREADABLE_STEP)
+    return TrackingTargetUnavailableError(message, remediation=TRACKER_UNREADABLE_STEP)
 
 
 class TrackingSyncRefusedError(PhaseSweepError):

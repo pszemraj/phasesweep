@@ -50,9 +50,15 @@ from phasesweep.runtime.reaper import (
 )
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
+    _RegisteredGroup,
     _shutdown_handler,
 )
-from tests.conftest import is_pid_zombie, make_experiment, raise_after_first_successful_call
+from tests.conftest import (
+    assert_descendant_dies,
+    is_pid_zombie,
+    make_experiment,
+    raise_after_first_successful_call,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -748,6 +754,7 @@ def test_spawn_blocked_supervisor_launch_argv_and_env(
         proc, pgid, ack_write, status_read = _spawn_blocked_supervisor(
             stdout=fout,
             stderr=ferr,
+            label="trial",
         )
     try:
         argv = captured["argv"]
@@ -794,7 +801,7 @@ def test_spawn_blocked_supervisor_invalidates_pipe_fd_before_close(
         (tmp_path / "err.log").open("w") as ferr,
         pytest.raises(InjectedClose),
     ):
-        process._spawn_blocked_supervisor(stdout=fout, stderr=ferr)
+        process._spawn_blocked_supervisor(stdout=fout, stderr=ferr, label="trial")
 
     assert close_calls
 
@@ -826,6 +833,10 @@ def test_supervisor_main_rejects_malformed_payload(
     """EOF or any payload-shape violation must return 75 without execing."""
     exec_calls: list[tuple[object, ...]] = []
     monkeypatch.setattr(supervisor.os, "execve", lambda *a: exec_calls.append(a))
+    # As a subreaper this pytest process would adopt every orphan for the rest of its session.
+    monkeypatch.setattr(supervisor, "_become_subreaper", lambda: False)
+    # A wait for any child would also reap children other tests in this process started.
+    monkeypatch.setattr(supervisor, "_wait_for_root", lambda root: os.waitpid(root, 0)[1])
 
     ready_read, ready_write = os.pipe()
     ack_read, ack_write = os.pipe()
@@ -871,29 +882,6 @@ _SIGTERM_IGNORING_CHILD_SCRIPT = (
 )
 
 
-def _assert_descendant_dies(
-    pid: int, *, deadline_seconds: float = 5.0, on_timeout_msg: str
-) -> None:
-    """Poll until ``pid`` is gone; if it outlives the deadline, SIGKILL it and fail.
-
-    :param int pid: Descendant PID expected to be reaped by supervisor cleanup.
-    :param float deadline_seconds: How long to poll before giving up.
-    :param str on_timeout_msg: ``pytest.fail`` message used if still alive at the deadline.
-    """
-    deadline = time.time() + deadline_seconds
-    while time.time() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return  # success
-        time.sleep(0.05)
-
-    # Cleanup before failing so we don't leak a python process across the test run.
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGKILL)
-    pytest.fail(on_timeout_msg)
-
-
 def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) -> None:
     """Timeout cleanup kills a SIGTERM-ignoring child after its root shell exits."""
     trial_dir = tmp_path / "trial"
@@ -921,7 +909,7 @@ def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) 
 
     # The child must be dead within a reasonable window after run_supervised returns.
     # If _kill_group only waited for the root, the child would still be alive here.
-    _assert_descendant_dies(
+    assert_descendant_dies(
         child_pid, on_timeout_msg=f"timeout left descendant process {child_pid} alive"
     )
 
@@ -1120,10 +1108,12 @@ def test_payload_delivery_consumes_total_trial_budget(
 def test_terminal_status_read_cannot_turn_expired_trial_into_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A status byte observed after the deadline still means the trial timed out."""
+    """A status byte observed after the deadline still means the trial timed out; the timeout is logged at INFO, for run.log only, because the trial's reason states it."""
     import phasesweep.runtime.process as process
 
+    caplog.set_level("INFO", logger="phasesweep.runtime.process")
     real_fd_ready = process.fd_ready
     read_waits = 0
 
@@ -1149,6 +1139,7 @@ def test_terminal_status_read_cannot_turn_expired_trial_into_success(
     assert result.timed_out
     assert result.cleanup_confirmed
     assert result.failure_reason == "timeout after 0.5s"
+    assert [r.levelname for r in caplog.records if "timed out" in r.getMessage()] == ["INFO"]
 
 
 def test_payload_write_timeout_covers_a_nonreading_pipe() -> None:
@@ -1322,94 +1313,12 @@ def test_deadline_expiring_during_launch_preparation_prevents_trainer_start(
     assert not marker.exists()
 
 
-def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
-    """Root exits 0 while a child ignores SIGTERM."""
-    trial_dir = tmp_path / "trial"
-    marker = tmp_path / "child_pid.txt"
-
-    parent_script = (
-        "import os, subprocess, sys; "
-        f"p = subprocess.Popen([sys.executable, '-c', {_SIGTERM_IGNORING_CHILD_SCRIPT!r}]); "
-        f"open({str(marker)!r}, 'w').write(str(p.pid)); "
-        "sys.stdout.flush(); "
-        "os._exit(0)"
-    )
-
-    cmd = f"python -c {parent_script!r}"
-
-    result = _run_supervised(trial_dir, cmd, timeout=10.0, attempt_id="descendant-attempt")
-
-    # Must be flagged as a lifecycle failure, not a clean exit.
-    assert result.failure_reason is not None
-    assert "still had live descendants" in result.failure_reason
-    assert "Make the trainer wait for its children before exiting" in result.failure_reason
-
-    # The atomic identity must be preserved for forensics.
-    assert (trial_dir / PROCESS_IDENTITY_FILE).exists()
-
-    # Descendant must be dead.
-    assert marker.exists(), "child PID marker was never written; test setup broken"
-    child_pid = int(marker.read_text().strip())
-    _assert_descendant_dies(
-        child_pid, on_timeout_msg=f"background descendant {child_pid} survived root exit"
-    )
-
-
-def test_descendant_reaping_grace_is_outside_trial_wallclock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An in-budget root exit remains a lifecycle failure, not a timeout."""
-    import phasesweep.runtime.process as process
-
-    trial_dir = tmp_path / "trial"
-    ready = tmp_path / "descendant_ready"
-    root_pid = tmp_path / "root_pid"
-    budget = 5.0
-    child_script = (
-        "import os, pathlib, signal, time; "
-        "signal.signal(signal.SIGTERM, "
-        f"lambda *_: (time.sleep({budget + 0.5}), os._exit(0))); "
-        f"pathlib.Path({str(ready)!r}).touch(); "
-        "time.sleep(60)"
-    )
-    parent_script = (
-        "import os, pathlib, subprocess, sys, time; "
-        f"subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
-        f"ready = pathlib.Path({str(ready)!r}); "
-        "\nwhile not ready.exists(): time.sleep(0.005)\n"
-        f"pathlib.Path({str(root_pid)!r}).write_text(str(os.getpid())); "
-        "os._exit(0)"
-    )
-
-    real_wait = process._wait_for_guardian_exit
-
-    def wait_for_cleanup(proc: subprocess.Popen[bytes]) -> bool:
-        # The root-exit status has already arrived; the guardian still owns cleanup.
-        assert root_pid.exists()
-        assert not is_pid_alive(int(root_pid.read_text()))
-        assert proc.poll() is None
-        assert time.monotonic() - started < budget, "root exit did not precede the deadline"
-        return real_wait(proc)
-
-    monkeypatch.setattr(process, "_wait_for_guardian_exit", wait_for_cleanup)
-    started = time.monotonic()
-    result = _run_supervised(
-        trial_dir,
-        shlex.join([sys.executable, "-c", parent_script]),
-        timeout=budget,
-        attempt_id="post-root-grace-attempt",
-    )
-
-    assert result.timed_out is False
-    assert result.return_code == 0
-    assert result.cleanup_confirmed is True
-    assert result.failure_reason is not None
-    assert "still had live descendants" in result.failure_reason
-    assert result.duration_seconds > budget, "test did not exercise cleanup beyond the budget"
-
-
 def test_in_band_guardian_wait_reports_uncertainty_instead_of_hanging() -> None:
-    """A fail-closed detached guardian cannot park the orchestrator forever."""
+    """A fail-closed detached guardian cannot park the orchestrator forever.
+
+    The bounded wait still outlasts a healthy guardian's worst case after its root
+    exits: the helper settle, then the SIGTERM grace.
+    """
     guardian = Mock(pid=4242)
     guardian.wait.side_effect = subprocess.TimeoutExpired("guardian", 0.0)
 
@@ -1417,7 +1326,7 @@ def test_in_band_guardian_wait_reports_uncertainty_instead_of_hanging() -> None:
     guardian.wait.assert_called_once()
     timeout = guardian.wait.call_args.kwargs["timeout"]
     assert timeout is not None
-    assert timeout > supervisor._GROUP_TERM_GRACE_SECONDS
+    assert timeout > supervisor._HELPER_SETTLE_SECONDS + supervisor._GROUP_TERM_GRACE_SECONDS
 
 
 @pytest.mark.parametrize("state", ["Z", "X"])
@@ -1503,6 +1412,124 @@ def test_guardian_proc_scan_ignores_only_proven_unrelated_entries(
     monkeypatch.setattr(builtins, "open", fake_open)
 
     assert supervisor._trainer_group_alive(1234) is expected_alive
+
+
+@pytest.mark.parametrize(
+    ("pgid_result", "expected"),
+    [
+        pytest.param(1234, True, id="group-member"),
+        pytest.param(99, False, id="other-group"),
+        pytest.param(ProcessLookupError, False, id="gone-process"),
+        pytest.param(PermissionError, None, id="unknown-group"),
+    ],
+)
+def test_guardian_decides_an_unreadable_process_by_getpgid(
+    monkeypatch: pytest.MonkeyPatch, pgid_result: int | type[OSError], expected: bool | None
+) -> None:
+    """Without ``stat``, ``getpgid`` says whether a process is in the trainer group."""
+
+    def fake_getpgid(target: int) -> int:
+        if isinstance(pgid_result, int):
+            return pgid_result
+        raise pgid_result(target)
+
+    monkeypatch.setattr("phasesweep.runtime.supervisor.os.getpgid", fake_getpgid)
+
+    assert supervisor._unreadable_member(22, 1234) is expected
+
+
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        pytest.param([(0, 0)], True, id="running-child"),
+        pytest.param([(22, 0), (23, 9), (0, 0)], True, id="exited-children-reaped-one-runs"),
+        pytest.param([(22, 0), ChildProcessError], False, id="exited-child-reaped-none-left"),
+        pytest.param([ChildProcessError], False, id="no-child"),
+    ],
+)
+def test_guardian_counts_its_children_by_waitpid(
+    monkeypatch: pytest.MonkeyPatch,
+    results: list[tuple[int, int] | type[ChildProcessError]],
+    expected: bool,
+) -> None:
+    """``waitpid(-1, WNOHANG)`` reaps every exited child and stops at a running one or at none."""
+    calls: list[tuple[int, int]] = []
+
+    def fake_waitpid(target: int, options: int) -> tuple[int, int]:
+        calls.append((target, options))
+        result = results[len(calls) - 1]
+        if isinstance(result, tuple):
+            return result
+        raise result(target)
+
+    monkeypatch.setattr("phasesweep.runtime.supervisor.os.waitpid", fake_waitpid)
+
+    assert supervisor._children_remain() is expected
+    assert calls == [(-1, os.WNOHANG)] * len(results)
+
+
+@pytest.mark.parametrize(
+    ("adopts", "group_alive", "children_alive", "expected", "steps", "listed"),
+    [
+        pytest.param(
+            False, False, True, False, ["group"], [], id="no-adoption-asks-only-the-group"
+        ),
+        pytest.param(True, True, False, True, ["group", "children"], [1235], id="live-group"),
+        pytest.param(
+            True,
+            True,
+            True,
+            True,
+            ["group", "children", "adopted"],
+            [1235, 22],
+            id="adopted-member-listed-once",
+        ),
+        pytest.param(
+            True,
+            False,
+            True,
+            True,
+            ["group", "children", "adopted"],
+            [1235, 22],
+            id="adopted-child-outlives-the-group",
+        ),
+        pytest.param(True, False, False, False, ["group", "children"], [], id="nothing-left"),
+    ],
+)
+def test_guardian_asks_about_adopted_children_after_the_group(
+    monkeypatch: pytest.MonkeyPatch,
+    adopts: bool,
+    group_alive: bool,
+    children_alive: bool,
+    expected: bool,
+    steps: list[str],
+    listed: list[int],
+) -> None:
+    """The group is checked first, then ``waitpid``; only a remaining child is listed by PID."""
+    seen: list[str] = []
+
+    def group_check(pgid: int, members: list[int] | None = None) -> bool:
+        seen.append("group")
+        if members is not None and group_alive:
+            members.append(1235)
+        return group_alive
+
+    def children_check() -> bool:
+        seen.append("children")
+        return children_alive
+
+    def adopted(root: int) -> list[int]:
+        seen.append("adopted")
+        return [1235, 22]
+
+    monkeypatch.setattr(supervisor, "_trainer_group_alive", group_check)
+    monkeypatch.setattr(supervisor, "_children_remain", children_check)
+    monkeypatch.setattr(supervisor, "_adopted_children", adopted)
+    members: list[int] = []
+
+    assert supervisor._trainer_alive(1234, members, adopts=adopts) is expected
+    assert seen == steps
+    assert members == listed
 
 
 def test_terminate_process_groups_shares_grace_across_groups(tmp_path: Path) -> None:
@@ -1597,7 +1624,7 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
     report.
     """
     terminated: list[int] = []
-    active = {1234: SimpleNamespace(pid=4321)}
+    active = {1234: _RegisteredGroup(SimpleNamespace(pid=4321), "trial")}
 
     monkeypatch.setattr("phasesweep.runtime.shutdown._active_children", active)
 
@@ -1607,7 +1634,7 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
         grace_seconds: float,
         guardians: Mapping[int, subprocess.Popen[bytes]],
     ) -> dict[int, bool]:
-        assert guardians == active
+        assert guardians == {1234: active[1234].guardian}
         terminated.extend(pgids)
         active.clear()
         return dict.fromkeys(pgids, True)
@@ -1626,7 +1653,8 @@ def test_shutdown_handler_reports_uncertain_when_group_termination_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "phasesweep.runtime.shutdown._active_children", {1234: SimpleNamespace(pid=4321)}
+        "phasesweep.runtime.shutdown._active_children",
+        {1234: _RegisteredGroup(SimpleNamespace(pid=4321), "trial")},
     )
     monkeypatch.setattr(
         "phasesweep.runtime.shutdown._terminate_process_groups",
@@ -1645,7 +1673,8 @@ def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The first shutdown signal owns cleanup evidence until its pass completes."""
-    active = {1234: SimpleNamespace(pid=4321), 5678: SimpleNamespace(pid=8765)}
+    active = {1234: _RegisteredGroup(SimpleNamespace(pid=4321), "trial")}
+    active[5678] = _RegisteredGroup(SimpleNamespace(pid=8765), "trial")
     terminated: list[int] = []
     reentered = False
 
@@ -1657,7 +1686,7 @@ def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
         grace_seconds: float,
         guardians: Mapping[int, subprocess.Popen[bytes]],
     ) -> dict[int, bool]:
-        assert guardians == active
+        assert guardians == {pgid: group.guardian for pgid, group in active.items()}
         nonlocal reentered
         terminated.extend(pgids)
         if not reentered:

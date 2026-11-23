@@ -47,6 +47,7 @@ from phasesweep.engine.state import (
     CLEANUP_RECOVERED_TRIALS_ATTR,
 )
 from phasesweep.mcp.errors import (
+    NEW_RUN_RESUMES,
     ExperimentBusyError,
     RunLaunchUnsettledError,
 )
@@ -108,7 +109,8 @@ def test_recovery_cli_renders_state_directory_remedy(tmp_path: Path) -> None:
     result = recover_run_cli(registry.state_dir, "refused-run", confirm=True)
 
     assert result.exit_code == 1
-    assert "use a fresh MCP state directory" in result.output
+    assert result.output.startswith("phasesweep: ")
+    assert f"format marker declares format {MCP_STATE_FORMAT_VERSION + 1}" in result.output
     assert f"fix: {FRESH_STATE_DIR_STEP}" in result.output
     assert "artifact root" not in result.output
     assert marker.read_bytes() == before
@@ -264,7 +266,7 @@ def test_operator_recovery_clears_abandoned_transactional_preparation(
         allow_cancel=True,
     )
     preparation = store.prepare_launch(pending, config.read_bytes())
-    with pytest.raises(RunLaunchUnsettledError, match="verified runner identity"):
+    with pytest.raises(RunLaunchUnsettledError, match="its runner identity"):
         app.cancel(run_id)
     log_path = store.log_path(run_id)
     recovered_log = log_path.with_suffix(".log.recovered")
@@ -307,7 +309,7 @@ def test_operator_recovery_clears_abandoned_transactional_preparation(
     preflight = recover_run_cli(registry.state_dir, run_id)
 
     assert preflight.exit_code == 0, preflight.output
-    assert "no runner can still start a trainer under this identity" in preflight.output
+    assert "would remove the abandoned launch preparation" in preflight.output
     if interrupted_recovery:
         assert f"Runner log already preserved at {recovered_log}." in preflight.output
     else:
@@ -569,10 +571,8 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
         "retryable": False,
         "actor": "operator",
         "remediation": (
-            "The runner ended with an earlier host boot, so no process from that boot "
-            "remains and no recover-run step is needed. This run recorded no results; a new "
-            "run of this experiment keeps its finished trials and reruns its interrupted ones "
-            "first."
+            "The runner ended with an earlier host boot, so no recover-run step is needed. "
+            f"This run recorded no results; {NEW_RUN_RESUMES}."
         ),
     }
     for payload in (status, awaited):
@@ -605,8 +605,9 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
 
     assert result.exit_code != 0
     assert "Another phasesweep process" in result.output
-    assert "Wait for the other PhaseSweep operation" in result.output
-    assert "then retry the same command" in result.output
+    assert "Wait for the process that holds this experiment's lock" in " ".join(
+        result.output.split()
+    )
     assert "only if the user wants it stopped" not in result.output
     assert "MCP cannot cancel a CLI operation" not in result.output
     assert "start a new run" not in result.output
@@ -695,9 +696,9 @@ def test_operator_recovery_keeps_unresolved_launch_reserved(
 
     assert result.exit_code != 0
     assert "launch outcome is unresolved" in result.output
-    assert "remains reserved" in result.output
-    assert "automated recovery cannot safely" in result.output
-    assert "retry the same operation" in result.output
+    assert "stays reserved" in result.output
+    assert "look for its runner on the host" in result.output
+    assert "fix: Retry once the reported blocker clears." in result.output
     assert "start a new run" not in result.output
     assert not store.cleanup_recovery_path(run_id).exists()
     assert not store.status_path(run_id).exists()
@@ -957,7 +958,7 @@ def test_tracking_receipt_of_another_generation_is_evidence_only_when_reported(
     refused = recover_run_cli(run.state_dir, run.handle.run_id, confirm=True)
 
     assert refused.exit_code != 0
-    assert "could not confirm any trial-level cleanup evidence" in refused.output
+    assert "found no trial-level cleanup evidence" in refused.output
     assert run.store.observe(run.handle).recovery_required
 
 
@@ -1030,7 +1031,7 @@ def test_damaged_tracking_receipt_is_not_cleanup_evidence(
 
     assert "Ignoring" in caplog.text
     assert refused.exit_code != 0
-    assert "could not confirm any trial-level cleanup evidence" in refused.output
+    assert "found no trial-level cleanup evidence" in refused.output
     assert run.store.observe(run.handle).recovery_required
 
 
@@ -1075,8 +1076,14 @@ def test_sync_tracking_leaves_the_originating_runs_recovery_evidence(
     if scope == "own_generation":
         assert sync_tracking(experiment, run_id)["pending"] == 0
     else:
-        with pytest.raises(TrackingSyncRefusedError, match="No tracking deliveries exist"):
+        with pytest.raises(
+            TrackingSyncRefusedError, match="No tracking deliveries exist"
+        ) as refused:
             sync_tracking(experiment, "other-generation")
+        assert refused.value.remediation == (
+            "Check --generation 'other-generation' and pass the `--set` overrides the run used; "
+            "an MCP run's ID is its generation ID."
+        )
 
     study = _load_first_phase_study(config_path)
     _recovered_tracking_run(
@@ -1213,7 +1220,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
         assert store.observe(handle).state == "failed"
     else:
         assert result.exit_code != 0
-        assert "could not confirm any trial-level cleanup evidence" in result.output
+        assert "found no trial-level cleanup evidence" in result.output
         assert not recovery_path.exists()
         assert store.observe(handle).state == "running"
         with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
@@ -1242,12 +1249,12 @@ def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_pa
 
     preflight = recover_run_cli(registry.state_dir, run_id)
     assert preflight.exit_code != 0
-    assert "cannot be rebuilt from the current shared study" in preflight.output
+    assert "cannot be rebuilt from the shared study" in preflight.output
     assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "failed"
 
     confirmed = recover_run_cli(registry.state_dir, run_id, confirm=True)
     assert confirmed.exit_code != 0
-    assert "cannot be rebuilt from the current shared study" in confirmed.output
+    assert "cannot be rebuilt from the shared study" in confirmed.output
     terminal = json.loads(store.status_path(run_id).read_text())
     assert terminal["result_snapshot_state"] == "failed"
     assert terminal["result_snapshot_error"] == "RuntimeError"
@@ -1301,7 +1308,7 @@ def test_registered_trial_recovery_counts_match_preflight_and_ledger(
     preflight = recover_run_cli(registry.state_dir, run_id)
 
     assert preflight.exit_code == 0, preflight.output
-    planned = "recover 1 cleanup-uncertain terminal trial" if terminal else "settle 1 stale trial"
+    planned = "recover 1 cleanup-uncertain trial" if terminal else "settle 1 stale trial"
     assert planned in preflight.output
     assert preflight.output.count(f"Attempt {attempt_id} phase=") == 1
     assert "training process group: recorded process group has exited" in preflight.output
@@ -1334,7 +1341,7 @@ def test_registered_trial_recovery_counts_match_preflight_and_ledger(
         pytest.param(
             write_uncertain_failed_trial,
             111,
-            "recover 1 cleanup-uncertain terminal trial",
+            "recover 1 cleanup-uncertain trial",
             "Cleared cleanup uncertainty",
             0,
             1,
@@ -1467,7 +1474,7 @@ def test_operator_recovery_clears_cleanup_uncertainty(
         # Cleanup is settled, but an absent historical snapshot remains an
         # explicit refusal; retry must not repeat process cleanup to repair it.
         assert repeat.exit_code == 1, repeat.output
-        assert "no immutable terminal result snapshot" in repeat.output
+        assert "no terminal result snapshot" in repeat.output
         assert "No further cleanup or result repair is available for this run" in repeat.output
         assert "inspect the PhaseSweep run log" not in repeat.output
     assert store.status_path(run_id).read_bytes() == final_status
@@ -1781,7 +1788,7 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
     replay = recover_run_cli(state_dir, second_run, confirm=True)
 
     assert replay.exit_code != 0
-    assert "could not confirm any trial-level cleanup evidence" in replay.output
+    assert "found no trial-level cleanup evidence" in replay.output
     assert not store.cleanup_recovery_path(second_run).exists()
     assert store.observe(second_handle).state == "running"
 
@@ -1885,7 +1892,7 @@ def test_operator_recovery_retry_clears_marker_after_terminal_only_recovery(
         pytest.param(
             b"",
             True,
-            "could not confirm any trial-level cleanup evidence",
+            "found no trial-level cleanup evidence",
             id="terminal-uncertainty-without-trial-evidence",
         ),
         pytest.param(

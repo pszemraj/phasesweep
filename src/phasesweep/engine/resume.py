@@ -13,11 +13,27 @@ import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.engine.errors import StudyContextConflictError, phase_timeout
+from phasesweep.engine.errors import PhaseTimeoutError, StudyContextConflictError, phase_timeout
 from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
+from phasesweep.errors import phase_names, rename_step
+from phasesweep.runtime.terminal import plural
+
+
+def _run_deadline_refusal(experiment: Experiment, phase_name: str) -> PhaseTimeoutError:
+    """Refuse a phase that the whole-run deadline passed before it could start.
+
+    :param Experiment experiment: Experiment whose storage decides the rerun step.
+    :param str phase_name: Phase the deadline reached before it started.
+    :return PhaseTimeoutError: The routed refusal, for the caller to raise.
+    """
+    return phase_timeout(
+        f"Run wallclock deadline reached before phase {phase_name!r} could start.",
+        scope="run",
+        experiment=experiment,
+    )
 
 
 def _preflight_skipped_winners(
@@ -70,11 +86,7 @@ def _preflight_skipped_winners(
         winners: dict[str, Winner] = {}
         for phase in experiment.phases:
             if run_deadline is not None and time.monotonic() >= run_deadline:
-                raise phase_timeout(
-                    f"Run wallclock deadline reached before phase {phase.name!r} could start.",
-                    scope="run",
-                    experiment=experiment,
-                )
+                raise _run_deadline_refusal(experiment, phase.name)
             if phase.name == from_phase:
                 break
             if phase.name not in required:
@@ -134,7 +146,7 @@ def _accept_skipped_winner(
     :raises WinnerIntegrityError: The winner is incompatible with the current
         partial-result policy.
     :raises StudyFingerprintMismatchError: The winner was produced by a
-        different phase config.
+        different config.
     :raises TrialEvidenceMissingError: The winner's source trial evidence is
         missing or changed.
     :return Winner: The accepted winner.
@@ -193,13 +205,46 @@ def _reject_bound_descendant_topups(
             and dependent.get_trials(deepcopy=False)
         ]
         if bound:
+            # The target is no part of a study's identity, so the enlarged phase keeps its
+            # trials; its dependents' studies hold trials bound to its old winner.
+            rename = rename_step(experiment.phases_inheriting(phase.name))
             raise StudyContextConflictError(
-                f"Phase {phase.name!r} has {phase.n_trials - finished} top-up trial(s) "
-                f"remaining, but dependent phase study/studies {bound} are already bound "
-                "to its published winner via inheritance. "
-                "Use a new experiment name to run the larger upstream budget without "
-                "mutating this completed phase chain."
+                f"Phase {phase.name!r} has {plural(phase.n_trials - finished, 'top-up trial')} "
+                f"remaining, but {plural(len(bound), 'dependent phase')} ({phase_names(bound)}) "
+                f"{'is' if len(bound) == 1 else 'are'} bound to its published winner.",
+                remediation=(
+                    f"{rename[0].upper()}{rename[1:]}; `{phase.name}` keeps its trials and runs "
+                    "the rest."
+                ),
             )
+
+
+def _preflight_missing_reached_phase_environments(
+    experiment: Experiment,
+    existing_studies: Mapping[str, object],
+    *,
+    from_phase: str | None,
+) -> None:
+    """Check that each reached phase with no durable study could start its trials.
+
+    A phase absent from an otherwise bound tree has no completed trial to replay, so it must
+    be able to launch before this invocation tops up an earlier phase. A run calls this before
+    its recovery and its dry run before its study checks, so both refuse it first. Existing
+    studies are checked after recovery
+    (:func:`phasesweep.engine.study_policy._reached_study_refusals`), which can tell new work
+    from an offline-safe no-op.
+
+    :param Experiment experiment: Parsed experiment supplying phase environments.
+    :param Mapping[str, object] existing_studies: Durable studies found under the lock, or in the
+        dry run's capture.
+    :param str | None from_phase: Optional first phase this invocation can execute.
+    :raises LaunchEnvironmentError: A missing reached phase has an invalid launch environment, a
+        missing trainer directory or a trial program its trainer cannot find; see
+        :func:`phasesweep.engine.study_policy._launch_preflight`.
+    """
+    for _index, phase in experiment.phases_from(from_phase):
+        if phase.name not in existing_studies:
+            study_policy_ops._launch_preflight(experiment, phase.name, None)
 
 
 def _reject_fixed_targets_without_study(
@@ -228,9 +273,7 @@ def _reject_fixed_targets_without_study(
     """
     for _index, phase in experiment.phases_from(from_phase):
         if phase.name not in existing_studies:
-            study_policy_ops._validate_fixed_configuration_target(
-                phase, finished=0, measured=0, has_study=False
-            )
+            study_policy_ops._validate_fixed_configuration_target(phase, finished=0, measured=0)
 
 
 def _preflight_reached_fingerprint(

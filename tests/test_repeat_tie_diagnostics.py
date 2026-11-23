@@ -1,4 +1,4 @@
-"""Repeat-group tie warnings show the measurements behind their noise comparison."""
+"""Repeat-group tie warnings state the gap and the pooled threshold behind their comparison."""
 
 from __future__ import annotations
 
@@ -22,11 +22,15 @@ from tests.conftest import log_regex_provenance, make_experiment
 
 
 @pytest.mark.parametrize("other_x", [1, 2])
-def test_repeat_tie_warning_names_params_gap_and_combined_standard_error(
+def test_repeat_tie_warning_names_the_group_gap_and_pooled_threshold(
     caplog: pytest.LogCaptureFixture,
     other_x: int,
 ) -> None:
-    """A near tie gives an interpretable comparison while distant groups stay out."""
+    """A near tie states its gap against the pooled threshold while distant groups stay out.
+
+    Variances 0.005, 0.005 and 0.00005 pool to sd 0.0578792 on 3 df, a threshold of
+    3.182446 * 0.0578792 = 0.184197 between two two-seed means.
+    """
     study = optuna.create_study(direction="minimize")
     for x, metrics in [(1, [0.5, 0.6]), (other_x, [0.52, 0.62]), (3, [0.9, 0.91])]:
         for seed, value in enumerate(metrics):
@@ -64,5 +68,7 @@ def test_repeat_tie_warning_names_params_gap_and_combined_standard_error(
         assert messages == []
         return
     (message,) = messages
-    assert "gap=0.02" in message and "combined_se=0.0707107" in message
-    assert "'x': 1" in message and f"'x': {other_x}" in message and "'x': 3" not in message
+    assert message.endswith(
+        "tie: 1 group is within noise of the winner, threshold 0.184197 (sd 0.0578792 pooled "
+        "over 3 groups, df 3): group 3 at gap 0.02"
+    )

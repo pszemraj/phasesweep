@@ -12,10 +12,11 @@ import pytest
 from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
+from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.artifacts import _load_winner
-from phasesweep.engine.errors import WinnerIntegrityError
+from phasesweep.engine.errors import WinnerIntegrityError, phase_timeout
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.read import read_status
@@ -24,7 +25,7 @@ from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import PHASE_DECISION_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
-from phasesweep.errors import PhaseSweepError
+from phasesweep.errors import ACCEPT_INCOMPLETE_STEP, PhaseSweepError
 from phasesweep.runtime.process import ProcessResult
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
@@ -32,6 +33,7 @@ from tests.conftest import (
     make_experiment,
     make_trial_context,
     phase_study,
+    phase_trials,
     write_constant_trainer,
     write_trainer,
     write_trial_zero_trainer,
@@ -127,11 +129,25 @@ def test_wallclock_timeout_refuses_incomplete_winner(tmp_path: Path, guard: str)
 
     with pytest.raises(
         TimeoutError,
-        match=r"timed out via phase guard .*Refusing to select a winner"
+        match=r"timed out via phase guard after 0/\d+ finished trials"
         if guard == "phase"
         else "run guard",
     ):
         run_experiment(exp)
+
+
+@pytest.mark.parametrize(
+    ("scope", "key"), [("run", "timeout_seconds_per_run"), (None, "timeout_seconds_per_phase")]
+)
+def test_the_timeout_step_names_the_key_and_not_where_it_was_set(
+    tmp_path: Path, scope: str | None, key: str
+) -> None:
+    """The step stays true for a budget that came from ``--set``: it names the key, not the config."""
+    exp = _sleeping_score_experiment(tmp_path, experiment="timeout_step")
+
+    refused = phase_timeout("deadline", scope=scope, experiment=exp)
+
+    assert (refused.remediation or "").startswith(f"Raise {key} and rerun; ")
 
 
 @pytest.mark.integration
@@ -150,7 +166,7 @@ def test_phase_timeout_preempts_active_trial(tmp_path: Path) -> None:
     started = time.monotonic()
     with pytest.raises(
         TimeoutError,
-        match=r"timed out via phase guard .*Refusing to select a winner",
+        match=r"timed out via phase guard after \d+/\d+ finished trials",
     ):
         run_experiment(exp)
     elapsed = time.monotonic() - started
@@ -195,13 +211,16 @@ def test_incomplete_timeout_winner_is_accepted_only_under_current_opt_in(tmp_pat
         timeout_seconds_per_phase=6.0,
         sleep_seconds=1.0,
     )
-    with pytest.raises(RuntimeError, match="incomplete phase result"):
+    with pytest.raises(
+        WinnerIntegrityError, match="records an incomplete result for skipped phase"
+    ) as refused:
         _load_winner(
             current,
             current.phases[0],
             {},
             publication=_published_for_resume(current),
         )
+    assert refused.value.remediation == ACCEPT_INCOMPLETE_STEP
 
 
 @pytest.mark.integration
@@ -234,8 +253,9 @@ def test_rerun_replays_an_accepted_partial_result_only_under_current_opt_in(
     strict = exp.model_copy(
         update={"phases": [exp.phases[0].model_copy(update={"allow_incomplete_on_timeout": False})]}
     )
-    with pytest.raises(WinnerIntegrityError, match="Refusing to replay it"):
+    with pytest.raises(WinnerIntegrityError, match="accepted an incomplete result at") as refused:
         run_experiment(strict)
+    assert refused.value.remediation == ACCEPT_INCOMPLETE_STEP
     assert len(load().trials) == trials_before
     assert load().user_attrs[PHASE_DECISION_ATTR] == decision_before
     assert _last_successful_generation_path(exp).read_text() == published_before
@@ -583,7 +603,7 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
         return executed
 
     monkeypatch.setattr(phase_mod, "launch_trial", launch_and_expire)
-    with pytest.raises(TimeoutError, match="Refusing to select a winner"):
+    with pytest.raises(TimeoutError, match="timed out via phase guard after 2/3 finished trials"):
         run_experiment(exp)
 
     study = optuna.load_study(
@@ -975,3 +995,50 @@ def test_timeout_remedy_matches_storage_and_budget(
     )
     assert failure["code"] == "timeout"
     assert failure["remediation"].startswith(f"Ask the operator: {remedy} ")
+
+
+@pytest.mark.integration
+def test_a_per_trial_timeout_abort_names_the_rename_that_the_raised_timeout_needs(
+    tmp_path: Path,
+) -> None:
+    """The supervisor's recorded timeout leads the abort advice, and that advice's rename runs."""
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json, time
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        time.sleep(1.5)
+        with open(args.out, "w") as f:
+            json.dump({"x": 1.0}, f)
+        print("x=1.0")
+        """,
+    )
+
+    def phase(name: str, timeout: float) -> Phase:
+        return Phase(
+            name=name,
+            n_trials=2,
+            max_consecutive_failures=2,
+            timeout_seconds_per_trial=timeout,
+            sampler=Sampler(type="random", seed=0),
+            search_space={"x": IntParam(type="int", low=0, high=10)},
+        )
+
+    short = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase("p", 0.5)])
+    with pytest.raises(NoFeasibleTrialError) as aborted:
+        run_experiment(short)
+    message = _operational_error_text(aborted.value)
+    assert message.index(
+        "For the timed-out trials, raise phases[p].timeout_seconds_per_trial and give `p` a new "
+        "`name`, which runs it again from scratch."
+    ) < message.index("For any other cause, fix it, then raise phases[p].n_trials")
+
+    raised = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase("p", 5.0)])
+    with pytest.raises(PhaseSweepError, match=r"phase\.timeout_seconds_per_trial: 0\.5 -> 5\.0"):
+        run_experiment(raised, dry_run=True)
+
+    renamed = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase("p2", 5.0)])
+    run_experiment(renamed)
+    assert [trial.state.name for trial in phase_trials(renamed, "p2")] == ["COMPLETE", "COMPLETE"]

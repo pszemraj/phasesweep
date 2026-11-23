@@ -286,20 +286,20 @@ def test_winner_view_projects_observed_values(tmp_path: Path) -> None:
     """The permissive reader carries observed values through and drops a malformed winner."""
     experiment, generation_id = golden_publication(tmp_path)
     winner = yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())
-    bare = _winner_view(winner, "p")
+    bare = _winner_view(winner, "p", persistent=True)
     assert bare is not None
     assert bare.observed == {}
 
     winner["observed"] = {"peak": 7.5}
-    reported = _winner_view(winner, "p")
+    reported = _winner_view(winner, "p", persistent=True)
     assert reported is not None
     assert reported.observed == {"peak": 7.5}
 
     for invalid in (float("inf"), 10**400):
         winner["observed"] = {"peak": invalid}
-        assert _winner_view(winner, "p") is None
+        assert _winner_view(winner, "p", persistent=True) is None
     del winner["observed"]
-    assert _winner_view(winner, "p") is None
+    assert _winner_view(winner, "p", persistent=True) is None
 
 
 def test_manifest_accepts_a_well_formed_observed_block(tmp_path: Path) -> None:

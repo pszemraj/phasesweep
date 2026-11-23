@@ -190,7 +190,7 @@ def test_concurrency_limit_error_bounds_actionable_run_ids() -> None:
         assert repr(run_id) not in message
     assert "2 more active" in message
     assert "await_run" in message
-    assert "only after that run is terminal" in message
+    assert "launch again once it is terminal" in message
 
 
 @pytest.mark.parametrize("recovery_required", [False, True], ids=["healthy", "needs-recovery"])
@@ -228,7 +228,7 @@ def test_capacity_refusal_guidance_matches_the_blocking_run(
     else:
         assert "await_run" in message
         if launch_target == "next":
-            assert "only after that run is terminal" in message
+            assert "launch again once it is terminal" in message
 
 
 @pytest.mark.parametrize("stale", [False, True], ids=["fresh-heartbeat", "stale-heartbeat"])
@@ -238,7 +238,7 @@ def test_capacity_refusal_qualifies_unobservable_runner_liveness(
 ) -> None:
     """A hidden runner keeps its reservation without a false claim that it is alive or dead.
 
-    A stale heartbeat sends the operator to recover it from a host shell, and still
+    A stale heartbeat sends the operator to recover it outside any sandbox, and still
     leaves the run holding its slot.
     """
     blocked_config = write_srv_config(tmp_path, name="blocking")
@@ -273,11 +273,11 @@ def test_capacity_refusal_qualifies_unobservable_runner_liveness(
 
     message = str(refused.value)
     assert handle.run_id in message
-    assert "host shell" in message
+    assert "outside any sandbox" in message
     if stale:
         assert "recover-run" in message
         assert "await_run" not in message
-        assert "Monitor durable progress" not in message
+        assert "progress" not in message
     else:
         assert "cannot verify" in message
         assert "progress" in message
@@ -336,8 +336,7 @@ def test_resume_requires_prior_winner(tmp_path: Path) -> None:
     with pytest.raises(ResumeNotReadyError, match="earlier phase 'p' has no winner yet") as excinfo:
         app.launch("srv", from_phase="q")
 
-    assert "get_latest_run('srv') first" in str(excinfo.value)
-    assert "get_run_results with its run_id" in str(excinfo.value)
+    assert "call get_latest_run('srv'), then get_run_results with its run_id" in str(excinfo.value)
 
 
 @pytest.mark.parametrize(
@@ -473,9 +472,9 @@ def test_capacity_refusal_notes_runs_files_only_for_the_records_it_lists() -> No
     listed_file = str(RunCapacityUnknownError({"run:a-0", "handle:zz bad.json"}))
 
     assert "and 2 more" in unlisted_file
-    assert "moves out as it is" not in unlisted_file
+    assert "move a listed `runs/` file as it is" not in unlisted_file
     assert "`runs/zz bad.json`" in listed_file
-    assert "; a listed `runs/` file moves out as it is" in listed_file
+    assert "; move a listed `runs/` file as it is" in listed_file
 
 
 @pytest.mark.parametrize(
@@ -512,21 +511,17 @@ def test_launch_names_unreadable_run_records_and_passes_once_they_are_moved_away
         app.launch("srv")
 
     message = str(refused.value)
-    assert "cannot prove available launch capacity because the MCP state contains 1 unreadable" in (
-        message
-    )
+    assert "cannot prove launch capacity: the MCP state has 1 unreadable or orphaned" in message
     assert f"Unreadable or orphaned: {listed}." in message
     # A trial carries the run id in its arguments only when its command uses {trial_dir}, and
     # the listing by environment prints PIDs alone, never the environment it matched.
     assert (
-        "For each run id, ask the operator to run, on the server host as the server's user, "
-        "`pgrep -af <run-id>`, which lists the run's runner, and "
-        "`ps axeww | awk '/[P]HASESWEEP_GENERATION_ID=<run-id>/ {print $1}'`, which prints the "
-        "PID of each of its trials, found by environment, wait for every listed process to "
-        "exit, or stop it, and move `runs/<run-id>.json` and `logs/<run-id>.*` out of the state "
-        "directory only once both print nothing"
+        "For each run id, ask the operator, on the server host as the server's user, to wait "
+        "for or stop every process that `pgrep -af <run-id>` (its runner) and "
+        "`ps axeww | awk '/[P]HASESWEEP_GENERATION_ID=<run-id>/ {print $1}'` (its trials) "
+        "list, then move `runs/<run-id>.json` and `logs/<run-id>.*` out of the state directory"
     ) in message
-    assert ("a listed `runs/` file moves out as it is" in message) is (run_id is None)
+    assert ("move a listed `runs/` file as it is" in message) is (run_id is None)
     assert "inspect and repair" not in message
     assert "cmd" not in captured
     assert store.list_handles() == []
@@ -737,8 +732,8 @@ def test_launch_retains_recoverable_lease_when_failure_status_cannot_persist(
     assert store.is_pre_spawn_orphan(pending.run_id)
     latest = app.latest_run("srv")["run"]
     assert latest["recovery_required"] is True
-    assert "The next permitted launch clears this preparation" in latest["failure"]["remediation"]
-    assert "without launching" in latest["failure"]["remediation"]
+    assert "never recorded whether its runner started" in latest["failure"]["remediation"]
+    assert "mcp recover-run" in latest["failure"]["remediation"]
 
     patch_popen_capture(monkeypatch)
     assert app.launch("srv")["state"] == "running"
@@ -960,11 +955,18 @@ def test_missing_runner_receipt_fails_without_reserving_retry_capacity(
             raise subprocess.TimeoutExpired("runner", timeout or 0.0)
 
     monkeypatch.setattr(mcp_tools.subprocess, "Popen", lambda *_args, **_kwargs: UnreadyProc())
-    monkeypatch.setattr(mcp_tools, "kill_stale_group", lambda *_args, **_kwargs: True)
+    stopped: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        mcp_tools, "kill_stale_group", lambda *_args, **kwargs: stopped.append(kwargs) or True
+    )
 
     with pytest.raises(RuntimeError, match="did not persist its launch receipt"):
         app.launch("srv")
 
+    # The runner may be waiting on its guardians, so it gets the grace cancel_run gives.
+    assert [kwargs.get("grace_seconds") for kwargs in stopped] == [
+        mcp_runs.RUNNER_STOP_GRACE_SECONDS
+    ]
     (failed,) = store.list_handles()
     assert store.observe(failed).state == "failed"
     assert not store.launch_lease_path(failed.run_id).exists()
@@ -1312,7 +1314,7 @@ def test_runner_that_exits_before_its_receipt_names_its_exit_code(
 
     (run_id,) = run_ids
     message = str(caught.value)
-    assert f"this run's log, `logs/{run_id}.log` under the catalog's `state_dir`" in message
+    assert f"`logs/{run_id}.log` under the catalog's `state_dir`" in message
     assert str(tmp_path) not in message
     terminal = json.loads(store.status_path(run_id).read_text())
     assert terminal["returncode"] == 1

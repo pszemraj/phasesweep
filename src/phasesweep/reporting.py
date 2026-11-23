@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from phasesweep.runtime.files import atomic_write_text
-from phasesweep.runtime.json import nonempty_text, progress_position
+from phasesweep.runtime.json import finite_nonnegative, nonempty_text
 
 _IDENTITY_ENV = (
     "PHASESWEEP_GENERATION_ID",
@@ -84,7 +84,7 @@ def _progress_values(progress: Mapping[str, Any]) -> dict[str, int | float]:
                 f"progress names must be nonempty and not 'step' (the envelope's own "
                 f"step), got {axis!r}."
             )
-        number = progress_position(_json_number(position))
+        number = finite_nonnegative(_json_number(position))
         if number is None:
             raise ValueError(
                 f"progress[{axis!r}] must be a finite non-negative number, got {position!r}."

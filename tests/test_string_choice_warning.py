@@ -14,10 +14,8 @@ from phasesweep.cli import cli as cli_main
 
 _STRING_CHOICES_WARNING = (
     "Phase 'wd_sweep': search_space 'lr' has categorical choices that load as strings, not "
-    "numbers: '1e-4', '3e-4', '1e-3', '3e-3'. YAML 1.1 leaves an exponent without a decimal "
-    "point and sign as text (so does a quoted number), and the trainer receives a string. "
-    "Write 1e-4 as 1.0e-4 or 0.0001, and the rest likewise, or ignore this if the strings "
-    "are intended."
+    "numbers: '1e-4', '3e-4', '1e-3', '3e-3' (YAML 1.1 reads an exponent without a decimal "
+    "point and sign as text). Write 1e-4 as 1.0e-4 or 0.0001, and the rest likewise."
 )
 
 

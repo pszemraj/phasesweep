@@ -48,7 +48,6 @@ from phasesweep.engine.selection import (
     PhaseTrialsFailedError,
 )
 from phasesweep.engine.state import (
-    ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     DURATION_ATTR,
@@ -59,7 +58,6 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
-    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
@@ -319,7 +317,7 @@ def test_stale_trial_holding_last_grid_point_recovers(tmp_path: Path) -> None:
     study._storage.set_trial_system_attr(stale._trial_id, "grid_id", 0)
     stale = study.get_trials(deepcopy=False)[stale_number]
 
-    _fail_stale_running_trial(study, stale, failure_message="stale grid trial")
+    _fail_stale_running_trial(study, stale, where="stale grid trial")
 
     assert study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
 
@@ -587,7 +585,7 @@ def test_terminal_callback_reports_success_evidence(
         validated_environments.append(phase_name)
         return _launch_preflight(_experiment, phase_name, study)
 
-    monkeypatch.setattr("phasesweep.engine.run._launch_preflight", validate_environment)
+    monkeypatch.setattr("phasesweep.engine.study_policy._launch_preflight", validate_environment)
 
     def preflight(_ledger, *, cleanup_report, from_phase):
         del from_phase
@@ -844,29 +842,6 @@ def test_abort_after_gpu_acquire_prevents_queued_trials(
         f"got {len(launched)}. Launched: {[d.name for d in launched]}. "
         "Queued threads ignored the post-acquire abort flag."
     )
-
-
-def test_optuna_logging_verbosity_tracks_cli_verbose_flag() -> None:
-    """Default CLI output quiets Optuna; ``-v`` restores Optuna INFO logs."""
-    from phasesweep.cli import _configure_logging
-
-    cases = [
-        ("default_quiet", optuna.logging.INFO, False, optuna.logging.ERROR),
-        ("verbose", optuna.logging.WARNING, True, optuna.logging.INFO),
-    ]
-
-    # Logging state is process-global, and pytest's capture handlers sit on the root logger.
-    root, saved_verbosity = logging.getLogger(), optuna.logging.get_verbosity()
-    saved_handlers, saved_level = root.handlers[:], root.level
-    try:
-        for case, initial, verbose, expected in cases:
-            optuna.logging.set_verbosity(initial)
-            _configure_logging(verbose=verbose)
-            assert optuna.logging.get_verbosity() == expected, case
-    finally:
-        optuna.logging.set_verbosity(saved_verbosity)
-        root.handlers[:] = saved_handlers
-        root.setLevel(saved_level)
 
 
 def test_runtime_platform_gate_refuses_an_unsupported_host_but_not_dry_run(
@@ -1203,7 +1178,7 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
         TRIAL_OUTCOME_ATTR,
         "injected outcome write failure",
     )
-    with pytest.raises(StudyStorageUnavailableError, match="deliberately left RUNNING"):
+    with pytest.raises(StudyStorageUnavailableError, match="The trial stays RUNNING"):
         run_experiment(exp)
 
     trials = phase_trials(exp)
@@ -1273,7 +1248,7 @@ def test_parallel_outcome_write_failure_surfaces_without_orphan_terminal_rows(
         TRIAL_OUTCOME_ATTR,
         "injected outcome write failure",
     )
-    with pytest.raises(StudyStorageUnavailableError, match="deliberately left RUNNING"):
+    with pytest.raises(StudyStorageUnavailableError, match="The trial stays RUNNING"):
         run_experiment(exp)
 
     trials = phase_trials(exp)
@@ -1327,9 +1302,9 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         if calls["n"] == 2:
             result.cleanup_confirmed = False
             # ``real_run_supervised`` already observed a clean exit before this
-            # fault injection. Restore the durable pre-exit shape a genuinely
-            # unconfirmed cleanup leaves behind so preflight must consult the
-            # process identity and our cleanup verdict.
+            # fault injection. Restore a durable pre-exit shape: with an identity,
+            # preflight must consult it and our cleanup verdict; without one, the
+            # identity write failed before any payload crossed.
             trial_dir = Path(str(kwargs["trial_dir"]))
             write_attempt_lifecycle(
                 trial_dir,
@@ -1373,6 +1348,16 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         assert unsafe_trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
     else:
         assert CLEANUP_CONFIRMED_ATTR not in unsafe_trial.user_attrs
+    if not identity_persists:
+        # No trainer received its payload, so the run's own reconciliation settles the
+        # launch without a cleanup verdict and only the recorded abort remains.
+        assert list(_attempts_dir(_exp(2)).glob("*.json")) == []
+        assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [unsafe_trial.number]
+        with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
+            run_experiment(_exp(2))
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(_exp(3))
+        return
     assert list(_attempts_dir(_exp(2)).glob("*.json"))
 
     # A preview cannot confirm cleanup, so it names the recovery that retires the abort.
@@ -1380,19 +1365,17 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         run_experiment(_exp(2), dry_run=True)
     message = _operational_error_text(previewed.value)
     assert "cleanup could not be confirmed" in message
-    assert "A larger n_trials does not retire this abort" in message
+    assert "First confirm the cleanup:" in message
     assert "phasesweep run" in message and "phasesweep mcp recover-run" in message
-    assert "Then raise phases[p].n_trials above 2 in the config" in message
-    assert "Raising n_trials does not change the study fingerprint." in message
-    assert "The recorded trial results stay in the study." in message
+    assert "Then raise phases[p].n_trials above 2" in message
     # A preview of the larger target refuses the same way, as the live run below does,
     # and asks only for the cleanup that target still waits on.
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as raised:
         run_experiment(_exp(3), dry_run=True)
     message = _operational_error_text(raised.value)
-    assert "A larger n_trials does not retire" in message
+    assert "First confirm the cleanup:" in message
     assert "phasesweep mcp recover-run" in message
-    assert "Then n_trials=3 retires it." in message
+    assert "Then n_trials=3 retires the abort." in message
 
     # A larger target is not cleanup authority and launches no new trial.
     before = len(study.trials)
@@ -1406,19 +1389,11 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     # Positive cleanup is durably consumed before the registry is retired and
     # the ordinary fatal-abort top-up path becomes available.
     cleanup_safe["value"] = True
-    if not identity_persists:
-        write_attempt_lifecycle(
-            Path(str(unsafe_trial.user_attrs[TRIAL_DIR_ATTR])),
-            attempt_id=str(unsafe_trial.user_attrs[ATTEMPT_ID_ATTR]),
-            state="exited",
-            return_code=0,
-            cleanup_confirmed=True,
-        )
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", real_run_supervised)
     # Once the preflight has confirmed cleanup, only the target is left to raise.
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as confirmed:
         run_experiment(_exp(2))
-    assert "phases[p].n_trials above 2 in the config" in _operational_error_text(confirmed.value)
+    assert "phases[p].n_trials above 2" in _operational_error_text(confirmed.value)
     assert "mcp recover-run" not in _operational_error_text(confirmed.value)
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_exp(3))

@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import re
+import signal
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -31,6 +32,7 @@ from phasesweep.engine.state import (
     DURATION_ATTR,
     FEASIBLE_ATTR,
     GATES_ATTR,
+    METRIC_EXTRACTOR_LABEL,
     OBJECTIVE_PROVENANCE_ATTR,
     OBSERVED_PREFIX,
     OVERRIDES_ATTR,
@@ -346,11 +348,9 @@ def _warn_dropped_cuda_visibility(
     _warn_once(
         log,
         ("dropped-cuda-visibility", experiment.experiment, phase_name, ambient),
-        "[%s] ambient CUDA_VISIBLE_DEVICES=%r is outside the "
-        "execution.inherit_env=%r contract and this phase leases no device, so trials "
-        "will see every host GPU and hold no GPU host lock. Set a top-level "
-        "env.CUDA_VISIBLE_DEVICES to bind trainer visibility — it is fingerprinted and "
-        "also drives GPU pool discovery, so lock set and trainer visibility stay in step.",
+        "[%s] ambient CUDA_VISIBLE_DEVICES=%r is dropped by execution.inherit_env=%r and "
+        "this phase leases no device, so trials see every host GPU. Set a top-level "
+        "env.CUDA_VISIBLE_DEVICES to bind them.",
         phase_name,
         ambient,
         experiment.execution.inherit_env,
@@ -403,6 +403,58 @@ def _stderr_last_line(trial_dir: Path) -> str | None:
     return None
 
 
+#: Appended to a SIGKILL reason: the signal has many senders, so it only says where to look.
+_OOM_KILLER_CLAUSE = "the kernel's out-of-memory killer is a common sender"
+
+
+def _shell_reported_signal(return_code: int) -> signal.Signals | None:
+    """Read a return code as a shell's ``128 + N`` report of a command killed by signal ``N``.
+
+    The trial command runs under ``/bin/sh -c``, and a shell that does not exec its
+    command survives the command's death and exits with that code. A trainer may also
+    exit with such a code on purpose, so a caller words the reading as a report. Only the
+    standard signals 1 to 31 count: Python names just the first and last real-time signals,
+    so reading further would call 162 and 192 signal deaths and the codes between them not.
+
+    :param int return_code: Trainer return code.
+    :return signal.Signals | None: The signal ``return_code - 128`` names, or ``None`` when
+        the code is outside 129 to 159 or that number is no signal on this host.
+    """
+    if not 129 <= return_code <= 159:
+        return None
+    try:
+        return signal.Signals(return_code - 128)
+    except ValueError:
+        return None
+
+
+def _nonzero_exit_reason(return_code: int) -> str:
+    """Name how a trainer ended abnormally, reading signal deaths as such.
+
+    :param int return_code: Nonzero trainer return code. A negative value is ``-N`` for a
+        process killed by signal ``N``, which is how the trial shell reports its own death.
+        A value from 129 to 159 naming a signal is the shell's report of its command's death.
+    :return str: The failure reason without any stderr quote.
+    """
+    if return_code < 0:
+        try:
+            killer = signal.Signals(-return_code)
+        except ValueError:
+            return f"killed by signal {-return_code}"
+        reason = f"killed by signal {killer.value} ({killer.name})"
+    elif (reported := _shell_reported_signal(return_code)) is not None:
+        killer = reported
+        reason = (
+            f"non-zero exit code {return_code}: the shell's report of a command "
+            f"killed by {reported.name}"
+        )
+    else:
+        return f"non-zero exit code {return_code}"
+    if killer == signal.SIGKILL:
+        reason += f"; {_OOM_KILLER_CLAUSE}"
+    return reason
+
+
 def _warn_narrowed_environment_exit(
     *,
     experiment: Experiment,
@@ -430,17 +482,15 @@ def _warn_narrowed_environment_exit(
         log,
         ("narrowed-environment-exit", experiment.experiment, phase_name),
         "[%s/trial_%d] the trainer exited with code %d under execution.inherit_env=%r, "
-        "so it received only %s plus env and passthrough_env values. If it needs another "
-        "ambient variable (PYTHONPATH, a virtualenv or conda setting, a cache path, a "
-        "credential), name it in execution.inherit_env: [NAME], set it under env:, or set "
-        "execution.inherit_env: all.%s The trainer's own error is in stderr.log in the "
-        "trial directory. This hint is shown once per phase.",
+        "so it received only %s plus env and passthrough_env values.%s If it needs another "
+        "ambient variable, name it in execution.inherit_env: [NAME]; see `phasesweep "
+        "explain execution.inherit_env`.",
         phase_name,
         trial_id,
         return_code,
         experiment.execution.inherit_env,
         ", ".join(admitted),
-        "" if stderr_line is None else f' Its last stderr line was "{stderr_line}".',
+        "" if stderr_line is None else f' Last stderr line: "{stderr_line}".',
     )
 
 
@@ -456,12 +506,9 @@ def _warn_managed_objective_missing(
     _warn_once(
         log,
         ("mlflow-objective-missing", experiment.experiment, phase_name),
-        "[%s/trial_%d] the managed MLflow run finished without the objective metric. Check "
-        "whether the objective was logged under another key or logging went to another run. "
-        "Log the configured metric key into the supplied run; after end_run() or another "
-        "start_run(), resume its saved ID. Give a logger the supplied run ID: read "
-        "MLFLOW_RUN_ID before any MLflow call, or use mlflow.active_run().info.run_id while "
-        "the run is active. This hint is shown once per phase.",
+        "[%s/trial_%d] the managed MLflow run finished without the objective metric. Log the "
+        "configured metric key into the run PhaseSweep supplies (MLFLOW_RUN_ID); see "
+        "`phasesweep explain mlflow.run_mode`.",
         phase_name,
         trial_id,
     )
@@ -677,9 +724,9 @@ def launch_trial(
         env["WANDB_RUN_ID"] = attempt_id
     if experiment.mlflow is not None:
         from phasesweep.runtime.json import json_text
-        from phasesweep.tracking.session import read_binding, read_record
+        from phasesweep.tracking.session import EXPECTED_BINDING_FILE, read_binding, read_record
 
-        expected = read_record(workdir / "mlflow-expected.json")
+        expected = read_record(workdir / EXPECTED_BINDING_FILE)
         env.pop("MLFLOW_EXPERIMENT_NAME", None)
         env["MLFLOW_EXPERIMENT_ID"] = json_text(expected, "experiment_id")
         if experiment.mlflow.run_mode == "managed":
@@ -803,24 +850,26 @@ def extract_trial_result(
             rc=rc,
             duration=duration,
             failure_reason=(
-                f"phase/run wallclock deadline exceeded before {stage}; the trainer "
-                "finished but its evidence could not be evaluated within the budget"
+                f"phase/run wallclock deadline exceeded before {stage}; the trainer finished"
             ),
             deadline_exhausted=True,
         )
 
     if rc != 0 and failure_reason is None:
         stderr_line = _stderr_last_line(executed.ctx.trial_dir)
-        failure_reason = f"non-zero exit code {rc}"
+        failure_reason = _nonzero_exit_reason(rc)
         if stderr_line is not None:
             failure_reason += f"; stderr: {stderr_line}"
-        _warn_narrowed_environment_exit(
-            experiment=experiment,
-            phase_name=executed.ctx.phase,
-            trial_id=executed.ctx.trial_id,
-            return_code=rc,
-            stderr_line=stderr_line,
-        )
+        # A signal death is not a missing-environment failure: the trainer never chose
+        # to exit, so the inheritance hint would send the operator the wrong way.
+        if rc > 0 and _shell_reported_signal(rc) is None:
+            _warn_narrowed_environment_exit(
+                experiment=experiment,
+                phase_name=executed.ctx.phase,
+                trial_id=executed.ctx.trial_id,
+                return_code=rc,
+                stderr_line=stderr_line,
+            )
 
     if failure_reason is not None:
         return _failed_trial(
@@ -859,7 +908,10 @@ def extract_trial_result(
         except ExtractorError as exc:
             exhausted = isinstance(exc, DeadlineExceededError)
             unreadable = isinstance(exc, EvidenceUnreadableError)
-            log.warning(
+            # A failed trial prints the same cause as its ``reason:``; only a trial left
+            # pending by an unreadable tracker has no progress line to carry it.
+            log.log(
+                logging.WARNING if unreadable else logging.INFO,
                 "[%s/trial_%d] %s extraction %s: %s",
                 executed.ctx.phase,
                 executed.ctx.trial_id,
@@ -888,7 +940,8 @@ def extract_trial_result(
                 evidence_unreadable=unreadable,
             )
         if not math.isfinite(value):
-            log.warning(
+            # The failed trial's ``reason:`` says the same on the console.
+            log.info(
                 "[%s/trial_%d] %s returned non-finite value: %r",
                 executed.ctx.phase,
                 executed.ctx.trial_id,
@@ -905,7 +958,7 @@ def extract_trial_result(
 
     metric_value = extract_required(
         experiment.metric.extractor,
-        label="metric extractor",
+        label=METRIC_EXTRACTOR_LABEL,
         log_label="metric",
         provenance=objective_provenance,
     )
@@ -936,7 +989,11 @@ def extract_trial_result(
     failed_gates = [gate for gate in gate_results if not gate.passed]
     if failed_gates:
         detail = "; ".join(gate.detail for gate in failed_gates)
-        log.warning(
+        unreadable = all(gate.evidence_unreadable for gate in failed_gates)
+        # As for an extractor: only a trial left pending by an unreadable tracker lacks a
+        # progress line that carries the failure.
+        log.log(
+            logging.WARNING if unreadable else logging.INFO,
             "[%s/trial_%d] evidence gate(s) failed: %s",
             executed.ctx.phase,
             executed.ctx.trial_id,
@@ -951,7 +1008,7 @@ def extract_trial_result(
             gate_results=gate_results,
             deadline_exhausted=any(gate.deadline_exhausted for gate in failed_gates),
             # A definite gate failure fails the trial whatever the tracker would answer.
-            evidence_unreadable=all(gate.evidence_unreadable for gate in failed_gates),
+            evidence_unreadable=unreadable,
         )
 
     expired = _deadline_failure("the trial result could be accepted")

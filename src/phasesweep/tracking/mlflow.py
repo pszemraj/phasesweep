@@ -308,8 +308,8 @@ def require_mlflow_sdk() -> None:
         from phasesweep.errors import OperatorAction, PhaseSweepError
 
         raise PhaseSweepError(
-            "MLflow tracking requires the optional SDK in the PhaseSweep environment. "
-            'Install this distribution with its mlflow extra: pip install "phasesweep[mlflow]".',
+            "The MLflow SDK is not installed in the PhaseSweep environment: "
+            'pip install "phasesweep[mlflow]".',
             action=OperatorAction.FIX_CONFIG,
         )
 
@@ -569,7 +569,7 @@ def _create(client: _SdkClient, request: CreateRequest) -> RunBinding:
         if not created:
             raise
         raise OperationOutcomeUnknownError(
-            f"MLflow created a run that failed verification ({exc}); it is not bound."
+            f"MLflow created a run that failed verification ({str(exc).rstrip('.')}); it is not bound."
         ) from exc
     return binding
 
@@ -905,12 +905,10 @@ def main(argv: list[str] | None = None) -> int:
         failure: BaseException | None = exc
         while failure is not None and not isinstance(failure, ConnectionRefusedError):
             failure = failure.__cause__ or failure.__context__
+        advice: str | None
         if isinstance(failure, ConnectionRefusedError):
             cause = _failure_cause(failure)
-            advice = (
-                "the tracking server refused the connection; check tracking_uri "
-                "and that the server is running"
-            )
+            advice = "check tracking_uri"
         elif code in {"RESOURCE_DOES_NOT_EXIST", "NOT_FOUND", 404}:
             advice = "the experiment or run no longer exists"
         elif code in {"INVALID_PARAMETER_VALUE", 400}:
@@ -920,7 +918,7 @@ def main(argv: list[str] | None = None) -> int:
                 else "MLflow rejected a logged name or value"
             )
         else:
-            advice = "check tracking access and credentials"
+            advice = None
         # A refused connection, a request that got no response, or a server error that is not
         # a verdict on the experiment, run or value leaves the request unanswered.
         unanswered = (
@@ -930,7 +928,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         response = {
             "status": "unavailable" if unanswered else "error",
-            "message": f"MLflow {request['action']} failed ({cause}); {advice}.",
+            "message": f"MLflow {request['action']} failed ({cause})"
+            + (f"; {advice}." if advice else "."),
         }
     private_atomic_write_text(args.response, json.dumps(response, allow_nan=False))
     return 0

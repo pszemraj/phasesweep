@@ -75,6 +75,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import EnvironmentIdentity
 from phasesweep.errors import (
+    ACCEPT_INCOMPLETE_STEP,
     OTHER_FORMAT_STEP,
     ForeignPidNamespaceError,
     OperatorAction,
@@ -103,6 +104,7 @@ from tests.conftest import (
     make_experiment,
     patch_published_trial_read_failure,
     phase_study,
+    reaped_pid,
     record_accepted_partial_timeout,
     requires_nonroot,
     trial_outcome,
@@ -586,7 +588,7 @@ WRAP_CASES = (
         trigger=_run_while_discovery_fails,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Artifact ownership could not be checked because required persistent",
+        message="Could not check artifact ownership: Could not inspect persistent study",
         cause=StudyStorageUnavailableError,
     ),
     RoutingCase(
@@ -866,12 +868,11 @@ def test_unusable_attempt_entry_gets_the_process_check_and_the_deletion(
 
     error = excinfo.value
     assert f"registry entry {entries[0]} " in str(error)
-    assert "Recovery cannot prove whether a process from this attempt is still alive." in str(error)
     assert error.remediation is not None
-    assert error.remediation.startswith("Look up pgid in the process_identity.json")
+    assert error.remediation.startswith("Read pgid from the process_identity.json")
     assert (
-        "on the host or in the container the sweep ran in, list that process group's members "
-        "with `pgrep -a -g <pgid>`; once it lists none, delete the entry file."
+        "run `pgrep -a -g <pgid>` on the host or in the container the sweep ran in; once it "
+        "lists none, delete the entry file."
     ) in error.remediation
     assert error.remediation.endswith("delete the entry file.")
     assert error.remediation not in str(error)
@@ -1005,7 +1006,12 @@ _UNCONFIRMED_CLEANUP = ("unsafe_process_cleanup", "trial cleanup could not be co
 
 
 def _preview_unconfirmed_cleanup_abort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Preview a phase whose unsafe-cleanup abort no cleanup recovery has retired."""
+    """Preview a phase whose unsafe-cleanup abort no cleanup recovery has retired.
+
+    The raised target needs new trials, so the preview applies the cohort check a launch
+    applies first, which passes only from the fixture's pinned environment.
+    """
+    pin_fixture_environment(monkeypatch)
     experiment, phase = _record_fatal_abort(
         tmp_path, *_UNCONFIRMED_CLEANUP, {CLEANUP_CONFIRMED_ATTR: False}
     )
@@ -1161,6 +1167,8 @@ def _clean_trial_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.Monk
             proc_starttime=111,
             boot_id="boot",
             pid_namespace="pid:[4026539001]@100",
+            guardian_pid=reaped_pid(),
+            guardian_starttime=1,
         )
     )
 
@@ -1196,7 +1204,7 @@ ORIGIN_CASES = (
         trigger=_claim_after_unlocked_bind,
         raised=ArtifactRootConflictError,
         action=OperatorAction.INSPECT_LOGS,
-        message="Stop that process before retrying.",
+        message="without the experiment lock; stop it and retry.",
     ),
     RoutingCase(
         id="registry_terminal_identity_missing",
@@ -1210,7 +1218,7 @@ ORIGIN_CASES = (
         trigger=_inspect_uncertain(TRIAL_DIR_ATTR),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Process identity is unknown.",
+        message="'phasesweep_attempt_id' user attribute is missing or invalid",
     ),
     RoutingCase(
         # Either the ledger or the tree may be the side that changed.
@@ -1246,7 +1254,7 @@ ORIGIN_CASES = (
         trigger=_lock_dir_override_missing,
         raised=UnsafeLockPathError,
         action=OperatorAction.PROVISION_LOCK_DIR,
-        message="does not exist; provision it before setting PHASESWEEP_LOCK_DIR",
+        message="does not exist.",
     ),
     RoutingCase(
         id="lock_file_access_refused",
@@ -1281,7 +1289,7 @@ ORIGIN_CASES = (
         trigger=_scan_registry(damage=_entry_garbled),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
-        message="is unreadable or malformed.",
+        message="is unreadable or malformed:",
     ),
     RoutingCase(
         id="registry_entry_partial_schema",
@@ -1328,14 +1336,14 @@ ORIGIN_CASES = (
         trigger=_reap_trial_with_invalid_trial_dir,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="invalid persisted 'phasesweep_trial_dir'",
+        message="'phasesweep_trial_dir' user attribute is missing or invalid",
     ),
     RoutingCase(
         id="running_trial_attempt_missing",
         trigger=_reap_trial_without_attempt,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Process identity is unknown.",
+        message="'phasesweep_attempt_id' user attribute is missing or invalid",
     ),
     RoutingCase(
         # The same split as uncertain_trial_identity_files_mismatch.
@@ -1350,14 +1358,14 @@ ORIGIN_CASES = (
         trigger=_inspect_uncertain(ATTEMPT_ID_ATTR),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="missing or invalid 'phasesweep_trial_dir'",
+        message="'phasesweep_trial_dir' user attribute is missing or invalid",
     ),
     RoutingCase(
         id="prior_phase_abort",
         trigger=_rerun_aborted_phase,
         raised=PhaseAbortRefusedError,
         action=OperatorAction.FIX_CONFIG,
-        message="phases[p].n_trials above 4 in the config",
+        message="phases[p].n_trials above 4",
     ),
     RoutingCase(
         # Raising the target does not retire an unsafe-cleanup abort; cleanup recovery does.
@@ -1373,14 +1381,14 @@ ORIGIN_CASES = (
         trigger=_abort_with_failed_cells,
         raised=PhaseTrialsFailedError,
         action=OperatorAction.FIX_CONFIG,
-        message="phases[p].n_trials from 2 to 4 in the config",
+        message="phases[p].n_trials from 2 to 4",
     ),
     RoutingCase(
         id="live_abort_with_unrun_cells",
         trigger=_abort_with_unrun_cells,
         raised=PhaseTrialsInfeasibleError,
         action=OperatorAction.FIX_CONFIG,
-        message="phases[p].max_consecutive_failures above 2 in the config",
+        message="phases[p].max_consecutive_failures above 2",
     ),
     RoutingCase(
         id="live_abort_with_every_cell_measured",
@@ -1394,7 +1402,7 @@ ORIGIN_CASES = (
         trigger=_finish_after_fatal_abort,
         raised=PhaseTrialsFailedError,
         action=OperatorAction.FIX_CONFIG,
-        message="phases[p].n_trials above 4 in the config",
+        message="phases[p].n_trials above 4",
     ),
     RoutingCase(
         id="live_abort_awaiting_cleanup_recovery",
@@ -1416,28 +1424,28 @@ ORIGIN_CASES = (
         trigger=_resume_with_streak_at_limit,
         raised=PhaseAbortRefusedError,
         action=OperatorAction.FIX_CONFIG,
-        message="meets max_consecutive_failures=2, so it launches no more trials",
+        message="which meets max_consecutive_failures=2.",
     ),
     RoutingCase(
         id="winner_incomplete_without_opt_in",
         trigger=_resume_over_incomplete_winner,
         raised=WinnerIntegrityError,
         action=OperatorAction.FIX_CONFIG,
-        message="unless the current config sets allow_incomplete_on_timeout: true.",
+        message=ACCEPT_INCOMPLETE_STEP,
     ),
     RoutingCase(
         id="partial_decision_without_opt_in",
         trigger=_replay_partial_decision_without_opt_in,
         raised=WinnerIntegrityError,
         action=OperatorAction.FIX_CONFIG,
-        message="Refusing to replay it unless the current config sets",
+        message=ACCEPT_INCOMPLETE_STEP,
     ),
     RoutingCase(
         id="ledger_directory_path_unusable",
         trigger=_claim_ledger_under(_regular_file),
         raised=PhaseSweepError,
         action=OperatorAction.FIX_CONFIG,
-        message="Correct the storage path, or the workdir for auto storage",
+        message="Correct `storage`, or `workdir` for `storage: auto`.",
     ),
     RoutingCase(
         id="live_trial_tracker_unreadable",
@@ -1538,8 +1546,7 @@ def test_runner_payload_follows_the_routed_steps() -> None:
     assert composed["remediation"] == (
         "Ask the operator to restore or repair the storage ledger and access to it, and restore "
         "the files and permissions identified in the error, then run `phasesweep mcp "
-        "recover-run --state-dir STATE_DIR --run-id r0` from a host shell, with the catalog's "
-        "`state_dir` as STATE_DIR, read its preview and repeat it with `--confirm` before "
-        "another launch. The error in this run's log, `logs/r0.log` under the catalog's "
-        "`state_dir`, gives the details."
+        "recover-run --state-dir STATE_DIR --run-id r0` on the server host (STATE_DIR is the "
+        "catalog's `state_dir`), then repeat it with `--confirm` before another launch. "
+        "Details: `logs/r0.log` under the catalog's `state_dir`."
     )

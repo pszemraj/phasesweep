@@ -65,6 +65,7 @@ from phasesweep.tracking.mlflow import _publish
 from phasesweep.tracking.session import (
     BINDING_FILE,
     INHERITS_FILE,
+    DeliveryTally,
     read_record,
     tracking_root,
     write_record,
@@ -73,6 +74,7 @@ from tests.conftest import lose_record_writes, patch_path_method_failure, trial_
 from tests.tracking_helpers import (
     FakeWorkerProcess,
     RunnerKilled,
+    delivery_record,
     killed_sweep,
     leak_tracking_worker,
     leave_cleanup_uncertain_attempt,
@@ -368,16 +370,19 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
         write_record(directory / INHERITS_FILE, {"schema_version": 1, "inherits": {}})
     write_record(
         tracking_root(experiment) / generation / "delivery" / f"attempt-{'2' * 32}.json",
-        {"schema_version": 1, "generation_id": generation, "state": "delivered"},
+        delivery_record(generation, state="delivered"),
     )
     requests = []
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
-    publication.publish_failed_generation(experiment, generation, KeyboardInterrupt(), ledger)
-    assert [(r["binding"]["attempt_id"][0], r["finish"]) for r in requests] == [
+    publication.deliver_closeout(experiment, ledger, generation, error=KeyboardInterrupt())
+    # An interrupted run only saves its records; the next run or sync-tracking sends them.
+    assert requests == []
+    saved = [read_record(path) for path in publication._pending_records(experiment, generation)]
+    assert [(r["binding"]["attempt_id"][0], r["finish"]) for r in saved] == [
         ("4", None),
         ("a", "KILLED"),
     ]
-    accepted = requests[0]["projection"]
+    accepted = saved[0]["projection"]
     assert accepted["metrics"] == {
         "phasesweep.objective": 0.5,
         "phasesweep.feasible": 1.0,
@@ -431,7 +436,7 @@ def test_failed_invocation_leaves_a_pending_trials_managed_run_open_only_when_pe
     write_record(directory / INHERITS_FILE, {"schema_version": 1, "inherits": {}})
     requests = []
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
-    publication.publish_failed_generation(experiment, generation, RuntimeError("outage"), ledger)
+    publication.deliver_closeout(experiment, ledger, generation, error=RuntimeError("outage"))
     delivery = tracking_root(experiment) / generation / "delivery"
     if storage == "memory":
         assert [(r["binding"]["attempt_id"], r["finish"]) for r in requests] == [
@@ -627,7 +632,10 @@ def _fail_engine(tmp_path, monkeypatch, error):
 
 @pytest.mark.parametrize("failure", ["ordinary", "signal", "keyboard"])
 def test_failure_projection_outage_preserves_error_and_retries(tmp_path, monkeypatch, failure):
-    """Terminal failures retain status intent and original error despite upload outage."""
+    """Terminal failures retain status intent and original error despite upload outage.
+
+    An ordinary failure sends its summary record once; a shutdown only saves it.
+    """
     error = (
         PhaseSweepShutdown(
             signal.SIGTERM,
@@ -658,9 +666,10 @@ def test_failure_projection_outage_preserves_error_and_retries(tmp_path, monkeyp
     assert record["finish"] == ("FAILED" if failure == "ordinary" else "KILLED")
     assert "private trainer failure" not in str(record)
     assert record["projection"]["metrics"] == {}
+    assert len(requests) == (1 if failure == "ordinary" else 0)
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
     assert publication.sync_tracking(experiment, generation) == {"pending": 0, "delivered": 1}
-    assert requests[0] == requests[1]
+    assert requests[0] == requests[-1]
     # sync-tracking sends the saved summary record as it is and never rebuilds it.
     assert read_record(record_path) == {**record, "state": "delivered"}
 
@@ -699,20 +708,53 @@ def test_failure_persistence_error_cannot_replace_primary(tmp_path, monkeypatch)
     experiment = _fail_engine(tmp_path, monkeypatch, error)
     monkeypatch.setattr(
         publication,
-        "publish_failed_generation",
-        lambda *args: (_ for _ in ()).throw(PermissionError("delivery filesystem read-only")),
+        "deliver_closeout",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            PermissionError("delivery filesystem read-only")
+        ),
     )
     with pytest.raises(RuntimeError) as caught:
         run_experiment(experiment)
     assert caught.value is error
 
 
+def test_each_summary_record_is_sent_after_the_records_of_its_generation(tmp_path: Path) -> None:
+    """Records go generation by generation, each summary-run record after its generation's others.
+
+    A summary run MLflow shows ended therefore had the attempt outcomes and winner references it
+    summarizes sent first, including a winner record whose name sorts after ``generation``.
+    """
+    experiment = native_experiment(tmp_path)
+    root = tracking_root(experiment)
+    stems = {
+        "1" * 32: ["winner-rate", "generation", "attempt-b", "attempt-a"],
+        "2" * 32: ["generation", "attempt-c"],
+    }
+    for generation, names in stems.items():
+        (root / generation / "delivery").mkdir(parents=True)
+        for name in names:
+            write_record(
+                root / generation / "delivery" / f"{name}.json", delivery_record(generation)
+            )
+    assert [
+        f"{path.parent.parent.name[0]}/{path.stem}"
+        for path in publication._pending_records(experiment, None)
+    ] == [
+        "1/attempt-a",
+        "1/attempt-b",
+        "1/winner-rate",
+        "1/generation",
+        "2/attempt-c",
+        "2/generation",
+    ]
+
+
 def test_missing_binding_never_creates_or_discovers_a_summary(tmp_path, monkeypatch):
     """An unresolved create response cannot identify a run to finish by guessing."""
     experiment = native_experiment(tmp_path)
     monkeypatch.setattr(publication, "call_tracking", lambda *args: pytest.fail("No remote work"))
-    publication.publish_failed_generation(
-        experiment, "a" * 32, RuntimeError("create unresolved"), validate_ledger(experiment)
+    publication.deliver_closeout(
+        experiment, validate_ledger(experiment), "a" * 32, error=RuntimeError("create unresolved")
     )
     assert publication.delivery_status(experiment) == {"pending": 0, "delivered": 0}
 
@@ -751,9 +793,7 @@ def test_failure_publisher_preserves_historical_generation_outcome(
     requests = []
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
 
-    publication.publish_failed_generation(
-        experiment, generation, RuntimeError("late error"), ledger
-    )
+    publication.deliver_closeout(experiment, ledger, generation, error=RuntimeError("late error"))
 
     assert pointer.read_bytes() == pointer_before
     assert published_generation_id(experiment) == newer_generation
@@ -928,6 +968,7 @@ def test_mcp_status_agrees_with_a_mirror_failure_after_publication(tmp_path, mon
     assert store.observe(handle).cleanup_recovery_required is (failure == "worker")
 
 
+@pytest.mark.integration
 def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_path, monkeypatch):
     """A controller that dies right after the pointer commit loses neither its proof nor its mirror.
 
@@ -945,7 +986,7 @@ def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_pa
 
     with monkeypatch.context() as crash:
         lose_record_writes(crash, OSError("controller died after the pointer commit"))
-        crash.setattr(publication, "publish_generation", lambda *args: None)
+        crash.setattr(publication, "deliver_closeout", lambda *args, **kwargs: None)
         run_experiment(experiment)
     first = yaml.safe_load(pointer_path.read_text())["generation_id"]
     first_delivery = tracking_root(experiment) / first / "delivery"
@@ -954,7 +995,6 @@ def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_pa
     assert len(list(first_delivery.glob("attempt-*.json"))) == 4
     assert not any((first_delivery / name).exists() for name in intents)
     uploads.clear()  # the attempt uploads are already delivered; only sync's remain to count
-    assert publication.generations_left_open(experiment) == set()
 
     reports = []
     run_experiment(experiment, terminal_callback=reports.append)
@@ -982,11 +1022,20 @@ def test_sync_leaves_superseded_publication_unresolved_when_its_record_cannot_be
     config["phases"] = config["phases"][:1]
     config["phases"][0].update(n_trials=1, gpu_policy="none", sampler={"type": "random", "seed": 1})
     experiment = Experiment.model_validate(config)
+
+    def offline(*args: object, **kwargs: object) -> None:
+        raise OSError("tracker offline")
+
     with monkeypatch.context() as without_mirror:
-        without_mirror.setattr(publication, "publish_generation", lambda *_: None)
-        without_mirror.setattr(publication, "_deliver", lambda *args, **kwargs: False)
+        without_mirror.setattr(publication, "deliver_closeout", lambda *args, **kwargs: None)
+        without_mirror.setattr(publication, "_deliver", offline)
         run_experiment(experiment, generation_id="older")
-    run_experiment(experiment, generation_id="newer")
+    with monkeypatch.context() as older_left_for_sync:
+        # The newer run's closeout would otherwise deliver the older generation's records.
+        older_left_for_sync.setattr(
+            publication, "deliver_ended_generations", lambda *args, **kwargs: None
+        )
+        run_experiment(experiment, generation_id="newer")
     assert read_status(experiment)["published_generation_id"] == "newer"
     lifecycle = _generation_record_path(experiment, "older")
     assert _recorded_generation(lifecycle).state == "published"
@@ -1123,9 +1172,10 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     """A pending trial's managed run receives the outcome recovery commits.
 
     Accepted evidence sends its accepted projection. Evidence the tracker answers with a
-    failure records the finished trial failed with that reason, as a live trial would be, which
-    ends the run FAILED and trains nothing again. An upload that fails, or a record that cannot
-    be saved, leaves the outcome for sync-tracking and the run still publishes its result.
+    failure records the finished trial failed with that reason, as a live trial would be, and
+    trains nothing again; the run then fails before any target check, so it only saves the
+    outcome, and sync-tracking ends the run FAILED. An upload that fails, or a record that
+    cannot be saved, leaves the outcome for sync-tracking and the run still publishes its result.
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
     from phasesweep.tracking.mlflow import OperationUnavailableError
@@ -1176,6 +1226,10 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     (recovered,) = read_phase_trials(validate_ledger(experiment), "depth").trials
     assert recovered.state == (TrialState.COMPLETE if answer == "accepted" else TrialState.FAIL)
     record_path = delivery / f"attempt-{attempt}.json"
+    if answer == "objective-missing":
+        assert [r for r in uploads if r["name"] == f"attempt-{attempt}"] == []
+        assert read_record(record_path)["state"] == "pending"
+        publication.sync_tracking(experiment)
     if upload == "unsaved":
         assert read_status(experiment)["published_generation_id"] not in {None, generation}
         assert not record_path.exists()
@@ -1185,7 +1239,10 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
         publication.sync_tracking(experiment)
     if upload == "offline":
         assert read_record(record_path)["state"] == "pending"
-        assert "Retry with sync-tracking" in caplog.text
+        assert (
+            f"MLflow: attempt record attempt-{attempt} of generation {generation} is pending (upload "
+            "refused)." in caplog.text
+        )
         refused_upload.clear()
         uploads.clear()
         publication.sync_tracking(experiment)
@@ -1232,8 +1289,8 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
 
     It ends KILLED, as its run recorded no failure, and is sent once, whether the run was
     killed with its trials in flight or between them, with no trial left to settle. A run's
-    recovered delivery never finishes that run's own summary run, which its terminal delivery
-    owns, and a dry run writes and sends nothing.
+    delivery of ended generations never finishes that run's own summary run, which its terminal
+    delivery owns, and a dry run writes and sends nothing.
     """
     experiment, uploads, _attempts = killed_sweep(
         tmp_path, monkeypatch, n_jobs=1, in_flight=in_flight
@@ -1243,8 +1300,9 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
     ledger = validate_ledger(experiment)
     uploads.clear()
     if caller == "own-run":
-        sent = publication.deliver_recovered_attempts(experiment, ledger, generation, [generation])
-        assert sent == {"delivered": 0, "pending_uploads": 0, "pending_creations": 0}
+        tally = DeliveryTally()
+        publication.deliver_ended_generations(experiment, ledger, generation, tally)
+        assert tally.delivered == 0
         assert not record.exists()
         assert uploads == []
         return
@@ -1263,10 +1321,12 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
         assert uploads == []
     else:
         if caller == "recover-run":
-            sent = publication.deliver_recovered_attempts(
-                experiment, ledger, generation, [generation], recovering=True
+            tally = DeliveryTally()
+            publication.deliver_ended_generations(
+                experiment, ledger, generation, tally, recovering=True
             )
-            assert sent == {"delivered": 1, "pending_uploads": 0, "pending_creations": 0}
+            assert tally.delivered == 1
+            assert publication.delivery_status(experiment)["pending"] == 0
         else:
             # A finished attempt's accepted outcome was delivered before the kill.
             delivered = 1 if in_flight else 2
@@ -1442,9 +1502,12 @@ def test_a_run_with_another_mlflow_target_saves_no_recovered_outcome(
 
     assert sorted(delivery.glob("*.json")) == recorded
     assert uploads == []
-    assert "with the config the sweep ran with" in caplog.text
-    with pytest.raises(TrackingSyncRefusedError, match="belongs to a different target"):
+    # The warning and the refusal give one step, which names the overrides as well as the file.
+    assert f"those runs used. {session.ORIGINAL_TARGET_STEP}" in caplog.text
+    with pytest.raises(TrackingSyncRefusedError, match="belongs to a different target") as refused:
         publication.sync_tracking(moved)
+    assert refused.value.remediation == session.ORIGINAL_TARGET_STEP
+    assert "`--set` overrides the sweep ran with" in session.ORIGINAL_TARGET_STEP
     assert (sorted(delivery.glob("*.json")), uploads) == (recorded, [])
     assert publication.sync_tracking(experiment)["pending"] == 0
     assert _sent(uploads, attempts) == (["KILLED"] if in_flight else [])
@@ -1527,18 +1590,25 @@ def test_a_reachable_tracker_receives_recovered_outcomes_after_its_check(tmp_pat
     assert uploads == []
 
 
+@pytest.mark.integration
 def test_an_upload_workers_unconfirmed_cleanup_is_not_charged_to_the_recovered_attempt(
     tmp_path, monkeypatch
 ):
-    """The worker sending a recovered outcome is what leaves cleanup uncertain, never the trial it reports."""
+    """The worker sending a recovered outcome is what leaves cleanup uncertain, never the trial it reports.
+
+    The outcome is sent right after the run's target check, so, as with a target check's own
+    worker, the run stops there and starts no trial.
+    """
     experiment, _uploads, [attempt] = killed_sweep(tmp_path, monkeypatch, n_jobs=1)
     leaked = leak_tracking_worker(monkeypatch, name=f"attempt-{attempt}")
     reports = []
-    run_experiment(experiment, terminal_callback=reports.append)
+    with pytest.raises(UnsafeProcessCleanupError):
+        run_experiment(experiment, terminal_callback=reports.append)
     [report] = reports
     assert leaked
     assert not report.cleanup_confirmed
     assert attempt not in report.uncertain_attempt_ids
+    assert report.failure_stage == "preflight"
     [recovered] = [
         trial
         for trial in read_phase_trials(validate_ledger(experiment), "depth").trials
@@ -1634,7 +1704,7 @@ def test_sync_refuses_a_tree_of_another_format_as_run_does_and_writes_nothing(
     with pytest.raises(ArtifactRootSchemaMismatchError) as sync_refusal:
         publication.sync_tracking(experiment)
     assert str(sync_refusal.value) == str(run_refusal.value)
-    assert "Nothing was written" in str(sync_refusal.value)
+    assert "this PhaseSweep reads format" in str(sync_refusal.value)
     assert uploads == []
     assert (_tree_listing(_experiment_dir(experiment)), journal.read_bytes()) == before
 

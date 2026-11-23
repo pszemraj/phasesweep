@@ -31,9 +31,25 @@ def nonempty_text(value: object, *, label: str) -> str:
     return value
 
 
+class NonFiniteJsonConstantError(ValueError):
+    """Raised when a JSON document holds ``NaN``, ``Infinity`` or ``-Infinity``."""
+
+    def __init__(self, constant: str) -> None:
+        """Record the refused token, so a reader can say what the file holds.
+
+        :param str constant: The token as the document writes it.
+        """
+        super().__init__(f"non-standard JSON constant {constant!r}")
+        self.constant = constant
+
+
 def _reject_constant(value: str) -> NoReturn:
-    """Reject Python's non-standard JSON constants with ValueError."""
-    raise ValueError(f"non-standard JSON constant {value!r}")
+    """Reject the non-standard constants Python's ``json.dumps`` writes for non-finite floats.
+
+    :param str value: The token the decoder met.
+    :raises NonFiniteJsonConstantError: Always.
+    """
+    raise NonFiniteJsonConstantError(value)
 
 
 def _unique_object(pairs: list[tuple[str, JsonValue]]) -> JsonObject:
@@ -56,7 +72,8 @@ def strict_json_loads(text: str) -> JsonValue:
 
     :param str text: JSON document to decode.
     :raises json.JSONDecodeError: The document has invalid JSON syntax.
-    :raises ValueError: An object has duplicate keys or a nonstandard numeric constant occurs.
+    :raises NonFiniteJsonConstantError: A nonstandard numeric constant occurs.
+    :raises ValueError: An object has duplicate keys.
     :return JsonValue: The decoded JSON value.
     """
     decoded: object = json.loads(
@@ -67,18 +84,37 @@ def strict_json_loads(text: str) -> JsonValue:
     return json_value(decoded)
 
 
-def progress_position(value: object) -> int | float | None:
+def finite_nonnegative(value: object) -> int | float | None:
     """Return a finite, nonnegative JSON number or None, excluding booleans.
 
-    Keep integers exact for evaluation-axis grouping.
+    Integers stay exact, which evaluation-axis grouping relies on.
 
-    :param object value: Candidate evaluation position.
-    :return int | float | None: The valid position unchanged, or None for an unsupported value.
+    :param object value: Candidate number, such as an evaluation position or a duration.
+    :return int | float | None: The number unchanged, or None for an unsupported value.
     """
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
     try:
         return value if math.isfinite(value) and value >= 0 else None
+    except OverflowError:
+        return None
+
+
+def float_or_none(value: object) -> float | None:
+    """Return a non-boolean number as a float, or None when it is not one.
+
+    The trial tables read user attrs and the edge advisory reads params and configured choices
+    through it, so an integer too large for a float, such as ``10**400``, reads as no number
+    in each of them.
+
+    :param object value: A recorded param, a configured choice or a trial user attr.
+    :return float | None: The value as a float, or None for booleans, nonnumbers and an
+        integer that overflows a float.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        return float(value)
     except OverflowError:
         return None
 

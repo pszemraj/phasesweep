@@ -21,7 +21,7 @@ def _winner_lines(experiment: Experiment) -> list[str]:
     return [
         line
         for line in (_experiment_dir(experiment) / "run.log").read_text().splitlines()
-        if "phase=p WINNER " in line
+        if " p  winner: trial " in line
     ]
 
 
@@ -76,7 +76,7 @@ def test_accepted_incomplete_winner_and_replay_log_counts_and_timeout_scope(
     for line in lines:
         assert "INCOMPLETE" in line
         assert "1/3 finished" in line
-        assert f"timeout_scope={guard}" in line
+        assert f"timeout scope {guard}" in line
 
 
 def test_completed_winner_has_no_incomplete_marker(tmp_path: Path) -> None:

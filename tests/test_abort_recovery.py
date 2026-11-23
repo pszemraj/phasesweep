@@ -159,9 +159,7 @@ def test_cli_abort_advice_is_logged_once_per_invocation(
         ]
         assert len(fixes) == 1
         advice = fixes[0]
-        assert "phases[p].n_trials above 1 in the config" in advice
-        assert "fix changes trial_command or the trainer's PATH" in advice
-        assert "new `experiment` name" in advice
+        assert advice == "Fix the cause, then raise phases[p].n_trials above 1 and rerun."
         assert (output.err + output.out + caplog.text).count(advice) == 1
         assert run_log.read_text(encoding="utf-8").count(advice) == invocation + 1
     assert len(phase_study(experiment).trials) == 1
@@ -186,7 +184,10 @@ def test_evidence_pending_preview_routes_to_resume(tmp_path: Path) -> None:
     error = caught.value
     assert error.action is OperatorAction.RUN_RECOVER_RUN
     advice = operator_step(error)
-    assert "phasesweep run with the same config, without --dry-run" in advice
+    assert advice == (
+        "Run `phasesweep run` with the same config, without --dry-run, to recover the pending "
+        "trial of `p`."
+    )
     assert "correct the experiment configuration" not in _operational_error_text(error)
     assert _operational_error_text(error).count(advice) == 1
     failure = mcp_runner._terminal_failure_payload(
@@ -460,7 +461,7 @@ def _with_limit(experiment: Experiment, limit: int) -> Experiment:
 
 
 def test_raised_failure_limit_retires_a_streak_abort_while_trials_remain(tmp_path: Path) -> None:
-    """A limit above the recorded streak recovers the abort and runs the trials the target left."""
+    """A limit above the recorded streak recovers the abort and runs the trials the target left, though the fix line offers the raised target."""
     flag = tmp_path / "resume_enabled"
     initial = make_experiment(
         persistent=tmp_path,
@@ -474,9 +475,8 @@ def test_raised_failure_limit_retires_a_streak_abort_while_trials_remain(tmp_pat
         run_experiment(initial)
     assert [trial.state.name for trial in phase_study(initial).trials] == ["FAIL", "FAIL"]
     message = _operational_error_text(aborted.value)
-    assert "phases[p].max_consecutive_failures above 2 in the config" in message
-    assert "run the 2 trials still left at n_trials=4" in message
-    assert "phases[p].n_trials above 4 in the config" in message
+    assert "phases[p].n_trials above 4" in message
+    assert "max_consecutive_failures above" not in message
 
     # A limit that is not above the recorded streak leaves the abort in place, preview and run.
     flag.touch()
@@ -518,7 +518,7 @@ def test_raised_failure_limit_leaves_an_abort_with_no_trials_left(tmp_path: Path
             run_experiment(_with_limit(initial, 5), dry_run=dry_run)
         refusals.append(_operational_error_text(refused.value))
     for message in refusals:
-        assert "phases[p].n_trials above 2 in the config" in message
+        assert "phases[p].n_trials above 2" in message
         assert "max_consecutive_failures above" not in message
     assert len(phase_study(initial).trials) == 2
 
@@ -590,7 +590,7 @@ def test_aborted_phase_headline_states_the_recorded_cause_of_a_fatal_abort(
     message = _operational_error_text(aborted.value)
     assert "Phase 'p' aborted: RuntimeError: simulated objective defect" in message
     assert "consecutive" not in message
-    assert "phases[p].n_trials above 3 in the config" in message
+    assert "phases[p].n_trials above 3" in message
     assert "max_consecutive_failures above" not in message
     # The abort recorded no streak, so there is no failure count to restart.
     assert "failure count" not in message
@@ -611,7 +611,7 @@ def test_fatal_abort_of_a_grid_advises_the_retry_target_without_a_failure_count(
         run_experiment(experiment)
 
     message = _operational_error_text(refused.value)
-    assert "phases[p].n_trials from 3 to 4 in the config" in message
+    assert "phases[p].n_trials from 3 to 4" in message
     assert "retry its 1 failed cell and run its 2 remaining cells" in message
     assert "failure count" not in message
 
@@ -632,7 +632,7 @@ def test_raised_failure_limit_does_not_retire_a_fatal_abort(
         refusals.append(_operational_error_text(refused.value))
     for message in refusals:
         assert "simulated objective defect" in message
-        assert "phases[p].n_trials above 3 in the config" in message
+        assert "phases[p].n_trials above 3" in message
         assert "max_consecutive_failures above" not in message
         assert "failure count" not in message
     assert not calls.exists()

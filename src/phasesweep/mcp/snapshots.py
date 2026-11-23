@@ -11,25 +11,22 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from phasesweep.config.models import Experiment, _metric_semantics_payload
 from phasesweep.engine.artifacts import read_yaml_or_none
-from phasesweep.engine.confound import (
-    ConfoundCheck,
-    ConfoundVerdict,
-    _confound_summary,
-    _validate_confound_block,
-)
+from phasesweep.engine.confound import ConfoundCheck, ConfoundVerdict, _confound_summary
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.ledger import ValidatedLedger, validate_ledger
 from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
 from phasesweep.engine.read import (
     CostAdvisoryStatus,
+    EdgeAdvisoryStatus,
     EngineStatus,
     PhaseWinnerView,
     ResultContext,
-    cost_advisory_status,
+    WinnerAdvisories,
+    _recorded_count,
     read_result,
     read_status,
-    winner_cost_advisory,
-    winner_tie_groups,
+    winner_advisories,
 )
 from phasesweep.engine.repeats import _repeats_summary
 from phasesweep.engine.state import (
@@ -46,11 +43,12 @@ from phasesweep.runtime.json import JsonObject, dump_json
 log = logging.getLogger("phasesweep.mcp.snapshots")
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
+PositiveInt = Annotated[int, Field(ge=1)]
 NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 McpPublicationState = PublicationState | Literal["unknown"]
 """Engine publication verdict plus the MCP snapshot-unavailable state."""
 
-RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[2] = 2
+RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[5] = 5
 
 
 class _SnapshotModel(BaseModel):
@@ -159,7 +157,8 @@ class EvaluationPointSummary(_SnapshotModel):
     verdict: ConfoundVerdict = Field(
         description=(
             f"{_VERDICT_DESCRIPTION} Always n/a for json and log_regex objectives, which "
-            "record no evaluation position; only json_envelope, wandb and mlflow bind one."
+            "record no evaluation position, and for mlflow select: min or max, whose step is "
+            "where the best value fell; json_envelope, wandb and other mlflow selectors bind one."
         )
     )
     distinct_values: NonNegativeInt | None = Field(
@@ -183,34 +182,62 @@ class EvaluationPointSummary(_SnapshotModel):
 
 
 class SurvivorshipSummary(_SnapshotModel):
-    """How many finished trials were ranked versus excluded from ranking."""
+    """How the configurations the phase tried ended: ranked, infeasible, failed or never tried.
+
+    A configuration is a trial's params, or a repeat group in a repeats phase.
+    """
 
     verdict: ConfoundVerdict = Field(
         description=(
-            f"{_VERDICT_DESCRIPTION} Heterogeneous when failed trials are at least as "
-            "numerous as ranked ones; infeasible and incomplete_group trials never flag."
+            f"{_VERDICT_DESCRIPTION} Heterogeneous when any configuration failed or a grid "
+            "cell was never tried, so the winner was chosen without them; infeasible "
+            "configurations never flag."
         )
     )
-    ranked: NonNegativeInt
-    infeasible: NonNegativeInt
-    incomplete_group: NonNegativeInt = Field(
+    remedy: str | None = Field(
         description=(
-            "Feasible trials of a repeats phase left unranked because another member of "
-            "their repeat group failed, was infeasible, or never ran; 0 without repeats."
+            "How to give the configurations without a result one when the check flagged: a "
+            "raised n_trials with persistent storage, a rerun with storage: null; otherwise null."
         )
     )
-    failed: NonNegativeInt
+    ranked: NonNegativeInt = Field(description="Configurations selection ranked.")
+    infeasible: NonNegativeInt = Field(
+        description="Configurations measured outside a metric bound or constraint."
+    )
+    failed: NonNegativeInt = Field(
+        description="Configurations whose every attempt failed, with no rerun pending."
+    )
+    untried: NonNegativeInt = Field(
+        description=(
+            "Grid cells' configurations no trial reached although the grid finished a "
+            "target covering every cell; 0 for any other phase."
+        )
+    )
+    failed_trials: list[NonNegativeInt] = Field(
+        description="The latest failed attempt of each failed configuration, by trial number."
+    )
 
 
 class TieSummary(_SnapshotModel):
-    """Whether the winner stands clear of ranked units that used other params.
+    """Whether draw order or seed noise could have decided the winner.
 
-    A unit is a trial, or a complete repeat group in a repeats phase.
+    Without repeats, ok only means no other configuration matched the winner's value
+    exactly; it says nothing about the margin. With mean repeats, it also flags groups whose
+    mean is within the noise band pooled over every ranked group. A unit is a trial, or a
+    complete repeat group in a repeats phase.
     """
 
-    verdict: ConfoundVerdict = Field(description=_VERDICT_DESCRIPTION)
+    verdict: ConfoundVerdict = Field(
+        description=(
+            f"{_VERDICT_DESCRIPTION} With reduce: median, n/a unless a group matched the "
+            "winner's median exactly, since medians have no noise band."
+        )
+    )
     remedy: str | None = Field(
-        description="Configuration-first noise guidance for a flagged tie between single trials; otherwise null."
+        description=(
+            "For a flagged exact tie between single trials, what draw order decided and how to "
+            "separate the configurations, distinct values first; otherwise null."
+        )
     )
     tied_trials: NonNegativeInt | None = Field(
         description=(
@@ -219,9 +246,19 @@ class TieSummary(_SnapshotModel):
     )
     within_noise: NonNegativeInt | None = Field(
         description=(
-            "Repeat groups whose aggregate is within two standard errors of the winning "
-            "group's, exact ties included. Null without repeats or when not checked."
+            "Repeat groups whose mean differs from the winning group's by at most the "
+            "two-sided 5% Student-t value at df times pooled_sd * sqrt(1/n_winner + 1/n_other), "
+            "exact ties included. Null without repeats, with reduce: median, or when not checked."
         )
+    )
+    pooled_sd: NonNegativeFloat | None = Field(
+        description=(
+            "Run-to-run standard deviation pooled over every ranked repeat group, assuming the "
+            "noise is about the same size at each configuration. Null when within_noise is."
+        )
+    )
+    df: PositiveInt | None = Field(
+        description="Degrees of freedom of pooled_sd: the sum of n - 1 over the ranked groups."
     )
 
 
@@ -261,13 +298,18 @@ class RepeatsSpread(_SnapshotModel):
 
 
 class TieGroupSnapshot(_SnapshotModel):
-    """Configuration overlapping the winner within two combined standard errors."""
+    """Configuration whose mean is within the phase's pooled noise band of the winner's.
+
+    ``combined_se`` is the pooled standard error of the difference between the two means and
+    ``threshold`` the Student-t critical value times it. Groups ranked by median have no band:
+    one ties only when its median equals the winner's, at ``gap`` 0 with both fields null.
+    """
 
     trial_number: NonNegativeInt
     params: dict[str, bool | int | float | str | None]
     gap: NonNegativeFloat
-    combined_se: NonNegativeFloat
-    threshold: NonNegativeFloat
+    combined_se: NonNegativeFloat | None
+    threshold: NonNegativeFloat | None
 
 
 class WinnerSnapshot(_SnapshotModel):
@@ -288,25 +330,32 @@ class WinnerSnapshot(_SnapshotModel):
     cost_advisory: str | None = None
     cost_advisory_status: CostAdvisoryStatus
     tie_groups: list[TieGroupSnapshot] | None
+    edge_advisory: str | None
+    edge_advisory_status: EdgeAdvisoryStatus
 
 
 def _winner_snapshot(
     phase: str,
     winner: PhaseWinnerView | Winner,
     *,
-    experiment: Experiment | None = None,
+    experiment: Experiment,
+    ledger: ValidatedLedger,
 ) -> WinnerSnapshot:
     """Freeze either engine winner representation into one validated snapshot.
 
+    A read view already carries its read-time advice; an engine winner gets it here.
+
     :param str phase: Phase under which the winner is exposed.
     :param PhaseWinnerView | Winner winner: Winner representation to serialize.
-    :param Experiment | None experiment: Producing config for recomputed repeat-cost advice.
-    :raises RuntimeError: A ``PhaseWinnerView`` carries no confound verdicts, or either
-        representation carries no source provenance.
-    :raises ValueError: A stored ``Winner``'s confound block fails validation.
+    :param Experiment experiment: The config the runner executed, which produced an engine
+        winner: it locates the trials the advice is recomputed from
+        (:func:`phasesweep.engine.read.winner_advisories`) and decides the survivorship remedy.
+    :param ValidatedLedger ledger: Handle the snapshot validated once for ``experiment``.
+    :raises RuntimeError: Either representation carries no confound verdicts or no source
+        provenance.
     :return WinnerSnapshot: Validated path-free winner snapshot.
     """
-    cost_status: CostAdvisoryStatus
+    advisories: WinnerAdvisories
     if isinstance(winner, Winner):
         gates_passed = (
             all(bool(gate.get("passed")) for gate in winner.gates) if winner.gates else None
@@ -315,10 +364,14 @@ def _winner_snapshot(
         provenance = winner.objective_provenance
         extractor = provenance.get("extractor") if isinstance(provenance, Mapping) else None
         kind = extractor.get("kind") if isinstance(extractor, Mapping) else None
+        if winner.confound is None:
+            raise RuntimeError("Current-format winner is missing confound verdicts.")
         confound = _confound_summary(
-            _validate_confound_block(winner.confound, winner_trial=winner.trial_number),
+            winner.confound,
             winner_trial=winner.trial_number,
             extractor_kind=kind if isinstance(kind, str) else "unknown",
+            persistent=experiment.persistent,
+            dependents=experiment.phases_inheriting(phase),
         )
         repeats = None if winner.repeats is None else _repeats_summary(winner.repeats)
         view = PhaseWinnerView(
@@ -332,14 +385,9 @@ def _winner_snapshot(
             repeats=repeats,
             repeats_detail=winner.repeats,
             confound_detail=winner.confound,
+            finished_trials=_recorded_count(winner.completion.get("finished_trials")),
         )
-        cost_advisory = winner_cost_advisory(experiment, view) if experiment is not None else None
-        tie_groups = winner_tie_groups(experiment, view) if experiment is not None else None
-        cost_status = (
-            cost_advisory_status(experiment, phase, cost_advisory, available=tie_groups is not None)
-            if experiment is not None
-            else "unavailable"
-        )
+        advisories = winner_advisories(experiment, view, config_matches=True, ledger=ledger)
     else:
         gates_passed = winner.gates_passed
         incomplete = winner.incomplete
@@ -347,9 +395,14 @@ def _winner_snapshot(
             raise RuntimeError("Current-format winner is missing confound verdicts.")
         confound = winner.confound
         repeats = winner.repeats
-        cost_advisory = winner.cost_advisory
-        tie_groups = winner.tie_groups
-        cost_status = winner.cost_advisory_status
+        advisories = WinnerAdvisories(
+            winner.cost_advisory,
+            winner.cost_advisory_status,
+            winner.tie_groups,
+            winner.edge_advisory,
+            winner.edge_advisory_status,
+        )
+    tie_groups = advisories.tie_groups
     source = winner.source
     if source is None:
         raise RuntimeError("Current-format winner is missing source provenance.")
@@ -366,18 +419,20 @@ def _winner_snapshot(
         confound=ConfoundSummary.model_validate(confound),
         observed=dict(winner.observed),
         repeats=None if repeats is None else RepeatsSpread.model_validate(repeats),
-        cost_advisory=cost_advisory,
-        cost_advisory_status=cost_status,
+        cost_advisory=advisories.cost_advisory,
+        cost_advisory_status=advisories.cost_advisory_status,
         tie_groups=(
             None if tie_groups is None else [TieGroupSnapshot.model_validate(g) for g in tie_groups]
         ),
+        edge_advisory=advisories.edge_advisory,
+        edge_advisory_status=advisories.edge_advisory_status,
     )
 
 
 class RunResultSnapshot(_SnapshotModel):
     """Terminal status and winners frozen for one MCP run id."""
 
-    schema_version: Literal[2]
+    schema_version: Literal[5]
     status: StatusSnapshot
     winners: list[WinnerSnapshot]
     represented_config_fingerprint: str | None = None
@@ -481,20 +536,27 @@ def capture_result_snapshot(
                 "capturing the terminal snapshot from the authoritative artifacts anyway",
                 generation_id,
             )
+    ledger = validate_ledger(experiment)
     if engine_winners is not None:
         status = read_status(
-            experiment, generation_id=generation_id, trial_generation_id=trial_generation_id
+            experiment,
+            generation_id=generation_id,
+            trial_generation_id=trial_generation_id,
+            ledger=ledger,
         )
         # The engine's winners count even where the generation holds no winner file.
         for phase in status["phases"]:
             phase["winner_present"] = phase["phase"] in engine_winners
         winner_snapshots = [
-            _winner_snapshot(phase_name, winner, experiment=experiment)
+            _winner_snapshot(phase_name, winner, experiment=experiment, ledger=ledger)
             for phase_name, winner in engine_winners.items()
         ]
     else:
-        status, winner_views = read_result(experiment, generation_id=generation_id)
-        winner_snapshots = [_winner_snapshot(winner.phase, winner) for winner in winner_views]
+        status, winner_views = read_result(experiment, generation_id=generation_id, ledger=ledger)
+        winner_snapshots = [
+            _winner_snapshot(winner.phase, winner, experiment=experiment, ledger=ledger)
+            for winner in winner_views
+        ]
     if not generation_claimed:
         status["represented_generation_id"] = None
     snapshot = RunResultSnapshot(

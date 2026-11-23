@@ -13,7 +13,6 @@ import logging
 import math
 import os
 import select
-import signal
 import subprocess
 import sys
 import time
@@ -25,7 +24,7 @@ from typing import IO, Any
 from phasesweep.errors import OperatorAction, PhaseSweepError, UnsafeProcessCleanupError
 from phasesweep.runtime import supervisor as _supervisor
 from phasesweep.runtime.files import atomic_write_text
-from phasesweep.runtime.json import strict_json_loads
+from phasesweep.runtime.json import finite_nonnegative, strict_json_loads
 from phasesweep.runtime.reaper import (
     _KILL_GRACE_SECONDS,
     PROCESS_IDENTITY_FILE,
@@ -33,11 +32,13 @@ from phasesweep.runtime.reaper import (
     StaleProcessIdentity,
     _process_group_alive,
     _terminate_process_groups,
+    guardian_exit_timeout,
     read_boot_id,
     read_pid_namespace,
     read_proc_starttime,
 )
 from phasesweep.runtime.shutdown import (
+    TRAINER_LABEL,
     PhaseSweepShutdown,
     ShutdownLaunchRefusedError,
     _launch_lock,
@@ -49,10 +50,12 @@ from phasesweep.runtime.shutdown import (
 
 log = logging.getLogger("phasesweep.runtime.process")
 
+# How a trial's failure reason begins when the trainer is killed at its per-trial timeout.
+# ``engine.optuna`` matches a recorded reason on this prefix to tell a timed-out phase from
+# a crashed one, so the wording lives here once.
+TIMEOUT_REASON_PREFIX = "timeout after "
+
 _DIRECT_CHILD_REAP_TIMEOUT_SECONDS = 5.0
-_GUARDIAN_EXIT_TIMEOUT_SECONDS = (
-    _supervisor._GROUP_TERM_GRACE_SECONDS + _DIRECT_CHILD_REAP_TIMEOUT_SECONDS
-)
 _SUPERVISOR_READY_TIMEOUT_SECONDS = 10.0
 # poll() takes its timeout as a C int of milliseconds, about 24.8 days, and a
 # trial timeout may be longer.
@@ -111,7 +114,7 @@ def _kill_group(pgid: int, proc: subprocess.Popen[bytes]) -> bool:
 
 
 def _wait_for_guardian_exit(proc: subprocess.Popen[bytes]) -> bool:
-    """Wait a bounded time for the GPU-lease guardian to exit.
+    """Wait :func:`~phasesweep.runtime.reaper.guardian_exit_timeout` for the GPU-lease guardian to exit.
 
     An uncertain group cleanup leaves the guardian holding its leases; a wait
     that expires must preserve that uncertainty.
@@ -119,14 +122,15 @@ def _wait_for_guardian_exit(proc: subprocess.Popen[bytes]) -> bool:
     :param subprocess.Popen[bytes] proc: Guardian process whose trainer-status pipe became ready or closed.
     :return bool: Whether the guardian exited inside its cleanup allowance.
     """
+    timeout = guardian_exit_timeout()
     try:
-        proc.wait(timeout=_GUARDIAN_EXIT_TIMEOUT_SECONDS)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         log.error(
             "Lease guardian PID %d did not finish descendant cleanup within %.1fs; "
             "returning cleanup uncertainty while it retains the GPU lease",
             proc.pid,
-            _GUARDIAN_EXIT_TIMEOUT_SECONDS,
+            timeout,
         )
         return False
     return True
@@ -147,6 +151,15 @@ def _abort_launch(proc: subprocess.Popen[bytes], pgid: int | None) -> bool:
     if pgid is not None:
         _unregister(pgid)
     return cleanup_confirmed
+
+
+def _guardian_return_code(proc: subprocess.Popen[bytes]) -> int:
+    """Return the guardian's exit status, read as a SIGKILL death when it was never reaped.
+
+    :param subprocess.Popen[bytes] proc: The lease guardian of a trial.
+    :return int: ``proc.returncode``, or ``-9`` while it is ``None``.
+    """
+    return proc.returncode if proc.returncode is not None else -9
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +237,7 @@ def _trial_process_identity(
     pid: int,
     pgid: int,
     pid_namespace: str,
+    guardian_pid: int,
 ) -> StaleProcessIdentity:
     """Build the identity persisted before a blocked supervisor may exec the trainer.
 
@@ -234,6 +248,7 @@ def _trial_process_identity(
     :param int pgid: Process-group ID that child was registered under.
     :param str pid_namespace: PID namespace ``pid`` and ``pgid`` are numbered in, from
         :func:`read_pid_namespace` before the launch.
+    :param int guardian_pid: Lease guardian PID in the same namespace.
     :return StaleProcessIdentity: The given fields combined with the current schema version,
         ``pid``'s kernel start time (``None`` if unreadable), and the current
         boot id (``None`` when unavailable).
@@ -246,6 +261,8 @@ def _trial_process_identity(
         proc_starttime=read_proc_starttime(pid),
         boot_id=read_boot_id(),
         pid_namespace=pid_namespace,
+        guardian_pid=guardian_pid,
+        guardian_starttime=read_proc_starttime(guardian_pid),
     )
 
 
@@ -262,7 +279,7 @@ def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
     )
 
 
-ATTEMPT_LIFECYCLE_FILE = "attempt_lifecycle.json"
+ATTEMPT_LIFECYCLE_FILE = _supervisor.ATTEMPT_LIFECYCLE_FILE
 ATTEMPT_LIFECYCLE_SCHEMA_VERSION = _supervisor.ATTEMPT_LIFECYCLE_SCHEMA_VERSION
 _ATTEMPT_LIFECYCLE_STATES = frozenset({"allocated", "launching", "terminating", "exited"})
 
@@ -272,9 +289,11 @@ class AttemptLifecycle:
     """Durable launch state for one attempt.
 
     ``allocated`` identifies a durable RUNNING trial before launch, possibly queued
-    for a GPU. ``launching`` is recorded before spawning, so a missing identity
-    then requires recovery. ``terminating`` preserves cancellation before the guardian
-    signals the trainer. ``exited`` confirms group cleanup before Optuna completion.
+    for a GPU. ``launching`` is recorded before spawning; the payload crosses only after
+    the identity file is written, so ``launching`` without one means no worker received
+    its payload and recovery settles it without signalling. ``terminating`` preserves
+    cancellation before the guardian signals the trainer. ``exited`` confirms group
+    cleanup before Optuna completion.
     """
 
     state: str
@@ -300,7 +319,7 @@ def write_attempt_lifecycle(
     :param str state: Allocated, launching, terminating, or exited lifecycle state.
     :param int | None return_code: Root return code or a guardian's nonzero cancellation code.
     :param bool | None cleanup_confirmed: Whether the whole process group was confirmed gone; false while cancellation is in progress.
-    :param float | None duration_seconds: Supervised elapsed time when the group exited.
+    :param float | None duration_seconds: Time to the root's own exit, or to cleanup after cancellation.
     :raises ValueError: ``state`` is not a known lifecycle state.
     :raises OSError: The record could not be written.
     """
@@ -358,16 +377,9 @@ def read_attempt_lifecycle(
     cleanup_confirmed = payload.get("cleanup_confirmed")
     if cleanup_confirmed is not None and not isinstance(cleanup_confirmed, bool):
         raise ValueError(f"Attempt lifecycle field 'cleanup_confirmed' is invalid at {path}.")
-    duration = payload.get("duration_seconds")
-    if duration is not None and (
-        isinstance(duration, bool) or not isinstance(duration, (int, float))
-    ):
-        raise ValueError(f"Attempt lifecycle field 'duration_seconds' is invalid at {path}.")
-    try:
-        valid_duration = duration is None or (math.isfinite(duration) and duration >= 0)
-    except OverflowError:
-        valid_duration = False
-    if not valid_duration:
+    recorded_duration = payload.get("duration_seconds")
+    duration = None if recorded_duration is None else finite_nonnegative(recorded_duration)
+    if recorded_duration is not None and duration is None:
         raise ValueError(f"Attempt lifecycle field 'duration_seconds' is invalid at {path}.")
     return AttemptLifecycle(
         state=state,
@@ -544,6 +556,7 @@ def _spawn_blocked_supervisor(
     deadline: float | None = None,
     gpu_lease_fds: Collection[int] = (),
     lifecycle_args: tuple[str, str, str] | tuple[()] = (),
+    label: str,
 ) -> tuple[subprocess.Popen[bytes], int, int, int]:
     """Spawn and register a supervisor whose trainer waits for a launch payload.
 
@@ -556,6 +569,7 @@ def _spawn_blocked_supervisor(
     :param Collection[int] gpu_lease_fds: Host GPU-lock descriptors inherited only by the
         guardian, keeping leases held after an orchestrator exit until cleanup finishes.
     :param tuple[str, str, str] | tuple[()] lifecycle_args: Optional attempt directory, identity, and monotonic start.
+    :param str label: What the interrupt line calls the registered group.
     :raises _LaunchDeadlineExpired: Readiness exceeded the launch deadline; the group was
         aborted and the exception carries cleanup confirmation.
     :raises RuntimeError: Supervisor readiness timed out or returned an invalid ready frame
@@ -565,8 +579,10 @@ def _spawn_blocked_supervisor(
         status_read)``: guardian process, registered trainer group, launch pipe and status
         pipe. The caller owns both descriptors; after persisting trainer identity, send the
         framed payload and close ``ack_write``. ``status_read`` yields ``b"X"`` when the
-        trainer root exits, then ``b"D"`` if descendants were reaped or EOF otherwise.
-        Cleanup after ``b"X"`` is outside the trainer wallclock budget.
+        trainer root exits, then ``b"D"`` and the survivors' descriptions in one write if
+        group members or adopted descendants outlived the helper settle and were
+        terminated, or EOF otherwise.
+        The settle and cleanup after ``b"X"`` are outside the trainer wallclock budget.
     """
     ready_read, ready_write = os.pipe()
     ack_read, ack_write = os.pipe()
@@ -618,7 +634,7 @@ def _spawn_blocked_supervisor(
         if trainer_pid <= 0:
             raise RuntimeError("trial supervisor reported an invalid trainer PID")
         pgid = trainer_pid
-        _register(proc, pgid=pgid)
+        _register(proc, label=label, pgid=pgid)
         status_read = ready_read
         ready_read = -1
         return proc, pgid, ack_write, status_read
@@ -655,13 +671,15 @@ def run_supervised(
     wallclock_deadline: float | None = None,
     cwd: str | None = None,
     gpu_lease_fds: Collection[int] = (),
+    label: str = TRAINER_LABEL,
 ) -> ProcessResult:
     """Launch a shell command in its own process group with durable ownership.
 
     Persist identity before delivering the trainer payload; earlier EOF prevents execution.
-    Identity files remain; ``exited`` requires confirmed cleanup. Surviving descendants cause
-    failure and termination even if their root succeeded. The guardian holds GPU leases
-    until the entire group is gone, independently of the trainer's file descriptors.
+    Identity files remain; ``exited`` requires confirmed cleanup. Descendants still running
+    once the helper settle after root exit ends cause failure and termination even if their
+    root succeeded. The guardian holds GPU leases until the entire group and every
+    descendant it adopted are gone, independently of the trainer's file descriptors.
 
     The earlier timeout or absolute deadline covers launch and execution; cleanup is
     outside that budget. Expected post-spawn deadline, identity-write and payload failures
@@ -677,6 +695,8 @@ def run_supervised(
     :param float | None wallclock_deadline: Absolute ``time.monotonic()`` phase/run deadline.
     :param str | None cwd: Trainer working directory; ``None`` retains invocation cwd.
     :param Collection[int] gpu_lease_fds: GPU-lock descriptors inherited by the guardian alone.
+    :param str label: What the interrupt line calls this process while it runs, defaults to a
+        trial; a worker passes what it is doing for the run, such as ``MLflow request``.
     :raises PhaseSweepError: PID namespace is unreadable; nothing is recorded or launched.
     :raises ShutdownLaunchRefusedError: Shutdown blocks launch; the attempt is recorded exited.
     :raises RuntimeError: Supervisor readiness failed before creating a process group.
@@ -695,7 +715,7 @@ def run_supervised(
     timeout_reason = (
         "phase/run wallclock deadline exceeded"
         if timeout_capped_by_wallclock
-        else f"timeout after {timeout}s"
+        else f"{TIMEOUT_REASON_PREFIX}{timeout}s"
     )
 
     # Defer signals before taking the launch lock, and release it before unmasking.
@@ -710,8 +730,7 @@ def run_supervised(
     pid_namespace = read_pid_namespace()
     if pid_namespace is None:
         raise PhaseSweepError(
-            "cannot read this process's host PID namespace. Refused to launch a trial "
-            "whose process identity could not be tied to it.",
+            "cannot launch a trial: this process's host PID namespace cannot be read.",
             action=OperatorAction.FIX_CONFIG,
         )
 
@@ -723,8 +742,9 @@ def run_supervised(
             signum = servicing_shutdown_signal()
             if signum is not None:
                 raise ShutdownLaunchRefusedError(signum)
-            # Persist launching before Popen so missing identity requires recovery rather
-            # than being mistaken for a worker still queued for a GPU.
+            # Persist launching before Popen. Until the identity below is written no
+            # payload has crossed, so recovery settles launching without an identity
+            # without signalling; once it exists, recovery must validate and clean it.
             write_attempt_lifecycle(
                 trial_dir,
                 attempt_id=attempt_id,
@@ -736,12 +756,14 @@ def run_supervised(
                 deadline=deadline,
                 gpu_lease_fds=gpu_lease_fds,
                 lifecycle_args=(str(trial_dir), attempt_id, str(started)),
+                label=label,
             )
             identity = _trial_process_identity(
                 attempt_id=attempt_id,
                 pid=pgid,
                 pgid=pgid,
                 pid_namespace=pid_namespace,
+                guardian_pid=proc.pid,
             )
             _write_process_identity(identity_path, identity)
             if deadline is not None and time.monotonic() >= deadline:
@@ -773,8 +795,7 @@ def run_supervised(
             # the supervisor is still blocked on its ack pipe; kill and reap it here.
             cleanup_confirmed = _abort_launch(proc, pgid)
             pid = pgid if pgid is not None else proc.pid
-            if proc.returncode is not None:
-                return_code = proc.returncode
+            return_code = _guardian_return_code(proc)
         if cleanup_confirmed:
             _record_attempt_exited(trial_dir, attempt_id=attempt_id, return_code=return_code)
         log.warning(
@@ -840,7 +861,7 @@ def run_supervised(
             _record_attempt_exited(
                 trial_dir,
                 attempt_id=attempt_id,
-                return_code=proc.returncode if proc.returncode is not None else -9,
+                return_code=_guardian_return_code(proc),
             )
         if control_flow_exception:
             if not cleanup_confirmed:
@@ -851,7 +872,7 @@ def run_supervised(
             raise
         duration = time.monotonic() - started
         return ProcessResult(
-            return_code=proc.returncode if proc.returncode is not None else -9,
+            return_code=_guardian_return_code(proc),
             timed_out=False,
             pid=pgid if pgid is not None else proc.pid,
             duration_seconds=duration,
@@ -867,6 +888,10 @@ def run_supervised(
     timed_out = False
     failure_reason: str | None = None
     cleanup_confirmed = True
+    # The root-exit byte ends the trial's time. The guardian sends it as soon as a root exits
+    # by itself, so the settle and cleanup after that stay teardown, as in its own record; it
+    # sends it after confirmed cleanup when it cancelled the root.
+    root_exited: float | None = None
 
     try:
         root_status: bytes | None
@@ -882,17 +907,22 @@ def run_supervised(
         if root_status is None and deadline is not None and time.monotonic() >= deadline:
             timed_out = True
             failure_reason = timeout_reason
-            log.warning("Process PID %d (pgid %d) timed out — terminating group", pgid, pgid)
+            # The caller reports the timeout in its own words (a trial's reason, a tracker
+            # that did not answer), so this line is for run.log.
+            log.info("Process PID %d (pgid %d) timed out — terminating group", pgid, pgid)
             cleanup_confirmed = _kill_group(pgid, proc)
         else:
-            # The trainer root exited within its budget. Descendant cleanup is
-            # lifecycle teardown, so the guardian's SIGTERM/SIGKILL grace must
-            # not retroactively turn this into a wallclock timeout.
+            # The trainer root exited within its budget. The helper settle and
+            # descendant cleanup are lifecycle teardown, so the guardian's waits
+            # must not retroactively turn this into a wallclock timeout.
+            if root_status == _supervisor._TRAINER_ROOT_EXITED:
+                root_exited = time.monotonic()
             guardian_exited = _wait_for_guardian_exit(proc)
             guardian_status = None
             if guardian_exited:
+                # The guardian has exited, so its one survivor frame is complete.
                 guardian_status = (
-                    os.read(status_read, 1)
+                    os.read(status_read, 4096)
                     if root_status == _supervisor._TRAINER_ROOT_EXITED
                     else root_status
                 )
@@ -904,17 +934,28 @@ def run_supervised(
                     f"trainer root exited, but lease guardian {proc.pid} could not "
                     "confirm descendant cleanup within its bounded allowance"
                 )
-            if guardian_status == _supervisor._DESCENDANTS_REAPED:
-                failure_reason = (
-                    f"trainer root exited, but process group {pgid} still had live descendants. "
-                    "Make the trainer wait for its children before exiting"
-                )
-                log.warning(
-                    "Trainer root PID %d exited but process group %d "
-                    "still had live descendants; the lease guardian terminated them",
+            if guardian_status is not None and guardian_status.startswith(
+                _supervisor._DESCENDANTS_REAPED
+            ):
+                settle = _supervisor._HELPER_SETTLE_SECONDS
+                survivors = guardian_status[1:].decode("ascii", "replace")
+                # run.log keeps the names. After a crash the trial reports the crash
+                # itself; after exit 0 the trial line carries the names as its reason.
+                log.info(
+                    "Trainer root PID %d exited with code %s but the trainer still had "
+                    "live descendants %gs later (%s); the lease guardian terminated them",
                     pgid,
-                    pgid,
+                    proc.returncode,
+                    settle,
+                    survivors or "members could not be named",
                 )
+                if proc.returncode == 0:
+                    named = f": {survivors}" if survivors else ""
+                    failure_reason = (
+                        "trainer root exited with code 0, but the trainer still had live "
+                        f"descendants {settle:g}s later{named}. They were terminated. Make "
+                        "the trainer wait for its children before exiting."
+                    )
             # Root exit is insufficient: surviving descendants still require group cleanup.
             if failure_reason is None and _process_group_alive(pgid):
                 failure_reason = (
@@ -932,7 +973,7 @@ def run_supervised(
                     trial_dir,
                     attempt_id=attempt_id,
                     state="terminating",
-                    return_code=-signal.SIGTERM,
+                    return_code=_supervisor._TERMINATING_RETURN_CODE,
                     cleanup_confirmed=False,
                 )
                 cleanup_confirmed = _kill_group(pgid, proc)
@@ -968,7 +1009,7 @@ def run_supervised(
             _record_attempt_exited(
                 trial_dir,
                 attempt_id=attempt_id,
-                return_code=proc.returncode if proc.returncode is not None else -9,
+                return_code=_guardian_return_code(proc),
             )
         except Exception:
             log.exception(
@@ -989,12 +1030,12 @@ def run_supervised(
         _record_attempt_exited(
             trial_dir,
             attempt_id=attempt_id,
-            return_code=proc.returncode if proc.returncode is not None else -9,
+            return_code=_guardian_return_code(proc),
         )
 
-    duration = time.monotonic() - started
+    duration = (time.monotonic() if root_exited is None else root_exited) - started
     return ProcessResult(
-        return_code=proc.returncode if proc.returncode is not None else -9,
+        return_code=_guardian_return_code(proc),
         timed_out=timed_out,
         pid=pgid,
         duration_seconds=duration,

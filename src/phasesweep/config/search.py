@@ -18,7 +18,7 @@ from phasesweep.config.common import (
     _Frozen,
     _require_finite,
 )
-from phasesweep.errors import NEW_STUDY_STEP
+from phasesweep.runtime.terminal import plural
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Phase
@@ -60,8 +60,7 @@ def _validate_optuna_integer_domain(low: int, high: int) -> None:
     if low < -_OPTUNA_EXACT_INT_LIMIT or high > _OPTUNA_EXACT_INT_LIMIT:
         raise ValueError(
             "numeric integer search bounds must stay within "
-            f"[{-_OPTUNA_EXACT_INT_LIMIT}, {_OPTUNA_EXACT_INT_LIMIT}] so every "
-            "value can round-trip exactly through Optuna; use categorical choices "
+            f"[{-_OPTUNA_EXACT_INT_LIMIT}, {_OPTUNA_EXACT_INT_LIMIT}]; use categorical choices "
             "for larger integers"
         )
 
@@ -338,15 +337,13 @@ def sampler_warnings(phase: Phase) -> list[str]:
     if sampler.type == "tpe" and phase_draws(phase) and phase.n_trials <= sampler.n_startup_trials:
         warnings.append(
             f"Phase {phase.name!r}: tpe with n_trials={phase.n_trials} <= "
-            f"n_startup_trials={sampler.n_startup_trials}, so every trial is sampled at random "
-            "and TPE never fits its model. Use sampler.type: random with a seed (same "
-            "coverage), or set sampler.n_startup_trials below n_trials."
+            f"n_startup_trials={sampler.n_startup_trials} samples every trial at random; set "
+            "sampler.n_startup_trials below n_trials."
         )
     if sampler.type in ("tpe", "cmaes") and phase_draws(phase) and phase.n_jobs > 1:
         warnings.append(
             f"Phase {phase.name!r}: parallel {sampler.type} suggestions depend on trial "
-            "completion order and are not reproducible even with sampler.seed. "
-            "Set sampler.seed and use n_jobs: 1 for reproducible draws given the same trial values."
+            "completion order, so they are not reproducible; use n_jobs: 1 with sampler.seed."
         )
     repeats = phase.repeats
     if (
@@ -359,10 +356,8 @@ def sampler_warnings(phase: Phase) -> list[str]:
         count = len(repeats.values)
         warnings.append(
             f"Phase {phase.name!r}: max_consecutive_failures={phase.max_consecutive_failures} "
-            f"<= {count} repeats.values, so one configuration that fails on every repeat value "
-            "can abort the phase by itself; under grid and seeded random its repeats run back to "
-            "back. "
-            f"Set max_consecutive_failures above {count}."
+            f"<= {count} repeats.values, so one failing configuration can abort the phase by "
+            f"itself. Set max_consecutive_failures above {count}."
         )
     return warnings
 
@@ -433,10 +428,9 @@ def search_space_warnings(phase: Phase) -> list[str]:
             shown.append(f"and {len(numeric) - _MAX_REPORTED_CHOICES} more")
         warnings.append(
             f"Phase {phase.name!r}: search_space {key!r} has categorical choices that load as "
-            f"strings, not numbers: {', '.join(shown)}. YAML 1.1 leaves an exponent without a "
-            "decimal point and sign as text (so does a quoted number), and the trainer "
-            f"receives a string. Write {numeric[0].strip()} as {_numeric_spellings(numeric[0])}, "
-            "and the rest likewise, or ignore this if the strings are intended."
+            f"strings, not numbers: {', '.join(shown)} (YAML 1.1 reads an exponent without a "
+            "decimal point and sign as text). Write "
+            f"{numeric[0].strip()} as {_numeric_spellings(numeric[0])}, and the rest likewise."
         )
     return warnings
 
@@ -490,17 +484,16 @@ def fixed_configuration_target_refusal(
         return (
             f"Phase {name!r} is a fixed configuration that already has a COMPLETE or "
             f"INFEASIBLE trial; n_trials={target} would run the same configuration again.",
-            f"Keep n_trials at {finished}, or use repeats to measure seed noise.",
+            f"Keep n_trials at {finished}.",
         )
     if finished == 0:
         return (
             f"Phase {name!r}: n_trials={target} with an empty search_space would run {target} "
             "identical trials.",
-            "Use n_trials: 1 for a fixed configuration, or repeats to measure seed noise.",
+            "Use n_trials: 1.",
         )
-    plural = "" if finished == 1 else "s"
     return (
-        f"Phase {name!r} is a fixed configuration with {finished} failed attempt{plural} and "
+        f"Phase {name!r} is a fixed configuration with {plural(finished, 'failed attempt')} and "
         "no completed one; raising n_trials retries it one attempt at a time.",
         f"Use n_trials at most {finished + 1}, not {target}.",
     )
@@ -517,37 +510,51 @@ def grid_cardinality(phase: Phase) -> int:
     )
 
 
-def grid_target_refusal(
-    phase: Phase, *, finished: int, measured: int, has_study: bool
-) -> tuple[str, str] | None:
+def _repeat_note(phase: Phase, cardinality: int) -> str:
+    """Break a repeats grid's cell count into configurations and repeats.
+
+    :param Phase phase: Grid phase whose cells are counted.
+    :param int cardinality: The grid's cell count, repeat axis included.
+    :return str: ``" (2 configurations x 3 repeats)"``, or an empty string without repeats.
+    """
+    if phase.repeats is None:
+        return ""
+    repeats = len(phase.repeats.values)
+    return f" ({cardinality // repeats} configurations x {repeats} repeats)"
+
+
+def grid_target_refusal(phase: Phase, *, finished: int, measured: int) -> tuple[str, str] | None:
     """Refuse a grid target above the ceiling :func:`retry_target_ceiling` allows.
 
     Finished failures remain spent. Raising the target may retry each failed
     cell once, or visit an unvisited cell; a completed cell is closed even if
-    its metric was infeasible.
+    its metric was infeasible. With nothing finished there are no failures to count or retry,
+    so the diagnosis says only that the target exceeds the grid's cells. A larger grid is a
+    changed search space, which the study's fingerprint refusal answers with its own step.
 
     :param Phase phase: Phase whose target is checked.
     :param int finished: Finished attempts, excluding interruptions.
     :param int measured: Grid cells whose trial is COMPLETE, in bounds or not.
-    :param bool has_study: Whether a recorded study binds the search space, so that
-        enlarging the grid needs a new study; a config that never ran has none.
     :return tuple[str, str] | None: Refusal diagnosis and remedy when the target exceeds the available cells.
     """
     maximum = retry_target_ceiling(phase, finished=finished, measured=measured)
     if phase.sampler.type != "grid" or maximum is None or phase.n_trials <= maximum:
         return None
     cardinality = grid_cardinality(phase)
-    remedy = (
-        f"Set phases[{phase.name}].n_trials to at most {maximum}. "
-        "To enlarge the grid instead, change the search space."
-    )
+    repeat_note = _repeat_note(phase, cardinality)
+    remedy = f"Set phases[{phase.name}].n_trials to at most {maximum}."
+    if finished == 0:
+        return (
+            f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid cardinality "
+            f"{cardinality}{repeat_note}.",
+            remedy,
+        )
     return (
         f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid's available "
-        f"attempts: {finished} finished attempt{'s' if finished != 1 else ''} and "
-        f"{measured} COMPLETE or INFEASIBLE cell{'s' if measured != 1 else ''} "
-        f"in a {cardinality}-cell grid allow at most {maximum}. Raising n_trials retries "
-        "failed cells once each; COMPLETE and INFEASIBLE cells are never repeated.",
-        f"{remedy} {NEW_STUDY_STEP}" if has_study else remedy,
+        f"attempts: {plural(finished, 'finished attempt')} and "
+        f"{plural(measured, 'COMPLETE or INFEASIBLE cell')} "
+        f"in a {cardinality}-cell grid{repeat_note} allow at most {maximum}.",
+        remedy,
     )
 
 
@@ -576,9 +583,8 @@ def _validate_sampler_search_space(phase: Phase, *, persistent: bool = False) ->
     if phase.allow_partial_grid and sampler_type != "grid":
         raise ValueError(
             f"Phase {phase.name!r}: allow_partial_grid: true applies only to "
-            f"sampler.type='grid', but this phase uses sampler.type={sampler_type!r}, "
-            "which would silently ignore it. Remove allow_partial_grid or set "
-            "sampler.type: grid."
+            f"sampler.type='grid', but this phase uses sampler.type={sampler_type!r}. "
+            "Remove allow_partial_grid."
         )
     if phase.repeats is not None:
         _validate_repeat_sampling(phase, phase.repeats, persistent=persistent)
@@ -596,23 +602,16 @@ def _validate_sampler_search_space(phase: Phase, *, persistent: bool = False) ->
         except ImportError as exc:
             raise ValueError(
                 f"Phase {phase.name!r}: sampler.type='cmaes' requires the "
-                "'cmaes' package, which is not installed. Reinstall phasesweep "
-                "or install it directly with `pip install cmaes`."
+                "'cmaes' package, which is not installed. Install it with `pip install cmaes`."
             ) from exc
 
     if sampler_type == "grid" and phase_draws(phase):
         cardinality = grid_cardinality(phase)
-        repeat_note = (
-            ""
-            if phase.repeats is None
-            else f" ({cardinality // len(phase.repeats.values)} configurations x "
-            f"{len(phase.repeats.values)} repeats)"
-        )
-        if phase.n_trials > cardinality and not persistent:
-            raise ValueError(
-                f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid "
-                f"cardinality {cardinality}{repeat_note}."
-            )
+        repeat_note = _repeat_note(phase, cardinality)
+        if not persistent:
+            refusal = grid_target_refusal(phase, finished=0, measured=0)
+            if refusal is not None:
+                raise ValueError(" ".join(refusal))
         if not phase.allow_partial_grid and phase.n_trials < cardinality:
             remedy = (
                 "increase n_trials or set allow_partial_grid: true."
@@ -650,17 +649,12 @@ def _validate_repeat_sampling(phase: Phase, repeats: Repeats, *, persistent: boo
         )
         raise ValueError(
             f"Phase {phase.name!r}: repeats needs sampler.type grid, or sampler.type random "
-            f"with a seed, and this phase uses {spelled}. Only those two keep every "
-            "configuration's repeats together: grid runs each configuration once per repeat "
-            "value, and seeded random draws each configuration once and runs it once per "
-            "repeat value."
+            f"with a seed; this phase uses {spelled}."
         )
     if phase.allow_partial_grid:
         raise ValueError(
-            f"Phase {phase.name!r}: allow_partial_grid cannot be combined with repeats. A grid "
-            "with repeats requires a target covering the full configuration x repeat matrix. "
-            "To run a subset of configurations with all their repeats, use "
-            "sampler.type random with a seed."
+            f"Phase {phase.name!r}: allow_partial_grid cannot be combined with repeats; for a "
+            "subset of configurations use sampler.type random with a seed."
         )
     if (
         not phase.search_space
@@ -736,8 +730,8 @@ def _grid_value_counts(
                     f"Phase {phase_name!r}: grid float param {name!r} collapses to "
                     f"{unique} unique value(s) instead of {count} after rounding "
                     f"to 12 decimal places (low={param.low}, high={param.high}, "
-                    f"step={param.step}). Rescale the parameter — sweep an exponent or "
-                    "a multiplier — so adjacent grid points differ by more than 1e-12."
+                    f"step={param.step}). Rescale it so adjacent grid points differ by more "
+                    "than 1e-12."
                 )
             origin = Fraction(str(param.low))
             spacing = Fraction(str(param.step))

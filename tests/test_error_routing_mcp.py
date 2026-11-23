@@ -374,7 +374,7 @@ CASES = (
         trigger=_recover_while_locked,
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
-        message="Another phasesweep process appears to be using the same experiment backend",
+        message="Another phasesweep process holds the lock experiment",
     ),
     RoutingCase(
         # Composed: the inbound refusal is a ValueError carrying no action, so the
@@ -383,7 +383,7 @@ CASES = (
         trigger=_recover_over_unmarked_state,
         raised=RunRecoveryError,
         action=OperatorAction.FRESH_NAMESPACE,
-        message="use a fresh MCP state directory",
+        message="durable run data has no format marker",
     ),
     RoutingCase(
         # Composed: a path with no run-store layout is a wrong argument, even
@@ -392,7 +392,7 @@ CASES = (
         trigger=_recover_from_mistyped_state_dir,
         raised=RunRecoveryError,
         action=OperatorAction.FIX_CONFIG,
-        message="Pass the state_dir from the catalog the MCP server runs with.",
+        message="not an existing MCP state directory; expected directories are missing",
     ),
     RoutingCase(
         id="recover_run_shared_state_dir",
@@ -428,7 +428,7 @@ CASES = (
         trigger=_recover_over_malformed_registry_entry,
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        message="Look up pgid in the process_identity.json in the directory under",
+        message="Read pgid from the process_identity.json in the directory under",
     ),
     RoutingCase(
         # Composed: the claim path routes this refusal to fixing the config,
@@ -468,7 +468,7 @@ CASES = (
         trigger=_recover_unsettled_launch,
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
-        message="The run remains reserved.",
+        message="The run stays reserved",
     ),
     # recover-run raises every RunRecoveryError itself, so none may route back
     # to it by default; only a confirmed run's own remedy names it.
@@ -623,8 +623,8 @@ def test_surviving_runner_refusal_names_the_runner_and_the_host_step(
         assert "`runner.py --run-id wrap-recover` line of `pgrep -af wrap-recover`" in step
         assert "runner PID" not in step
     assert ("cancel_run" in step) is runner_is_live
-    assert "is still running on the host, clear the cause there" in step
-    assert "uninterruptible I/O ignores SIGKILL until the I/O ends" in step
+    assert "is still running on the host, clear what blocks SIGKILL" in step
+    assert "uninterruptible I/O ignores it" in step
     assert step in _operational_error_text(excinfo.value)
 
 

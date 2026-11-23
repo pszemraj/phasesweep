@@ -511,8 +511,9 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
 ) -> None:
     """A successful run's result is frozen even if studies became unloadable.
 
-    The one tolerant read replays a journal snapshot through ``optuna.load_study``,
-    so exactly one load succeeds and any reload after it fails.
+    The tolerant status read replays a journal snapshot through ``optuna.load_study``, so
+    exactly one load succeeds and any reload after it fails: the read of the winner's trials
+    for the advice recomputed at read, which is then unavailable instead of failing capture.
     """
     experiment = make_experiment(
         persistent=tmp_path, trainer=write_constant_trainer(tmp_path), n_trials=1
@@ -536,8 +537,8 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
         return real_load_study(*args, **kwargs)
 
     # Patched on Optuna itself rather than on a PhaseSweep helper, so no
-    # import binding can hide a study reload from this test. Every remaining
-    # storage read must be the tolerant one read_status performs.
+    # import binding can hide a study reload from this test. The status read
+    # and the winner's trial read are the only storage reads.
     monkeypatch.setattr(optuna, "load_study", fail_on_reload)
 
     snapshot = mcp_runner.capture_result_snapshot(
@@ -546,7 +547,7 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
         engine_winners=report.winners,
     )
 
-    assert loads == 1
+    assert loads == 2
     phase = snapshot["status"]["phases"][0]
     assert phase["trial_data_available"] is True
     assert phase["running_attempts"] == []
@@ -555,6 +556,7 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
     assert frozen["phase"] == "p"
     assert frozen["metric"] == report.winners["p"].metric
     assert frozen["trial_number"] == report.winners["p"].trial_number
+    assert (frozen["edge_advisory"], frozen["edge_advisory_status"]) == (None, "unavailable")
 
     status_path = tmp_path / "status.json"
     mcp_runner._write_status(
@@ -671,6 +673,18 @@ def _engine_winner(
     )
 
 
+def test_snapshot_refuses_an_engine_winner_without_confound_verdicts(tmp_path: Path) -> None:
+    """A winner that carries no confound block cannot be frozen, so no verdict is invented."""
+    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
+    winner = _engine_winner(1)
+    winner.confound = None
+
+    with pytest.raises(RuntimeError, match="missing confound verdicts"):
+        mcp_runner.capture_result_snapshot(
+            experiment, generation_id="engine-generation", engine_winners={"p": winner}
+        )
+
+
 def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path) -> None:
     """Engine winners freeze without rereading files; observed values survive the stored view."""
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
@@ -755,6 +769,40 @@ def test_snapshot_freezes_the_repeats_summary_without_config_strings(tmp_path: P
     assert phase["repeats"] == expected
 
 
+def test_snapshot_carries_the_pooled_noise_band_of_a_group_tie(tmp_path: Path) -> None:
+    """An agent reads the band a within-noise count was judged against: pooled sd and its df."""
+    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
+    winner = _engine_winner(1)
+    winner.confound = {
+        **single_trial_confound(1),
+        "ranked_trials": [0, 1, 2, 3],
+        "ranked_groups": [[0, 1], [2, 3]],
+        "checks": {
+            **single_trial_confound(1)["checks"],
+            "tie": {
+                "verdict": "heterogeneous",
+                "detail": {"tied_trials": [], "within_noise": [3], "pooled_sd": 0.05, "df": 2},
+            },
+        },
+    }
+
+    snapshot = mcp_runner.capture_result_snapshot(
+        experiment, generation_id="engine-generation", engine_winners={"p": winner}
+    )
+
+    (frozen,) = snapshot["winners"]
+    assert frozen["confound"]["tie"] == {
+        "verdict": "heterogeneous",
+        "remedy": None,
+        "tied_trials": 0,
+        "within_noise": 1,
+        "pooled_sd": 0.05,
+        "df": 2,
+    }
+    stored = RunResultSnapshot.model_validate(snapshot)
+    assert stored.winners[0].confound.tie.df == 2
+
+
 @pytest.mark.parametrize("from_phase", [None, "b"])
 @pytest.mark.integration
 def test_failed_fingerprint_preflight_preserves_published_results(
@@ -808,7 +856,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
             )
         )
 
-    with pytest.raises(RuntimeError, match="different phase config"):
+    with pytest.raises(RuntimeError, match="different config"):
         run_experiment(
             changed,
             from_phase=from_phase,

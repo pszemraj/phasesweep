@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from phasesweep.runtime.json import json_text, json_text_list, progress_position
+from phasesweep.runtime.json import finite_nonnegative, json_text, json_text_list
 from phasesweep.runtime.remote_worker import report_reserve, run_worker
 
 _HistoryRead = Literal["settled", "lagging", "retry"]
@@ -85,6 +85,9 @@ class WandbMissingKeysError(RuntimeError):
     available: list[str]
 
 
+WANDB_SDK_MISSING = 'W&B evidence requires the optional SDK: pip install "phasesweep[wandb]".'
+
+
 def require_wandb_sdk() -> None:
     """Check the optional SDK without authenticating or making a network request.
 
@@ -95,11 +98,7 @@ def require_wandb_sdk() -> None:
     except ImportError as exc:
         from phasesweep.errors import OperatorAction, PhaseSweepError
 
-        raise PhaseSweepError(
-            "W&B evidence requires the optional SDK in the PhaseSweep environment. "
-            'Install this distribution with its wandb extra: pip install "phasesweep[wandb]".',
-            action=OperatorAction.FIX_CONFIG,
-        ) from exc
+        raise PhaseSweepError(WANDB_SDK_MISSING, action=OperatorAction.FIX_CONFIG) from exc
 
 
 def _error_chain(exc: BaseException) -> Iterable[BaseException]:
@@ -288,9 +287,7 @@ def poll_wandb_summary(
     if response.get("status") == "invalid_evidence":
         raise ValueError(response["cause"])
     if response.get("status") == "import_error":
-        raise ImportError(
-            "W&B SDK is unavailable in the supervised worker; install phasesweep[wandb]."
-        )
+        raise ImportError(WANDB_SDK_MISSING)
     # A complete response was captured before the deadline, even if worker exit timed out.
     if response.get("status") != "summary":
         if result.timed_out or response.get("status") == "timeout" or time.monotonic() >= deadline:
@@ -379,7 +376,7 @@ def locate_wandb_position(
     )
     if result.timed_out or response.get("status") != "position":
         return None
-    return progress_position(response.get("value"))
+    return finite_nonnegative(response.get("value"))
 
 
 def _history_position(
@@ -415,7 +412,7 @@ def _history_position(
     """
     from phasesweep.evidence.evaluation import json_float
 
-    last_step = progress_position(summary.get("_step"))
+    last_step = finite_nonnegative(summary.get("_step"))
     if last_step is None:
         return "settled", None
     head, dot, aggregation = metric_key.rpartition(".")
@@ -451,10 +448,10 @@ def _history_position(
                 continue
             read += 1
             if series != metric_key:
-                position = progress_position(row.get(axis))
+                position = finite_nonnegative(row.get(axis))
                 continue
             final_value = None
-            final_position = progress_position(row.get(axis))
+            final_position = finite_nonnegative(row.get(axis))
             try:
                 logged = json_float(row[series], label=series)
             except ValueError:

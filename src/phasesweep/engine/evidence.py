@@ -33,9 +33,12 @@ from phasesweep.errors import (
     OTHER_FORMAT_STEP,
     OperatorAction,
     format_mismatch,
+    short_digest,
 )
 from phasesweep.evidence.evaluation import (
     EVIDENCE_PROVENANCE_SCHEMA_VERSION,
+    OutsideAttemptError,
+    attempt_file,
     extractor_config_fingerprint,
     json_float,
 )
@@ -51,7 +54,7 @@ from phasesweep.runtime.commands import TRAINER_INPUT_FILENAMES
 from phasesweep.runtime.files import (
     file_sha256,
 )
-from phasesweep.runtime.json import progress_position
+from phasesweep.runtime.json import finite_nonnegative
 from phasesweep.runtime.process import (
     read_attempt_lifecycle,
 )
@@ -272,7 +275,7 @@ def _valid_progress_record(record: object, *, nullable: bool) -> TypeGuard[Mappi
         return False
     if record["value"] is None:
         return nullable
-    return progress_position(record["value"]) is not None
+    return finite_nonnegative(record["value"]) is not None
 
 
 def _verify_objective_source_evidence(
@@ -284,8 +287,8 @@ def _verify_objective_source_evidence(
 ) -> None:
     """Verify the retained local source or the frozen remote capture.
 
-    Local records name a file in this trial tree. Remote records are validated
-    without contacting the service again.
+    Local records name a file that must resolve inside this attempt's directory, as
+    extraction required. Remote records are validated without contacting the service again.
 
     :param Path trial_dir: Structurally translated directory for the trial.
     :param Mapping[str, Any] | None provenance: Parsed objective provenance.
@@ -294,7 +297,8 @@ def _verify_objective_source_evidence(
         the recorded ``sha256``. Reserved for the winner (see
         :func:`_verify_winner_evidence`).
     :raises TrialEvidenceMissingError: The record is absent or malformed, or
-        its file source is missing, unreadable, or no longer the recorded bytes.
+        its file source is missing, unreadable, outside the attempt, or no longer the
+        recorded bytes.
     """
     if provenance is None:
         raise TrialEvidenceMissingError(f"{subject} has no objective provenance record.")
@@ -303,9 +307,14 @@ def _verify_objective_source_evidence(
     assert isinstance(source, Mapping)  # required by _validate_objective_provenance
     if source["kind"] in {"wandb", "mlflow"}:
         return
+    # _validate_objective_provenance refused any path but a trial-relative one.
     raw_path = str(source["path"])
-    candidate = Path(raw_path)
-    source_path = candidate if candidate.is_absolute() else trial_dir / candidate
+    try:
+        source_path = attempt_file(trial_dir, raw_path)
+    except OutsideAttemptError as exc:
+        raise TrialEvidenceMissingError(
+            f"{subject} recorded its objective evidence in {raw_path!r}, but {exc}"
+        ) from exc
     try:
         stat_result = source_path.stat()
     except OSError as exc:
@@ -332,8 +341,8 @@ def _verify_objective_source_evidence(
     if actual_digest != recorded_digest:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r} with sha256 "
-            f"{recorded_digest}, but that file now hashes to {actual_digest}: the bytes behind "
-            f"the published metric have changed."
+            f"{short_digest(recorded_digest)}, but that file now hashes to "
+            f"{short_digest(actual_digest)}: its bytes have changed."
         )
 
 
@@ -345,13 +354,14 @@ def _verify_trainer_input_evidence(
 ) -> None:
     """Verify the generated input recorded by a trial, independently of current config.
 
-    Require the versioned format/filename pair to identify a trial-relative file.
+    Require the versioned format/filename pair to identify a trial-relative file that
+    resolves inside the attempt directory.
 
     :param Path trial_dir: Structurally translated trial evidence directory.
     :param Any record: Raw ``TRAINER_INPUT_ATTR`` Optuna user attribute.
     :param str subject: Caller-built trial label for diagnostics.
     :raises TrialEvidenceMissingError: The record is absent or malformed, or
-        its exact file bytes are missing or changed.
+        its exact file bytes are missing, outside the attempt, or changed.
     """
     if not isinstance(record, Mapping):
         raise TrialEvidenceMissingError(
@@ -385,7 +395,12 @@ def _verify_trainer_input_evidence(
             f"{TRAINER_INPUT_ATTR!r} record."
         )
 
-    input_path = trial_dir / filename
+    try:
+        input_path = attempt_file(trial_dir, filename)
+    except OutsideAttemptError as exc:
+        raise TrialEvidenceMissingError(
+            f"{subject} recorded trainer input {filename!r}, but {exc}"
+        ) from exc
     if not input_path.is_file():
         raise TrialEvidenceMissingError(
             f"{subject} is missing its recorded trainer input {filename!r} under "
@@ -411,9 +426,9 @@ def _verify_trainer_input_evidence(
         ) from exc
     if actual_digest != recorded_digest:
         raise TrialEvidenceMissingError(
-            f"{subject} recorded trainer input {filename!r} with sha256 {recorded_digest}, "
-            f"but that file now hashes to {actual_digest}: the exact trainer input bytes "
-            f"have changed."
+            f"{subject} recorded trainer input {filename!r} with sha256 "
+            f"{short_digest(recorded_digest)}, but that file now hashes to "
+            f"{short_digest(actual_digest)}: its bytes have changed."
         )
 
 
@@ -530,9 +545,7 @@ def _verify_trial_evidence_dir(
         "config_sha256"
     ] != extractor_config_fingerprint(verification.extractor):
         raise TrialEvidenceMissingError(
-            f"{subject} objective evidence no longer matches its configured extractor "
-            "evaluation contract. The extractor configuration or evaluator revision "
-            "changed after this trial ran, or the saved provenance was altered.",
+            f"{subject} objective evidence no longer matches its configured extractor.",
             action=OperatorAction.FRESH_NAMESPACE,
             remediation=NEW_STUDY_STEP,
         )
@@ -562,11 +575,11 @@ def _verify_trial_evidence_dir(
     elif verification.mlflow_query is not None:
         from phasesweep.evidence.mlflow import observation_id
         from phasesweep.evidence.models import MlflowExtractor
-        from phasesweep.tracking.session import read_binding, read_record
+        from phasesweep.tracking.session import EXPECTED_BINDING_FILE, read_binding, read_record
 
         try:
             binding = read_binding(trial_dir)
-            expected = read_record(trial_dir / "mlflow-expected.json")
+            expected = read_record(trial_dir / EXPECTED_BINDING_FILE)
             if (
                 capture is None
                 or capture.get("kind") != "mlflow"

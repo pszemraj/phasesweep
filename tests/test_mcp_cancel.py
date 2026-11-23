@@ -5,6 +5,8 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
+import subprocess
+import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -54,6 +56,28 @@ from tests.recovery_helpers import (
     write_uncertain_failed_trial,
 )
 
+# Raises the reaper's guardian-exit margin before the MCP run store loads, then prints how far
+# the runner stop grace exceeds the allowance.
+_GRACE_PAST_A_RAISED_MARGIN = (
+    "from phasesweep.runtime import reaper\n"
+    "reaper._GUARDIAN_EXIT_MARGIN_SECONDS = 60.0\n"
+    "from phasesweep.mcp.runs import RUNNER_STOP_GRACE_SECONDS\n"
+    "print(RUNNER_STOP_GRACE_SECONDS - reaper.guardian_exit_timeout())\n"
+)
+
+
+def test_the_runner_stop_grace_outlasts_the_guardian_exit_allowance_by_a_margin() -> None:
+    """A cancelled runner gets the allowance it gives its guardians plus room for its own writes: 40 s at the guardian's timing, and more when the reaper's margin grows."""
+    assert mcp_runs.RUNNER_STOP_GRACE_SECONDS == 40.0
+    assert mcp_runs.RUNNER_STOP_GRACE_SECONDS - reaper.guardian_exit_timeout() > 0
+    raised = subprocess.run(
+        [sys.executable, "-c", _GRACE_PAST_A_RAISED_MARGIN],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert float(raised.stdout) > 0
+
 
 def test_cancel_refuses_unsettled_launch_without_runner_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -69,7 +93,7 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
     )
     store.create(pending)
 
-    with pytest.raises(RunLaunchUnsettledError, match="verified runner identity"):
+    with pytest.raises(RunLaunchUnsettledError, match="its runner identity"):
         app.cancel(pending.run_id)
 
     assert not store.cleanup_uncertain_path(pending.run_id).exists()
@@ -223,7 +247,7 @@ def test_cancel_requires_catalog_and_launch_time_permission(
     assert (
         f"To stop this run, the operator can check that `ps -p {handle.pid} -o args=` shows "
         f"`runner.py --run-id {run_id}`, then run `kill -TERM {handle.pid}` from a host shell. "
-        "The runner handles SIGTERM as cancellation. Do not retry."
+        "Do not retry."
     ) in str(denied.value)
 
 
@@ -361,8 +385,8 @@ def test_cancel_refusal_names_a_stop_route_only_it_can_give(
         assert "To stop this run" not in message
     else:
         assert (
-            f"find the PID of `runner.py --run-id {run_id}` in `ps -A -o pid=,args=`, "
-            "then run `kill -TERM PID` with that PID from a host shell."
+            f"find the PID of `runner.py --run-id {run_id}` in `ps -A -o pid=,args=` "
+            "and run `kill -TERM PID` from a host shell."
         ) in message
 
 
@@ -578,8 +602,8 @@ def test_cancel_cleanup_confirmation_policy(
             assert f"`pgrep -af {run_id}` from a host shell" in remedy
             assert str(handle.pid) not in remedy
             assert str(handle.pgid) not in remedy
-        assert "is still running on the host, clear the cause there" in remedy
-        assert "uninterruptible I/O ignores SIGKILL until the I/O ends" in remedy
+        assert "is still running on the host, clear what blocks SIGKILL" in remedy
+        assert "uninterruptible I/O ignores it" in remedy
         assert "cancel_run" not in remedy
         assert len(remedy.splitlines()) == 1
         for visibility in ("observable", "absent", "unobservable"):

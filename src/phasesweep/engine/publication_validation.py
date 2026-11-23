@@ -17,7 +17,7 @@ import phasesweep.engine.paths as path_ops
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
 from phasesweep.config.models import Experiment, Metric, _metric_semantics_payload
 from phasesweep.config.search import Repeats
-from phasesweep.engine.confound import _validate_confound_block
+from phasesweep.engine.confound import ConfoundBlock, _validate_confound_block
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.provenance import CodeRevision, _parse_code_revision
 from phasesweep.engine.repeats import RepeatsRecord, _check_repeats_axis, _validate_repeats_block
@@ -67,7 +67,7 @@ class ValidatedWinner:
     """The mapping decoded from ``content``."""
     metric: float
     source: WinnerSource
-    confound: Mapping[str, object]
+    confound: ConfoundBlock
     observed: dict[str, float]
     repeats: RepeatsRecord | None
 
@@ -195,18 +195,13 @@ def _generation_artifact_manifest(
 
 
 def _unreadable_artifact_permission_detail(subject: str) -> str:
-    """Describe an unreadable artifact by role, directing validation to its publishing user.
+    """Describe an unreadable artifact by role.
 
     :param str subject: Artifact that could not be read, named by role
         (e.g. ``"config_snapshot artifact"``), never by path.
     :return str: Bare reason clause for the caller's manifest-validation error.
     """
-    return (
-        f"{subject} is not readable as this user (permission denied): validation cannot run "
-        "without it, and a generation's config.snapshot.yaml is deliberately owner-only, so "
-        "only the publishing user can fully validate this tree -- re-read it as that user "
-        "before treating this publication as corrupt"
-    )
+    return f"{subject} is not readable as this user (permission denied)"
 
 
 def _validate_generation_manifest(

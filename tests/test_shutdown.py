@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -13,23 +14,28 @@ import time
 from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from phasesweep import run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.runtime import shutdown as runtime_shutdown
+from phasesweep.runtime.console import ConsoleHandler
 from phasesweep.runtime.process import ATTEMPT_LIFECYCLE_FILE, fd_ready, run_supervised
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     ShutdownLaunchRefusedError,
     SignalOwnershipUnavailableError,
+    _interrupt_text,
     _shutdown_handler,
     defer_shutdown_signals,
     install_signal_handlers,
+    interruption_cause,
     signal_handler_scope,
 )
+from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText
 from tests.conftest import (
     make_experiment,
     restored_signal_ownership,
@@ -140,13 +146,13 @@ def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_rest
 
 
 def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failure(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """One failed ``signal.signal`` restore must not abort the rest of the loop.
 
     Every other prior handler must still be restored, and the first
     restoration error surfaces once the scope body itself did not already
-    raise.
+    raise. The failure is logged under the signal's name.
     """
 
     def make_sentinel(tag: int):
@@ -171,6 +177,7 @@ def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failur
         return real_signal(signalnum, handler)
 
     with (
+        caplog.at_level(logging.ERROR, logger="phasesweep"),
         pytest.raises(OSError, match="simulated restore failure"),
         monkeypatch.context() as scoped,
         signal_handler_scope(),
@@ -179,6 +186,9 @@ def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failur
         # signal.signal; the patch ends before the handler assertions.
         scoped.setattr(signal, "signal", flaky_signal)
 
+    assert [r.getMessage() for r in caplog.records] == [
+        f"Failed to restore the prior handler for {signal.Signals(first_signal).name} after scope exit"
+    ]
     for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
         if sig == first_signal:
             # Restoration failed for this one; phasesweep's handler is
@@ -402,6 +412,234 @@ def test_stale_process_lifetime_claim_is_reasserted_on_scope_entry() -> None:
         assert signal.getsignal(interloper_sig) is runtime_shutdown._shutdown_handler
 
 
+# Sets SIGHUP's disposition, then execs the ownership child, as nohup does to its command.
+_EXEC_WITH_SIGHUP = (
+    "import os, signal, sys\n"
+    "signal.signal(signal.SIGHUP, signal.Handlers[sys.argv[1]])\n"
+    "os.execv(sys.executable, [sys.executable, '-c', *sys.argv[2:]])\n"
+)
+
+# Takes ownership one way, then waits for the parent on stdin with SIGHUP arriving
+# from the parent, and from itself inside a deferral and an absorb window.
+_OWNERSHIP_CHILD = r"""
+import os, signal, sys
+from phasesweep.runtime import shutdown
+
+def body():
+    print("ready", signal.getsignal(signal.SIGHUP) is signal.SIG_IGN, flush=True)
+    sys.stdin.readline()
+    with shutdown.defer_shutdown_signals():
+        os.kill(os.getpid(), signal.SIGHUP)
+    with shutdown.absorb_shutdown_signals() as absorbed:
+        os.kill(os.getpid(), signal.SIGHUP)
+    print(
+        "survived",
+        absorbed.signum,
+        shutdown.servicing_shutdown_signal(),
+        shutdown._deferred_shutdown_signum,
+        signal.getsignal(signal.SIGHUP) is signal.SIG_IGN,
+        flush=True,
+    )
+    sys.stdin.readline()
+
+if sys.argv[1] == "install":
+    shutdown.install_signal_handlers()
+    body()
+else:
+    with shutdown.signal_handler_scope():
+        body()
+"""
+
+
+def _start_ownership_child(sighup: str, entry: str) -> subprocess.Popen[str]:
+    """Start a process with SIGHUP at ``sighup`` that takes shutdown ownership through ``entry``.
+
+    :param str sighup: ``SIG_IGN`` or ``SIG_DFL``, the disposition the process starts with.
+    :param str entry: ``install`` for :func:`install_signal_handlers`, ``scope`` for
+        :func:`signal_handler_scope`.
+    :return subprocess.Popen[str]: The process, with piped text stdin, stdout and stderr.
+    """
+    return subprocess.Popen(
+        [sys.executable, "-c", _EXEC_WITH_SIGHUP, sighup, _OWNERSHIP_CHILD, entry],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _reap(proc: subprocess.Popen[str]) -> str:
+    """Kill an ownership child that is still running, reap it and return its stderr.
+
+    :param subprocess.Popen[str] proc: Child started by :func:`_start_ownership_child`.
+    :return str: Everything the child wrote to stderr.
+    """
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=5.0)
+    assert proc.stderr is not None
+    return proc.stderr.read()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("entry", ["install", "scope"])
+@pytest.mark.parametrize("stop", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
+def test_sighup_ignored_at_first_ownership_stays_ignored_while_term_and_int_still_stop(
+    entry: str, stop: signal.Signals
+) -> None:
+    """A process started under nohup survives SIGHUP and records no shutdown; SIGTERM and SIGINT still stop it.
+
+    SIGHUP from outside, inside a deferral and inside an absorb window is dropped by the
+    kernel, so nothing is absorbed, deferred or serviced, and SIGHUP is still ignored.
+    """
+    proc = _start_ownership_child("SIG_IGN", entry)
+    assert proc.stdin is not None and proc.stdout is not None
+    try:
+        assert proc.stdout.readline() == "ready True\n"
+        os.kill(proc.pid, signal.SIGHUP)
+        proc.stdin.write("continue\n")
+        proc.stdin.flush()
+        assert proc.stdout.readline() == "survived None None None True\n"
+        os.kill(proc.pid, stop)
+        proc.wait(timeout=10.0)
+    finally:
+        stderr = _reap(proc)
+    assert proc.returncode == 128 + stop, stderr
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("entry", ["install", "scope"])
+def test_sighup_at_default_on_first_ownership_still_stops_the_process(entry: str) -> None:
+    """A process started with SIGHUP at its default takes SIGHUP as a shutdown and exits 129."""
+    proc = _start_ownership_child("SIG_DFL", entry)
+    assert proc.stdout is not None
+    try:
+        assert proc.stdout.readline() == "ready False\n"
+        os.kill(proc.pid, signal.SIGHUP)
+        proc.wait(timeout=10.0)
+    finally:
+        stderr = _reap(proc)
+    assert proc.returncode == 128 + signal.SIGHUP, stderr
+
+
+def _host_handler(_signum: int, _frame: object) -> None:
+    """Stand in for an embedding program's own handler, which no test here delivers to."""
+    raise AssertionError("host handler should never fire during this test")
+
+
+def test_reassert_leaves_a_sighup_ignored_at_first_ownership_alone(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Under process-lifetime ownership taken with SIGHUP ignored, a scope's reassert neither warns about nor reinstalls SIGHUP, and still repairs SIGTERM."""
+    monkeypatch.setattr(runtime_shutdown, "_owned_signals", None)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    install_signal_handlers()
+    assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep"), signal_handler_scope():
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+    assert caplog.records == []
+
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    with caplog.at_level(logging.WARNING, logger="phasesweep"), signal_handler_scope():
+        pass
+    [warning] = caplog.records
+    assert "signal(s) SIGTERM were replaced" in warning.getMessage()
+    assert "SIGHUP" not in warning.getMessage()
+    assert signal.getsignal(signal.SIGTERM) is runtime_shutdown._shutdown_handler
+    assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+
+
+def test_a_scope_entered_with_sighup_ignored_restores_the_host_and_never_takes_sighup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A temporary scope leaves an ignored SIGHUP ignored and blocked, restores the host state on exit, and a later scope leaves SIGHUP to the host too."""
+    monkeypatch.setattr(runtime_shutdown, "_owned_signals", None)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _host_handler)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP})
+    host_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+    with signal_handler_scope():
+        assert signal.getsignal(signal.SIGTERM) is runtime_shutdown._shutdown_handler
+        assert signal.getsignal(signal.SIGINT) is runtime_shutdown._shutdown_handler
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+        inside = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        assert signal.SIGTERM not in inside
+        assert signal.SIGHUP in inside
+
+    assert signal.getsignal(signal.SIGTERM) is _host_handler
+    assert signal.getsignal(signal.SIGINT) is _host_handler
+    assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == host_mask
+
+    # The host later handles SIGHUP itself: the set fixed by the first scope still leaves it out.
+    signal.signal(signal.SIGHUP, _host_handler)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGHUP})
+    with signal_handler_scope():
+        assert signal.getsignal(signal.SIGHUP) is _host_handler
+        with defer_shutdown_signals():
+            deferred = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        assert {signal.SIGTERM, signal.SIGINT} <= deferred
+        assert signal.SIGHUP not in deferred
+    assert signal.getsignal(signal.SIGHUP) is _host_handler
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(sys.platform != "linux", reason="reads Linux procfs SigIgn and SigCgt")
+@pytest.mark.parametrize("ignored", [True, False], ids=["nohup", "terminal"])
+def test_trainer_inherits_the_runs_sighup_disposition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ignored: bool
+) -> None:
+    """A trainer launched by a run that keeps SIGHUP ignored, as under ``nohup``, starts with it ignored; under a run that handles SIGHUP it starts at the default."""
+    monkeypatch.setattr(runtime_shutdown, "_owned_signals", None)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN if ignored else signal.SIG_DFL)
+    install_signal_handlers()
+    assert (signal.getsignal(signal.SIGHUP) is signal.SIG_IGN) is ignored
+    ignored_mask, caught_mask = _trainer_signal_masks(tmp_path)
+    sighup_bit = 1 << (signal.SIGHUP - 1)
+    assert bool(ignored_mask & sighup_bit) is ignored
+    assert not caught_mask & sighup_bit
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(sys.platform != "linux", reason="reads Linux procfs SigIgn")
+def test_trainer_starts_with_the_signals_python_ignores_at_default(tmp_path: Path) -> None:
+    """A trainer starts with SIGPIPE and SIGXFSZ at their defaults, as a program a shell starts does, although the guardian that launches it is a Python process and ignores both."""
+    assert signal.getsignal(signal.SIGPIPE) is signal.SIG_IGN
+    ignored_mask, _caught = _trainer_signal_masks(tmp_path)
+    for restored in (signal.SIGPIPE, signal.SIGXFSZ):
+        assert not ignored_mask & (1 << (restored - 1)), restored.name
+
+
+def _trainer_signal_masks(tmp_path: Path) -> tuple[int, int]:
+    """Run a supervised trainer that records its own signal dispositions as it starts.
+
+    :param Path tmp_path: Scratch directory for the trial and the recorded status.
+    :return tuple[int, int]: The trainer's ignored and caught signal masks from procfs.
+    """
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    status_out = tmp_path / "status.txt"
+    with (
+        (trial_dir / "stdout.log").open("w") as stdout,
+        (trial_dir / "stderr.log").open("w") as stderr,
+    ):
+        result = run_supervised(
+            f"cp /proc/self/status {status_out}",
+            env=dict(os.environ),
+            stdout=stdout,
+            stderr=stderr,
+            timeout=30.0,
+            trial_dir=trial_dir,
+            attempt_id="signal-mask-attempt",
+        )
+    assert result.return_code == 0
+    fields = dict(line.split(":", 1) for line in status_out.read_text().splitlines())
+    return int(fields["SigIgn"], 16), int(fields["SigCgt"], 16)
+
+
 def _install_signal_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
     """Patch ``signal_handler_scope`` so tests can observe whether it was entered.
 
@@ -541,7 +779,7 @@ def test_sigterm_via_worker_thread_mid_launch_window_defers_instead_of_deadlocki
     window is delivered to one of them — and CPython then runs the Python
     handler in the main thread anyway, mid-critical-section. A handler that
     re-acquired ``_launch_lock`` held by that same thread would hang until the
-    MCP server's 30s grace SIGKILLed the runner with no status.json written.
+    MCP server's cancellation grace SIGKILLed the runner with no status.json written.
     The handler must record the signal and let the window exit service it.
     """
     code = r"""
@@ -605,6 +843,213 @@ def test_shutdown_handler_names_the_signal_it_services_until_the_next_run() -> N
         assert runtime_shutdown.servicing_shutdown_signal() is None
 
 
+@pytest.mark.parametrize(
+    ("signum", "running", "text"),
+    [
+        (
+            signal.SIGINT,
+            ["trial"],
+            "Interrupted (SIGINT): stopping 1 trial and waiting for it to exit.",
+        ),
+        (
+            signal.SIGTERM,
+            ["trial"] * 3,
+            "Interrupted (SIGTERM): stopping 3 trials and waiting for them to exit.",
+        ),
+        (signal.SIGHUP, [], "Interrupted (SIGHUP): no trial is running."),
+        (
+            99,
+            ["trial"] * 2,
+            "Interrupted (signal 99): stopping 2 trials and waiting for them to exit.",
+        ),
+        (
+            signal.SIGINT,
+            ["MLflow request"],
+            "Interrupted (SIGINT): no trial is running; stopping 1 MLflow request.",
+        ),
+        (
+            signal.SIGINT,
+            ["W&B request", "trial", "W&B request"],
+            "Interrupted (SIGINT): stopping 1 trial and 2 W&B requests and waiting for them to exit.",
+        ),
+    ],
+)
+def test_interrupt_text_names_the_signal_and_the_trials_it_stops(
+    signum: int, running: list[str], text: str
+) -> None:
+    """The line names the signal, counts only trainers as trials, and names each worker by its label."""
+    assert _interrupt_text(signum, running) == text
+
+
+@pytest.mark.parametrize(
+    ("signum", "name"), [(signal.SIGINT, "SIGINT"), (signal.SIGHUP, "SIGHUP"), (99, "signal 99")]
+)
+def test_the_recorded_cause_names_the_signal_as_the_interrupt_line_does(
+    signum: int, name: str
+) -> None:
+    """A stopped trial's cause, shown by ``status --trials`` and a rerun's reason, names its signal like the line beside it."""
+    assert interruption_cause(signum) == f"orchestrator interrupted by {name}"
+    assert _interrupt_text(signum, []).startswith(f"Interrupted ({name}): ")
+
+
+@pytest.mark.parametrize(
+    ("backend", "label"),
+    [("mlflow", "MLflow request"), ("wandb", "W&B request"), ("other", "other request")],
+)
+def test_a_tracker_worker_is_launched_under_the_name_the_interrupt_line_gives_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str, label: str
+) -> None:
+    """A tracker worker registers as its backend's request, so a signal during one never counts it as a trial."""
+    from phasesweep.runtime import process as runtime_process
+    from phasesweep.runtime.remote_worker import run_worker
+
+    labels: list[object] = []
+
+    def launch(_command: str, **options: object) -> runtime_process.ProcessResult:
+        labels.append(options["label"])
+        return runtime_process.ProcessResult(
+            return_code=0, timed_out=False, pid=0, duration_seconds=0.0
+        )
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(runtime_process, "run_supervised", launch)
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+
+    run_worker(
+        {},
+        tmp_path / "worker.py",
+        backend,
+        statuses=frozenset({"ok"}),
+        run_id="attempt",
+        trial_dir=trial_dir,
+        environment={},
+        deadline=time.monotonic() + 10,
+    )
+
+    assert labels == [label]
+    assert label != runtime_shutdown.TRAINER_LABEL
+
+
+@pytest.mark.parametrize(
+    ("labels", "text"),
+    [
+        (["trial"], "Interrupted (SIGINT): stopping 1 trial and waiting for it to exit."),
+        (
+            ["MLflow request"],
+            "Interrupted (SIGINT): no trial is running; stopping 1 MLflow request.",
+        ),
+        (
+            ["trial", "MLflow request"],
+            "Interrupted (SIGINT): stopping 1 trial and 1 MLflow request and waiting for them to exit.",
+        ),
+    ],
+    ids=["trainer", "worker", "both"],
+)
+def test_the_handler_counts_registered_trainers_as_trials_and_names_workers(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    labels: list[str],
+    text: str,
+) -> None:
+    """The real handler prints what each registered group is, and stops every one of them."""
+    monkeypatch.setattr(runtime_shutdown, "_active_children", {})
+    stopped: list[dict[int, object]] = []
+
+    def terminate(
+        pgids: tuple[int, ...], *, grace_seconds: float, guardians: dict[int, object]
+    ) -> dict[int, bool]:
+        stopped.append(dict(guardians))
+        return dict.fromkeys(pgids, True)
+
+    monkeypatch.setattr(runtime_shutdown, "_terminate_process_groups", terminate)
+    registered: dict[int, object] = {}
+    for offset, label in enumerate(labels):
+        guardian = SimpleNamespace(pid=4321 + offset)
+        pgid = runtime_shutdown._register(guardian, label=label, pgid=1234 + offset)
+        registered[pgid] = guardian
+
+    with caplog.at_level(logging.INFO, logger=REPORT_LOGGER), pytest.raises(PhaseSweepShutdown):
+        _shutdown_handler(signal.SIGINT, None)
+
+    assert [r.getMessage() for r in caplog.records if r.name == REPORT_LOGGER] == [text]
+    assert stopped == [registered]
+
+
+def test_the_longest_interrupt_line_wraps_within_an_80_column_terminal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Three trials and a worker request under SIGTERM print on lines of at most 80 columns."""
+    monkeypatch.setenv("COLUMNS", "80")
+    text = _interrupt_text(signal.SIGTERM, ["trial"] * 3 + ["MLflow request"])
+    record = logging.LogRecord(
+        REPORT_LOGGER, logging.INFO, __file__, 0, ReportText(text), None, None
+    )
+
+    ConsoleHandler().emit(record)
+
+    lines = capsys.readouterr().err.splitlines()
+    assert " ".join(line.strip() for line in lines).endswith(text)
+    assert len(lines) > 1
+    assert max(len(line) for line in lines) <= 80
+
+
+@pytest.mark.parametrize(
+    "running", [["trial"] * 3, ["MLflow request"]], ids=["three-trials", "one-request"]
+)
+def test_the_usual_interrupt_lines_stay_on_one_line_of_an_80_column_terminal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], running: list[str]
+) -> None:
+    """Trainers alone, or one tracker request alone, print unbroken behind the time prefix, even for SIGTERM's longer name."""
+    monkeypatch.setenv("COLUMNS", "80")
+    text = _interrupt_text(signal.SIGTERM, running)
+    record = logging.LogRecord(
+        REPORT_LOGGER, logging.INFO, __file__, 0, ReportText(text), None, None
+    )
+
+    ConsoleHandler().emit(record)
+
+    [line] = capsys.readouterr().err.splitlines()
+    assert line.endswith(text)
+    assert len(line) <= 80
+
+
+def test_a_shutdown_prints_one_report_line_and_logs_the_confirmed_cleanup_quietly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The console shows one plain line; the confirmed cleanup is INFO, which only run.log keeps, and names the signal as the console does."""
+    with caplog.at_level(logging.INFO, logger="phasesweep"), pytest.raises(PhaseSweepShutdown):
+        _shutdown_handler(signal.SIGINT, None)
+    assert [(r.name, r.levelno, r.getMessage()) for r in caplog.records] == [
+        (REPORT_LOGGER, logging.INFO, "Interrupted (SIGINT): no trial is running."),
+        (
+            "phasesweep.runtime.process",
+            logging.INFO,
+            "Received SIGINT; confirmed cleanup for 0 child groups",
+        ),
+    ]
+
+
+def test_unconfirmed_cleanup_is_logged_with_the_signals_name_and_the_groups_left(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The error ``run.log`` keeps for an unconfirmed cleanup names the signal and counts and lists the groups it left."""
+    monkeypatch.setattr(runtime_shutdown, "_active_children", {})
+    monkeypatch.setattr(
+        runtime_shutdown,
+        "_terminate_process_groups",
+        lambda pgids, **_: dict.fromkeys(pgids, False),
+    )
+    runtime_shutdown._register(SimpleNamespace(pid=4321), label="trial", pgid=1234)
+
+    with caplog.at_level(logging.INFO, logger="phasesweep"), pytest.raises(PhaseSweepShutdown):
+        _shutdown_handler(signal.SIGHUP, None)
+
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR] == [
+        "Received SIGHUP; cleanup is uncertain for 1 child group: [1234]"
+    ]
+
+
 def test_shutdown_handler_wakes_registered_waiters_after_naming_the_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -637,7 +1082,10 @@ def test_a_launch_while_a_shutdown_is_serviced_starts_no_process(
     with (
         (trial_dir / "stdout.log").open("w") as stdout,
         (trial_dir / "stderr.log").open("w") as stderr,
-        pytest.raises(ShutdownLaunchRefusedError, match="interrupted by signal 15"),
+        pytest.raises(
+            ShutdownLaunchRefusedError,
+            match="^trainer launch refused: orchestrator interrupted by SIGTERM$",
+        ),
     ):
         run_supervised(
             f"{sys.executable} -c 'open({str(ran)!r}, \"w\")'",

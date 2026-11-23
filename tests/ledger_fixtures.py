@@ -403,6 +403,23 @@ def winner_payload(experiment: Experiment, generation_id: str, phase: str = "p")
     return loaded
 
 
+def published_survivorship(experiment: Experiment) -> JsonObject:
+    """Read the survivorship check that phase ``p``'s published winner records.
+
+    :param Experiment experiment: Experiment holding the publication.
+    :return JsonObject: The check's verdict and counts.
+    """
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    confound = winner_payload(experiment, generation_id)["confound"]
+    assert isinstance(confound, dict)
+    checks = confound["checks"]
+    assert isinstance(checks, dict)
+    survivorship = checks["survivorship"]
+    assert isinstance(survivorship, dict)
+    return survivorship
+
+
 def reseal_winner(
     experiment: Experiment,
     generation_id: str,

@@ -9,6 +9,7 @@ import os
 import shlex
 import sys
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,9 +31,10 @@ from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanup
 from phasesweep.evidence.evaluation import TrialContext
 from phasesweep.evidence.mlflow import compile_query
 from phasesweep.runtime import process
+from phasesweep.runtime.json import JsonObject
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
-from phasesweep.tracking.mlflow import _capture
+from phasesweep.tracking.mlflow import OperationOutcomeUnknownError, _capture
 
 
 class ManualClock:
@@ -82,6 +84,20 @@ def mlflow_run(binding, *, status="FINISHED", metrics=None):
             tags=worker.identity_tags(binding), params={}, metrics=metrics or {"loss": 2.0}
         ),
     )
+
+
+def delivery_record(generation_id, *, state="pending", **fields):
+    """Return a delivery record holding every field delivery reads, for a test that writes one."""
+    return {
+        "schema_version": 1,
+        "generation_id": generation_id,
+        "state": state,
+        "source": {},
+        "binding": {},
+        "projection": {},
+        "finish": None,
+        **fields,
+    }
 
 
 def attempt_identity(generation_id="a" * 32, attempt_id="b" * 32):
@@ -299,8 +315,7 @@ def leak_tracking_worker(monkeypatch, *, action="publish", name=None):
     already in place.
 
     :param pytest.MonkeyPatch monkeypatch: Replaces ``request_operation`` for the test.
-    :param str action: Worker action to leave unconfirmed: ``publish`` for an upload, ``resolve``
-        for a target check.
+    :param str action: Request action to match, such as ``publish`` or ``resolve``.
     :param str | None name: Upload name to match, such as ``attempt-<id>``; any request of
         ``action`` when ``None``.
     :return list[str]: The operation id of the worker left unconfirmed, once one has been.
@@ -343,6 +358,52 @@ def leak_tracking_worker(monkeypatch, *, action="publish", name=None):
     monkeypatch.setattr(session, "request_operation", leaky)
     monkeypatch.setattr(worker, "request_operation", leaky)
     return leaked
+
+
+def hang_uploads_until_killed(monkeypatch: pytest.MonkeyPatch, started: list[str]) -> None:
+    """Make every MLflow upload run a real supervised worker that only a signal ends.
+
+    The worker registers as ``runtime.remote_worker.run_worker`` registers a real one, so the
+    shutdown handler names and kills it as an MLflow request. Every other request reaches the
+    request operation already in place.
+
+    :param pytest.MonkeyPatch monkeypatch: Replaces the request function for the test.
+    :param list[str] started: Receives the record name of each upload as it starts.
+    """
+    respond = session.request_operation
+
+    def upload_until_killed(
+        request: Mapping[str, object],
+        *,
+        operation_id: str,
+        directory: Path,
+        environment: Mapping[str, str],
+        deadline: float,
+    ) -> JsonObject:
+        if request["action"] != "publish":
+            return respond(
+                request,
+                operation_id=operation_id,
+                directory=directory,
+                environment=environment,
+                deadline=deadline,
+            )
+        started.append(str(request["name"]))
+        with Path(os.devnull).open("w") as sink:
+            result = process.run_supervised(
+                "sleep 30",
+                env=dict(os.environ),
+                stdout=sink,
+                stderr=sink,
+                timeout=60,
+                trial_dir=directory,
+                attempt_id=operation_id,
+                label="MLflow request",
+            )
+        raise OperationOutcomeUnknownError(f"MLflow worker failed (exit {result.return_code}).")
+
+    monkeypatch.setattr(session, "request_operation", upload_until_killed)
+    monkeypatch.setattr(worker, "request_operation", upload_until_killed)
 
 
 class RunnerKilled(BaseException):
@@ -398,8 +459,7 @@ def killed_sweep(
         patch.setattr(
             generation_module, "_persist_failed_state_unless_recorded", lambda *args: None
         )
-        patch.setattr(publication, "publish_failed_generation", lambda *args: None)
-        patch.setattr(publication, "deliver_recovered_attempts", lambda *args, **kwargs: None)
+        patch.setattr(publication, "deliver_closeout", lambda *args, **kwargs: None)
         with pytest.raises(RunnerKilled):
             run_experiment(experiment, generation_id=generation_id)
     assert not any(session.tracking_root(experiment).glob("*/delivery/generation.json"))

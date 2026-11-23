@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shlex
 import signal
 import subprocess
 import time
@@ -127,6 +128,8 @@ class _Harness:
                 stdout=handle,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                # A wide terminal keeps the closing ``log:`` path on one line.
+                env={**os.environ, "COLUMNS": "500"},
             )
         self.spawned.append(proc)
         return proc
@@ -472,9 +475,8 @@ def test_model_samplers_top_up_real_runs_exactly(
 
 
 _NO_RUN_ACTIVE = (
-    "# No run is active, so the 1 trial recorded RUNNING was left by a run that stopped before "
-    "recording it; rerun the same config to settle it. A trainer still running is stopped and "
-    "its trial rerun, so wait for it to exit to keep its result."
+    "# No run is active; 1 trial is recorded RUNNING. Rerun the same config to settle it. "
+    "A trainer still running is stopped, so let it exit first to keep its result."
 )
 
 
@@ -496,7 +498,12 @@ def test_status_tells_a_killed_run_from_a_live_one(harness: _Harness) -> None:
     for arguments in (["status"], ["status", "--trials"]):
         shown = CliRunner().invoke(cli, [*arguments, str(config)])
         assert shown.exit_code == 0, shown.output
-        assert shown.output.splitlines()[0] == _NO_RUN_ACTIVE
+        # The table form wraps the comment to the terminal width, each line still a comment.
+        comment = [line for line in shown.output.splitlines() if line.startswith("# ")]
+        assert " ".join(line.removeprefix("# ") for line in comment) == _NO_RUN_ACTIVE.removeprefix(
+            "# "
+        )
+        assert shown.output.splitlines()[0] == comment[0]
         assert shown.output.count("No run is active") == 1
         with _experiment_lock(experiment):
             live = CliRunner().invoke(cli, [*arguments, str(config)])
@@ -517,7 +524,7 @@ def test_status_tells_a_killed_run_from_a_live_one(harness: _Harness) -> None:
 def test_a_stopped_run_ends_with_the_next_step_once(
     harness: _Harness, sig: signal.Signals, persistent: bool
 ) -> None:
-    """After SIGINT, SIGHUP or SIGTERM the last line says to rerun, and what that keeps."""
+    """After SIGINT, SIGHUP or SIGTERM the line before the log path says to rerun, and what that keeps."""
     phase = Phase(
         name="p",
         n_trials=2,
@@ -540,13 +547,14 @@ def test_a_stopped_run_ends_with_the_next_step_once(
 
     assert harness.spawned[-1].returncode == 128 + sig
     expected = (
-        "phasesweep: stopped. Rerun the same command to resume: finished trials are kept "
-        "and interrupted ones rerun first."
+        "phasesweep: stopped. Rerun the same command to resume."
         if persistent
         else "phasesweep: stopped. Rerun the same command to start over: storage: null keeps "
-        "no completed trials."
+        "no completed trials between runs."
     )
     lines = harness.log.read_text().splitlines()
-    assert lines[-1] == expected
+    assert lines[-3] == expected
+    assert lines[-2] == shlex.join(["phasesweep", "run", str(config)])
+    assert lines[-1].startswith("log: ") and lines[-1].endswith("run.log")
     assert lines.count(expected) == 1
     assert "Aborted." not in lines

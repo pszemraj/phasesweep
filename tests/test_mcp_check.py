@@ -172,7 +172,7 @@ experiments:
     ("alias_kind", "expected_error"),
     [
         ("output", "same experiment output namespace"),
-        ("storage", "same Optuna study namespace"),
+        ("storage", "same study namespace"),
     ],
 )
 def test_check_catalog_matches_server_cross_entry_identity_rejections(
@@ -405,11 +405,10 @@ def test_mcp_check_prints_the_trainer_directory_and_refuses_a_missing_one(tmp_pa
     assert f"trainer cwd {(tmp_path / 'trainer').resolve()}" in result.output
     assert not missing_entry.ok
     assert "which is not a directory on this host" in (missing_entry.error or "")
-    assert (
-        missing_entry.suggestion
-        == "Create that directory, or set execution.cwd to an existing one."
-    )
-    assert "fix: Create that directory, or set execution.cwd to an existing one." in result.output
+    suggestion = missing_entry.suggestion or ""
+    assert suggestion.startswith("Create /")
+    assert suggestion.endswith("/nope, or set execution.cwd to an existing directory.")
+    assert f"fix: {suggestion}" in result.output
     assert result.exit_code == 2
     registry = Registry.load(catalog, collect_errors=True)
     assert not registry.failures

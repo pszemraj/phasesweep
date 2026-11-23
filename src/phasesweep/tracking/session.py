@@ -7,12 +7,14 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
+from phasesweep.engine.errors import TrackingSyncRefusedError, TrackingTargetUnavailableError
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
@@ -27,9 +29,12 @@ from phasesweep.runtime.json import (
     strict_json_loads,
 )
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE, recorded_process_check
+from phasesweep.runtime.shutdown import servicing_shutdown_signal
+from phasesweep.runtime.terminal import command_line, plural
 from phasesweep.tracking.mlflow import (
     OperationOutcomeUnknownError,
     OperationRejectedError,
+    OperationUnavailableError,
     identity_tags,
     request_operation,
     verify_remote,
@@ -38,7 +43,6 @@ from phasesweep.tracking.records import validate_binding, validate_identity
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Experiment
-    from phasesweep.engine.errors import TrackingSyncRefusedError
     from phasesweep.engine.state import Winner
     from phasesweep.tracking.mlflow import _SdkClient
     from phasesweep.tracking.records import (
@@ -52,11 +56,196 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 BINDING_FILE = "mlflow-binding.json"
+# The identity an attempt's run must carry, written in its trial directory before it launches.
+EXPECTED_BINDING_FILE = "mlflow-expected.json"
 GENERATION_BINDING_FILE = "generation-binding.json"
 INHERITS_FILE = "mlflow-inherits.json"
+# The target and experiment the tree's bound runs live in, under the tracking root.
+SOURCE_FILE = "source.json"
+# Delivery records live in this directory of their generation's tracking directory. The summary
+# run's is named SUMMARY_RECORD, the others attempt-<attempt id> and winner-<phase>.
+DELIVERY_DIR = "delivery"
+SUMMARY_RECORD = "generation"
 _PENDING_SUFFIX = ".pending.json"
 PENDING_GENERATION_BINDING_FILE = Path(GENERATION_BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
 _PARENT_LOCK = threading.RLock()
+# Failures that say nothing about a request's subject: MLflow gave no answer, or the worker's
+# answer was lost. The next request would meet the same tracker, so a pass that sees one stops
+# sending and leaves the rest pending.
+NO_ANSWER: tuple[type[Exception], ...] = (
+    TimeoutError,
+    OperationUnavailableError,
+    OperationOutcomeUnknownError,
+)
+# What one failed request of a delivery was, as DeliveryTally.note_failure classifies it.
+RequestFailure = Literal["shutdown", "no answer", "refused", "refused again", "other"]
+# The command that sends what a run left pending, as every line a run logs names it. These lines
+# also reach run.log and an MCP runner's log, where the config path is not known, so they write
+# CONFIG; the CLI prints the command as typed, overrides included, after a run that leaves work
+# pending. Without the overrides a run used, sync-tracking's own refusals name them.
+SYNC_TRACKING_STEP = f"`{command_line('sync-tracking', 'CONFIG')}`"
+# The step for a target check MLflow gave no answer to: a down server and a wrong URI look alike.
+NO_ANSWER_STEP = "Start the MLflow server or correct `mlflow.tracking_uri`, then run again."
+# The step for a config whose MLflow target is not the one the tree's runs used, as a run's
+# warning and sync-tracking's refusal both give it. A ``--set`` override can move the target.
+ORIGINAL_TARGET_STEP = (
+    f"Run {SYNC_TRACKING_STEP}, or the sweep, with the config and `--set` "
+    "overrides the sweep ran with."
+)
+
+
+@dataclass
+class DeliveryTally:
+    """What one MLflow delivery has met: a run's, recover-run's or sync-tracking's.
+
+    A run keeps one for the pass after its first target check and its closeout, so its closing
+    lines count both. Within a pass, once ``sending`` is False the later steps only save their
+    records: a later request would meet the same silent tracker, or a shutdown, which refuses
+    every worker launch. A closeout sends again whatever the earlier pass met.
+    """
+
+    sending: bool = True
+    """Whether requests may still be made."""
+    unanswered: str | None = None
+    """Why MLflow gave no answer, once a request got none; sync-tracking's error states it."""
+    delivered: int = 0
+    """Records of ended generations delivered."""
+    settled: int = 0
+    """Unconfirmed run creations settled: bound to the run a search found, or retired."""
+    refused: set[Path] = field(default_factory=set)
+    """Records and creations MLflow last answered with a refusal, such as for a deleted run.
+
+    They stay pending. A record is warned about and counted once however many passes refuse it,
+    and leaves the set once a later request delivers or settles it.
+    """
+
+    def note_failure(
+        self, experiment: Experiment, path: Path, exc: BaseException
+    ) -> RequestFailure:
+        """Record what one failed request of this delivery means for the rest of it.
+
+        During a shutdown the failure says nothing about MLflow, as a shutdown refuses every
+        worker launch and kills running workers, so the delivery stops quietly. When MLflow gave
+        no answer, the next request would meet the same tracker, so the delivery stops and keeps
+        why. A refusal MLflow answered concerns its record alone, which stays pending.
+
+        :param Experiment experiment: The delivery's MLflow-backed experiment.
+        :param Path path: The delivery record or creation intent the request was for.
+        :param BaseException exc: The request's error.
+        :return RequestFailure: Which it was: ``shutdown``, ``no answer``, ``refused``,
+            ``refused again`` for a refusal this delivery already met, or ``other``.
+        """
+        if servicing_shutdown_signal() is not None:
+            self.sending = False
+            return "shutdown"
+        if gave_no_answer(exc):
+            self.sending = False
+            self.unanswered = unready_target_text(experiment, exc)
+            return "no answer"
+        if not isinstance(exc, OperationRejectedError):
+            return "other"
+        if path in self.refused:
+            return "refused again"
+        self.refused.add(path)
+        return "refused"
+
+
+def gave_no_answer(exc: BaseException) -> bool:
+    """Tell a request MLflow gave no answer to from one it answered with a failure.
+
+    A creation whose answer was lost and that no search could confirm is raised from the error
+    that lost it, so that cause counts too.
+
+    :param BaseException exc: The failed request's error.
+    :return bool: Whether ``exc`` or its cause is one of :data:`NO_ANSWER`.
+    """
+    return isinstance(exc, NO_ANSWER) or isinstance(exc.__cause__, NO_ANSWER)
+
+
+def record_name(path: Path) -> str:
+    """Name a delivery record or creation intent by what it is, for the lines that report it.
+
+    :param Path path: A delivery record under ``tracking/<generation>/delivery``, a summary
+        run's creation intent under ``tracking/<generation>``, or an attempt run's creation
+        intent in its trial directory.
+    :return str: For example ``the summary record of generation <id>`` or ``attempt record
+        attempt-<id> of generation <id>``.
+    """
+    if path.name == PENDING_GENERATION_BINDING_FILE:
+        return f"the summary-run creation record of generation {path.parent.name}"
+    if is_creation_intent(path):
+        # pending_creation_records finds these only in trial_<n>__generation_<id>__attempt_<id>.
+        # The markers fix the parse, as a generation id may hold "__" itself: an MCP run's is
+        # named after its catalog id, which may. An attempt id is hex.
+        generation, _, attempt = path.parent.name.partition("__generation_")[2].rpartition(
+            "__attempt_"
+        )
+        return f"the run-creation record of attempt {attempt} of generation {generation}"
+    generation = path.parent.parent.name
+    if path.stem == SUMMARY_RECORD:
+        return f"the summary record of generation {generation}"
+    return f"{path.stem.split('-', 1)[0]} record {path.stem} of generation {generation}"
+
+
+def is_creation_intent(path: Path) -> bool:
+    """Tell an unconfirmed run creation's intent from a delivery record.
+
+    :param Path path: A delivery record or a creation intent.
+    :return bool: Whether ``path`` is a creation intent, which a search settles.
+    """
+    return path.name.endswith(_PENDING_SUFFIX)
+
+
+def count_text(records: int, creations: int) -> str:
+    """Count delivery records and unconfirmed run creations in the words every MLflow line uses.
+
+    A run creation whose answer was lost is searched for, never sent again, so it is counted
+    apart from the records that are uploaded.
+
+    :param int records: Delivery records.
+    :param int creations: Unconfirmed run creations, the intents a search settles.
+    :return str: For example ``2 records``, ``1 unconfirmed run creation`` or ``2 records and
+        1 unconfirmed run creation``; ``0 records`` when both are zero.
+    """
+    parts = [plural(records, "record")] if records or not creations else []
+    if creations:
+        parts.append(plural(creations, "unconfirmed run creation"))
+    return " and ".join(parts)
+
+
+def delivered_text(delivered: int, settled: int) -> str:
+    """Say what a delivery delivered and settled, in the words of :func:`count_text`.
+
+    :param int delivered: Delivery records delivered.
+    :param int settled: Unconfirmed run creations settled, bound to their run or retired.
+    :return str: For example ``delivered 2 records and settled 1 unconfirmed run creation``,
+        or an empty string when there was neither.
+    """
+    parts = [f"delivered {plural(delivered, 'record')}"] if delivered else []
+    if settled:
+        parts.append(f"settled {plural(settled, 'unconfirmed run creation')}")
+    return " and ".join(parts)
+
+
+def refused_text(refused: Collection[Path]) -> str:
+    """Say what MLflow refused, records and creation searches apart, and where its cause is.
+
+    A refused record stays pending: a retry alone meets the same refusal, so the warning each
+    one logged at its first refusal, above on the console, is where its cause is.
+
+    :param Collection[Path] refused: The records and creation intents MLflow refused in this
+        delivery.
+    :return str: A sentence with a leading space, or an empty string when none were refused.
+    """
+    if not refused:
+        return ""
+    creations = sum(map(is_creation_intent, refused))
+    records = len(refused) - creations
+    parts = [plural(records, "record")] if records else []
+    if creations:
+        parts.append(f"the search for {plural(creations, 'unconfirmed run creation')}")
+    where = "its cause is in its warning" if len(refused) == 1 else "each cause is in its warning"
+    return f" MLflow refused {' and '.join(parts)}; {where} above."
 
 
 def tracking_root(experiment: Experiment) -> Path:
@@ -68,6 +257,28 @@ def tracking_root(experiment: Experiment) -> Path:
     from phasesweep.engine.paths import _experiment_dir
 
     return _experiment_dir(experiment) / "tracking"
+
+
+def summary_binding_path(experiment: Experiment, generation_id: str) -> Path:
+    """Locate a generation's summary-run binding; the summary run is bound once it is a file.
+
+    :param Experiment experiment: Local experiment namespace.
+    :param str generation_id: The generation.
+    :return Path: The binding's path, whether or not it exists.
+    """
+    return tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE
+
+
+def delivery_record_path(experiment: Experiment, generation_id: str, name: str) -> Path:
+    """Locate one delivery record of a generation.
+
+    :param Experiment experiment: Local experiment namespace.
+    :param str generation_id: The generation the record belongs to.
+    :param str name: The record's name: :data:`SUMMARY_RECORD`, ``attempt-<attempt id>`` or
+        ``winner-<phase>``.
+    :return Path: The record's path, whether or not it exists.
+    """
+    return tracking_root(experiment) / generation_id / DELIVERY_DIR / f"{name}.json"
 
 
 def write_record(path: Path, record: Mapping[str, object]) -> None:
@@ -117,7 +328,7 @@ def bind_mlflow_run(run_id: str) -> None:
     from mlflow import MlflowClient
 
     directory = Path(os.environ["PHASESWEEP_TRIAL_DIR"])
-    expected = read_record(directory / "mlflow-expected.json")
+    expected = read_record(directory / EXPECTED_BINDING_FILE)
     if (
         expected["run_mode"] != "trainer"
         or expected["attempt_id"] != os.environ["PHASESWEEP_ATTEMPT_ID"]
@@ -207,9 +418,10 @@ def tracking_operation(experiment: Experiment, generation_id: str) -> Iterator[t
                 entry_path = _attempts_dir(experiment) / f"{operation_id}.json"
                 raise ProcessCleanupUncertainError(
                     f"Tracking operation {operation_id} has an unreadable lifecycle record in "
-                    f"{directory} ({exc}), so its worker may still be running. Its attempt "
-                    f"registry entry {entry_path} is kept. "
-                    + recorded_process_check(str(directory / PROCESS_IDENTITY_FILE)),
+                    f"{directory} ({str(exc).rstrip('.')}); its worker may still be running. "
+                    + recorded_process_check(
+                        str(directory / PROCESS_IDENTITY_FILE), entry=str(entry_path)
+                    ),
                     action=OperatorAction.RESTORE_TREE,
                 ) from exc
             log.warning(
@@ -217,7 +429,7 @@ def tracking_operation(experiment: Experiment, generation_id: str) -> Iterator[t
                 "its attempt registry entry is kept.",
                 operation_id,
                 directory,
-                exc,
+                str(exc).rstrip("."),
             )
         else:
             if lifecycle is not None and (
@@ -303,7 +515,7 @@ def _create_bound(
         raise RuntimeError(
             f"MLflow run creation for attempt {identity['attempt_id']} of generation "
             f"{identity['generation_id']} is unresolved: an earlier request may still create "
-            "the run, so it is not sent again. Run sync-tracking to reconcile the intent."
+            f"the run. Run {SYNC_TRACKING_STEP} to reconcile it."
         ) from cause
 
     if pending.exists():
@@ -375,25 +587,46 @@ def _find_bound(
 
 
 def pending_creation_records(
-    experiment: Experiment, generation_id: str | None = None
+    experiment: Experiment, generation_id: str | None = None, *, skip: str | None = None
 ) -> list[Path]:
     """Find the creation intents that have yet to be reconciled.
 
     :param Experiment experiment: Local namespace.
     :param str | None generation_id: Generation filter, defaulting to every generation.
+    :param str | None skip: Generation left out, a live invocation's own, defaults to none.
     :return list[Path]: Pending summary and attempt creation records, in that order.
     """
     from phasesweep.engine.paths import _experiment_dir
 
     scope = generation_id or "*"
     attempt_pending = Path(BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
-    return sorted(
+    records = sorted(
         tracking_root(experiment).glob(f"{scope}/{PENDING_GENERATION_BINDING_FILE}")
     ) + sorted(
         _experiment_dir(experiment).glob(
             f"*/trial_*__generation_{scope}__attempt_*/{attempt_pending}"
         )
     )
+    if skip is None:
+        return records
+    skipped = set(pending_creation_records(experiment, skip))
+    return [path for path in records if path not in skipped]
+
+
+def creation_window_end(experiment: Experiment, pending: Path) -> float:
+    """Say when the lost request of a pending creation can no longer create its run.
+
+    Until then a search that finds no run leaves the intent pending; one started after it
+    retires the intent.
+
+    :param Experiment experiment: MLflow-backed experiment, whose ``timeout_seconds`` bounds
+        the request.
+    :param Path pending: Pending creation intent, written as the request was sent.
+    :return float: The window's end, as a ``time.time()`` value.
+    """
+    settings = experiment.mlflow
+    assert settings is not None
+    return pending.stat().st_mtime + settings.timeout_seconds
 
 
 def resolve_pending_creations(
@@ -401,32 +634,44 @@ def resolve_pending_creations(
     environment: Mapping[str, str],
     generation_id: str | None,
     *,
+    skip: str | None = None,
     worker_generation: str | None = None,
     errors: list[TrackingSyncRefusedError] | None = None,
-) -> bool:
+    tally: DeliveryTally | None = None,
+    deadline: float | None = None,
+) -> None:
     """Reconcile pending creations with one read-only search per record.
 
     The caller holds the experiment lock and has confirmed cleanup of registered workers for
     the generations it reconciles. Persist each found binding before retiring its intent.
     Retire an unmatched intent only after a successful lookup started outside its request window.
+    A search MLflow gives no answer to, or one that fails during a shutdown, ends the pass and
+    stops ``tally`` sending, leaving the later intents and every upload for the next pass. On the
+    main thread a shutdown raises out of the search in flight instead.
 
     :param Experiment experiment: Configured experiment with a verified tracking target.
     :param Mapping[str, str] environment: Composed credentials and transport.
     :param str | None generation_id: Generation to resolve, or ``None`` for every generation.
+    :param str | None skip: Generation left out of the scope, a live invocation's own.
     :param str | None worker_generation: Invocation registering the searches, defaulting to
         each record's own generation.
     :param list[TrackingSyncRefusedError] | None errors: Collect local record failures and
         continue, or raise the first one if omitted.
+    :param DeliveryTally | None tally: The delivery this pass belongs to; a fresh one when
+        omitted.
+    :param float | None deadline: Absolute run deadline every search is cut at, defaults to
+        none.
     :raises ProcessCleanupUncertainError: A search worker's cleanup is uncertain.
     :raises TrackingSyncRefusedError: A local creation record could not be read or updated.
-    :return bool: Whether the requested scope had any creation intents.
     """
-    from phasesweep.engine.errors import TrackingSyncRefusedError
-
-    records = pending_creation_records(experiment, generation_id)
-    for pending in records:
+    tally = DeliveryTally() if tally is None else tally
+    for pending in pending_creation_records(experiment, generation_id, skip=skip):
+        if not tally.sending:
+            return
         try:
-            _reconcile_creation(experiment, pending, environment, worker_generation)
+            _reconcile_creation(
+                experiment, pending, environment, worker_generation, tally, deadline
+            )
         except (OSError, UnsafePrivatePathError, ValueError) as exc:
             failure = TrackingSyncRefusedError(
                 f"Could not reconcile local MLflow creation record {pending}: {exc}",
@@ -436,7 +681,6 @@ def resolve_pending_creations(
                 raise failure from exc
             failure.__cause__ = exc
             errors.append(failure)
-    return bool(records)
 
 
 def _reconcile_creation(
@@ -444,6 +688,8 @@ def _reconcile_creation(
     pending: Path,
     environment: Mapping[str, str],
     worker_generation: str | None,
+    tally: DeliveryTally,
+    deadline: float | None,
 ) -> None:
     """Bind a found run or retire its expired intent after one conclusive lookup.
 
@@ -451,36 +697,59 @@ def _reconcile_creation(
     :param Path pending: Unconfirmed creation intent.
     :param Mapping[str, str] environment: Composed credentials and transport.
     :param str | None worker_generation: Invocation registering the lookup, defaulting to the intent's generation.
+    :param DeliveryTally tally: The delivery the search belongs to, which counts the intent
+        settled once it is retired, and stops sending when MLflow gives no answer or a shutdown
+        is under way.
+    :param float | None deadline: Absolute run deadline the search is cut at, if any.
     """
     path = pending.with_suffix("").with_suffix(".json")
     if path.exists():
-        _retire_creation(pending)
+        _settle_creation(pending, tally)
         return
-    settings = experiment.mlflow
-    assert settings is not None
     identity = validate_identity(read_record(pending).get("identity"))
-    expires_at = pending.stat().st_mtime + settings.timeout_seconds
     # A search started inside the window may see absence even if it returns after the window.
-    expired = time.time() >= expires_at
+    expired = time.time() >= creation_window_end(experiment, pending)
     try:
         binding = _find_bound(
             experiment,
             identity,
             environment,
             timeout_at=time.monotonic(),
-            deadline=None,
+            deadline=deadline,
             worker_generation=worker_generation,
         )
     except PhaseSweepError:
         raise
-    except (TimeoutError, ValueError, RuntimeError) as exc:
-        log.warning("MLflow run creation at %s is still unresolved (%s).", pending, exc)
+    except (TimeoutError, ValueError, RuntimeError) as exc:  # every NO_ANSWER error included
+        failure = tally.note_failure(experiment, pending, exc)
+        # Nothing blames MLflow for a shutdown, and a refusal met before is counted already.
+        if failure not in ("shutdown", "refused again"):
+            # After no answer the pass sends nothing more, so this is its only outage warning.
+            log.warning(
+                "MLflow: %s is still unresolved (%s).%s",
+                record_name(pending),
+                str(exc).rstrip("."),
+                " MLflow did not answer, so later searches and uploads wait too."
+                if failure == "no answer"
+                else "",
+            )
         return
     if binding is not None:
         write_record(path, binding)
     elif not expired:
         return
+    _settle_creation(pending, tally)
+
+
+def _settle_creation(pending: Path, tally: DeliveryTally) -> None:
+    """Retire a creation intent a search settled, and count it for the delivery's closing line.
+
+    :param Path pending: Creation intent whose run is bound, or which no run carries.
+    :param DeliveryTally tally: The delivery that settled it.
+    """
     _retire_creation(pending)
+    tally.settled += 1
+    tally.refused.discard(pending)
 
 
 def _resolve_source(
@@ -505,7 +774,7 @@ def _resolve_source(
             experiment, generation_id, {"action": "resolve"}, environment, deadline
         )
         experiment_id = json_text(resolved, "experiment_id")
-        source_path = tracking_root(experiment) / "source.json"
+        source_path = tracking_root(experiment) / SOURCE_FILE
         source = {
             "schema_version": 1,
             "source": experiment.mlflow.evidence_identity(),
@@ -534,8 +803,8 @@ def prepare_generation(
     """
     assert experiment.mlflow is not None
     with _PARENT_LOCK:
-        parent_path = tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE
-        if parent_path.exists():
+        parent_path = summary_binding_path(experiment, generation_id)
+        if parent_path.is_file():
             return read_binding(parent_path.parent, parent_path.name)
         experiment_id = _resolve_source(
             experiment, generation_id=generation_id, environment=environment, deadline=deadline
@@ -570,7 +839,7 @@ def require_tracking_target(
     environment: Mapping[str, str],
     deadline: float | None,
     resolve_only: bool = False,
-) -> None:
+) -> bool:
     """Resolve the MLflow target before a phase allocates trials or a run sends to it.
 
     A generation whose summary run is bound only resolves the target, as does a check for a
@@ -585,46 +854,67 @@ def require_tracking_target(
     :param bool resolve_only: Only resolve the target, for a caller that launches nothing and
         sends recovered outcomes, defaults to False.
     :raises OSError: A recovery-only check could not access its local tracking records.
-    :raises TrackingTargetUnavailableError: The target cannot be resolved or reached.
+    :raises TrackingTargetUnavailableError: The target cannot be resolved or reached; its step
+        is a retry when MLflow gave no answer, the creation it left unconfirmed included, and
+        fixing the configuration when MLflow answered with a refusal.
+    :return bool: Whether this check bound the generation's summary run, which only a run's
+        first successful check does.
     """
-    from phasesweep.engine.errors import TrackingTargetUnavailableError
-
     settings = experiment.mlflow
     assert settings is not None
     try:
-        if (
-            resolve_only
-            or (tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE).exists()
-        ):
+        if resolve_only or summary_binding_path(experiment, generation_id).is_file():
             # An earlier phase bound the summary run, or the caller binds none; the target must
             # still resolve.
             _resolve_source(
                 experiment, generation_id=generation_id, environment=environment, deadline=deadline
             )
-        else:
-            prepare_generation(
-                experiment, generation_id=generation_id, environment=environment, deadline=deadline
-            )
+            return False
+        prepare_generation(
+            experiment, generation_id=generation_id, environment=environment, deadline=deadline
+        )
+        return True
     except PhaseSweepError:
         raise
     except (OSError, ValueError, RuntimeError) as exc:
         if resolve_only and isinstance(exc, OSError) and not isinstance(exc, TimeoutError):
             raise
-        cause = str(exc).rstrip(".")
-        if isinstance(exc, TimeoutError):
-            if deadline is not None and time.monotonic() >= deadline:
-                raise
-            cause = "it did not answer within timeout_seconds; check that the server is reachable"
-        selector = (
-            f"experiment_id={settings.experiment_id!r}"
-            if settings.experiment_id is not None
-            else f"experiment_name={settings.experiment_name!r}"
-        )
+        if isinstance(exc, TimeoutError) and deadline is not None and time.monotonic() >= deadline:
+            raise
         launch = "" if resolve_only else " No trial was started."
+        # A server that gave no answer may give one to the same command later, and so may one
+        # whose creation answer was lost; a refusal it answered, such as a missing experiment,
+        # needs the configuration or MLflow fixed first.
+        unanswered = gave_no_answer(exc)
         raise TrackingTargetUnavailableError(
-            f"MLflow tracking target {selector} at {settings.tracking_uri!r} is not ready: "
-            f"{cause}.{launch}"
+            unready_target_text(experiment, exc) + launch,
+            action=OperatorAction.RETRY if unanswered else None,
+            remediation=NO_ANSWER_STEP if unanswered else None,
         ) from exc
+
+
+def unready_target_text(experiment: Experiment, exc: BaseException) -> str:
+    """Say that the configured MLflow target gave no usable answer, and why.
+
+    A run's target check and a delivery MLflow stopped answering word the target alike. The
+    tracking URI carries no credentials, which config load refuses, so it is printed as is.
+
+    :param Experiment experiment: MLflow-backed experiment.
+    :param BaseException exc: The failed request's error; a timeout is worded as the
+        ``timeout_seconds`` it outlasted.
+    :return str: One sentence naming the experiment selector, the URI and the cause.
+    """
+    settings = experiment.mlflow
+    assert settings is not None
+    selector = (
+        f"experiment_id={settings.experiment_id!r}"
+        if settings.experiment_id is not None
+        else f"experiment_name={settings.experiment_name!r}"
+    )
+    target = f"MLflow tracking target {selector} at {settings.tracking_uri!r}"
+    if isinstance(exc, TimeoutError):
+        return f"{target} did not answer within timeout_seconds."
+    return f"{target} is not ready: {str(exc).rstrip('.')}."
 
 
 def prepare_attempt(
@@ -685,7 +975,7 @@ def prepare_attempt(
             },
         },
     )
-    write_record(directory / "mlflow-expected.json", identity)
+    write_record(directory / EXPECTED_BINDING_FILE, identity)
     if experiment.mlflow.run_mode == "managed":
         return _create_bound(
             experiment,

@@ -80,6 +80,7 @@ from tests.conftest import (
     make_experiment,
     mark_current_format,
     patch_rejected_trial_user_attr,
+    reaped_pid,
     write_constant_trainer,
     write_trainer,
 )
@@ -241,7 +242,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     claimed = engine_ledger.claim_ledger(engine_ledger.validate_ledger(exp))
 
     # Will raise on fingerprint mismatch, but reap must have run first.
-    with pytest.raises(RuntimeError, match="different phase config"):
+    with pytest.raises(RuntimeError, match="different config"):
         _run_phase(
             exp,
             exp.phases[0],
@@ -700,6 +701,8 @@ def test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling(
         proc_starttime=111,
         boot_id="old-boot",
         pid_namespace=_RECORDED_NAMESPACE,
+        guardian_pid=reaped_pid(),
+        guardian_starttime=1,
     )
     monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: "current-boot")
     monkeypatch.setattr(
@@ -723,6 +726,8 @@ def test_cleanup_stale_trial_process_refuses_unverifiable_platform_identity(
         proc_starttime=None,
         boot_id=None,
         pid_namespace=_RECORDED_NAMESPACE,
+        guardian_pid=reaped_pid(),
+        guardian_starttime=1,
     )
     monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: None)
     monkeypatch.setattr("phasesweep.runtime.reaper.read_pid_namespace", lambda: _RECORDED_NAMESPACE)
@@ -1032,7 +1037,7 @@ def test_reaper_raises_for_malformed_trial_dir_attr(
     trial = study.ask()
     trial.set_user_attr(TRIAL_DIR_ATTR, bad_value)
 
-    with pytest.raises(RuntimeError, match="invalid persisted"):
+    with pytest.raises(RuntimeError, match="user attribute is missing or invalid"):
         _reap_stale_trials(study, exp, exp.phases[0].name, confirm=True)
 
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
@@ -1054,7 +1059,7 @@ def test_reaper_raises_for_malformed_trial_dir_attr(
         pytest.param(
             "ledger-read", "cleanup recovery ledger could not be updated", id="ledger-read"
         ),
-        pytest.param("tell", "Optuna state could not be updated", id="tell"),
+        pytest.param("tell", "could not be marked FAIL", id="tell"),
     ],
 )
 def test_reaper_reports_storage_failures_after_cleanup(
@@ -1079,6 +1084,8 @@ def test_reaper_reports_storage_failures_after_cleanup(
             proc_starttime=12345,
             boot_id="test-boot",
             pid_namespace=_RECORDED_NAMESPACE,
+            guardian_pid=reaped_pid(),
+            guardian_starttime=1,
         )
 
     monkeypatch.setattr("phasesweep.engine.attempts.read_stale_process_identity", fake_identity)
@@ -1165,10 +1172,7 @@ def test_reaper_keeps_uncertain_cleanup_actionable(
 
     text = _operational_error_text(excinfo.value)
     assert "pid=99999 pgid=99998" in text
-    assert (
-        "List the members of process group 99998 with `pgrep -a -g 99998` "
-        "and check GPU processes before retrying recovery"
-    ) in text
+    assert "List the group's members with `pgrep -a -g 99998`, then retry recovery" in text
     assert text.index("`pgrep") < text.index("fix:")
     assert "recover-run" in text
     assert uncertain == {"uncertain-attempt"}
@@ -1559,7 +1563,7 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
     )
     report = _PreflightCleanupReport()
     if identity_change == "generation":
-        with pytest.raises(StudySchemaMismatchError, match="conflicting recovery identity"):
+        with pytest.raises(StudySchemaMismatchError, match="identifies generation"):
             _preflight_active_attempts(experiment, report, confirm=True)
     elif identity_change in {"missing-attempt", "missing-generation"}:
         with pytest.raises(ProcessCleanupUncertainError, match="identity is missing") as exc_info:
@@ -1948,9 +1952,6 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     else:
         assert "allocated lifecycle marker" in message
     assert "No trainer was started" in message
-    # The refusal routes only the workdir repair; its message says when the
-    # durable abort also needs a higher target, as the rerun below shows.
-    assert "n_trials" in message and "accepted target" in message
     # Nothing was launched: no marker, and no durable process identity.
     assert not launched.exists()
     phase_dir = tmp_path / "runs" / "unregistrable" / "p"
@@ -1973,7 +1974,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     monkeypatch.setattr(phase_mod, "write_attempt_lifecycle", real_write_attempt_lifecycle)
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(_exp(2))
-    assert "phases[p].n_trials above 2 in the config" in _operational_error_text(refused.value)
+    assert "phases[p].n_trials above 2" in _operational_error_text(refused.value)
     assert not launched.exists()
 
     winners = run_experiment(_exp(3))

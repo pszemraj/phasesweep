@@ -37,15 +37,24 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import _describe_environment_changes
 from phasesweep.engine.trial import _environment_identity
-from phasesweep.errors import OperatorAction, PhaseSweepError, operator_step
+from phasesweep.errors import (
+    ACCEPT_INCOMPLETE_STEP,
+    OperatorAction,
+    PhaseSweepError,
+    operator_step,
+    short_digest,
+)
 from phasesweep.runtime.files import atomic_text_writer
 
 log = logging.getLogger(__name__)
 
-# One log line shape for every destination. The date format differs on purpose: console
-# handlers print clock time (``%H:%M:%S``), while ``run.log`` and the MCP runner's captured
-# log carry the date as well (``%Y-%m-%d %H:%M:%S``) because those files outlive the day.
+# One log line shape for every file destination. ``run.log`` and the MCP runner's captured log
+# carry the date (``%Y-%m-%d %H:%M:%S``) because those files outlive the day; the CLI console
+# prints its own clock-time layout (``phasesweep.runtime.console``).
 LOG_FORMAT = "%(asctime)s %(levelname).1s %(name)s %(message)s"
+
+# The only way past a skipped phase's published winner when no study outlives the run.
+_WITHOUT_FROM_PHASE_IN_MEMORY = "without --from-phase to start every phase again"
 
 
 def read_yaml_or_none(path: Path) -> object:
@@ -76,6 +85,9 @@ def _write_yaml_atomic(path: Path, payload: Any) -> None:
 def _file_log_handler(path: Path) -> Iterator[None]:
     """Capture phasesweep logs, and a routed failure with its advice, in the run log.
 
+    The logger keeps a ``DEBUG`` level a caller set, so a verbose run records debug messages and
+    the traceback of a routed failure; otherwise it records from ``INFO``.
+
     :param Path path: Log file path to append to.
     :raises PhaseSweepError: The operational failure raised inside the context.
     :return Iterator[None]: Context manager that removes the handler on exit.
@@ -97,10 +109,14 @@ def _file_log_handler(path: Path) -> Iterator[None]:
     try:
         yield
     except PhaseSweepError as exc:
-        # The caller prints the error to its own stderr, so the log records it with its step.
-        for line in (str(exc), f"fix: {operator_step(exc)}"):
+        # The caller prints the error to its own stderr, so the log records it with its step,
+        # and with its traceback when DEBUG is on, which the console never shows.
+        error_info = (
+            (type(exc), exc, exc.__traceback__) if logger.isEnabledFor(logging.DEBUG) else None
+        )
+        for line, info in ((str(exc), error_info), (f"fix: {operator_step(exc)}", None)):
             handler.handle(
-                logger.makeRecord(logger.name, logging.ERROR, __file__, 0, "%s", (line,), None)
+                logger.makeRecord(logger.name, logging.ERROR, __file__, 0, "%s", (line,), info)
             )
         raise
     finally:
@@ -185,7 +201,7 @@ def _refresh_recovered_trials_csv(
         ) == fingerprint_ops._semantic_phase_dump(phase):
             _write_trials_csv(
                 study,
-                path_ops._phase_dir(experiment, phase.name) / "trials.csv",
+                path_ops._trials_csv_path(experiment, phase.name),
                 repeats=repeat_axis(phase),
             )
     except Exception as exc:
@@ -272,8 +288,9 @@ def _warn_environment_drift(
 
     Skipped-phase loading and no-work replay reuse results without allocating trials;
     ordinary top-ups refuse cohort drift before allocation. The warning names the
-    variables that differ when the caller holds the winning trial's recorded mapping,
-    and shows the two digests otherwise.
+    variables that differ as the cohort refusal does
+    (:func:`phasesweep.engine.study_policy._describe_environment_changes`) when the caller
+    holds the winning trial's recorded mapping, and shows the two digests otherwise.
 
     :param Experiment experiment: Parsed experiment supplying the current contract.
     :param str phase_name: Phase whose winner was reused, used in the warn-once key.
@@ -293,30 +310,13 @@ def _warn_environment_drift(
         if stored_environment is not None
         else ""
     )
-    key = ("environment-drift", experiment.experiment, phase_name, stored_digest)
-    if differences:
-        _warn_once(
-            log,
-            key,
-            "[%s] reused winner ran under a different trainer environment: %s "
-            "(execution.inherit_env=%r). The recorded result is being reused across an "
-            "environment change; confirm the difference is irrelevant to the metric, or "
-            "re-run the phase.",
-            phase_name,
-            differences,
-            experiment.execution.inherit_env,
-        )
-        return
     _warn_once(
         log,
-        key,
-        "[%s] reused winner ran under trainer environment %s..., but this process "
-        "composes %s... under execution.inherit_env=%r. The recorded result is being "
-        "reused across an environment change; confirm the difference is irrelevant to "
-        "the metric, or re-run the phase.",
+        ("environment-drift", experiment.experiment, phase_name, stored_digest),
+        "[%s] reused winner ran under a different trainer environment: %s "
+        "(execution.inherit_env=%r).",
         phase_name,
-        stored_digest[:12],
-        current.digest[:12],
+        differences or f"{short_digest(stored_digest)} -> {short_digest(current.digest)}",
         experiment.execution.inherit_env,
     )
 
@@ -356,17 +356,13 @@ def _load_winner(
             if publication is None
             else "The last published generation holds no winner for it."
         )
-        rerun = (
-            "Run without --from-phase so the earlier phases run first (completed trials are reused)"
-            if experiment.persistent
-            else "Run without --from-phase to start every phase again, because storage: null "
-            "keeps no completed trials"
-        )
         raise ResumeWinnerMissingError(
-            f"Winner file missing for phase {phase.name!r}: {absent} "
-            "Unpublished phase winners can be inspected, but --from-phase requires published "
-            "predecessors.",
-            remediation=f"{rerun}, or use the workdir that holds the publication.",
+            f"Winner file missing for phase {phase.name!r}: {absent}",
+            remediation=(
+                "Run without --from-phase so the earlier phases run first."
+                if experiment.persistent
+                else f"Run {_WITHOUT_FROM_PHASE_IN_MEMORY}."
+            ),
         )
     path = path_ops._generation_winner_path(experiment, publication.generation_id, phase.name)
     validated = publication.winners[phase.name]
@@ -375,21 +371,26 @@ def _load_winner(
     current_fp = fingerprint_ops._phase_fingerprint(experiment, phase, inherited_winners)
     stored_fp = data["phase_fingerprint"]
     if stored_fp != current_fp:
+        # A winner file records only the hash, so the refusal can name no changed key. MCP shows
+        # the step without the message, so the step names the winner it means.
+        produced = f"the config that produced the winner of `{phase.name}`"
         raise StudyFingerprintMismatchError(
-            f"Winner file {path} was produced by a different phase config "
-            f"(stored fingerprint {stored_fp[:16]}... != current "
-            f"{current_fp[:16]}...). Re-run phase {phase.name!r}, change the "
-            f"experiment name, or restore the matching config before resuming.",
+            f"Winner file {path} was produced by a different config (stored fingerprint "
+            f"{short_digest(stored_fp)} != current {short_digest(current_fp)}).",
             action=OperatorAction.FIX_CONFIG,
+            remediation=(
+                fingerprint_ops.restore_or_rename_step(experiment, phase, recorded=produced)
+                if experiment.persistent
+                else f"Restore {produced}, or run {_WITHOUT_FROM_PHASE_IN_MEMORY}."
+            ),
         )
 
     completion = data["completion"]
     if completion.get("incomplete") is True and not phase.allow_incomplete_on_timeout:
         raise WinnerIntegrityError(
-            f"Winner file {path} records an incomplete phase result. Refusing to "
-            f"use it for skipped phase {phase.name!r} unless the current config "
-            "sets allow_incomplete_on_timeout: true.",
+            f"Winner file {path} records an incomplete result for skipped phase {phase.name!r}.",
             action=OperatorAction.FIX_CONFIG,
+            remediation=ACCEPT_INCOMPLETE_STEP,
         )
 
     try:
@@ -410,7 +411,7 @@ def _load_winner(
             objective_provenance=dict(data["objective_provenance"]),
             trainer_input=dict(data["trainer_input"]),
             trainer_env_digest=stored_env_digest,
-            confound=dict(validated.confound),
+            confound=validated.confound.copy(),
             observed=dict(validated.observed),
             repeats=validated.repeats,
         )

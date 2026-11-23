@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import re
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     PublishedStudyMissingError,
     RunRequestError,
+    StudyContextConflictError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -63,7 +65,11 @@ from phasesweep.engine.state import (
     WinnerSource,
 )
 from phasesweep.engine.trial import _environment_identity
-from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
+from phasesweep.errors import (
+    OperatorAction,
+    ProcessCleanupUncertainError,
+    operator_step,
+)
 from phasesweep.evidence.models import JsonEqualsGate, LogRegexExtractor, WandbExtractor
 from phasesweep.runtime.files import (
     atomic_text_writer,
@@ -207,7 +213,7 @@ def test_fingerprint_mismatch_raises(tmp_path):
     run_experiment(experiment([4, 8]))
 
     # Now change the search space and re-run — should fail.
-    with pytest.raises(RuntimeError, match="different phase config"):
+    with pytest.raises(RuntimeError, match="different config"):
         run_experiment(experiment([4, 8, 12]))
 
 
@@ -259,7 +265,7 @@ def test_late_child_fingerprint_failure_preserves_last_successful_results(
     )
     changed = experiment.model_copy(update={"phases": [experiment.phases[0], changed_child]})
 
-    with pytest.raises(RuntimeError, match="different phase config"):
+    with pytest.raises(RuntimeError, match="different config"):
         run_experiment(changed)
 
     assert {path: path.read_bytes() for path in protected_paths} == before
@@ -507,7 +513,7 @@ def test_changed_semantic_inherited_value_rejects_topup_before_allocation(
     run_experiment(experiment)
 
     monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-b")
-    with pytest.raises(StudyFingerprintMismatchError, match="No trial was allocated"):
+    with pytest.raises(StudyFingerprintMismatchError, match="different trainer environment"):
         run_experiment(_with_trial_target(experiment, 2))
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
@@ -565,8 +571,8 @@ def test_drift_warning_names_the_variable_where_the_trial_mapping_is_held(
     (replayed,) = [m for m in messages if m.startswith("[q]")]
     assert len(messages) == 2
     assert 'PHASESWEEP_DATASET_REV "revision-a" -> "revision-b"' in replayed
-    assert "but this process composes" not in replayed
-    assert "but this process composes" in skipped
+    assert re.search(r": [0-9a-f]{12}\.\.\. -> [0-9a-f]{12}\.\.\. ", replayed) is None
+    assert re.search(r": [0-9a-f]{12}\.\.\. -> [0-9a-f]{12}\.\.\. ", skipped)
     assert "revision-a" not in skipped
 
 
@@ -831,8 +837,16 @@ def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path)
     topped_up_parent = experiment.phases[0].model_copy(update={"n_trials": 2})
     topped_up = experiment.model_copy(update={"phases": [topped_up_parent, experiment.phases[1]]})
 
-    with pytest.raises(RuntimeError, match="dependent phase study.*new experiment name"):
+    with pytest.raises(
+        StudyContextConflictError, match=r"1 dependent phase \(`lr`\) is bound"
+    ) as refused:
         run_experiment(topped_up)
+
+    # The rename step names only the dependent, so the enlarged phase keeps its trials.
+    assert refused.value.remediation == (
+        "Give `lr` a new `name`, which runs it again from scratch; `arch` keeps its trials and "
+        "runs the rest."
+    )
 
     parent_after = optuna.load_study(study_name="t::arch", storage=_resolve_storage(storage)).trials
     assert len(parent_after) == len(parent_before) == 1
@@ -855,7 +869,7 @@ def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
     parent_study = _fake_top_up_study(completed=1)
     grandchild_study = _fake_top_up_study(completed=1, fingerprint="bound-grandchild")
 
-    with pytest.raises(RuntimeError, match=r"dependent phase study/studies \['final'\]"):
+    with pytest.raises(RuntimeError, match=r"1 dependent phase \(`final`\) is bound"):
         _reject_bound_descendant_topups(
             experiment,
             from_phase=None,
@@ -1080,9 +1094,12 @@ def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path
     )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
 
-    with pytest.raises(StudySchemaMismatchError, match="config requires maximize"):
+    with pytest.raises(StudySchemaMismatchError, match="config requires maximize") as caught:
         run_experiment(experiment)
 
+    assert caught.value.remediation == (
+        "Restore `metric.goal: minimize`, or set a new `experiment` name to start a fresh study."
+    )
     assert study.get_trials(deepcopy=False) == []
 
 
@@ -1099,7 +1116,6 @@ def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
     message = str(excinfo.value)
     assert "records no artifact root" in message
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
-    assert "nothing was written" in message.lower()
     assert (
         ARTIFACT_ROOT_ATTR
         not in optuna.load_study(study_name="t::p", storage=_resolve_storage(storage)).user_attrs
@@ -1499,12 +1515,12 @@ def test_persistent_bound_root_rejects_an_in_memory_configuration(tmp_path: Path
         ArtifactRootConflictError, match="created with a different storage ledger"
     ) as excinfo:
         run_experiment(offered)
-    assert str(excinfo.value).endswith("Nothing was written.")
+    assert str(excinfo.value).endswith("than this config names.")
     with pytest.raises(
         ArtifactRootConflictError, match="created with a different storage ledger"
     ) as excinfo:
         read_status(offered)
-    assert str(excinfo.value).endswith("Nothing was written.")
+    assert str(excinfo.value).endswith("than this config names.")
 
     assert materialized.unchanged()
     assert read_status(owner) == status_before
@@ -1596,11 +1612,14 @@ def test_from_phase_rejects_stale_parent_winner(
     run_experiment(exp_v1)
 
     exp_v2 = _two_phase_experiment(workdir=workdir, trainer=trainer, **after)
-    with pytest.raises(StudyFingerprintMismatchError, match="different phase config") as excinfo:
+    with pytest.raises(StudyFingerprintMismatchError, match="different config") as excinfo:
         run_experiment(exp_v2, from_phase="lr")
     assert type(excinfo.value) is StudyFingerprintMismatchError
     assert excinfo.value.action is OperatorAction.FIX_CONFIG
-    assert "or restore the matching config before resuming." in str(excinfo.value)
+    assert operator_step(excinfo.value).startswith(
+        "Restore the config that produced the winner of `arch`, or run "
+    )
+    assert "Re-run phase" not in str(excinfo.value)
 
 
 @pytest.mark.integration
@@ -1688,7 +1707,7 @@ def test_from_phase_preflight_consumes_run_deadline(
 
     with pytest.raises(TimeoutError, match="before phase 'lr' could start") as refused:
         run_experiment(resumed, from_phase="lr")
-    from phasesweep.errors import PhaseSweepError, operator_step
+    from phasesweep.errors import PhaseSweepError
 
     assert isinstance(refused.value, PhaseSweepError)
     assert "Raise timeout_seconds_per_run" in operator_step(refused.value)
@@ -1909,5 +1928,5 @@ def test_fingerprint_mismatch_still_raises_once_a_trial_exists(tmp_path: Path) -
         )
 
     run_experiment(_exp(f"python {trainer} {{overrides}}"))
-    with pytest.raises(RuntimeError, match="different phase config"):
+    with pytest.raises(RuntimeError, match="different config"):
         run_experiment(_exp(f"python {trainer} --changed {{overrides}}"))

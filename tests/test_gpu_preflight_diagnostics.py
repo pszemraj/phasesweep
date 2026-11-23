@@ -10,7 +10,7 @@ from click.testing import CliRunner
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli
-from phasesweep.errors import GpuConfigurationError
+from phasesweep.errors import GpuConfigurationError, operator_step
 from tests.experiments import phase_payload, write_experiment
 
 
@@ -41,9 +41,11 @@ def test_gpu_preflight_refuses_nonexistent_explicit_index(
     if command == "validate":
         result = CliRunner().invoke(cli, ["validate", str(config)])
         assert isinstance(result.exception, GpuConfigurationError), result.output
-        assert "index 99 does not exist" in str(result.exception)
+        assert "index 99 is not in the nvidia-smi inventory" in str(result.exception)
     else:
-        with pytest.raises(GpuConfigurationError, match="index 99 does not exist"):
+        with pytest.raises(
+            GpuConfigurationError, match="index 99 is not in the nvidia-smi inventory"
+        ):
             run_experiment(load_experiment(config), dry_run=True)
 
     assert not workdir.exists()
@@ -79,8 +81,8 @@ def test_gpu_preflight_inventory_refusal_explains_host_access(
         error = failure.value
 
     assert "nvidia-smi" in str(error)
-    assert "sandbox" in str(error)
-    assert "host shell with GPU access" in str(error)
+    assert "sandbox" in operator_step(error)
+    assert "host shell with GPU access" in operator_step(error)
     assert not workdir.exists()
 
 

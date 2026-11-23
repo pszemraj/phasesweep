@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import stat
 import time
 from collections.abc import Iterator, Mapping
@@ -35,6 +36,7 @@ from phasesweep.evidence.models import (
     _WandbSummarySource,
 )
 from phasesweep.evidence.wandb import (
+    WANDB_SDK_MISSING,
     WandbMissingKeysError,
     WandbPollTimeout,
     WandbRunMissingError,
@@ -44,7 +46,11 @@ from phasesweep.evidence.wandb import (
     poll_wandb_summary,
 )
 from phasesweep.runtime.files import file_sha256
-from phasesweep.runtime.json import progress_position, strict_json_loads
+from phasesweep.runtime.json import (
+    NonFiniteJsonConstantError,
+    finite_nonnegative,
+    strict_json_loads,
+)
 from phasesweep.runtime.time import utc_now_iso
 
 if TYPE_CHECKING:
@@ -82,6 +88,40 @@ def _file_digest(raw: bytes) -> dict[str, Any]:
     return {"sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}
 
 
+class OutsideAttemptError(OSError):
+    """A trial-relative evidence path resolves outside its attempt directory."""
+
+
+def attempt_file(trial_dir: Path, relative: str | Path) -> Path:
+    """Return a trial-relative evidence path, refusing one that resolves outside the attempt.
+
+    PhaseSweep reads a trial's objective, constraints, observations, gate values and
+    digests only from files inside that attempt's directory. Config load already refuses
+    absolute and ``..`` paths, so a link is the only way out, and several trials whose
+    links name one shared file would all be scored from whichever trainer wrote it last.
+    A link that stays inside the attempt, such as ``latest -> checkpoint-500``, reads as
+    usual. A missing file resolves inside and keeps the caller's own not-found handling.
+
+    :param Path trial_dir: The attempt directory the file must resolve inside.
+    :param str | Path relative: Configured trial-relative path.
+    :raises OutsideAttemptError: The path resolves outside ``trial_dir``.
+    :return Path: ``trial_dir / relative``, unchanged, for the caller to read.
+    """
+    path = trial_dir / relative
+    try:
+        resolved = path.resolve()
+    except RuntimeError:
+        # A symlink loop, which raises here before Python 3.13. It names no file, so the
+        # caller's own not-found handling reports it, as on later versions.
+        return path
+    if not resolved.is_relative_to(trial_dir.resolve()):
+        raise OutsideAttemptError(
+            f"`{relative}` in attempt directory {trial_dir} resolves to {resolved}, outside the "
+            "attempt. Have the trainer write it under PHASESWEEP_TRIAL_DIR."
+        )
+    return path
+
+
 def load_json_value(
     trial_dir: Path,
     relative_path: str,
@@ -97,29 +137,89 @@ def load_json_value(
     :param dict[str, Any] | None digest: Optional sink that receives the
         ``sha256``/``size_bytes`` of the exact bytes parsed, for evidence
         provenance.
+    :raises OutsideAttemptError: If ``relative_path`` resolves outside ``trial_dir``.
     :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular
         file under ``trial_dir``.
-    :raises KeyError: If a segment of the dotted ``key`` path is missing, with the
-        failing segment as the argument.
+    :raises JsonKeyMissingError: If a segment of the dotted ``key`` path is missing, with the
+        failing segment as the argument and what the file holds there.
     :raises OSError: If the resolved file exists but cannot be read.
     :raises UnicodeDecodeError: If the file bytes are not valid UTF-8.
     :raises ValueError: If the contents are not strict JSON (malformed document,
         duplicate object keys, or a rejected JSON constant).
     :return tuple[Path, Any]: Resolved JSON file path and loaded value.
     """
-    target = trial_dir / relative_path
+    target = attempt_file(trial_dir, relative_path)
     if not target.is_file():
         raise FileNotFoundError(target)
     raw = target.read_bytes()
     if digest is not None:
         digest.update(_file_digest(raw))
     cur = strict_json_loads(raw.decode("utf-8"))
+    walked: list[str] = []
     for part in key.split("."):
         if isinstance(cur, dict) and part in cur:
             cur = cur[part]
+            walked.append(part)
             continue
-        raise KeyError(part)
+        raise JsonKeyMissingError(part, _level_text(".".join(walked), cur))
     return target, cur
+
+
+#: How many of an object's keys a missing-key diagnostic lists before it counts the rest.
+_KEYS_SHOWN = 5
+
+
+class JsonKeyMissingError(KeyError):
+    """A segment of a dotted key is missing from a JSON file, with what the file holds there.
+
+    :param str segment: The segment the lookup failed at, also ``args[0]``.
+    :param str found: What the file holds where the lookup failed, a clause for the diagnostic.
+    """
+
+    def __init__(self, segment: str, found: str) -> None:
+        super().__init__(segment)
+        self.segment = segment
+        self.found = found
+
+    def __str__(self) -> str:
+        """Say which key is missing and what the file holds there."""
+        return f"no key {self.segment!r}; {self.found}"
+
+
+def _level_text(path: str, level: object) -> str:
+    """Say what a JSON file holds at the level a key lookup failed.
+
+    :param str path: Dotted path of ``level`` within the file; empty for the file's top level.
+    :param object level: The value the lookup could not descend into or find its segment in.
+    :return str: ``the file has 'a', 'b' and 3 more``, ``'m' has no keys`` or ``'m' is a list``.
+    """
+    where = repr(path) if path else "the file"
+    if not isinstance(level, dict):
+        return f"{where} is {_json_noun(level)}"
+    if not level:
+        return f"{where} has no keys"
+    keys = [repr(name) for name in level]
+    more = len(keys) - _KEYS_SHOWN
+    return f"{where} has {', '.join(keys[:_KEYS_SHOWN])}" + (
+        f" and {more} more" if more > 0 else ""
+    )
+
+
+def _json_noun(value: object) -> str:
+    """Name the kind of a parsed JSON value that is not an object.
+
+    :param object value: A null, boolean, number, string or list.
+    :return str: ``null``, ``a boolean``, ``a number``, ``a string`` or ``a list``.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "a boolean"
+    if isinstance(value, int | float):
+        return "a number"
+    if isinstance(value, str):
+        return "a string"
+    return "a list"
 
 
 def json_float(value: Any, *, label: str) -> float:
@@ -158,26 +258,57 @@ class MlflowObjectiveMissingError(ExtractorError):
     """Raised when a finished managed MLflow run lacks the configured objective metric."""
 
 
+def _non_finite_text(constant: str) -> str:
+    """Say what a file holding NaN or Infinity means, for a trial's failure reason.
+
+    :param str constant: The refused token.
+    :return str: A clause that follows the file's subject.
+    """
+    return f"holds {constant}, which is not a finite number; a diverged run writes it"
+
+
+def _gate_unavailable(path: str, key: str, exc: Exception) -> str:
+    """Describe a JSON gate whose value could not be read.
+
+    :param str path: Trial-relative file the gate reads.
+    :param str key: Dotted key the gate reads.
+    :param Exception exc: Failure raised while reading it.
+    :return str: The gate result's detail.
+    """
+    if isinstance(exc, NonFiniteJsonConstantError):
+        return f"{path}:{key} unavailable: the file {_non_finite_text(exc.constant)}"
+    return f"{path}:{key} unavailable: {exc}"
+
+
 @contextmanager
-def _trial_json_read_errors(target: Path, *, noun: str) -> Iterator[None]:
+def _trial_json_read_errors(target: Path, *, noun: str, trainer_step: str) -> Iterator[None]:
     """Translate file-read and JSON-decoding failures into extractor diagnostics.
 
     :param Path target: Trial-relative file being read.
     :param str noun: ``JSON`` or ``JSON envelope`` diagnostic label.
-    :raises ExtractorError: The file is missing, unreadable, or malformed.
+    :param str trainer_step: What the trainer must do for the file to exist, a clause without
+        a final period that follows a missing-file diagnostic in parentheses, since a trainer
+        that exits 0 without it fails here. The path ends the diagnostic's own words, so no
+        punctuation sticks to it when a reader copies it.
+    :raises ExtractorError: The file is missing, unreadable, malformed, or outside the
+        attempt; the last carries the refusal's own text as the trial's failure reason.
     :return Iterator[None]: Context covering the read and parse of the same bytes.
     """
     try:
         yield
+    except OutsideAttemptError as exc:
+        raise ExtractorError(str(exc)) from exc
     except FileNotFoundError as exc:
         missing = (
             f"JSON file not found: {exc.args[0]}"
             if noun == "JSON"
             else f"{noun} not found: {target}"
         )
-        raise ExtractorError(missing) from exc
+        raise ExtractorError(f"{missing} ({trainer_step})") from exc
     except UnicodeError as exc:
         raise ExtractorError(f"{noun} at {target} is not valid UTF-8: {exc}") from exc
+    except NonFiniteJsonConstantError as exc:
+        raise ExtractorError(f"{noun} at {target} {_non_finite_text(exc.constant)}.") from exc
     except ValueError as exc:
         raise ExtractorError(f"Invalid {noun} at {target}: {exc}") from exc
     except OSError as exc:
@@ -219,17 +350,25 @@ def _extract_json(
     :param TrialContext ctx: Trial identity; the file is read from its ``trial_dir``.
     :param JsonExtractor cfg: Relative file path and dotted numeric key.
     :param dict | None provenance: Optional source-evidence sink.
-    :raises ExtractorError: The file or key is missing, JSON is invalid, or the value is nonnumeric.
+    :raises ExtractorError: The file or key is missing, the file resolves outside the attempt,
+        JSON is invalid, or the value is nonnumeric.
     :return float: Configured numeric value.
     """
     digest: dict[str, Any] = {}
     target = ctx.trial_dir / cfg.path
     try:
-        with _trial_json_read_errors(target, noun="JSON"):
+        with _trial_json_read_errors(
+            target,
+            noun="JSON",
+            trainer_step=(
+                f"the trainer must write `{cfg.path}` under PHASESWEEP_TRIAL_DIR before it exits, "
+                f"with the numeric key `{cfg.key}`"
+            ),
+        ):
             _, cur = load_json_value(ctx.trial_dir, cfg.path, cfg.key, digest=digest)
-    except KeyError as exc:
+    except JsonKeyMissingError as exc:
         raise ExtractorError(
-            f"Key {cfg.key!r} not found in {target} (failed at {exc.args[0]!r})."
+            f"Key {cfg.key!r} not found in {target} (failed at {exc.segment!r}; {exc.found})."
         ) from exc
 
     try:
@@ -239,6 +378,18 @@ def _extract_json(
     if provenance is not None:
         provenance["source"] = {"kind": "file", "path": cfg.path, "key": cfg.key, **digest}
     return value
+
+
+def _it_reports(value: object) -> str:
+    """Show what an envelope holds where it differs from the config, so a mismatch names both sides.
+
+    :param object value: The envelope's own value for the mismatched field.
+    :return str: ``; it reports 'x'`` for a string or an integer, and an empty string for a
+        missing or malformed value, which is not quoted back as ``None``.
+    """
+    if isinstance(value, str) or type(value) is int:
+        return f"; it reports {value!r}"
+    return ""
 
 
 def _extract_json_envelope(
@@ -253,13 +404,20 @@ def _extract_json_envelope(
     :param dict[str, Any] | None provenance: Optional sink that receives the
         frozen evidence ``source`` payload — envelope digest plus the
         validated evaluation metadata — on success.
-    :raises ExtractorError: If the envelope is missing, malformed, or belongs to
-        another execution attempt.
+    :raises ExtractorError: If the envelope is missing, resolves outside the attempt
+        directory, is malformed, or belongs to another execution attempt.
     :return float: Validated objective value from the envelope.
     """
     target = ctx.trial_dir / cfg.path
-    with _trial_json_read_errors(target, noun="JSON envelope"):
-        raw = target.read_bytes()
+    with _trial_json_read_errors(
+        target,
+        noun="JSON envelope",
+        trainer_step=(
+            "the trainer must call `phasesweep.report_objective(...)` before it exits, from rank "
+            f"0 only; it writes `{cfg.path}` under PHASESWEEP_TRIAL_DIR"
+        ),
+    ):
+        raw = attempt_file(ctx.trial_dir, cfg.path).read_bytes()
         data = strict_json_loads(raw.decode("utf-8"))
 
     if not isinstance(data, dict):
@@ -284,35 +442,49 @@ def _extract_json_envelope(
     objective = data.get("objective")
     if not isinstance(objective, dict):
         raise ExtractorError(f"JSON envelope at {target} has no objective object.")
-    if objective.get("name") != cfg.objective_name:
+    reported_name = objective.get("name")
+    if reported_name != cfg.objective_name:
         raise ExtractorError(
-            f"JSON envelope at {target} does not report objective {cfg.objective_name!r}."
+            f"JSON envelope at {target} does not report objective {cfg.objective_name!r}"
+            f"{_it_reports(reported_name)}."
         )
-    if objective.get("split") != cfg.split:
-        raise ExtractorError(f"JSON envelope at {target} does not report split {cfg.split!r}.")
+    reported_split = objective.get("split")
+    if reported_split != cfg.split:
+        raise ExtractorError(
+            f"JSON envelope at {target} does not report split {cfg.split!r}"
+            f"{_it_reports(reported_split)}."
+        )
 
     evaluation = data.get("evaluation")
     if not isinstance(evaluation, dict):
         raise ExtractorError(f"JSON envelope at {target} has no evaluation object.")
-    if evaluation.get("policy") != cfg.policy:
-        raise ExtractorError(f"JSON envelope at {target} does not report policy {cfg.policy!r}.")
+    reported_policy = evaluation.get("policy")
+    if reported_policy != cfg.policy:
+        raise ExtractorError(
+            f"JSON envelope at {target} does not report policy {cfg.policy!r}"
+            f"{_it_reports(reported_policy)}."
+        )
     checkpoint = evaluation.get("checkpoint")
     if not isinstance(checkpoint, str) or not checkpoint:
         raise ExtractorError(f"JSON envelope at {target} has no checkpoint identity.")
     if cfg.checkpoint is not None and checkpoint != cfg.checkpoint:
         raise ExtractorError(
-            f"JSON envelope at {target} does not report checkpoint {cfg.checkpoint!r}."
+            f"JSON envelope at {target} does not report checkpoint {cfg.checkpoint!r}"
+            f"{_it_reports(checkpoint)}."
         )
     step = evaluation.get("step")
     if type(step) is not int or step < 0:
         raise ExtractorError(f"JSON envelope at {target} has no non-negative evaluation step.")
     if cfg.expected_step is not None and step != cfg.expected_step:
-        raise ExtractorError(f"JSON envelope at {target} does not report step {cfg.expected_step}.")
+        raise ExtractorError(
+            f"JSON envelope at {target} does not report step {cfg.expected_step}"
+            f"{_it_reports(step)}."
+        )
     if cfg.evaluation_axis == "step":
         position: int | float | None = step
     else:
         reported = evaluation.get("progress")
-        position = progress_position(
+        position = finite_nonnegative(
             reported.get(cfg.evaluation_axis) if isinstance(reported, dict) else None
         )
         if position is None:
@@ -361,16 +533,20 @@ def _extract_log_regex(
     :param TrialContext ctx: Trial identity; the log is read from its ``trial_dir``.
     :param LogRegexExtractor cfg: Log path, named value group, and first/last/min/max selector.
     :param dict | None provenance: Optional source-evidence sink.
-    :raises ExtractorError: The log is missing, unreadable, has no numeric match,
-        has a non-finite match under ``min`` or ``max``, or a line eligible for
-        matching is invalid UTF-8.
+    :raises ExtractorError: The log is missing, outside the attempt, unreadable, has no
+        numeric match, has a non-finite match under ``min`` or ``max``, or a line eligible
+        for matching is invalid UTF-8.
     :return float: Selected match value.
     """
-    import re
-
-    target = ctx.trial_dir / cfg.file
+    try:
+        target = attempt_file(ctx.trial_dir, cfg.file)
+    except OutsideAttemptError as exc:
+        raise ExtractorError(str(exc)) from exc
     if not target.is_file():
-        raise ExtractorError(f"Log file not found: {target}")
+        raise ExtractorError(
+            f"Log file not found: {target} (the trainer must write `{cfg.file}` under "
+            "PHASESWEEP_TRIAL_DIR; `stdout.log` and `stderr.log` are written automatically)"
+        )
 
     pattern = re.compile(cfg.pattern)
 
@@ -419,8 +595,7 @@ def _extract_log_regex(
                         # run would be scored on whichever side of them it landed.
                         raise ExtractorError(
                             f"Log file {target} has a non-finite match on line {line_no}, "
-                            f"so select: {cfg.select} cannot score this trial. "
-                            "Check why the trainer reported a non-finite objective."
+                            f"so select: {cfg.select} cannot score this trial."
                         )
                     elif cfg.select == "min":
                         if result is None or v < result:
@@ -448,7 +623,7 @@ def _extract_log_regex(
             first_unparseable,
         )
     if result is None:
-        raise ExtractorError(f"No matches for {cfg.pattern!r} in {target}.")
+        raise ExtractorError(f"No matches for {cfg.pattern!r} in {target}")
     if provenance is not None:
         provenance["source"] = {
             "kind": "file",
@@ -523,9 +698,8 @@ def _capture_wandb(
             if isinstance(exc, WandbRunMissingError):
                 message = (
                     f"No W&B run {ctx.attempt_id!r} was found in {source.entity}/{source.project} "
-                    "at the evidence deadline. Check that the trainer calls wandb.init() and "
-                    "passes no project, entity or id of its own, or set the extractor's "
-                    "project and entity to match."
+                    "at the evidence deadline. The trainer should call wandb.init() without "
+                    "its own project, entity or id."
                 )
             else:
                 expired = (
@@ -539,7 +713,7 @@ def _capture_wandb(
             raise error(message) from exc
         except WandbSetupError as exc:
             raise EvidenceUnreadableError(
-                f"W&B authentication/setup failed for {target}: {exc.cause}. Check account access and endpoint settings."
+                f"W&B authentication/setup failed for {target}: {exc.cause}."
             ) from exc
         except WandbRunTerminalError as exc:
             raise ExtractorError(
@@ -551,9 +725,7 @@ def _capture_wandb(
                 f"available summary keys: {exc.available!r}."
             ) from exc
         except ImportError as exc:
-            raise EvidenceUnreadableError(
-                "W&B evidence requires the optional SDK; install phasesweep[wandb]."
-            ) from exc
+            raise EvidenceUnreadableError(WANDB_SDK_MISSING) from exc
         except ValueError as exc:
             raise ExtractorError(f"Invalid W&B numeric evidence for {target}: {exc}") from exc
         except (ExtractorError, UnsafeProcessCleanupError):
@@ -668,13 +840,14 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
     :raises ExtractorError: Binding or remote evidence cannot be accepted.
     """
     from phasesweep.evidence.mlflow import validate_capture
-    from phasesweep.tracking.mlflow import (
-        ManagedObjectiveMissingError,
-        OperationOutcomeUnknownError,
-        OperationUnavailableError,
-        request_operation,
+    from phasesweep.tracking.mlflow import ManagedObjectiveMissingError, request_operation
+    from phasesweep.tracking.session import (
+        BINDING_FILE,
+        EXPECTED_BINDING_FILE,
+        gave_no_answer,
+        read_binding,
+        read_record,
     )
-    from phasesweep.tracking.session import BINDING_FILE, read_binding, read_record
 
     if ctx.mlflow_capture:
         return validate_capture(ctx.mlflow_capture)
@@ -688,7 +861,7 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
                 "phasesweep.tracking.bind_mlflow_run(run_id) inside its active run."
             )
         binding = read_binding(ctx.trial_dir)
-        expected = read_record(ctx.trial_dir / "mlflow-expected.json")
+        expected = read_record(ctx.trial_dir / EXPECTED_BINDING_FILE)
         if (
             any(binding.get(k) != v for k, v in expected.items())
             or binding["attempt_id"] != ctx.attempt_id
@@ -711,18 +884,16 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
             deadline=min(stop, deadline) if deadline is not None else stop,
         )
         capture = validate_capture(retrieved)
-    except TimeoutError as exc:
-        if deadline is not None and time.monotonic() >= deadline:
-            raise DeadlineExceededError(str(exc)) from exc
-        raise EvidenceUnreadableError(str(exc)) from exc
-    except (OperationUnavailableError, OperationOutcomeUnknownError) as exc:
-        raise EvidenceUnreadableError(str(exc)) from exc
     except ManagedObjectiveMissingError as exc:
         raise MlflowObjectiveMissingError(str(exc)) from exc
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:  # every NO_ANSWER error included
         if isinstance(exc, UnsafeProcessCleanupError):
             raise
-        raise ExtractorError(str(exc)) from exc
+        if not gave_no_answer(exc):
+            raise ExtractorError(str(exc)) from exc
+        if isinstance(exc, TimeoutError) and deadline is not None and time.monotonic() >= deadline:
+            raise DeadlineExceededError(str(exc)) from exc
+        raise EvidenceUnreadableError(str(exc)) from exc
     ctx.mlflow_capture.update(retrieved)
     return capture
 
@@ -853,7 +1024,7 @@ def _json_equals(ctx: TrialContext, gate: JsonEqualsGate) -> GateResult:
     try:
         _, actual = load_json_value(ctx.trial_dir, gate.path, gate.key)
     except Exception as exc:
-        return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
+        return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
     if type(actual) is type(gate.value) and actual == gate.value:
         return GateResult(gate.type, True, f"{gate.key} == {gate.value!r}")
     return GateResult(
@@ -875,7 +1046,7 @@ def _json_scalar_bound(ctx: TrialContext, gate: JsonScalarBoundGate) -> GateResu
         _, raw_value = load_json_value(ctx.trial_dir, gate.path, gate.key)
         value = json_float(raw_value, label=gate.key)
     except Exception as exc:
-        return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
+        return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
     if not math.isfinite(value):
         return GateResult(gate.type, False, f"{gate.key} was non-finite: {value!r}")
     if gate.min is not None and value < gate.min:
@@ -940,7 +1111,7 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
         try:
             _, raw_size = load_json_value(ctx.trial_dir, gate.path, gate.key)
         except Exception as exc:
-            return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
+            return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
         if not isinstance(raw_size, int) or isinstance(raw_size, bool):
             return GateResult(gate.type, False, f"{gate.key} was not an integer byte count")
         if raw_size < 0:
@@ -961,8 +1132,8 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
     :param Sha256Gate gate: Gate config naming the file and expected digest.
     :return GateResult: Pass/fail result and human-readable detail.
     """
-    path = ctx.trial_dir / gate.path
     try:
+        path = attempt_file(ctx.trial_dir, gate.path)
         if not path.is_file():
             return GateResult(gate.type, False, f"{gate.path} is missing")
         digest = file_sha256(path)

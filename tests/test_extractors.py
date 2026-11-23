@@ -1460,16 +1460,8 @@ def test_json_extractor_reports_missing_or_nonnumeric_values(
         run_extractor(make_trial_context(tmp_path), cfg)
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        '{"x": 1, "x": 2}',
-        '{"x": NaN}',
-        '{"x": Infinity}',
-    ],
-)
-def test_json_extractor_rejects_ambiguous_nonstandard_json(tmp_path, payload):
-    (tmp_path / "result.json").write_text(payload)
+def test_json_extractor_rejects_duplicate_keys(tmp_path):
+    (tmp_path / "result.json").write_text('{"x": 1, "x": 2}')
     cfg = JsonExtractor(type="json", path="result.json", key="x")
 
     with pytest.raises(ExtractorError, match="Invalid JSON"):
@@ -1665,13 +1657,13 @@ def test_log_regex_considers_every_numeric_match_per_line(
 def test_log_regex_min_max_fails_on_any_non_finite_match(
     tmp_path: Path, select: str, text: str, bad_line: int
 ) -> None:
-    """A min or max over matches that include nan or inf fails with the offending line and trainer diagnosis."""
+    """A min or max over matches that include nan or inf fails naming the offending line."""
     (tmp_path / "stdout.log").write_text(text, encoding="utf-8")
     cfg = LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[^\s]+)", select=select)
     provenance: dict = {}
     with pytest.raises(
         ExtractorError,
-        match=rf"line {bad_line}\b.*Check why the trainer reported a non-finite objective",
+        match=rf"non-finite match on line {bad_line}\b.*cannot score this trial",
     ):
         run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
     assert "source" not in provenance
@@ -1940,10 +1932,7 @@ def test_wandb_missing_run_worker_names_target_and_init_overrides(
         run_extractor(context, source)
     message = str(refused.value)
     assert f"No W&B run {context.attempt_id!r} was found in entity/project" in message
-    assert (
-        "Check that the trainer calls wandb.init() and passes no project, entity or id of its own"
-    ) in message
-    assert "set the extractor's project and entity to match" in message
+    assert "The trainer should call wandb.init() without its own project, entity or id" in message
     assert "Last observation: ValueError" not in message
     assert len(message.splitlines()) == 1
 

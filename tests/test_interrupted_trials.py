@@ -35,6 +35,7 @@ from phasesweep.engine.attempts import (
     _record_stale_trial_outcome,
 )
 from phasesweep.engine.errors import (
+    TRACKER_UNREADABLE_STEP,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrackingTargetUnavailableError,
@@ -82,6 +83,7 @@ from phasesweep.engine.study_policy import (
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import OPERATOR_STEPS, OperatorAction, PhaseSweepError
+from phasesweep.evidence.wandb import WANDB_SDK_MISSING
 from phasesweep.runtime.json import JsonObject, JsonValue, json_object
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
 from phasesweep.runtime.reaper import read_boot_id
@@ -92,6 +94,7 @@ from tests.conftest import (
     phase_study,
     phase_trials,
     trial_outcome,
+    use_guardian_timing,
     write_experiment_config,
     write_param_echo_trainer,
     write_trainer,
@@ -183,7 +186,7 @@ def _finished(study: optuna.Study, sequence: int, outcome: str) -> None:
     [
         pytest.param(None, id="no-record"),
         pytest.param(
-            trial_outcome(3, "interrupted", cause="orchestrator interrupted by signal 2"),
+            trial_outcome(3, "interrupted", cause="orchestrator interrupted by SIGINT"),
             id="signal",
         ),
         pytest.param(trial_outcome(3, "failure", cause="exit 1"), id="failure"),
@@ -210,7 +213,7 @@ def test_stale_recovery_records_interrupted_unless_the_objective_recorded_a_fail
         recorded if recorded is not None else trial_outcome(3, "interrupted", cause=_STALE_CAUSE)
     )
 
-    assert _fail_stale_running_trial(study, trial, failure_message="could not settle trial")
+    assert _fail_stale_running_trial(study, trial, where="could not settle trial")
 
     recovered = study.trials[trial.number]
     interrupted = expected["outcome"] == "interrupted"
@@ -348,10 +351,10 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
     assert (winner.params, winner.metric) == (expected.params, expected.metric)
     assert winner.completion["finished_trials"] == 3
 
-    assert "phase=p study=t::p finished=0 remaining=3 reruns=1 n_jobs=1" in lines
-    assert f"phase=p RERUN trial=1 of=0 reason={_STALE_CAUSE}" in lines
-    (rerun_line,) = (line for line in lines if line.startswith("phase=p TRIAL trial=1 "))
-    assert " rerun_of=0 (1/3 finished)" in rerun_line
+    assert "p  3 trials to run, 1 of them a rerun, 1 at a time" in lines
+    assert f"p  trial 1  RERUN of trial 0  reason: {_STALE_CAUSE}" in lines
+    (rerun_line,) = (line for line in lines if line.startswith("p  trial 1  COMPLETE  "))
+    assert "  1/3  " in rerun_line and rerun_line.endswith("  rerun of 0")
     with (_phase_dir(exp, "p") / "trials.csv").open(newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert [row["state"] for row in rows] == ["INTERRUPTED", "COMPLETE", "COMPLETE", "COMPLETE"]
@@ -366,7 +369,7 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
     ]
 
 
-_SIGINT_CAUSE = f"orchestrator interrupted by signal {int(signal.SIGINT)}"
+_SIGINT_CAUSE = "orchestrator interrupted by SIGINT"
 
 
 def _cause(trial: optuna.trial.FrozenTrial) -> str | None:
@@ -636,13 +639,15 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
             time.sleep(0.01)
         """,
     )
-    guardian_script = write_trainer(
-        tmp_path / "guardian.py",
-        f"""
-        import runpy, time
+    use_guardian_timing(
+        monkeypatch,
+        tmp_path,
+        settle_seconds=0.2,
+        term_grace_seconds=0.2,
+        patch=f"""
+        import time
         from pathlib import Path
-        namespace = runpy.run_path({process._SUPERVISOR_SCRIPT_PATH!r})
-        original = namespace["write_lifecycle_record"]
+        original = guardian.write_lifecycle_record
         def fail_intent(path: Path, *, attempt_id: str, state: str, return_code: int | None, cleanup_confirmed: bool | None, duration_seconds: float | None) -> None:
             if state == "terminating" and {intent_write_fails!r}:
                 Path({str(failed)!r}).touch()
@@ -652,16 +657,13 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
                 while not Path({str(publish)!r}).exists():
                     time.sleep(0.01)
             original(path, attempt_id=attempt_id, state=state, return_code=return_code, cleanup_confirmed=cleanup_confirmed, duration_seconds=duration_seconds)
-        namespace["main"].__globals__["write_lifecycle_record"] = fail_intent
-        namespace["main"].__globals__["_GROUP_TERM_GRACE_SECONDS"] = 0.2
+        guardian.write_lifecycle_record = fail_intent
         if not {procfs_available!r}:
             def no_procfs(path):
                 raise FileNotFoundError(path)
-            namespace["os"].scandir = no_procfs
-        raise SystemExit(namespace["main"]())
+            guardian.os.scandir = no_procfs
         """,
     )
-    monkeypatch.setattr(process, "_SUPERVISOR_SCRIPT_PATH", str(guardian_script))
     process.write_attempt_lifecycle(tmp_path, attempt_id="held-lease", state="launching")
     lease = tmp_path / "gpu.lock"
     with lease.open("w") as held, (tmp_path / "guardian.log").open("w") as output:
@@ -671,6 +673,7 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
             stderr=output,
             gpu_lease_fds=(held.fileno(),),
             lifecycle_args=(str(tmp_path), "held-lease", str(time.monotonic())),
+            label="trial",
         )
     try:
         process._write_all(
@@ -779,6 +782,7 @@ def test_completed_orphan_evidence_survives_runner_sigkill(
     sdk_worker = recovery_stage in {"sdk", "sdk-interrupt", "sdk-interrupt-parallel"}
     shutdown_sdk = recovery_stage.startswith("sdk-interrupt")
     guardian_cancel = recovery_stage in {"shutdown-trainer", "timeout-trainer"}
+    direct_recovery = recovery_stage in {"interrupt-intent", "interrupt-termination"}
     terminated = recovery_stage in {
         "terminate",
         "mcp-terminate",
@@ -982,37 +986,15 @@ else:
                     )
                     assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds > 0
             assert (directory / "r.json").exists()
-            if terminated and not guardian_cancel:
-                terminate_group = reaper._terminate_process_group
-
-                def terminate_and_wait_for_guardian(
-                    pgid: int,
-                    *,
-                    grace_seconds: float,
-                ) -> bool:
-                    """Expose a handled SIGTERM's real zero exit before recovery reads evidence.
-
-                    :param int pgid: Trainer group selected for termination.
-                    :param float grace_seconds: SIGTERM grace before escalation.
-                    :return bool: Confirmed cleanup after the guardian records the trainer exit.
-                    """
-                    assert terminate_group(pgid, grace_seconds=grace_seconds)
-                    deadline = time.monotonic() + 5
-                    while time.monotonic() < deadline:
-                        exited = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
-                        if exited is not None and exited.state == "exited":
-                            break
-                        time.sleep(0.02)
-                    assert exited is not None and exited.state == "exited"
-                    assert exited.return_code == 0
-                    assert exited.cleanup_confirmed
-                    assert exited.duration_seconds is not None and exited.duration_seconds > 0
-                    assert (directory / "r.json").read_text() == '{"x": 0.25}'
-                    return True
-
-                monkeypatch.setattr(
-                    reaper, "_terminate_process_group", terminate_and_wait_for_guardian
-                )
+            if direct_recovery:
+                # Only the unguarded fallback records its interruption in Optuna before
+                # it signals. These cases exercise losing the recovery process there.
+                guardian_pid = orphan_identity.guardian_pid
+                os.kill(guardian_pid, signal.SIGKILL)
+                stop_deadline = time.monotonic() + 5
+                while reaper.is_same_live_process(guardian_pid, orphan_identity.guardian_starttime):
+                    assert time.monotonic() < stop_deadline, "guardian still owns cleanup"
+                    time.sleep(0.02)
             if recovery_stage.endswith("snapshot"):
                 snapshot = _generation_config_snapshot_path(
                     _experiment_dir(experiment), "orphan-generation"
@@ -1112,12 +1094,11 @@ else:
             if shutdown_sdk or recovery_stage == "interrupt-extraction-signal":
                 log_text = (tmp_path / "runner.log").read_text()
                 assert (
-                    log_text.count("Trial 0 in phase p finished training; its result is retained.")
+                    log_text.count(
+                        "Trial 0 in phase p finished training; its result is retained. The "
+                        "next run extracts it without retraining."
+                    )
                     == 1
-                )
-                assert (
-                    "The next phasesweep run with the same config will extract the result without retraining."
-                    in log_text
                 )
             if return_code == 0 and not terminated:
                 assert (
@@ -1153,7 +1134,7 @@ else:
                     objective.write_bytes(original.replace(b"x=1.0", b"x=0.1"))
                     with pytest.raises(
                         TrialEvidenceMissingError,
-                        match="bytes behind the published metric have changed",
+                        match="now hashes to .*: its bytes have changed",
                     ) as refused:
                         run_experiment(experiment)
                     assert refused.value.remediation is not None
@@ -1246,7 +1227,7 @@ else:
                     registry.state_dir, "orphan-generation", confirm=True
                 )
                 assert recovered_run.exit_code == 0, recovered_run.output
-                assert f"terminated {int(terminated)} live process group(s)" in recovered_run.output
+                assert "terminated 0 live process group(s)" in recovered_run.output
                 expected_kept = 0 if terminated else 1
                 assert f"kept {expected_kept} completed trial result(s)" in recovered_run.output
                 if expected_kept:
@@ -1285,7 +1266,7 @@ else:
             if terminated:
                 lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
                 assert lifecycle is not None and lifecycle.return_code == (
-                    -signal.SIGTERM if guardian_cancel else 0
+                    None if direct_recovery else -signal.SIGTERM
                 )
                 assert recovered.value is None
                 release.touch()
@@ -1386,8 +1367,7 @@ def test_unreadable_tracker_leaves_finished_training_pending_until_it_answers(
     tracker.switch("denied")
     with pytest.raises(TrackingTargetUnavailableError) as refused:
         run_experiment(experiment)
-    assert refused.value.remediation is not None
-    assert "nothing is retrained" in refused.value.remediation
+    assert refused.value.remediation == TRACKER_UNREADABLE_STEP
     trials = phase_trials(experiment)
     assert len(trials) == n_jobs
     for trial in trials:
@@ -1424,15 +1404,13 @@ def test_a_pending_trial_whose_tracker_sdk_is_missing_names_installing_it(
     with pytest.raises(TrackingTargetUnavailableError) as refused:
         run_experiment(experiment)
     assert str(refused.value) == (
-        "1 completed trial(s) finished training, but the tracker could not be read. First "
-        "failure: metric extractor: W&B evidence requires the optional SDK; install "
-        "phasesweep[wandb]. Their training is kept and no new trial was started."
+        "1 completed trial(s) finished training, but the tracker could not be read: "
+        f"metric extractor: {WANDB_SDK_MISSING}"
     )
-    assert refused.value.remediation is not None
-    assert refused.value.remediation.startswith(
-        "Fix the reported cause (restore access to the tracker, or install its missing SDK), "
-        "then run the same config again: the completed training is kept and nothing is "
-        "retrained."
+    assert refused.value.remediation == (
+        "Restore access to the tracker or install its SDK, then run the same config again; the "
+        "finished training is kept. If the tracker is gone for good, set a new `experiment` name "
+        "to start a fresh study."
     )
     assert "its tracker could not be read: metric extractor: W&B evidence requires" in caplog.text
     (trial,) = phase_trials(experiment)
@@ -1777,8 +1755,8 @@ def test_in_memory_run_fails_a_trial_whose_tracker_is_unreadable_and_promises_no
     with pytest.raises(NoFeasibleTrialError) as refused:
         run_experiment(experiment)
     assert not isinstance(refused.value, TrackingTargetUnavailableError)
-    assert "state=FAIL" in caplog.text
-    assert "reason=metric extractor: W&B authentication/setup failed" in caplog.text
+    assert "trial 0  FAIL" in caplog.text
+    assert "reason: metric extractor: W&B authentication/setup failed" in caplog.text
     assert "retained" not in caplog.text
     assert "kept" not in str(refused.value) + str(refused.value.remediation)
     # The next run starts afresh: nothing was kept, so the trainer runs again.
@@ -1799,8 +1777,8 @@ def test_in_memory_sweep_keeps_its_finished_trials_when_the_tracker_turns_unread
     assert winners["p"].metric == 1.0
     assert launches.read_text().splitlines() == ["launch"] * 6
     assert _last_successful_generation_path(experiment).is_file()
-    assert caplog.text.count("state=COMPLETE") == 4
-    assert caplog.text.count("reason=metric extractor: W&B authentication/setup failed") == 2
+    assert caplog.text.count("  COMPLETE  ") == 4
+    assert caplog.text.count("reason: metric extractor: W&B authentication/setup failed") == 2
 
 
 @pytest.mark.parametrize("storage", ["journal", "memory"])
@@ -1829,8 +1807,6 @@ def test_shutdown_during_extraction_promises_kept_training_only_with_persistent_
     lost = "Trial 0 in phase p finished training, but its result was not extracted"
     assert (retained in caplog.text) is (storage == "journal")
     assert (lost in caplog.text) is (storage == "memory")
-    if storage == "memory":
-        assert "storage: null keeps no trials between runs" in caplog.text
 
 
 _RUN_CONFIG = """
@@ -1880,8 +1856,7 @@ def test_recovery_defers_a_killed_runs_finished_trial_while_its_tracker_is_unrea
                 TrackingTargetUnavailableError, match="1 completed trial"
             ) as refused:
                 run_experiment(experiment, terminal_callback=reports.append)
-            assert refused.value.remediation is not None
-            assert "nothing is retrained" in refused.value.remediation
+            assert refused.value.remediation == TRACKER_UNREADABLE_STEP
             (report,) = reports
             assert report.cleanup_confirmed
             assert report.failure_stage == "preflight"
@@ -1894,7 +1869,9 @@ def test_recovery_defers_a_killed_runs_finished_trial_while_its_tracker_is_unrea
             recovered_run = recover_run_cli(registry.state_dir, "orphan-generation", confirm=True)
             assert recovered_run.exit_code == 0, recovered_run.output
             assert "kept 0 completed trial result(s)" in recovered_run.output
+            # The run's own refusal and recover-run end with the same step.
             assert "Left 1 completed trial(s) pending" in recovered_run.output
+            assert f"). {TRACKER_UNREADABLE_STEP}\n" in recovered_run.output
         assert not reaper._process_group_alive(reader.pgid)
         (trial,) = phase_trials(experiment)
         _assert_evidence_pending(experiment, trial)
@@ -1925,7 +1902,7 @@ def test_recovery_preview_names_trial_group_liveness(
     )
     monkeypatch.setattr(reaper, "same_pid_namespace", lambda _: case != "foreign_absent")
     monkeypatch.setattr(reaper, "recorded_process_blocker", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(reaper, "is_pid_alive", lambda _: case == "live")
+    monkeypatch.setattr(reaper, "is_pid_alive", lambda pid: pid == 12345 and case == "live")
     monkeypatch.setattr(reaper, "read_proc_starttime", lambda _: 1)
     monkeypatch.setattr(reaper.os, "getpgid", lambda _: 12345)
     monkeypatch.setattr(reaper, "_process_group_exists", lambda _: case != "group_exited")
@@ -1933,7 +1910,11 @@ def test_recovery_preview_names_trial_group_liveness(
     monkeypatch.setattr(
         reaper,
         "_read_proc_stat",
-        lambda _: SimpleNamespace(pgrp=12345, starttime=2) if case == "reused_group" else None,
+        lambda entry: (
+            SimpleNamespace(pgrp=12345, starttime=2)
+            if entry.name == "12345" and case == "reused_group"
+            else None
+        ),
     )
     signalled: list[int] = []
     monkeypatch.setattr(

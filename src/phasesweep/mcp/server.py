@@ -30,7 +30,7 @@ if typing.TYPE_CHECKING:
 from phasesweep import __version__
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine.artifacts import LOG_FORMAT
-from phasesweep.engine.read import CostAdvisoryStatus
+from phasesweep.engine.read import CostAdvisoryStatus, EdgeAdvisoryStatus
 from phasesweep.engine.read import ResultContext as ResultContextLiteral
 from phasesweep.engine.state import TrialStateName, WinnerSourceKind
 from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND, agent_prompt_text
@@ -146,8 +146,8 @@ DESCRIPTION_AWAIT_RUN = (
     "Wait up to timeout_seconds for a launched run to change, become terminal, or require "
     "recovery. Call after launch_run and repeat with the same run_id while run.state is "
     "running, including after reason phase_completed and after a client disconnect; omit "
-    "timeout_seconds for a client-safe 20-second wait, and request longer waits only when the "
-    "client permits them. Stop immediately if run.recovery_required is true. When "
+    f"timeout_seconds for a client-safe {AWAIT_DEFAULT_TIMEOUT_SECONDS}-second wait, and request "
+    "longer waits only when the client permits them. Stop immediately if run.recovery_required is true. When "
     "run.runner_observable is false, monitor durable progress and notify the operator if it "
     "stops. Call get_run_results when terminal. Read-only."
 )
@@ -652,7 +652,13 @@ class WinnerPhasePayload(_ToolPayload):
         description="Whether cost_key is unset, comparison unavailable, no cheaper configuration qualifies, or advice is available."
     )
     tie_groups: list[TieGroupSnapshot] | None = Field(
-        description="Other repeat configurations within two combined standard errors, with params, gap, combined_se and threshold; null when retained trials are unavailable. Parameter values follow visible_params."
+        description="Other repeat configurations whose mean is within the phase's pooled noise band of the winner's, with params, gap, combined_se and threshold; with reduce: median, those whose median equals the winner's, at gap 0 with combined_se and threshold null. Null when retained trials are unavailable. Parameter values follow visible_params."
+    )
+    edge_advisory: str | None = Field(
+        description="Searched numeric parameters whose winning value is the lowest or highest of at least three the phase tried, so no trial ran beyond it; parameters follow visible_params policy."
+    )
+    edge_advisory_status: EdgeAdvisoryStatus = Field(
+        description="unavailable when the trials or the producing config cannot be read, not_at_edge when no parameter qualifies, available with an edge_advisory."
     )
     confound: ConfoundSummary = Field(
         description="Verdicts on the population this winner was selected from, frozen at selection."
@@ -995,7 +1001,7 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
         :return CancelRunResult: Structured cancellation result.
         """
         # MCP 1.27 invokes synchronous tool functions on the event-loop
-        # thread. Cancellation may spend its 30-second grace period waiting
+        # thread. Cancellation may spend its whole RUNNER_STOP_GRACE_SECONDS waiting
         # for a process group, so isolate it from concurrent await/status calls.
         return CancelRunResult.model_validate(await asyncio.to_thread(app.cancel, run_id))
 
@@ -1195,9 +1201,8 @@ def call(catalog: Path, tool: str, arguments: JsonObject) -> int:
     if tool == TOOL_LAUNCH_RUN and not in_initial_pid_namespace():
         print(
             "phasesweep mcp call: warning: this process is not in the host's initial PID "
-            "namespace, so a runner launched from it ends when that namespace does, such as "
-            "when a sandboxed command finishes; launch from a shell outside any sandbox for "
-            "a run that must outlive it.",
+            "namespace, so a runner launched here ends when that namespace does. Launch from "
+            "a host shell for a run that must outlive it.",
             file=sys.stderr,
         )
 

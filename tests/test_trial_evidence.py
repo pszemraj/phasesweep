@@ -652,7 +652,7 @@ def test_log_regex_evaluation_revision_change_blocks_study_reuse(
 
     with pytest.raises(
         TrialEvidenceMissingError,
-        match="extractor evaluation contract.*evaluator revision",
+        match="objective evidence no longer matches its configured extractor",
     ) as excinfo:
         run_experiment(_evidence_experiment(tmp_path, n_trials=2))
 
@@ -743,7 +743,7 @@ def test_republishing_refuses_a_winner_whose_objective_bytes_changed(tmp_path: P
     source.write_bytes(b"y" + original[1:])
     assert source.stat().st_size == len(original)
 
-    with pytest.raises(TrialEvidenceMissingError, match="bytes behind the published metric"):
+    with pytest.raises(TrialEvidenceMissingError, match="now hashes to .*: its bytes have changed"):
         run_experiment(_evidence_experiment(tmp_path))
 
     assert _pointer_bytes(experiment) == pointer_before
@@ -758,7 +758,7 @@ def test_republishing_refuses_a_winner_whose_objective_bytes_changed(tmp_path: P
 @pytest.mark.parametrize(
     ("damage", "expected"),
     [
-        pytest.param("changed", "bytes behind the published metric", id="same-size-edit"),
+        pytest.param("changed", "now hashes to .*: its bytes have changed", id="same-size-edit"),
         pytest.param(
             "missing", "objective evidence in 'stdout.log', which is missing", id="missing"
         ),
@@ -840,14 +840,14 @@ def test_group_winner_verifies_every_member_evidence(tmp_path: Path) -> None:
 
     with pytest.raises(
         TrialEvidenceMissingError,
-        match=r"Skipped phase 'p' winner source phase 'p' trial 0 .*bytes behind the published",
+        match=r"Skipped phase 'p' winner source phase 'p' trial 0 .*now hashes to .*: its bytes",
     ):
         run_experiment(experiment(3), from_phase="q")
     assert len(phase_trials(original, "q")) == 2
     assert not marker.exists()
     with pytest.raises(
         TrialEvidenceMissingError,
-        match=r"Phase 'p' winner group member trial 0 .*bytes behind the published",
+        match=r"Phase 'p' winner group member trial 0 .*now hashes to .*: its bytes",
     ):
         run_experiment(carrying)
     assert _pointer_bytes(original) == pointer_before

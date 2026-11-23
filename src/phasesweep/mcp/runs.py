@@ -37,6 +37,7 @@ from phasesweep.runtime.files import (
 )
 from phasesweep.runtime.reaper import (
     foreign_pid_namespace_reason,
+    guardian_exit_timeout,
     identity_from_earlier_boot,
     is_pid_namespace,
     is_same_live_process,
@@ -70,13 +71,18 @@ RUNNER_HEARTBEAT_INTERVAL_SECONDS = 15.0
 #: Heartbeat age, several missed refreshes, past which a reader that cannot
 #: observe the runner reports that it has probably stopped.
 RUNNER_HEARTBEAT_STALE_SECONDS = 120.0
+#: How long a SIGTERMed runner group gets before SIGKILL. A runner confirms its
+#: trials' cleanup by waiting for their guardians, and a guardian whose trainer root
+#: had just exited finishes its helper settle and SIGTERM grace first. The runner allows
+#: that guardian :func:`~phasesweep.runtime.reaper.guardian_exit_timeout`; this grace adds
+#: room for the runner's ledger and status writes after that wait. It is fixed at import:
+#: the runner and its guardians are other processes, timed by the guardian's own constants,
+#: so a test that shortens them in this process leaves the runner's needs unchanged.
+RUNNER_STOP_GRACE_SECONDS = guardian_exit_timeout() + 15.0
 
 log = logging.getLogger("phasesweep.mcp.runs")
 
 
-# 128 + SIGTERM(15); 128 + SIGINT(2). The engine shutdown handler exits
-# 128+signum, so the runner records these as the "cancelled" terminal cause.
-_SIGNALLED_EXIT_CODES = frozenset({143, 130})
 _RUN_EVIDENCE_SUFFIXES = (
     ".config.yaml",
     ".status.json",
@@ -93,11 +99,8 @@ _RUN_EVIDENCE_SUFFIXES = (
 _UNREADABLE_RUN = "run:"
 _UNREADABLE_HANDLE_FILE = "handle:"
 #: The operator's step for a state directory in another format, which nothing migrates.
-FRESH_STATE_DIR_STEP = (
-    "Point the catalog's `state_dir` at a new directory; the PhaseSweep version that wrote "
-    "this one still reads it."
-)
-MCP_STATE_FORMAT_VERSION = 9
+FRESH_STATE_DIR_STEP = "Point the catalog's `state_dir` at a new directory."
+MCP_STATE_FORMAT_VERSION = 12
 CLEANUP_UNCERTAINTY_SCHEMA_VERSION = 1
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
 _STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}
@@ -346,7 +349,6 @@ class RunStore:
         """
         store = cls.__new__(cls)
         store._set_paths(state_dir)
-        wrong_path = ". Pass the state_dir from the catalog the MCP server runs with."
         parent = absolute_path(state_dir).parent
         if parent != parent.parent:
             try:
@@ -354,24 +356,22 @@ class RunStore:
             except (OSError, UnsafePrivatePathError) as exc:
                 raise ValueError(
                     f"not an existing MCP state directory; {state_dir} is not reachable "
-                    f"through real directories: {exc}{wrong_path}"
+                    f"through real directories: {exc}"
                 ) from None
         try:
             os.lstat(store._format_marker_path)
         except (FileNotFoundError, NotADirectoryError):
             if store._has_run_handles():
                 raise store._format_refusal("durable run data has no format marker") from None
-            missing = [
-                str(path)
-                for path in (state_dir, store._runs_dir, store._logs_dir)
-                if not path.is_dir()
-            ]
+            # A missing state directory already says its subdirectories are missing.
+            layout = (store._runs_dir, store._logs_dir) if state_dir.is_dir() else (state_dir,)
+            missing = [str(path) for path in layout if not path.is_dir()]
             detail = (
                 "expected directories are missing: " + ", ".join(missing)
                 if missing
                 else f"it has no format marker and no run handles under {store._runs_dir}"
             )
-            raise ValueError(f"not an existing MCP state directory; {detail}{wrong_path}") from None
+            raise ValueError(f"not an existing MCP state directory; {detail}.") from None
         except OSError:
             # Marker presence is unknown until directory validation succeeds.
             pass
@@ -528,18 +528,18 @@ class RunStore:
         """Build the actionable refusal for unmarked or unsupported MCP state.
 
         :param str detail: Specific format-boundary failure observed.
-        :return UnsupportedStateFormatError: Refusal that directs the operator to a safe path.
+        :return UnsupportedStateFormatError: Refusal naming the directory and the detail; the
+            caller adds :data:`FRESH_STATE_DIR_STEP`.
         """
         return UnsupportedStateFormatError(
-            f"MCP state directory {self._format_marker_path.parent} {detail}; "
-            "use a fresh MCP state directory."
+            f"MCP state directory {self._format_marker_path.parent}: {detail}."
         )
 
     def _marker_version_refusal(self, version: int) -> UnsupportedStateFormatError:
         """Build the refusal for a well-formed marker that declares another format.
 
         :param int version: Format the marker declares.
-        :return UnsupportedStateFormatError: Refusal naming both formats and the fresh-directory step.
+        :return UnsupportedStateFormatError: Refusal naming both formats.
         """
         return self._format_refusal(
             f"format marker declares format {version}; "
@@ -1094,10 +1094,9 @@ class RunStore:
                 state = "running"
             elif status["returncode"] == 0:
                 state = "succeeded"
-            elif (
-                status["returncode"] in _SIGNALLED_EXIT_CODES
-                or status.get("error_class") == "cancelled"
-            ):
+            elif status.get("error_class") == "cancelled":
+                # The runner records every shutdown signal it honours this way, with
+                # returncode 128 plus the signal; nothing else writes "cancelled".
                 state = "cancelled"
             else:
                 state = "failed"

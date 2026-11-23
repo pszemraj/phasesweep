@@ -158,15 +158,15 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
         for path in paths:
             handle = _lock_outlasting_probes(path)
             if handle is None:
+                # Both locks are keyed on what the experiment uses (its resolved output
+                # directory, and its storage with its name), so the holder may run another
+                # config or an experiment name linked to the same directory.
                 raise ExperimentLockBusyError(
-                    f"Another phasesweep process appears to be using the same "
-                    f"experiment backend or output namespace for "
-                    f"{experiment.experiment!r} (lock file: {path}). phasesweep "
-                    f"supports one active orchestrator per experiment output "
-                    f"namespace and per persistent storage identity.",
+                    f"Another phasesweep process holds the lock experiment "
+                    f"{experiment.experiment!r} needs (lock file: {path}).",
                     remediation=(
-                        "Wait for the other PhaseSweep operation using this experiment output "
-                        "or storage namespace to finish, then retry the same command."
+                        "Wait for the process that holds this experiment's lock to finish, "
+                        "then retry."
                     ),
                 )
             handles.append(handle)

@@ -4,10 +4,17 @@ Reads kernel identity to decide whether a recorded PID or process group is still
 one phasesweep launched, terminates groups SIGTERM -> grace -> SIGKILL, and
 cleans a stale trial's group only when the boot- and process-bound identity in
 ``process_identity.json`` proves that signalling it cannot hit a reused PID.
+
+The lease guardian in ``runtime.supervisor`` runs without the package and keeps
+stdlib-only copies of two liveness rules here: :func:`_has_exited` as
+``supervisor._has_exited``, and the group-member rule of
+:func:`_process_group_alive_with_members` and :func:`_group_member_pids` as
+``supervisor._trainer_group_alive``. Change each pair together.
 """
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import re
@@ -21,15 +28,19 @@ from pathlib import Path
 from typing import Literal, TypeGuard
 
 from phasesweep.errors import ForeignPidNamespaceError
-from phasesweep.runtime.darwin import read_boot_session_uuid, read_process_info
+from phasesweep.runtime import supervisor as _supervisor
+from phasesweep.runtime.darwin import ProcessInfo, read_boot_session_uuid, read_process_info
 from phasesweep.runtime.json import strict_json_loads
 
 # Process supervision logs on one channel, whichever module does the work.
 log = logging.getLogger("phasesweep.runtime.process")
 
 _KILL_GRACE_SECONDS = 10.0
+# Room past a guardian's helper settle and SIGTERM grace for its poll overshoot and procfs
+# scans, which a loaded machine stretches to over a second.
+_GUARDIAN_EXIT_MARGIN_SECONDS = 5.0
 PROCESS_IDENTITY_FILE = "process_identity.json"
-PROCESS_IDENTITY_SCHEMA_VERSION = 3
+PROCESS_IDENTITY_SCHEMA_VERSION = 4
 
 #: The kernel constant ``PROC_PID_INIT_INO``: the ``ns/pid`` link text of the
 #: initial PID namespace, fixed since Linux 3.8. That namespace is never freed.
@@ -42,7 +53,7 @@ _PROC = Path("/proc")
 
 @dataclass(frozen=True)
 class StaleProcessIdentity:
-    """Durable identity of one launched trial process group."""
+    """Durable identity of one launched trial process group and its lease guardian."""
 
     schema_version: int
     attempt_id: str
@@ -51,6 +62,8 @@ class StaleProcessIdentity:
     proc_starttime: int | None
     boot_id: str | None
     pid_namespace: str
+    guardian_pid: int
+    guardian_starttime: int | None
 
 
 def read_boot_id() -> str | None:
@@ -177,7 +190,7 @@ def group_members_command(pgid: str) -> str:
     return f"`pgrep -a -g {pgid}`"
 
 
-def recorded_process_check(identity_location: str) -> str:
+def recorded_process_check(identity_location: str, entry: str = "the entry file") -> str:
     """Word the manual check of a recorded trial process and the deletion it makes safe.
 
     The recorded group number means something only where the sweep ran: from a host shell,
@@ -185,13 +198,13 @@ def recorded_process_check(identity_location: str) -> str:
 
     :param str identity_location: Where the ``process_identity.json`` to read is, as a
         path or a description of the directory holding it.
+    :param str entry: The registry entry to delete, as a path or ``the entry file``.
     :return str: The step naming the file to read, where to run the command that lists
         every member of the recorded process group, and the entry deletion that follows.
     """
     return (
-        f"Look up pgid in {identity_location} and, on the host or in the container the sweep "
-        f"ran in, list that process group's members with {group_members_command('<pgid>')}; "
-        "once it lists none, delete the entry file."
+        f"Read pgid from {identity_location} and run {group_members_command('<pgid>')} on the "
+        f"host or in the container the sweep ran in; once it lists none, delete {entry}."
     )
 
 
@@ -296,7 +309,7 @@ def foreign_pid_namespace_reason(pid_namespace: str, blocker: str) -> str:
     current = read_pid_namespace() or "unreadable"
     return (
         f"it was recorded in PID namespace {pid_namespace}, but this process is in {current}, "
-        f"so its PID numbers name unrelated processes here, and {blocker}"
+        f"and {blocker}"
     )
 
 
@@ -360,6 +373,16 @@ def _read_proc_stat(proc_entry: Path) -> _ProcStat | None:
     return stat
 
 
+def _process_stat(pid: int) -> _ProcStat | ProcessInfo | None:
+    """Read the state, process group and start time of one process on Linux or macOS.
+
+    :param int pid: Process to inspect.
+    :return _ProcStat | ProcessInfo | None: Its ``/proc/<pid>/stat`` fields on Linux or its
+        native process information on macOS, or ``None`` when unreadable.
+    """
+    return read_process_info(pid) if sys.platform == "darwin" else _read_proc_stat(_PROC / str(pid))
+
+
 def _has_exited(pid: int, state: str) -> bool:
     """Return whether a process whose ``stat`` reads ``state`` can no longer run.
 
@@ -372,9 +395,6 @@ def _has_exited(pid: int, state: str) -> bool:
     A vanished entry has exited; an unreadable listing cannot rule out a live
     thread. macOS reports no per-thread process information, so its ``Z``
     keeps meaning exited there.
-
-    ``runtime.supervisor._has_exited`` is a stdlib-only copy of this rule,
-    because the lease guardian runs without the package; change both together.
 
     :param int pid: Process whose ``stat`` was read.
     :param str state: Its one-letter state from procfs or macOS process info.
@@ -405,7 +425,7 @@ def read_proc_starttime(pid: int) -> int | None:
     :return int | None: Clock ticks on Linux (``/proc/<pid>/stat`` field 22),
         microseconds since the epoch on macOS, or unknown when unreadable.
     """
-    stat = read_process_info(pid) if sys.platform == "darwin" else _read_proc_stat(_PROC / str(pid))
+    stat = _process_stat(pid)
     return None if stat is None else stat.starttime
 
 
@@ -435,7 +455,7 @@ def is_same_live_process(pid: int | None, saved_starttime: int | None) -> bool:
     """
     if pid is None or not is_pid_alive(pid):
         return False
-    stat = read_process_info(pid) if sys.platform == "darwin" else _read_proc_stat(_PROC / str(pid))
+    stat = _process_stat(pid)
     if saved_starttime is not None and (stat is None or stat.starttime != saved_starttime):
         return False
     return stat is None or not _has_exited(pid, stat.state)
@@ -486,6 +506,8 @@ def read_stale_process_identity(
         "proc_starttime",
         "boot_id",
         "pid_namespace",
+        "guardian_pid",
+        "guardian_starttime",
     }
     if not required_fields.issubset(payload):
         raise ValueError(f"Trial process identity at {path} is partial.")
@@ -510,13 +532,14 @@ def read_stale_process_identity(
             raise ValueError(f"Trial process identity field {field!r} is invalid at {path}.")
         return value
 
-    proc_starttime = payload.get("proc_starttime")
-    if proc_starttime is not None and (
-        isinstance(proc_starttime, bool)
-        or not isinstance(proc_starttime, int)
-        or proc_starttime <= 0
-    ):
-        raise ValueError(f"Trial process identity field 'proc_starttime' is invalid at {path}.")
+    proc_starttime = None if payload["proc_starttime"] is None else positive_int("proc_starttime")
+    guardian_pid = positive_int("guardian_pid")
+    guardian_starttime = (
+        None if payload["guardian_starttime"] is None else positive_int("guardian_starttime")
+    )
+    pid, pgid = positive_int("pid"), positive_int("pgid")
+    if guardian_pid in {pid, pgid}:
+        raise ValueError(f"Trial process identity field 'guardian_pid' is invalid at {path}.")
     boot_id = payload.get("boot_id")
     if boot_id is not None and (not isinstance(boot_id, str) or not boot_id):
         raise ValueError(f"Trial process identity field 'boot_id' is invalid at {path}.")
@@ -526,11 +549,13 @@ def read_stale_process_identity(
     return StaleProcessIdentity(
         schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
         attempt_id=attempt_id,
-        pid=positive_int("pid"),
-        pgid=positive_int("pgid"),
+        pid=pid,
+        pgid=pgid,
         proc_starttime=proc_starttime,
         boot_id=boot_id,
         pid_namespace=pid_namespace,
+        guardian_pid=guardian_pid,
+        guardian_starttime=guardian_starttime,
     )
 
 
@@ -538,13 +563,13 @@ def read_stale_process_identity(
 class StaleProcessDecision:
     """One read-only cleanup decision, shared by inspection and termination."""
 
-    action: Literal["gone", "terminate", "refuse"]
+    action: Literal["gone", "guardian", "terminate", "refuse"]
     reason: str
     pgid: int | None = None
 
 
 def stale_trial_process_decision(identity: StaleProcessIdentity) -> StaleProcessDecision:
-    """Decide whether a recorded trial group is absent, safe to signal, or unsafe.
+    """Decide whether a guardian owns cleanup or the recorded trial group needs it.
 
     :param StaleProcessIdentity identity: Attempt-bound durable process identity.
     :raises ForeignPidNamespaceError: Another namespace's processes cannot be proven absent.
@@ -555,7 +580,9 @@ def stale_trial_process_decision(identity: StaleProcessIdentity) -> StaleProcess
         return StaleProcessDecision("gone", "an earlier host boot proves the process group gone")
     if not same_pid_namespace(identity.pid_namespace):
         blocker = recorded_process_blocker(
-            identity.pid_namespace, pids=(identity.pid,), pgids=(identity.pgid,)
+            identity.pid_namespace,
+            pids=(identity.pid, identity.guardian_pid),
+            pgids=(identity.pgid, identity.guardian_pid),
         )
         if blocker is None:
             return StaleProcessDecision(
@@ -563,10 +590,18 @@ def stale_trial_process_decision(identity: StaleProcessIdentity) -> StaleProcess
             )
         raise ForeignPidNamespaceError(
             f"Attempt {identity.attempt_id} (pid={identity.pid}) cannot be cleaned from here: "
-            f"{foreign_pid_namespace_reason(identity.pid_namespace, blocker)}. "
-            "Nothing was signalled."
+            f"{foreign_pid_namespace_reason(identity.pid_namespace, blocker)}."
         )
-    if identity.boot_id is None or identity.proc_starttime is None or current_boot_id is None:
+    if identity.boot_id is None or current_boot_id is None:
+        return StaleProcessDecision("refuse", "robust process-birth identity is unavailable")
+    guardian = _stale_guardian_state(identity)
+    if guardian == "unknown":
+        return StaleProcessDecision("refuse", "the recorded lease guardian cannot be verified")
+    if guardian == "alive":
+        return StaleProcessDecision(
+            "guardian", f"lease guardian PID {identity.guardian_pid} owns descendant cleanup"
+        )
+    if identity.proc_starttime is None:
         return StaleProcessDecision("refuse", "robust process-birth identity is unavailable")
     return _stale_group_decision(identity.pid, identity.proc_starttime, pgid=identity.pgid)
 
@@ -575,21 +610,99 @@ def cleanup_stale_trial_process(
     identity: StaleProcessIdentity,
     *,
     grace_seconds: float = _KILL_GRACE_SECONDS,
+    before_signal: Callable[[], None] | None = None,
     before_terminate: Callable[[], None] | None = None,
+    guardian_completed: Callable[[], bool] | None = None,
 ) -> bool:
     """Apply the same boot, namespace and group decision used by recovery inspection.
 
     :param StaleProcessIdentity identity: Attempt-bound durable process identity.
     :param float grace_seconds: SIGTERM grace before SIGKILL.
+    :param Callable[[], None] | None before_signal: Check the caller's authority before any
+        signal to a guardian or trainer group.
     :param Callable[[], None] | None before_terminate: Commit recovery intent before signalling a live group; a raised exception prevents termination.
+    :param Callable[[], bool] | None guardian_completed: Read the guardian's durable verdict
+        after it exits. Process-only callers may omit this check.
     :raises ForeignPidNamespaceError: Another namespace's processes cannot be proven absent.
     :return bool: Whether cleanup is confirmed; unsafe identities remain untouched.
     """
-    return _apply_stale_process_decision(
-        stale_trial_process_decision(identity),
-        grace_seconds=grace_seconds,
-        before_terminate=before_terminate,
-    )
+    decision = stale_trial_process_decision(identity)
+    if decision.action in {"guardian", "terminate"} and before_signal is not None:
+        before_signal()
+    if decision.action != "guardian":
+        return _apply_stale_process_decision(
+            decision, grace_seconds=grace_seconds, before_terminate=before_terminate
+        )
+    # The guardian alone knows if its root is still running. It saves cancellation
+    # before signalling a live root and preserves a finished root's verdict.
+    log.info("Stale process cleanup: %s.", decision.reason)
+    if not _stop_stale_guardian(identity):
+        return False
+    return guardian_completed is None or guardian_completed()
+
+
+def _stale_guardian_state(identity: StaleProcessIdentity) -> Literal["alive", "gone", "unknown"]:
+    """Check the guardian's birth and session ownership in the verified namespace and boot.
+
+    :param StaleProcessIdentity identity: Identity recorded before the payload crossed.
+    :return str: Whether the recorded guardian lives, is gone, or cannot be verified.
+    """
+    pid = identity.guardian_pid
+    stat = _process_stat(pid)
+    if stat is None:
+        return "unknown" if is_pid_alive(pid) else "gone"
+    if _has_exited(pid, stat.state) or (
+        identity.guardian_starttime is not None and stat.starttime != identity.guardian_starttime
+    ):
+        return "gone"
+    if identity.guardian_starttime is None or stat.pgrp != pid:
+        return "unknown"
+    return "alive"
+
+
+def _stop_stale_guardian(identity: StaleProcessIdentity) -> bool:
+    """Ask the original guardian to settle and wait for its bounded cleanup window.
+
+    A pidfd pins the Linux signal target while its birth is rechecked. macOS uses the
+    native birth check immediately before signalling, as for its other recovered processes.
+    A guardian that vanishes during the request can still have finished its record.
+
+    :param StaleProcessIdentity identity: The same-boot, same-namespace attempt identity.
+    :return bool: Whether the guardian exited and its completion record can be examined.
+    """
+    pid = identity.guardian_pid
+    pidfd = None
+    try:
+        if (
+            sys.platform == "linux"
+            and hasattr(os, "pidfd_open")
+            and hasattr(signal, "pidfd_send_signal")
+        ):
+            try:
+                pidfd = os.pidfd_open(pid)
+            except OSError as exc:
+                # Python can expose pidfd_open while the running kernel predates it.
+                if exc.errno != errno.ENOSYS:
+                    raise
+        state = _stale_guardian_state(identity)
+        if state != "alive":
+            return state == "gone"
+        if pidfd is None:
+            os.kill(pid, signal.SIGTERM)
+        else:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError as exc:
+        log.warning("Could not request cleanup from lease guardian PID %d: %s", pid, exc)
+        return False
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
+    deadline = time.monotonic() + guardian_exit_timeout()
+    while (state := _stale_guardian_state(identity)) == "alive" and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return state == "gone"
 
 
 def _apply_stale_process_decision(
@@ -614,6 +727,22 @@ def _apply_stale_process_decision(
     return _terminate_process_group(decision.pgid, grace_seconds=grace_seconds)
 
 
+def guardian_exit_timeout() -> float:
+    """Return how long the controller waits for a guardian whose trainer root has exited.
+
+    Such a guardian ignores cancellation, waits out its helper settle, then gives survivors its
+    SIGTERM grace. Both the wait for a guardian's exit and the guarded shutdown window allow
+    this, read from the guardian's constants at each call.
+
+    :return float: The helper settle plus the SIGTERM grace plus the margin, in seconds.
+    """
+    return (
+        _supervisor._HELPER_SETTLE_SECONDS
+        + _supervisor._GROUP_TERM_GRACE_SECONDS
+        + _GUARDIAN_EXIT_MARGIN_SECONDS
+    )
+
+
 def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
     """Send SIGTERM, wait, then SIGKILL, confirming the group is gone.
 
@@ -635,8 +764,13 @@ def _terminate_process_groups(
     """Request group cleanup with shared waits, delegating guarded groups to their guardians.
 
     All groups share one grace period and one final confirmation window. Unguarded
-    groups receive direct SIGKILL after the grace period; live guardians own escalation
-    for their groups. If a guardian exits, its trainer group receives direct termination.
+    groups still alive after the grace period receive direct SIGKILL; live guardians own
+    escalation for their groups. A trainer group whose guardian has exited, or exits during
+    the grace period, receives SIGTERM directly; after the grace period it receives SIGKILL
+    once a probe finds it still alive. While a guardian still
+    runs after the grace period, the confirmation window grows to the rest of
+    :func:`guardian_exit_timeout`: a guardian whose trainer root already exited ignores
+    cancellation, waits out the helper settle, then gives survivors its own SIGTERM grace.
 
     :param tuple[int, ...] pgids: Target process-group IDs.
     :param float grace_seconds: Shared wait after requesting cancellation, before direct SIGKILL for unguarded groups or continued observation of guardians.
@@ -686,10 +820,16 @@ def _terminate_process_groups(
     def force_termination(pgid: int) -> bool:
         """Escalate an unguarded group within the shared cleanup deadline.
 
+        The group is probed first: a guardian that exits inside the window has usually
+        confirmed its group gone, which needs neither SIGKILL nor a warning.
+
         :param int pgid: Trainer process group whose guardian is absent or exited.
         :return bool: Whether SIGKILL succeeded and cleanup still needs observation.
         """
         active_guardians.pop(pgid, None)
+        if not _process_group_alive_with_members(pgid, members[pgid]):
+            confirmed[pgid] = True
+            return False
         log.warning("Process group %d remained alive after cancellation — sending SIGKILL", pgid)
         try:
             os.killpg(pgid, signal.SIGKILL)
@@ -743,8 +883,14 @@ def _terminate_process_groups(
             survivors.append(pgid)
 
     # Wait briefly for the kernel to actually reap descendants so the reaper's
-    # "marked FAIL" state means cleanup completed, not requested.
-    kill_deadline = time.monotonic() + 2.0
+    # "marked FAIL" state means cleanup completed, not requested. A guardian
+    # whose trainer root exited as the request arrived ignores it, waits out the
+    # helper settle, then gives survivors its own SIGTERM grace; a group it still
+    # guards gets what is left of the guardian-exit allowance after the grace spent here.
+    kill_window = 2.0
+    if any(pgid in active_guardians for pgid in survivors):
+        kill_window = max(kill_window, guardian_exit_timeout() - grace_seconds)
+    kill_deadline = time.monotonic() + kill_window
     while survivors and time.monotonic() < kill_deadline:
         still_alive = []
         for pgid in survivors:
@@ -820,9 +966,7 @@ def _stored_pgid_is_reused_group_leader(pgid: int, saved_starttime: int) -> bool
         leader exists or its identity is compatible, and ``None`` when a live
         leader's proc identity is unreadable.
     """
-    stat = (
-        read_process_info(pgid) if sys.platform == "darwin" else _read_proc_stat(_PROC / str(pgid))
-    )
+    stat = _process_stat(pgid)
     if stat is None:
         return None if is_pid_alive(pgid) else False
     return stat.pgrp == pgid and stat.starttime != saved_starttime

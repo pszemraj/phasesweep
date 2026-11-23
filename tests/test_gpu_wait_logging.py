@@ -7,6 +7,7 @@ import logging
 import pytest
 
 from phasesweep.runtime.gpu import GpuDevice, GpuLeaseTimeoutError, GpuPool
+from phasesweep.runtime.terminal import ReportBlock
 
 
 @pytest.mark.parametrize("whole_node", [False, True], ids=["single", "whole-node"])
@@ -17,6 +18,7 @@ def test_gpu_wait_emits_one_info_message(
     whole_node: bool,
     blocked_by: str,
 ) -> None:
+    """One line per wait: another process's lock is a report line, this run's own slots are not."""
     pool = GpuPool([GpuDevice("0", "GPU-test-0")], whole_node=whole_node)
     retries = 0
 
@@ -35,15 +37,24 @@ def test_gpu_wait_emits_one_info_message(
         monkeypatch.setattr(pool._condition, "wait", stop_waiting)
 
     with (
-        caplog.at_level(logging.INFO, logger="phasesweep.runtime.gpu"),
+        caplog.at_level(logging.INFO, logger="phasesweep"),
         pytest.raises(GpuLeaseTimeoutError, match="test lease deadline"),
         pool.acquire(),
     ):
         pytest.fail("a blocked GPU lease was acquired")
 
-    waiting = [
+    records = [
         record
         for record in caplog.records
-        if record.levelno == logging.INFO and "waiting for gpu" in record.getMessage().lower()
+        if record.levelno == logging.INFO and record.getMessage().startswith("Waiting for")
     ]
-    assert len(waiting) == 1
+    # The console wraps a report line only when it is a block, so the lock wait must be one.
+    assert [isinstance(record.msg, ReportBlock) for record in records] == [
+        blocked_by == "host-lease"
+    ]
+    waiting = [(record.name, record.getMessage()) for record in records]
+    assert waiting == [
+        ("phasesweep.report", "Waiting for a GPU: another process holds its lock.")
+        if blocked_by == "host-lease"
+        else ("phasesweep.runtime.gpu", "Waiting for GPU lease: local GPU slots are in use.")
+    ]

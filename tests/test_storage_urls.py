@@ -10,6 +10,7 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment
+from phasesweep.config.io import describe_validation_error
 from phasesweep.config.models import ExecutionContext, Experiment
 from phasesweep.config.search import Sampler
 from phasesweep.engine.ledger import _resolve_storage
@@ -155,7 +156,7 @@ def test_explicit_journal_storage_allows_parallel_jobs(tmp_path: Path) -> None:
     ],
 )
 def test_non_journal_storage_is_refused_at_config_load(tmp_path: Path, storage: str) -> None:
-    """Every spelling but null, auto, and lowercase journal:/// is refused, with the remedy spelled out."""
+    """Every spelling but null, auto, and lowercase journal:/// is refused, naming the value."""
     path = _storage_policy_config(tmp_path, storage=json.dumps(storage), n_jobs=1)
 
     with pytest.raises(ValidationError) as excinfo:
@@ -163,8 +164,8 @@ def test_non_journal_storage_is_refused_at_config_load(tmp_path: Path, storage: 
 
     message = str(excinfo.value)
     assert "storage must be null, auto, or a journal:/// URL" in message
-    assert "journal:///path/to/study.journal" in message
-    assert "storage: null" in message
+    assert repr(storage) in message
+    assert "see: phasesweep explain storage" in describe_validation_error(excinfo.value)
 
 
 @pytest.mark.parametrize(

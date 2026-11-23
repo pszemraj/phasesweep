@@ -59,6 +59,7 @@ from phasesweep.runtime.files import (
 )
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.reaper import read_pid_namespace, read_proc_starttime
+from phasesweep.runtime.terminal import command_line
 
 VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
 
@@ -77,14 +78,12 @@ def require_supported_mcp_host() -> None:
         raise CatalogError(str(exc), suggestion="run the MCP server on Linux or macOS") from exc
     if read_proc_starttime(os.getpid()) is None:
         raise CatalogError(
-            "the phasesweep MCP server cannot read this process's start time, "
-            "which is required for PID-reuse-safe cancellation and crash recovery",
+            "the phasesweep MCP server cannot read this process's start time",
             suggestion="allow native process identity reads for the MCP server process",
         )
     if read_pid_namespace() is None:
         raise CatalogError(
-            "the phasesweep MCP server cannot read its own PID namespace, which is required "
-            "to tell its runners' process ids from those of another namespace",
+            "the phasesweep MCP server cannot read its own PID namespace",
             suggestion="run the MCP server where its own host PID namespace can be read",
         )
 
@@ -283,7 +282,7 @@ def _prepare_state_dir(base: Path, path: Path, *, check_runs: bool = False) -> P
             _check_run_inventory(store)
     except UnsupportedStateFormatError as exc:
         raise CatalogError(
-            f"state_dir is not usable: {resolved}: {exc}", suggestion=FRESH_STATE_DIR_STEP
+            f"state_dir is not usable: {exc}", suggestion=FRESH_STATE_DIR_STEP
         ) from exc
     except ValueError as exc:
         raise CatalogError(f"state_dir is not usable: {resolved}: {exc}") from exc
@@ -348,12 +347,8 @@ def _require_persistent_storage(experiment_id: str, experiment: Experiment) -> N
     """
     if not experiment.persistent:
         raise CatalogError(
-            f"{experiment_id!r}: storage must be persistent; "
-            "in-memory storage cannot be monitored or resumed across processes",
-            suggestion=(
-                "use a persistent local ledger, e.g. storage: auto for "
-                "<workdir>/<experiment>/study.journal"
-            ),
+            f"{experiment_id!r}: storage must be persistent",
+            suggestion="set storage: auto (a ledger at <workdir>/<experiment>/study.journal)",
         )
 
 
@@ -414,7 +409,7 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
         label=f"{entry.id!r}: cwd",
     )
     invalid_config_fix = (
-        f"correct the config until `phasesweep validate {shlex.quote(str(cfg_path))}` passes"
+        f"correct the config until `{command_line('validate', str(cfg_path))}` passes"
     )
     try:
         config_bytes = cfg_path.read_bytes()
@@ -449,6 +444,25 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     )
 
 
+def _alias_refusal(other: str, entry_id: str, kind: str, namespace: str) -> CatalogError:
+    """Build the refusal for two catalog ids that resolve to one engine namespace.
+
+    :param str other: Catalog id that already governs the namespace.
+    :param str entry_id: Catalog id that resolves to the same one.
+    :param str kind: What the namespace names, for example ``study``.
+    :param str namespace: The shared namespace.
+    :return CatalogError: The refusal, for the caller to raise.
+    """
+    return CatalogError(
+        f"catalog ids {other!r} and {entry_id!r} resolve to the same {kind} namespace "
+        f"({namespace})",
+        suggestion=(
+            "keep one catalog entry per experiment: remove one of these entries, or give its "
+            "config its own experiment name"
+        ),
+    )
+
+
 def _claim_catalog_entry_identity(
     loaded: RegisteredExperiment,
     namespace_owners: dict[str, str],
@@ -461,19 +475,10 @@ def _claim_catalog_entry_identity(
     :param dict[str, str] storage_owners: Catalog ids keyed by Optuna study namespace.
     :raises CatalogError: If another catalog id already governs either namespace.
     """
-    one_entry_fix = (
-        "keep one catalog entry per experiment: remove one of these entries, or give its config "
-        "its own experiment name"
-    )
     namespace = _artifact_root_identity(loaded.experiment)
     other = namespace_owners.get(namespace)
     if other is not None:
-        raise CatalogError(
-            f"catalog ids {other!r} and {loaded.id!r} resolve to the same "
-            f"experiment output namespace ({namespace}); one engine "
-            "experiment must be governed by exactly one catalog entry.",
-            suggestion=one_entry_fix,
-        )
+        raise _alias_refusal(other, loaded.id, "experiment output", namespace)
     namespace_owners[namespace] = loaded.id
 
     storage_identity = canonical_storage_identity(loaded.experiment.resolved_storage)
@@ -482,13 +487,8 @@ def _claim_catalog_entry_identity(
     storage_key = f"{storage_identity}::{loaded.experiment.experiment}"
     other = storage_owners.get(storage_key)
     if other is not None:
-        raise CatalogError(
-            f"catalog ids {other!r} and {loaded.id!r} resolve to the same "
-            f"Optuna study namespace ({loaded.experiment.experiment!r} on "
-            f"{storage_identity}); one engine experiment must be governed "
-            "by exactly one catalog entry.",
-            suggestion=one_entry_fix,
-        )
+        namespace = f"{loaded.experiment.experiment!r} on {storage_identity}"
+        raise _alias_refusal(other, loaded.id, "study", namespace)
     storage_owners[storage_key] = loaded.id
 
 

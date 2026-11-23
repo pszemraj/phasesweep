@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -8,6 +9,7 @@ import optuna
 import pytest
 
 from phasesweep.config.models import Constraint, Phase
+from phasesweep.config.search import CategoricalParam, FloatParam, Sampler
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.repeats import RepeatAxis
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
@@ -24,7 +26,9 @@ from phasesweep.engine.state import (
     constraint_attr,
 )
 from phasesweep.evidence.models import JsonExtractor
-from tests.conftest import log_regex_provenance, make_experiment, trial_outcome
+from phasesweep.runtime.process import TIMEOUT_REASON_PREFIX
+from phasesweep.runtime.terminal import display_path
+from tests.conftest import log_regex_provenance, make_experiment, no_winner_remedy, trial_outcome
 
 # Allocation writes both attrs on every trial before its trainer runs.
 _ALLOCATION_ATTRS = {TRAINER_ENV_DIGEST_ATTR: "a" * 64, TRAINER_INPUT_ATTR: {"schema_version": 1}}
@@ -278,11 +282,8 @@ def test_metric_bounds_no_feasible_message_names_bound_and_best_value() -> None:
     with pytest.raises(NoFeasibleTrialError) as excinfo:
         select_winner(study, _with_bounds(_make_exp(), max=2.0))
     assert str(excinfo.value) == (
-        "No completed trials in phase. The phase's trials.csv records why each "
-        "failed or infeasible trial finished that way; trainer output is in its "
-        "trial_* directory. "
-        "Metric bounds: metric.max=2.0. The best value among COMPLETE and INFEASIBLE trials "
-        "with a finite value is 3.5 (trial 1)."
+        "No completed trials in phase. Metric bounds: metric.max=2.0. The best value among "
+        "COMPLETE and INFEASIBLE trials with a finite value is 3.5 (trial 1)."
     )
 
     with pytest.raises(NoFeasibleTrialError, match=r"metric\.min=6\.0.*is 7\.0 \(trial 2\)"):
@@ -364,9 +365,16 @@ def test_repeats_group_with_failed_or_infeasible_member_cannot_rank(member: str)
 
     assert winner.params == {"x": 2}
     assert winner.metric == pytest.approx(0.5)
+    # Survivorship counts configurations: x=1 fails or is infeasible as a whole, and a member
+    # that never ran leaves it to the completion record.
     survivorship = winner.confound["checks"]["survivorship"]["detail"]
-    assert survivorship["ranked"] == 3
-    assert survivorship["incomplete_group"] == 2
+    assert survivorship == {
+        "ranked": 1,
+        "infeasible": int(member == "infeasible"),
+        "failed": int(member == "failed"),
+        "untried": 0,
+        "failed_trials": [2] if member == "failed" else [],
+    }
     assert winner.confound["checks"]["tie"] == {
         "verdict": "n/a",
         "reason": "only one repeat group was ranked",
@@ -385,7 +393,7 @@ def test_repeats_collapsed_member_outside_metric_bounds_excludes_its_configurati
     assert unbounded.params == {"x": 1}
     assert bounded.params == {"x": 2}
     survivorship = bounded.confound["checks"]["survivorship"]["detail"]
-    assert (survivorship["infeasible"], survivorship["incomplete_group"]) == (1, 2)
+    assert (survivorship["ranked"], survivorship["infeasible"]) == (1, 1)
 
 
 def test_repeats_without_complete_group_names_incomplete_groups() -> None:
@@ -401,9 +409,8 @@ def test_repeats_without_complete_group_names_incomplete_groups() -> None:
 
     assert str(excinfo.value).startswith(
         "No complete repeat group: a configuration ranks only when all 3 trials (one per "
-        "repeats.values of 'seed') are COMPLETE, feasible and within bounds; 2 group(s) were "
-        "incomplete. The phase's trials.csv labels each trial's repeat_group and records "
-        "why each failed or infeasible trial finished that way. Metric bounds: metric.min=0.01."
+        "repeats.values of 'seed') are COMPLETE, feasible and within bounds; 2 groups were "
+        "incomplete. Metric bounds: metric.min=0.01."
     )
 
 
@@ -422,7 +429,12 @@ def test_repeats_tie_goes_to_lowest_group_and_highest_member_names_it() -> None:
     assert winner.confound["ranked_groups"] == [[0, 2, 5], [1, 3, 4]]
     tie = winner.confound["checks"]["tie"]
     assert tie["verdict"] == "heterogeneous"
-    assert tie["detail"] == {"tied_trials": [4], "within_noise": [4]}
+    assert tie["detail"] == {
+        "tied_trials": [4],
+        "within_noise": [4],
+        "pooled_sd": pytest.approx(math.sqrt(0.005)),
+        "df": 4,
+    }
 
 
 def test_repeats_tie_goes_to_the_group_with_the_lowest_member_draw_position() -> None:
@@ -442,6 +454,11 @@ def test_repeats_tie_goes_to_the_group_with_the_lowest_member_draw_position() ->
 
 
 def test_repeats_within_noise_flags_a_close_runner_up_and_clears_a_distant_one() -> None:
+    """Variances 0.0025, 0.0025 and 0.0001 on 2 df each pool to 0.0017 on 6 df.
+
+    The threshold is t(6) * sqrt(0.0017) * sqrt(2/3) = 2.446912 * 0.0336650 = 0.0823753, so the
+    0.02 gap is within noise and the 0.37 gap is not.
+    """
     study = _make_study()
     _add_group(study, 1, [0.50, 0.60, 0.55])
     _add_group(study, 2, [0.52, 0.62, 0.57])
@@ -452,12 +469,17 @@ def test_repeats_within_noise_flags_a_close_runner_up_and_clears_a_distant_one()
     assert winner.params == {"x": 1}
     assert winner.confound["checks"]["tie"] == {
         "verdict": "heterogeneous",
-        "detail": {"tied_trials": [], "within_noise": [5]},
+        "detail": {
+            "tied_trials": [],
+            "within_noise": [5],
+            "pooled_sd": pytest.approx(math.sqrt(0.0017)),
+            "df": 6,
+        },
     }
 
 
 def test_seeded_random_duplicate_configs_rank_as_separate_slots() -> None:
-    """Two slots that drew the same params are two groups, never one oversized group."""
+    """Two slots that drew the same params are two groups, never one oversized group, and with no other configuration the tie check is not run."""
     study = _make_study()
     _add_group(study, 1, [0.4, 0.4, 0.4])
     _add_group(study, 1, [0.3, 0.3, 0.3])
@@ -467,9 +489,11 @@ def test_seeded_random_duplicate_configs_rank_as_separate_slots() -> None:
     assert slotted.trial_number == 5
     assert slotted.metric == pytest.approx(0.3)
     assert slotted.confound["ranked_groups"] == [[0, 1, 2], [3, 4, 5]]
-    # The other slot repeats the winner's configuration, so it is not a tie candidate.
-    assert slotted.confound["checks"]["tie"]["detail"] == {"tied_trials": [], "within_noise": []}
-    with pytest.raises(NoFeasibleTrialError, match="1 group\\(s\\) were incomplete"):
+    assert slotted.confound["checks"]["tie"] == {
+        "verdict": "n/a",
+        "reason": "only one configuration was ranked",
+    }
+    with pytest.raises(NoFeasibleTrialError, match="1 group was incomplete"):
         select_winner(study, _make_exp(), repeats=_axis())
 
 
@@ -477,7 +501,7 @@ def test_seeded_random_duplicate_configs_rank_as_separate_slots() -> None:
 def test_crashed_trials_remedy_names_the_next_attempt_budget(
     tmp_path: Path, persistent: bool
 ) -> None:
-    """A crashed population retries with a raised persistent budget, a fresh study when the fix edits the config, or a fresh memory run."""
+    """A crashed population retries with a raised persistent budget, or with a plain rerun in memory."""
     from tests.conftest import make_experiment
 
     experiment = make_experiment(persistent=tmp_path if persistent else None, n_trials=2)
@@ -489,24 +513,160 @@ def test_crashed_trials_remedy_names_the_next_attempt_budget(
     remedy = refused.value.remediation
     assert remedy is not None
     if persistent:
-        assert "raise phases[p].n_trials above 2 in the config" in remedy
-        assert "Fix the failure" in remedy
-        assert "`n_jobs` can change on retry" in remedy
-        assert "changes study identity" in remedy
-        assert "set a new `experiment` name" in remedy
+        assert remedy.endswith("Fix the failure, then raise phases[p].n_trials above 2 and rerun.")
     else:
-        assert "storage: null starts fresh" in remedy
+        assert remedy.endswith("Fix the failure, or the metric bounds or constraints, then rerun.")
         assert "raise" not in remedy
+
+
+def _crashed_remedy(
+    tmp_path: Path, phase: Phase, reasons: list[str | None], *, inheriting: Phase | None = None
+) -> str:
+    """Return the remedy a persistent experiment gives when every trial of ``phase`` failed.
+
+    :param Phase | None inheriting: A later phase that inherits ``phase``, if the experiment has one.
+    """
+    phases = [phase] if inheriting is None else [phase, inheriting]
+    return no_winner_remedy(
+        make_experiment(persistent=tmp_path, phases=phases),
+        reasons,
+        phase_name=phase.name,
+        grid=phase.sampler.type == "grid",
+    )
+
+
+def _sampled_phase(sampler: Sampler, *, n_trials: int = 2) -> Phase:
+    """Build a phase whose sampler draws configurations from a continuous space."""
+    return Phase(
+        name="p",
+        n_trials=n_trials,
+        sampler=sampler,
+        search_space={"x": FloatParam(type="float", low=0.1, high=1.0)},
+    )
+
+
+@pytest.mark.parametrize(
+    ("phase", "outcome"),
+    [
+        pytest.param(
+            Phase(
+                name="p",
+                n_trials=3,
+                sampler=Sampler(type="grid"),
+                search_space={"x": CategoricalParam(type="categorical", choices=[1, 2, 3])},
+            ),
+            "raise phases[p].n_trials from 3 to 6 and rerun to retry its 3 failed cells.",
+            id="grid-retries-failed-cells",
+        ),
+        pytest.param(
+            Phase(name="p", n_trials=2, sampler=Sampler(type="random", seed=0), search_space={}),
+            "raise phases[p].n_trials from 2 to 3 and rerun to retry its failed attempt.",
+            id="fixed-configuration-retries-its-cell",
+        ),
+        pytest.param(
+            _sampled_phase(Sampler(type="random", seed=0)),
+            "raise phases[p].n_trials above 2 and rerun.",
+            id="random-draws-new-ones",
+        ),
+        pytest.param(
+            _sampled_phase(Sampler(type="tpe", seed=0)),
+            "raise phases[p].n_trials above 2 and rerun.",
+            id="tpe-draws-new-ones",
+        ),
+    ],
+)
+def test_crashed_remedy_names_the_target_each_sampler_needs(
+    tmp_path: Path, phase: Phase, outcome: str
+) -> None:
+    """A grid or fixed configuration is raised to the target that retries its failed cells; a sampler that draws is raised above its target."""
+    remedy = _crashed_remedy(tmp_path, phase, [None] * phase.n_trials)
+
+    assert remedy.endswith(f"Fix the failure, then {outcome}")
+    assert "timed out" not in remedy
+
+
+def test_a_no_winner_remedy_names_the_phase_directory_it_sends_the_operator_to(
+    tmp_path: Path,
+) -> None:
+    """The first step says where trials.csv is, not just that it exists."""
+    phase = _sampled_phase(Sampler(type="random", seed=0))
+    trials_csv = display_path(tmp_path / "runs" / "t" / "p" / "trials.csv")
+
+    remedy = _crashed_remedy(tmp_path, phase, ["non-zero exit code 1", None])
+
+    assert remedy.startswith(f"Inspect {trials_csv}. ")
+
+
+def test_a_failure_that_was_not_a_timeout_says_nothing_about_the_timeout(
+    tmp_path: Path,
+) -> None:
+    """Raising the timeout in place is refused with its own rename step, so a plain crash does not mention it."""
+    phase = _sampled_phase(Sampler(type="random", seed=0))
+
+    remedy = _crashed_remedy(tmp_path, phase, ["non-zero exit code 1", None])
+
+    assert "Fix the failure, then raise phases[p].n_trials above 2" in remedy
+    assert "timeout" not in remedy
+
+
+@pytest.mark.parametrize(
+    ("child", "rename"),
+    [
+        pytest.param(
+            None, "give `p` a new `name`, which runs it again from scratch", id="no-dependents"
+        ),
+        pytest.param(
+            Phase(
+                name="q",
+                n_trials=2,
+                inherits=["p"],
+                sampler=Sampler(type="random", seed=0),
+                search_space={"y": FloatParam(type="float", low=0.1, high=1.0)},
+            ),
+            "give `p` and `q` new names and update the `inherits` that name them, which runs "
+            "them again from scratch",
+            id="one-dependent",
+        ),
+    ],
+)
+def test_a_timed_out_phase_is_told_to_rename_it_and_the_phases_that_inherit_it(
+    tmp_path: Path, child: Phase | None, rename: str
+) -> None:
+    """A recorded per-trial timeout leads the remedy: raising it needs a new name for the phase and each dependent."""
+    phase = _sampled_phase(Sampler(type="random", seed=0))
+    timeout = f"{TIMEOUT_REASON_PREFIX}5.0s"
+
+    remedy = _crashed_remedy(tmp_path, phase, [timeout, timeout], inheriting=child)
+
+    assert (
+        f"For the timed-out trials, raise phases[p].timeout_seconds_per_trial and {rename}. "
+        "For any other failure, fix it, then raise phases[p].n_trials above 2"
+    ) in remedy
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "phase/run wallclock deadline exceeded",
+        f"non-zero exit code 1; stderr: {TIMEOUT_REASON_PREFIX}5.0s",
+    ],
+    ids=["deadline", "quoted-stderr"],
+)
+def test_other_failures_are_not_read_as_a_per_trial_timeout(tmp_path: Path, reason: str) -> None:
+    """Only the supervisor's per-trial wording counts; a deadline or a quoted stderr line does not."""
+    phase = _sampled_phase(Sampler(type="random", seed=0))
+
+    assert "timed out" not in _crashed_remedy(tmp_path, phase, [reason, reason])
 
 
 @pytest.mark.parametrize(
     ("feasible", "required", "excluded"),
     [
         pytest.param(
-            True, "raise phases[p].n_trials above 3", "Changing metric.min", id="crashed-member"
+            True, "raise phases[p].n_trials above 3", "To change metric.min", id="crashed-member"
         ),
         pytest.param(
-            False, "Changing metric.min", "raise phases[p].n_trials", id="infeasible-members"
+            False, "To change metric.min", "raise phases[p].n_trials", id="infeasible-members"
         ),
     ],
 )

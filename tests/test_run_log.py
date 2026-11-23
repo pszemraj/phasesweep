@@ -1,4 +1,4 @@
-"""``run.log`` carries one TRIAL line per finished trial, the process-free progress stream."""
+"""``run.log`` carries one progress line per finished trial, the process-free progress stream."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from phasesweep.engine.state import (
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.gpu import GpuPool
+from phasesweep.runtime.terminal import display_path
 from tests.conftest import (
     bounded_metric,
     console_script,
@@ -35,7 +36,9 @@ from tests.conftest import (
     patch_rejected_trial_user_attr,
     phase_study,
     phase_trials,
+    run_log_text,
     trial_outcome,
+    write_constant_trainer,
     write_experiment_config,
     write_trainer,
 )
@@ -43,8 +46,8 @@ from tests.conftest import (
 
 def _trial_lines(experiment_log: Path, phase: str) -> list[str]:
     """Return every ``run.log`` line the phase logged for a finished trial, in order."""
-    marker = f"phase={phase} TRIAL "
-    return [line for line in experiment_log.read_text().splitlines() if marker in line]
+    finished = re.compile(rf" {re.escape(phase)}  trial \d+  [A-Z]+  ")
+    return [line for line in experiment_log.read_text().splitlines() if finished.search(line)]
 
 
 def _field(line: str, pattern: str) -> str:
@@ -143,13 +146,12 @@ def test_trial_write_error_reports_cause_and_storage_specific_recovery(
 
     for diagnostic in (
         capsys.readouterr().err,
-        (_experiment_dir(experiment) / "run.log").read_text(encoding="utf-8"),
+        run_log_text(experiment),
     ):
         assert "RuntimeError: injected trial write fault" in diagnostic
         if persistent:
-            assert "the next run recovers the attempt" in diagnostic
+            assert "the next run recovers it" in diagnostic
         else:
-            assert "storage: null keeps no study to resume" in diagnostic
             assert "The trial result was lost" in diagnostic
             assert "RUNNING" not in diagnostic
 
@@ -182,24 +184,24 @@ def test_run_log_records_one_line_per_finished_trial(tmp_path: Path) -> None:
     run_experiment(experiment)
 
     lines = _trial_lines(_experiment_dir(experiment) / "run.log", "p")
-    assert [_field(line, r"TRIAL trial=(\d+)") for line in lines] == ["0", "1", "2", "3"]
-    assert [_field(line, r"\((\d+)/4 finished\)") for line in lines] == ["1", "2", "3", "4"]
-    by_state = {_field(line, r"state=(\w+)"): line for line in lines}
+    assert [_field(line, r"trial (\d+)") for line in lines] == ["0", "1", "2", "3"]
+    assert [_field(line, r"  (\d+)/4(?:  |$)") for line in lines] == ["1", "2", "3", "4"]
+    by_state = {_field(line, r"  (COMPLETE|FAIL|INFEASIBLE)  "): line for line in lines}
     assert sorted(by_state) == ["COMPLETE", "FAIL", "INFEASIBLE"]
 
     failed = by_state["FAIL"]
-    assert "state=FAIL value=none" in failed
-    assert failed.endswith(" reason=non-zero exit code 3; stderr: second line")
+    assert re.search(r"  FAIL  \d+\.\ds  ", failed), "a failed trial reports no objective"
+    assert failed.endswith("  reason: non-zero exit code 3; stderr: second line")
     infeasible = by_state["INFEASIBLE"]
-    assert "state=INFEASIBLE value=52.5" in infeasible
-    assert "reason=metric or evidence constraints were infeasible" in infeasible
-    feasible = [line for line in lines if "state=COMPLETE" in line]
+    assert "  INFEASIBLE  objective 52.5  " in infeasible
+    assert "reason: metric or evidence constraints were infeasible" in infeasible
+    feasible = [line for line in lines if "  COMPLETE  " in line]
     assert len(feasible) == 2
-    assert all(re.search(r"state=COMPLETE value=\d", line) for line in feasible)
-    assert all("reason=" not in line for line in feasible)
+    assert all(re.search(r"  COMPLETE  objective \d", line) for line in feasible)
+    assert all("reason:" not in line for line in feasible)
     assert all("outcome=" not in line for line in lines)
-    assert all(re.search(r"duration=\d+\.\ds", line) for line in lines)
-    assert all("repeat=" not in line for line in lines)
+    assert all(re.search(r"  \d+\.\ds  ", line) for line in lines)
+    assert all("repeat " not in line for line in lines)
 
 
 @pytest.mark.parametrize("source", ["metric", "constraint"])
@@ -241,7 +243,7 @@ def test_infeasible_reason_names_measured_value_and_violated_bound(
     assert bound in cause
     assert str(limit) in cause
     lines = _trial_lines(_experiment_dir(experiment) / "run.log", "p")
-    assert any(line.endswith(f" reason={cause}") for line in lines)
+    assert any(line.endswith(f"  reason: {cause}") for line in lines)
 
 
 def test_run_log_names_the_configuration_and_repeat_value_of_each_trial(tmp_path: Path) -> None:
@@ -263,9 +265,9 @@ def test_run_log_names_the_configuration_and_repeat_value_of_each_trial(tmp_path
     run_experiment(experiment)
 
     lines = _trial_lines(_experiment_dir(experiment) / "run.log", "p")
-    assert [_field(line, r"repeat=seed=(\d+)") for line in lines] == ["0", "1", "0", "1"]
-    assert all("params={'x': " in line for line in lines)
-    assert all("'seed':" not in line for line in lines)
+    assert [_field(line, r"repeat seed=(\d+)") for line in lines] == ["0", "1", "0", "1"]
+    assert all(re.search(r"  x=\d", line) for line in lines)
+    assert all("  seed=" not in line for line in lines)
     csv_path = _phase_dir(experiment, "p") / "trials.csv"
     with csv_path.open(newline="") as handle:
         assert [row["repeat_group"] for row in csv.DictReader(handle)] == ["1", "1", "3", "3"]
@@ -312,7 +314,7 @@ def _stderr_cause_trainer(tmp_path: Path) -> Path:
 def test_failed_trials_carry_their_stderr_cause_and_the_hint_only_for_the_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One cause string reaches the outcome record, trials.csv and the TRIAL line; the hint is for imports."""
+    """One cause string reaches the outcome record, trials.csv and the trial's progress line; the hint is for imports."""
     monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
     experiment = make_experiment(
         persistent=tmp_path,
@@ -334,19 +336,19 @@ def test_failed_trials_carry_their_stderr_cause_and_the_hint_only_for_the_enviro
         3: "non-zero exit code 1; stderr: ModuleNotFoundError: No module named 'm3'",
     }
     log_path = _experiment_dir(experiment) / "run.log"
-    lines = {int(_field(line, r"TRIAL trial=(\d+)")): line for line in _trial_lines(log_path, "p")}
+    lines = {int(_field(line, r"trial (\d+)")): line for line in _trial_lines(log_path, "p")}
     with (_phase_dir(experiment, "p") / "trials.csv").open(newline="") as handle:
         rows = {int(row["number"]): row for row in csv.DictReader(handle)}
     for trial in study.trials:
         x = x_by_trial[trial.number]
         if x == 4:
             assert FAILURE_REASON_ATTR not in trial.user_attrs
-            assert " reason=" not in lines[trial.number]
+            assert "reason:" not in lines[trial.number]
             continue
         assert trial.user_attrs[FAILURE_REASON_ATTR] == causes[x]
         assert trial.user_attrs[TRIAL_OUTCOME_ATTR]["cause"] == causes[x]
         assert rows[trial.number][f"user_attr:{FAILURE_REASON_ATTR}"] == causes[x]
-        assert lines[trial.number].endswith(f" reason={causes[x]}")
+        assert lines[trial.number].endswith(f"  reason: {causes[x]}")
 
     hints = [line for line in log_path.read_text().splitlines() if "execution.inherit_env" in line]
     first_import_failure = min(number for number, x in x_by_trial.items() if x in {2, 3})
@@ -356,7 +358,7 @@ def test_failed_trials_carry_their_stderr_cause_and_the_hint_only_for_the_enviro
 
 
 def test_no_feasible_headline_covers_the_causes_of_infeasible_trials_too(tmp_path: Path) -> None:
-    """The headline promises a cause for every failed or infeasible trial, and each row keeps its own."""
+    """The fix line sends the operator to trials.csv, where each failed or infeasible row keeps its own cause."""
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=_x_trainer(tmp_path),
@@ -367,8 +369,11 @@ def test_no_feasible_headline_covers_the_causes_of_infeasible_trials_too(tmp_pat
         search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
     )
 
-    with pytest.raises(NoFeasibleTrialError, match="records why each failed or infeasible trial"):
+    with pytest.raises(NoFeasibleTrialError, match="No completed trials in phase") as refused:
         run_experiment(experiment)
+    assert str(refused.value.remediation).startswith(
+        f"Inspect {display_path(_phase_dir(experiment, 'p') / 'trials.csv')}. "
+    )
 
     with (_phase_dir(experiment, "p") / "trials.csv").open(newline="") as handle:
         rows = {row["state"]: row for row in csv.DictReader(handle)}
@@ -382,8 +387,10 @@ def test_no_feasible_headline_covers_the_causes_of_infeasible_trials_too(tmp_pat
 
 @pytest.mark.parametrize("verbose", [False, True])
 @pytest.mark.integration
-def test_cli_failed_trial_tracebacks_require_verbose(tmp_path: Path, verbose: bool) -> None:
-    """Normal CLI failures keep the TRIAL cause; verbose restores Optuna diagnostics."""
+def test_cli_verbose_deepens_run_log_and_leaves_the_console_alone(
+    tmp_path: Path, verbose: bool
+) -> None:
+    """Debug messages and a failure's traceback reach run.log only under ``-v``, never the console."""
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=_x_trainer(tmp_path),
@@ -405,15 +412,13 @@ def test_cli_failed_trial_tracebacks_require_verbose(tmp_path: Path, verbose: bo
     )
 
     assert result.returncode == 1, result.stdout + result.stderr
-    assert "TRIAL trial=0 state=FAIL" in result.stderr
-    assert "reason=non-zero exit code 3; stderr: second line" in result.stderr
-    if verbose:
-        assert "A new study created" in result.stderr
-        assert "Trial 0 failed" in result.stderr
-        assert "Traceback (most recent call last):" in result.stderr
-    else:
-        assert "Trial 0 failed" not in result.stderr
-        assert "Traceback (most recent call last):" not in result.stderr
+    assert "p  trial 0  FAIL  " in result.stderr
+    assert "reason: non-zero exit code 3; stderr: second line" in result.stderr
+    for internals in ("A new study created", "Trial 0 failed", "Traceback", "JournalFileStorage"):
+        assert internals not in result.stderr
+    log = run_log_text(experiment)
+    assert (" D phasesweep.engine.ledger Using JournalFileStorage" in log) is verbose
+    assert ("Traceback (most recent call last):" in log) is verbose
 
 
 def _execution(tmp_path: Path) -> phase_ops._PhaseExecution:
@@ -466,9 +471,9 @@ def test_trial_lines_carry_their_own_completion_ordinal(
         phase_ops._settle_finished_trial(run, run.study, run.study.trials[number])
 
     ordinals = [
-        _field(record.getMessage(), r"\((\d+/6) finished\)")
+        _field(record.getMessage(), r"  (\d+/6)(?:  |$)")
         for record in caplog.records
-        if " TRIAL " in record.getMessage()
+        if re.search(r"^p  trial \d+  [A-Z]+  ", record.getMessage())
     ]
     assert ordinals == ["1/6", "2/6", "3/6"]
 
@@ -484,7 +489,7 @@ def test_an_interrupted_trial_takes_no_ordinal(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
 def test_run_log_reports_abort_after_its_triggering_trial(tmp_path: Path, n_jobs: int) -> None:
-    """The abort stays in its triggering outcome and prints after that trial's TRIAL line."""
+    """The abort stays in its triggering outcome and prints after that trial's progress line."""
     experiment = make_experiment(
         persistent=tmp_path,
         trial_command="false {overrides}",
@@ -502,13 +507,96 @@ def test_run_log_reports_abort_after_its_triggering_trial(tmp_path: Path, n_jobs
         trial for trial in study.trials if "abort" in trial.user_attrs[TRIAL_OUTCOME_ATTR]
     )
     abort = triggering.user_attrs[TRIAL_OUTCOME_ATTR]["abort"]
-    lines = (_experiment_dir(experiment) / "run.log").read_text().splitlines()
+    lines = run_log_text(experiment).splitlines()
     abort_lines = [index for index, line in enumerate(lines) if "phase=p ABORTED:" in line]
     trial_index = next(
-        index
-        for index, line in enumerate(lines)
-        if f"phase=p TRIAL trial={triggering.number} " in line
+        index for index, line in enumerate(lines) if f" p  trial {triggering.number}  " in line
     )
     assert len(abort_lines) == 1
     assert trial_index < abort_lines[0]
     assert abort["cause"] in lines[abort_lines[0]]
+
+
+@pytest.mark.integration
+def test_each_run_marks_its_start_in_run_log_and_never_on_the_console(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Runs append to one ``run.log``; each opens with its experiment, process ID and start phase."""
+    monkeypatch.setenv("COLUMNS", "500")
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_constant_trainer(tmp_path),
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+
+    override = ["--set", "provenance.note=SECRET-TOKEN"]
+    assert invoke_cli_boundary(["run", str(config), *override], monkeypatch) == 0
+    first_console = capsys.readouterr().err
+    resumed = ["run", str(config), "--from-phase", "p", *override]
+    assert invoke_cli_boundary(resumed, monkeypatch) == 0
+    second_console = capsys.readouterr().err
+
+    lines = run_log_text(experiment).splitlines()
+    starts = [index for index, line in enumerate(lines) if "Run started" in line]
+    assert len(starts) == 2
+    first, second = (lines[index] for index in starts)
+    assert re.search(r" I phasesweep\.engine\.run Run started: experiment t, pid \d+$", first)
+    assert re.search(
+        r" I phasesweep\.engine\.run Run started: experiment t, pid \d+, from phase p$", second
+    )
+    assert any(" p  trial 0  COMPLETE  " in line for line in lines[starts[0] : starts[1]])
+    assert "SECRET-TOKEN" not in run_log_text(experiment)
+    assert "Run started" not in first_console + second_console
+
+    ends = [index for index, line in enumerate(lines) if "Run finished" in line]
+    assert len(ends) == 2
+    first_end, second_end = (lines[index] for index in ends)
+    assert starts[0] < ends[0] < starts[1] < ends[1]
+    assert re.search(
+        r" I phasesweep\.engine\.run Run finished: experiment t, pid \d+, "
+        r"1 phase, 2 trials, 0 from a previous run, \d+\.\ds$",
+        first_end,
+    )
+    assert re.search(
+        r" I phasesweep\.engine\.run Run finished: experiment t, pid \d+, "
+        r"1 phase, 2 trials, 2 from a previous run, \d+\.\ds$",
+        second_end,
+    )
+    assert _field(first, r"pid (\d+)") == _field(first_end, r"pid (\d+)")
+    assert "Run finished" not in first_console + second_console
+
+
+def test_a_run_that_fails_leaves_its_start_line_without_a_finish_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a run that finishes normally logs ``Run finished``, so an unmatched start marks a failure."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_trainer(tmp_path, "import sys\nsys.exit(1)\n"),
+        n_trials=1,
+        gpu_policy="none",
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+
+    assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 1
+
+    text = run_log_text(experiment)
+    assert "Run started" in text
+    assert "Run finished" not in text
+
+
+def test_a_dry_run_opens_no_run_log_and_prints_no_start_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A dry run writes nothing, so it has no ``run.log`` to mark and its console lines are unchanged."""
+    experiment = make_experiment(persistent=tmp_path, trainer=write_constant_trainer(tmp_path))
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+
+    assert invoke_cli_boundary(["run", str(config), "--dry-run"], monkeypatch) == 0
+
+    assert not (_experiment_dir(experiment) / "run.log").exists()
+    assert "Run started" not in capsys.readouterr().err

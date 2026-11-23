@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from phasesweep.errors import GpuConfigurationError, OperatorAction
+from phasesweep.errors import GpuConfigurationError, OperatorAction, operator_step
 from phasesweep.mcp.runner import _terminal_error, _terminal_failure_payload
 from phasesweep.runtime.files import UnsafeLockPathError
 from phasesweep.runtime.gpu import GpuPool
@@ -25,25 +25,32 @@ def test_mcp_lock_access_failure_has_operator_remediation() -> None:
     assert failure["retryable"] is False
     assert failure["remediation"] == (
         "Ask the operator to point PHASESWEEP_LOCK_DIR at an existing writable directory shared "
-        "by every shell, MCP server, and sandbox on the host, or run on the host. The error in "
-        "this run's log, `logs/r0.log` under the catalog's `state_dir`, gives the details."
+        "by every shell, MCP server, and sandbox on the host, or run on the host. "
+        "Details: `logs/r0.log` under the catalog's `state_dir`."
     )
     assert "/private/host/locks" not in str(failure)
 
 
-def test_gpu_enumeration_refusal_explains_cpu_only_policy(
+def test_gpu_enumeration_refusal_names_the_fix_and_the_host_shell_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unreadable mocked CUDA hardware explains the deliberate CPU opt-out on any host."""
+    """Unreadable mocked CUDA hardware says to fix nvidia-smi or rerun from a host shell, on any host.
+
+    The deliberate CPU opt-out stays ``gpu_policy: none``, which this refusal no longer names.
+    """
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
 
-    with pytest.raises(GpuConfigurationError, match="gpu_policy: none") as failure:
+    with pytest.raises(GpuConfigurationError, match="could not enumerate GPUs") as failure:
         GpuPool.create(n_jobs=1)
 
-    assert "sandbox" in str(failure.value)
-    assert "host shell with GPU access" in str(failure.value)
+    step = operator_step(failure.value)
+    assert step.startswith("Fix nvidia-smi.")
+    assert "sandboxed shell" in step
+    assert "host shell with GPU access" in step
+    assert "sandboxed shell" not in str(failure.value)
+    assert "gpu_policy" not in str(failure.value) + step
 
     with GpuPool.create(n_jobs=1, policy="none").acquire() as assignment:
         assert assignment.visible_devices is None

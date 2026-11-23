@@ -10,11 +10,12 @@ from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.engine.errors import StudySchemaMismatchError
-from phasesweep.runtime.json import JsonObject, json_object
+from phasesweep.runtime.json import JsonObject, finite_nonnegative, json_object
 
 if TYPE_CHECKING:
     from optuna.trial import FrozenTrial, Trial
 
+    from phasesweep.engine.confound import ConfoundBlock
     from phasesweep.engine.repeats import RepeatsRecord
     from phasesweep.runtime.process import AttemptLifecycle
 
@@ -145,7 +146,7 @@ class Winner:
     # Advisory verdicts on the population the source selection ranked, frozen
     # at that selection (:mod:`phasesweep.engine.confound`). A carried winner
     # keeps them verbatim; no fingerprint reads them.
-    confound: dict[str, Any] | None = None
+    confound: ConfoundBlock | None = None
     # Report-only values the selected trial recorded, by observation name; for
     # a repeats phase, the mean over the members that recorded each name.
     # They never enter a fingerprint or selection.
@@ -159,6 +160,41 @@ class Winner:
     # a placeholder's own searched keys plus those it carries from placeholder
     # parents. Empty on every winner a run selects or loads, and never persisted.
     placeholder_keys: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class PhaseCounts:
+    """A phase's trials by recorded state when the phase ended, as the run's summary reports them.
+
+    ``earlier`` counts the trials of a state in :data:`FINISHED_TRIAL_STATES` that a previous run
+    recorded, so it is a part of :attr:`counted`. ``winner_dirs`` holds the attempt directory of
+    each trial the phase's winner stands on, in trial order, leaving out one that recorded none;
+    it is read for the summary and never saved.
+    """
+
+    complete: int = 0
+    infeasible: int = 0
+    failed: int = 0
+    interrupted: int = 0
+    earlier: int = 0
+    winner_dirs: tuple[Path, ...] = ()
+
+    @property
+    def counted(self) -> int:
+        """Count the trials that count toward ``n_trials``, as the status heading does.
+
+        An interrupted trial is in none of the :data:`FINISHED_TRIAL_STATES`: its rerun counts
+        in its place.
+
+        :return int: Trials in a state of :data:`FINISHED_TRIAL_STATES`.
+        """
+        by_state: dict[TrialStateName, int] = {
+            "COMPLETE": self.complete,
+            "INFEASIBLE": self.infeasible,
+            "FAIL": self.failed,
+            "INTERRUPTED": self.interrupted,
+        }
+        return sum(by_state[state] for state in FINISHED_TRIAL_STATES)
 
 
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"
@@ -222,6 +258,10 @@ OVERRIDES_ATTR = "phasesweep_overrides"
 CLEANUP_CONFIRMED_ATTR = "phasesweep_cleanup_confirmed"
 CLEANUP_RECOVERED_TRIALS_ATTR = "phasesweep_cleanup_recovered_trials"
 FAILURE_REASON_ATTR = "phasesweep_failure_reason"
+# How the metric extractor names itself in a failed trial's reason: ``<label>: <cause>`` when
+# the objective could not be read. The producer and the remedy that recognizes the reason
+# share this one string.
+METRIC_EXTRACTOR_LABEL = "metric extractor"
 # Study-level binding from a persistent study to the one artifact root it
 # publishes into: the resolved ``<workdir>/<experiment>`` namespace as a string.
 # ``workdir`` stays outside semantic fingerprints, so this binding refuses a
@@ -469,18 +509,28 @@ def _completed_trainer_duration(
     duration = trial.user_attrs.get(
         DURATION_ATTR, None if lifecycle is None else lifecycle.duration_seconds
     )
-    if (
-        type(return_code) is not int
-        or return_code != 0
-        or isinstance(duration, bool)
-        or not isinstance(duration, (int, float))
-        or duration < 0
-    ):
+    if type(return_code) is not int or return_code != 0:
         return None
-    try:
-        return float(duration) if math.isfinite(duration) else None
-    except OverflowError:
+    seconds = finite_nonnegative(duration)
+    return None if seconds is None else float(seconds)
+
+
+def _trial_lifecycle(trial: FrozenTrial | Trial) -> AttemptLifecycle | None:
+    """Read the attempt lifecycle record in the directory a trial recorded for its attempt.
+
+    :param FrozenTrial | Trial trial: Trial whose directory and attempt id attributes name the record.
+    :raises ValueError: The record is unreadable, malformed or belongs to another attempt. A
+        caller that acts on the process treats that as cleanup uncertainty, not as absence.
+    :return AttemptLifecycle | None: The validated record, or ``None`` when the trial recorded
+        no directory or attempt id, or its directory holds no record.
+    """
+    from phasesweep.runtime.process import read_attempt_lifecycle
+
+    directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
+    attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+    if not isinstance(directory, str) or not isinstance(attempt_id, str):
         return None
+    return read_attempt_lifecycle(Path(directory), expected_attempt_id=attempt_id)
 
 
 def _recovered_trial_state(
@@ -488,25 +538,23 @@ def _recovered_trial_state(
 ) -> RecoveredTrialState:
     """Predict the recovery disposition of a RUNNING trial.
 
+    A lifecycle record that cannot be read predicts an interruption: this only previews what
+    recovery will settle, and recovery itself refuses the unreadable record.
+
     :param FrozenTrial trial: Trial whose finished training may await extraction.
     :param _ParsedTrialOutcome | None outcome: Its unique committed outcome, if any.
     :return RecoveredTrialState: Pending evidence, a recorded failure, or an interruption.
     """
-    from phasesweep.runtime.process import read_attempt_lifecycle
-
     if outcome is not None:
         if outcome.metric is not None:
             return "EVIDENCE_PENDING"
         return "INTERRUPTED" if outcome.outcome == "interrupted" else "FAIL"
-    directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
-    attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
-    if isinstance(directory, str) and isinstance(attempt_id, str):
-        try:
-            lifecycle = read_attempt_lifecycle(Path(directory), expected_attempt_id=attempt_id)
-        except ValueError:
-            lifecycle = None
-        if lifecycle is not None and _completed_trainer_duration(trial, lifecycle) is not None:
-            return "EVIDENCE_PENDING"
+    try:
+        lifecycle = _trial_lifecycle(trial)
+    except ValueError:
+        return "INTERRUPTED"
+    if lifecycle is not None and _completed_trainer_duration(trial, lifecycle) is not None:
+        return "EVIDENCE_PENDING"
     return "INTERRUPTED"
 
 
@@ -523,6 +571,72 @@ def _trial_interrupted(trial: FrozenTrial) -> bool:
         return False
     parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
     return parsed is not None and parsed.outcome == "interrupted"
+
+
+def _unreplaced_attempts(trials: Iterable[FrozenTrial], *, interrupted: bool) -> list[FrozenTrial]:
+    """Return the attempts no rerun names, either the interrupted ones or all the others.
+
+    A rerun names the attempt it replaces (:data:`RERUN_OF_ATTR`): an interrupted trial, or a
+    failed grid cell a raised target retries. Of the attempts no rerun names, an interrupted
+    one still waits for its rerun, and every other one stands for its cell: the cell's
+    measurement, its latest failure, or an attempt still queued or running.
+
+    :param Iterable[FrozenTrial] trials: Every trial of one study.
+    :param bool interrupted: ``True`` for the interrupted attempts that wait for a rerun,
+        ``False`` for the attempts that stand for their cell.
+    :return list[FrozenTrial]: Those attempts, in the order ``trials`` gives them.
+    """
+    trials = list(trials)
+    named = {trial.user_attrs.get(RERUN_OF_ATTR) for trial in trials}
+    return [
+        trial
+        for trial in trials
+        if trial.number not in named and _trial_interrupted(trial) is interrupted
+    ]
+
+
+def _winning_trials(
+    trial_number: int, attempt_id: str | None, repeats: RepeatsRecord | None
+) -> dict[int, str | None]:
+    """Map the trial numbers a phase winner stands on to the attempt each must carry.
+
+    A repeats winner stands on every member of its group, each with the attempt it was ranked
+    on; any other winner stands on its one trial.
+
+    :param int trial_number: The winner's trial number; for a repeats winner, its
+        highest-numbered member's.
+    :param str | None attempt_id: That trial's attempt, or ``None`` where only the number is known.
+    :param RepeatsRecord | None repeats: The winner's repeats block, if its phase has repeats.
+    :return dict[int, str | None]: The attempt id to require by trial number, for
+        :func:`_stands_under_winner`.
+    """
+    if repeats is None:
+        return {trial_number: attempt_id}
+    return {member["trial_number"]: member["attempt_id"] for member in repeats["members"]}
+
+
+def _stands_under_winner(trial: FrozenTrial, standing: Mapping[int, str | None]) -> bool:
+    """Say whether a trial is one a phase winner stands on, the attempt included.
+
+    :param FrozenTrial trial: Trial to test.
+    :param Mapping[int, str | None] standing: The winner's trials by number, each with the
+        attempt id the trial must carry, ``None`` where only the number is known.
+    :return bool: ``True`` when the number is listed and any attempt id recorded for it matches.
+    """
+    if trial.number not in standing:
+        return False
+    attempt = standing[trial.number]
+    return attempt is None or trial.user_attrs.get(ATTEMPT_ID_ATTR) == attempt
+
+
+def _recorded_trial_dir(trial: FrozenTrial) -> Path | None:
+    """Return the attempt directory a trial recorded when it launched.
+
+    :param FrozenTrial trial: Trial to read.
+    :return Path | None: The directory, or ``None`` when none was recorded.
+    """
+    directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
+    return Path(directory) if isinstance(directory, str) and directory else None
 
 
 GENERATION_SUMMARY_SCHEMA_VERSION = 6

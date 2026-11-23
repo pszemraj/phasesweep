@@ -17,89 +17,134 @@ import optuna
 from phasesweep.config.common import check_bounds
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import (
+    CategoricalParam,
+    SearchParam,
     grid_search_space,
     phase_draws,
-    retry_target_ceiling,
     sampler_search_space,
 )
 from phasesweep.engine.artifacts import _winner_common_payload
 from phasesweep.engine.confound import (
+    ConfoundBlock,
     _assess_population,
     _describe_flagged,
-    _evaluation_point_remedy,
+    _params_text,
 )
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
 from phasesweep.engine.optuna import (
+    _any_objective_unreadable,
+    _any_trial_timed_out,
     _draw_positions,
     _finished_trial_count,
-    _measured_trial_count,
     _trial_count_state,
 )
+from phasesweep.engine.paths import TRIALS_CSV_FILENAME, _trials_csv_path
 from phasesweep.engine.repeats import (
-    _NOISE_STANDARD_ERRORS,
     RankedGroup,
     RepeatAxis,
     RepeatsRecord,
-    combined_standard_error,
     group_key,
+    noise_band,
     observed_means,
     ranked_group,
-    within_noise,
 )
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    FINISHED_TRIAL_STATES,
     GATES_ATTR,
     GENERATION_ID_ATTR,
     OBSERVED_PREFIX,
-    RERUN_OF_ATTR,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
     Winner,
-    _trial_interrupted,
+    _unreplaced_attempts,
     _validate_observed_block,
     constraint_attr,
 )
-from phasesweep.errors import FRESH_STUDY, NEW_STUDY_STEP, OperatorAction, PhaseSweepError
-from phasesweep.runtime.json import JsonObject, json_object, json_text_map
+from phasesweep.engine.study_policy import _raised_target_step
+from phasesweep.errors import (
+    FRESH_STUDY,
+    OperatorAction,
+    PhaseSweepError,
+    timeout_step,
+    unreadable_objective_step,
+)
+from phasesweep.evidence.models import MlflowExtractor
+from phasesweep.runtime.json import JsonObject, float_or_none, json_object, json_text_map
+from phasesweep.runtime.terminal import (
+    display_path,
+    objective_text,
+    param_text,
+    plural,
+)
 
 log = logging.getLogger("phasesweep.engine.selection")
 
-# Grid cells without a successful trial that one advisory spells out before it counts the rest.
-_MAX_LISTED_CELLS = 10
-
 
 class TieGroupComparison(typing.TypedDict):
-    """One configuration compared with the selected repeat group."""
+    """One configuration compared with the selected repeat group.
+
+    ``combined_se`` and ``threshold`` are ``None`` for groups ranked by median, which have no
+    noise band and tie only exactly, at ``gap`` 0.
+    """
 
     trial_number: int
     params: JsonObject
     gap: float
-    combined_se: float
-    threshold: float
+    combined_se: float | None
+    threshold: float | None
 
 
 def tie_group_comparisons(
     winner: RankedGroup, groups: Sequence[RankedGroup]
 ) -> list[TieGroupComparison]:
-    """Describe other configurations within two combined standard errors.
+    """Describe the other configurations that tie the winner: within its noise band, or exactly.
 
     :param RankedGroup winner: Selected repeat group.
-    :param Sequence[RankedGroup] groups: Groups from the same ranked population.
-    :return list[TieGroupComparison]: Parameters, objective gap and noise threshold for each overlap.
+    :param Sequence[RankedGroup] groups: Every group of the same ranked population, which the
+        band pools (:func:`phasesweep.engine.repeats.noise_band`).
+    :return list[TieGroupComparison]: Parameters, objective gap, standard error of the difference
+        and threshold for each overlap; for groups ranked by median, which have no band, each
+        group whose median equals the winner's, without the two band fields.
     """
+    band = noise_band(groups)
+    if band is None:
+        return [
+            {
+                "trial_number": group.representative,
+                "params": json_object(group.params),
+                "gap": 0.0,
+                "combined_se": None,
+                "threshold": None,
+            }
+            for group in groups
+            if dict(group.params) != dict(winner.params) and group.aggregate == winner.aggregate
+        ]
     return [
         {
             "trial_number": group.representative,
             "params": json_object(group.params),
             "gap": abs(group.aggregate - winner.aggregate),
-            "combined_se": combined_standard_error(winner, group),
-            "threshold": _NOISE_STANDARD_ERRORS * combined_standard_error(winner, group),
+            "combined_se": band.standard_error(winner, group),
+            "threshold": band.threshold(winner, group),
         }
         for group in groups
-        if dict(group.params) != dict(winner.params) and within_noise(winner, group)
+        if dict(group.params) != dict(winner.params) and band.within(winner, group)
     ]
+
+
+def _inspect_step(experiment: Experiment, phase_name: str | None) -> str:
+    """Point at a phase's record of its trials, which gives each failed trial's reason.
+
+    :param Experiment experiment: Config locating the artifact root.
+    :param str | None phase_name: Phase whose ``trials.csv`` is named, if known.
+    :return str: The first sentence of a no-winner remedy.
+    """
+    if phase_name is None:
+        return f"Inspect the phase's {TRIALS_CSV_FILENAME}."
+    return f"Inspect {display_path(_trials_csv_path(experiment, phase_name))}."
 
 
 def _no_feasible_remedy(
@@ -107,33 +152,38 @@ def _no_feasible_remedy(
 ) -> str:
     """Name the failed-trial retry or infeasible-bound remedy for the recorded population.
 
+    A fix that changes the study's identity, such as its ``metric`` or ``trial_command``, meets
+    the fingerprint refusal on the next run, which gives that change's own step.
+
     :param Experiment experiment: Config whose storage controls trial retention.
     :param Sequence[optuna.trial.FrozenTrial] trials: Recorded phase attempts.
     :param str | None phase_name: Phase supplying its accepted trial budget, if known.
     :return str: Operator steps appropriate to failures, bounds, and storage.
     """
-    evidence = "Inspect the phase's trials.csv and trial_* trainer logs."
+    evidence = _inspect_step(experiment, phase_name)
+    unreadable = _any_objective_unreadable(trials)
     if not experiment.persistent:
-        return f"{evidence} Fix the trainer failure or adjust the metric bounds or constraints, then rerun; storage: null starts fresh."
+        if unreadable:
+            return f"{evidence} {unreadable_objective_step(persistent=False)}"
+        return f"{evidence} Fix the failure, or the metric bounds or constraints, then rerun."
     infeasible = any(_trial_count_state(trial) == "INFEASIBLE" for trial in trials)
     if infeasible:
-        return f"{evidence} Changing metric.min, metric.max or constraints changes persistent study identity. {NEW_STUDY_STEP}"
+        return f"{evidence} To change metric.min, metric.max or constraints, {FRESH_STUDY}."
+    timeout_lead = ""
+    step: str | None = "raise the phase's n_trials and rerun."
     if phase_name is not None:
         phase = experiment.phase(phase_name)
-        finished = _finished_trial_count(trials)
-        ceiling = retry_target_ceiling(
-            phase, finished=finished, measured=_measured_trial_count(trials)
-        )
-        target = f"above {phase.n_trials}" if ceiling is None else f"to {ceiling}"
-        budget = f"phases[{phase.name}].n_trials {target}"
-    else:
-        budget = "the phase's n_trials"
-    return (
-        f"{evidence} Fix the failure, then raise {budget} in the config and rerun to retry "
-        "the failed attempts. Run controls such as `n_jobs` can change on retry. "
-        "If the fix changes study identity "
-        f"(for example `trial_command`, `trainer_config` or `provenance`), {FRESH_STUDY}."
+        step = _raised_target_step(phase, trials)
+        if _any_trial_timed_out(trials):
+            timeout_lead = f"{timeout_step(phase.name, experiment.phases_inheriting(phase.name))} "
+    objective_lead = f"{unreadable_objective_step(persistent=True)} " if unreadable else ""
+    fix = "For any other failure, fix it" if timeout_lead else "Fix the failure"
+    then = (
+        f"{fix}, then {step}"
+        if step is not None
+        else f"{fix}; every configuration was measured, so no larger n_trials retries one."
     )
+    return f"{evidence} {timeout_lead}{objective_lead}{then}"
 
 
 @dataclass
@@ -155,9 +205,8 @@ class SelectedTrial:
     trainer_env_digest: str
     # Versioned identity of the exact generated input consumed by the trainer.
     trainer_input: dict[str, Any]
-    # Advisory verdicts on the population this selection ranked
-    # (:mod:`phasesweep.engine.confound`).
-    confound: dict[str, Any]
+    # Advisory verdicts on the population this selection ranked.
+    confound: ConfoundBlock
     # The tracked environment mapping behind ``trainer_env_digest``, or ``None`` when the
     # trial recorded none. Only the ledger trial holds it; winner.yaml keeps the digest.
     trainer_env: dict[str, str] | None = None
@@ -254,8 +303,8 @@ def select_winner(
         (minimize/maximize), the metric bounds, and the constraint definitions used to
         filter trials.
     :param str | None phase_name: Phase label used in log messages and to find the phase for
-        the grid advisories. Log messages fall back to the study name when ``None``, and
-        the grid advisories are skipped.
+        the edge advisory, a grid's untried cells and the no-winner remedy's retry step. Log
+        messages fall back to the study name when ``None``, and the others are skipped.
     :param RepeatAxis | None repeats: The phase's repeat axis
         (:func:`phasesweep.engine.repeats.repeat_axis`), or ``None`` for a phase without repeats.
     :param bool emit_advisories: Whether this fresh selection should log advisories; replay retains verdicts silently.
@@ -281,21 +330,21 @@ def select_winner(
         else [t for group in ranking.groups for t in ranking.members[group.representative]]
     )
 
+    # The remedy points at trials.csv, which gives each failed trial's reason and, with
+    # repeats, its repeat_group.
     if repeats is not None and ranking is not None and not ranking.groups:
+        incomplete = ranking.incomplete_groups
         raise _no_feasible_error_type(trials)(
             f"No complete repeat group: a configuration ranks only when all "
             f"{len(repeats.values)} trials (one per repeats.values of {repeats.key!r}) are "
-            f"COMPLETE, feasible and within bounds; {ranking.incomplete_groups} group(s) were "
-            "incomplete. The phase's trials.csv labels each trial's repeat_group and records "
-            "why each failed or infeasible trial finished that way."
+            f"COMPLETE, feasible and within bounds; {plural(incomplete, 'group')} "
+            f"{'was' if incomplete == 1 else 'were'} incomplete."
             + _metric_bounds_note(trials, experiment),
             remediation=_no_feasible_remedy(experiment, trials, phase_name),
         )
     if not survivors:
         raise _no_feasible_error_type(trials)(
-            "No completed trials in phase. The phase's trials.csv records why each "
-            "failed or infeasible trial finished that way; trainer output is in its "
-            "trial_* directory." + _metric_bounds_note(trials, experiment),
+            "No completed trials in phase." + _metric_bounds_note(trials, experiment),
             remediation=_no_feasible_remedy(experiment, trials, phase_name),
         )
 
@@ -354,42 +403,47 @@ def select_winner(
         if t is not best:
             with contextlib.suppress(TrialEvidenceMissingError):
                 provenance[t.number] = _trial_objective_provenance(t)
+    phase = next((phase for phase in experiment.phases if phase.name == phase_name), None)
+    untried_cells = _untried_grid_cells(phase, trials)
+    extractor = experiment.metric.extractor
     confound = _assess_population(
         trials,
         survivors,
         best,
         provenance=provenance,
+        axis=repeats,
         groups=None if ranking is None else ranking.groups,
         incomplete_group=() if ranking is None else ranking.incomplete_group,
+        untried_cells=untried_cells,
+        best_value_select=(
+            extractor.select
+            if isinstance(extractor, MlflowExtractor) and extractor.select in ("min", "max")
+            else None
+        ),
     )
-    flagged = _describe_flagged(confound)
-    if winning is not None and ranking is not None:
-        for comparison in tie_group_comparisons(winning, ranking.groups):
-            flagged.append(
-                f"group {comparison['trial_number']} params={comparison['params']} versus "
-                f"winner params={dict(winning.params)}, "
-                f"gap={comparison['gap']:.6g}, combined_se={comparison['combined_se']:.6g}, "
-                f"threshold={_NOISE_STANDARD_ERRORS:g}*combined_se={comparison['threshold']:.6g}"
-            )
-    if confound["checks"]["evaluation_point"]["verdict"] == "heterogeneous":
-        flagged.append(
-            _evaluation_point_remedy(
-                experiment.metric.extractor.type,
-                axis=confound["checks"]["evaluation_point"]["detail"]["axis"],
-            )
-        )
+    flagged = _describe_flagged(
+        confound,
+        winner_trial=best.number,
+        trials=trials,
+        untried_cells=untried_cells,
+        noise_gaps=(
+            None
+            if winning is None or ranking is None
+            else {
+                comparison["trial_number"]: (comparison["gap"], threshold)
+                for comparison in tie_group_comparisons(winning, ranking.groups)
+                if (threshold := comparison["threshold"]) is not None
+            }
+        ),
+    )
     if flagged and emit_advisories:
-        log.warning(
-            "[%s] potential confounds in the %d ranked trials (verdicts recorded in the "
-            "winner's confound block): %s.",
-            phase_name or study.study_name,
-            len(survivors),
-            "; ".join(fragment.rstrip(".") for fragment in flagged),
-        )
-    phase = next((phase for phase in experiment.phases if phase.name == phase_name), None)
+        # The warning states what each check found; the run's closing summary gives the
+        # show-winners command as typed, which prints each flagged check's counts and remedy.
+        log.warning("[%s] %s", phase_name or study.study_name, "; ".join(flagged))
     if phase is not None and emit_advisories:
-        _warn_grid_edges(phase, best.params)
-        _warn_unsuccessful_grid_cells(phase, trials)
+        edge = _edge_advisory(phase, trials, best.params if winning is None else winning.params)
+        if edge is not None:
+            log.warning("[%s] %s", phase.name, edge)
         if winning is not None and ranking is not None and phase.cost_key is not None:
             advisory = _cost_advisory(phase, winning, ranking.groups, goal=experiment.metric.goal)
             if advisory is not None:
@@ -437,16 +491,24 @@ def _cost_advisory(
 ) -> str | None:
     """Describe a cheaper configuration within one standard error of the winner's mean.
 
+    The standard error is the phase's pooled run-to-run sd over the square root of the
+    winner's group size, from the same noise band the tie check uses
+    (:func:`phasesweep.engine.repeats.noise_band`), so a phase has one noise estimate.
+
     :param Phase phase: Phase declaring a numeric sampled cost key and mean repeats.
     :param RankedGroup winner: Configuration selected by the objective.
     :param Sequence[RankedGroup] groups: Complete feasible configuration groups.
     :param typing.Literal["minimize", "maximize"] goal: Objective direction for breaking cost ties.
+    :raises ValueError: The groups rank by median, which the cost-key validator refuses.
     :return str | None: Advisory text, or ``None`` without a cheaper eligible group or cost key.
     """
     key = phase.cost_key
     if key is None:
         return None
-    winner_se = winner.spread["sd"] / math.sqrt(winner.spread["n"])
+    band = noise_band(groups)
+    if band is None:
+        raise ValueError(f"cost_key {key!r} needs repeats with reduce: mean.")
+    winner_se = band.pooled_sd / math.sqrt(winner.spread["n"])
     eligible = [group for group in groups if abs(group.aggregate - winner.aggregate) <= winner_se]
 
     def cost(group: RankedGroup) -> float:
@@ -463,84 +525,123 @@ def _cost_advisory(
     sign = 1.0 if goal == "minimize" else -1.0
     cheapest = min(eligible, key=lambda group: (cost(group), sign * group.aggregate, group.numbers))
     if cost(cheapest) < cost(winner):
+        # The params carry the cheaper cost, so the winner's one value says by how much.
         return (
-            f"one-standard-error cost advisory: params={dict(cheapest.params)} has "
-            f"{key}={cost(cheapest):g} versus winner {key}={cost(winner):g}, "
-            f"gap={abs(cheapest.aggregate - winner.aggregate):g} <= winner_se={winner_se:g}. "
-            "The selected winner is unchanged."
+            f"cost advisory: {_params_text(cheapest.params).lstrip()} is cheaper than the "
+            f"winner's {key}={param_text(winner.params[key])}, with a mean within one standard "
+            f"error of the winner's (gap {objective_text(abs(cheapest.aggregate - winner.aggregate))}"
+            f", standard error {objective_text(winner_se)}); the selected winner is unchanged"
         )
     return None
 
 
-def _warn_grid_edges(phase: Phase, params: Mapping[str, object]) -> None:
-    """Warn when selected params touch an endpoint of a numeric grid axis.
+def _configured_end(param: SearchParam, *, upper: bool) -> float | None:
+    """Return the most extreme value a numeric parameter's configuration allows on one side.
 
-    Numeric categorical choices are ordered by value. Mixed, boolean and
-    axes with fewer than three values have no reported boundary; the repeat axis is not searched.
-
-    :param Phase phase: Configured search space and sampler.
-    :param Mapping[str, object] params: Selected configuration's sampled values.
+    :param SearchParam param: A searched parameter.
+    :param bool upper: Whether to return the highest value rather than the lowest.
+    :return float | None: ``high`` or ``low`` of a range, the largest or smallest choice of an
+        all-numeric categorical, or ``None`` for choices that are not all numbers.
     """
-    if phase.sampler.type != "grid":
-        return
-    for name, choices in grid_search_space(phase.search_space, phase_name=phase.name).items():
-        values = [
-            value
-            for value in choices
-            if isinstance(value, int | float) and not isinstance(value, bool)
-        ]
-        if len(values) != len(choices) or len(set(values)) < 3:
-            continue
-        value = params.get(name)
-        lower, upper = min(values), max(values)
-        edge = "lower" if value == lower else "upper" if value == upper else None
-        if edge is not None:
-            log.warning(
-                "[%s] winner is at the %s numeric grid boundary for %s=%s (grid %s..%s); "
-                "widen the range to check for a better value beyond it.",
-                phase.name,
-                edge,
-                name,
-                value,
-                lower,
-                upper,
-            )
+    if isinstance(param, CategoricalParam):
+        choices = [float_or_none(choice) for choice in param.choices]
+        numbers = [choice for choice in choices if choice is not None]
+        if len(numbers) != len(choices):
+            return None
+        return max(numbers) if upper else min(numbers)
+    return float(param.high if upper else param.low)
 
 
-def _warn_unsuccessful_grid_cells(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]) -> None:
-    """Warn when a grid winner was chosen while some cell has no successful trial.
+def _at_configured_end(param: SearchParam, value: float, end: float) -> bool:
+    """Say whether no configured value lies beyond ``value`` on the side of ``end``.
 
-    A cell is successful when one of its trials is COMPLETE, feasible or not, which is
-    when the retry rule closes it. A cell whose attempts all failed, were interrupted or
-    never ran has none. The repeat axis counts as a grid axis. The advisory never changes
-    selection.
+    A stepped range allows values one step apart, so within half a step of the end is at it;
+    a continuous float reaches its end only by equalling it.
 
-    :param Phase phase: Configured search space and sampler.
+    :param SearchParam param: The parameter ``end`` came from (:func:`_configured_end`).
+    :param float value: The winner's value.
+    :param float end: The configured end on the side the winner is extreme on.
+    :return bool: Whether the winner sits on the configured end.
+    """
+    if isinstance(param, CategoricalParam):
+        return value == end
+    step = param.step or 0
+    return abs(end - value) <= step / 2
+
+
+def _edge_advisory(
+    phase: Phase, trials: Sequence[optuna.trial.FrozenTrial], params: Mapping[str, object]
+) -> str | None:
+    """Say which searched numeric parameters no finished trial tried beyond the winner's value.
+
+    A best value is located only once worse values lie on both sides of it. Every sampler gets
+    the one rule, stated in terms of what was tried: a numeric parameter (an int or float range,
+    or all-numeric categorical choices) with at least three distinct values across the trials
+    that finished, COMPLETE, INFEASIBLE or FAIL, whose winning value is the lowest or highest of
+    them. A failed or infeasible trial beyond the winner counts as tried, and an interrupted one
+    tried nothing. Boolean and mixed choices have no order; the repeat axis is not searched.
+
+    :param Phase phase: Configured search space.
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
+    :param Mapping[str, object] params: The winning configuration's params; for a repeats
+        phase, the winning group's.
+    :return str | None: One clause per such parameter, naming the values tried and whether the
+        winner sits on the configured end; ``None`` when no parameter qualifies.
     """
-    if phase.sampler.type != "grid" or not phase_draws(phase):
-        return
+    finished = [trial for trial in trials if _trial_count_state(trial) in FINISHED_TRIAL_STATES]
+    clauses: list[str] = []
+    for name, param in phase.search_space.items():
+        value = float_or_none(params.get(name))
+        tried = sorted(
+            {
+                number
+                for trial in finished
+                if (number := float_or_none(trial.params.get(name))) is not None
+            }
+        )
+        if value is None or len(tried) < 3 or value not in (tried[0], tried[-1]):
+            continue
+        upper = value == tried[-1]
+        end = _configured_end(param, upper=upper)
+        if end is None:
+            continue
+        place = (
+            f"at the configured {'upper' if upper else 'lower'} bound"
+            if _at_configured_end(param, value, end)
+            else f"configured range extends to {param_text(end)}"
+        )
+        clauses.append(
+            f"{'above' if upper else 'below'} the winner's {name}={param_text(params.get(name))} "
+            f"(tried {param_text(tried[0])}..{param_text(tried[-1])}, {place})"
+        )
+    return None if not clauses else "no trial ran " + " or ".join(clauses)
+
+
+def _untried_grid_cells(
+    phase: Phase | None, trials: Sequence[optuna.trial.FrozenTrial]
+) -> list[dict[str, object]]:
+    """Return the cells of a grid that reached its target covering every cell, yet no trial ran.
+
+    Raising a grid's target after failures schedules the failed cells' retries ahead of the
+    cells it never reached, so a finished target can leave cells nobody tried, and nothing
+    else reports them. A target below the grid's size leaves cells out by design, and a
+    phase cut short by an accepted timeout reports its shortfall in the completion record,
+    so neither counts. The repeat axis counts as a grid axis.
+
+    :param Phase | None phase: The phase, or ``None`` when selection has none.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
+    :return list[dict[str, object]]: The untried cells in grid order, empty for any other phase.
+    """
+    if phase is None or phase.sampler.type != "grid" or not phase_draws(phase):
+        return []
     axes = grid_search_space(sampler_search_space(phase), phase_name=phase.name)
-    succeeded = {
-        tuple(trial.params.get(name) for name in axes)
-        for trial in trials
-        if trial.state == optuna.trial.TrialState.COMPLETE
-    }
-    cells = [dict(zip(axes, values, strict=True)) for values in itertools.product(*axes.values())]
-    missing = [cell for cell in cells if tuple(cell.values()) not in succeeded]
-    if not missing:
-        return
-    listed = "; ".join(str(cell) for cell in missing[:_MAX_LISTED_CELLS])
-    if len(missing) > _MAX_LISTED_CELLS:
-        listed += f"; and {len(missing) - _MAX_LISTED_CELLS} more"
-    log.warning(
-        "[%s] only %d of %d grid cells succeeded; the winner was chosen without a "
-        "successful trial for: %s.",
-        phase.name,
-        len(cells) - len(missing),
-        len(cells),
-        listed,
-    )
+    cells: list[dict[str, object]] = [
+        dict(zip(axes, values, strict=True)) for values in itertools.product(*axes.values())
+    ]
+    if phase.n_trials < len(cells) or _finished_trial_count(trials) < phase.n_trials:
+        return []
+    tried = {tuple(trial.params.get(name) for name in axes) for trial in trials}
+    return [cell for cell in cells if tuple(cell.values()) not in tried]
 
 
 def _rank_groups(
@@ -551,11 +652,12 @@ def _rank_groups(
     """Group a repeats phase's trials by configuration and keep the complete groups.
 
     A group is complete when it holds one trial per repeat value and every one
-    of them is eligible (:func:`_eligible`). Trials that never recorded the
-    repeat param belong to no group.
-    An interrupted trial belongs to none either: its rerun takes its place, in
-    the same group because it has the same draw position. A failed grid member
-    replaced by a retry likewise leaves its group to that replacement.
+    of them is eligible (:func:`_eligible`). Only the attempts that stand for
+    their cell join a group (:func:`~phasesweep.engine.state._unreplaced_attempts`):
+    an interrupted trial's rerun takes its place, in the same group because it has
+    the same draw position, and a failed grid member replaced by a retry leaves its
+    group to that replacement. Trials that never recorded the repeat param belong
+    to no group.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the phase study.
     :param Experiment experiment: Parsed experiment; supplies the eligibility bounds.
@@ -565,13 +667,8 @@ def _rank_groups(
     """
     by_key: dict[str, list[optuna.trial.FrozenTrial]] = {}
     draw_positions = _draw_positions(trials)
-    replaced = {trial.user_attrs.get(RERUN_OF_ATTR) for trial in trials}
-    for trial in trials:
-        if (
-            axis.key in trial.params
-            and not _trial_interrupted(trial)
-            and trial.number not in replaced
-        ):
+    for trial in _unreplaced_attempts(trials, interrupted=False):
+        if axis.key in trial.params:
             key = group_key(draw_positions[trial.number], trial.params, axis)
             by_key.setdefault(key, []).append(trial)
     groups: list[RankedGroup] = []

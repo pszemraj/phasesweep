@@ -7,6 +7,7 @@
 # The file is one UTF-8 YAML mapping. An unknown or duplicate key, or a value that breaks a constraint stated here, fails config load with an error naming it.
 # Paths: a relative workdir, journal path or execution.cwd resolves against the config file's directory, after symlinks. A leading ~ expands from HOME.
 # Trial paths (extractor path and file, gate path) are relative to the attempt directory, nonempty, without NUL or .. segments, and name a file below it.
+# A file read for a value or a digest must also resolve inside the attempt directory: a symlink out of it fails the read, while one that stays inside works.
 # JSON evidence is parsed strictly: duplicate names or NaN and Infinity tokens invalidate the file. A JSON key is a dotted path of nonempty object keys.
 # YAML scalars follow PyYAML (YAML 1.1) typing: 1e-3 and 1.0e3 load as strings, 1.0e-3, 0.001 and 1.0e+3 as floats.
 # Numeric keys accept numeric strings, reject booleans and must be finite. Bounds are inclusive, and a lower bound may not exceed its upper bound.
@@ -23,7 +24,7 @@
 # Warning: renaming starts new studies and a new artifact directory, and results recorded under the old name are not reused.
 experiment: string (required)
 
-# Shell command template that runs one trainer attempt under /bin/sh -c in execution.cwd, with the trainer environment rather than the shell's. It must exit 0.
+# Shell command template that runs one trainer attempt under /bin/sh -c in execution.cwd, with the trainer environment rather than the shell's. It must exit 0 and leave nothing it started running.
 # {trial_dir} is the absolute attempt directory, {trial_id} the phase's trial number, {phase} its name, {run_name} <experiment>-<phase>-<trial_id>-<attempt ID>.
 # {config_path}, {overrides} or {overrides_path} carries the trainer input, as override_format says, for example python train.py --config {config_path}.
 # PhaseSweep shell-quotes every placeholder but {trial_id}. Write {{ and }} for literal braces and $VAR or ${{VAR}} for a shell variable.
@@ -76,9 +77,10 @@ phases: list[object] (required)
   - name: string (required)
 
     # Target number of finished attempts, an integer >= 1. COMPLETE, INFEASIBLE and FAIL attempts count, and interrupted ones do not.
+    # An interrupted attempt reruns from scratch as a new attempt in a new directory, so the trainer's own checkpoint-resume logic does not find the earlier attempt's files.
     # When the target is reached with no eligible feasible attempt, the phase fails.
     # On persistent storage a raised target runs the remaining attempts in the same study, and a lowered one is refused.
-    # While a phase that inherits from this one, even indirectly, has trials, a run that would add trials here is refused. Use a new experiment name then.
+    # While a phase that inherits from this one, even indirectly, has trials, a run that would add trials here is refused. Give each phase that inherits this one a new `name`, updating every `inherits` to match: this phase keeps its finished trials and runs the rest, and the renamed phases start new studies and run again. A new experiment name reruns every phase.
     # Recommended: one trial per configuration, spending the budget on more distinct values, such as 7 to 8 log-spaced learning rates.
     # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation for retries, aborts and partial results.
     n_trials: int (required)
@@ -166,7 +168,7 @@ phases: list[object] (required)
       # Repeat values, at least two: null, booleans, integers, finite floats or strings, distinct as categorical choices must be.
       values: list[bool | int | float | string | null] (required)
 
-      # How a group's member metrics combine into the value it ranks by: mean or median.
+      # How a group's member metrics combine into the value it ranks by: mean or median. Median groups get no noise band, so the tie check judges only exact ties and cost_key is unavailable.
       reduce: "mean" | "median" = "mean"
 
     # Sampling strategy and its parameters. Omit the block for the defaults.
@@ -211,8 +213,10 @@ phases: list[object] (required)
     # Device lease policy. single_per_trial leases one device per attempt, with a same-host lock held until the trainer's process group exits.
     # MPS leases use gpu_mps.lock without assigning CUDA_VISIBLE_DEVICES; the trainer selects its device.
     # whole_node gives the one running attempt every listed CUDA device, comma-joined, or the discovered MPS device; its device count is fingerprinted.
+    # A torchrun or accelerate launch trainer uses whole_node: the launcher sets the rank variables, and it must wait for its ranks and exit nonzero when one fails.
     # none binds no device and takes no lock. Set CUDA_VISIBLE_DEVICES in env, or name it in execution.inherit_env, when the trainer needs a restriction.
     # Warning: the trainer sees a leased GPU as its local cuda:0, so index devices locally.
+    # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#multi-process-and-multi-gpu-trainers for the objective report and for ranks a killed launcher leaves.
     gpu_policy: "single_per_trial" | "whole_node" | "none" = "single_per_trial"
 
     # Explicit CUDA device indices, each an integer >= 0, used instead of discovery. An empty list is rejected.
@@ -252,6 +256,7 @@ phases: list[object] (required)
     # Wallclock limit for one trainer process, in seconds, > 0. null means no limit.
     # Its clock starts at the supervised launch, after the GPU lease is held, so it excludes the lease wait and the evidence reads.
     # A trainer it kills fails the attempt. A trainer that a phase or run deadline stops first is interrupted instead, and it reruns.
+    # Unlike timeout_seconds_per_phase, this key is part of the phase's study identity: changing it after the phase has trials is refused as a changed study, so give the phase, and each phase that inherits it, a new `name`, updating every `inherits` to match, to run it under another value.
     # Requires: phases[].allow_unbounded_trials true for null.
     timeout_seconds_per_trial: float | null = 259200.0
 
@@ -284,6 +289,7 @@ phases: list[object] (required)
 
         # Trial path, which names a directory when source is directory. There . names the attempt directory itself.
         # Warning: . counts the files PhaseSweep writes there, such as stdout.log, stderr.log, command.txt and the trainer input.
+        # With source json the file must resolve inside the attempt directory, so a symlink out of it fails the gate. file and directory sizes read no value.
         path: string (required)
 
         # JSON key of the byte count, for example artifact.bytes.
@@ -298,7 +304,7 @@ phases: list[object] (required)
       # Variant json_equals: require a JSON value to equal a scalar of the same JSON type, so true, 1 and 1.0 differ. A missing file or key fails the gate.
       - type: "json_equals" (required)
 
-        # JSON file to read, for example result.json.
+        # JSON file to read, for example result.json. It must resolve inside the attempt directory, so a symlink out of it fails the gate.
         path: string (required)
 
         # JSON key of the value, for example eval.loss.
@@ -310,7 +316,7 @@ phases: list[object] (required)
       # Variant json_scalar_bound: require a finite JSON number within min and max, at least one of which is set. A boolean or a string fails the gate.
       - type: "json_scalar_bound" (required)
 
-        # JSON file holding the number, for example result.json.
+        # JSON file holding the number, for example result.json. It must resolve inside the attempt directory, so a symlink out of it fails the gate.
         path: string (required)
 
         # JSON key of the number, for example eval.loss.
@@ -345,7 +351,7 @@ phases: list[object] (required)
       # Variant sha256: require the exact SHA-256 digest of a file, hashed after the trainer exits. A directory or a missing file fails the gate.
       - type: "sha256" (required)
 
-        # File to hash, for example model.safetensors.
+        # File to hash, for example model.safetensors. It must resolve inside the attempt directory, so a symlink out of it fails the gate.
         path: string (required)
 
         # Expected digest: 64 hexadecimal characters. Uppercase is accepted and lowercased. A mismatch fails the gate.
@@ -393,6 +399,7 @@ storage: string | null = null
 
 # Directory for per-experiment generations, attempt directories, logs and winner files. Write . for the config file's directory; "" fails config load.
 # Warning: changing execution.cwd does not move it. Give trainer outputs a trial-specific path through trainer_config or trial_command.
+# Warning: nothing under it is pruned. Every trial, interrupted attempt and rerun keeps its directory, so have the trainer bound its own checkpoints.
 workdir: string = "./runs"
 
 # Operator-defined identifiers of inputs outside this YAML that git does not capture, such as dataset_revision and dependency versions.
@@ -470,7 +477,7 @@ mlflow: object | null = null
   # Seconds each controller tracking operation may take, at least 1. It never limits training time.
   # Experiment resolution, run creation, evidence capture and each result upload get a separate budget of this length.
   # A creation whose outcome is unconfirmed is never sent again; a search for its identity tags gets a fresh budget of this length to find the run.
-  # Phase and run deadlines also cap resolution, creation and capture, and a capture cut short fails the trial. An upload that runs out waits for sync-tracking.
+  # Phase and run deadlines also cap resolution, creation and capture, and a capture cut short fails the trial. An upload that runs out waits for the next run or sync-tracking.
   # Recommended: leave room for SDK startup and a slow server. The default suits most servers.
   timeout_seconds: float = 120.0
 
@@ -527,6 +534,7 @@ JsonExtractor:
   type: "json" (required)
 
   # JSON file, for example result.json. The trainer finds the attempt directory through {trial_dir} or PHASESWEEP_TRIAL_DIR.
+  # It must resolve inside the attempt directory, so a symlink to a results file outside it fails the read; copy such a file in instead.
   path: string (required)
 
   # JSON key of the number, for example eval.loss. List indexes and keys that contain a dot cannot be addressed.
@@ -541,6 +549,7 @@ JsonEnvelopeExtractor:
 
   # Envelope file. report_objective() writes the metric.extractor path, exported as PHASESWEEP_OBJECTIVE_PATH only for a json_envelope metric.extractor.
   # A constraint's or observation's envelope at another path is the trainer's to write. At the same path it reads the metric's envelope.
+  # It must resolve inside the attempt directory, so a symlink out of it fails the read.
   path: string = "result.json"
 
   # Exact nonempty objective.name the envelope must report, for example eval_loss.
@@ -570,6 +579,7 @@ LogRegexExtractor:
   type: "log_regex" (required)
 
   # Log file, for example stdout.log. stdout.log and stderr.log hold the trainer's two streams, and Python logging writes to stderr by default.
+  # It must resolve inside the attempt directory, so a symlink out of it, including one a trainer puts in place of stdout.log, fails the read.
   file: string = "stdout.log"
 
   # Python regular expression whose required group (?P<value>...) captures the whole metric token. Use loss=(?P<value>\S+) for whitespace delimiters or loss=(?P<value>[^\s,]+) when a comma can follow.
@@ -594,7 +604,7 @@ MlflowExtractor:
   # A metric missing from a finished run fails the trial at once, naming it and listing the run's metric keys.
   metric_key: string (required)
 
-  # Which point of the metric history is used: last, min, max, or the point at step. It must be finite, and its step is the evaluation_point position.
+  # Which point of the metric history is used: last, min, max, or the point at step. It must be finite. For last and step its step is the evaluation_point position; min and max leave evaluation_point n/a, since their step is where the best value fell.
   # Requires: step set exactly when select is step.
   select: "last" | "min" | "max" | "step" (required)
 

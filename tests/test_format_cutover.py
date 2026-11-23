@@ -105,7 +105,7 @@ def test_unmarked_output_root_is_refused_before_mutation(
 
     with pytest.raises(
         ArtifactRootConflictError,
-        match=r"unmarked PhaseSweep state.*Nothing was written",
+        match=r"unmarked PhaseSweep state entry .* but no supported format marker\.$",
     ) as excinfo:
         run_experiment(experiment)
 
@@ -131,7 +131,7 @@ def test_unsupported_artifact_binding_version_is_refused_before_mutation(
         ArtifactRootConflictError,
         match=(
             f"uses format {previous}; this PhaseSweep reads format "
-            f"{ARTIFACT_ROOT_BINDING_SCHEMA_VERSION}. Nothing was written"
+            f"{ARTIFACT_ROOT_BINDING_SCHEMA_VERSION}\\.$"
         ),
     ) as excinfo:
         run_experiment(experiment)
@@ -206,7 +206,7 @@ def test_artifact_binding_without_a_version_is_refused_as_unversioned(tmp_path: 
         ArtifactRootConflictError,
         match=(
             "has no format version; this PhaseSweep reads format "
-            f"{ARTIFACT_ROOT_BINDING_SCHEMA_VERSION}. Nothing was written"
+            f"{ARTIFACT_ROOT_BINDING_SCHEMA_VERSION}\\.$"
         ),
     ):
         run_experiment(materialized.experiment)
@@ -233,6 +233,8 @@ def test_format_refusal_gives_the_same_fix_to_every_command(
     options: list[str],
 ) -> None:
     """Data in another format ends in one fix line whichever command meets it, before any preview."""
+    # A wide terminal keeps the closing ``log:`` path on one line.
+    monkeypatch.setenv("COLUMNS", "500")
     materialized = materialize("current-journal", tmp_path, mode="tree")
     if format_record == "artifact-root":
         _downgrade_binding(materialized.experiment)
@@ -249,7 +251,10 @@ def test_format_refusal_gives_the_same_fix_to_every_command(
     assert "checkout" not in output.err
     assert "format None" not in output.err
     assert not [record for record in caplog.records if "DRY RUN" in record.getMessage()]
-    assert output.err.endswith(f"\nfix: {OTHER_FORMAT_STEP}\n")
+    lines = output.err.splitlines()
+    if command == "run" and "--dry-run" not in options:
+        assert lines.pop().startswith("log: ")
+    assert "\n".join(lines).endswith(f"\nfix: {OTHER_FORMAT_STEP}")
     assert tree_snapshot(materialized.root) == before
 
 
@@ -292,7 +297,7 @@ def test_unsupported_populated_ledger_is_refused_with_a_fresh_output_root(
         StudySchemaMismatchError,
         match=(
             rf"'old_experiment::removed_phase' {shown}; "
-            rf"this PhaseSweep reads format {STUDY_SCHEMA_VERSION}\. Nothing was written"
+            rf"this PhaseSweep reads format {STUDY_SCHEMA_VERSION}\."
         ),
     ) as excinfo:
         run_experiment(experiment)
@@ -318,9 +323,10 @@ def test_float_schema_is_refused_by_live_and_snapshot_checks(tmp_path: Path) -> 
 
     with pytest.raises(StudySchemaMismatchError, match=r"t::p.*Affected trial numbers: \[0\]"):
         _initialize_study_schema(study)
-    with pytest.raises(StudySchemaMismatchError, match="t::p.*Nothing was written"):
+    uses = rf"t::p. uses format {float(STUDY_SCHEMA_VERSION)}"
+    with pytest.raises(StudySchemaMismatchError, match=uses):
         engine_ledger._check_study_schema(study, trials)
-    with pytest.raises(StudySchemaMismatchError, match="t::p.*Nothing was written"):
+    with pytest.raises(StudySchemaMismatchError, match=uses):
         engine_ledger._scan_ledger_format(storage)
 
     assert tree_snapshot(tmp_path) == before
@@ -431,7 +437,7 @@ def test_unwritable_ledger_directory_fails_before_the_tree_is_bound(
         monkeypatch.setattr(Path, "mkdir", refuse_ledger_directory)
 
     try:
-        with pytest.raises(PhaseSweepError, match="could not be created") as refused:
+        with pytest.raises(PhaseSweepError, match="cannot be created") as refused:
             claim_ledger(validate_ledger(experiment))
     finally:
         if denial == "permissions":
@@ -955,7 +961,7 @@ def test_repair_refuses_a_journal_lock_that_is_never_released(
         assert len(raised) == 1
         assert isinstance(raised[0], IncompleteJournalRecordError)
         assert raised[0].action == OperatorAction.RESTORE_LEDGER
-        assert "Wait for the writer to finish" in str(raised[0])
+        assert "Retry when the writer finishes" in str(raised[0])
         assert journal.read_bytes() == damaged
         assert holder.held()
         assert not list(journal.parent.glob(f"{journal.name}.*.bak"))
@@ -1111,7 +1117,7 @@ def test_repair_never_truncates_under_or_releases_a_lock_another_process_took_ov
             repair_incomplete_journal_record(validate_ledger(materialized.experiment))
         assert excinfo.value.action == OperatorAction.RETRY
         rendered = _operational_error_text(excinfo.value)
-        assert "retry the same operation once the reported blocker is resolved" in rendered
+        assert "fix: Retry once the reported blocker clears." in rendered
         assert "start a new run" not in rendered
         assert journal.read_bytes() == (damaged if taken_over == "before truncation" else complete)
         assert successor[0].held()

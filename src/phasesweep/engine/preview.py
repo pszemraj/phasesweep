@@ -51,19 +51,32 @@ from phasesweep.engine.state import (
     _unique_trial_outcomes,
 )
 from phasesweep.engine.study_policy import (
+    ReachedStudy,
     _launch_preflight,
     _load_phase_policy_state,
     _pending_rerun_count,
+    _reached_study_refusals,
     _validate_fixed_configuration_target,
     _validate_study_direction,
     _validate_study_schema,
-    _validate_trial_target,
 )
 from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.run_report import rerun_clause
 from phasesweep.runtime.commands import render_command
 from phasesweep.runtime.gpu import GpuPool
+from phasesweep.runtime.terminal import REPORT_LOGGER, plural
 
-log = logging.getLogger("phasesweep.engine.preview")
+# Every line of a preview is for the person reading the dry run, so all of it is report.
+log = logging.getLogger(REPORT_LOGGER)
+
+
+def warn_dry_run(message: str, *args: object) -> None:
+    """Log a dry-run warning under the one label that readers and tests scan for.
+
+    :param str message: Logging format string, without the label.
+    :param object args: Values substituted into the format string.
+    """
+    log.warning(f"DRY RUN warning: {message}", *args)
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,15 +114,6 @@ class PhasePreview:
     replays: bool
 
 
-def _reruns_phrase(reruns: int) -> str:
-    """Name a count of reruns in the singular or plural.
-
-    :param int reruns: Reruns counted.
-    :return str: For example ``"1 rerun"``.
-    """
-    return "1 rerun" if reruns == 1 else f"{reruns} reruns"
-
-
 def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
     """Total the trials a dry run would launch from the counts its phase lines print.
 
@@ -121,10 +125,10 @@ def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
     reruns = sum(preview.reruns for preview in previews)
     launching = sum(1 for preview in previews if preview.launches)
     replaying = sum(1 for preview in previews if preview.replays)
-    line = f"total: would launch {trials} {'trial' if trials == 1 else 'trials'} "
+    line = f"total: would launch {plural(trials, 'trial')} "
     if reruns:
-        line += f"({_reruns_phrase(reruns)}) "
-    line += f"across {launching} {'phase' if launching == 1 else 'phases'}"
+        line += f"({plural(reruns, 'rerun')}) "
+    line += f"across {plural(launching, 'phase')}"
     if replaying:
         line += f" ({replaying} other {'phase replays' if replaying == 1 else 'phases replay'})"
     return line
@@ -163,12 +167,12 @@ def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
     recovered = _recovered_running_states(study.study_name, trials)
     if "EVIDENCE_PENDING" in recovered:
         raise PhaseSweepError(
-            f"Phase {phase.name!r} has completed trainer evidence awaiting recovery; "
-            "the trial and rerun counts depend on its extraction.",
+            f"Phase {phase.name!r} has completed trainer evidence awaiting recovery, so the "
+            "dry run cannot count its trials.",
             action=OperatorAction.RUN_RECOVER_RUN,
             remediation=(
-                "Let any active run finish. If the evidence is still pending, run "
-                "phasesweep run with the same config, without --dry-run, to recover it."
+                "Run `phasesweep run` with the same config, without --dry-run, to recover the "
+                f"pending trial of `{phase.name}`."
             ),
         )
     recovered_as_failed = recovered.count("FAIL")
@@ -198,9 +202,8 @@ def _read_recorded_phases(experiment: Experiment) -> dict[str, RecordedPhase | N
     try:
         studies = read_phase_studies(validate_ledger(experiment))
     except StudyStorageUnavailableError as exc:
-        log.warning(
-            "DRY RUN warning: the ledger could not be inspected, and a real run refuses "
-            "a ledger it cannot read: %s",
+        warn_dry_run(
+            "the ledger could not be inspected, and a real run refuses a ledger it cannot read: %s",
             exc,
         )
         return {phase.name: None for phase in experiment.phases}
@@ -243,7 +246,6 @@ def validate_trial_targets(experiment: Experiment) -> None:
             + recovered.count("FAIL")
             + recovered.count("EVIDENCE_PENDING"),
             measured=_measured_trial_count(trials),
-            has_study=study is not None,
         )
 
 
@@ -255,11 +257,13 @@ def _refuse_as_a_launch_would(
 ) -> None:
     """Apply claim, preflight, and top-up refusals to snapshots in launch order.
 
-    Combine per-study refusals as a launch does. For RUNNING studies, apply direction,
-    schema, and fixed-target checks using predicted recovery counts; defer target
-    and descendant checks requiring actual recovery. Preview inspects each study's
-    artifact-root claim without making it, and does not verify evidence;
-    :func:`_preview_phase` runs each launching phase's launch preflight.
+    The reached studies get the checks a launch gives them after its recovery, from the same
+    function (:func:`phasesweep.engine.study_policy._reached_study_refusals`): recorded
+    identity, then target, then the launch preflight of a phase that needs new trials. A
+    RUNNING study gets the fixed-target check on predicted recovery counts in place of its
+    accepted target, and stays out of the descendant check, which needs the recovered state.
+    Preview inspects each study's artifact-root claim without making it, and does not verify
+    evidence.
 
     :param Experiment experiment: Parsed experiment being previewed.
     :param Mapping[str, RecordedPhase] recorded: What the ledger holds for each phase.
@@ -270,8 +274,11 @@ def _refuse_as_a_launch_would(
     :raises PublicationIntegrityError: The last publication no longer validates.
     :raises ArtifactRootConflictError: A study publishes into another artifact root, or
         holds trials without recording one.
+    :raises LaunchEnvironmentError: A reached phase cannot start its trials.
     :raises StudySchemaMismatchError: A study's direction differs from the
         config's, or its failure-policy state is malformed.
+    :raises StudyFingerprintMismatchError: A reached study recorded another config, or its
+        trials ran under another trainer environment.
     :raises TrialTargetRefusedError: A study already accepted a higher target
         than its phase requests, or a fixed configuration asks for more
         attempts than it may retry.
@@ -282,26 +289,36 @@ def _refuse_as_a_launch_would(
     _check_published_phase_studies(experiment, studies, from_phase=from_phase)
     for bound_study in studies.values():
         _artifact_root_claim_needed(bound_study, experiment)
+    resume_ops._preflight_missing_reached_phase_environments(
+        experiment, studies, from_phase=from_phase
+    )
     errors: list[Exception] = []
-    reached = from_phase is None
+    checked: dict[str, optuna.Study] = {}
     for phase in experiment.phases:
-        if phase.name == from_phase:
-            reached = True
         study = studies.get(phase.name)
         if study is None:
             continue
-        record = recorded[phase.name]
         try:
             _validate_study_direction(study, experiment.metric.goal)
             _validate_study_schema(study)
-            if reached and record.running:
-                _validate_fixed_configuration_target(
-                    phase, finished=record.finished, measured=record.measured, has_study=True
-                )
-            elif reached:
-                _validate_trial_target(study, phase)
         except Exception as exc:
             errors.append(exc)
+        else:
+            checked[phase.name] = study
+    reached = [
+        ReachedStudy(
+            phase,
+            checked[phase.name],
+            predicted=(
+                (recorded[phase.name].finished, recorded[phase.name].measured)
+                if recorded[phase.name].running
+                else None
+            ),
+        )
+        for _index, phase in experiment.phases_from(from_phase)
+        if phase.name in checked
+    ]
+    errors.extend(_reached_study_refusals(experiment, reached))
     _raise_collected_errors(errors)
     settled = {name: study for name, study in studies.items() if not recorded[name].running}
     resume_ops._reject_bound_descendant_topups(
@@ -353,8 +370,9 @@ def _preview_phase(
         for phases earlier in the chain.
     :param RecordedPhase | None recorded: What the ledger holds for the phase,
         or ``None`` when that could not be read and the phase previews as fresh.
-    :raises PhaseSweepError: A launch would refuse the phase's recorded state, or its
-        launch preflight (:func:`phasesweep.engine.study_policy._launch_preflight`) refuses.
+    :raises PhaseSweepError: A launch would refuse the phase's recorded state, or, for a phase
+        previewed fresh from an unreadable ledger, its launch preflight
+        (:func:`phasesweep.engine.study_policy._launch_preflight`) refuses.
     :return PhasePreview: The winner a replay would publish or a placeholder, the
         trials a launch would run, and whether the phase replays.
     """
@@ -374,8 +392,9 @@ def _preview_phase(
                 recorded.study, experiment, phase, inherited_winners
             )
         else:
-            log.warning(
-                "DRY RUN warning: phase=%s fingerprint comparison awaits the inherited "
+            # Its own config was compared before any phase previewed (_reached_study_refusals).
+            warn_dry_run(
+                "phase=%s comparison of its inherited values awaits the parent "
                 "winner whose values are placeholders",
                 phase.name,
             )
@@ -411,19 +430,18 @@ def _preview_phase(
         logger=log,
     )
     if recorded is None:
-        log.warning(
-            "DRY RUN warning: phase=%s recorded trials could not be read, so it is "
+        warn_dry_run(
+            "phase=%s recorded trials could not be read, so it is "
             "previewed as a fresh phase; a real run refuses a ledger it cannot read",
             phase.name,
         )
     elif recorded.running:
-        log.warning(
-            "DRY RUN warning: phase=%s has %d RUNNING attempt(s) that a real run recovers "
-            "before it checks the phase, as failed where the trial recorded a failure and "
-            "otherwise as interrupted, which reruns; they are counted that way, and its "
-            "accepted target, abort state and partial decision are not checked",
+        warn_dry_run(
+            "phase=%s has %s, counted the way a real run recovers RUNNING attempts (failed "
+            "if the trial recorded a failure, otherwise interrupted and rerun); its accepted "
+            "target, abort state and partial decision are not checked",
             phase.name,
-            recorded.running,
+            plural(recorded.running, "RUNNING attempt"),
         )
     if remaining == 0:
         log.info(
@@ -440,8 +458,11 @@ def _preview_phase(
                 experiment, phase, inherited_winners, study, resume, verify_evidence=False
             )
         return PhasePreview(winner=winner, launches=0, reruns=0, replays=True)
-    # Recovery keeps each RUNNING attempt's environment, so the snapshot's cohort is the launch's.
-    _launch_preflight(experiment, phase.name, None if recorded is None else recorded.study)
+    if recorded is None:
+        # A readable ledger had every reached phase's launch preflighted before any phase
+        # previewed (_refuse_as_a_launch_would); one previewed fresh from an unreadable ledger
+        # gets it here.
+        _launch_preflight(experiment, phase.name, None)
     GpuPool.for_phase(phase, cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"))
     winner = _dry_run_phase(
         experiment,
@@ -555,18 +576,8 @@ def _dry_run_phase(
     :return Winner: A placeholder built from the previewed sample, with the repeat key
         omitted, so downstream dry-run previews see consistent inherited context.
     """
-    of_them = ""
-    if reruns == 1:
-        of_them = ", 1 of them a rerun"
-    elif reruns:
-        of_them = f", {reruns} of them reruns"
-    log.info(
-        "DRY RUN phase=%s would launch %d %s%s",
-        phase.name,
-        remaining,
-        "trial" if remaining == 1 else "trials",
-        of_them,
-    )
+    of_them = f", {rerun_clause(reruns)}" if reruns else ""
+    log.info("DRY RUN phase=%s would launch %s%s", phase.name, plural(remaining, "trial"), of_them)
     sample_trial = study.ask()
     sampled: dict[str, object] = {
         name: _suggest(sample_trial, name, p) for name, p in sampler_search_space(phase).items()

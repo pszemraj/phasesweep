@@ -21,15 +21,8 @@ from phasesweep.errors import OperatorAction, PhaseSweepError
 
 log = logging.getLogger("phasesweep.runtime.files")
 
-SUPPORTED_RUNTIME_ERROR = (
-    "phasesweep runs on Linux and macOS, and this host reports {platform!r}. It requires "
-    "kernel process identities, fcntl.flock host locks and POSIX process groups."
-)
+SUPPORTED_RUNTIME_ERROR = "phasesweep runs on Linux and macOS, and this host reports {platform!r}."
 _LOCK_DIR_ENV = "PHASESWEEP_LOCK_DIR"
-_LOCK_ACCESS_GUIDANCE = (
-    "Use the same writable PHASESWEEP_LOCK_DIR for every shell, MCP server, and sandbox "
-    "launching work on this host; provision that directory before setting it."
-)
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 SHARED_DIR_MODE = 0o3770
@@ -193,7 +186,7 @@ def lock_dir(*, create: bool = True) -> Path:
             _lock_policy(path)
         except OSError as exc:
             raise UnsafeLockPathError(
-                f"Cannot access lock directory {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}",
+                f"Cannot access lock directory {_lock_dir_name(path)}: {exc}",
                 action=OperatorAction.PROVISION_LOCK_DIR,
             ) from exc
         return path
@@ -226,7 +219,7 @@ def lock_dir(*, create: bool = True) -> Path:
         raise UnsafeLockPathError(f"Default lock directory is unsafe: {exc}") from exc
     except OSError as exc:
         raise UnsafeLockPathError(
-            f"Cannot create or access default lock directory {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}",
+            f"Cannot create or access default lock directory {path}: {exc}",
             action=OperatorAction.PROVISION_LOCK_DIR,
         ) from exc
     return path
@@ -251,23 +244,46 @@ def _lock_policy(path: Path) -> _LockPolicy:
         fd = open_directory_fd(path, create=False, private_final=False)
     except FileNotFoundError as exc:
         raise UnsafeLockPathError(
-            f"Lock directory {path} does not exist; provision it before setting {_LOCK_DIR_ENV}.",
+            f"Lock directory {_lock_dir_name(path)} does not exist.",
             action=OperatorAction.PROVISION_LOCK_DIR,
-            remediation=(
-                f"For an owner-only lock directory, run `mkdir -p -m 700 {shlex.quote(str(path))}`. "
-                f"Use the same {_LOCK_DIR_ENV} in every shell, MCP server, and sandbox "
-                "launching work on this host."
-            ),
+            remediation=f"Create it with `mkdir -p -m 700 {shlex.quote(str(path))}`.",
         ) from exc
     except UnsafePrivatePathError as exc:
         raise UnsafeLockPathError(
-            f"Lock directory {path} has an unsafe path component: {exc}",
+            _lock_dir_refusal(path, exc),
             action=OperatorAction.PROVISION_LOCK_DIR,
         ) from exc
     try:
         return _lock_policy_for_info(path, os.fstat(fd))
     finally:
         os.close(fd)
+
+
+def _lock_dir_name(path: Path) -> str:
+    """Name a lock directory in a refusal, with the variable that selected it when one did.
+
+    :param Path path: The lock directory.
+    :return str: ``path``, followed by ``(PHASESWEEP_LOCK_DIR)`` when that variable holds it.
+    """
+    override = os.environ.get(_LOCK_DIR_ENV)
+    return f"{path} ({_LOCK_DIR_ENV})" if override and Path(override) == path else str(path)
+
+
+def _lock_dir_refusal(path: Path, exc: UnsafePrivatePathError) -> str:
+    """Word the refusal of the walk to a lock directory, naming the directory once.
+
+    The walk names the component it stopped at. When that is the lock directory itself, the
+    refusal speaks of the directory and does not repeat its path.
+
+    :param Path path: The lock directory.
+    :param UnsafePrivatePathError exc: The walk's refusal.
+    :return str: The refusal, with the component named when it is a parent of ``path``.
+    """
+    name = f"Lock directory {_lock_dir_name(path)}"
+    problem = str(exc).removeprefix(_component_subject(path))
+    if problem != str(exc):
+        return f"{name}{problem}"
+    return f"{name}: {exc}"
 
 
 def _lock_policy_for_info(path: Path, info: os.stat_result) -> _LockPolicy:
@@ -287,7 +303,9 @@ def _lock_policy_for_info(path: Path, info: os.stat_result) -> _LockPolicy:
         owner/mode does not match either the private or shared policy.
     """
     if not stat.S_ISDIR(info.st_mode):
-        raise UnsafeLockPathError(f"Lock directory {path} must be a real directory, not a symlink.")
+        raise UnsafeLockPathError(
+            f"Lock directory {_lock_dir_name(path)} must be a real directory, not a symlink."
+        )
 
     mode = stat.S_IMODE(info.st_mode)
     euid = os.geteuid()
@@ -299,9 +317,9 @@ def _lock_policy_for_info(path: Path, info: os.stat_result) -> _LockPolicy:
         return _LockPolicy(True, info.st_uid, info.st_gid, SHARED_FILE_MODE)
 
     raise UnsafeLockPathError(
-        f"Unsafe lock directory {path}: found uid {info.st_uid}, gid {info.st_gid}, and mode "
-        f"{mode:04o}. Expected owner-only mode 0700 owned by uid {euid}, or an "
-        "administrator-owned shared directory with mode 03770 and an accessible group.",
+        f"Unsafe lock directory {_lock_dir_name(path)}: found uid {info.st_uid}, gid {info.st_gid}, mode "
+        f"{mode:04o}. Expected mode 0700 owned by uid {euid}, or mode 03770 owned by root "
+        "in a group you belong to.",
         remediation=(
             f"For an owner-only lock directory, run `chmod 700 {shlex.quote(str(path))}`."
             if info.st_uid == euid
@@ -331,7 +349,7 @@ def open_lock_file(path: Path) -> IO[str]:
             return _open_lock_file(path)
         except OSError as exc:
             raise UnsafeLockPathError(
-                f"Cannot open lock file {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}",
+                f"Cannot open lock file {path}: {exc}",
                 action=OperatorAction.PROVISION_LOCK_DIR,
             ) from exc
 
@@ -353,8 +371,12 @@ def _open_lock_file(path: Path) -> IO[str]:
     require_supported_runtime()
     try:
         parent_fd = open_directory_fd(path.parent, create=False, private_final=False)
-    except (FileNotFoundError, UnsafePrivatePathError) as exc:
-        raise UnsafeLockPathError(f"Lock directory {path.parent} is not safe to open.") from exc
+    except UnsafePrivatePathError as exc:
+        raise UnsafeLockPathError(_lock_dir_refusal(path.parent, exc)) from exc
+    except FileNotFoundError as exc:
+        raise UnsafeLockPathError(
+            f"Lock directory {_lock_dir_name(path.parent)} is not safe to open: {exc}"
+        ) from exc
     try:
         policy = _lock_policy_for_info(path.parent, os.fstat(parent_fd))
         try:
@@ -609,6 +631,34 @@ def open_directory_fd(
     return result_fd
 
 
+def _private_component_error(
+    component_path: Path, cause: OSError | None = None
+) -> UnsafePrivatePathError:
+    """Build the refusal for a private path component that fails the real-directory walk.
+
+    :param Path component_path: The component, as an absolute path.
+    :param OSError | None cause: The OS error that stopped the walk, if one did; a component
+        that is simply not a directory has none.
+    :return UnsafePrivatePathError: The refusal to raise, with the OS error text when there is one.
+    """
+    if cause is None:
+        return UnsafePrivatePathError(
+            f"{_component_subject(component_path)} is not a real directory."
+        )
+    return UnsafePrivatePathError(
+        f"{_component_subject(component_path)} cannot be accessed: {cause}"
+    )
+
+
+def _component_subject(component_path: Path) -> str:
+    """Name a private path component as the subject of a refusal sentence.
+
+    :param Path component_path: The component, as an absolute path.
+    :return str: The subject every component refusal starts with.
+    """
+    return f"Private path component {component_path}"
+
+
 def _walk_directory_fd(
     path: Path,
     *,
@@ -653,32 +703,22 @@ def _walk_directory_fd(
                 try:
                     before = os.stat(component, dir_fd=current_fd, follow_symlinks=False)
                 except OSError as exc:
-                    raise UnsafePrivatePathError(
-                        f"Private path component {component_path} is not a real directory."
-                    ) from exc
+                    raise _private_component_error(component_path, exc) from exc
             except OSError as exc:
-                raise UnsafePrivatePathError(
-                    f"Private path component {component_path} is not a real directory."
-                ) from exc
+                raise _private_component_error(component_path, exc) from exc
             if stat.S_ISLNK(before.st_mode):
-                raise UnsafePrivatePathError(
-                    f"Private path component {component_path} is a symlink."
-                )
+                raise UnsafePrivatePathError(f"{_component_subject(component_path)} is a symlink.")
             if not stat.S_ISDIR(before.st_mode):
-                raise UnsafePrivatePathError(
-                    f"Private path component {component_path} is not a real directory."
-                )
+                raise _private_component_error(component_path)
             try:
                 next_fd = os.open(component, flags, dir_fd=current_fd)
             except OSError as exc:
-                raise UnsafePrivatePathError(
-                    f"Private path component {component_path} is not a real directory."
-                ) from exc
+                raise _private_component_error(component_path, exc) from exc
             after = os.fstat(next_fd)
             if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
                 os.close(next_fd)
                 raise UnsafePrivatePathError(
-                    f"Private path component {component_path} changed while it was opened."
+                    f"{_component_subject(component_path)} changed while it was opened."
                 )
             # Signals remain deferred through this ownership transfer. Assign first so a
             # close failure cannot make finally close the old descriptor again.

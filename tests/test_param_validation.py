@@ -115,7 +115,7 @@ def test_numeric_config_fields_reject_yaml_booleans(
 )
 def test_int_param_rejects_bounds_optuna_cannot_round_trip(low: int, high: int) -> None:
     """Numeric integer domains must survive Optuna's float representation."""
-    with pytest.raises(ValidationError, match="round-trip exactly through Optuna"):
+    with pytest.raises(ValidationError, match=r"must stay within \[-9007199254740992, "):
         IntParam(type="int", low=low, high=high)
 
 
@@ -252,7 +252,7 @@ def test_validate_rejects_invalid_grid_configs() -> None:
             "over_budget",
             {"x": {"type": "categorical", "choices": [1, 2]}},
             3,
-            "n_trials=3 exceeds the grid cardinality 2",
+            r"n_trials=3 exceeds the grid cardinality 2\. Set phases\[p\]\.n_trials to at most 2\.",
         ),
     ]
 
@@ -696,7 +696,6 @@ def test_trial_command_rejects_format_specs_and_conversions(placeholder: str) ->
     message = str(caught.value)
     assert "placeholders take no format spec or conversion" in message
     assert placeholder in message
-    assert "$(printf '%05d' {trial_id})" in message
     assert "unbalanced braces" not in message
 
 
@@ -707,7 +706,8 @@ def test_trial_command_reports_all_formatted_placeholders() -> None:
     assert "{phase!r}" in str(caught.value)
 
 
-def test_trial_command_missing_placeholder_names_repeat_overrides() -> None:
+def test_trial_command_of_a_repeats_only_phase_needs_the_overrides_placeholder() -> None:
+    """A phase whose only input is its repeat key still must reference ``{overrides}``."""
     with pytest.raises(ValueError) as caught:
         make_experiment(
             trial_command="echo",
@@ -720,8 +720,7 @@ def test_trial_command_missing_placeholder_names_repeat_overrides() -> None:
                 )
             ],
         )
-    assert "repeat overrides" in str(caught.value)
-    assert "repeat parameters" in str(caught.value)
+    assert "does not reference {overrides}" in str(caught.value)
 
 
 def test_invalid_trainer_config_is_not_misreported_as_a_command_template_error() -> None:

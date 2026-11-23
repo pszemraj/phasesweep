@@ -273,11 +273,11 @@ def test_mcp_call_serves_the_entries_that_load_when_one_fails(tmp_path: Path) ->
     assert payload["catalog_status"]["reload_refusal"] == "invalid"
     assert payload["experiments"][0]["capabilities"]["launch"] is False
     assert payload["catalog_status"]["remediation"].startswith(
-        "catalog entry 'srv' failed to load, so this server refuses launches of every experiment, "
-        "showing `launch: false` for each,"
+        "catalog entry 'srv' failed to load, so launches and inspection of a changed config "
+        "are refused until"
     )
     assert result.stderr.startswith("phasesweep mcp: 'srv': storage must be persistent")
-    assert "\nfix: use a persistent local ledger" in result.stderr
+    assert "\nfix: set storage: auto" in result.stderr
 
 
 def test_mcp_call_catalog_level_error_exits_2(tmp_path: Path) -> None:

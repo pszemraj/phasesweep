@@ -26,7 +26,7 @@ from phasesweep.engine.locking import (
     experiment_is_busy,
 )
 from phasesweep.engine.run import run_experiment
-from phasesweep.errors import PhaseSweepError
+from phasesweep.errors import PhaseSweepError, operator_step
 from phasesweep.runtime import files as runtime_files
 from tests.conftest import (
     make_experiment,
@@ -52,7 +52,9 @@ def test_busy_probe_observes_run_locks_without_creating_paths(
         assert {path: path.read_bytes() for path in home.rglob("*") if path.is_file()} == before
         with pytest.raises(ExperimentLockBusyError) as busy, _experiment_lock(experiment):
             pytest.fail("the probe released the live operation's locks")
-        assert "finish, then retry the same command" in str(busy.value.remediation)
+        assert busy.value.remediation == (
+            "Wait for the process that holds this experiment's lock to finish, then retry."
+        )
         assert "MCP" not in str(busy.value.remediation)
         assert "only if the user" not in str(busy.value.remediation)
     assert not experiment_is_busy(experiment)
@@ -107,14 +109,11 @@ def test_run_lock_held_past_the_retry_window_is_refused_as_busy(tmp_path: Path) 
 
     assert time.monotonic() - started >= locking._PROBE_OUTLAST_SECONDS
     assert busy.value.args[0] == (
-        "Another phasesweep process appears to be using the same experiment backend or "
-        f"output namespace for {experiment.experiment!r} (lock file: {path}). phasesweep "
-        "supports one active orchestrator per experiment output namespace and per "
-        "persistent storage identity."
+        f"Another phasesweep process holds the lock experiment {experiment.experiment!r} needs "
+        f"(lock file: {path})."
     )
     assert busy.value.remediation == (
-        "Wait for the other PhaseSweep operation using this experiment output or storage "
-        "namespace to finish, then retry the same command."
+        "Wait for the process that holds this experiment's lock to finish, then retry."
     )
 
 
@@ -316,8 +315,9 @@ def test_lock_directory_os_failure_is_actionable(
     assert caught.value.__cause__ is denied
     assert str(lock_root) in str(caught.value)
     assert "Permission denied" in str(caught.value)
-    assert "PHASESWEEP_LOCK_DIR" in str(caught.value)
-    assert "same writable" in str(caught.value)
+    # The routed step carries the shared-directory rule once; the message states what failed.
+    assert "PHASESWEEP_LOCK_DIR" in operator_step(caught.value)
+    assert "shared by every shell" in operator_step(caught.value)
     assert not lock_root.exists()
 
 
@@ -337,8 +337,8 @@ def test_lock_file_os_failure_is_actionable(
 
     assert caught.value.__cause__ is denied
     assert str(lock_path) in str(caught.value)
-    assert "PHASESWEEP_LOCK_DIR" in str(caught.value)
-    assert "same writable" in str(caught.value)
+    assert "Permission denied" in str(caught.value)
+    assert "PHASESWEEP_LOCK_DIR" in operator_step(caught.value)
     assert not lock_path.exists()
 
 
@@ -379,13 +379,16 @@ def test_lock_dir_rejects_missing_or_unsafe_override(
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
     with pytest.raises(runtime_files.UnsafeLockPathError, match="does not exist") as missing:
         runtime_files.lock_dir()
+    assert f"Lock directory {override} (PHASESWEEP_LOCK_DIR) does not exist." == str(missing.value)
     assert f"`mkdir -p -m 700 '{override}'`" in (missing.value.remediation or "")
     assert not override.exists()
 
     override.write_text("")
     with pytest.raises(runtime_files.UnsafeLockPathError) as caught:
         runtime_files.lock_dir()
-    assert f"{override} is not a real directory" in str(caught.value)
+    assert f"Lock directory {override} (PHASESWEEP_LOCK_DIR) is not a real directory." == str(
+        caught.value
+    )
     assert caught.value.action.value == "provision_lock_dir"
     override.unlink()
 
@@ -396,12 +399,49 @@ def test_lock_dir_rejects_missing_or_unsafe_override(
     ) as wrong_mode:
         runtime_files.lock_dir()
     assert "mode 0750" in str(wrong_mode.value)
+    assert f"Unsafe lock directory {override} (PHASESWEEP_LOCK_DIR):" in str(wrong_mode.value)
     assert (
         wrong_mode.value.remediation
         == f"For an owner-only lock directory, run `chmod 700 '{override}'`."
     )
     assert stat.S_IMODE(override.stat().st_mode) == 0o750
     assert issubclass(runtime_files.UnsafeLockPathError, PhaseSweepError)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens any directory")
+def test_a_path_component_the_os_refuses_to_open_names_the_os_error(tmp_path: Path) -> None:
+    """A permission failure on a private path component says so rather than 'not a real directory'."""
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    blocked.chmod(0)
+    try:
+        with pytest.raises(runtime_files.UnsafePrivatePathError) as caught:
+            runtime_files.open_directory_fd(blocked / "inner", create=False, private_final=False)
+    finally:
+        blocked.chmod(0o700)
+
+    assert f"Private path component {blocked} cannot be accessed" in str(caught.value)
+    assert "Permission denied" in str(caught.value)
+    assert isinstance(caught.value.__cause__, PermissionError)
+
+
+def test_a_lock_directory_under_a_symlinked_parent_names_the_parent_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal names the lock directory and the parent that fails, each once, and the variable."""
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    (tmp_path / "linked").symlink_to(real, target_is_directory=True)
+    override = tmp_path / "linked" / "locks"
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
+
+    with pytest.raises(runtime_files.UnsafeLockPathError) as caught:
+        runtime_files.lock_dir()
+
+    assert str(caught.value) == (
+        f"Lock directory {override} (PHASESWEEP_LOCK_DIR): "
+        f"Private path component {tmp_path / 'linked'} is a symlink."
+    )
 
 
 def test_lock_open_rejects_symlink_before_gpu_diagnostics_write(
@@ -942,7 +982,7 @@ def test_run_lock_collides_for_different_storage_same_output_dir(
 
     with (  # testing that the inner enter raises
         _experiment_lock(exp_a),
-        pytest.raises(RuntimeError, match="output namespace|backend"),
+        pytest.raises(RuntimeError, match=r"lock file: .*__output__"),
         _experiment_lock(exp_b),
     ):
         pass

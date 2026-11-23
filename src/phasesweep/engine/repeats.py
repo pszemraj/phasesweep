@@ -34,9 +34,42 @@ REDUCERS: tuple[ReduceName, ...] = get_args(ReduceName)
 RepeatValue: TypeAlias = str | int | float | bool | None
 """One value of the repeat axis, such as a seed."""
 
-# Groups whose aggregates differ by at most this many combined standard errors
-# are flagged as within noise of each other.
-_NOISE_STANDARD_ERRORS = 2.0
+# Two-sided 5% critical values of Student's t for 1 to 30 degrees of freedom. Past the table,
+# t_critical adds the first term of the expansion of t about the normal value, which stays
+# within 0.15% of t from 31 degrees of freedom on and meets the table without a step.
+_T_CRITICAL = (
+    12.706205,
+    4.302653,
+    3.182446,
+    2.776445,
+    2.570582,
+    2.446912,
+    2.364624,
+    2.306004,
+    2.262157,
+    2.228139,
+    2.200985,
+    2.178813,
+    2.160369,
+    2.144787,
+    2.131450,
+    2.119905,
+    2.109816,
+    2.100922,
+    2.093024,
+    2.085963,
+    2.079614,
+    2.073873,
+    2.068658,
+    2.063899,
+    2.059539,
+    2.055529,
+    2.051831,
+    2.048407,
+    2.045230,
+    2.042272,
+)
+_NORMAL_CRITICAL = 1.959964
 
 _REPEATS_KEYS = frozenset({"key", "reduce", "spread", "members"})
 _SPREAD_KEYS = ("n", "mean", "sd", "min", "max")
@@ -126,6 +159,7 @@ class RankedGroup:
 
     numbers: tuple[int, ...]
     params: Mapping[str, object]
+    reduce: ReduceName
     aggregate: float
     spread: RepeatSpread
 
@@ -136,6 +170,48 @@ class RankedGroup:
         :return int: The last member's trial number.
         """
         return self.numbers[-1]
+
+
+@dataclass(frozen=True)
+class NoiseBand:
+    """Run-to-run spread pooled over the groups one selection ranked, for comparing their means.
+
+    ``pooled_sd`` is the square root of the groups' sample variances weighted by each group's
+    ``n - 1``, and ``df``, the sum of those weights, is its degrees of freedom. Pooling assumes
+    run-to-run noise is about the same size at every configuration in the phase; it then gives
+    one estimate on ``df`` degrees of freedom instead of one per group of two or three seeds.
+    """
+
+    pooled_sd: float
+    df: int
+
+    def standard_error(self, first: RankedGroup, second: RankedGroup) -> float:
+        """Return the standard error of the difference between two group means.
+
+        :param RankedGroup first: One ranked group.
+        :param RankedGroup second: Another ranked group.
+        :return float: ``pooled_sd * sqrt(1/n_first + 1/n_second)``.
+        """
+        return self.pooled_sd * math.sqrt(1 / first.spread["n"] + 1 / second.spread["n"])
+
+    def threshold(self, first: RankedGroup, second: RankedGroup) -> float:
+        """Return the largest gap between two group means that the noise explains.
+
+        :param RankedGroup first: One ranked group.
+        :param RankedGroup second: Another ranked group.
+        :return float: The two-sided 5% Student-t critical value at ``df`` times
+            :meth:`standard_error`.
+        """
+        return t_critical(self.df) * self.standard_error(first, second)
+
+    def within(self, winner: RankedGroup, other: RankedGroup) -> bool:
+        """Say whether two group means differ by no more than the noise explains.
+
+        :param RankedGroup winner: The winning group.
+        :param RankedGroup other: Another ranked group.
+        :return bool: Whether the gap is at most :meth:`threshold`.
+        """
+        return abs(winner.aggregate - other.aggregate) <= self.threshold(winner, other)
 
 
 @dataclass(frozen=True)
@@ -255,6 +331,52 @@ def group_labels_for(trials: Sequence[FrozenTrial], axis: RepeatAxis | None) -> 
     return {number: last[key] for number, key in keyed.items()}
 
 
+def configuration_slot(
+    position: int, params: Mapping[str, object], axis: RepeatAxis | None
+) -> tuple[str, str] | None:
+    """Key params by the configuration they measure and the slot they fill in it.
+
+    Without a repeat axis a configuration is its params, with one slot: every attempt at
+    those params, a retried grid cell or a fixed configuration's next attempt, measures the
+    same thing. With one, the configuration is the repeat group (:func:`group_key`) and each
+    repeat value is a slot.
+
+    :param int position: The trial's draw position; a grid cell's is ignored, because only
+        seeded random keys its groups by position.
+    :param Mapping[str, object] params: Recorded params, or a grid cell.
+    :param RepeatAxis | None axis: Configured repeat axis, or ``None`` without repeats.
+    :return tuple[str, str] | None: ``(configuration, slot)``, or ``None`` for params that
+        never recorded the repeat key.
+    """
+    if axis is None:
+        key = json.dumps(dict(params), sort_keys=True)
+        return key, key
+    if axis.key not in params:
+        return None
+    return group_key(position, params, axis), json.dumps(params[axis.key])
+
+
+def configuration_slots(
+    trials: Sequence[FrozenTrial], axis: RepeatAxis | None
+) -> dict[int, tuple[str, str]]:
+    """Key each trial by the configuration it measures and the slot it fills in it.
+
+    :param Sequence[FrozenTrial] trials: Every trial of one phase study.
+    :param RepeatAxis | None axis: Configured repeat axis, or ``None`` without repeats.
+    :return dict[int, tuple[str, str]]: :func:`configuration_slot` keys by trial number,
+        leaving out trials that never recorded the repeat key.
+    """
+    from phasesweep.engine.optuna import _draw_positions
+
+    positions = _draw_positions(trials)
+    slots: dict[int, tuple[str, str]] = {}
+    for trial in trials:
+        keys = configuration_slot(positions[trial.number], trial.params, axis)
+        if keys is not None:
+            slots[trial.number] = keys
+    return slots
+
+
 def reduce_values(values: Sequence[float], reduce: ReduceName) -> float:
     """Combine member metrics into the value a group ranks by.
 
@@ -299,33 +421,46 @@ def ranked_group(
     return RankedGroup(
         numbers=tuple(number for number, _ in ordered),
         params=dict(params),
+        reduce=reduce,
         aggregate=reduce_values(values, reduce),
         spread=spread(values),
     )
 
 
-def within_noise(winner: RankedGroup, other: RankedGroup) -> bool:
-    """Say whether two groups' aggregates differ by no more than their noise.
+def t_critical(df: int) -> float:
+    """Return the two-sided 5% critical value of Student's t.
 
-    The threshold of two combined standard errors applies to the median reducer as well.
-
-    :param RankedGroup winner: The winning group.
-    :param RankedGroup other: Another ranked group.
-    :return bool: Whether the aggregates differ by at most two combined standard errors.
+    :param int df: Degrees of freedom, at least 1.
+    :raises ValueError: ``df`` is below 1, which no ranked group of two or more members gives.
+    :return float: The tabulated value for 1 to 30 degrees of freedom; above, the normal value
+        ``z`` plus the first correction, ``z + (z**3 + z) / (4 * df)``, which tends to ``z``.
     """
-    error = combined_standard_error(winner, other)
-    return abs(winner.aggregate - other.aggregate) <= _NOISE_STANDARD_ERRORS * error
+    if df < 1:
+        raise ValueError(f"Student's t needs at least one degree of freedom, not {df}")
+    if df <= len(_T_CRITICAL):
+        return _T_CRITICAL[df - 1]
+    z = _NORMAL_CRITICAL
+    return z + (z**3 + z) / (4 * df)
 
 
-def combined_standard_error(first: RankedGroup, second: RankedGroup) -> float:
-    """Return the combined standard error used by the repeat-group noise heuristic.
+def noise_band(groups: Sequence[RankedGroup]) -> NoiseBand | None:
+    """Pool the run-to-run spread of every group one selection ranked.
 
-    :param RankedGroup first: First complete group's sample statistics.
-    :param RankedGroup second: Second complete group's sample statistics.
-    :return float: Square root of the summed variances of their sample means.
+    The band compares group means: a median's sampling spread depends on the distribution
+    of the member metrics, which two or three seeds cannot show, so groups ranked by their
+    median get no band.
+
+    :param Sequence[RankedGroup] groups: Every complete group of the ranked population.
+    :raises ValueError: ``groups`` is empty.
+    :return NoiseBand | None: The pooled spread, or ``None`` for groups ranked by median.
     """
-    a, b = first.spread, second.spread
-    return math.sqrt(a["sd"] ** 2 / a["n"] + b["sd"] ** 2 / b["n"])
+    if not groups:
+        raise ValueError("a noise band needs at least one ranked group")
+    if any(group.reduce != "mean" for group in groups):
+        return None
+    df = sum(group.spread["n"] - 1 for group in groups)
+    pooled = sum((group.spread["n"] - 1) * group.spread["sd"] ** 2 for group in groups)
+    return NoiseBand(pooled_sd=math.sqrt(pooled / df), df=df)
 
 
 def observed_means(members: Sequence[Mapping[str, float]]) -> dict[str, float]:

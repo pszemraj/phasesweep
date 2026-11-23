@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
+import shlex
+import signal
+import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -14,16 +19,18 @@ from phasesweep.engine.attempts import _retire_active_attempt
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
 from phasesweep.engine.paths import _attempts_dir
 from phasesweep.engine.state import CLEANUP_CONFIRMED_ATTR, TRIAL_DIR_ATTR
-from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
+from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
+from phasesweep.runtime import shutdown
 from phasesweep.runtime.json import JsonObject
+from phasesweep.runtime.shutdown import signal_name
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
-from phasesweep.tracking.mlflow import OperationUnavailableError
+from phasesweep.tracking.mlflow import OperationRejectedError, OperationUnavailableError
 from phasesweep.tracking.session import read_record, tracking_root
-from tests.conftest import write_experiment_config
+from tests.conftest import invoke_cli_boundary, write_experiment_config
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     make_mcp_app,
@@ -35,6 +42,7 @@ from tests.mcp_helpers import (
 from tests.recovery_helpers import recover_run_cli
 from tests.tracking_helpers import (
     RunnerKilled,
+    hang_uploads_until_killed,
     killed_sweep,
     leak_tracking_worker,
     leave_cleanup_uncertain_attempt,
@@ -43,7 +51,7 @@ from tests.tracking_helpers import (
 
 _RUN_ID = "mcp-recovered-run"
 _SENDING_RUN_ID = "mcp-sending-run"
-_PENDING_STEP = "`phasesweep sync-tracking CONFIG`"
+_PENDING_STEP = "`phasesweep sync-tracking"
 
 
 class _RecoveredRun:
@@ -202,6 +210,37 @@ def _logged_requests(monkeypatch: pytest.MonkeyPatch, *, down: bool) -> list[str
     return requests
 
 
+def _recover_after_a_silent_preview(
+    run: _RecoveredRun, monkeypatch: pytest.MonkeyPatch, *, delivered: str
+) -> list[str]:
+    """Preview recover-run, then confirm it, and check what the confirmation leaves behind.
+
+    A preview writes and sends nothing. The confirmed run delivers ``delivered`` and leaves
+    nothing pending, no recovery required and no delivery remedy.
+
+    :param str delivered: The record count the confirmed run reports, such as ``1 record``.
+    :return list[str]: The MLflow request actions of the confirmed run, in order.
+    """
+    requests = _logged_requests(monkeypatch, down=False)
+    root = tracking_root(run.experiment)
+    before = sorted(root.rglob("*"))
+
+    preview = run.recover(confirm=False)
+
+    assert preview.exit_code == 0, preview.output
+    assert (requests, sorted(root.rglob("*"))) == ([], before)
+
+    confirmed = run.recover()
+
+    assert confirmed.exit_code == 0, confirmed.output
+    assert f"MLflow: delivered {delivered}; none stay pending." in confirmed.output
+    assert _PENDING_STEP not in confirmed.output
+    assert not run.store.observe(run.handle).recovery_required
+    delivery = run.app.status(_RUN_ID)["tracking_delivery"]
+    assert (delivery["pending"], delivery["remedy"]) == (0, None)
+    return requests
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("source", ["running", "uncertain-registered", "uncertain-retired"])
 def test_recover_run_finishes_the_mlflow_run_of_each_trial_it_settles(
@@ -225,29 +264,14 @@ def test_recover_run_finishes_the_mlflow_run_of_each_trial_it_settles(
         run.uploads.clear()
         assert publication.sync_tracking(run.experiment, _RUN_ID) == {"pending": 0, "delivered": 1}
         assert (run.sent(), run.summaries()) == ([], [finish])
-    requests = _logged_requests(monkeypatch, down=False)
-    root = tracking_root(run.experiment)
-    before = sorted(root.rglob("*"))
-
-    preview = run.recover(confirm=False)
-
-    assert preview.exit_code == 0, preview.output
-    assert (requests, sorted(root.rglob("*"))) == ([], before)
-
-    confirmed = run.recover()
-
-    assert confirmed.exit_code == 0, confirmed.output
     sends = 2 if source == "running" else 1
+
+    requests = _recover_after_a_silent_preview(
+        run, monkeypatch, delivered="1 record" if sends == 1 else f"{sends} records"
+    )
+
     assert requests == ["resolve"] + ["publish"] * sends
     assert (run.sent(), run.summaries()) == ([finish], [finish])
-    assert (
-        f"Delivered {sends} MLflow outcome(s) of the recovered trials and generations; none stay "
-        "pending." in confirmed.output
-    )
-    assert _PENDING_STEP not in confirmed.output
-    assert not run.store.observe(run.handle).recovery_required
-    delivery = run.app.status(_RUN_ID)["tracking_delivery"]
-    assert (delivery["pending"], delivery["remedy"]) == (0, None)
     read = read_phase_trials(validate_ledger(run.experiment), "depth")
     [trial] = read.trials
     assert read.cleanup_recovered == {trial.number}
@@ -272,27 +296,11 @@ def test_recover_run_ends_the_summary_run_of_a_run_killed_between_trials(
     """
     run = _killed_run(tmp_path, monkeypatch, in_flight=False)
     run.uploads.clear()
-    requests = _logged_requests(monkeypatch, down=False)
-    root = tracking_root(run.experiment)
-    before = sorted(root.rglob("*"))
 
-    preview = run.recover(confirm=False)
+    requests = _recover_after_a_silent_preview(run, monkeypatch, delivered="1 record")
 
-    assert preview.exit_code == 0, preview.output
-    assert (requests, sorted(root.rglob("*"))) == ([], before)
-
-    confirmed = run.recover()
-
-    assert confirmed.exit_code == 0, confirmed.output
     assert requests == ["resolve", "publish"]
     assert (run.sent(), run.summaries()) == ([], ["KILLED"])
-    assert (
-        "Delivered 1 MLflow outcome(s) of the recovered trials and generations; none stay "
-        "pending." in confirmed.output
-    )
-    assert not run.store.observe(run.handle).recovery_required
-    delivery = run.app.status(_RUN_ID)["tracking_delivery"]
-    assert (delivery["pending"], delivery["remedy"]) == (0, None)
     publication.sync_tracking(run.experiment)
     assert (run.sent(), run.summaries()) == ([], ["KILLED"])
 
@@ -326,8 +334,11 @@ def test_recover_run_distinguishes_a_creation_miss_from_an_upload_failure(
     monkeypatch.setattr(session, "request_operation", lookup)
     result = run.recover()
     assert result.exit_code == 0, result.output
-    assert "Pending uploads: 0. Unconfirmed run creations: 1." in result.output
-    assert _PENDING_STEP in result.output
+    # The summary record went out; the attempt's creation, inside its window, stays unconfirmed.
+    assert (
+        "MLflow: delivered 1 record; 1 unconfirmed run creation pending. Send it with "
+        "`phasesweep sync-tracking CONFIG`." in result.output
+    )
     assert pending.is_file() and not bound.exists()
     assert not run.store.observe(run.handle).recovery_required
 
@@ -352,8 +363,9 @@ def test_recover_run_leaves_outcomes_pending_while_mlflow_is_down(
     assert requests == ["resolve"]
     assert run.sent() == []
     assert read_record(run.record)["state"] == "pending"
-    assert "Pending uploads: 2. Unconfirmed run creations: 0." in confirmed.output
-    assert _PENDING_STEP in confirmed.output
+    assert "MLflow: 2 records pending. Send them with `phasesweep sync-tracking CONFIG`." in (
+        confirmed.output
+    )
     assert not run.store.observe(run.handle).recovery_required
     delivery = run.app.status(_RUN_ID)["tracking_delivery"]
     assert delivery["pending"] == 2
@@ -364,6 +376,56 @@ def test_recover_run_leaves_outcomes_pending_while_mlflow_is_down(
     publication.sync_tracking(run.experiment)
     publication.sync_tracking(run.experiment)
     assert (run.sent(), run.summaries()) == (["KILLED"], ["KILLED"])
+
+
+@pytest.mark.integration
+def test_recover_run_and_mcp_status_say_what_keeps_a_refused_record_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A record MLflow refuses during recover-run stays pending, and recover-run names the refusal.
+
+    MLflow refuses the attempt's outcome, as for a run deleted in MLflow, and accepts the
+    summary run's end. recover-run's line counts both and names the refusal, and its warning
+    is on the console; the run's MCP remedy names the retry.
+    """
+    run = _killed_run(tmp_path, monkeypatch)
+    respond = session.request_operation
+
+    def deleted(request: dict[str, object], **kwargs: object) -> JsonObject:
+        if request["action"] == "publish" and request["name"] == f"attempt-{run.attempt}":
+            raise OperationRejectedError("MLflow run is deleted; restore it, or its experiment.")
+        return respond(request, **kwargs)
+
+    monkeypatch.setattr(session, "request_operation", deleted)
+    monkeypatch.setattr(worker, "request_operation", deleted)
+    run.uploads.clear()
+
+    confirmed = run.recover()
+
+    assert confirmed.exit_code == 0, confirmed.output
+    assert (run.sent(), run.summaries()) == ([], ["KILLED"])
+    assert read_record(run.record)["state"] == "pending"
+    (line,) = [
+        line for line in confirmed.output.splitlines() if line.startswith("MLflow: delivered")
+    ]
+    assert line.startswith(
+        "MLflow: delivered 1 record; 1 record pending. "
+        "Send it with `phasesweep sync-tracking CONFIG`."
+    )
+    assert "MLflow refused 1 record" in line
+    # The refusal's warning is on recover-run's console, labelled and wrapped as a run's is.
+    assert re.search(
+        rf"\d\d:\d\d:\d\d warning: MLflow: attempt record attempt-{run.attempt} of generation "
+        rf"{_RUN_ID} is pending \(MLflow run is deleted;",
+        " ".join(confirmed.stderr.split()),
+    )
+    assert not run.store.observe(run.handle).recovery_required
+    delivery = run.app.status(_RUN_ID)["tracking_delivery"]
+    assert delivery["remedy"] == (
+        "MLflow: 1 record pending for this run; its scores and winners are unaffected. The "
+        f"operator can send it with `phasesweep sync-tracking CONFIG --generation {_RUN_ID}` "
+        "(the config this run launched with)."
+    )
 
 
 @pytest.mark.integration
@@ -442,10 +504,10 @@ def test_a_recover_run_killed_before_its_uploads_end_is_settled_by_one_more_pass
 
     def dies_before_summary(
         experiment: Experiment, path: Path, environment: dict[str, str], **kwargs: object
-    ) -> bool:
+    ) -> None:
         if path.stem == "generation":
             raise RunnerKilled()
-        return deliver(experiment, path, environment, **kwargs)
+        deliver(experiment, path, environment, **kwargs)
 
     with monkeypatch.context() as patch:
         if killed_at == "after-cleanup-record":
@@ -478,42 +540,95 @@ def test_a_recover_run_killed_before_its_uploads_end_is_settled_by_one_more_pass
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize(
-    ("earlier", "action"),
-    [("killed", "publish"), ("uncertain", "publish"), ("uncertain", "resolve")],
-    ids=["upload-after-success", "upload-after-failure", "resolve-after-failure"],
-)
+@pytest.mark.signals_own_pid
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP], ids=signal_name)
+def test_a_shutdown_signal_during_recover_run_stops_its_worker_and_prints_the_command_that_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    signum: int,
+) -> None:
+    """A real SIGTERM or SIGHUP while recover-run --confirm uploads stops the worker and names the rerun.
+
+    The shutdown handler kills the upload worker in flight, and the command exits with 128 plus
+    the signal number after the interrupt line and the stop line, the command whole on the last
+    line. Nothing is sent and the run stays recovery-required; that command, run as printed,
+    clears it and sends each outcome once.
+    """
+    run = _killed_run(tmp_path, monkeypatch)
+    run.uploads.clear()
+    uploading: list[str] = []
+
+    def signal_once_the_upload_runs() -> None:
+        deadline = time.monotonic() + 30.0
+        while (not uploading or not shutdown._active_children) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        os.kill(os.getpid(), signum)
+
+    command = shlex.join(
+        [
+            "phasesweep",
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(run.state_dir),
+            "--run-id",
+            _RUN_ID,
+            "--confirm",
+        ]
+    )
+    with monkeypatch.context() as patch:
+        hang_uploads_until_killed(patch, uploading)
+        capsys.readouterr()
+        sender = threading.Thread(target=signal_once_the_upload_runs, daemon=True)
+        sender.start()
+        status = invoke_cli_boundary(shlex.split(command)[1:], monkeypatch)
+        sender.join(timeout=5)
+
+    error = capsys.readouterr().err
+    assert status == 128 + signum
+    assert len(uploading) == 1
+    assert not shutdown._active_children
+    assert re.search(
+        rf"^\d\d:\d\d:\d\d  Interrupted \({signal_name(signum)}\): no trial is running; "
+        r"stopping 1 MLflow request\.$",
+        error,
+        re.MULTILINE,
+    )
+    assert error.splitlines()[-2:] == [
+        "phasesweep: stopped. Rerun the same command to finish the recovery:",
+        command,
+    ]
+    assert run.store.observe(run.handle).recovery_required
+    assert (run.sent(), run.summaries()) == ([], [])
+
+    assert invoke_cli_boundary(shlex.split(command)[1:], monkeypatch) == 0
+    assert not run.store.observe(run.handle).recovery_required
+    assert (run.sent(), run.summaries()) == (["KILLED"], ["KILLED"])
+
+
+@pytest.mark.integration
 def test_the_printed_steps_clear_a_run_whose_worker_sent_an_earlier_outcome(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, earlier: str, action: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A tracking worker a run starts for an earlier generation's recovered outcome is that run's to recover.
 
-    The run recovers an earlier sweep's attempt, then succeeds or fails, leaving the worker that
-    resolves the target for that outcome, or uploads it, with its cleanup unconfirmed. Following
-    the steps the run's MCP status prints, sync-tracking where it names one and then a confirmed
-    recover-run, clears the run, and the outcome reaches its MLflow run once.
+    The run recovers an earlier sweep's attempt and, right after its target check, sends that
+    outcome; the worker uploading it is left with its cleanup unconfirmed, so the run stops
+    before its first trial. Following the steps the run's MCP status prints, sync-tracking where
+    it names one and then a confirmed recover-run, clears the run, and the outcome reaches its
+    MLflow run once. A run starts no such worker before its own target check.
     """
-    if earlier == "killed":
-        experiment, uploads, [attempt] = killed_sweep(tmp_path, monkeypatch, n_jobs=1)
-        finish = "KILLED"
-    else:
-        experiment, uploads, attempt = _uncertain_attempt(tmp_path, monkeypatch)
-        finish = "FAILED"
+    experiment, uploads, [attempt] = killed_sweep(tmp_path, monkeypatch, n_jobs=1)
     # The runner resolves the config's relative paths against its directory, and the earlier
     # sweep ran from the working directory.
     config = write_experiment_config(Path.cwd() / "experiment.yaml", experiment)
     app, registry, store = make_mcp_app(
         write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
     )
-    leaked = leak_tracking_worker(
-        monkeypatch, action=action, name=f"attempt-{attempt}" if action == "publish" else None
-    )
-    if earlier == "killed":
-        assert run_claimed_runner(store, _SENDING_RUN_ID, config, cwd=Path.cwd()) == 0
-    else:
-        # The earlier sweep's unsafe-cleanup abort stays recorded, so this run fails.
-        with pytest.raises(ProcessCleanupUncertainError, match="worker cleanup is uncertain"):
-            run_claimed_runner(store, _SENDING_RUN_ID, config, cwd=Path.cwd())
+    leaked = leak_tracking_worker(monkeypatch, name=f"attempt-{attempt}")
+    with pytest.raises(UnsafeProcessCleanupError):
+        run_claimed_runner(store, _SENDING_RUN_ID, config, cwd=Path.cwd())
     assert leaked
     failure = app.status(_SENDING_RUN_ID)["run"]["failure"]
     assert failure["code"] == "cleanup_uncertain"
@@ -532,7 +647,54 @@ def test_the_printed_steps_clear_a_run_whose_worker_sent_an_earlier_outcome(
     assert handle is not None and not store.observe(handle).recovery_required
     publication.sync_tracking(experiment)
     publication.sync_tracking(experiment)
-    assert [r["finish"] for r in uploads if r["name"] == f"attempt-{attempt}"] == [finish]
+    assert [r["finish"] for r in uploads if r["name"] == f"attempt-{attempt}"] == ["KILLED"]
+
+
+@pytest.mark.integration
+def test_the_printed_steps_clear_a_recovery_whose_target_check_worker_was_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker recover-run starts to resolve the target before it sends is that run's to recover.
+
+    recover-run resolves the target itself, as no check in its process covered it, and the
+    worker doing so is left with its cleanup unconfirmed. The run stays recovery-required with
+    a cleanup_uncertain failure; following the steps recover-run and MCP status print clears
+    it, and the outcomes reach their MLflow runs once.
+    """
+    run = _killed_run(tmp_path, monkeypatch)
+    leaked = leak_tracking_worker(monkeypatch, action="resolve")
+    run.uploads.clear()
+
+    failed = run.recover()
+
+    [operation] = leaked
+    assert failed.exit_code != 0
+    assert "fix: run `phasesweep run` again with the same config for a CLI run, or " in (
+        failed.output
+    )
+    assert (run.sent(), run.summaries()) == ([], [])
+    assert run.store.observe(run.handle).recovery_required
+    failure = run.app.status(_RUN_ID)["run"]["failure"]
+    assert failure["code"] == "cleanup_uncertain"
+    assert (
+        f"`phasesweep mcp recover-run --state-dir STATE_DIR --run-id {_RUN_ID}`"
+        in (failure["remediation"])
+    )
+    entry = _attempts_dir(run.experiment) / f"{operation}.json"
+    assert entry.is_file()
+
+    # The MCP step: read the preview, then repeat it with --confirm.
+    preview = run.recover(confirm=False)
+    assert preview.exit_code == 0, preview.output
+    confirmed = run.recover()
+
+    assert confirmed.exit_code == 0, confirmed.output
+    assert not entry.exists()
+    assert not run.store.observe(run.handle).recovery_required
+    assert not run.store.cleanup_uncertain(run.handle)
+    assert (run.sent(), run.summaries()) == (["KILLED"], ["KILLED"])
+    publication.sync_tracking(run.experiment)
+    assert (run.sent(), run.summaries()) == (["KILLED"], ["KILLED"])
 
 
 @pytest.mark.integration
@@ -540,7 +702,11 @@ def test_the_printed_steps_clear_a_run_whose_worker_sent_an_earlier_outcome(
 def test_recover_run_cleans_worker_before_finalizing_pending_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
 ) -> None:
-    """A runner killed during mirroring holds its slot until its registered worker is reaped."""
+    """A runner killed during mirroring holds its slot until its registered worker is reaped.
+
+    A recovered earlier outcome is still pending at the mirror when MLflow gave no answer to
+    the pass after the run's target check.
+    """
     experiment, uploads, [attempt] = killed_sweep(
         tmp_path, monkeypatch, n_jobs=1, generation_id=_RUN_ID
     )
@@ -579,6 +745,19 @@ def test_recover_run_cleans_worker_before_finalizing_pending_publication(
 
         crash.setattr(session, "request_operation", die_during_upload)
         crash.setattr(worker, "request_operation", die_during_upload)
+        if target == "recovered-attempt":
+            silent: list[str] = []
+
+            def silent_before_training(
+                request: Mapping[str, object], **kwargs: object
+            ) -> JsonObject:
+                if request["action"] == "publish" and request.get("name") == name and not silent:
+                    silent.append(name)
+                    raise OperationUnavailableError("tracking server unreachable")
+                return die_during_upload(request, **kwargs)
+
+            crash.setattr(session, "request_operation", silent_before_training)
+            crash.setattr(worker, "request_operation", silent_before_training)
         child = os.fork()
         if child == 0:
             os._exit(run_claimed_runner(store, _SENDING_RUN_ID, config, cwd=Path.cwd()))

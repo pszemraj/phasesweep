@@ -10,13 +10,11 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep.config.io import load_yaml_document
+from phasesweep.config.reference import pin_documentation_links
 from phasesweep.runtime.json import JsonObject, JsonValue, json_value
 
-SET_SYNTAX = (
-    "Accepted syntax: dot-separated names (env.NOTE); a list element by zero-based index, "
-    "as .N or [N] (phases.0, phases[0]); a phase by name, as [NAME] (phases[lr]); "
-    "a mapping key taken verbatim, as [KEY] (search_space[model.n_layers]), "
-    "where \\] and \\\\ stand for a literal ] and \\ inside the brackets."
+SET_SYNTAX = pin_documentation_links(
+    "Syntax: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#run-time-overrides"
 )
 
 _INDEX = re.compile(r"[0-9]+")
@@ -134,9 +132,8 @@ def created_key_notes(exc: ValidationError, created: Sequence[CreatedKey]) -> li
         for key in created:
             if _at_or_below(error["loc"], key.location):
                 note = (
-                    f"note: --set {_shown(key.setting)} created {key.written!r} because the "
-                    "config had no such key, and validation failed at or below it. "
-                    "Check the spelling of each segment."
+                    f"note: --set {_shown(key.setting)} created {key.written!r} (the config "
+                    "had no such key), and validation failed at or below it."
                 )
                 if note not in notes:
                     notes.append(note)
@@ -276,11 +273,11 @@ def _list_position(setting: str, segment: _Segment, prefix: str, items: list[Jso
 
 
 def _path_error(setting: str, problem: str) -> SetPathError:
-    """Build a path error that quotes the assignment key and repeats the accepted syntax.
+    """Build a path error that quotes the assignment key and points at the accepted syntax.
 
     :param str setting: Assignment whose value is omitted from the message.
     :param str problem: Explanation of the invalid path.
-    :return SetPathError: Error containing the bounded key, problem and accepted syntax.
+    :return SetPathError: Error containing the bounded key, problem and syntax pointer.
     """
     return SetPathError(f"{_shown(setting)}: {problem}. {SET_SYNTAX}")
 

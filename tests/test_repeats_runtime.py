@@ -347,8 +347,6 @@ def _forge_axis_mismatch(winner: JsonObject, tamper: str) -> float:
             for group in groups
             if isinstance(group, list)
         ]
-        counts = _block(_block(_block(confound, "checks"), "survivorship"), "detail")
-        counts["ranked"] = len(ranked) - len(dropped)
     metrics = [member["metric"] for member in _members(winner)]
     assert all(isinstance(value, float) for value in metrics)
     values = [value for value in metrics if isinstance(value, float)]
@@ -462,7 +460,7 @@ def test_winner_view_projects_the_repeats_summary(
     assert view.params.keys() == {"x"}
 
     _members(winner)[1]["metric"] = 99.0
-    assert _winner_view(winner, "p") is None
+    assert _winner_view(winner, "p", persistent=True) is None
 
 
 def test_trial_tables_label_repeat_groups_and_star_every_winning_member(
@@ -481,6 +479,7 @@ def test_trial_tables_label_repeat_groups_and_star_every_winning_member(
         "value",
         "params",
         "duration_s",
+        "trial_dir",
         "repeat_group",
         "winner",
     )

@@ -324,8 +324,7 @@ def _scan_journal_before_write(path: Path) -> tuple[bytes, int] | None:
         data = _capture_journal(path)
     except (OSError, ValueError) as exc:
         raise StudyStorageUnavailableError(
-            f"Journal storage {path} could not be read before writing to it: {exc}. "
-            "Nothing was written."
+            f"Journal storage {path} could not be read before writing to it: {exc}."
         ) from exc
     if data is None:
         return None
@@ -334,10 +333,30 @@ def _scan_journal_before_write(path: Path) -> tuple[bytes, int] | None:
     except ValueError as exc:
         raise StudyStorageUnavailableError(
             f"Journal storage {path} holds a malformed record that other records follow. "
-            f"Repair backups, if present, are beside it as `{path.name}.*.bak`. "
-            "Nothing was written."
+            f"Repair backups, if present, are beside it as `{path.name}.*.bak`."
         ) from exc
     return data, end
+
+
+def _journal_changed_error(
+    path: Path, change: str, *, backup: Path | None = None
+) -> IncompleteJournalRecordError:
+    """Refuse a journal repair or append because the journal pathname changed under it.
+
+    :param Path path: Journal file.
+    :param str change: What happened to the journal.
+    :param Path | None backup: Where the journal as it was is saved, when the repair had
+        already backed it up, defaults to None.
+    :return IncompleteJournalRecordError: Error routed to retrying the operation.
+    """
+    outcome = (
+        ""
+        if backup is None
+        else f", so its incomplete final record was not truncated. The journal as it was is saved at {backup}"
+    )
+    return IncompleteJournalRecordError(
+        f"Journal storage {path} {change}{outcome}.", action=OperatorAction.RETRY
+    )
 
 
 def _truncate_incomplete_journal_record(lock: _JournalLock) -> tuple[Path, int] | None:
@@ -371,26 +390,17 @@ def _truncate_incomplete_journal_record(lock: _JournalLock) -> tuple[Path, int] 
             os.fsync(copy.fileno())
         fsync_directory(path.parent)
         if not lock.held():
-            raise IncompleteJournalRecordError(
-                f"Journal storage {path}: another process removed or replaced its pathname "
-                "during the repair, so its incomplete final record was not truncated. "
-                f"The journal as it was is saved at {backup}. "
-                "Nothing was appended.",
-                action=OperatorAction.RETRY,
+            raise _journal_changed_error(
+                path, "was removed or replaced during repair", backup=backup
             )
         if os.fstat(journal.fileno()).st_size != len(data):
-            raise IncompleteJournalRecordError(
-                f"Journal storage {path} changed while its journal lock was held for "
-                "repair, so it was not truncated. The journal as it was is saved at "
-                f"{backup}. Nothing was appended.",
-                action=OperatorAction.RETRY,
-            )
+            raise _journal_changed_error(path, "changed during repair", backup=backup)
         journal.truncate(end)
         os.fsync(journal.fileno())
     except OSError as exc:
         raise IncompleteJournalRecordError(
             f"Journal storage {path} ends with an incomplete record that could not be "
-            f"repaired: {exc}. Nothing was appended."
+            f"repaired: {exc}"
         ) from exc
     try:
         repaired = _capture_journal(path)
@@ -403,7 +413,7 @@ def _truncate_incomplete_journal_record(lock: _JournalLock) -> tuple[Path, int] 
     except Exception as exc:
         raise StudyStorageUnavailableError(
             f"Journal storage {path} does not replay after its incomplete final record was "
-            f"removed. The journal as it was is saved at {backup}. Nothing was appended."
+            f"removed. The journal as it was is saved at {backup}."
         ) from exc
     return backup, len(data) - end
 
@@ -447,10 +457,9 @@ class _JournalLock(BaseJournalFileLock):
                     if acquired:
                         self._handle = handle
                         if not self.held():
-                            raise IncompleteJournalRecordError(
-                                f"Journal storage {self.path} was removed or replaced while "
-                                "its journal lock was being taken. Nothing was written.",
-                                action=OperatorAction.RETRY,
+                            raise _journal_changed_error(
+                                self.path,
+                                "was removed or replaced while its journal lock was being taken",
                             )
                 if acquired:
                     return True
@@ -459,8 +468,7 @@ class _JournalLock(BaseJournalFileLock):
                     raise IncompleteJournalRecordError(
                         f"Journal storage {self.path} ends with an incomplete record, and "
                         f"its journal lock was still held after {self._timeout:g} seconds, "
-                        "so the record was not repaired. Wait for the writer to finish, "
-                        "then retry. Nothing was written."
+                        "so the record was not repaired. Retry when the writer finishes."
                     )
                 time.sleep(delay if remaining is None else min(delay, remaining))
                 delay = min(delay * 2, 1.0)
@@ -472,7 +480,7 @@ class _JournalLock(BaseJournalFileLock):
             if isinstance(exc, OSError):
                 raise IncompleteJournalRecordError(
                     f"Journal storage {self.path} could not be repaired or appended: "
-                    f"its journal lock could not be taken: {exc}. Nothing was written."
+                    f"its journal lock could not be taken: {exc}."
                 ) from exc
             raise
 
@@ -529,19 +537,16 @@ def _repair_incomplete_journal_record(storage_url: str) -> None:
     try:
         repaired = _truncate_incomplete_journal_record(lock)
         if not lock.held():
-            raise IncompleteJournalRecordError(
-                f"Journal storage {path} was removed or replaced while its incomplete final "
-                "record was being repaired. The replacement was left in place. "
-                "Retry to check the journal again.",
-                action=OperatorAction.RETRY,
+            raise _journal_changed_error(
+                path, "was removed or replaced during repair; the replacement was left in place"
             )
     finally:
         lock.release()
     if repaired is not None:
         backup, dropped = repaired
         log.warning(
-            "Repaired journal storage %s: removed an incomplete final record of %d bytes "
-            "that no reader could see. The journal as it was is saved at %s.",
+            "Repaired journal storage %s: removed an incomplete final record of %d bytes; "
+            "the journal as it was is saved at %s.",
             path,
             dropped,
             backup,
@@ -644,7 +649,7 @@ def _validate_storage_versions(versions: Iterable[tuple[str, object, bool]]) -> 
         detail = ", ".join(f"{name!r} {format_found(version)}" for name, version in unsupported)
         raise StudySchemaMismatchError(
             "The selected local storage ledger contains unsupported PhaseSweep study "
-            f"state: {detail}; {format_reads(STUDY_SCHEMA_VERSION)}. Nothing was written.",
+            f"state: {detail}; {format_reads(STUDY_SCHEMA_VERSION)}.",
             remediation=OTHER_FORMAT_STEP,
         )
 
@@ -1049,17 +1054,13 @@ def _create_ledger_directory(directory: Path) -> None:
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        if exc.errno in _UNUSABLE_PATH_ERRNOS:
-            raise PhaseSweepError(
-                f"Storage ledger directory {directory} cannot be created at that path: "
-                f"{exc}. Correct the storage path, or the workdir for auto storage, so it "
-                "names a directory PhaseSweep can create. Nothing was written.",
-                action=OperatorAction.FIX_CONFIG,
-            ) from exc
+        unusable_path = exc.errno in _UNUSABLE_PATH_ERRNOS
         raise PhaseSweepError(
-            f"Storage ledger directory {directory} could not be created: {exc}. "
-            "Nothing was written.",
-            action=OperatorAction.RESTORE_TREE,
+            f"Storage ledger directory {directory} cannot be created: {exc}.",
+            action=OperatorAction.FIX_CONFIG if unusable_path else OperatorAction.RESTORE_TREE,
+            remediation="Correct `storage`, or `workdir` for `storage: auto`."
+            if unusable_path
+            else None,
         ) from exc
 
 
@@ -1119,12 +1120,12 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     offered = _artifact_root_identity(experiment)
     binding_state = _check_artifact_root_binding(experiment)
     if binding_state != ledger.binding_state or offered != ledger.artifact_root:
+        moved = "" if offered == ledger.artifact_root else f" at {offered!r}"
         raise ArtifactRootConflictError(
             f"Artifact root {ledger.artifact_root!r} changed while its ledger was being "
             f"claimed: validation found it {ledger.binding_state}, but it is now "
-            f"{binding_state} at {offered!r}. Another process modified this tree without "
-            "holding the experiment lock. Stop that process before retrying. Nothing was "
-            "written.",
+            f"{binding_state}{moved}. Another process modified this tree without the "
+            "experiment lock; stop it and retry.",
             action=OperatorAction.INSPECT_LOGS,
         )
     # Refuse unusable ledger paths before binding the artifact tree.

@@ -87,14 +87,12 @@ def test_fingerprint_refusal_on_an_existing_tree_reports_preflight(
     [
         pytest.param(
             "program_missing",
-            "Put the program on the PATH used to launch PhaseSweep (activate the environment "
-            "containing the program for CLI runs, or set PATH in the MCP server entry), or name "
-            "it by absolute path in trial_command.",
+            "Put 'phasesweep-no-such-trainer' on the PATH PhaseSweep is launched with.",
             id="program_missing",
         ),
         pytest.param(
             "trainer_cwd_missing",
-            "Create that directory, or set execution.cwd to an existing one.",
+            "Create {gone}, or set execution.cwd to an existing directory.",
             id="trainer_cwd_missing",
         ),
     ],
@@ -125,8 +123,8 @@ def test_a_refused_launch_environment_reports_its_own_code_and_fix(
         "retryable": False,
         "actor": "operator",
         "remediation": (
-            f"Ask the operator: {remediation} The error in this run's log, `logs/refused.log` "
-            "under the catalog's `state_dir`, gives the details."
+            f"Ask the operator: {remediation.format(gone=(tmp_path / 'gone').resolve())} "
+            "Details: `logs/refused.log` under the catalog's `state_dir`."
         ),
     }
 
@@ -147,4 +145,4 @@ def test_an_unreadable_tracker_stops_the_live_run_and_refuses_the_next_at_prefli
             run_claimed_runner(store, run_id, config_path, experiment_id="t", cwd=tmp_path)
         failure = json.loads(store.status_path(run_id).read_text())["failure"]
         assert (failure["code"], failure["stage"]) == ("tracking_unavailable", stage)
-        assert "nothing is retrained" in failure["remediation"]
+        assert "the finished training is kept" in failure["remediation"]

@@ -16,7 +16,7 @@ import pytest
 
 import phasesweep.engine.ledger as ledger_module
 from phasesweep import run_experiment
-from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.models import ExecutionContext, Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
@@ -24,6 +24,7 @@ from phasesweep.engine.errors import (
     PublishedStudyMissingError,
     ResumeWinnerMissingError,
     StudyContextConflictError,
+    StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     TrialEvidenceMissingError,
     TrialTargetRefusedError,
@@ -78,10 +79,9 @@ _LEDGER_REFUSED = (
 _PLACEHOLDERS = "placeholders until 'a' publishes a winner: a_x"
 
 _RUNNING_WARNING = (
-    "DRY RUN warning: phase={name} has 1 RUNNING attempt(s) that a real run recovers before it "
-    "checks the phase, as failed where the trial recorded a failure and otherwise as "
-    "interrupted, which reruns; they are counted that way, and its accepted target, abort "
-    "state and partial decision are not checked"
+    "DRY RUN warning: phase={name} has 1 RUNNING attempt, counted the way a real run recovers "
+    "RUNNING attempts (failed if the trial recorded a failure, otherwise interrupted and "
+    "rerun); its accepted target, abort state and partial decision are not checked"
 )
 
 
@@ -213,10 +213,12 @@ def _refusals_match(
     match: str,
     *,
     from_phase: str | None = None,
-) -> None:
+) -> Exception:
     """Assert the dry run refuses an experiment with the error a real run then gives.
 
     The dry run must write nothing under ``root`` and must give the real run's message verbatim.
+
+    :return Exception: The error the real run raised.
     """
     before = tree_snapshot(root)
     with pytest.raises(error, match=match) as dry:
@@ -225,6 +227,7 @@ def _refusals_match(
     with pytest.raises(error) as real:
         run_experiment(experiment, from_phase=from_phase)
     assert str(dry.value) == str(real.value)
+    return real.value
 
 
 @pytest.mark.integration
@@ -334,7 +337,9 @@ def test_accepted_partial_timeout_previews_a_replay_and_launches_nothing(
     assert _terminal_trials(accepting, "a") == 2
 
     refusing = _persistent(tmp_path, _phase("a", 4))
-    _refusals_match(refusing, tmp_path, WinnerIntegrityError, "allow_incomplete_on_timeout: true")
+    _refusals_match(
+        refusing, tmp_path, WinnerIntegrityError, "accepted an incomplete result at 2/4 finished"
+    )
 
 
 @pytest.mark.integration
@@ -367,7 +372,7 @@ def test_accepted_partial_replay_proves_the_winners_evidence_but_the_preview_lea
         "DRY RUN phase=a accepted a partial result at 2 of 4 trials: would replay it and "
         "launch no trials"
     )
-    with pytest.raises(TrialEvidenceMissingError, match="bytes behind the published metric"):
+    with pytest.raises(TrialEvidenceMissingError, match="now hashes to .*: its bytes have changed"):
         run_experiment(accepting)
 
 
@@ -415,8 +420,28 @@ def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
 
     with _experiment_lock(experiment):
         _preview(experiment, tmp_path, caplog)
-    assert "another operation is active" in caplog.text
+    assert "DRY RUN warning: another operation is active" in caplog.text
     assert "In-flight trials can still finish without a rerun" in caplog.text
+    assert "DRY RUN hypothetical restart total:" in caplog.text
+
+
+def test_dry_run_labels_the_warning_that_it_could_not_check_for_an_active_run(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every dry-run warning carries the `DRY RUN warning:` label a reader scans for."""
+    experiment = _persistent(tmp_path, _phase("a", 2))
+
+    def unreadable_lock(_experiment: Experiment) -> bool:
+        raise OSError("lock directory is unreadable")
+
+    monkeypatch.setattr("phasesweep.engine.run.locking_ops.experiment_is_busy", unreadable_lock)
+    _preview(experiment, tmp_path, caplog)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == [
+        "DRY RUN warning: could not check whether the experiment is active: "
+        "lock directory is unreadable"
+    ]
     assert "DRY RUN hypothetical restart total:" in caplog.text
 
 
@@ -541,8 +566,7 @@ def test_lowered_target_is_refused_as_a_run_refuses(tmp_path: Path, case: str) -
         experiment,
         tmp_path,
         TrialTargetRefusedError,
-        r"already accepted a target of 4 .* requests 2\. Set phases\[a\]\.n_trials to at least 4 "
-        "in the config",
+        r"already accepted a target of 4 finished trials; the config requests 2\.",
     )
 
 
@@ -657,11 +681,105 @@ def test_raised_upstream_target_over_a_bound_descendant_is_refused_as_a_run_refu
         _phase("c", 2, inherits=("b",)),
     )
 
-    _refusals_match(
+    refusal = _refusals_match(
         raised,
         tmp_path,
         StudyContextConflictError,
-        r"dependent phase study/studies \['b', 'c'\] are already bound",
+        r"1 top-up trial remaining, but 2 dependent phases \(`b`, `c`\) are bound",
+    )
+
+    # The rename step names only the dependents, so the enlarged phase keeps its trials.
+    assert isinstance(refusal, StudyContextConflictError)
+    assert refusal.remediation == (
+        "Give `b` and `c` new names and update the `inherits` that name them, which runs them "
+        "again from scratch; `a` keeps its trials and runs the rest."
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("changed", ["a", "b"])
+def test_a_top_up_of_a_changed_phase_is_refused_as_a_changed_study_first(
+    tmp_path: Path, changed: str
+) -> None:
+    """A raised target on a phase whose search space also changed is refused as a changed study.
+
+    The top-up refusal says the phase keeps its trials, which a changed study does not, so the
+    run and its dry run both refuse the change first, for the first phase or a later one. With
+    the search space restored, the top-up refusal is what remains, and it is then true.
+    """
+    chain = {"a": (), "b": ("a",), "c": ("b",)}
+    run_experiment(
+        _persistent(tmp_path, *(_phase(name, 2, inherits=up) for name, up in chain.items()))
+    )
+
+    def edited(*, widen: bool) -> Experiment:
+        phases = []
+        for name, up in chain.items():
+            phase = _phase(name, 3 if name == changed else 2, inherits=up)
+            if widen and name == changed:
+                space = {f"{name}_x": IntParam(type="int", low=0, high=20)}
+                phase = phase.model_copy(update={"search_space": space})
+            phases.append(phase)
+        return _persistent(tmp_path, *phases)
+
+    refusal = _refusals_match(
+        edited(widen=True),
+        tmp_path,
+        StudyFingerprintMismatchError,
+        rf"Study 't::{changed}' was created with a different config\. Changed: "
+        rf"phase\.search_space\.{changed}_x\.high: 10 -> 20\.$",
+    )
+    assert isinstance(refusal, StudyFingerprintMismatchError)
+    assert refusal.remediation is not None
+    assert refusal.remediation.startswith("Restore the recorded value(s), or give ")
+    _refusals_match(
+        edited(widen=False),
+        tmp_path,
+        StudyContextConflictError,
+        rf"Phase '{changed}' has 1 top-up trial remaining",
+    )
+
+
+@pytest.mark.integration
+def test_a_top_up_under_another_environment_is_refused_for_the_environment_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run and its dry run refuse a changed trainer environment before a bound top-up."""
+
+    def experiment(n_trials: int) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            phases=[_phase("a", n_trials), _phase("b", 1, inherits=("a",))],
+            metric=bounded_metric(),
+            execution=ExecutionContext(inherit_env=["PHASESWEEP_DATASET_REV"]),
+        )
+
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-a")
+    run_experiment(experiment(2))
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-b")
+
+    _refusals_match(
+        experiment(3),
+        tmp_path,
+        StudyFingerprintMismatchError,
+        r"Study 't::a' ran its trials under a different trainer environment",
+    )
+
+
+def test_the_bound_descendant_refusal_counts_in_the_singular_without_list_syntax(
+    tmp_path: Path,
+) -> None:
+    """One bound dependent and several top-up trials read as plain words, with the phase named as the rename step names it."""
+    recorded = _persistent(tmp_path, _phase("a", 2), _phase("b", 2, inherits=("a",)))
+    for name in ("a", "b"):
+        _record(recorded, name, _STATE.FAIL, _STATE.FAIL, target=2)
+    raised = _persistent(tmp_path, _phase("a", 5), _phase("b", 2, inherits=("a",)))
+
+    refusal = _refusals_match(raised, tmp_path, StudyContextConflictError, "top-up")
+
+    assert str(refusal) == (
+        "Phase 'a' has 3 top-up trials remaining, but 1 dependent phase (`b`) is bound to its "
+        "published winner."
     )
 
 
@@ -708,7 +826,7 @@ def test_flipped_goal_is_refused_as_a_run_refuses(tmp_path: Path) -> None:
         _persistent(tmp_path, _phase("a", 2), maximize=True),
         tmp_path,
         StudySchemaMismatchError,
-        "optimizes minimize, but the current config requires maximize",
+        "optimizes minimize, but the config requires maximize",
     )
 
 
@@ -867,7 +985,7 @@ def test_validate_counts_pending_evidence_as_the_failure_a_run_may_record(tmp_pa
     ):
         run_experiment(_two_cell_grid(tmp_path, 3), dry_run=True)
     assert pending.value.remediation is not None
-    assert pending.value.remediation.startswith("Let any active run finish.")
+    assert pending.value.remediation.startswith("Run `phasesweep run` with the same config")
 
 
 def test_validate_allows_the_retry_a_fixed_configurations_pending_evidence_may_justify(

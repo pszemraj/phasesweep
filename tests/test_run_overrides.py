@@ -2,6 +2,7 @@
 
 import json
 import stat
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ import phasesweep.engine.read as read_module
 from phasesweep import run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.config.run_overrides import SetPathError, apply_set
+from phasesweep.config.run_overrides import SET_SYNTAX, SetPathError, apply_set
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudyStorageUnavailableError
 from phasesweep.engine.ledger import ValidatedLedger
@@ -26,9 +27,10 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
 )
 from phasesweep.engine.read import experiment_status, read_result
+from phasesweep.engine.run import TerminalReport
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
-from phasesweep.errors import operator_step
+from phasesweep.errors import ABORT_START_AGAIN_STEP, START_AGAIN_STEP, operator_step
 from phasesweep.runtime.files import file_sha256
 from tests.conftest import (
     invoke_cli_boundary,
@@ -274,7 +276,7 @@ def test_published_winner_survives_a_failed_later_generation(
                 "trainer_config": {"caption": "changed-base"},
             }
         )
-        with pytest.raises(StudyFingerprintMismatchError, match="different phase config"):
+        with pytest.raises(StudyFingerprintMismatchError, match="different config"):
             run_experiment(changed)
     else:
         with pytest.raises(NoFeasibleTrialError, match="aborted"):
@@ -297,26 +299,27 @@ def test_published_winner_survives_a_failed_later_generation(
     assert phase_payload["winner_is_published"] is (continuation != "append")
     assert str(expected_generation) in str(phase_payload["winner"])
     if continuation == "prepend_drift":
-        lead, published = winners.output.split("=== lead ===", 1)[1].split("=== p ===", 1)
-        assert "changed_metric: 0.5" in lead
+        # The changed metric and base change p's recorded config, so the run is refused
+        # before the prepended `lead` launches: p keeps its published winner, shown with
+        # the metric, annotation and base that produced it, and `lead` has no result.
+        assert "=== lead ===" not in winners.output
+        published = winners.output.split("=== p ===", 1)[1]
         assert "objective: 0.5" in published and "changed_metric:" not in published
         assert "# original annotation" in published and "changed annotation" not in published
         assert (
-            "# Historical published phase result: does not match the current config." in published
-        )
-        assert "# Historical experiment result: unpublished generation" not in winners.output
-        for generation, base in (
-            (published_id, "original-base"),
-            (status["current_generation_id"], "changed-base"),
-        ):
-            assert (
-                f"# Producing argparse trainer base for generation {generation}, before phase overrides.\n"
-                f"trainer_config:\n  caption: {base}"
-            ) in winners.output
-            assert winners.output.count(f"caption: {base}") == 1
+            f"# Historical experiment result: published generation {published_id} does not "
+            "match the current config."
+        ) in winners.output
+        assert (
+            "# Producing argparse trainer base, before phase overrides.\n"
+            "trainer_config:\n  caption: original-base"
+        ) in winners.output
+        assert "changed-base" not in winners.output
+        lead_payload = next(phase for phase in phases_payload if phase["name"] == "lead")
+        assert lead_payload["trials"] == {}, lead_payload
     table = CliRunner().invoke(cli, ["status", str(path), "--trials"])
     assert table.exit_code == 0, table.exception
-    assert f"winner generation: {expected_generation} ({expected_label})" in table.output
+    assert f"{expected_label} generation {expected_generation}" in table.output
 
 
 def test_show_winners_distinguishes_appended_phases_from_historical_results(tmp_path: Path) -> None:
@@ -344,7 +347,7 @@ def test_show_winners_distinguishes_appended_phases_from_historical_results(tmp_
     assert payload["phases"][0]["winner"].endswith("/phases/p/winner.yaml")
     table = CliRunner().invoke(cli, ["status", str(path), "--trials"])
     assert table.exit_code == 0, table.output
-    assert "marks unpublished generation" in table.output
+    assert "\nunpublished generation " in table.output
 
 
 def test_unpublished_winner_discloses_semantic_config_drift(tmp_path: Path) -> None:
@@ -647,14 +650,15 @@ def test_in_memory_unpublished_status_describes_a_full_restart(tmp_path: Path) -
     )
     assert experiment.resolved_storage is None
     config = write_experiment_config(tmp_path / "memory.yaml", experiment)
-    with pytest.raises(NoFeasibleTrialError):
+    with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(experiment)
 
     shown = CliRunner().invoke(cli, ["status", str(config)])
     assert shown.exit_code == 0, shown.output
-    assert (
-        "start the run again; storage: null keeps no completed trials between runs" in shown.output
-    )
+    # Nothing is recorded about why the run stopped, so status gives the plain rerun; the
+    # abort's own step leads with fixing its cause.
+    assert f"# fix: {START_AGAIN_STEP}" in shown.output
+    assert operator_step(aborted.value) == ABORT_START_AGAIN_STEP
     assert "resume and publish" not in shown.output
     assert "completed trials are kept" not in shown.output
     assert launches.read_text().splitlines() == ["a", "a", "b", "b"]
@@ -716,7 +720,11 @@ def _derived(path: Path, monkeypatch: pytest.MonkeyPatch, *settings: str) -> Exp
     received: list[Experiment] = []
 
     def capture(
-        experiment: Experiment, *, from_phase: str | None, dry_run: bool
+        experiment: Experiment,
+        *,
+        from_phase: str | None,
+        dry_run: bool,
+        terminal_callback: Callable[[TerminalReport], None],
     ) -> dict[str, Winner]:
         assert dry_run
         assert from_phase is None
@@ -810,13 +818,13 @@ def test_set_can_add_keys_to_the_free_form_trainer_config(
 def test_set_refuses_an_unknown_phase_name_and_lists_the_phases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """An unknown phase name stops at ``--set`` with the argument, segment and syntax named."""
+    """An unknown phase name stops at ``--set`` with the argument, segment and syntax pointer."""
     message = _refused(_two_phase_config(tmp_path), monkeypatch, capsys, "phases[wd2].n_trials=2")
 
     assert "'phases[wd2].n_trials'" in message
     assert "'[wd2]'" in message
     assert "lr, wd" in message
-    assert "Accepted syntax" in message
+    assert SET_SYNTAX in message
     assert "validation error" not in message
     assert not (tmp_path / "original").exists()
 
@@ -907,9 +915,9 @@ def test_set_path_errors_name_the_argument_the_segment_and_the_syntax(
     setting: str,
     fragment: str,
 ) -> None:
-    """Every refused path quotes its argument, says what failed and repeats the syntax."""
+    """Every refused path quotes its argument, says what failed and points at the syntax."""
     message = _refused(_two_phase_config(tmp_path), monkeypatch, capsys, setting)
 
     assert repr(setting.partition("=")[0]) in message
     assert fragment in message
-    assert "Accepted syntax" in message
+    assert SET_SYNTAX in message

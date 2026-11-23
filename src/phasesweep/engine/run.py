@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.attempts as attempt_ops
@@ -25,6 +27,7 @@ from phasesweep._metadata import __version__
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.config.models import (
     Experiment,
+    Phase,
     _metric_semantics_payload,
     experiment_disclosures,
 )
@@ -33,8 +36,8 @@ from phasesweep.engine.errors import (
     IncompleteJournalRecordError,
     StudyStorageUnavailableError,
     TrackingTargetUnavailableError,
-    phase_timeout,
 )
+from phasesweep.engine.optuna import _finished_trial_count, _trial_count_state
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.preview import (
     PhasePreview,
@@ -42,11 +45,25 @@ from phasesweep.engine.preview import (
     _dry_run_total_line,
     _preview_ledger,
     _preview_phase,
+    warn_dry_run,
 )
 from phasesweep.engine.selection import _winner_summary_item
-from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
-from phasesweep.engine.study_policy import _launch_preflight
-from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
+from phasesweep.engine.state import (
+    GENERATION_ID_ATTR,
+    GENERATION_SUMMARY_SCHEMA_VERSION,
+    PhaseCounts,
+    Winner,
+    _recorded_trial_dir,
+    _stands_under_winner,
+    _winning_trials,
+)
+from phasesweep.errors import (
+    OperatorAction,
+    PhaseSweepError,
+    ProcessCleanupUncertainError,
+    operator_step,
+)
+from phasesweep.run_report import duration_text, report, run_totals, skipped_line, winner_line
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
     UnsafeLockPathError,
@@ -59,32 +76,10 @@ from phasesweep.runtime.shutdown import (
     signal_handler_scope,
 )
 
+if TYPE_CHECKING:
+    from phasesweep.tracking.session import DeliveryTally
+
 log = logging.getLogger("phasesweep.engine.run")
-
-
-def _preflight_missing_reached_phase_environments(
-    experiment: Experiment,
-    existing_studies: Mapping[str, object],
-    *,
-    from_phase: str | None,
-) -> None:
-    """Check that each reached phase with no durable study could start its trials.
-
-    A phase absent from an otherwise bound tree has no completed trial to
-    replay, so it must be able to launch before this invocation tops up an
-    earlier phase. Existing studies remain deferred to recovery, which can
-    distinguish new work from an offline-safe no-op.
-
-    :param Experiment experiment: Parsed experiment supplying phase environments.
-    :param Mapping[str, object] existing_studies: Durable studies found under the lock.
-    :param str | None from_phase: Optional first phase this invocation can execute.
-    :raises LaunchEnvironmentError: A missing reached phase has an invalid launch environment, a
-        missing trainer directory or a trial program its trainer cannot find; see
-        :func:`phasesweep.engine.study_policy._launch_preflight`.
-    """
-    for _index, phase in experiment.phases_from(from_phase):
-        if phase.name not in existing_studies:
-            _launch_preflight(experiment, phase.name, None)
 
 
 @dataclass(frozen=True)
@@ -99,7 +94,9 @@ class TerminalReport:
     on success, so a terminal-result consumer need not re-read storage. It is
     ``None`` on every failure path. ``replayed_generation_id`` names the published
     generation whose winners a successful invocation replayed without writing a
-    generation, and is ``None`` otherwise.
+    generation, and is ``None`` otherwise. ``phase_counts`` holds the trial counts of
+    each phase a successful invocation ran, read from its ledger, so a run on in-memory
+    storage reports them too.
     """
 
     generation_id: str
@@ -112,6 +109,7 @@ class TerminalReport:
     failure_stage: str | None = None
     winners: Mapping[str, Winner] | None = None
     replayed_generation_id: str | None = None
+    phase_counts: Mapping[str, PhaseCounts] = field(default_factory=dict)
 
 
 class PublicationHook(Protocol):
@@ -155,6 +153,7 @@ def _terminal_report_from_cleanup(
     failure_stage: str | None,
     winners: Mapping[str, Winner] | None = None,
     replayed_generation_id: str | None = None,
+    phase_counts: Mapping[str, PhaseCounts] | None = None,
 ) -> TerminalReport:
     """Freeze accumulated cleanup evidence into one terminal report.
 
@@ -165,6 +164,8 @@ def _terminal_report_from_cleanup(
     :param Mapping[str, Winner] | None winners: Successful published winners.
     :param str | None replayed_generation_id: Published generation whose winners a successful
         invocation replayed without writing a generation.
+    :param Mapping[str, PhaseCounts] | None phase_counts: Trial counts of each phase the
+        invocation ran, for a successful one.
     :return TerminalReport: Immutable terminal outcome snapshot.
     """
     return TerminalReport(
@@ -178,6 +179,7 @@ def _terminal_report_from_cleanup(
         failure_stage=failure_stage,
         winners=MappingProxyType(dict(winners)) if winners is not None else None,
         replayed_generation_id=replayed_generation_id,
+        phase_counts=MappingProxyType(dict(phase_counts or {})),
     )
 
 
@@ -248,7 +250,9 @@ def run_experiment(
         # A fresh tree holds no publication, so a resume that needs earlier winners cannot
         # succeed; refuse it before the run creates the tree.
         resume_ops._preflight_skipped_winners(experiment, from_phase=from_phase, run_deadline=None)
-        _preflight_missing_reached_phase_environments(experiment, {}, from_phase=from_phase)
+        resume_ops._preflight_missing_reached_phase_environments(
+            experiment, {}, from_phase=from_phase
+        )
     winners = _run_experiment_outcome(
         experiment,
         from_phase=from_phase,
@@ -317,30 +321,39 @@ def _run_experiment_outcome(
             )
         except StudyStorageUnavailableError as exc:
             # Unreadable ownership state cannot rule out earlier live attempts.
-            unknown = (
-                "Artifact ownership could not be checked because required persistent "
-                f"study state is unavailable: {exc} Cleanup state is therefore unknown."
-            )
+            unknown = f"Could not check artifact ownership: {exc}"
+            for_mcp = "for an MCP run, then run `phasesweep mcp recover-run`"
             if isinstance(exc, IncompleteJournalRecordError):
                 # A partial final record's repair did not finish, and it names its
                 # own remedy; restoring the whole ledger instead would be wrong.
                 raise ProcessCleanupUncertainError.rewrap(
-                    exc, f"{unknown} For an MCP run, then run phasesweep mcp recover-run."
+                    exc, unknown, remediation=f"{operator_step(exc).rstrip('.')}; {for_mcp}."
                 ) from exc
             raise ProcessCleanupUncertainError(
-                f"{unknown} An MCP run requires phasesweep mcp recover-run after ledger repair.",
+                unknown,
                 action=OperatorAction.RESTORE_LEDGER,
+                remediation=f"Restore or repair the storage ledger; {for_mcp}.",
             ) from exc
         if not environments_preflighted:
             # Checked before recovery, so a launch that a phase with no study would refuse
             # changes nothing; the next launch that passes recovers the registered attempts.
-            _preflight_missing_reached_phase_environments(
+            resume_ops._preflight_missing_reached_phase_environments(
                 experiment,
                 claimed.studies,
                 from_phase=from_phase,
             )
         ensure_artifact_dir(path_ops._experiment_dir(experiment))
         run_stack.enter_context(artifact_io._file_log_handler(path_ops._run_log_path(experiment)))
+        # ``run.log`` is appended to by every run, so this line marks where this one begins.
+        # It carries no command line or ``--set`` value, which can hold a tracking URI with
+        # credentials, and the console prints only the report logger's INFO records.
+        run_started = time.monotonic()
+        log.info(
+            "Run started: experiment %s, pid %d%s",
+            experiment.experiment,
+            os.getpid(),
+            "" if from_phase is None else f", from phase {from_phase}",
+        )
         generation = generation_ops.InvocationGeneration(
             experiment,
             generation_id=generation_ops._new_generation_id(experiment, requested_generation_id),
@@ -351,6 +364,13 @@ def _run_experiment_outcome(
         terminal_error: BaseException | None = None
         terminal_report: TerminalReport | None = None
         cleanup = attempt_ops._PreflightCleanupReport()
+        tracking: DeliveryTally | None = None
+        if experiment.mlflow is not None:
+            from phasesweep.tracking.session import DeliveryTally
+
+            # One for the run, so its closing lines count the pass after its first target
+            # check as well as its closeout.
+            tracking = DeliveryTally()
         try:
             run_deadline = (
                 time.monotonic() + experiment.timeout_seconds_per_run
@@ -362,18 +382,6 @@ def _run_experiment_outcome(
                 cleanup_report=cleanup,
                 from_phase=from_phase,
             )
-            if experiment.mlflow is not None:
-                from phasesweep.tracking.publication import (
-                    generations_left_open,
-                    save_recovered_attempts,
-                )
-
-                # The lock rules out a live invocation and this run has requested no summary,
-                # so every open summary binding or creation belongs to an earlier invocation.
-                cleanup.settled_generations.update(generations_left_open(experiment))
-                # Recovery sends nothing; what it settled waits as pending records until the
-                # run has reached the tracker.
-                save_recovered_attempts(experiment, claimed, cleanup.settled_generations)
             if cleanup.unreadable_evidence:
                 # New trials would bury finished training the tracker has yet to report.
                 raise attempt_ops._pending_evidence_refusal(cleanup.unreadable_evidence)
@@ -408,6 +416,7 @@ def _run_experiment_outcome(
                 preloaded_winners=preloaded_winners,
                 run_deadline=run_deadline,
                 publication_hook=publication_hook,
+                tracking=tracking,
             )
         except BaseException as exc:
             terminal_error = exc
@@ -429,30 +438,19 @@ def _run_experiment_outcome(
                     control_error = cleanup_exc
                     terminal_error = cleanup_exc
                 except Exception as cleanup_exc:
-                    if isinstance(cleanup_exc, ProcessCleanupUncertainError):
-                        reconciliation.mark_uncertain(cleanup_exc)
+                    reconciliation.mark_uncertain_if_unconfirmed(cleanup_exc)
                     log.exception("failed to reconcile all existing studies after run termination")
                 cleanup.recovered_attempt_ids.update(reconciliation.recovered_attempt_ids)
                 cleanup.recovered_attempt_generations.update(
                     reconciliation.recovered_attempt_generations
                 )
                 cleanup.uncertain_attempt_ids.update(reconciliation.uncertain_attempt_ids)
-                cleanup.settled_generations.update(reconciliation.settled_generations)
                 cleanup.cleanup_confirmed = reconciliation.cleanup_confirmed
                 cleanup.error = reconciliation.error
-            original_cleanup_uncertain = isinstance(exc, ProcessCleanupUncertainError) or (
-                isinstance(exc, PhaseSweepShutdown) and not exc.report.cleanup_confirmed
-            )
-            if original_cleanup_uncertain:
-                # Preserve prior cleanup uncertainty even if a signal interrupts reconciliation.
-                cleanup.mark_uncertain(exc)
+            # Preserve prior cleanup uncertainty even if a signal interrupts reconciliation.
+            cleanup.mark_uncertain_if_unconfirmed(exc)
             primary_error = control_error or exc
-            shutdown_cleanup_uncertain = (
-                isinstance(primary_error, PhaseSweepShutdown)
-                and not primary_error.report.cleanup_confirmed
-            )
-            if shutdown_cleanup_uncertain:
-                cleanup.mark_uncertain(primary_error)
+            primary_cleanup_uncertain = cleanup.mark_uncertain_if_unconfirmed(primary_error)
             failed_error_class = type(primary_error).__name__
             if generation.claimed:
                 # Keep a more specific publication_failed record and pointer intact.
@@ -468,34 +466,29 @@ def _run_experiment_outcome(
                     ),
                 )
             if experiment.mlflow is not None and cleanup.cleanup_confirmed:
-                from phasesweep.tracking.publication import (
-                    deliver_recovered_attempts,
-                    publish_failed_generation,
-                )
+                from phasesweep.tracking.publication import deliver_closeout
 
                 try:
-                    publish_failed_generation(experiment, generation_id, primary_error, claimed)
-                    deliver_recovered_attempts(
-                        experiment,
-                        claimed,
-                        generation_id,
-                        cleanup.settled_generations,
-                        tracker_unreachable=isinstance(
-                            primary_error, TrackingTargetUnavailableError
-                        ),
+                    deliver_closeout(
+                        experiment, claimed, generation_id, error=primary_error, tally=tracking
                     )
                 except ProcessCleanupUncertainError as tracking_exc:
                     cleanup.mark_uncertain(tracking_exc)
                     log.exception("MLflow failure delivery cleanup could not be confirmed")
-                except BaseException as tracking_exc:  # primary error must survive
-                    if (
-                        isinstance(tracking_exc, PhaseSweepShutdown)
-                        and not tracking_exc.report.cleanup_confirmed
-                    ):
-                        cleanup.mark_uncertain(tracking_exc)
+                except (PhaseSweepShutdown, KeyboardInterrupt) as tracking_exc:
+                    # The closing count already says what stays pending; the run keeps its error.
+                    cleanup.mark_uncertain_if_unconfirmed(tracking_exc)
+                    log.info("MLflow failure delivery stopped by a shutdown")
+                except BaseException:  # primary error must survive
                     log.exception(
                         "MLflow failure delivery did not complete; preserving the original error"
                     )
+            elif tracking is not None:
+                from phasesweep.tracking.publication import report_delivery
+
+                # Unconfirmed cleanup sends and saves nothing, but the closing count is a local
+                # read, so it still says what the run's earlier pass delivered and what waits.
+                report_delivery(experiment, generation_id, tracking)
             terminal_report = _terminal_report_from_cleanup(
                 generation_id,
                 cleanup,
@@ -508,7 +501,7 @@ def _run_experiment_outcome(
                     primary_error,
                     (ProcessCleanupUncertainError, StudyStorageUnavailableError),
                 )
-                and not shutdown_cleanup_uncertain
+                and not primary_cleanup_uncertain
                 and control_error is None
             ):
                 # Cleanup recovery takes precedence; preserve the original failure as the cause.
@@ -529,7 +522,7 @@ def _run_experiment_outcome(
             # Outside the except clause: the pointer has committed, so nothing
             # the MLflow mirror raises may enter the failure handling above.
             try:
-                if experiment.mlflow is not None:
+                if tracking is not None:
                     _mirror_publication(
                         experiment,
                         generation_id,
@@ -538,6 +531,7 @@ def _run_experiment_outcome(
                         # Success without a claim published nothing: the replay matched the
                         # publication.
                         published=generation.claimed,
+                        tally=tracking,
                     )
             finally:
                 terminal_report = _terminal_report_from_cleanup(
@@ -547,7 +541,16 @@ def _run_experiment_outcome(
                     failure_stage=None,
                     winners=result,
                     replayed_generation_id=generation.replayed_generation_id,
+                    phase_counts=generation.phase_counts,
                 )
+            # Pairs with the start line, so a log that holds several runs shows which finished.
+            log.info(
+                "Run finished: experiment %s, pid %d, %s, %s",
+                experiment.experiment,
+                os.getpid(),
+                run_totals(generation.phase_counts),
+                duration_text(time.monotonic() - run_started),
+            )
             return MappingProxyType(dict(result))
         finally:
             if terminal_callback is not None:
@@ -572,51 +575,95 @@ def _mirror_publication(
     *,
     ledger: ledger_ops.ValidatedLedger,
     published: bool,
+    tally: DeliveryTally,
 ) -> None:
     """Mirror a successful run's result to MLflow without changing the run's outcome.
 
-    The mirror sends the published generation's records, then the outcomes this run's
-    recovery committed for earlier attempts. Once the last-success pointer has committed,
-    nothing may fail the run. An ordinary failure only leaves the mirror for ``phasesweep
-    sync-tracking``, which rebuilds any record this left unsaved. A tracking worker whose
-    cleanup is uncertain is recorded as cleanup evidence, and a shutdown still ends the run,
-    marked as arriving after the published result.
+    The mirror sends whatever earlier generations still leave pending, as ``phasesweep
+    sync-tracking`` would, then the published generation's pending records, until MLflow stops
+    answering.
+    Once the last-success pointer has committed, nothing may fail the run. An ordinary
+    failure only leaves the mirror for the next run or ``phasesweep sync-tracking``, which
+    rebuild any record this left unsaved. A tracking worker whose cleanup is uncertain is
+    recorded as cleanup evidence, and a shutdown still ends the run, marked as arriving after
+    the published result.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param str generation_id: This run's generation.
     :param attempt_ops._PreflightCleanupReport cleanup: Cleanup evidence for the
-        terminal report, naming the generations recovery settled.
+        terminal report.
     :param ledger_ops.ValidatedLedger ledger: The run's ledger, holding the settled trials.
     :param bool published: Whether this run published ``generation_id``; a replay of an
         existing publication did not.
+    :param DeliveryTally tally: The run's MLflow delivery, which its pass after its first
+        target check already counts into.
     :raises PhaseSweepShutdown: A shutdown signal arrived during the mirror.
     """
-    from phasesweep.tracking.publication import deliver_recovered_attempts, publish_generation
+    from phasesweep.tracking.publication import deliver_closeout
+    from phasesweep.tracking.session import SYNC_TRACKING_STEP
 
     try:
-        if published:
-            publish_generation(experiment, generation_id)
-        deliver_recovered_attempts(experiment, ledger, generation_id, cleanup.settled_generations)
+        deliver_closeout(experiment, ledger, generation_id, published=published, tally=tally)
     except ProcessCleanupUncertainError as exc:
         cleanup.mark_uncertain(exc)
         log.exception(
-            "An MLflow tracking worker of generation %s's run may still be running; the "
-            "published result is unaffected. Run `phasesweep sync-tracking` with the same "
-            "config to retry its cleanup and delivery.",
+            "An MLflow tracking worker of generation %s's run may still be running. Run %s "
+            "to retry its cleanup and delivery.",
             generation_id,
+            SYNC_TRACKING_STEP,
         )
     except PhaseSweepShutdown as exc:
-        if not exc.report.cleanup_confirmed:
-            cleanup.mark_uncertain(exc)
+        cleanup.mark_uncertain_if_unconfirmed(exc)
         exc.published_result_committed = True
         raise
     except Exception:
         log.exception(
-            "MLflow delivery records of generation %s's run were not all saved; the published "
-            "result is unaffected. `phasesweep sync-tracking` rebuilds them from the ledger "
-            "and the published generation.",
+            "MLflow delivery records of generation %s's run were not all saved. Run %s to "
+            "rebuild them.",
             generation_id,
+            SYNC_TRACKING_STEP,
         )
+
+
+def _phase_counts(
+    ledger: ledger_ops.ValidatedLedger, phase: Phase, generation_id: str, winner: Winner
+) -> PhaseCounts | None:
+    """Count a finished phase's trials by recorded state, and the counted ones an earlier run recorded.
+
+    The counts also carry the attempt directory of each trial the phase's winner stands on, so
+    the summary names them from the same read. Reporting never fails a run whose result is
+    already decided, so a ledger that cannot be read back here costs the summary its counts for
+    the phase and nothing else.
+
+    :param ledger_ops.ValidatedLedger ledger: The run's ledger, memory-backed or journal-backed.
+    :param Phase phase: The phase that just ended.
+    :param str generation_id: This run's generation, which its own trials carry.
+    :param Winner winner: The phase's winner, whose trials' directories the counts carry.
+    :return PhaseCounts | None: The counts, or ``None`` when the phase's trials cannot be read.
+    """
+    try:
+        read = ledger_ops.read_phase_trials(ledger, phase)
+    except (PhaseSweepError, OSError) as exc:
+        log.warning("Could not count phase %r's trials for the run summary: %s", phase.name, exc)
+        return None
+    trials = [] if read is None else read.trials
+    states = Counter(_trial_count_state(trial) for trial in trials)
+    standing = _winning_trials(winner.trial_number, winner.attempt_id, winner.repeats)
+    standing_dirs = (
+        _recorded_trial_dir(trial)
+        for trial in sorted(trials, key=lambda trial: trial.number)
+        if _stands_under_winner(trial, standing)
+    )
+    return PhaseCounts(
+        complete=states["COMPLETE"],
+        infeasible=states["INFEASIBLE"],
+        failed=states["FAIL"],
+        interrupted=states["INTERRUPTED"],
+        earlier=_finished_trial_count(
+            trial for trial in trials if trial.user_attrs.get(GENERATION_ID_ATTR) != generation_id
+        ),
+        winner_dirs=tuple(directory for directory in standing_dirs if directory is not None),
+    )
 
 
 def _run_experiment_inner(
@@ -628,6 +675,7 @@ def _run_experiment_inner(
     preloaded_winners: dict[str, Winner] | None = None,
     run_deadline: float | None = None,
     publication_hook: PublicationHook | None = None,
+    tracking: DeliveryTally | None = None,
 ) -> dict[str, Winner]:
     """Execute the phase sequence under the caller's locks and signal handlers.
 
@@ -644,6 +692,8 @@ def _run_experiment_inner(
         before generation commit.
     :param float | None run_deadline: Monotonic deadline including preflight and stale cleanup.
     :param PublicationHook | None publication_hook: Optional required publication sidecar.
+    :param DeliveryTally | None tracking: The run's MLflow delivery, for the pass after its first
+        target check, or ``None`` for a dry run or a run without MLflow.
     :return dict[str, Winner]: Phase winners, or dry-run placeholders and replayed winners.
     :raises TimeoutError: The run deadline expired before a phase started.
     :raises PublicationAccessError: A recorded dry-run publication is inaccessible.
@@ -664,13 +714,13 @@ def _run_experiment_inner(
         try:
             busy = locking_ops.experiment_is_busy(experiment)
         except (OSError, UnsafeLockPathError, PlatformCapabilityError) as exc:
-            log.warning("DRY RUN could not check whether the experiment is active: %s", exc)
+            warn_dry_run("could not check whether the experiment is active: %s", exc)
             busy = None
         if busy is not False:
             preview_context = "hypothetical restart "
         if busy:
-            log.warning(
-                "DRY RUN another operation is active. Counts below assume a restart from this "
+            warn_dry_run(
+                "another operation is active. Counts below assume a restart from this "
                 "snapshot. In-flight trials can still finish without a rerun."
             )
         # A tree this PhaseSweep cannot use refuses before the preview, as a launch would.
@@ -678,9 +728,9 @@ def _run_experiment_inner(
         for _phase, lines in experiment_disclosures(experiment):
             for warning, line in lines:
                 if warning:
-                    log.warning("DRY RUN warning: %s", line)
+                    warn_dry_run("%s", line)
                 else:
-                    log.info("DRY RUN %s", line)
+                    report.info("DRY RUN %s", line)
         preloaded_winners = resume_ops._preflight_skipped_winners(
             experiment, from_phase=from_phase, run_deadline=None
         )
@@ -693,17 +743,13 @@ def _run_experiment_inner(
             and run_deadline is not None
             and time.monotonic() >= run_deadline
         ):
-            raise phase_timeout(
-                f"Run wallclock deadline reached before phase {phase.name!r} could start.",
-                scope="run",
-                experiment=experiment,
-            )
+            raise resume_ops._run_deadline_refusal(experiment, phase.name)
         if (
             using_preloaded_winner
             and preloaded_winners is not None
             and phase.name not in preloaded_winners
         ):
-            log.info("phase=%s SKIPPED (no published or required winner)", phase.name)
+            report.info(skipped_line(experiment, phase, "no published or required winner"))
             continue
         # Resolve current parents before validating skipped winners or running the phase.
         inherited = {p: winners[p] for p in phase.inherits}
@@ -713,7 +759,7 @@ def _run_experiment_inner(
             winners[phase.name] = preloaded_winners[phase.name]
             if generation is not None:
                 generation.save_winner(phase.name, winners[phase.name])
-            log.info("phase=%s SKIPPED (using preflight-validated winner)", phase.name)
+            report.info(skipped_line(experiment, phase, "using its validated earlier winner"))
             continue
         skip_until = False
 
@@ -729,46 +775,26 @@ def _run_experiment_inner(
                 generation=generation,
                 ledger=ledger,
                 run_deadline=run_deadline,
+                tracking=tracking,
             )
+            counts = _phase_counts(ledger, phase, generation.generation_id, winner)
+            if counts is not None:
+                generation.phase_counts[phase.name] = counts
         if generation is not None:
             generation.save_winner(phase.name, winner)
-            group = winner.repeats
-            completion = winner.completion
-            log.info(
-                "phase=%s WINNER trial=%d metric=%g params=%s%s%s",
-                phase.name,
-                winner.trial_number,
-                winner.metric,
-                winner.params,
-                ""
-                if group is None
-                else (
-                    f" ({group['reduce']} over {group['spread']['n']} repeats of "
-                    f"{group['key']!r}: sd={group['spread']['sd']:g}, "
-                    f"range {group['spread']['min']:g}..{group['spread']['max']:g}, "
-                    f"members {[member['trial_number'] for member in group['members']]})"
-                ),
-                ""
-                if not completion.get("incomplete")
-                else (
-                    f" INCOMPLETE {completion['finished_trials']}/"
-                    f"{completion['requested_trials']} finished "
-                    f"timeout_scope={completion['timeout_scope']}"
-                ),
-            )
+            report.info(winner_line(experiment, phase, winner))
         winners[phase.name] = winner
 
     if generation is None:
-        log.info("DRY RUN %s%s", preview_context, _dry_run_total_line(previews))
-        log.info("DRY RUN complete. No trials launched, no summary written.")
+        report.info("DRY RUN %s%s", preview_context, _dry_run_total_line(previews))
+        report.info("DRY RUN complete. No trials launched, no summary written.")
         return winners
 
     if not generation.claimed:
         published_id = generation_ops._publication_holds(experiment, winners)
         if published_id is not None:
             log.info(
-                "No trial launched and generation %s already publishes these winners; "
-                "the publication is unchanged and no new generation was written.",
+                "No trial launched and generation %s already publishes these winners.",
                 published_id,
             )
             generation.replayed_generation_id = published_id
