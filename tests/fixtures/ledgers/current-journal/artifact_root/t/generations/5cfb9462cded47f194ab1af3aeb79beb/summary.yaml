@@ -1,6 +1,6 @@
 schema_version: 7
 experiment: t
-generation_id: 454afe9aa92043e9ac99881485455c2d
+generation_id: 5cfb9462cded47f194ab1af3aeb79beb
 phasesweep_version: 0.3.15
 config_fingerprint: 510eb146e62737707cbf637293fedb6a7f213d3715b3bada974b7f90d629f027
 metric:
@@ -28,15 +28,15 @@ phases:
     incomplete: false
     reason: null
     timeout_scope: null
-  generation_id: 454afe9aa92043e9ac99881485455c2d
-  attempt_id: de38ed019f744a8bb6849b030246ede9
-  trial_dir: trial_00000__de38ed019f744a8bb6849b030246ede9
+  generation_id: 5cfb9462cded47f194ab1af3aeb79beb
+  attempt_id: 647f8c1766404bee8e58a941ddd6e042
+  trial_dir: trial_00000__647f8c1766404bee8e58a941ddd6e042
   winner_source:
     kind: phase_trial
     phase: p
     trial_number: 0
-    generation_id: 454afe9aa92043e9ac99881485455c2d
-    attempt_id: de38ed019f744a8bb6849b030246ede9
+    generation_id: 5cfb9462cded47f194ab1af3aeb79beb
+    attempt_id: 647f8c1766404bee8e58a941ddd6e042
   trainer_input:
     schema_version: 1
     format: argparse
@@ -73,7 +73,7 @@ phases:
         verdict: ok
         detail:
           generations:
-          - generation_id: 454afe9aa92043e9ac99881485455c2d
+          - generation_id: 5cfb9462cded47f194ab1af3aeb79beb
             record: unknown
             commit: null
             dirty: null
@@ -85,11 +85,11 @@ phases:
 artifacts:
 - kind: config_snapshot
   path: config.snapshot.yaml
-  sha256: 00192fb5f988ac1b289b0103e17949b89f53ebf386c77813c3b4a715e2ff2680
+  sha256: 66ca9aa184e8b9780c9695fcc9db655dba75f6b5117ab47144878daca599fc69
 - kind: reproducibility
   path: reproducibility.json
-  sha256: a8e09ac9151a09a8f24c631febfc867062e8bf6e9c0a1d1a42e024b0337e174d
+  sha256: 9f64245686f5c708c9e8848869226bd7ae2a5a65e6e7ea6ff8a0cb619020d88f
 - kind: winner
   phase: p
-  sha256: 4eda706d1328fd5a2b7885c3bba4b1d58569d6b53ece885b957ec3514bb179d7
+  sha256: f79070c05f9e5642b0ee377223ccc982baf9ac13de177058bbad9bc574203b98
 trainer_config: {}
