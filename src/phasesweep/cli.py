@@ -28,7 +28,7 @@ from phasesweep.config.io import (
     describe_validation_error,
     load_experiment,
 )
-from phasesweep.config.models import Experiment, experiment_disclosures
+from phasesweep.config.models import Experiment, Phase, experiment_disclosures
 from phasesweep.config.reference import (
     ReferenceEntry,
     explain_command,
@@ -961,6 +961,17 @@ def validate(config_path: Path, settings: tuple[str, ...]) -> None:
     click.echo("\n".join([*wrap(sentence, terminal_width(sys.stdout)), dry_run]))
 
 
+def _phase_header(phase: Phase) -> str:
+    """Name a phase with its trial budget, how it samples and the phases it inherits from.
+
+    :param Phase phase: Phase to describe.
+    :return str: The header, such as ``depth: n_trials=2 sampler=grid inherits=a,b``.
+    """
+    sampling = f"sampler={phase.sampler.type}" if phase_draws(phase) else "(fixed configuration)"
+    inherits = f" inherits={','.join(phase.inherits)}" if phase.inherits else ""
+    return f"{phase.name}: n_trials={phase.n_trials} {sampling}{inherits}"
+
+
 def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> None:
     """Render phase summaries and sampler capability lines for ``validate``.
 
@@ -974,11 +985,7 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
     for phase, lines in experiment_disclosures(experiment):
         prefix = indent
         if phase is not None:
-            deps = f" inherits={phase.inherits}" if phase.inherits else ""
-            sampling = (
-                f"sampler={phase.sampler.type}" if phase_draws(phase) else "(fixed configuration)"
-            )
-            click.echo(f"{indent}- {phase.name}: n_trials={phase.n_trials} {sampling}{deps}")
+            click.echo(f"{indent}- {_phase_header(phase)}")
             prefix += "    "
         for warning, line in lines:
             if warning:
