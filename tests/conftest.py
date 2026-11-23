@@ -674,8 +674,9 @@ def console_script(name: str) -> Path:
     return script
 
 
-#: The names of a short trial directory and of a real one, which is wider than a terminal; the
-#: report and trial-table tests each put them under their own parent.
+#: The names of a short trial directory and of an arbitrary one wider than an 80-column line, which
+#: the layout tests of the report and the trial table put under their own parent. The wide name
+#: is not a name PhaseSweep builds; it only has to overrun the terminal.
 SHORT_TRIAL_NAME = "trial_00001"
 ATTEMPT_TRIAL_NAME = (
     "trial_00001__generation_6413d5c1edd5475998cfadd4d3b59980"
