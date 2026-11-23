@@ -464,9 +464,8 @@ def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> N
         phase, consecutive_failures=2, completion_sequence=2, trial_target=4
     )
 
-    with pytest.raises(PhaseAbortRefusedError) as refused:
-        phase_ops._raise_streak_at_limit(phase, streak, phase_study(original), dependents=())
-    message = _operational_error_text(refused.value)
+    refused = phase_ops._streak_at_limit_error(phase, streak, phase_study(original), dependents=())
+    message = _operational_error_text(refused)
     assert "has 2 consecutive failed/infeasible trials" in message
     assert "meets max_consecutive_failures=2" in message
     assert_advises_target(message, 4, 6, "retry its 2 failed cells and run its 2 remaining cells")
@@ -495,10 +494,9 @@ def test_infeasible_streak_advice_sends_a_bounds_change_to_a_new_experiment(
     streak = phase_ops._failure_policy_abort_record(
         phase, consecutive_failures=2, completion_sequence=2, trial_target=4
     )
-    with pytest.raises(PhaseAbortRefusedError) as at_limit:
-        phase_ops._raise_streak_at_limit(phase, streak, phase_study(original), dependents=())
+    at_limit = phase_ops._streak_at_limit_error(phase, streak, phase_study(original), dependents=())
 
-    for message in map(_operational_error_text, (aborted.value, refused.value, at_limit.value)):
+    for message in map(_operational_error_text, (aborted.value, refused.value, at_limit)):
         _assert_advises_limit(message, 2, 2)
         assert message.index("metric bounds or constraints; to change those") < message.index(
             "new `experiment` name"

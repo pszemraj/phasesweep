@@ -243,7 +243,6 @@ The principal test groups and what each covers:
 - TODO(runtime): Recover draws whose bookkeeping failed before the trainer started. A fatal pre-launch write can currently spend the draw and require a top-up.
 - TODO(runtime): Print a recovered trial's kept result as a report line in the trial-line style. Recovery logs `Kept completed trial result: …` as a warning, which is the console's only record of the recovered value and carries the `warning:` label for good news.
 - TODO(runtime): Fit `validate`'s contract lines to the terminal and print the extractor without Python dict syntax. `run --dry-run` already wraps the same facts; `validate` prints them as single lines of up to several hundred columns.
-- TODO(runtime): Show a recorded phase abort in `status` and `status --trials`. After a failure-streak abort the phase reads as `3 of 8 trials` with three FAIL rows and no abort mark or `# fix:` line; only the next `run` or dry run says the phase is refused and prints the step.
 - TODO(runtime): Head `status --trials` with the metric the study recorded, or say that the config's differs. After `metric.name` or `metric.goal` is edited, the table labels the recorded values with the edited name and direction while still marking the recorded winner.
 - TODO(runtime): Account for repeated configuration–seed pairs so running the same seed twice does not inflate the pooled noise band's effective sample size.
 - TODO(runtime): Recheck process identity in `_signal_members` so PID reuse between enumeration and signalling cannot redirect a signal to another group.

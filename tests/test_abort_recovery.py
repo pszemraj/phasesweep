@@ -11,9 +11,10 @@ from typing import Any
 import optuna
 import pytest
 import yaml
+from click.testing import CliRunner
 
 from phasesweep import run_experiment
-from phasesweep.cli import _operational_error_text
+from phasesweep.cli import _operational_error_text, cli
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import StudySchemaMismatchError, TrialTargetRefusedError
@@ -44,6 +45,7 @@ from tests.conftest import (
     make_experiment,
     phase_study,
     trial_outcome,
+    write_experiment_config,
     write_flag_gated_trainer,
     write_flaky_trainer,
     write_trainer,
@@ -528,6 +530,54 @@ def test_raised_failure_limit_leaves_an_abort_with_no_trials_left(tmp_path: Path
         assert "phases[p].n_trials above 2" in message
         assert "max_consecutive_failures above" not in message
     assert len(phase_study(initial).trials) == 2
+
+
+@pytest.mark.parametrize("kind", ["recorded abort", "streak at the lowered limit"])
+def test_status_prints_the_refusal_the_next_run_prints(tmp_path: Path, kind: str) -> None:
+    """``status`` and ``status --trials`` give a recorded refusal and its fix as ``run`` words them, active run or not."""
+    failing = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
+    if kind == "recorded abort":
+        experiment = make_experiment(
+            persistent=tmp_path,
+            trainer=failing,
+            n_trials=3,
+            max_consecutive_failures=2,
+            gpu_policy="none",
+            sampler={"type": "random", "seed": 7},
+        )
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(experiment)
+    else:
+        experiment = make_experiment(
+            persistent=tmp_path,
+            trainer=failing,
+            n_trials=2,
+            max_consecutive_failures=5,
+            gpu_policy="none",
+            sampler={"type": "random", "seed": 7},
+        )
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(experiment)
+        # An interrupted run leaves a target above the finished trials; lowering the limit
+        # to the recorded streak then refuses new work at that target.
+        phase_study(experiment).set_user_attr(TRIAL_TARGET_ATTR, 3)
+        phase = experiment.phases[0].model_copy(
+            update={"n_trials": 3, "max_consecutive_failures": 2}
+        )
+        experiment = experiment.model_copy(update={"phases": [phase]})
+    with pytest.raises(PhaseAbortRefusedError) as refused:
+        run_experiment(experiment)
+    expected = _operational_error_text(refused.value).splitlines()
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+
+    shown = CliRunner().invoke(cli, ["status", str(config)])
+    assert shown.exit_code == 0, shown.output
+    comments = [line for line in shown.output.splitlines() if line.startswith("# ")]
+    assert comments == [f"# {line}" for line in expected]
+
+    table = CliRunner().invoke(cli, ["status", str(config), "--trials"], env={"COLUMNS": "500"})
+    assert table.exit_code == 0, table.output
+    assert "\n".join(f"  {line}" for line in expected) in table.output
 
 
 def _abort_fatally(

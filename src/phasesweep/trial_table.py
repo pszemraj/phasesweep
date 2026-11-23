@@ -432,6 +432,10 @@ def _phase_lines(
         width,
         subsequent_indent=INDENT,
     )
+    if table.refusal is not None:
+        diagnosis, step = table.refusal
+        lines.extend(wrap(diagnosis, width, indent=INDENT, subsequent_indent=INDENT))
+        lines.extend(wrap_labeled("fix:", step, width, indent=INDENT))
     sources = set(tables.winner_generations.values())
     source = tables.winner_generations.get(table.phase)
     if len(sources) > 1 and source is not None:

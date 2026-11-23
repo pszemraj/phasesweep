@@ -76,6 +76,7 @@ def _table(
     available: bool = True,
     finished: int | None = None,
     uncounted: tuple[tuple[str, int], ...] = (),
+    refusal: tuple[str, str] | None = None,
 ) -> TrialTable:
     """Build a table whose columns are the core ones plus every optional key any row carries.
 
@@ -95,6 +96,7 @@ def _table(
         finished=len(rows) if finished is None else finished,
         uncounted=uncounted,
         groups=groups,
+        refusal=refusal,
     )
 
 
@@ -228,6 +230,30 @@ def test_a_phase_without_trials_says_so() -> None:
             "depth: no trials yet, eval_loss (lower is better)",
         ]
     )
+
+
+def test_a_recorded_refusal_and_its_fix_print_under_the_heading() -> None:
+    """A phase a run would refuse says why and what to do under its heading, wrapped to the width."""
+    phase = _phase("search", n_trials=8, x=IntParam(type="int", low=0, high=9))
+    refusal = (
+        "Phase 'search' previously aborted at its accepted n_trials=8: 3 consecutive "
+        "failed/infeasible trials reached max_consecutive_failures=3.",
+        "Fix the cause, then raise phases[search].n_trials above 8 and rerun.",
+    )
+    rows = [_row(index, None, {"x": index}, state="FAIL", duration=0.1) for index in range(3)]
+    tables = _tables(
+        _table("search", rows, refusal=refusal), represented=None, published=None, winners={}
+    )
+
+    lines = _render(tables, phase).splitlines()
+
+    assert lines[3:8] == [
+        "search: 3 of 8 trials, eval_loss (lower is better)",
+        "  Phase 'search' previously aborted at its accepted n_trials=8: 3 consecutive",
+        "  failed/infeasible trials reached max_consecutive_failures=3.",
+        "  fix: Fix the cause, then raise phases[search].n_trials above 8 and rerun.",
+        "          trial  eval_loss  x  state  time",
+    ]
 
 
 def test_unreadable_trial_data_is_reported_without_a_table() -> None:

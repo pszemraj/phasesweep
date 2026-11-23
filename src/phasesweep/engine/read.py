@@ -59,6 +59,7 @@ from phasesweep.engine.paths import (
     _generation_summary_path,
     _generation_winner_path,
 )
+from phasesweep.engine.phase import _phase_refusal
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.publication import PublicationPointer, _resolve_publication_pointer
 from phasesweep.engine.publication_validation import ValidatedWinner, _parse_phase_plan
@@ -74,6 +75,7 @@ from phasesweep.engine.repeats import (
     repeat_axis,
 )
 from phasesweep.engine.selection import (
+    PhaseAbortRefusedError,
     TieGroupComparison,
     _cost_advisory,
     _edge_advisory,
@@ -101,17 +103,12 @@ from phasesweep.engine.state import (
     _validate_observed_block,
     _winning_trials,
 )
-from phasesweep.engine.study_policy import (
-    _awaits_cleanup_recovery,
-    _config_retires_abort,
-    _load_phase_policy_state,
-    _recovery_advice,
-)
+from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.errors import (
-    NEW_STUDY_STEP,
     PERSISTENT_STUDY_KEEPS_TRIALS,
     START_AGAIN_STEP,
     OperatorAction,
+    operator_step,
 )
 from phasesweep.evidence.models import EXTRACTOR_KINDS
 from phasesweep.runtime.json import JsonObject, JsonValue, float_or_none, json_object
@@ -1086,6 +1083,9 @@ class TrialTable:
     finished: int
     uncounted: tuple[tuple[str, int], ...]
     groups: tuple[RepeatGroupView, ...] = ()
+    #: The diagnosis and step a run of the same config would be refused with, from the phase's
+    #: recorded abort or failure streak (:func:`phasesweep.engine.phase._phase_refusal`).
+    refusal: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -1154,10 +1154,45 @@ class UnpublishedWinnerStep:
     fix: str
 
 
+def phase_refusals(
+    experiment: Experiment, ledger: ValidatedLedger
+) -> dict[str, PhaseAbortRefusedError]:
+    """Give the refusal each phase's recorded abort or failure streak would meet on a run.
+
+    :param Experiment experiment: Current config, which decides whether a recorded abort is
+        retired.
+    :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
+    :return dict[str, PhaseAbortRefusedError]: The refusal :func:`phasesweep.engine.phase._phase_refusal`
+        builds, by phase name, for each phase that has one; empty without a readable ledger.
+    """
+    if not experiment.persistent:
+        return {}
+    try:
+        studies = read_phase_studies(ledger)
+    except StudyStorageUnavailableError:
+        return {}
+    refusals: dict[str, PhaseAbortRefusedError] = {}
+    for phase in experiment.phases:
+        study = studies[phase.name]
+        if study is None:
+            continue
+        refusal = _phase_refusal(
+            phase,
+            study,
+            _load_phase_policy_state(study),
+            dependents=experiment.phases_inheriting(phase.name),
+        )
+        if refusal is not None:
+            refusals[phase.name] = refusal
+    return refusals
+
+
 def unpublished_winner_step(
     experiment: Experiment, ledger: ValidatedLedger
 ) -> UnpublishedWinnerStep | None:
-    """Give one publication remedy from recorded failures for an idle experiment.
+    """Give one publication remedy from a phase without a feasible winner, for an idle experiment.
+
+    A recorded abort or failure streak is :func:`phase_refusals`' to report.
 
     :param Experiment experiment: Current config used to inspect durable phase policy.
     :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
@@ -1175,19 +1210,6 @@ def unpublished_winner_step(
         if study is None:
             continue
         trials = study.get_trials(deepcopy=False)
-        abort = _load_phase_policy_state(study).abort
-        if abort is not None and (
-            _awaits_cleanup_recovery(study, abort)
-            or not _config_retires_abort(phase, trials, abort)
-        ):
-            cause = str(abort["cause"]).rstrip(".")
-            advice = (
-                _recovery_advice(
-                    phase, study, abort, dependents=experiment.phases_inheriting(phase.name)
-                )
-                or NEW_STUDY_STEP
-            )
-            return UnpublishedWinnerStep(f"Phase {phase.name!r}: {cause}.", advice)
         if _finished_trial_count(trials) < phase.n_trials:
             continue
         axis = repeat_axis(phase)
@@ -1322,6 +1344,7 @@ def _trial_table(
     winner: PhaseWinnerView | None,
     *,
     available: bool = True,
+    refusal: tuple[str, str] | None = None,
 ) -> TrialTable:
     """Build one phase's table from its trials and the winner the publication holds for it.
 
@@ -1333,6 +1356,8 @@ def _trial_table(
     :param Sequence[optuna.trial.FrozenTrial] trials: The phase study's trials.
     :param PhaseWinnerView | None winner: The published winner for the phase, if any.
     :param bool available: ``False`` when the trials could not be read, so ``trials`` is empty.
+    :param tuple[str, str] | None refusal: The diagnosis and step a run would be refused with,
+        defaults to none.
     :return TrialTable: The rows and the columns they carry.
     """
     axis = repeat_axis(phase)
@@ -1386,6 +1411,7 @@ def _trial_table(
             if state not in FINISHED_TRIAL_STATES and state in states
         ),
         groups=_repeat_group_views(experiment, phase, trials, rows),
+        refusal=refusal,
     )
 
 
@@ -1469,7 +1495,9 @@ def read_trial_tables(
 
     Resolve publication once before capturing trials; winner marks identify the
     requested generation, or that publication by default. Absent studies and in-memory ledgers
-    have no rows. Unreadable phases are reported unavailable.
+    have no rows. Unreadable phases are reported unavailable. A phase whose recorded abort or
+    failure streak would refuse a run carries that refusal, read from the same study snapshot as
+    its trials.
 
     :param Experiment experiment: Parsed experiment config whose phases are read.
     :param str | None generation_id: Generation whose winners are marked, defaulting to publication.
@@ -1497,15 +1525,36 @@ def read_trial_tables(
         )
     }
     tables: list[TrialTable] = []
+    unreadable: StudyStorageUnavailableError | None = None
+    studies: dict[str, optuna.Study | None] = {}
+    try:
+        studies = read_phase_studies(ledger)
+    except StudyStorageUnavailableError as exc:
+        unreadable = exc
     for phase in experiment.phases:
-        try:
-            read = read_phase_trials(ledger, phase)
-        except StudyStorageUnavailableError as exc:
-            log_storage_read_failure(ledger, phase, exc, logger=log)
+        if unreadable is not None:
+            log_storage_read_failure(ledger, phase, unreadable, logger=log)
             tables.append(_trial_table(experiment, phase, [], None, available=False))
             continue
-        trials = [] if read is None else read.trials
-        tables.append(_trial_table(experiment, phase, trials, winners.get(phase.name)))
+        study = studies[phase.name]
+        if study is None:
+            tables.append(_trial_table(experiment, phase, [], winners.get(phase.name)))
+            continue
+        refusal = _phase_refusal(
+            phase,
+            study,
+            _load_phase_policy_state(study),
+            dependents=experiment.phases_inheriting(phase.name),
+        )
+        tables.append(
+            _trial_table(
+                experiment,
+                phase,
+                study.get_trials(deepcopy=False),
+                winners.get(phase.name),
+                refusal=(str(refusal), operator_step(refusal)) if refusal is not None else None,
+            )
+        )
     return TrialTables(
         experiment=experiment.experiment,
         published_generation_id=published_generation_id,

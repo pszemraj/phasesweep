@@ -565,7 +565,11 @@ def test_unpublished_status_prints_the_recorded_failure_remedy_once(
         run_experiment(experiment)
     shown = CliRunner().invoke(cli, ["status", str(config)])
     assert shown.exit_code == 0, shown.output
-    assert shown.output.count("Winner retained but not published") == 1
+    # A recorded abort is a refusal, which status prints in place of the retained-winner comment.
+    assert shown.output.count("Winner retained but not published") == (0 if streak_abort else 1)
+    assert ("# Phase 'c' previously aborted at its accepted n_trials=2" in shown.output) is (
+        streak_abort
+    )
     assert f"\n# fix: {operator_step(refused.value)}\n" in shown.output
     assert "fix:" not in shown.output.replace("# fix:", "")
     assert "phases[c].n_trials" in shown.output

@@ -469,10 +469,10 @@ def _as_sentence(cause: object) -> str:
     return text if text.rstrip().endswith((".", "!", "?")) else f"{text}."
 
 
-def _raise_prior_phase_abort(
+def _prior_phase_abort_error(
     phase: Phase, abort_record: JsonObject, study: optuna.Study, *, dependents: Sequence[str]
-) -> None:
-    """Refuse a phase whose recorded abort the current config does not retire.
+) -> PhaseAbortRefusedError:
+    """Build the refusal of a phase whose recorded abort the current config does not retire.
 
     The advice comes from :func:`~phasesweep.engine.study_policy._recovery_advice` and
     the action from :func:`~phasesweep.engine.study_policy._recovery_action`.
@@ -483,11 +483,10 @@ def _raise_prior_phase_abort(
         ``trial_target`` and ``cause``.
     :param optuna.Study study: The phase's study.
     :param Sequence[str] dependents: The phases that inherit ``phase``.
-    :raises PhaseAbortRefusedError: Always; this function never returns
-        normally.
+    :return PhaseAbortRefusedError: The refusal, for the caller to raise or report.
     """
     advice = _recovery_advice(phase, study, abort_record, dependents=dependents)
-    raise PhaseAbortRefusedError(
+    return PhaseAbortRefusedError(
         f"Phase {phase.name!r} previously aborted at its accepted "
         f"n_trials={abort_record['trial_target']}: {_as_sentence(abort_record['cause'])}",
         action=_recovery_action(study, abort_record),
@@ -495,10 +494,10 @@ def _raise_prior_phase_abort(
     )
 
 
-def _raise_streak_at_limit(
+def _streak_at_limit_error(
     phase: Phase, abort_record: JsonObject, study: optuna.Study, *, dependents: Sequence[str]
-) -> None:
-    """Refuse new work while the resumed failure streak meets the current limit.
+) -> PhaseAbortRefusedError:
+    """Build the refusal of new work while the resumed failure streak meets the current limit.
 
     :param Phase phase: Phase whose current ``max_consecutive_failures`` the
         streak meets.
@@ -507,17 +506,72 @@ def _raise_streak_at_limit(
         accepted target.
     :param optuna.Study study: The phase's study.
     :param Sequence[str] dependents: The phases that inherit ``phase``.
-    :raises PhaseAbortRefusedError: Always; this function never returns
-        normally.
+    :return PhaseAbortRefusedError: The refusal, for the caller to raise or report.
     """
     advice = _recovery_advice(phase, study, abort_record, dependents=dependents)
-    raise PhaseAbortRefusedError(
+    return PhaseAbortRefusedError(
         f"Phase {phase.name!r} has {abort_record['consecutive_failures']} consecutive "
         f"failed/infeasible trials, which meets "
         f"max_consecutive_failures={phase.max_consecutive_failures}.",
         action=OperatorAction.FIX_CONFIG,
         remediation=advice,
     )
+
+
+def _replayed_streak_abort(
+    phase: Phase, study: optuna.Study, policy_state: _PhasePolicyState
+) -> JsonObject | None:
+    """Return the abort a replayed failure streak at the current limit would record.
+
+    :param Phase phase: The phase being judged.
+    :param optuna.Study study: The phase's study.
+    :param _PhasePolicyState policy_state: The study's replayed failure-policy state.
+    :return JsonObject | None: The abort, or ``None`` when one is already recorded, the phase
+        has no work remaining, or the streak is under the limit.
+    """
+    if (
+        policy_state.abort is not None
+        or _finished_trial_count(study.get_trials(deepcopy=False)) >= phase.n_trials
+        or not _consecutive_failure_threshold_tripped(policy_state.consecutive_failures, phase)
+    ):
+        return None
+    return _failure_policy_abort_record(
+        phase,
+        consecutive_failures=policy_state.consecutive_failures,
+        completion_sequence=policy_state.max_sequence,
+        trial_target=_accepted_trial_target(study),
+    )
+
+
+def _phase_refusal(
+    phase: Phase,
+    study: optuna.Study,
+    policy_state: _PhasePolicyState,
+    *,
+    dependents: Sequence[str],
+) -> PhaseAbortRefusedError | None:
+    """Return the refusal a run would raise for the phase's recorded abort or failure streak.
+
+    A recorded abort refuses until the current config retires it or its cleanup recovery runs,
+    and a replayed streak at the current limit refuses until ``n_trials`` exceeds the accepted
+    target. ``run`` raises it and ``status`` prints it, so both give one diagnosis and step.
+
+    :param Phase phase: The phase being judged.
+    :param optuna.Study study: The phase's study.
+    :param _PhasePolicyState policy_state: The study's replayed failure-policy state.
+    :param Sequence[str] dependents: The phases that inherit ``phase``.
+    :return PhaseAbortRefusedError | None: The refusal, or ``None`` when the phase may run.
+    """
+    abort = policy_state.abort
+    if abort is not None and (
+        _awaits_cleanup_recovery(study, abort)
+        or not _config_retires_abort(phase, study.get_trials(deepcopy=False), abort)
+    ):
+        return _prior_phase_abort_error(phase, abort, study, dependents=dependents)
+    streak = _replayed_streak_abort(phase, study, policy_state)
+    if streak is not None and phase.n_trials <= _accepted_trial_target(study):
+        return _streak_at_limit_error(phase, streak, study, dependents=dependents)
+    return None
 
 
 @dataclass(frozen=True)
@@ -673,30 +727,14 @@ def _judge_recorded_phase(
             raise _no_feasible_before_deadline(
                 experiment, phase.name, partial_decision.timeout_scope
             ) from exc
-    # A later success or a lowered failure limit does not clear a recorded abort.
+    # A later success or a lowered failure limit does not clear a recorded abort. A live run's
+    # preflight confirms cleanup before this point; a dry run cannot.
+    refusal = _phase_refusal(phase, study, policy_state, dependents=dependents)
+    if refusal is not None:
+        raise refusal
     active_abort = policy_state.abort
-    trials = study.get_trials(deepcopy=False)
-    # A live run's preflight confirms cleanup before this point; a dry run cannot.
-    if active_abort is not None and (
-        _awaits_cleanup_recovery(study, active_abort)
-        or not _config_retires_abort(phase, trials, active_abort)
-    ):
-        _raise_prior_phase_abort(phase, active_abort, study, dependents=dependents)
-    if (
-        active_abort is None
-        and _finished_trial_count(trials) < phase.n_trials
-        and _consecutive_failure_threshold_tripped(policy_state.consecutive_failures, phase)
-    ):
-        # A replayed streak at the current limit requires a raised target for new work.
-        accepted_target = _accepted_trial_target(study)
-        active_abort = _failure_policy_abort_record(
-            phase,
-            consecutive_failures=policy_state.consecutive_failures,
-            completion_sequence=policy_state.max_sequence,
-            trial_target=accepted_target,
-        )
-        if phase.n_trials <= accepted_target:
-            _raise_streak_at_limit(phase, active_abort, study, dependents=dependents)
+    if active_abort is None:
+        active_abort = _replayed_streak_abort(phase, study, policy_state)
     return _PhaseResume(
         policy_state=policy_state,
         phase_fingerprint=phase_fingerprint,

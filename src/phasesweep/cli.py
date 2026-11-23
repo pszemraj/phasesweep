@@ -75,6 +75,7 @@ from phasesweep.engine.read import (
     _read_generation_selection,
     _represented_winners,
     experiment_status,
+    phase_refusals,
     read_trial_tables,
     require_study,
     unpublished_winner_step,
@@ -1352,11 +1353,13 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     The payload is printed first and in full even when it reports a corrupt
     publication: the operator needs the trial counts and generation identity
     to decide what to inspect, and the boundary's one-line diagnostic follows
-    on stderr. An unpublished winner gets a comment explaining how to resume publication,
-    and trials recorded RUNNING while no run holds the experiment's locks get a comment
-    saying that a rerun settles them. These comments require a successful idle lock probe.
-    ``--trials`` prints the trial tables in its place, from one publication resolution,
-    styled only on a terminal, and exits the same way.
+    on stderr. A phase whose recorded abort or failure streak would refuse a run gets a
+    comment with that refusal and its fix, active run or not. Otherwise an unpublished winner
+    gets a comment explaining how to resume publication, and trials recorded RUNNING while no
+    run holds the experiment's locks get a comment saying that a rerun settles them; both
+    require a successful idle lock probe. ``--trials`` prints the trial tables in its place,
+    from one publication resolution, with each refusal under its phase's heading, styled only
+    on a terminal, and exits the same way.
 
     :param Path config_path: Experiment YAML file to inspect.
     :param bool show_trials: Print per-phase trial tables instead of the YAML status.
@@ -1409,7 +1412,12 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     suggest_resume = _status_can_suggest_resume(config) if running or retained else False
     if running and suggest_resume:
         click.echo(unsettled_running_comment(running))
-    if retained and suggest_resume:
+    # A recorded refusal needs no idle probe: it holds whether or not a run is active.
+    refusals = phase_refusals(config, ledger)
+    for refusal in refusals.values():
+        for line in _operational_error_text(refusal).splitlines():
+            click.echo(f"# {line}")
+    if retained and suggest_resume and not refusals:
         step = unpublished_winner_step(config, ledger)
         if step is not None:
             click.echo(
