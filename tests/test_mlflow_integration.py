@@ -1,4 +1,4 @@
-"""Qualification against a temporary HTTP MLflow 3.17 server."""
+"""Qualification against a temporary HTTP MLflow server."""
 
 from __future__ import annotations
 
