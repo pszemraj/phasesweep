@@ -27,7 +27,7 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
     _last_successful_generation_path,
 )
-from phasesweep.engine.read import PhaseWinnerView, read_result
+from phasesweep.engine.read import read_result
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
@@ -49,7 +49,12 @@ from phasesweep.mcp.server import (
     GetRunResultsResult,
     GetRunStatusResult,
 )
-from phasesweep.mcp.snapshots import RunResultSnapshot, StatusSnapshot, capture_result_snapshot
+from phasesweep.mcp.snapshots import (
+    RunResultSnapshot,
+    StatusSnapshot,
+    WinnerSnapshot,
+    capture_result_snapshot,
+)
 from phasesweep.mcp.tools import PhaseSweepMCP
 from tests.conftest import (
     phase_study,
@@ -380,7 +385,7 @@ def test_mcp_winners_hide_unusable_frozen_publications_before_and_after_live_rea
         experiment_id: str,
         experiment: Experiment,
         saved: RunHandle,
-    ) -> tuple[StatusSnapshot, list[PhaseWinnerView]]:
+    ) -> tuple[StatusSnapshot, list[WinnerSnapshot]]:
         nonlocal finalized
         result = original_live_result(experiment_id, experiment, saved)
         assert not finalized
@@ -932,7 +937,7 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
 
     def finish_during_live_read(
         experiment_id: str, experiment: Experiment, saved: RunHandle
-    ) -> tuple[StatusSnapshot, list[PhaseWinnerView]]:
+    ) -> tuple[StatusSnapshot, list[WinnerSnapshot]]:
         nonlocal finalized, runner_live
         result = original_live(experiment_id, experiment, saved)
         if not finalized:

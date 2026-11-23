@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Collection, Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -22,7 +22,6 @@ from phasesweep.engine.read import (
     EngineStatus,
     PhaseWinnerView,
     ResultContext,
-    WinnerAdvisories,
     _recorded_count,
     read_result,
     read_status,
@@ -387,98 +386,103 @@ class WinnerSnapshot(_SnapshotModel):
     edge_advisory_status: EdgeAdvisoryStatus
 
 
-def _winner_snapshot(
+def _engine_winner_view(
     phase: str,
-    winner: PhaseWinnerView | Winner,
+    winner: Winner,
     *,
     experiment: Experiment,
     ledger: ValidatedLedger,
-) -> WinnerSnapshot:
-    """Freeze either engine winner representation into one validated snapshot.
-
-    A read view already carries its read-time advice; an engine winner gets it here.
+) -> PhaseWinnerView:
+    """Give an engine winner the facts and read-time advice a read view carries.
 
     :param str phase: Phase under which the winner is exposed.
-    :param PhaseWinnerView | Winner winner: Winner representation to serialize.
-    :param Experiment experiment: The config the runner executed, which produced an engine
-        winner: it locates the trials the advice is recomputed from
-        (:func:`phasesweep.engine.read.winner_advisories`) and decides the survivorship remedy.
+    :param Winner winner: Winner from the engine's terminal report.
+    :param Experiment experiment: The config the runner executed: it locates the trials the
+        advice is recomputed from (:func:`phasesweep.engine.read.winner_advisories`) and
+        decides the survivorship remedy.
     :param ValidatedLedger ledger: Handle the snapshot validated once for ``experiment``.
-    :raises RuntimeError: Either representation carries no confound verdicts or no source
-        provenance.
-    :return WinnerSnapshot: Validated path-free winner snapshot.
+    :raises RuntimeError: The winner carries no confound verdicts.
+    :return PhaseWinnerView: View of the winner with its advice.
     """
-    advisories: WinnerAdvisories
-    if isinstance(winner, Winner):
-        gates_passed = (
+    provenance = winner.objective_provenance
+    extractor = provenance.get("extractor") if isinstance(provenance, Mapping) else None
+    kind = extractor.get("kind") if isinstance(extractor, Mapping) else None
+    if winner.confound is None:
+        raise RuntimeError("Current-format winner is missing confound verdicts.")
+    view = PhaseWinnerView(
+        phase=phase,
+        trial_number=winner.trial_number,
+        metric=winner.metric,
+        params=dict(winner.params),
+        effective_overrides={},
+        gates_passed=(
             all(bool(gate.get("passed")) for gate in winner.gates) if winner.gates else None
-        )
-        incomplete = bool(winner.completion.get("incomplete", False))
-        provenance = winner.objective_provenance
-        extractor = provenance.get("extractor") if isinstance(provenance, Mapping) else None
-        kind = extractor.get("kind") if isinstance(extractor, Mapping) else None
-        if winner.confound is None:
-            raise RuntimeError("Current-format winner is missing confound verdicts.")
-        confound = _confound_summary(
+        ),
+        incomplete=bool(winner.completion.get("incomplete", False)),
+        source=winner.source,
+        confound=_confound_summary(
             winner.confound,
             winner_trial=winner.trial_number,
             extractor_kind=kind if isinstance(kind, str) else "unknown",
             persistent=experiment.persistent,
             dependents=experiment.phases_inheriting(phase),
-        )
-        repeats = None if winner.repeats is None else _repeats_summary(winner.repeats)
-        view = PhaseWinnerView(
-            phase=phase,
-            trial_number=winner.trial_number,
-            metric=winner.metric,
-            params=dict(winner.params),
-            effective_overrides={},
-            gates_passed=gates_passed,
-            incomplete=incomplete,
-            repeats=repeats,
-            repeats_detail=winner.repeats,
-            confound_detail=winner.confound,
-            finished_trials=_recorded_count(winner.completion.get("finished_trials")),
-        )
-        advisories = winner_advisories(experiment, view, config_matches=True, ledger=ledger)
-    else:
-        gates_passed = winner.gates_passed
-        incomplete = winner.incomplete
-        if winner.confound is None:
-            raise RuntimeError("Current-format winner is missing confound verdicts.")
-        confound = winner.confound
-        repeats = winner.repeats
-        advisories = WinnerAdvisories(
-            winner.cost_advisory,
-            winner.cost_advisory_status,
-            winner.tie_groups,
-            winner.edge_advisory,
-            winner.edge_advisory_status,
-        )
-    tie_groups = advisories.tie_groups
-    source = winner.source
-    if source is None:
-        raise RuntimeError("Current-format winner is missing source provenance.")
-    return WinnerSnapshot(
-        phase=phase,
-        trial_number=winner.trial_number,
-        metric=winner.metric,
-        params=dict(winner.params),
-        gates_passed=gates_passed,
-        incomplete=incomplete,
-        generation_id=winner.generation_id if isinstance(winner, Winner) else source.generation_id,
-        attempt_id=winner.attempt_id if isinstance(winner, Winner) else source.attempt_id,
-        source=WinnerSourceSnapshot.model_validate(asdict(source)),
-        confound=ConfoundSummary.model_validate(confound),
+        ),
         observed=dict(winner.observed),
-        repeats=None if repeats is None else RepeatsSpread.model_validate(repeats),
+        repeats=None if winner.repeats is None else _repeats_summary(winner.repeats),
+        repeats_detail=winner.repeats,
+        confound_detail=winner.confound,
+        finished_trials=_recorded_count(winner.completion.get("finished_trials")),
+    )
+    advisories = winner_advisories(experiment, view, config_matches=True, ledger=ledger)
+    return replace(
+        view,
         cost_advisory=advisories.cost_advisory,
         cost_advisory_status=advisories.cost_advisory_status,
-        tie_groups=(
-            None if tie_groups is None else [TieGroupSnapshot.model_validate(g) for g in tie_groups]
-        ),
+        tie_groups=advisories.tie_groups,
         edge_advisory=advisories.edge_advisory,
         edge_advisory_status=advisories.edge_advisory_status,
+    )
+
+
+def winner_snapshot(view: PhaseWinnerView) -> WinnerSnapshot:
+    """Project a winner view onto the model frozen reads and redaction share.
+
+    The execution identity comes from the source trial: a view's own ``generation_id``
+    names the generation that represents it, which differs for a reselected earlier trial.
+
+    :param PhaseWinnerView view: Live read view, or an engine winner's view from
+        :func:`_engine_winner_view`.
+    :raises RuntimeError: The view carries no source provenance or no confound verdicts.
+    :raises ValidationError: The view does not fit the strict snapshot model.
+    :return WinnerSnapshot: Validated path-free winner.
+    """
+    source = view.source
+    if source is None:
+        raise RuntimeError("Current-format winner is missing source provenance.")
+    if view.confound is None:
+        raise RuntimeError("Current-format winner is missing confound verdicts.")
+    return WinnerSnapshot(
+        phase=view.phase,
+        trial_number=view.trial_number,
+        metric=view.metric,
+        params=dict(view.params),
+        gates_passed=view.gates_passed,
+        incomplete=view.incomplete,
+        generation_id=source.generation_id,
+        attempt_id=source.attempt_id,
+        source=WinnerSourceSnapshot.model_validate(asdict(source)),
+        confound=ConfoundSummary.model_validate(view.confound),
+        observed=dict(view.observed),
+        repeats=None if view.repeats is None else RepeatsSpread.model_validate(view.repeats),
+        cost_advisory=view.cost_advisory,
+        cost_advisory_status=view.cost_advisory_status,
+        tie_groups=(
+            None
+            if view.tie_groups is None
+            else [TieGroupSnapshot.model_validate(group) for group in view.tie_groups]
+        ),
+        edge_advisory=view.edge_advisory,
+        edge_advisory_status=view.edge_advisory_status,
     )
 
 
@@ -577,22 +581,18 @@ def capture_result_snapshot(
         # The engine's winners count even where the generation holds no winner file.
         for phase in status["phases"]:
             phase["winner_present"] = phase["phase"] in engine_winners
-        winner_snapshots = [
-            _winner_snapshot(phase_name, winner, experiment=experiment, ledger=ledger)
+        winner_views = [
+            _engine_winner_view(phase_name, winner, experiment=experiment, ledger=ledger)
             for phase_name, winner in engine_winners.items()
         ]
     else:
         status, winner_views = read_result(experiment, generation_id=generation_id, ledger=ledger)
-        winner_snapshots = [
-            _winner_snapshot(winner.phase, winner, experiment=experiment, ledger=ledger)
-            for winner in winner_views
-        ]
     if not generation_claimed:
         status["represented_generation_id"] = None
     snapshot = RunResultSnapshot(
         schema_version=RESULT_SNAPSHOT_SCHEMA_VERSION,
         status=status_snapshot(status),
-        winners=winner_snapshots,
+        winners=[winner_snapshot(view) for view in winner_views],
         represented_config_fingerprint=(
             _experiment_semantic_fingerprint(
                 experiment, phase_count=len(status["result_phase_plan"])

@@ -44,7 +44,7 @@ from phasesweep.engine.errors import (
     WinnerIntegrityError,
 )
 from phasesweep.engine.fingerprints import _recorded_config_matches
-from phasesweep.engine.read import PhaseWinnerView, read_result
+from phasesweep.engine.read import read_result
 from phasesweep.engine.resume import _preflight_skipped_winners
 from phasesweep.mcp.audit import AUDIT_LOG_NAME, AuditLogger
 from phasesweep.mcp.errors import (
@@ -112,6 +112,7 @@ from phasesweep.mcp.snapshots import (
     capture_pre_generation_result_snapshot,
     parse_result_snapshot,
     status_snapshot,
+    winner_snapshot,
 )
 from phasesweep.mcp.tool_names import TOOL_CANCEL_RUN, TOOL_LAUNCH_RUN
 from phasesweep.runtime.files import ensure_private_dir, open_private_text
@@ -843,7 +844,7 @@ class PhaseSweepMCP:
         str,
         Experiment | None,
         StatusSnapshot,
-        Sequence[PhaseWinnerView | WinnerSnapshot],
+        Sequence[WinnerSnapshot],
         RunHandle,
         RunnerView,
         ResultSource,
@@ -866,7 +867,7 @@ class PhaseSweepMCP:
         # unavailable-result placeholders need the sibling configuration.
         experiment = None if snapshot is not None else self._load_run_experiment(handle)
         snapshot, result_source = self._result_snapshot_view(experiment, handle, snapshot, view)
-        winners: Sequence[PhaseWinnerView | WinnerSnapshot]
+        winners: Sequence[WinnerSnapshot]
         if snapshot is None:
             assert experiment is not None
             status, winners = self._live_result(target_id, experiment, handle)
@@ -921,7 +922,7 @@ class PhaseSweepMCP:
         experiment_id: str,
         experiment: Experiment,
         handle: RunHandle,
-    ) -> tuple[StatusSnapshot, list[PhaseWinnerView]]:
+    ) -> tuple[StatusSnapshot, list[WinnerSnapshot]]:
         """Read run-pinned generation status and winners using the saved run config.
 
         After decataloging, that config still locates artifacts but cannot establish current
@@ -930,8 +931,8 @@ class PhaseSweepMCP:
         :param str experiment_id: Catalog id associated with the read target.
         :param Experiment experiment: Live run snapshot config.
         :param RunHandle handle: Live run pinning the represented generation.
-        :return tuple[StatusSnapshot, list[PhaseWinnerView]]: Live status projected onto
-            the frozen status model, and the represented generation's winners.
+        :return tuple[StatusSnapshot, list[WinnerSnapshot]]: Live status and the represented
+            generation's winners, projected onto the models frozen reads use.
         """
         comparison = self._catalog_comparison_experiment(experiment_id)
         try:
@@ -949,7 +950,7 @@ class PhaseSweepMCP:
             self._raise_persistent_read_error(handle, exc)
         if comparison is None:
             status["published_config_matches_current"] = None
-        return status_snapshot(status), winners
+        return status_snapshot(status), [winner_snapshot(winner) for winner in winners]
 
     @staticmethod
     def _raise_persistent_read_error(
@@ -1081,7 +1082,7 @@ class PhaseSweepMCP:
         result = winners_payload(
             target_id,
             winner_views,
-            metric=status.metric.model_dump(mode="json"),
+            metric=status.metric,
             declared_phases=list(status.result_phase_plan),
             result_source=result_source,
             publication_integrity=publication_integrity,

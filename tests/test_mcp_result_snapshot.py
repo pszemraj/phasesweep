@@ -86,7 +86,7 @@ def _frozen_result_payload(snapshot: RunResultSnapshot) -> dict[str, object]:
     return winners_payload(
         "t",
         snapshot.winners,
-        metric=snapshot.status.metric.model_dump(mode="json"),
+        metric=snapshot.status.metric,
         declared_phases=snapshot.status.result_phase_plan,
         result_source="frozen_run_snapshot",
         publication_integrity=snapshot.status.publication_integrity,

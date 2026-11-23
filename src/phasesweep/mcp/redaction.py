@@ -5,11 +5,16 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, TypeAlias
 
-from phasesweep.engine.read import PhaseWinnerView, ResultContext
+from phasesweep.engine.read import ResultContext
 from phasesweep.engine.state import FINISHED_TRIAL_STATES, TRIAL_STATE_NAMES
 from phasesweep.mcp.errors import sync_tracking_command
 from phasesweep.mcp.registry import VisibleParamsPolicy
-from phasesweep.mcp.snapshots import McpPublicationState, StatusSnapshot, WinnerSnapshot
+from phasesweep.mcp.snapshots import (
+    McpPublicationState,
+    MetricSnapshot,
+    StatusSnapshot,
+    WinnerSnapshot,
+)
 from phasesweep.runtime.json import JsonObject, JsonValue, json_object
 
 ResultSource: TypeAlias = Literal[
@@ -60,28 +65,20 @@ def _visible_winner_params(
 
 
 def _tie_groups_payload(
-    view: PhaseWinnerView | WinnerSnapshot, policy: VisibleParamsPolicy
+    view: WinnerSnapshot, policy: VisibleParamsPolicy
 ) -> list[JsonObject] | None:
     """Apply the winner parameter policy to every overlapping configuration.
 
-    :param PhaseWinnerView | WinnerSnapshot view: Live or frozen phase winner.
+    :param WinnerSnapshot view: Live or frozen phase winner.
     :param VisibleParamsPolicy policy: Catalog parameter visibility.
     :return list[JsonObject] | None: Redacted comparisons, or null when trial details are unavailable.
     """
     if view.tie_groups is None:
         return None
-    groups = (
-        [group.model_dump(mode="json") for group in view.tie_groups]
-        if isinstance(view, WinnerSnapshot)
-        else [dict(group) for group in view.tie_groups]
-    )
     public: list[JsonObject] = []
-    for group in groups:
-        payload = json_object(group)
-        params = payload["params"]
-        if not isinstance(params, dict):
-            raise TypeError("tie-group parameters are not a mapping")
-        payload["params"] = json_object(_visible_winner_params(params, policy)[0])
+    for group in view.tie_groups:
+        payload = json_object(group.model_dump(mode="json"))
+        payload["params"] = json_object(_visible_winner_params(group.params, policy)[0])
         public.append(payload)
     return public
 
@@ -105,9 +102,9 @@ def _run_wrote_generation(
 
 def winners_payload(
     experiment_id: str,
-    views: Sequence[PhaseWinnerView | WinnerSnapshot],
+    views: Sequence[WinnerSnapshot],
     *,
-    metric: dict[str, Any],
+    metric: MetricSnapshot,
     declared_phases: list[str],
     result_source: ResultSource,
     publication_integrity: McpPublicationState,
@@ -118,15 +115,15 @@ def winners_payload(
     result_context: ResultContext = "current_config",
     published_config_matches_current: bool | None = None,
 ) -> dict[str, Any]:
-    """Build the ``get_run_results`` payload from live views or frozen winners.
+    """Build the ``get_run_results`` payload from live or frozen winners.
 
     Expose sampled params under the visibility policy; omit effective overrides, fixed
     values and inherited values.
 
     :param str experiment_id: Catalog id whose winners are being returned.
-    :param Sequence[PhaseWinnerView | WinnerSnapshot] views: Live engine views or
-        validated frozen winners.
-    :param dict[str, Any] metric: Optimization metric and objective-evidence
+    :param Sequence[WinnerSnapshot] views: Live winners projected by
+        :func:`phasesweep.mcp.snapshots.winner_snapshot`, or the frozen ones.
+    :param MetricSnapshot metric: Optimization metric and objective-evidence
         kind the represented generation recorded.
     :param list[str] declared_phases: Phase plan the represented generation
         published under, in execution order.
@@ -143,7 +140,6 @@ def winners_payload(
         represented generation, or current config when nothing is published.
     :param bool | None published_config_matches_current: Represented/current config
         fingerprint agreement, or ``None`` when undeterminable.
-    :raises RuntimeError: A winner view carries no source provenance.
     :return dict[str, Any]: MCP-safe winners payload.
     """
     winner_phases = {view.phase for view in views}
@@ -152,8 +148,6 @@ def winners_payload(
     for view in views:
         params, redacted = _visible_winner_params(view.params, visible_params)
         source = view.source
-        if source is None:
-            raise RuntimeError("Current-format winner is missing source provenance.")
         winner_source = {
             "kind": source.kind,
             "phase": source.phase,
@@ -176,17 +170,9 @@ def winners_payload(
                 "params_redacted": redacted,
                 "gates_passed": view.gates_passed,
                 "incomplete": view.incomplete,
-                "confound": (
-                    view.confound.model_dump(mode="json")
-                    if isinstance(view, WinnerSnapshot)
-                    else view.confound
-                ),
+                "confound": view.confound.model_dump(mode="json"),
                 "observed": dict(view.observed),
-                "repeats": (
-                    view.repeats.model_dump(mode="json")
-                    if isinstance(view, WinnerSnapshot) and view.repeats is not None
-                    else view.repeats
-                ),
+                "repeats": None if view.repeats is None else view.repeats.model_dump(mode="json"),
                 "cost_advisory": (
                     view.cost_advisory
                     if visible_params == "all" or view.cost_advisory is None
@@ -213,7 +199,7 @@ def winners_payload(
         "publication_integrity": publication_integrity,
         "result_context": result_context,
         "published_config_matches_current": published_config_matches_current,
-        "metric": metric,
+        "metric": metric.model_dump(mode="json"),
         "declared_phase_count": len(declared_phases),
         "winner_count": len(views),
         "missing_phases": missing_phases,
