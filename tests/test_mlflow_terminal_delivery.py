@@ -26,13 +26,7 @@ from phasesweep.engine.ledger import (
     read_phase_trials,
     validate_ledger,
 )
-from phasesweep.engine.paths import (
-    _attempt_dir,
-    _experiment_dir,
-    _generation_dir,
-    _generation_record_path,
-    _phase_dir,
-)
+from phasesweep.engine.paths import _experiment_dir, _generation_dir, _generation_record_path
 from phasesweep.engine.read import experiment_status, read_status
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -193,7 +187,10 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
     assert retried.params == original.params
     assert retried.user_attrs[RERUN_OF_ATTR] == original.number
     assert search_generations == [reports[0].generation_id]
-    assert session.read_binding(attempt_dir) == created
+    tracking_dir = session.attempt_tracking_dir(
+        _experiment_dir(experiment), created["generation_id"], created["attempt_id"]
+    )
+    assert session.read_binding(tracking_dir) == created
     assert _sent(uploads, [created["attempt_id"]]) == ["KILLED"]
     assert publication.delivery_status(experiment)["pending"] == 0
 
@@ -252,7 +249,10 @@ def test_failed_trial_finishes_its_managed_run(tmp_path, monkeypatch):
         }
     )
 
-    def prepare(experiment, *, phase, generation_id, attempt_id, directory, **kwargs):
+    def prepare(experiment, *, phase, generation_id, attempt_id, **kwargs):
+        directory = session.attempt_tracking_dir(
+            _experiment_dir(experiment), generation_id, attempt_id
+        )
         binding = {
             **mlflow_binding(),
             "phase": phase,
@@ -320,8 +320,8 @@ def test_unresolved_attempt_upload_worker_fails_the_run(
 def _add_bound_attempt(
     experiment, study, phase, generation, attempt, number, *, trial, run_mode="managed"
 ):
-    """Persist a fresh trial and its native binding in the same attempt directory."""
-    directory = _attempt_dir(_phase_dir(experiment, phase), attempt)
+    """Persist a fresh trial and its generation-owned native run binding."""
+    directory = session.attempt_tracking_dir(_experiment_dir(experiment), generation, attempt)
     write_record(
         directory / BINDING_FILE,
         {
@@ -1022,6 +1022,48 @@ def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_pa
 
 
 @pytest.mark.integration
+def test_scoped_sync_reads_only_its_generations_attempt_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ended generation's sync ignores other bindings and reports its own unreadable intents."""
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config["phases"] = config["phases"][:1]
+    config["phases"][0].update(n_trials=1, gpu_policy="none", sampler={"type": "random", "seed": 1})
+    experiment = Experiment.model_validate(config)
+    run_experiment(experiment, generation_id="older")
+    run_experiment(experiment, generation_id="newer")
+    assert not experiment.persistent
+
+    (older_binding,) = session.attempt_tracking_records(experiment, BINDING_FILE, "older")
+    older_binding.write_text("{}", encoding="utf-8")
+    summary = session.delivery_record_path(experiment, "newer", session.SUMMARY_RECORD)
+    write_record(summary, {**read_record(summary), "state": "pending"})
+    uploads.clear()
+
+    reopened = Experiment.model_validate(config)
+    assert publication.sync_tracking(reopened, "newer") == {"pending": 0, "delivered": 3}
+    assert [request["binding"]["generation_id"] for request in uploads] == ["newer"]
+
+    orphan = session.attempt_tracking_dir(_experiment_dir(experiment), "newer", "orphan")
+    orphan.mkdir()
+    pending = orphan / session.PENDING_ATTEMPT_BINDING_FILE
+    pending.write_text("{}", encoding="utf-8")
+    assert publication.delivery_status(reopened, "newer") == {"pending": 1, "delivered": 3}
+    with pytest.raises(
+        TrackingSyncRefusedError, match="Could not reconcile local MLflow creation record"
+    ) as refused:
+        publication.sync_tracking(reopened, "newer")
+    assert str(pending) in str(refused.value)
+    assert pending.read_text(encoding="utf-8") == "{}"
+
+    source = tracking_root(experiment) / session.SOURCE_FILE
+    recorded = read_record(source, schema_version=session.SOURCE_SCHEMA_VERSION)
+    write_record(source, {**recorded, "schema_version": 1})
+    with pytest.raises(ValueError, match="Unsupported MLflow tracking record format"):
+        publication.sync_tracking(reopened, "newer")
+
+
+@pytest.mark.integration
 def test_sync_leaves_superseded_publication_unresolved_when_its_record_cannot_be_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1137,7 +1179,9 @@ def test_sync_binds_and_finishes_a_run_created_after_its_attempt_gave_up(
     reports = []
     run_experiment(experiment, terminal_callback=reports.append)
     generation = reports[0].generation_id
-    attempt_directory = _attempt_dir(_phase_dir(experiment, "depth"), late["attempt_id"])
+    attempt_directory = session.attempt_tracking_dir(
+        _experiment_dir(experiment), generation, late["attempt_id"]
+    )
     assert attempt_directory.is_dir()
     pending = attempt_directory / "mlflow-binding.pending.json"
     # An existing run is bound before sync, directly or by the search that follows an unreadable
@@ -1412,7 +1456,7 @@ def test_only_an_in_memory_generation_ends_an_attempt_its_ledger_lost(
         {**mlflow_binding(), "phase": "generation", "attempt_id": generation},
     )
     attempt = "1" * 32
-    directory = _attempt_dir(_phase_dir(experiment, "depth"), attempt)
+    directory = session.attempt_tracking_dir(_experiment_dir(experiment), generation, attempt)
     binding = {
         **mlflow_binding(),
         "phase": "depth",

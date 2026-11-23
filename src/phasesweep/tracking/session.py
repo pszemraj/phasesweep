@@ -56,17 +56,22 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 BINDING_FILE = "mlflow-binding.json"
-# The identity an attempt's run must carry, written in its trial directory before it launches.
+# The identity an attempt's run must carry, persisted before it launches.
 EXPECTED_BINDING_FILE = "mlflow-expected.json"
 GENERATION_BINDING_FILE = "generation-binding.json"
 INHERITS_FILE = "mlflow-inherits.json"
+_TRACKING_DIR = "tracking"
+# Attempt metadata is owned by its generation, even when its payload cannot be read.
+_TRACKING_ATTEMPTS_DIR = "attempts"
 # The target and experiment the tree's bound runs live in, under the tracking root.
 SOURCE_FILE = "source.json"
+SOURCE_SCHEMA_VERSION = 2
 # Delivery records live in this directory of their generation's tracking directory. The summary
 # run's is named SUMMARY_RECORD, the others attempt-<attempt id> and winner-<phase>.
 DELIVERY_DIR = "delivery"
 SUMMARY_RECORD = "generation"
 _PENDING_SUFFIX = ".pending.json"
+PENDING_ATTEMPT_BINDING_FILE = Path(BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
 PENDING_GENERATION_BINDING_FILE = Path(GENERATION_BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
 _PARENT_LOCK = threading.RLock()
 # Failures that say nothing about a request's subject: MLflow gave no answer, or the worker's
@@ -165,17 +170,15 @@ def gave_no_answer(exc: BaseException) -> bool:
 def record_name(path: Path) -> str:
     """Name a delivery record or creation intent by what it is, for the lines that report it.
 
-    :param Path path: A delivery record under ``tracking/<generation>/delivery``, a summary
-        run's creation intent under ``tracking/<generation>``, or an attempt run's creation
-        intent in its attempt directory.
+    :param Path path: A delivery record or a pending creation in its generation's
+        tracking directory.
     :return str: For example ``the summary record of generation <id>`` or ``attempt record
         attempt-<id> of generation <id>``.
     """
-    if path.name == PENDING_GENERATION_BINDING_FILE:
-        return f"the summary-run creation record of generation {path.parent.name}"
     if is_creation_intent(path):
-        # pending_creation_records finds these only in an attempt directory, named by its id.
-        generation = _intent_generation(path) or "unknown"
+        generation = _creation_generation(path)
+        if path.name == PENDING_GENERATION_BINDING_FILE:
+            return f"the summary-run creation record of generation {generation}"
         return f"the run-creation record of attempt {path.parent.name} of generation {generation}"
     generation = path.parent.parent.name
     if path.stem == SUMMARY_RECORD:
@@ -183,17 +186,15 @@ def record_name(path: Path) -> str:
     return f"{path.stem.split('-', 1)[0]} record {path.stem} of generation {generation}"
 
 
-def _intent_generation(path: Path) -> str | None:
-    """Read the generation an attempt run's pending creation was requested for.
+def _creation_generation(path: Path) -> str:
+    """Give the generation that owns a pending creation, identified by its location.
 
-    :param Path path: The creation intent in an attempt directory.
-    :return str | None: Its generation id, or ``None`` when the intent cannot be read,
-        which the reconciliation that reads it in full reports.
+    :param Path path: The summary or attempt creation intent.
+    :return str: The generation directory's name.
     """
-    try:
-        return validate_identity(read_record(path).get("identity"))["generation_id"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
+    if path.name == PENDING_GENERATION_BINDING_FILE:
+        return path.parent.name
+    return path.parent.parent.parent.name
 
 
 def is_creation_intent(path: Path) -> bool:
@@ -265,7 +266,32 @@ def tracking_root(experiment: Experiment) -> Path:
     """
     from phasesweep.engine.paths import _experiment_dir
 
-    return _experiment_dir(experiment) / "tracking"
+    return _experiment_dir(experiment) / _TRACKING_DIR
+
+
+def attempt_tracking_dir(artifact_root: Path, generation_id: str, attempt_id: str) -> Path:
+    """Locate an attempt's native run metadata in its generation's tracking state.
+
+    :param Path artifact_root: Experiment's artifact directory.
+    :param str generation_id: Generation that owns this attempt.
+    :param str attempt_id: Attempt whose tracking metadata is addressed.
+    :return Path: Directory for the native binding, expected identity and inheritance record.
+    """
+    return artifact_root / _TRACKING_DIR / generation_id / _TRACKING_ATTEMPTS_DIR / attempt_id
+
+
+def attempt_tracking_records(
+    experiment: Experiment, filename: str, generation_id: str | None
+) -> list[Path]:
+    """List one kind of MLflow attempt record in the requested generation scope.
+
+    :param Experiment experiment: Experiment owning the tracking state.
+    :param str filename: File name within each attempt's metadata directory.
+    :param str | None generation_id: Generation to inspect, or ``None`` for all generations.
+    :return list[Path]: Matching files in path order, without opening their payloads.
+    """
+    scope = generation_id or "*"
+    return sorted(tracking_root(experiment).glob(f"{scope}/{_TRACKING_ATTEMPTS_DIR}/*/{filename}"))
 
 
 def summary_binding_path(experiment: Experiment, generation_id: str) -> Path:
@@ -303,16 +329,17 @@ def write_record(path: Path, record: Mapping[str, object]) -> None:
     )
 
 
-def read_record(path: Path) -> JsonObject:
+def read_record(path: Path, *, schema_version: int = 1) -> JsonObject:
     """Read a current-format tracking record.
 
     :param Path path: Record to read.
+    :param int schema_version: Required local record version, defaults to 1.
     :raises ValueError: The record does not use the current format.
     :return JsonObject: Decoded current-format record.
     """
     data: object = strict_json_loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or data.get("schema_version") != 1:
-        raise ValueError("Unsupported MLflow tracking record format.")
+    if not isinstance(data, dict) or data.get("schema_version") != schema_version:
+        raise ValueError(f"Unsupported MLflow tracking record format at {path}.")
     return json_object(data)
 
 
@@ -336,11 +363,10 @@ def bind_mlflow_run(run_id: str) -> None:
     """
     from mlflow import MlflowClient
 
-    from phasesweep.engine.paths import _attempt_dir
-
-    # The binding belongs to this attempt, whose records sit beside the trial directory.
-    directory = _attempt_dir(
-        Path(os.environ["PHASESWEEP_TRIAL_DIR"]).parent, os.environ["PHASESWEEP_ATTEMPT_ID"]
+    directory = attempt_tracking_dir(
+        Path(os.environ["PHASESWEEP_TRIAL_DIR"]).parent.parent,
+        os.environ["PHASESWEEP_GENERATION_ID"],
+        os.environ["PHASESWEEP_ATTEMPT_ID"],
     )
     expected = read_record(directory / EXPECTED_BINDING_FILE)
     if (
@@ -371,7 +397,7 @@ def bind_mlflow_run(run_id: str) -> None:
 def read_inherits(directory: Path) -> dict[str, str]:
     """Load the native run of each parent winner an attempt inherited.
 
-    :param Path directory: Attempt directory.
+    :param Path directory: Attempt's tracking directory.
     :raises ValueError: The record is not a mapping of phase names to run IDs.
     :return dict[str, str]: Run ID by parent phase name.
     """
@@ -610,22 +636,13 @@ def pending_creation_records(
     :param str | None skip: Generation left out, a live invocation's own, defaults to none.
     :return list[Path]: Pending summary and attempt creation records, in that order.
     """
-    from phasesweep.engine.paths import _experiment_dir
-
     scope = generation_id or "*"
-    attempt_pending = Path(BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
-    # Attempt directories sit at <phase>/attempts/<attempt_id>, as _attempt_dir builds them.
     records = sorted(
         tracking_root(experiment).glob(f"{scope}/{PENDING_GENERATION_BINDING_FILE}")
-    ) + [
-        path
-        for path in sorted(_experiment_dir(experiment).glob(f"*/attempts/*/{attempt_pending}"))
-        if generation_id is None or _intent_generation(path) == generation_id
-    ]
+    ) + attempt_tracking_records(experiment, PENDING_ATTEMPT_BINDING_FILE, generation_id)
     if skip is None:
         return records
-    skipped = set(pending_creation_records(experiment, skip))
-    return [path for path in records if path not in skipped]
+    return [path for path in records if _creation_generation(path) != skip]
 
 
 def creation_window_end(experiment: Experiment, pending: Path) -> float:
@@ -722,6 +739,8 @@ def _reconcile_creation(
         _settle_creation(pending, tally)
         return
     identity = validate_identity(read_record(pending).get("identity"))
+    if identity["generation_id"] != _creation_generation(pending):
+        raise ValueError("MLflow creation record belongs to a different generation.")
     # A search started inside the window may see absence even if it returns after the window.
     expired = time.time() >= creation_window_end(experiment, pending)
     try:
@@ -791,11 +810,14 @@ def _resolve_source(
         experiment_id = json_text(resolved, "experiment_id")
         source_path = tracking_root(experiment) / SOURCE_FILE
         source = {
-            "schema_version": 1,
+            "schema_version": SOURCE_SCHEMA_VERSION,
             "source": experiment.mlflow.evidence_identity(),
             "experiment_id": experiment_id,
         }
-        if source_path.exists() and read_record(source_path) != source:
+        if (
+            source_path.exists()
+            and read_record(source_path, schema_version=SOURCE_SCHEMA_VERSION) != source
+        ):
             raise ValueError("MLflow experiment resolution changed within this scientific cohort.")
         write_record(source_path, source)
         return experiment_id
@@ -941,7 +963,6 @@ def prepare_attempt(
     run_name: str,
     overrides_sha256: str,
     inherited: Mapping[str, Winner],
-    directory: Path,
     environment: Mapping[str, str],
     deadline: float | None,
 ) -> RunIdentity:
@@ -956,12 +977,14 @@ def prepare_attempt(
     :param str run_name: The trainer's ``PHASESWEEP_RUN_NAME``, reused for a managed run.
     :param str overrides_sha256: Existing prepared-input identity.
     :param Mapping[str, Winner] inherited: Parent-phase winners fixed into this attempt.
-    :param Path directory: Registered attempt directory.
     :param Mapping[str, str] environment: Composed trainer environment.
     :param float | None deadline: Existing phase/run deadline.
     :return RunIdentity: Expected identity, a full binding with a run ID in managed mode.
     """
+    from phasesweep.engine.paths import _experiment_dir
+
     assert experiment.mlflow is not None
+    directory = attempt_tracking_dir(_experiment_dir(experiment), generation_id, attempt_id)
     parent = prepare_generation(
         experiment, generation_id=generation_id, environment=environment, deadline=deadline
     )

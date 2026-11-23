@@ -51,7 +51,7 @@ The root `generation.yaml` names the latest [generation](#timeouts-cleanup-and-c
 
 The generated `trainer_config.yaml` or `overrides.json` holds the trainer base with the effective overrides applied. For these file formats, `overrides_resolved.json` is an overrides-only audit record. For argparse and Hydra, it is the actual flattened input, merging the trainer base with effective overrides before command placeholders expand. Winner observations are empty when none were recorded; `repeats` is `null` outside a repeats phase.
 
-MLflow stores native run bindings in attempt directories, and [delivery and recovery records](mlflow.md#result-delivery-and-recovery) under `tracking/<generation-id>/delivery/` and `tracking/<generation-id>/cleanup-receipts/`.
+MLflow stores each native attempt's run binding and creation intent under `tracking/<generation-id>/attempts/<attempt-id>/`. Its [delivery and recovery records](mlflow.md#result-delivery-and-recovery) live under `tracking/<generation-id>/delivery/` and `tracking/<generation-id>/cleanup-receipts/`.
 
 W&B readers and MLflow workers use disposable scratch under `~/.cache/phasesweep/<backend>/workers/`, or the corresponding `XDG_CACHE_HOME/phasesweep` root; the default home comes from `Path.home()`. Each operation removes its temporary directory. Host locks use a [separate location](#storage-and-locks).
 

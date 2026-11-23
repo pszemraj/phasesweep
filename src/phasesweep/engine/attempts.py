@@ -1477,6 +1477,7 @@ def _fail_stale_running_trial(
             _EvidenceVerification(producing, producing.phase(record.phase_name)).verify_trial(
                 trial,
                 record.trial_dir,
+                record.generation_id,
                 record.attempt_id,
                 outcome.metric,
                 subject=f"Phase {record.phase_name!r} trial {trial.number}",

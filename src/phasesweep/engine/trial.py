@@ -802,13 +802,19 @@ def launch_trial(
         env["WANDB_RUN_ID"] = attempt_id
     if experiment.mlflow is not None:
         from phasesweep.runtime.json import json_text
-        from phasesweep.tracking.session import EXPECTED_BINDING_FILE, read_binding, read_record
+        from phasesweep.tracking.session import (
+            EXPECTED_BINDING_FILE,
+            attempt_tracking_dir,
+            read_binding,
+            read_record,
+        )
 
-        expected = read_record(attempt_dir / EXPECTED_BINDING_FILE)
+        tracking_dir = attempt_tracking_dir(workdir.parent.parent, generation_id, attempt_id)
+        expected = read_record(tracking_dir / EXPECTED_BINDING_FILE)
         env.pop("MLFLOW_EXPERIMENT_NAME", None)
         env["MLFLOW_EXPERIMENT_ID"] = json_text(expected, "experiment_id")
         if experiment.mlflow.run_mode == "managed":
-            env["MLFLOW_RUN_ID"] = read_binding(attempt_dir)["run_id"]
+            env["MLFLOW_RUN_ID"] = read_binding(tracking_dir)["run_id"]
     # The launch preflight checked this directory, but it can vanish while a phase runs.
     missing_cwd = _missing_trainer_cwd(experiment)
     if missing_cwd is not None:

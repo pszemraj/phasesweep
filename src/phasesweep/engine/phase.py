@@ -1045,7 +1045,6 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     run_name=trial_run_name(experiment, phase.name, *opened_by),
                     overrides_sha256=prepared_input.sha256,
                     inherited=run.inherited_winners,
-                    directory=attempt_dir,
                     environment=run.environment_identity.values,
                     deadline=run.optimize_deadline,
                 )

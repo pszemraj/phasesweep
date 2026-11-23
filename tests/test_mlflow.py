@@ -747,12 +747,12 @@ def test_creation_that_cannot_be_reconciled_keeps_its_record(
     deadline = time.monotonic() - 1 if expired else None
     worker = _ScriptedWorker(monkeypatch, create=[failure], find=[_ABSENT])
     with pytest.raises(error):
-        bind(deadline)
+        bind(deadline=deadline)
     assert worker.actions == ["create"]
     assert path.with_name(f"{path.stem}.pending.json").exists()
     # Later calls never create; an expired deadline does not even search.
     with pytest.raises(RuntimeError, match="unresolved"):
-        bind(deadline)
+        bind(deadline=deadline)
     assert worker.actions == later_actions
     assert path.with_name(f"{path.stem}.pending.json").exists()
 
@@ -799,16 +799,11 @@ def test_unreadable_creation_response_leaves_the_run_recoverable(
     tmp_path, monkeypatch, slot, reply, recovery
 ):
     """A response the controller cannot read says nothing about a creation, whatever it held."""
-    from phasesweep.engine.paths import _attempt_dir, _phase_dir
     from phasesweep.tracking import session
 
     experiment = native_experiment(tmp_path)
     identity = attempt_identity()
-    directory = _attempt_dir(_phase_dir(experiment, "p"), identity["attempt_id"])
-    directory.mkdir(parents=True)
-    bind, path = mlflow_binder(
-        tmp_path, slot, experiment=experiment, identity=identity, directory=directory
-    )
+    bind, path = mlflow_binder(tmp_path, slot, experiment=experiment, identity=identity)
     pending = path.with_name(f"{path.stem}.pending.json")
     binding = mlflow_binding()
     created = (
@@ -856,30 +851,31 @@ def test_sync_binds_late_runs_and_retires_expired_misses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Bind found runs at any age and retire absent ones outside the request window."""
-    from phasesweep.engine.paths import _attempt_dir, _phase_dir
+    from phasesweep.engine.paths import _experiment_dir
     from phasesweep.tracking import session
 
     experiment = native_experiment(tmp_path)
     first, second = "1" * 32, "2" * 32
     root = session.tracking_root(experiment)
 
-    def attempt_dir(attempt):
-        return _attempt_dir(_phase_dir(experiment, "p"), attempt)
+    def pending_path(generation: str, attempt: str) -> Path:
+        directory = session.attempt_tracking_dir(_experiment_dir(experiment), generation, attempt)
+        return directory / session.PENDING_ATTEMPT_BINDING_FILE
 
     pending = {
         "generation": _write_pending(
             root / first / "generation-binding.pending.json", attempt_identity(first, first)
         ),
         "absent": _write_pending(
-            attempt_dir("absent") / "mlflow-binding.pending.json",
+            pending_path(first, "absent"),
             attempt_identity(first, "absent"),
         ),
         "bound": _write_pending(
-            attempt_dir("bound") / "mlflow-binding.pending.json",
+            pending_path(first, "bound"),
             attempt_identity(first, "bound"),
         ),
         "other": _write_pending(
-            attempt_dir("late") / "mlflow-binding.pending.json",
+            pending_path(second, "late"),
             attempt_identity(second, "late"),
         ),
     }
@@ -1128,10 +1124,11 @@ def test_wrong_binding_is_rejected_before_remote_access(tmp_path, monkeypatch, f
         expected["run_id"] = "another-run"
     elif field != "unbound":
         binding[field] = "another-identity"
-    session.write_record(tmp_path / "mlflow-expected.json", expected)
-    if field != "unbound":
-        session.write_record(tmp_path / "mlflow-binding.json", binding)
     ctx = mlflow_trial_context(tmp_path)
+    directory = session.attempt_tracking_dir(tmp_path, ctx.generation_id, ctx.attempt_id)
+    session.write_record(directory / session.EXPECTED_BINDING_FILE, expected)
+    if field != "unbound":
+        session.write_record(directory / session.BINDING_FILE, binding)
 
     def remote(*args, **kwargs):
         pytest.fail("A foreign binding must not contact MLflow")
@@ -1895,13 +1892,12 @@ def test_later_phase_rechecks_a_bound_target(tmp_path, monkeypatch, error, expec
 def test_binding_helper_checks_target_and_preserves_parent(tmp_path, monkeypatch, problem):
     import sys
 
-    from phasesweep.engine.paths import _attempt_dir
     from phasesweep.tracking import bind_mlflow_run
-    from phasesweep.tracking.session import read_binding, write_record
+    from phasesweep.tracking.session import attempt_tracking_dir, read_binding, write_record
 
     binding = {**mlflow_binding(), "run_mode": "trainer"}
-    trial_dir = tmp_path / "trial_00000__attempt"
-    attempt_dir = _attempt_dir(tmp_path, binding["attempt_id"])
+    trial_dir = tmp_path / "p" / "trial_00000__attempt"
+    attempt_dir = attempt_tracking_dir(tmp_path, binding["generation_id"], binding["attempt_id"])
     attempt_dir.mkdir(parents=True)
     write_record(
         attempt_dir / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}

@@ -18,7 +18,7 @@ from phasesweep.config.models import Experiment
 from phasesweep.engine.attempts import _retire_active_attempt
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
 from phasesweep.engine.paths import _attempts_dir
-from phasesweep.engine.state import CLEANUP_CONFIRMED_ATTR, _trial_attempt_dir
+from phasesweep.engine.state import CLEANUP_CONFIRMED_ATTR
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
@@ -311,12 +311,9 @@ def test_recover_run_distinguishes_a_creation_miss_from_an_upload_failure(
 ) -> None:
     """An answering tracker can have no run for a recently interrupted creation."""
     run = _killed_run(tmp_path, monkeypatch)
-    [trial] = read_phase_trials(validate_ledger(run.experiment), "depth").trials
-    attempt_dir = _trial_attempt_dir(trial)
-    assert attempt_dir is not None
-    bound = attempt_dir / session.BINDING_FILE
-    identity = session.read_binding(attempt_dir)
-    pending = bound.with_suffix(".pending.json")
+    (bound,) = session.attempt_tracking_records(run.experiment, session.BINDING_FILE, None)
+    identity = session.read_binding(bound.parent)
+    pending = bound.with_name(session.PENDING_ATTEMPT_BINDING_FILE)
     session.write_record(
         pending,
         {

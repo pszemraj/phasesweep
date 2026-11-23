@@ -922,6 +922,7 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
     from phasesweep.tracking.session import (
         BINDING_FILE,
         EXPECTED_BINDING_FILE,
+        attempt_tracking_dir,
         gave_no_answer,
         read_binding,
         read_record,
@@ -931,15 +932,18 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
         return validate_capture(ctx.mlflow_capture)
     if ctx.mlflow_settings is None or ctx.mlflow_query is None:
         raise ExtractorError("MLflow capture requires a configured target and query.")
+    tracking_dir = attempt_tracking_dir(
+        ctx.trial_dir.parent.parent, ctx.generation_id, ctx.attempt_id
+    )
     try:
         # Managed runs are bound before launch, so only a trainer-owned run can be missing.
-        if not (ctx.attempt_dir / BINDING_FILE).is_file():
+        if not (tracking_dir / BINDING_FILE).is_file():
             raise ValueError(
                 "The trainer never bound its MLflow run; call "
                 "phasesweep.tracking.bind_mlflow_run(run_id) inside its active run."
             )
-        binding = read_binding(ctx.attempt_dir)
-        expected = read_record(ctx.attempt_dir / EXPECTED_BINDING_FILE)
+        binding = read_binding(tracking_dir)
+        expected = read_record(tracking_dir / EXPECTED_BINDING_FILE)
         if (
             any(binding.get(k) != v for k, v in expected.items())
             or binding["attempt_id"] != ctx.attempt_id

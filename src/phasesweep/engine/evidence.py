@@ -458,6 +458,7 @@ class _EvidenceVerification:
         self,
         trial: optuna.trial.FrozenTrial,
         trial_dir: Path,
+        generation_id: str,
         attempt_id: str,
         metric: float,
         *,
@@ -468,6 +469,7 @@ class _EvidenceVerification:
 
         :param optuna.trial.FrozenTrial trial: Trial holding the input, provenance and constraints.
         :param Path trial_dir: Trial directory the producing attempt ran in.
+        :param str generation_id: Generation that owns the attempt.
         :param str attempt_id: Attempt whose evidence is required.
         :param float metric: Recorded objective.
         :param str subject: Trial description for a refusal.
@@ -477,6 +479,7 @@ class _EvidenceVerification:
         _verify_trial_evidence_dir(
             trial_dir,
             subject=subject,
+            generation_id=generation_id,
             attempt_id=attempt_id,
             provenance=_trial_objective_provenance(trial),
             trainer_input=trial.user_attrs.get(TRAINER_INPUT_ATTR),
@@ -493,6 +496,7 @@ def _verify_trial_evidence_dir(
     trial_dir: Path,
     *,
     subject: str,
+    generation_id: str,
     attempt_id: str,
     provenance: Mapping[str, Any] | None,
     trainer_input: Any,
@@ -504,12 +508,14 @@ def _verify_trial_evidence_dir(
     """Require a trial's translated directories and its recorded artifacts.
 
     The trainer input and objective source live in the trial directory; the lifecycle
-    record, audit artifacts and tracker binding in the attempt's directory beside it. A
-    lifecycle record must belong to the attempt. Its state is not constrained: writing
+    record and audit artifacts in the attempt's directory beside it. MLflow metadata
+    stays in the producing generation's tracking directory. A lifecycle record must
+    belong to the attempt. Its state is not constrained: writing
     ``exited`` is best-effort, so completed trials may retain ``launching``.
 
     :param Path trial_dir: Translated trial directory the attempt ran in.
     :param str subject: Caller-built label naming the study, phase, and trial.
+    :param str generation_id: Producing generation that owns the attempt.
     :param str attempt_id: Attempt identity the lifecycle record must belong to.
     :param Mapping[str, Any] | None provenance: Parsed objective provenance.
     :param Any trainer_input: Versioned historical generated-input record.
@@ -589,16 +595,23 @@ def _verify_trial_evidence_dir(
     elif verification.mlflow_query is not None:
         from phasesweep.evidence.mlflow import observation_id
         from phasesweep.evidence.models import MlflowExtractor
-        from phasesweep.tracking.session import EXPECTED_BINDING_FILE, read_binding, read_record
+        from phasesweep.tracking.session import (
+            EXPECTED_BINDING_FILE,
+            attempt_tracking_dir,
+            read_binding,
+            read_record,
+        )
 
+        tracking_dir = attempt_tracking_dir(trial_dir.parent.parent, generation_id, attempt_id)
         try:
-            binding = read_binding(attempt_dir)
-            expected = read_record(attempt_dir / EXPECTED_BINDING_FILE)
+            binding = read_binding(tracking_dir)
+            expected = read_record(tracking_dir / EXPECTED_BINDING_FILE)
             if (
                 capture is None
                 or capture.get("kind") != "mlflow"
                 or capture["binding"] != binding
                 or capture["query"] != verification.mlflow_query
+                or binding["generation_id"] != generation_id
                 or binding["attempt_id"] != attempt_id
                 or binding["overrides_sha256"] != trainer_input["sha256"]
                 or any(binding.get(k) != v for k, v in expected.items())
@@ -684,7 +697,7 @@ def _validate_selection_evidence(
             identity = _selection_candidate_identity(trial)
             if identity is None:
                 continue
-            _, attempt_id = identity
+            generation_id, attempt_id = identity
             assert trial.value is not None
             subject = (
                 f"Study {study.study_name!r} phase {phase_name!r} trial {trial.number} "
@@ -712,6 +725,7 @@ def _validate_selection_evidence(
             verification.verify_trial(
                 trial,
                 phase_dir / expected_name,
+                generation_id,
                 attempt_id,
                 float(trial.value),
                 subject=subject,
@@ -753,6 +767,7 @@ def _verify_winner_evidence(
                 f"{subject} {member.trial_number} "
                 f"(generation {member.generation_id!r}, attempt {member.attempt_id!r})"
             ),
+            generation_id=member.generation_id,
             attempt_id=member.attempt_id,
             provenance=member.objective_provenance,
             trainer_input=member.trainer_input,

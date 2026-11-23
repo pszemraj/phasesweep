@@ -95,8 +95,8 @@ def _trial_dir_for(
 def _attempt_dir(phase_dir: Path, attempt_id: str) -> Path:
     """Return the directory holding one attempt's own records, beside the trial directories.
 
-    The lifecycle record, process identity, command, captured streams, environment record,
-    tracker bindings and evidence baseline live here rather than in the trial directory, so
+    The lifecycle record, process identity, command, captured streams, environment record
+    and evidence baseline live here rather than in the trial directory, so
     a trainer that clears its output directory cannot delete its own process identity.
 
     :param Path phase_dir: Phase directory holding the trial directory.

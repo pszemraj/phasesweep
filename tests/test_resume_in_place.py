@@ -281,10 +281,9 @@ def test_each_attempt_in_a_directory_delivers_its_own_mlflow_run(
     assert rerun.user_attrs[RERUN_OF_ATTR] == first.number
     assert rerun.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
     resumed = rerun.user_attrs[ATTEMPT_ID_ATTR]
-    phase_dir = _phase_dir(experiment, "depth")
     bindings = {
         path.parent.name: session.read_binding(path.parent)
-        for path in phase_dir.glob(f"attempts/*/{session.BINDING_FILE}")
+        for path in session.attempt_tracking_records(experiment, session.BINDING_FILE, None)
     }
     assert set(bindings) == {stopped, resumed}
     assert not (Path(first.user_attrs[TRIAL_DIR_ATTR]) / session.BINDING_FILE).exists()

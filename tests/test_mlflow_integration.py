@@ -192,7 +192,6 @@ def _late_creation(server, tmp_path, monkeypatch, *, timeout_seconds):
     from mlflow import MlflowClient
     from mlflow.exceptions import MlflowException
 
-    from phasesweep.engine.paths import _attempt_dir, _phase_dir
     from phasesweep.runtime.json import json_object
     from phasesweep.tracking import mlflow as worker
     from phasesweep.tracking import session
@@ -232,9 +231,7 @@ def _late_creation(server, tmp_path, monkeypatch, *, timeout_seconds):
         "experiment": experiment.experiment,
         "experiment_id": server.experiment_id,
     }
-    attempt_dir = _attempt_dir(_phase_dir(experiment, identity["phase"]), identity["attempt_id"])
-    attempt_dir.mkdir(parents=True)
-    bind, path = mlflow_binder(attempt_dir, "attempt", experiment=experiment, identity=identity)
+    bind, path = mlflow_binder(tmp_path, "attempt", experiment=experiment, identity=identity)
     return bind, path, calls, experiment
 
 
@@ -575,7 +572,7 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     from phasesweep.engine.paths import _experiment_dir
     from phasesweep.engine.selection import NoFeasibleTrialError
     from phasesweep.engine.state import FAILURE_REASON_ATTR
-    from phasesweep.tracking.session import read_binding
+    from phasesweep.tracking.session import BINDING_FILE, attempt_tracking_records, read_binding
     from tests.conftest import phase_trials, write_experiment_config
 
     monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
@@ -593,8 +590,8 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(experiment)
 
-    (directory,) = (_experiment_dir(experiment) / "p").glob("attempts/*")
-    binding = read_binding(directory)
+    (binding_path,) = attempt_tracking_records(experiment, BINDING_FILE, None)
+    binding = read_binding(binding_path.parent)
     remote = client.get_run(binding["run_id"])
     assert (remote.info.status, remote.data.tags["phasesweep.outcome"]) == ("FAILED", "FAILED")
     assert "phasesweep.objective" not in remote.data.metrics

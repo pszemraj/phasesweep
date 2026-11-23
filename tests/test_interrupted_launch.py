@@ -93,9 +93,13 @@ def extract_with_worker(ctx, cfg, **kwargs):
         "attempt_id": ctx.attempt_id,
         "overrides_sha256": ctx.overrides_sha256,
     }
-    session.write_record(ctx.attempt_dir / "mlflow-binding.json", binding)
+    tracking_dir = session.attempt_tracking_dir(
+        ctx.trial_dir.parent.parent, ctx.generation_id, ctx.attempt_id
+    )
+    session.write_record(tracking_dir / session.BINDING_FILE, binding)
     session.write_record(
-        ctx.attempt_dir / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
+        tracking_dir / session.EXPECTED_BINDING_FILE,
+        {k: v for k, v in binding.items() if k != "run_id"},
     )
     remote = experiment.model_copy(update={
         "mlflow": settings,

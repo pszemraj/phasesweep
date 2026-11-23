@@ -35,9 +35,12 @@ from phasesweep.tracking.session import (
     GENERATION_BINDING_FILE,
     ORIGINAL_TARGET_STEP,
     SOURCE_FILE,
+    SOURCE_SCHEMA_VERSION,
     SUMMARY_RECORD,
     SYNC_TRACKING_STEP,
     DeliveryTally,
+    attempt_tracking_dir,
+    attempt_tracking_records,
     call_tracking,
     count_text,
     delivered_text,
@@ -420,14 +423,15 @@ def publish_trial(
     """
     from optuna.trial import TrialState
 
-    from phasesweep.engine.state import _trial_attempt_dir
+    from phasesweep.engine.paths import _experiment_dir
+    from phasesweep.engine.state import ATTEMPT_ID_ATTR
 
-    # The binding lives in the attempt's own directory, beside the trial directory.
-    directory = _trial_attempt_dir(trial)
-    if directory is None:
+    attempt_id: object = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+    if not isinstance(attempt_id, str) or not attempt_id:
         if trial.state == TrialState.COMPLETE:
-            raise ValueError(f"Completed trial {trial.number} records no attempt directory.")
+            raise ValueError(f"Completed trial {trial.number} records no attempt id.")
         return
+    directory = attempt_tracking_dir(_experiment_dir(experiment), generation_id, attempt_id)
     if trial.state != TrialState.COMPLETE and not (directory / BINDING_FILE).is_file():
         return
     binding = read_binding(directory)
@@ -448,23 +452,18 @@ def _unrecorded_attempts(
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
-    :return list[tuple[Path, RunBinding]]: Attempt directory and binding of each such attempt.
+    :return list[tuple[Path, RunBinding]]: Tracking directory and binding of each such attempt.
     """
-    from phasesweep.engine.paths import _experiment_dir
-
-    # Attempt directories sit at <phase>/attempts/<attempt_id>, as _attempt_dir builds them.
-    attempts = [
-        (path.parent, read_binding(path.parent))
-        for path in sorted(_experiment_dir(experiment).glob(f"*/attempts/*/{BINDING_FILE}"))
-    ]
-    return [
-        (directory, binding)
-        for directory, binding in attempts
-        if binding["generation_id"] == generation_id
-        and not delivery_record_path(
+    attempts: list[tuple[Path, RunBinding]] = []
+    for path in attempt_tracking_records(experiment, BINDING_FILE, generation_id):
+        binding = read_binding(path.parent)
+        if binding["generation_id"] != generation_id or binding["attempt_id"] != path.parent.name:
+            raise ValueError(f"MLflow binding {path} belongs to a different generation or attempt.")
+        if not delivery_record_path(
             experiment, generation_id, f"attempt-{binding['attempt_id']}"
-        ).exists()
-    ]
+        ).exists():
+            attempts.append((path.parent, binding))
+    return attempts
 
 
 class _AttemptTrial(NamedTuple):
@@ -926,7 +925,7 @@ def _target_recorded(experiment: Experiment) -> bool:
     source = tracking_root(experiment) / SOURCE_FILE
     if not source.exists():
         return True
-    recorded = read_record(source).get("source")
+    recorded = read_record(source, schema_version=SOURCE_SCHEMA_VERSION).get("source")
     if not isinstance(recorded, dict):
         raise ValueError(f"MLflow tracking record {source} has no 'source' object.")
     return recorded == experiment.mlflow.evidence_identity()
@@ -1412,7 +1411,11 @@ def sync_tracking(
         # Refuse a tree this checkout cannot own before anything here writes to it.
         ledger = validate_ledger(experiment)
         _preflight_active_attempts(
-            experiment, _PreflightCleanupReport(), confirm=True, tracking_only=True
+            experiment,
+            _PreflightCleanupReport(),
+            confirm=True,
+            tracking_only=True,
+            generation_id=generation_id,
         )
         root = tracking_root(experiment)
         had_creations = bool(pending_creation_records(experiment, generation_id))

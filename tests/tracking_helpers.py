@@ -10,6 +10,7 @@ import shlex
 import sys
 import threading
 from collections.abc import Mapping
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +36,7 @@ from phasesweep.runtime.json import JsonObject
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
 from phasesweep.tracking.mlflow import OperationOutcomeUnknownError, _capture
+from phasesweep.tracking.records import RunBinding, RunIdentity
 
 
 class ManualClock:
@@ -116,7 +118,7 @@ def native_experiment(tmp_path, *, storage=None):
 
 
 def mlflow_trial_context(tmp_path: Path) -> TrialContext:
-    """Build the context of the native example's one attempt, with its directory at ``tmp_path``.
+    """Build the context of the native example's attempt in a scratch artifact tree.
 
     :param Path tmp_path: The attempt directory, also the example's workdir.
     :return TrialContext: Context carrying the MLflow settings and compiled query of a capture.
@@ -129,7 +131,7 @@ def mlflow_trial_context(tmp_path: Path) -> TrialContext:
         generation_id="a" * 32,
         attempt_id="b" * 32,
         overrides_sha256="c" * 64,
-        trial_dir=tmp_path,
+        trial_dir=tmp_path / "p" / "trial_00000__test",
         attempt_dir=tmp_path,
         run_name="test",
         return_code=0,
@@ -146,11 +148,14 @@ def bind_mlflow_attempt(tmp_path: Path) -> tuple[dict[str, str | int], TrialCont
     :return tuple[dict[str, str | int], TrialContext]: The binding and the attempt's context.
     """
     binding = mlflow_binding()
+    ctx = mlflow_trial_context(tmp_path)
+    directory = session.attempt_tracking_dir(tmp_path, ctx.generation_id, ctx.attempt_id)
     session.write_record(
-        tmp_path / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
+        directory / session.EXPECTED_BINDING_FILE,
+        {k: v for k, v in binding.items() if k != "run_id"},
     )
-    session.write_record(tmp_path / "mlflow-binding.json", binding)
-    return binding, mlflow_trial_context(tmp_path)
+    session.write_record(directory / session.BINDING_FILE, binding)
+    return binding, ctx
 
 
 def run_mlflow_worker_in_process(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -175,26 +180,35 @@ def scripted_response(script, request):
     return response() if callable(response) else response
 
 
-def mlflow_binder(tmp_path, slot, *, experiment=None, identity=None, directory=None):
-    """Return the binding path and a ``_create_bound`` call for one attempt or generation binding."""
+def mlflow_binder(
+    tmp_path: Path,
+    slot: str,
+    *,
+    experiment: Experiment | None = None,
+    identity: RunIdentity | None = None,
+) -> tuple[partial[RunBinding], Path]:
+    """Prepare a binding call at the location used by creation and reconciliation.
+
+    :param Path tmp_path: Scratch root for the default experiment.
+    :param str slot: Attempt or generation binding.
+    :param Experiment | None experiment: Experiment that owns the binding.
+    :param RunIdentity | None identity: Identity for the run to create.
+    :return tuple[partial[RunBinding], Path]: Binding call and record destination.
+    """
     experiment = experiment or native_experiment(tmp_path)
     identity = identity or attempt_identity()
     if slot == "attempt":
-        path = (directory or tmp_path) / "mlflow-binding.json"
+        directory = session.attempt_tracking_dir(
+            _experiment_dir(experiment), identity["generation_id"], identity["attempt_id"]
+        )
+        path = directory / session.BINDING_FILE
     else:
-        path = (
-            session.tracking_root(experiment)
-            / identity["generation_id"]
-            / "generation-binding.json"
-        )
-        path.parent.mkdir(parents=True)
+        path = session.summary_binding_path(experiment, identity["generation_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    def bind(deadline=None):
-        return session._create_bound(
-            experiment, identity, path, {}, run_name="r", deadline=deadline
-        )
-
-    return bind, path
+    return partial(
+        session._create_bound, experiment, identity, path, {}, run_name="r", deadline=None
+    ), path
 
 
 class FakeWorkerProcess:
@@ -465,7 +479,7 @@ def killed_sweep(
             run_experiment(experiment, generation_id=generation_id)
     assert not any(session.tracking_root(experiment).glob("*/delivery/generation.json"))
     if not persistent:
-        bindings = sorted(_experiment_dir(experiment).glob(f"*/attempts/*/{session.BINDING_FILE}"))
+        bindings = session.attempt_tracking_records(experiment, session.BINDING_FILE, generation_id)
         assert len(bindings) == n_jobs
         return experiment, uploads, [session.read_binding(b.parent)["attempt_id"] for b in bindings]
     trials = read_phase_trials(validate_ledger(experiment), "depth").trials

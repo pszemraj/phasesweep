@@ -49,7 +49,7 @@ from phasesweep.evidence.evaluation import MlflowObjectiveMissingError
 from phasesweep.evidence.models import JsonEnvelopeExtractor, WandbSummaryRequiredGate
 from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import ProcessResult, fd_ready, read_attempt_lifecycle
-from phasesweep.tracking.session import write_record
+from phasesweep.tracking.session import attempt_tracking_dir, write_record
 from tests.conftest import make_experiment, make_trial_context, phase_study, write_trainer
 from tests.tracking_helpers import attempt_identity, mlflow_binding
 
@@ -1203,12 +1203,14 @@ def test_recorded_environment_resolves_mlflow_name_and_run_bindings(
             },
         }
     )
-    attempt_dir = _launch_attempt_dir(tmp_path)
+    phase_dir = tmp_path / "p"
+    attempt_dir = _launch_attempt_dir(phase_dir)
     attempt_dir.mkdir(parents=True)
-    write_record(attempt_dir / "mlflow-expected.json", attempt_identity())
-    write_record(attempt_dir / "mlflow-binding.json", mlflow_binding())
+    tracking_dir = attempt_tracking_dir(tmp_path, "generation-test", "attempt-test")
+    write_record(tracking_dir / "mlflow-expected.json", attempt_identity())
+    write_record(tracking_dir / "mlflow-binding.json", mlflow_binding())
 
-    captured = _capture_launch_env(tmp_path, monkeypatch, experiment=experiment)
+    captured = _capture_launch_env(phase_dir, monkeypatch, experiment=experiment)
     recorded = json.loads((attempt_dir / "environment.json").read_text())
 
     assert recorded["env"] == captured["process_env"]
