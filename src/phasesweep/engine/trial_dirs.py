@@ -16,6 +16,7 @@ from typing import NamedTuple
 from optuna.trial import FrozenTrial
 
 from phasesweep.config.models import Experiment
+from phasesweep.engine.attempts import _attempt_process_resolution
 from phasesweep.engine.paths import (
     _attempt_dir,
     _phase_dir,
@@ -30,6 +31,7 @@ from phasesweep.engine.state import (
     _trial_interrupted,
 )
 from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
+from phasesweep.runtime.process import read_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 
 
@@ -115,7 +117,8 @@ def _trial_dir_for_attempt(
     A trial that continues another's directory may start only once that directory's last
     attempt is provably gone, so two live processes never write one directory: its
     lifecycle says ``exited`` with cleanup confirmed, or ``allocated`` with no process
-    identity beside it, or recovery recorded its cleanup.
+    identity beside it, or recovery recorded its cleanup. The first two are recovery's own
+    rule, :func:`phasesweep.engine.attempts._attempt_process_resolution`.
 
     :param Experiment experiment: Configuration naming the phase directory.
     :param str phase_name: Phase the attempt runs in.
@@ -130,8 +133,6 @@ def _trial_dir_for_attempt(
         the trial number and attempt that opened it: ``trial`` and ``attempt_id`` themselves
         for a directory of its own.
     """
-    from phasesweep.runtime.process import read_attempt_lifecycle
-
     owner = _directory_owner(trials, trial)
     if owner is trial:
         path = _trial_dir_for(experiment, phase_name, trial.number, attempt_id=attempt_id)
@@ -147,13 +148,11 @@ def _trial_dir_for_attempt(
                 lifecycle = read_attempt_lifecycle(source_dir, expected_attempt_id=source_attempt)
             except ValueError:
                 lifecycle = None
-            settled = lifecycle is not None and (
-                (lifecycle.state == "exited" and lifecycle.cleanup_confirmed is True)
-                or (
-                    lifecycle.state == "allocated"
-                    and not (source_dir / PROCESS_IDENTITY_FILE).exists()
-                )
-            )
+            # Recovery's own rule for an attempt that needs no signal: anything else it
+            # would have to inspect or clean first.
+            settled = lifecycle is not None and _attempt_process_resolution(
+                lifecycle, identity_exists=(source_dir / PROCESS_IDENTITY_FILE).exists()
+            ) in {"exited", "allocated"}
         else:
             settled = False
         if not settled:
