@@ -154,7 +154,7 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
                     directory,
                     attempt_id=operation_id,
                     state="terminating",
-                    return_code=-15,
+                    ended_by="cancelled",
                     cleanup_confirmed=False,
                 )
                 raise UnsafeProcessCleanupError("creation worker cleanup is uncertain")

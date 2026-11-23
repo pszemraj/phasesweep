@@ -1243,6 +1243,7 @@ def test_exited_attempt_recovers_without_signalling(
         trial_dir,
         attempt_id="exited-attempt",
         state="exited",
+        ended_by="trainer",
         return_code=0,
         cleanup_confirmed=True,
     )

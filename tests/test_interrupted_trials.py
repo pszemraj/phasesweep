@@ -648,7 +648,7 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
         import time
         from pathlib import Path
         original = guardian.write_lifecycle_record
-        def fail_intent(path: Path, *, attempt_id: str, state: str, return_code: int | None, cleanup_confirmed: bool | None, duration_seconds: float | None) -> None:
+        def fail_intent(path: Path, *, attempt_id: str, state: str, ended_by: str | None, return_code: int | None, cleanup_confirmed: bool | None, duration_seconds: float | None) -> None:
             if state == "terminating" and {intent_write_fails!r}:
                 Path({str(failed)!r}).touch()
                 raise OSError("intent write unavailable")
@@ -656,7 +656,7 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
                 Path({str(failed)!r}).touch()
                 while not Path({str(publish)!r}).exists():
                     time.sleep(0.01)
-            original(path, attempt_id=attempt_id, state=state, return_code=return_code, cleanup_confirmed=cleanup_confirmed, duration_seconds=duration_seconds)
+            original(path, attempt_id=attempt_id, state=state, ended_by=ended_by, return_code=return_code, cleanup_confirmed=cleanup_confirmed, duration_seconds=duration_seconds)
         guardian.write_lifecycle_record = fail_intent
         if not {procfs_available!r}:
             def no_procfs(path):
@@ -722,7 +722,9 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
             fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
         lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="held-lease")
         assert lifecycle is not None and lifecycle.state == "exited"
-        assert lifecycle.return_code == (-signal.SIGTERM if cancelled else 0)
+        assert (lifecycle.ended_by, lifecycle.return_code) == (
+            ("cancelled", None) if cancelled else ("trainer", 0)
+        )
         assert lifecycle.cleanup_confirmed
         assert not reaper._process_group_alive(pgid)
     finally:
@@ -958,7 +960,10 @@ else:
                 assert runner.returncode == -signal.SIGKILL
                 intent = json_object(json.loads(termination_intent.read_text()))
                 assert intent["state"] == "terminating"
-                assert intent["return_code"] == -signal.SIGTERM
+                assert (intent["ended_by"], intent["return_code"]) == (
+                    "timed_out" if recovery_stage == "timeout-trainer" else "cancelled",
+                    None,
+                )
                 assert intent["cleanup_confirmed"] is False
             if not terminated:
                 release.touch()
@@ -981,9 +986,7 @@ else:
                     assert trial.user_attrs[DURATION_ATTR] > 0
                     assert (_attempts_dir(experiment) / f"{attempt}.json").is_file()
                 else:
-                    assert lifecycle.return_code == (
-                        -signal.SIGTERM if guardian_cancel else return_code
-                    )
+                    assert lifecycle.return_code == (None if guardian_cancel else return_code)
                     assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds > 0
             assert (directory / "r.json").exists()
             if direct_recovery:
@@ -1265,8 +1268,9 @@ else:
             assert not reaper._process_group_alive(orphan_identity.pgid)
             if terminated:
                 lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
-                assert lifecycle is not None and lifecycle.return_code == (
-                    None if direct_recovery else -signal.SIGTERM
+                assert lifecycle is not None and lifecycle.return_code is None
+                assert lifecycle.ended_by == (
+                    "timed_out" if recovery_stage == "timeout-trainer" else "cancelled"
                 )
                 assert recovered.value is None
                 release.touch()

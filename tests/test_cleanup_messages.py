@@ -97,6 +97,7 @@ def test_confirm_does_not_count_an_already_complete_trial_as_a_recovered_result(
         directory,
         attempt_id="completed-attempt",
         state="exited",
+        ended_by="trainer",
         return_code=0,
         cleanup_confirmed=True,
     )

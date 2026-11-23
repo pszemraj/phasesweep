@@ -27,6 +27,7 @@ from phasesweep.config.models import ExecutionContext
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import (
+    AttemptEnd,
     _kill_group,
     _spawn_blocked_supervisor,
     _wait_for_guardian_exit,
@@ -74,8 +75,9 @@ def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> N
         *,
         grace_seconds: float,
         guardians: Mapping[int, subprocess.Popen[bytes]] | None = None,
+        cancel_signal: int = signal.SIGTERM,
     ) -> dict[int, bool]:
-        real_terminate(pgids, grace_seconds=0.05, guardians=guardians)
+        real_terminate(pgids, grace_seconds=0.05, guardians=guardians, cancel_signal=cancel_signal)
         return dict.fromkeys(pgids, False)
 
     monkeypatch.setattr(
@@ -158,7 +160,7 @@ def test_run_supervised_preserves_identity_and_records_terminal_lifecycle(
     lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
     assert lifecycle is not None
     assert lifecycle.state == "exited"
-    assert lifecycle.return_code == return_code
+    assert (lifecycle.ended_by, lifecycle.return_code) == ("trainer", return_code)
     assert lifecycle.cleanup_confirmed is True
 
 
@@ -222,7 +224,7 @@ def test_pre_spawn_failure_records_confirmed_terminal_lifecycle(
     )
     assert lifecycle is not None
     assert lifecycle.state == "exited"
-    assert lifecycle.return_code is None
+    assert (lifecycle.ended_by, lifecycle.return_code) == ("not_started", None)
     assert lifecycle.cleanup_confirmed is True
     assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
 
@@ -241,7 +243,7 @@ def test_pre_spawn_failure_requires_terminal_lifecycle_write(
         *,
         attempt_id: str,
         state: str,
-        return_code: int | None = None,
+        ended_by: AttemptEnd | None = None,
         cleanup_confirmed: bool | None = None,
     ) -> None:
         if state == "exited":
@@ -250,7 +252,7 @@ def test_pre_spawn_failure_requires_terminal_lifecycle_write(
             trial_dir,
             attempt_id=attempt_id,
             state=state,
-            return_code=return_code,
+            ended_by=ended_by,
             cleanup_confirmed=cleanup_confirmed,
         )
 
@@ -338,10 +340,10 @@ def test_spawn_interrupt_after_popen_preserves_cleanup_evidence(
         assert lifecycle.state in {"launching", "terminating", "exited"}
         if lifecycle.state == "exited":
             assert lifecycle.cleanup_confirmed is True
-            assert lifecycle.return_code != 0
+            assert lifecycle.ended_by in {"cancelled", "not_started"}
             assert lifecycle.duration_seconds is not None
         elif lifecycle.state == "terminating":
-            assert lifecycle.return_code == -signal.SIGTERM
+            assert lifecycle.ended_by == "cancelled"
             assert lifecycle.cleanup_confirmed is False
     assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
 
@@ -402,7 +404,7 @@ def test_payload_delivery_interrupt_cleans_registered_trainer_group(
     assert lifecycle is not None
     assert lifecycle.state == "exited"
     assert lifecycle.cleanup_confirmed is True
-    assert lifecycle.return_code is not None and lifecycle.return_code != 0
+    assert (lifecycle.ended_by, lifecycle.return_code) == ("cancelled", None)
     assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds >= 0
 
 
@@ -438,15 +440,15 @@ def test_identity_write_failure_marks_launch_before_popen(
     assert lifecycle is not None
     assert lifecycle.state == "exited"
     assert lifecycle.cleanup_confirmed is True
-    assert lifecycle.return_code is not None and lifecycle.return_code != 0
+    assert lifecycle.ended_by in {"cancelled", "not_started"} and lifecycle.return_code is None
     assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds >= 0
     assert not _process_group_alive(result.pid)
     assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
 
 
-@pytest.mark.parametrize("cleanup_return_code", [None, 0, -signal.SIGTERM])
+@pytest.mark.parametrize("controller_ending", ["guardian_lost", "cancelled", "not_started"])
 def test_cleanup_retains_cancellation_after_guardian_dies_before_final_publication(
-    tmp_path: Path, cleanup_return_code: int | None
+    tmp_path: Path, controller_ending: AttemptEnd
 ) -> None:
     """Cleanup after guardian death retains cancellation through repeated durable confirmations."""
     from phasesweep.runtime.process import _record_attempt_exited, write_attempt_lifecycle
@@ -455,14 +457,14 @@ def test_cleanup_retains_cancellation_after_guardian_dies_before_final_publicati
         tmp_path,
         attempt_id="cancelled",
         state="terminating",
-        return_code=-signal.SIGTERM,
+        ended_by="timed_out",
         cleanup_confirmed=False,
     )
     for _ in range(2):
-        _record_attempt_exited(tmp_path, attempt_id="cancelled", return_code=cleanup_return_code)
+        _record_attempt_exited(tmp_path, attempt_id="cancelled", ended_by=controller_ending)
         lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="cancelled")
         assert lifecycle is not None and lifecycle.state == "exited"
-        assert lifecycle.return_code == -signal.SIGTERM
+        assert (lifecycle.ended_by, lifecycle.return_code) == ("timed_out", None)
         assert lifecycle.cleanup_confirmed and lifecycle.duration_seconds is None
 
 
@@ -473,7 +475,7 @@ def test_kill_group_reports_unconfirmed_when_direct_child_reap_times_out(
     as unconfirmed, not silently ``True``."""
     monkeypatch.setattr(
         "phasesweep.runtime.process._terminate_process_groups",
-        lambda pgids, *, grace_seconds, guardians: dict.fromkeys(pgids, True),
+        lambda pgids, *, grace_seconds, guardians, cancel_signal: dict.fromkeys(pgids, True),
     )
 
     proc = Mock(pid=424243, returncode=None)
@@ -983,7 +985,7 @@ def test_unexpected_status_read_failure_preserves_cleanup_evidence(
     assert lifecycle is not None
     assert lifecycle.state == "exited"
     assert lifecycle.cleanup_confirmed is True
-    assert lifecycle.return_code is not None and lifecycle.return_code != 0
+    assert (lifecycle.ended_by, lifecycle.return_code) == ("cancelled", None)
     assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds >= 0
 
 

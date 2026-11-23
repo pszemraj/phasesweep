@@ -1097,8 +1097,8 @@ def _resolve_attempt(
         if resolution != "identity":
             assert lifecycle is not None
             report(
-                f"{label}: lifecycle={lifecycle.state} rc={lifecycle.return_code} "
-                "confirms cleanup without signalling.",
+                f"{label}: lifecycle={lifecycle.state} ended_by={lifecycle.ended_by} "
+                f"rc={lifecycle.return_code} confirms cleanup without signalling.",
                 level=logging.INFO,
             )
             return False
@@ -1170,7 +1170,9 @@ def _resolve_attempt(
     if guardian_settled:
         log.info("%s: lease guardian confirmed descendant cleanup.", label)
         return False
-    _record_attempt_exited(record.trial_dir, attempt_id=record.attempt_id, return_code=None)
+    # Recovery cleaned the group itself, with no guardian verdict to keep: it stopped the
+    # attempt, or found it already gone without knowing how it ended. Either way it reruns.
+    _record_attempt_exited(record.trial_dir, attempt_id=record.attempt_id, ended_by="cancelled")
     # Signalling a live group is worth a warning; a group that was already gone is routine.
     log.log(
         logging.WARNING if terminated else logging.INFO,

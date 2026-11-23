@@ -820,11 +820,12 @@ def test_cancellation_kills_a_session_escaped_child_once_its_launcher_is_killed(
     assert (guardian.returncode, rest) == (-signal.SIGTERM, supervisor._TRAINER_ROOT_EXITED)
     lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="settle")
     assert lifecycle is not None
-    assert (lifecycle.state, lifecycle.return_code, lifecycle.cleanup_confirmed) == (
-        "exited",
-        -signal.SIGTERM,
-        True,
-    )
+    assert (
+        lifecycle.state,
+        lifecycle.ended_by,
+        lifecycle.return_code,
+        lifecycle.cleanup_confirmed,
+    ) == ("exited", "cancelled", None, True)
     assert 0.5 <= elapsed < 5.0
 
 

@@ -1475,6 +1475,7 @@ def test_guardian_sigkill_fails_one_trial_and_continues_phase(
         *,
         grace_seconds: float,
         guardians: Mapping[int, subprocess.Popen[bytes]] | None = None,
+        cancel_signal: int = signal.SIGTERM,
     ) -> dict[int, bool]:
         assert guardians is None
         first = phase_study(experiment).trials[0]
@@ -1483,9 +1484,11 @@ def test_guardian_sigkill_fails_one_trial_and_continues_phase(
         assert isinstance(directory, str) and isinstance(attempt, str)
         lifecycle = read_attempt_lifecycle(Path(directory), expected_attempt_id=attempt)
         assert lifecycle is not None and lifecycle.state == "terminating"
-        assert lifecycle.return_code == -signal.SIGTERM
+        assert (lifecycle.ended_by, lifecycle.return_code) == ("guardian_lost", None)
         cleaned.extend(pgids)
-        return real_terminate(pgids, grace_seconds=grace_seconds, guardians=guardians)
+        return real_terminate(
+            pgids, grace_seconds=grace_seconds, guardians=guardians, cancel_signal=cancel_signal
+        )
 
     monkeypatch.setattr(process, "_terminate_process_groups", terminate)
     try:
@@ -1509,6 +1512,6 @@ def test_guardian_sigkill_fails_one_trial_and_continues_phase(
         expected_attempt_id=first.user_attrs[ATTEMPT_ID_ATTR],
     )
     assert lifecycle is not None and lifecycle.state == "exited" and lifecycle.cleanup_confirmed
-    assert lifecycle.return_code == -signal.SIGTERM
+    assert (lifecycle.ended_by, lifecycle.return_code) == ("guardian_lost", None)
     assert "Lease guardian" in caplog.text
     assert "root process exited with code -9" not in caplog.text

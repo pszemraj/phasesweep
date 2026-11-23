@@ -170,7 +170,12 @@ def test_evidence_pending_preview_routes_to_resume(tmp_path: Path) -> None:
     directory = tmp_path / "trial"
     directory.mkdir()
     write_attempt_lifecycle(
-        directory, attempt_id="attempt", state="exited", return_code=0, duration_seconds=1.0
+        directory,
+        attempt_id="attempt",
+        state="exited",
+        ended_by="trainer",
+        return_code=0,
+        duration_seconds=1.0,
     )
     study = optuna.create_study()
     running = study.ask()

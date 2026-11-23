@@ -19,6 +19,7 @@ from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import (
     ATTEMPT_LIFECYCLE_FILE,
     ATTEMPT_LIFECYCLE_SCHEMA_VERSION,
+    AttemptEnd,
     AttemptLifecycle,
     _write_process_identity,
     read_attempt_lifecycle,
@@ -58,6 +59,7 @@ def test_attempt_process_resolution_table(
         if state is None
         else AttemptLifecycle(
             state=state,
+            ended_by=None,
             return_code=None,
             cleanup_confirmed=cleanup_confirmed,
             duration_seconds=None,
@@ -88,7 +90,12 @@ def test_read_attempt_lifecycle_rejects_unreadable_record(tmp_path: Path) -> Non
         ({"state": {}}, "Unknown attempt lifecycle state"),
         ({"state": "exited", "return_code": True}, "field 'return_code' is invalid"),
         (
-            {"state": "exited", "return_code": 0, "cleanup_confirmed": 1},
+            {"state": "exited", "ended_by": "cancelled", "return_code": -15},
+            "field 'return_code' is invalid",
+        ),
+        ({"state": "exited", "ended_by": "killed"}, "field 'ended_by' is invalid"),
+        (
+            {"state": "exited", "ended_by": "trainer", "return_code": 0, "cleanup_confirmed": 1},
             "field 'cleanup_confirmed' is invalid",
         ),
         ({"duration_seconds": True}, "field 'duration_seconds' is invalid"),
@@ -119,7 +126,7 @@ def test_read_attempt_lifecycle_rejects_every_malformed_shape(
 
 
 @pytest.mark.parametrize(
-    ("state", "return_code", "cleanup_confirmed", "text"),
+    ("state", "ended_by", "cleanup_confirmed", "text"),
     [
         pytest.param(
             "launching",
@@ -131,9 +138,9 @@ def test_read_attempt_lifecycle_rejects_every_malformed_shape(
         ),
         pytest.param(
             "exited",
-            -15,
+            "cancelled",
             True,
-            "lifecycle=exited rc=-15 confirms cleanup without signalling.",
+            "lifecycle=exited ended_by=cancelled rc=None confirms cleanup without signalling.",
             id="exited-with-cleanup",
         ),
     ],
@@ -142,7 +149,7 @@ def test_an_attempt_settled_without_signalling_is_routine_in_a_run_and_collected
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     state: str,
-    return_code: int | None,
+    ended_by: AttemptEnd | None,
     cleanup_confirmed: bool | None,
     text: str,
 ) -> None:
@@ -151,7 +158,7 @@ def test_an_attempt_settled_without_signalling_is_routine_in_a_run_and_collected
         tmp_path,
         attempt_id="a1",
         state=state,
-        return_code=return_code,
+        ended_by=ended_by,
         cleanup_confirmed=cleanup_confirmed,
     )
     record = _AttemptRecord("a1", tmp_path, "generation", "p", 3)

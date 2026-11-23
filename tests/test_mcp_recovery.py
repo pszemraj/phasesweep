@@ -1301,6 +1301,7 @@ def test_registered_trial_recovery_counts_match_preflight_and_ledger(
             ),
             attempt_id=attempt_id,
             state="exited",
+            ended_by="trainer",
             return_code=0,
             cleanup_confirmed=True,
         )

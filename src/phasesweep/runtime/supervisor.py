@@ -47,10 +47,18 @@ _PR_SET_CHILD_SUBREAPER = 36
 # The lifecycle record both the guardian and the controller write, shared with
 # phasesweep.runtime.process like the wire constants above.
 ATTEMPT_LIFECYCLE_FILE = "attempt_lifecycle.json"
-ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 3
-# The return code of a ``terminating`` lifecycle record, written by the guardian for a
-# cancellation and by the controller for a group its guardian left behind.
-_TERMINATING_RETURN_CODE = -signal.SIGTERM
+ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 4
+# The controller cancels a trial at its per-trial timeout with this signal instead of
+# SIGTERM, so the guardian can record the timeout apart from a shutdown or a deadline cap.
+TIMEOUT_CANCEL_SIGNAL = signal.SIGUSR1
+# How an attempt ended, as ``ended_by`` records it. Only ``trainer`` carries a return code.
+ENDED_BY_TRAINER = "trainer"
+ENDED_BY_CANCELLED = "cancelled"
+ENDED_BY_TIMED_OUT = "timed_out"
+ENDED_BY_NOT_STARTED = "not_started"
+ENDED_BY_GUARDIAN_LOST = "guardian_lost"
+# The one byte the launch child writes to the exec pipe when it fails before ``execve``.
+_NOT_STARTED_BYTE = b"N"
 
 
 def write_lifecycle_record(
@@ -58,6 +66,7 @@ def write_lifecycle_record(
     *,
     attempt_id: str,
     state: str,
+    ended_by: str | None,
     return_code: int | None,
     cleanup_confirmed: bool | None,
     duration_seconds: float | None,
@@ -67,7 +76,8 @@ def write_lifecycle_record(
     :param Path path: Existing attempt directory's lifecycle file.
     :param str attempt_id: Immutable attempt identity.
     :param str state: Allocated, launching, terminating, or exited lifecycle state.
-    :param int | None return_code: Supervised process exit code, when known.
+    :param str | None ended_by: How the attempt ended, ``None`` until that is known.
+    :param int | None return_code: The trainer root's exit code; set only when ``ended_by`` is ``trainer``.
     :param bool | None cleanup_confirmed: Whether the whole group and every adopted descendant have exited.
     :param float | None duration_seconds: Time to the root's own exit, or to cleanup after cancellation.
     :raises OSError: The record could not be durably replaced.
@@ -76,6 +86,7 @@ def write_lifecycle_record(
         "schema_version": ATTEMPT_LIFECYCLE_SCHEMA_VERSION,
         "attempt_id": attempt_id,
         "state": state,
+        "ended_by": ended_by,
         "return_code": return_code,
         "cleanup_confirmed": cleanup_confirmed,
         "duration_seconds": duration_seconds,
@@ -454,20 +465,26 @@ def _reap_remaining_group(pgid: int, *, adopts: bool) -> str | None:
     return survivors
 
 
-def _close_trainer_fds() -> None:
-    """Close every non-stdio descriptor before executing trainer code."""
+def _close_trainer_fds(exec_fd: int) -> None:
+    """Close every non-stdio descriptor but the exec pipe before executing trainer code.
+
+    :param int exec_fd: Close-on-exec write end of the exec pipe, kept open so a failed
+        ``execve`` can still report it; a successful one closes it.
+    """
     try:
         max_fd = int(os.sysconf("SC_OPEN_MAX"))
     except (OSError, TypeError, ValueError):
         max_fd = 1_048_576
-    os.closerange(3, max_fd)
+    os.closerange(3, exec_fd)
+    os.closerange(exec_fd + 1, max_fd)
 
 
-def _run_trainer(ready_fd: int, ack_fd: int) -> int:
+def _run_trainer(ready_fd: int, ack_fd: int, exec_fd: int) -> int:
     """Create the trainer session, cross the launch barrier, and exec it.
 
     :param int ready_fd: Descriptor used to publish the trainer process identity.
     :param int ack_fd: Descriptor carrying the committed launch payload.
+    :param int exec_fd: Close-on-exec write end of the exec pipe, kept open until ``execve``.
     :return int: Supervisor error status when setup or ``execve`` fails; a
         successful call replaces the process and does not return.
     """
@@ -501,7 +518,7 @@ def _run_trainer(ready_fd: int, ack_fd: int) -> int:
     # started from a shell has, so a pipeline in its command ends when its reader does.
     for interpreter_ignored in (signal.SIGPIPE, signal.SIGXFSZ):
         signal.signal(interpreter_ignored, signal.SIG_DFL)
-    _close_trainer_fds()
+    _close_trainer_fds(exec_fd)
     try:
         os.execve("/bin/sh", ["/bin/sh", "-c", cmd], env)
     except OSError:
@@ -542,6 +559,22 @@ def _wait_for_root(root: int) -> int:
         pid, status = os.waitpid(-1, 0)
         if pid == root:
             return status
+
+
+def _trainer_started(exec_read: int) -> bool:
+    """Say whether the reaped launch child reached ``execve``.
+
+    Every write end of the pipe is gone once the root is reaped: the guardian closed its own
+    after the fork, and the child's closed on exec or on exit. So the read cannot block, and
+    end-of-file means the exec succeeded; a setup failure left one byte first.
+
+    :param int exec_read: Non-blocking read end of the exec pipe.
+    :return bool: ``False`` only when the child reported a failure before ``execve``.
+    """
+    try:
+        return os.read(exec_read, 1) != _NOT_STARTED_BYTE
+    except OSError:
+        return True
 
 
 def _become_subreaper() -> bool:
@@ -585,6 +618,9 @@ def main(argv: list[str] | None = None) -> int:
         terminating them, holds inherited GPU leases until every group member and adopted
         descendant is gone, and returns the trainer root's exit status or terminating signal.
         Guardian cancellation preserves SIGTERM as the result even if the trainer handles it by exiting zero.
+        The lifecycle record says how the attempt ended: ``trainer`` with the root's code
+        when it exited by itself, ``cancelled`` for SIGTERM, ``timed_out`` for
+        :data:`TIMEOUT_CANCEL_SIGNAL`, and ``not_started`` when the launch child failed before ``execve``.
     """
     args = sys.argv[1:] if argv is None else argv
     if len(args) not in {2, 5}:
@@ -592,17 +628,30 @@ def main(argv: list[str] | None = None) -> int:
     ready_fd = int(args[0])
     ack_fd = int(args[1])
     adopts = _become_subreaper()
+    cancel_signals = {signal.SIGTERM, TIMEOUT_CANCEL_SIGNAL}
 
     # A cancellation request must wait until the guardian can preserve its intent.
-    signal.pthread_sigmask(signal.SIG_SETMASK, {signal.SIGTERM})
+    signal.pthread_sigmask(signal.SIG_SETMASK, cancel_signals)
+    # Both ends close on exec. The child keeps the write end open until ``execve`` and writes
+    # one byte when setup fails, so a trainer that itself exits 75 is not read as unstarted.
+    exec_read, exec_write = os.pipe()
 
     child_pid = os.fork()
     if child_pid == 0:
-        signal.pthread_sigmask(signal.SIG_SETMASK, set())
-        os._exit(_run_trainer(ready_fd, ack_fd))
+        status = 70
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, set())
+            status = _run_trainer(ready_fd, ack_fd, exec_write)
+        finally:
+            with contextlib.suppress(OSError):
+                os.write(exec_write, _NOT_STARTED_BYTE)
+            os._exit(status)
+    os.close(exec_write)
+    os.set_blocking(exec_read, False)
 
     # cancel() reaps a root that had already exited and leaves its wait status here.
     reaped_root_status: int | None = None
+    cancel_signum: int | None = None
 
     def cancel(signum: int, _frame: FrameType | None) -> None:
         """Interrupt supervision only while the trainer root still runs.
@@ -620,8 +669,9 @@ def main(argv: list[str] | None = None) -> int:
         :raises ChildProcessError: The root had exited and is reaped here, its status kept.
         :raises SystemExit: A running root needs durably recorded cancellation.
         """
-        nonlocal reaped_root_status
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        nonlocal reaped_root_status, cancel_signum
+        for cancel_signal in cancel_signals:
+            signal.signal(cancel_signal, signal.SIG_IGN)
         try:
             reaped_pid, wait_status = os.waitpid(child_pid, os.WNOHANG)
         except ChildProcessError:
@@ -629,15 +679,18 @@ def main(argv: list[str] | None = None) -> int:
         if reaped_pid == child_pid:
             reaped_root_status = wait_status
             raise ChildProcessError(f"trainer root {child_pid} was reaped by cancel()")
+        cancel_signum = signum
         raise SystemExit(128 + signum)
 
-    signal.signal(signal.SIGTERM, cancel)
+    for cancel_signal in cancel_signals:
+        signal.signal(cancel_signal, cancel)
 
     # The guardian is outside the trainer's new session and
     # process group. Group-directed SIGKILL can therefore never release its
     # inherited GPU leases before every trainer descendant is confirmed gone.
     os.close(ack_fd)
-    cancelled = False
+    # How a cancellation ended the attempt; ``None`` while the root ended by itself.
+    cancelled_as: str | None = None
     # A root that exits by itself ends the trial's time; the settle and cleanup after it
     # are teardown. A cancelled trial's time runs on to its confirmed cleanup.
     root_exited: float | None = None
@@ -654,22 +707,29 @@ def main(argv: list[str] | None = None) -> int:
             root_exited = time.monotonic()
             # Once the root has exited, cancellation no longer applies: the settle
             # and the verdict below run to completion, keeping a finished result.
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            for cancel_signal in cancel_signals:
+                signal.signal(cancel_signal, signal.SIG_IGN)
         except SystemExit:
-            cancelled = True
+            cancelled_as = (
+                ENDED_BY_TIMED_OUT if cancel_signum == TIMEOUT_CANCEL_SIGNAL else ENDED_BY_CANCELLED
+            )
             try:
                 if len(args) == 5:
                     write_lifecycle_record(
                         Path(args[2]) / ATTEMPT_LIFECYCLE_FILE,
                         attempt_id=args[3],
                         state="terminating",
-                        return_code=_TERMINATING_RETURN_CODE,
+                        ended_by=cancelled_as,
+                        return_code=None,
                         cleanup_confirmed=False,
                         duration_seconds=None,
                     )
             except OSError:
-                # Without durable intent, retain the lease and let the trainer finish.
+                # Without durable intent, retain the lease and let the trainer finish; it
+                # then ends by itself, and the record says so.
+                cancelled_as = None
                 status = _wait_for_root(child_pid)
+                root_exited = time.monotonic()
                 _wait_for_group_exit(child_pid, None, adopts=adopts)
             else:
                 _reap_remaining_group(child_pid, adopts=adopts)
@@ -678,7 +738,7 @@ def main(argv: list[str] | None = None) -> int:
                 status = signal.SIGTERM
         with contextlib.suppress(OSError):
             os.write(ready_fd, _TRAINER_ROOT_EXITED)
-        if not cancelled:
+        if cancelled_as is None:
             # Helpers that watch for their parent's death exit by themselves; only a
             # member still running after the settle is the trainer's leak. The settle
             # follows a nonzero exit too, so a crash keeps its own failure reason.
@@ -690,16 +750,23 @@ def main(argv: list[str] | None = None) -> int:
             # A closed pipe is expected after an orchestrator hard exit: there
             # is no parent left to consume the diagnostic, but cleanup continues.
         if len(args) == 5:
-            return_code = os.waitstatus_to_exitcode(status)
-            # Descendant cleanup is a failed trial even when its root returned zero.
-            if survivors is not None and return_code == 0:
-                return_code = 1
+            ended_by = cancelled_as
+            return_code: int | None = None
+            if ended_by is None and not _trainer_started(exec_read):
+                ended_by = ENDED_BY_NOT_STARTED
+            elif ended_by is None:
+                ended_by = ENDED_BY_TRAINER
+                return_code = os.waitstatus_to_exitcode(status)
+                # Descendant cleanup is a failed trial even when its root returned zero.
+                if survivors is not None and return_code == 0:
+                    return_code = 1
             ended = time.monotonic() if root_exited is None else root_exited
             with contextlib.suppress(OSError):
                 write_lifecycle_record(
                     Path(args[2]) / ATTEMPT_LIFECYCLE_FILE,
                     attempt_id=args[3],
                     state="exited",
+                    ended_by=ended_by,
                     return_code=return_code,
                     cleanup_confirmed=True,
                     duration_seconds=ended - float(args[4]),
@@ -707,6 +774,7 @@ def main(argv: list[str] | None = None) -> int:
         return _return_child_status(status)
     finally:
         os.close(ready_fd)
+        os.close(exec_read)
 
 
 if __name__ == "__main__":

@@ -348,7 +348,7 @@ def leak_tracking_worker(monkeypatch, *, action="publish", name=None):
             directory,
             attempt_id=operation_id,
             state="terminating",
-            return_code=-15,
+            ended_by="cancelled",
             cleanup_confirmed=False,
         )
         raise UnsafeProcessCleanupError(

@@ -760,6 +760,7 @@ def _terminate_process_groups(
     *,
     grace_seconds: float,
     guardians: Mapping[int, subprocess.Popen[bytes]] | None = None,
+    cancel_signal: int = signal.SIGTERM,
 ) -> dict[int, bool]:
     """Request group cleanup with shared waits, delegating guarded groups to their guardians.
 
@@ -775,6 +776,7 @@ def _terminate_process_groups(
     :param tuple[int, ...] pgids: Target process-group IDs.
     :param float grace_seconds: Shared wait after requesting cancellation, before direct SIGKILL for unguarded groups or continued observation of guardians.
     :param Mapping[int, subprocess.Popen[bytes]] | None guardians: Group-to-guardian processes whose cancellation protocol owns durable intent and trainer signals while they remain alive.
+    :param int cancel_signal: Signal a live guardian receives, which it records as how the attempt ended; an unguarded group always receives SIGTERM.
     :return dict[int, bool]: Confirmation verdict per requested pgid, ``True`` only when that
         group and any assigned guardian are confirmed dead, so lifecycle publication has finished.
     """
@@ -803,7 +805,7 @@ def _terminate_process_groups(
         try:
             guardian = active_guardians.get(pgid)
             if guardian is not None and guardian_alive(pgid):
-                guardian.send_signal(signal.SIGTERM)
+                guardian.send_signal(cancel_signal)
                 if guardian_alive(pgid):
                     return True
             active_guardians.pop(pgid, None)

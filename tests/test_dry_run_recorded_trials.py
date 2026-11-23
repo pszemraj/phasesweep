@@ -958,7 +958,12 @@ def _add_pending_evidence(experiment: Experiment, phase: str, directory: Path) -
     """Add a RUNNING trial whose trainer exited cleanly, so its evidence awaits extraction."""
     directory.mkdir()
     write_attempt_lifecycle(
-        directory, attempt_id="pending", state="exited", return_code=0, duration_seconds=1.0
+        directory,
+        attempt_id="pending",
+        state="exited",
+        ended_by="trainer",
+        return_code=0,
+        duration_seconds=1.0,
     )
     phase_study(experiment, phase).add_trial(
         optuna.trial.create_trial(
