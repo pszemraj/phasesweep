@@ -129,6 +129,18 @@ def test_evaluation_axis_defaults_and_misplacements_are_rejected():
             )
 
 
+def test_an_envelope_at_a_captured_stream_fails_config_load() -> None:
+    """A ``json_envelope`` path naming a captured stream is refused: report_objective cannot write it."""
+    with pytest.raises(ValidationError, match="'stderr.log' names a captured stream"):
+        JsonEnvelopeExtractor(
+            type="json_envelope",
+            path="stderr.log",
+            objective_name="loss",
+            split="validation",
+            policy="final",
+        )
+
+
 def test_evaluation_axis_is_part_of_study_identity():
     from phasesweep.engine.fingerprints import _phase_fingerprint
 

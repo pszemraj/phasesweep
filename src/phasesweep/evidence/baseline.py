@@ -30,6 +30,7 @@ from phasesweep.evidence.models import (
     Sha256Gate,
     WandbExtractor,
     WandbSummaryRequiredGate,
+    is_captured_stream,
 )
 from phasesweep.runtime.files import atomic_write_text
 from phasesweep.runtime.json import strict_json_loads
@@ -60,17 +61,15 @@ def _extractor_value_path(extractor: ObjectiveExtractor) -> str | None:
 
     Every extractor type is named, so a new one is a type error here until it says whether
     it reads a file in the trial directory. ``json_envelope`` is left out: the envelope
-    names the attempt that wrote it. A captured stream is the attempt's own already.
+    names the attempt that wrote it.
 
     :param ObjectiveExtractor extractor: A metric, constraint or observation extractor.
     :return str | None: The path, or ``None`` when the value comes from no trial file.
     """
-    from phasesweep.evidence.evaluation import CAPTURED_STREAMS
-
     if isinstance(extractor, JsonExtractor):
         return extractor.path
     if isinstance(extractor, LogRegexExtractor):
-        return None if extractor.file in CAPTURED_STREAMS else extractor.file
+        return extractor.file
     if isinstance(extractor, JsonEnvelopeExtractor | WandbExtractor | MlflowExtractor):
         return None
     assert_never(extractor)
@@ -99,7 +98,10 @@ def _gate_value_path(gate: Gate) -> str | None:
 
 
 def _value_paths(experiment: Experiment, phase: Phase) -> Iterator[str]:
-    """Yield every trial-relative path a value is read from.
+    """Yield every trial-directory path a value is read from.
+
+    A captured stream is left out whichever extractor or gate reads it: it is the attempt's
+    own, in its attempt directory.
 
     :param Experiment experiment: Metric, constraints and observations.
     :param Phase phase: Gates of the phase the attempt runs in.
@@ -111,7 +113,7 @@ def _value_paths(experiment: Experiment, phase: Phase) -> Iterator[str]:
         *(_extractor_value_path(observation.extractor) for observation in experiment.observe),
         *(_gate_value_path(gate) for gate in phase.gates),
     ]
-    yield from (path for path in paths if path is not None)
+    yield from (path for path in paths if path is not None and not is_captured_stream(path))
 
 
 def file_stamp(path: Path) -> FileStamp | None:

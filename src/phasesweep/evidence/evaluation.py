@@ -35,6 +35,7 @@ from phasesweep.evidence.models import (
     WandbQuery,
     WandbSummaryRequiredGate,
     _WandbSummarySource,
+    is_captured_stream,
 )
 from phasesweep.evidence.wandb import (
     WANDB_SDK_MISSING,
@@ -87,11 +88,6 @@ def _file_digest(raw: bytes) -> dict[str, Any]:
     :return dict[str, Any]: ``sha256`` and ``size_bytes`` of those bytes.
     """
     return {"sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}
-
-
-#: Log names that resolve to the attempt's own captured streams in its attempt directory,
-#: so a ``log_regex`` reads only what this attempt printed.
-CAPTURED_STREAMS = frozenset({"stdout.log", "stderr.log"})
 
 
 class OutsideAttemptError(OSError):
@@ -154,47 +150,55 @@ def trial_file(
     relative: str | Path,
     *,
     baseline: EvidenceBaseline | None = None,
+    checked: bool = True,
 ) -> Path:
     """Return where a configured trial path is read from.
 
-    A captured stream (:data:`CAPTURED_STREAMS`) is the attempt's own, kept in its attempt
-    directory; any other path is a trainer file inside the trial directory, as
-    :func:`attempt_file` resolves and checks it.
+    Every extractor, gate and verification of a configured path resolves it here, so they
+    agree on the file. A captured stream (:func:`is_captured_stream`) is the attempt's own,
+    kept in its attempt directory; any other path is a trainer file inside the trial
+    directory, as :func:`attempt_file` resolves and checks it.
 
     :param Path trial_dir: The trial directory the trainer writes into.
     :param Path attempt_dir: The attempt's directory, holding its captured streams.
     :param str | Path relative: Configured trial-relative path.
     :param EvidenceBaseline | None baseline: Passed to :func:`attempt_file`.
-    :raises OutsideAttemptError: A trainer path resolves outside ``trial_dir``, or, as
-        :class:`StaleEvidenceError`, is unchanged since before the attempt ran.
+    :param bool checked: Apply :func:`attempt_file`'s checks to a trainer path. ``False``
+        only locates it: for a gate that tests an artifact wherever its links lead, or to
+        name the file in a diagnostic.
+    :raises OutsideAttemptError: A checked trainer path resolves outside ``trial_dir``, or,
+        as :class:`StaleEvidenceError`, is unchanged since before the attempt ran.
     :return Path: The path to read.
     """
-    if str(relative) in CAPTURED_STREAMS:
+    if is_captured_stream(relative):
         return attempt_dir / relative
+    if not checked:
+        return trial_dir / relative
     return attempt_file(trial_dir, relative, baseline=baseline)
 
 
 def load_json_value(
     trial_dir: Path,
+    attempt_dir: Path,
     relative_path: str,
     key: str,
     *,
     digest: dict[str, Any] | None = None,
     baseline: EvidenceBaseline | None = None,
 ) -> tuple[Path, Any]:
-    """Load a dotted JSON value from a trial-relative file.
+    """Load a dotted JSON value from a configured trial path, as :func:`trial_file` locates it.
 
     :param Path trial_dir: Directory containing the trial outputs.
-    :param str relative_path: JSON file path relative to ``trial_dir``.
+    :param Path attempt_dir: The attempt's directory, holding its captured streams.
+    :param str relative_path: Configured trial-relative JSON file path.
     :param str key: Dot-separated key path to read from the JSON object.
     :param dict[str, Any] | None digest: Optional sink that receives the
         ``sha256``/``size_bytes`` of the exact bytes parsed, for evidence
         provenance.
-    :param EvidenceBaseline | None baseline: Passed to :func:`attempt_file`.
-    :raises OutsideAttemptError: If ``relative_path`` resolves outside ``trial_dir``, or,
-        as :class:`StaleEvidenceError`, is unchanged since before the attempt ran.
-    :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular
-        file under ``trial_dir``.
+    :param EvidenceBaseline | None baseline: Passed to :func:`trial_file`.
+    :raises OutsideAttemptError: If a trainer ``relative_path`` resolves outside ``trial_dir``,
+        or, as :class:`StaleEvidenceError`, is unchanged since before the attempt ran.
+    :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular file.
     :raises JsonKeyMissingError: If a segment of the dotted ``key`` path is missing, with the
         failing segment as the argument and what the file holds there.
     :raises OSError: If the resolved file exists but cannot be read.
@@ -203,7 +207,7 @@ def load_json_value(
         duplicate object keys, or a rejected JSON constant).
     :return tuple[Path, Any]: Resolved JSON file path and loaded value.
     """
-    target = attempt_file(trial_dir, relative_path, baseline=baseline)
+    target = trial_file(trial_dir, attempt_dir, relative_path, baseline=baseline)
     if not target.is_file():
         raise FileNotFoundError(target)
     raw = target.read_bytes()
@@ -407,7 +411,8 @@ def _extract_json(
 ) -> float:
     """Read a trial-relative JSON file and extract its numeric value.
 
-    :param TrialContext ctx: Trial identity; the file is read from its ``trial_dir``.
+    :param TrialContext ctx: Trial identity; the file is read from its ``trial_dir``, or its
+        ``attempt_dir`` for a captured stream.
     :param JsonExtractor cfg: Relative file path and dotted numeric key.
     :param dict | None provenance: Optional source-evidence sink.
     :raises ExtractorError: The file or key is missing, the file resolves outside the attempt,
@@ -415,7 +420,7 @@ def _extract_json(
     :return float: Configured numeric value.
     """
     digest: dict[str, Any] = {}
-    target = ctx.trial_dir / cfg.path
+    target = trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.path, checked=False)
     try:
         with _trial_json_read_errors(
             target,
@@ -426,7 +431,12 @@ def _extract_json(
             ),
         ):
             _, cur = load_json_value(
-                ctx.trial_dir, cfg.path, cfg.key, digest=digest, baseline=ctx.baseline
+                ctx.trial_dir,
+                ctx.attempt_dir,
+                cfg.path,
+                cfg.key,
+                digest=digest,
+                baseline=ctx.baseline,
             )
     except JsonKeyMissingError as exc:
         raise ExtractorError(
@@ -470,7 +480,7 @@ def _extract_json_envelope(
         directory, is malformed, or belongs to another execution attempt.
     :return float: Validated objective value from the envelope.
     """
-    target = ctx.trial_dir / cfg.path
+    target = trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.path, checked=False)
     with _trial_json_read_errors(
         target,
         noun="JSON envelope",
@@ -479,7 +489,7 @@ def _extract_json_envelope(
             f"0 only; it writes `{cfg.path}` under PHASESWEEP_TRIAL_DIR"
         ),
     ):
-        raw = attempt_file(ctx.trial_dir, cfg.path).read_bytes()
+        raw = trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.path).read_bytes()
         data = strict_json_loads(raw.decode("utf-8"))
 
     if not isinstance(data, dict):
@@ -1071,7 +1081,7 @@ def _required_file(ctx: TrialContext, gate: RequiredFileGate) -> GateResult:
     :param RequiredFileGate gate: Gate config naming the required file path.
     :return GateResult: Pass/fail result and human-readable detail.
     """
-    path = ctx.trial_dir / gate.path
+    path = trial_file(ctx.trial_dir, ctx.attempt_dir, gate.path, checked=False)
     if path.is_file():
         return GateResult(gate.type, True, f"{gate.path} exists")
     return GateResult(gate.type, False, f"{gate.path} is missing")
@@ -1085,7 +1095,9 @@ def _json_equals(ctx: TrialContext, gate: JsonEqualsGate) -> GateResult:
     :return GateResult: Pass/fail result and human-readable detail.
     """
     try:
-        _, actual = load_json_value(ctx.trial_dir, gate.path, gate.key, baseline=ctx.baseline)
+        _, actual = load_json_value(
+            ctx.trial_dir, ctx.attempt_dir, gate.path, gate.key, baseline=ctx.baseline
+        )
     except Exception as exc:
         return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
     if type(actual) is type(gate.value) and actual == gate.value:
@@ -1106,7 +1118,9 @@ def _json_scalar_bound(ctx: TrialContext, gate: JsonScalarBoundGate) -> GateResu
     :return GateResult: Pass/fail result and human-readable detail.
     """
     try:
-        _, raw_value = load_json_value(ctx.trial_dir, gate.path, gate.key, baseline=ctx.baseline)
+        _, raw_value = load_json_value(
+            ctx.trial_dir, ctx.attempt_dir, gate.path, gate.key, baseline=ctx.baseline
+        )
         value = json_float(raw_value, label=gate.key)
     except Exception as exc:
         return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
@@ -1126,7 +1140,7 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
     :param ArtifactSizeGate gate: Gate config for file, directory, or JSON byte size.
     :return GateResult: Pass/fail result and human-readable detail.
     """
-    path = ctx.trial_dir / gate.path
+    path = trial_file(ctx.trial_dir, ctx.attempt_dir, gate.path, checked=False)
     if gate.source == "file":
         try:
             if not path.is_file():
@@ -1172,7 +1186,9 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
     else:
         assert gate.key is not None
         try:
-            _, raw_size = load_json_value(ctx.trial_dir, gate.path, gate.key, baseline=ctx.baseline)
+            _, raw_size = load_json_value(
+                ctx.trial_dir, ctx.attempt_dir, gate.path, gate.key, baseline=ctx.baseline
+            )
         except Exception as exc:
             return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
         if not isinstance(raw_size, int) or isinstance(raw_size, bool):
@@ -1196,7 +1212,7 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
     :return GateResult: Pass/fail result and human-readable detail.
     """
     try:
-        path = attempt_file(ctx.trial_dir, gate.path)
+        path = trial_file(ctx.trial_dir, ctx.attempt_dir, gate.path)
         if not path.is_file():
             return GateResult(gate.type, False, f"{gate.path} is missing")
         digest = file_sha256(path)

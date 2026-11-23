@@ -340,6 +340,35 @@ def test_parallel_reruns_each_use_their_own_sources_directory(tmp_path: Path) ->
     assert _expected_trial_dir_name(trials, trials[4]) == dirs["a0"].name
 
 
+_PRINTS_JSON = """
+import argparse, json
+parser = argparse.ArgumentParser()
+parser.add_argument("--out")
+parser.add_argument("--x", type=int)
+print(json.dumps({"loss": parser.parse_args().x / 10}))
+"""
+
+
+@pytest.mark.integration
+def test_a_json_objective_over_stdout_reads_and_verifies_the_captured_stream(
+    tmp_path: Path,
+) -> None:
+    """A ``json`` objective at ``stdout.log`` scores the attempt's captured stdout, and its winner verifies against the same file in later runs."""
+    metric = Metric(extractor=JsonExtractor(type="json", path="stdout.log", key="loss"))
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_trainer(tmp_path / "trainer.py", _PRINTS_JSON),
+        metric=metric,
+    )
+
+    winner = run_experiment(experiment)["p"]
+    _verify_winner_evidence(experiment, experiment.phases[0], winner)
+    assert run_experiment(experiment)["p"].metric == winner.metric
+    trial = next(t for t in phase_trials(experiment) if t.number == winner.trial_number)
+    attempt_dir = _attempt_dir(_phase_dir(experiment, "p"), trial.user_attrs[ATTEMPT_ID_ATTR])
+    assert (attempt_dir / "stdout.log").read_text() == f'{{"loss": {winner.metric}}}\n'
+
+
 def test_in_memory_runs_never_reuse_a_directory(tmp_path: Path) -> None:
     """Two ``storage: null`` runs restart trial numbers but open distinct directories, named by their attempts."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=0)

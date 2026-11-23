@@ -28,6 +28,19 @@ from phasesweep.config.common import (
     _validate_optional_bounds,
 )
 
+#: Configured paths that name the attempt's own captured streams in its attempt directory,
+#: so every extractor, gate and verification reading one sees only what this attempt printed.
+CAPTURED_STREAMS = frozenset({"stdout.log", "stderr.log"})
+
+
+def is_captured_stream(relative: str | Path) -> bool:
+    """Say whether a configured path names one of the attempt's captured streams.
+
+    :param str | Path relative: Configured trial-relative path.
+    :return bool: Whether it is in :data:`CAPTURED_STREAMS`.
+    """
+    return str(relative) in CAPTURED_STREAMS
+
 
 def _validate_trial_path(value: str) -> str:
     """Require a non-empty path inside the trial directory.
@@ -110,6 +123,22 @@ class JsonEnvelopeExtractor(_Frozen):
             "envelope's evaluation.progress, e.g. 'tokens' for a fixed-token sweep."
         ),
     )
+
+    @field_validator("path")
+    @classmethod
+    def _not_a_captured_stream(cls, value: str) -> str:
+        """Refuse a captured stream's name, which PhaseSweep writes and report_objective cannot.
+
+        :param str value: Validated trial-relative envelope path.
+        :raises ValueError: ``value`` is ``stdout.log`` or ``stderr.log``.
+        :return str: ``value``, unchanged.
+        """
+        if is_captured_stream(value):
+            raise ValueError(
+                f"json_envelope path {value!r} names a captured stream; report_objective() "
+                "writes the envelope under PHASESWEEP_TRIAL_DIR, so name another file."
+            )
+        return value
 
 
 class LogRegexExtractor(_Frozen):
