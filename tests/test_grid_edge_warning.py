@@ -61,6 +61,15 @@ from tests.ledger_fixtures import published_generation_id
 Row = tuple[dict[str, JsonValue], float | str]
 """One trial: its params, and its metric or the state ``fail``, ``infeasible`` or ``interrupted``."""
 
+_GROW_GRID = (
+    "; add values beyond the bound to search_space and raise n_trials to the new grid size; "
+    "the study keeps its finished trials"
+)
+_WIDEN_RANGE = (
+    "; widen the range in search_space and raise n_trials; the study keeps its finished trials"
+)
+_INHERIT_CHOICES = "; add a phase that inherits `p` with a grid over values beyond the bound"
+
 
 def _edge_warnings(
     caplog: pytest.LogCaptureFixture,
@@ -162,11 +171,41 @@ def test_edge_warning_uses_the_ordered_numeric_values_tried(
     warning: str | None,
     sampler_type: str,
 ) -> None:
-    """Every sampler gets the one rule; only numeric axes with three values tried have edges."""
+    """Every sampler gets the one rule; only numeric axes with three values tried have edges.
+
+    At the bound, a grid and a range under random or TPE grow in place, and choices under random
+    or TPE, which cannot grow, go to an inheriting phase.
+    """
     values = grid_search_space({"x": param})["x"]
     rows: list[Row] = [({"x": item}, 0.1 if item == value else 0.5) for item in values]
     warnings = _edge_warnings(caplog, {"x": param}, rows, sampler_type=sampler_type)
-    assert warnings == ([] if warning is None else [f"[p] no trial ran {warning}"])
+    remedy = (
+        _GROW_GRID
+        if sampler_type == "grid"
+        else _INHERIT_CHOICES
+        if isinstance(param, CategoricalParam)
+        else _WIDEN_RANGE
+    )
+    assert warnings == ([] if warning is None else [f"[p] no trial ran {warning}{remedy}"])
+
+
+def test_a_cmaes_range_at_its_bound_goes_to_an_inheriting_phase(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CMA-ES cannot widen a recorded range, so the warning names an inheriting phase instead."""
+    space: dict[str, SearchParam] = {
+        "x": FloatParam(type="float", low=0.1, high=0.3, step=0.1),
+        "y": FloatParam(type="float", low=0.0, high=1.0),
+    }
+    rows: list[Row] = [
+        ({"x": 0.1, "y": 0.5}, 0.5),
+        ({"x": 0.2, "y": 0.4}, 0.4),
+        ({"x": 0.3, "y": 0.45}, 0.1),
+    ]
+    assert _edge_warnings(caplog, space, rows, sampler_type="cmaes") == [
+        "[p] no trial ran above the winner's x=0.3 (tried 0.1..0.3, at the configured upper "
+        "bound); add an inheriting seeded random or TPE phase over the wider range"
+    ]
 
 
 @pytest.mark.parametrize("sampler_type", ["random", "tpe", "grid"])
@@ -202,7 +241,7 @@ def test_edge_warning_reads_log_float_ranges_and_names_every_parameter_once(
     assert _edge_warnings(caplog, space, rows) == [
         "[p] no trial ran above the winner's lr=0.0081 (tried 0.0002..0.0081, configured range "
         "extends to 0.01) or below the winner's width=64 (tried 64..512, at the configured lower "
-        "bound)"
+        f"bound){_WIDEN_RANGE}"
     ]
 
 
@@ -254,7 +293,9 @@ def test_repeats_edge_warning_uses_the_winning_group_and_skips_the_repeat_axis(
         rows,
         sampler_type="grid",
         repeats=Repeats(key="seed", values=[0, 1, 2]),
-    ) == ["[p] no trial ran below the winner's x=1 (tried 1..3, at the configured lower bound)"]
+    ) == [
+        f"[p] no trial ran below the winner's x=1 (tried 1..3, at the configured lower bound){_GROW_GRID}"
+    ]
 
 
 @pytest.mark.integration
@@ -286,7 +327,7 @@ def test_edge_advisory_is_recomputed_at_read_over_the_trials_selection_saw(
     )
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     winner = run_experiment(experiment)["p"]
-    expected = "no trial ran below the winner's x=2 (tried 2..4, at the configured lower bound)"
+    expected = f"no trial ran below the winner's x=2 (tried 2..4, at the configured lower bound){_GROW_GRID}"
     path = _generation_winner_path(experiment, winner.generation_id, "p")
     assert "no trial ran" not in path.read_text(encoding="utf-8")
 

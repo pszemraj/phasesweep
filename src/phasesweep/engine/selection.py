@@ -684,10 +684,12 @@ def _edge_advisory(
     :param Mapping[str, object] params: The winning configuration's params; for a repeats
         phase, the winning group's.
     :return str | None: One clause per such parameter, naming the values tried and whether the
-        winner sits on the configured end; ``None`` when no parameter qualifies.
+        winner sits on the configured end, then how to search past each configured end
+        reached; ``None`` when no parameter qualifies.
     """
     finished = [trial for trial in trials if _trial_count_state(trial) in FINISHED_TRIAL_STATES]
     clauses: list[str] = []
+    remedies: dict[str, None] = {}
     for name, param in phase.search_space.items():
         value = float_or_none(params.get(name))
         tried = sorted(
@@ -703,16 +705,42 @@ def _edge_advisory(
         end = _configured_end(param, upper=upper)
         if end is None:
             continue
+        at_end = _at_configured_end(param, value, end)
         place = (
             f"at the configured {'upper' if upper else 'lower'} bound"
-            if _at_configured_end(param, value, end)
+            if at_end
             else f"configured range extends to {param_text(end)}"
         )
         clauses.append(
             f"{'above' if upper else 'below'} the winner's {name}={param_text(params.get(name))} "
             f"(tried {param_text(tried[0])}..{param_text(tried[-1])}, {place})"
         )
-    return None if not clauses else "no trial ran " + " or ".join(clauses)
+        if at_end:
+            remedies[_edge_remedy(phase, param)] = None
+    if not clauses:
+        return None
+    return "; ".join(["no trial ran " + " or ".join(clauses), *remedies])
+
+
+def _edge_remedy(phase: Phase, param: SearchParam) -> str:
+    """Say how to search past a configured end the winner sits on, without retraining.
+
+    A grid, and an int or float range under random or TPE, grow in place; choices under random
+    or TPE and a CMA-ES range cannot (:func:`phasesweep.engine.growth._search_space_growth`),
+    so the values past the end go to an inheriting phase.
+
+    :param Phase phase: The phase whose winner sits on the end.
+    :param SearchParam param: The parameter at its configured end.
+    :return str: The remedy clause.
+    """
+    kept = "; the study keeps its finished trials"
+    if phase.sampler.type == "grid":
+        return f"add values beyond the bound to search_space and raise n_trials to the new grid size{kept}"
+    if phase.sampler.type == "cmaes":
+        return "add an inheriting seeded random or TPE phase over the wider range"
+    if isinstance(param, CategoricalParam):
+        return f"add a phase that inherits `{phase.name}` with a grid over values beyond the bound"
+    return f"widen the range in search_space and raise n_trials{kept}"
 
 
 def _untried_grid_cells(
