@@ -38,9 +38,11 @@ from phasesweep.engine.fingerprints import (
     _render_value,
     _verify_recorded_identity,
 )
+from phasesweep.engine.grid_order import recorded_search_space
 from phasesweep.engine.optuna import (
     _any_objective_unreadable,
     _any_trial_timed_out,
+    _draw_positions,
     _finished_trial_count,
     _measured_trial_count,
     _trial_count_state,
@@ -60,6 +62,7 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
+    _recorded_identity,
     _study_schema_supported,
     _unique_trial_outcomes,
     _unreplaced_attempts,
@@ -551,15 +554,13 @@ def _accepted_trial_target(study: optuna.Study) -> int:
 def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
     """Reject a target the study's durable state does not allow.
 
-    A target lower than the accepted one is refused, and so is a fixed
-    configuration or grid target past what it may retry (see
-    :func:`_validate_fixed_configuration_target`).
+    A target must keep the accepted budget, fit the available attempts, and reserve
+    enough draws to cover a full grown grid.
 
     :param optuna.Study study: Existing study whose accepted target is checked.
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
-    :raises TrialTargetRefusedError: ``phase.n_trials`` is lower than the
-        study's durable accepted target, or a fixed configuration or grid asks for more
-        attempts than it may retry.
+    :raises TrialTargetRefusedError: The target is too low for the accepted budget or
+        full grown grid, or too high for a fixed configuration or grid.
     """
     accepted_target = _accepted_trial_target(study)
     if phase.n_trials < accepted_target:
@@ -572,6 +573,7 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
     _validate_fixed_configuration_target(
         phase, finished=_finished_trial_count(trials), measured=_measured_trial_count(trials)
     )
+    _validate_grown_grid_target(study, phase, trials)
 
 
 def _validate_fixed_configuration_target(phase: Phase, *, finished: int, measured: int) -> None:
@@ -691,15 +693,67 @@ def _rerun_sources(trials: Sequence[optuna.trial.FrozenTrial]) -> list[optuna.tr
     return sorted(_unreplaced_attempts(trials, interrupted=True), key=lambda trial: trial.number)
 
 
+def _undrawn_grown_grid_cells(
+    study: optuna.Study, phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]
+) -> int:
+    """Count positions an enlarged full grid still has to allocate.
+
+    :param optuna.Study study: Study whose first search space defines its original grid.
+    :param Phase phase: Current phase whose grid may have grown.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Existing attempts, including reruns.
+    :return int: Unallocated cells of an enlarged full grid, or zero for any other phase.
+    """
+    if phase.sampler.type != "grid" or phase.allow_partial_grid or not phase_draws(phase):
+        return 0
+    identity = _recorded_identity(study)
+    if identity is None:
+        return 0
+    original = phase.model_copy(
+        update={"search_space": recorded_search_space(identity["search_spaces"][0]["search_space"])}
+    )
+    size = grid_cardinality(phase)
+    if size <= grid_cardinality(original):
+        return 0
+    return max(0, size - len(set(_draw_positions(trials).values())))
+
+
+def _validate_grown_grid_target(
+    study: optuna.Study, phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]
+) -> None:
+    """Require enough trial slots for every cell of an enlarged full grid.
+
+    A RUNNING attempt uses one slot whether it recovers as finished or needs a rerun,
+    so this check also works on the dry run's unrecovered study snapshot.
+
+    :param optuna.Study study: Study whose first search space defines its original grid.
+    :param Phase phase: Phase whose current target is checked.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Existing attempts.
+    :raises TrialTargetRefusedError: The target leaves too few slots for the undrawn cells.
+    """
+    undrawn = _undrawn_grown_grid_cells(study, phase, trials)
+    if not undrawn:
+        return
+    running = sum(trial.state == optuna.trial.TrialState.RUNNING for trial in trials)
+    minimum = _finished_trial_count(trials) + running + _pending_rerun_count(study) + undrawn
+    if phase.n_trials < minimum:
+        raise TrialTargetRefusedError(
+            f"Phase {phase.name!r}: n_trials={phase.n_trials} leaves too few trials for "
+            f"the enlarged grid's {plural(undrawn, 'undrawn cell')}.",
+            remediation=f"Set phases[{phase.name}].n_trials to at least {minimum}.",
+        )
+
+
 def _scheduled_reruns(
-    trials: Sequence[optuna.trial.FrozenTrial], phase: Phase | None = None
+    study: optuna.Study, trials: Sequence[optuna.trial.FrozenTrial], phase: Phase | None = None
 ) -> list[optuna.trial.FrozenTrial]:
     """Return the trials the next run reruns before any new draw and has not yet queued.
 
     Interrupted trials without a rerun come first, then the failed grid cells a target above
     the grid size retries, each in trial-number order. A retry takes one of the slots the
-    target leaves after the finished trials and the reruns already counted.
+    target leaves after the finished trials and reruns already counted. For a full grown grid,
+    reserve one slot per undrawn cell first.
 
+    :param optuna.Study study: Study holding the trials and grid history.
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
     :param Phase | None phase: Phase whose target above grid cardinality may retry failed cells.
     :return list[optuna.trial.FrozenTrial]: The trials to rerun, in scheduling order.
@@ -712,30 +766,32 @@ def _scheduled_reruns(
         and phase.n_trials > grid_cardinality(phase)
     ):
         waiting = sum(trial.state == optuna.trial.TrialState.WAITING for trial in trials)
-        slots = max(0, phase.n_trials - _finished_trial_count(trials) - len(sources) - waiting)
+        undrawn = _undrawn_grown_grid_cells(study, phase, trials)
+        slots = max(
+            0, phase.n_trials - _finished_trial_count(trials) - len(sources) - waiting - undrawn
+        )
         sources.extend(_failed_grid_cells(trials)[:slots])
     return sources
 
 
-def _pending_rerun_count(
-    trials: Sequence[optuna.trial.FrozenTrial], phase: Phase | None = None
-) -> int:
+def _pending_rerun_count(study: optuna.Study, phase: Phase | None = None) -> int:
     """Count the reruns a phase's next run launches before any new draw.
 
     That is every WAITING rerun already queued plus each trial :func:`_scheduled_reruns`
     names: interrupted trials without a rerun and failed grid cells a raised target retries.
     All of them are among the trials the target still leaves to run.
 
-    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
+    :param optuna.Study study: Study holding the trials and grid history.
     :param Phase | None phase: Phase whose target above grid cardinality may retry failed cells.
     :return int: Reruns the next run that reaches the phase launches before any new draw.
     """
+    trials = study.get_trials(deepcopy=False)
     waiting = sum(
         1
         for trial in trials
         if trial.state == optuna.trial.TrialState.WAITING and RERUN_OF_ATTR in trial.user_attrs
     )
-    return len(_scheduled_reruns(trials, phase)) + waiting
+    return len(_scheduled_reruns(study, trials, phase)) + waiting
 
 
 def _failed_grid_cells(
@@ -997,7 +1053,7 @@ def _record_reruns(study: optuna.Study, phase: Phase | None = None) -> list[tupl
     :return list[tuple[int, int]]: ``(source, rerun)`` trial numbers, interrupted
         sources first, then failed cells, each in trial-number order.
     """
-    sources = _scheduled_reruns(study.get_trials(deepcopy=False), phase)
+    sources = _scheduled_reruns(study, study.get_trials(deepcopy=False), phase)
     for source in sources:
         study.add_trial(
             optuna.trial.create_trial(
@@ -1544,6 +1600,7 @@ def _reached_study_refusals(
                 # is the one a launch checks after recovering them.
                 finished, measured = item.predicted
                 _validate_fixed_configuration_target(phase, finished=finished, measured=measured)
+                _validate_grown_grid_target(study, phase, study.get_trials(deepcopy=False))
                 needs_new_trials = phase.n_trials > finished
             if needs_new_trials:
                 _launch_preflight(experiment, phase.name, study)

@@ -24,7 +24,7 @@ from phasesweep.config.search import (
     SearchParam,
     sampler_search_space,
 )
-from phasesweep.engine.errors import StudyFingerprintMismatchError
+from phasesweep.engine.errors import StudyFingerprintMismatchError, TrialTargetRefusedError
 from phasesweep.engine.fingerprints import _verify_fingerprint
 from phasesweep.engine.growth import (
     CHOICES_ROUTE,
@@ -35,6 +35,7 @@ from phasesweep.engine.growth import (
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _build_sampler, _draw_positions, _suggest_all
 from phasesweep.engine.preview import validate_trial_targets
+from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_DIR_ATTR, _recorded_identity
 from phasesweep.runtime.json import dump_json
 from tests.conftest import make_experiment, phase_study, phase_trials, write_trainer
@@ -45,11 +46,14 @@ _GROWN = [1e-5, *_ORIGINAL, 1e-2, 3e-2]
 _RENAME = "give `p` a new `name`, which runs it again from scratch"
 
 
-def _trainer(tmp_path: Path, *, fail_once: float | None = None) -> tuple[Path, Path]:
+def _trainer(
+    tmp_path: Path, *, fail_value: float | None = None, failure_attempts: int = 1
+) -> tuple[Path, Path]:
     """Write a trainer that logs its ``--lr`` as the objective and records each call.
 
     :param Path tmp_path: Directory holding the trainer and its call log.
-    :param float | None fail_once: An lr whose first call exits nonzero.
+    :param float | None fail_value: An lr whose initial calls exit nonzero.
+    :param int failure_attempts: Number of calls at that lr that fail, defaults to one.
     :return tuple[Path, Path]: The trainer and the log that gains one ``lr`` line per call.
     """
     calls = tmp_path / "calls.log"
@@ -66,7 +70,7 @@ def _trainer(tmp_path: Path, *, fail_once: float | None = None) -> tuple[Path, P
         seen = calls.read_text().split() if calls.exists() else []
         with calls.open("a") as log:
             log.write(repr(args.lr) + "\\n")
-        if args.lr == {fail_once!r} and repr(args.lr) not in seen:
+        if args.lr == {fail_value!r} and seen.count(repr(args.lr)) < {failure_attempts}:
             sys.exit(1)
         print(f"x={{args.lr}}")
         """,
@@ -241,7 +245,7 @@ def test_interrupted_old_cell_reruns_in_place_before_the_grown_cells(
 @pytest.mark.integration
 def test_failed_old_cell_retries_above_the_grown_size(tmp_path: Path) -> None:
     """A recorded failed cell is not retried by the grown grid's own size, only by a target above it, at its own grid_id."""
-    trainer, calls = _trainer(tmp_path, fail_once=3e-4)
+    trainer, calls = _trainer(tmp_path, fail_value=3e-4)
     original = _experiment(tmp_path, trainer, _phase(_ORIGINAL))
     run_experiment(original)
     failed = next(t for t in phase_trials(original) if t.state.name == "FAIL")
@@ -257,6 +261,51 @@ def test_failed_old_cell_retries_above_the_grown_size(tmp_path: Path) -> None:
     assert retry.system_attrs["grid_id"] == failed.system_attrs["grid_id"]
     assert retry.user_attrs[TRIAL_DIR_ATTR] != failed.user_attrs[TRIAL_DIR_ATTR]
     assert _complete_lrs(raised) == sorted(_GROWN)
+
+
+@pytest.mark.parametrize("failure_attempts", [1, 2])
+@pytest.mark.integration
+def test_full_grid_growth_reserves_new_cells_after_spent_retries(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, failure_attempts: int
+) -> None:
+    """Past retries consume budget, and new retries cannot take slots needed for full coverage."""
+    trainer, calls = _trainer(tmp_path, fail_value=_ORIGINAL[0], failure_attempts=failure_attempts)
+    run_experiment(_experiment(tmp_path, trainer, _phase(_ORIGINAL)))
+    already_finished = len(_ORIGINAL) + 1
+    run_experiment(_experiment(tmp_path, trainer, _phase(_ORIGINAL, n_trials=already_finished)))
+    assert len(_calls(calls)) == already_finished
+
+    grown = _experiment(tmp_path, trainer, _phase(_GROWN))
+    for dry_run in (True, False):
+        with pytest.raises(
+            TrialTargetRefusedError, match="enlarged grid's 3 undrawn cells"
+        ) as error:
+            run_experiment(grown, dry_run=dry_run)
+        assert error.value.remediation == "Set phases[p].n_trials to at least 8."
+    assert len(_calls(calls)) == already_finished
+
+    partial = grown.phases[0].model_copy(update={"allow_partial_grid": True})
+    run_experiment(_experiment(tmp_path, trainer, partial), dry_run=True)
+    full = _experiment(tmp_path, trainer, _phase(_GROWN, n_trials=len(_GROWN) + 1))
+    caplog.set_level(logging.INFO, logger="phasesweep")
+    run_experiment(full, dry_run=True)
+    assert "DRY RUN phase=p would launch 3 trials" in caplog.messages
+    run_experiment(full)
+    assert sorted(_calls(calls)[already_finished:]) == sorted(set(_GROWN) - set(_ORIGINAL))
+
+
+@pytest.mark.integration
+def test_full_grid_growth_runs_earlier_cells_an_abort_left_undrawn(tmp_path: Path) -> None:
+    """Every unallocated cell remains in the full grid after an abort and growth."""
+    failed = 1e-3
+    trainer, calls = _trainer(tmp_path, fail_value=failed)
+    phase = _phase(_ORIGINAL).model_copy(update={"max_consecutive_failures": 1})
+    with pytest.raises(PhaseTrialsFailedError, match="1 consecutive failed/infeasible trials"):
+        run_experiment(_experiment(tmp_path, trainer, phase))
+    assert _calls(calls) == [failed]
+
+    run_experiment(_experiment(tmp_path, trainer, _phase(_GROWN)))
+    assert sorted(_calls(calls)[1:]) == sorted(set(_GROWN) - {failed})
 
 
 @pytest.mark.integration
@@ -360,7 +409,7 @@ def test_dry_run_of_grown_phase_leaves_the_journal_unchanged(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, retry: bool
 ) -> None:
     """A grown phase's preview counts retries in its launch budget and writes nothing."""
-    trainer, calls = _trainer(tmp_path, fail_once=_ORIGINAL[0] if retry else None)
+    trainer, calls = _trainer(tmp_path, fail_value=_ORIGINAL[0] if retry else None)
     run_experiment(_experiment(tmp_path, trainer, _phase(_ORIGINAL)))
     journal = tmp_path / "studies.journal"
     before = journal.read_bytes()

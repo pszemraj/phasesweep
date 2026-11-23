@@ -1595,7 +1595,7 @@ def _run_phase(
     trials = study.get_trials(deepcopy=False)
     finished = _finished_trial_count(trials)
     remaining = max(0, phase.n_trials - finished)
-    reruns = _pending_rerun_count(trials, phase)
+    reruns = _pending_rerun_count(study, phase)
     report.info(
         phase_start(experiment, phase, finished=finished, remaining=remaining, reruns=reruns)
     )

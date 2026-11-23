@@ -91,11 +91,10 @@ class RecordedPhase:
     measured: int
     #: How many attempts are RUNNING, which a launch recovers before it checks anything.
     running: int
-    #: Reruns a launch would run before any new draw: interrupted trials without one,
-    #: failed grid cells a raised target retries, WAITING reruns, and RUNNING attempts that
-    #: recover as interrupted. A phase with a RUNNING attempt counts no grid retries, because
-    #: its recovery changes how many a launch schedules.
-    reruns: int
+    #: Predicted reruns while the study still needs recovery: interrupted and already queued
+    #: attempts plus RUNNING attempts that recover as interrupted. With no recovery pending,
+    #: preview instead counts reruns, including grid retries, after the phase passes preflight.
+    recovery_reruns: int
     #: The phase's study as a read-only snapshot, or ``None`` when the ledger holds none.
     study: optuna.Study | None
 
@@ -162,7 +161,7 @@ def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
     :return RecordedPhase: The counts and the study.
     """
     if study is None:
-        return RecordedPhase(finished=0, measured=0, running=0, reruns=0, study=None)
+        return RecordedPhase(finished=0, measured=0, running=0, recovery_reruns=0, study=None)
     trials = study.get_trials(deepcopy=False)
     recovered = _recovered_running_states(study.study_name, trials)
     if "EVIDENCE_PENDING" in recovered:
@@ -180,9 +179,9 @@ def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
         finished=_finished_trial_count(trials) + recovered_as_failed,
         measured=_measured_trial_count(trials),
         running=len(recovered),
-        reruns=_pending_rerun_count(trials, None if recovered else phase)
-        + len(recovered)
-        - recovered_as_failed,
+        recovery_reruns=(
+            _pending_rerun_count(study) + len(recovered) - recovered_as_failed if recovered else 0
+        ),
         study=study,
     )
 
@@ -377,7 +376,7 @@ def _preview_phase(
         trials a launch would run, and whether the phase replays.
     """
     finished = 0 if recorded is None else recorded.finished
-    reruns = 0 if recorded is None else recorded.reruns
+    reruns = 0 if recorded is None else recorded.recovery_reruns
     remaining = max(0, phase.n_trials - finished)
     study: optuna.Study | None = None
     resume: _PhaseResume | None = None
@@ -415,6 +414,7 @@ def _preview_phase(
             )
     if recorded is not None and not recorded.running and recorded.study is not None:
         study = recorded.study
+        reruns = _pending_rerun_count(study, phase)
         # Empty snapshots need no fingerprint stamp or comparison.
         resumed = _judge_recorded_phase(
             experiment,
