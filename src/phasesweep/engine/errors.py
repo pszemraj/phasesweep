@@ -120,7 +120,8 @@ class IncompleteJournalRecordError(StudyStorageUnavailableError):
 
     Causes include lock timeout or replacement, backup or truncation failure,
     and journal changes during repair. Intact records remain;
-    lock replacement or concurrent changes carry ``OperatorAction.RETRY``.
+    a lock still held after the repair's wait, lock replacement or concurrent changes carry
+    ``OperatorAction.RETRY``.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_LEDGER

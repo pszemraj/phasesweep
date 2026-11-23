@@ -960,7 +960,7 @@ def test_repair_refuses_a_journal_lock_that_is_never_released(
         assert clock["now"] == pytest.approx(engine_ledger._JOURNAL_LOCK_WAIT_SECONDS)
         assert len(raised) == 1
         assert isinstance(raised[0], IncompleteJournalRecordError)
-        assert raised[0].action == OperatorAction.RESTORE_LEDGER
+        assert raised[0].action == OperatorAction.RETRY
         assert "Retry when the writer finishes" in str(raised[0])
         assert journal.read_bytes() == damaged
         assert holder.held()

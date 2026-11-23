@@ -468,7 +468,8 @@ class _JournalLock(BaseJournalFileLock):
                     raise IncompleteJournalRecordError(
                         f"Journal storage {self.path} ends with an incomplete record, and "
                         f"its journal lock was still held after {self._timeout:g} seconds, "
-                        "so the record was not repaired. Retry when the writer finishes."
+                        "so the record was not repaired. Retry when the writer finishes.",
+                        action=OperatorAction.RETRY,
                     )
                 time.sleep(delay if remaining is None else min(delay, remaining))
                 delay = min(delay * 2, 1.0)
