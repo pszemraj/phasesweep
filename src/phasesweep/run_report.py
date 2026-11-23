@@ -282,6 +282,7 @@ def trial_line(
     repeat: tuple[str, object] | None,
     rerun_of: object,
     reason: str | None,
+    recovered: bool = False,
 ) -> FactLine:
     """Build the line for one finished trial from its recorded values.
 
@@ -296,6 +297,7 @@ def trial_line(
     :param tuple[str, object] | None repeat: Repeat key and value this trial ran, if any.
     :param object rerun_of: Trial number this one reruns, ``None`` for a first attempt.
     :param str | None reason: First line of the recorded cause, if any.
+    :param bool recovered: Whether a later run's recovery settled the trial, not its own run.
     :return FactLine: The block to log.
     """
     facts = [
@@ -308,6 +310,8 @@ def trial_line(
     notes = [] if repeat is None else [f"repeat {repeat[0]}={param_text(repeat[1])}"]
     if rerun_of is not None:
         notes.append(f"rerun of {rerun_of}")
+    if recovered:
+        notes.append("recovered")
     style = _STATE_STYLES.get(state)
     return FactLine(
         phase.name,

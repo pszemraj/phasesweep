@@ -16,7 +16,13 @@ from tests.conftest import make_experiment, phase_trials, write_constant_trainer
 
 _DEFERRED = "finished training; its result is retained"
 _LOST = "finished training, but its result was not extracted and is lost"
-_KEPT = "Kept completed trial result"
+
+
+def _kept(caplog: pytest.LogCaptureFixture) -> int:
+    """Count the trial lines that report a result the run kept for a trial it had stopped."""
+    return sum(
+        "COMPLETE" in line and line.endswith("  recovered") for line in caplog.text.splitlines()
+    )
 
 
 def _run_until_shutdown(experiment: Experiment, caplog: pytest.LogCaptureFixture) -> None:
@@ -82,7 +88,7 @@ def test_a_trial_the_stopped_run_commits_is_not_also_left_to_the_next_run(
     _run_until_shutdown(experiment, caplog)
 
     assert _DEFERRED not in caplog.text
-    assert caplog.text.count(_KEPT) == 1
+    assert _kept(caplog) == 1
     assert [trial.state.name for trial in phase_trials(experiment)] == ["COMPLETE"]
 
 
@@ -97,7 +103,7 @@ def test_training_the_stopped_run_could_not_settle_keeps_its_warning(
     _run_until_shutdown(experiment, caplog)
 
     assert caplog.text.count(_DEFERRED) == 1
-    assert _KEPT not in caplog.text
+    assert _kept(caplog) == 0
     assert [trial.state.name for trial in phase_trials(experiment)] == ["RUNNING"]
 
 
@@ -112,4 +118,4 @@ def test_storage_null_still_says_the_stopped_trial_is_lost(
     _run_until_shutdown(experiment, caplog)
 
     assert caplog.text.count(_LOST) == 1
-    assert _KEPT not in caplog.text
+    assert _kept(caplog) == 0

@@ -256,6 +256,82 @@ def test_infeasible_and_interrupted_trials_keep_what_was_recorded(experiment: Ex
     )
 
 
+@pytest.mark.parametrize(
+    ("width", "kept", "crashed"),
+    [
+        pytest.param(
+            80,
+            [
+                "12:00:00  depth          trial 3  COMPLETE  eval_loss 0.3  0.5s  3/4",
+                "                         model.n_layers=8  recovered",
+            ],
+            [
+                "12:00:00  depth          trial 0  FAIL  0.5s  1/4  model.n_layers=8  recovered",
+                "                         reason: non-zero exit code 1; stderr: loading the",
+                "                                 dataset failed: shard 3 is truncated",
+            ],
+            id="80",
+        ),
+        pytest.param(
+            60,
+            [
+                "12:00:00  depth          trial 3  COMPLETE  eval_loss 0.3",
+                "                         0.5s  3/4",
+                "                         model.n_layers=8  recovered",
+            ],
+            [
+                "12:00:00  depth          trial 0  FAIL  0.5s  1/4",
+                "                         model.n_layers=8  recovered",
+                "                         reason: non-zero exit code 1;",
+                "                                 stderr: loading the dataset",
+                "                                 failed: shard 3 is",
+                "                                 truncated",
+            ],
+            id="60",
+        ),
+    ],
+)
+def test_a_trial_recovery_settled_is_a_trial_line_marked_recovered(
+    experiment: Experiment, width: int, kept: list[str], crashed: list[str]
+) -> None:
+    """A result recovery kept and a crash it recorded print as trial lines noted ``recovered``."""
+    depth = experiment.phases[0]
+    result = trial_line(
+        experiment,
+        depth,
+        number=3,
+        state="COMPLETE",
+        value=0.3,
+        seconds=0.5,
+        finished=3,
+        params={"model.n_layers": 8},
+        repeat=None,
+        rerun_of=None,
+        reason=None,
+        recovered=True,
+    )
+    crash = trial_line(
+        experiment,
+        depth,
+        number=0,
+        state="FAIL",
+        value=None,
+        seconds=0.5,
+        finished=1,
+        params={"model.n_layers": 8},
+        repeat=None,
+        rerun_of=None,
+        reason="non-zero exit code 1; stderr: loading the dataset failed: shard 3 is truncated",
+        recovered=True,
+    )
+    assert console(result, width) == kept
+    assert console(crash, width) == crashed
+    assert (
+        str(result)
+        == "depth  trial 3  COMPLETE  eval_loss 0.3  0.5s  3/4  model.n_layers=8  recovered"
+    )
+
+
 def test_rerun_and_skipped_lines(experiment: Experiment) -> None:
     """A rerun names its source and that trial's cause; a skipped phase says where its winner is."""
     depth = experiment.phases[0]

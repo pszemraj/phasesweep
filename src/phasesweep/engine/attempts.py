@@ -24,8 +24,9 @@ from phasesweep.engine.errors import (
     tracker_unreadable,
 )
 from phasesweep.engine.ledger import open_registry_study
+from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.paths import _attempt_dir, _attempts_dir, _experiment_dir
-from phasesweep.engine.progress import _warn_deferred_extraction
+from phasesweep.engine.progress import _log_recovered_trial, _warn_deferred_extraction
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -1351,13 +1352,7 @@ def _recover_completed_trial(
         raise StudyStorageUnavailableError(
             f"Completed attempt {record.attempt_id} could not be committed; its retained evidence permits recovery on retry."
         ) from exc
-    _tell_recovered_trial(study, trial, record, result.metric, report)
-    if result.failure_reason is not None:
-        log.warning(
-            "Completed orphan attempt %s failed: its evidence could not be accepted: %s",
-            record.attempt_id,
-            result.failure_reason,
-        )
+    _tell_recovered_trial(study, trial, record, result.metric, report, producing=experiment)
     return True
 
 
@@ -1367,14 +1362,17 @@ def _tell_recovered_trial(
     record: _AttemptRecord,
     metric: float | None,
     report: _PreflightCleanupReport | None,
+    *,
+    producing: Experiment,
 ) -> None:
-    """Finish the Optuna transition for a trial whose outcome is already durable.
+    """Finish the Optuna transition for a trial whose outcome is already durable, and report it.
 
     :param optuna.Study study: Owning study.
     :param optuna.trial.FrozenTrial trial: Trial to settle.
     :param _AttemptRecord record: Attempt that produced the measurement.
     :param float | None metric: Accepted objective, or None for a failed extraction.
     :param _PreflightCleanupReport | None report: Collector for newly retained measurements.
+    :param Experiment producing: The configuration that produced the attempt, for its line.
     :raises StudyStorageUnavailableError: The cleanup record or terminal transition failed.
     """
     _record_cleanup_recovery(study, trial)
@@ -1387,17 +1385,30 @@ def _tell_recovered_trial(
         raise StudyStorageUnavailableError(
             f"Completed attempt {record.attempt_id} could not be committed; its retained evidence permits recovery on retry."
         ) from exc
-    if metric is None:
-        return
-    if report is not None:
+    if metric is not None and report is not None:
         report.retained_results += 1
-    log.warning(
-        "Kept completed trial result: phase=%r trial=%d value=%g (attempt=%s).",
-        record.phase_name,
-        trial.number,
-        metric,
-        record.attempt_id,
-    )
+    _report_recovered_trial(study, trial, producing.phase(record.phase_name), producing)
+
+
+def _report_recovered_trial(
+    study: optuna.Study, trial: optuna.trial.FrozenTrial, phase: Phase, producing: Experiment
+) -> None:
+    """Print the trial line of a trial recovery just made terminal.
+
+    A line that cannot be built never undoes the settlement already committed.
+
+    :param optuna.Study study: Owning study.
+    :param optuna.trial.FrozenTrial trial: The settled trial, as read before its transition.
+    :param Phase phase: Its phase in the producing configuration.
+    :param Experiment producing: The configuration that produced the attempt.
+    """
+    try:
+        settled = study._storage.get_trial(trial._trial_id)
+        finished = _finished_trial_count(study.get_trials(deepcopy=False))
+    except Exception:
+        log.debug("Recovered trial %d settled; its line could not be read.", trial.number)
+        return
+    _log_recovered_trial(producing, phase, settled, finished)
 
 
 def _fail_stale_running_trial(
@@ -1473,7 +1484,7 @@ def _fail_stale_running_trial(
             raise TrialEvidenceMissingError.rewrap(
                 exc, str(exc), remediation=f"{operator_step(exc).rstrip('.')}, or {FRESH_STUDY}."
             ) from exc
-        _tell_recovered_trial(study, trial, record, outcome.metric, report)
+        _tell_recovered_trial(study, trial, record, outcome.metric, report, producing=producing)
         recovered = True
     elif outcome is None and record is not None and experiment is not None:
         extracted = _recover_completed_trial(
@@ -1485,8 +1496,11 @@ def _fail_stale_running_trial(
     else:
         recovered = False
     if not recovered:
+        crashed = None
         if outcome is None:
-            _record_unfinished_trial_outcome(study, trial, record=record, experiment=experiment)
+            crashed = _record_unfinished_trial_outcome(
+                study, trial, record=record, experiment=experiment
+            )
         _record_cleanup_recovery(study, trial)
         try:
             study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
@@ -1495,6 +1509,8 @@ def _fail_stale_running_trial(
                 f"Process cleanup completed ({where}), but stale RUNNING trial {trial.number} "
                 f"in study {study.study_name!r} could not be marked FAIL: {exc}"
             ) from exc
+        if crashed is not None:
+            _report_recovered_trial(study, trial, *crashed)
     return True
 
 
@@ -1504,7 +1520,7 @@ def _record_unfinished_trial_outcome(
     *,
     record: _AttemptRecord | None,
     experiment: Experiment | None,
-) -> None:
+) -> tuple[Phase, Experiment] | None:
     """Record the verdict of a stale trial no outcome and no measurement settled.
 
     A trainer that crashed before its runner died keeps its failure, as on the live path,
@@ -1519,6 +1535,8 @@ def _record_unfinished_trial_outcome(
     :raises WinnerIntegrityError: A failure's producing configuration snapshot is unavailable.
     :raises StudySchemaMismatchError: The durable completion order is invalid.
     :raises StudyStorageUnavailableError: The verdict could not be recorded.
+    :return tuple[Phase, Experiment] | None: For a recorded failure, the phase and configuration
+        its trial line is printed under once the trial is terminal; ``None`` for an interruption.
     """
     from phasesweep.engine.trial import _trainer_failure_reason
 
@@ -1533,8 +1551,9 @@ def _record_unfinished_trial_outcome(
         reason = _trainer_failure_reason(trial, lifecycle, record.attempt_dir)
     if reason is None or record is None:
         _record_stale_trial_outcome(study, trial)
-        return
+        return None
     policy_phase = None
+    producing = experiment
     if record.generation_id is not None and experiment is not None:
         producing = _load_generation_experiment(_experiment_dir(experiment), record.generation_id)
         policy_phase = producing.phase(record.phase_name)
@@ -1547,12 +1566,9 @@ def _record_unfinished_trial_outcome(
                 f"The failure of stale RUNNING trial {trial.number} in study "
                 f"{study.study_name!r} was recorded, but its reason could not be saved."
             ) from exc
-    log.warning(
-        "Recovered trial %d in phase %r failed before its run stopped: %s",
-        trial.number,
-        record.phase_name,
-        reason,
-    )
+    if producing is None:
+        return None
+    return producing.phase(record.phase_name), producing
 
 
 def _cleanup_recovered_trial_numbers(study: optuna.Study) -> set[int]:

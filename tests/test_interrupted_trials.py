@@ -1234,7 +1234,10 @@ else:
                 expected_kept = 0 if terminated else 1
                 assert f"kept {expected_kept} completed trial result(s)" in recovered_run.output
                 if expected_kept:
-                    assert "Kept completed trial result: phase='p' trial=0 value=1" in caplog.text
+                    assert any(
+                        line.endswith("  recovered") and "p  trial 0  COMPLETE  " in line
+                        for line in caplog.text.splitlines()
+                    )
             else:
                 cleanup_report = _PreflightCleanupReport()
                 _reconcile_existing_studies(experiment, cleanup_report=cleanup_report)
@@ -1339,7 +1342,10 @@ def _assert_restored_tracker_keeps_training(
     recovered = phase_trials(experiment)
     assert [trial.state.name for trial in recovered] == ["COMPLETE"] * len(pending)
     for trial in pending:
-        assert f"Kept completed trial result: phase='p' trial={trial.number} value=1" in caplog.text
+        assert any(
+            line.endswith("  recovered") and f"p  trial {trial.number}  COMPLETE  " in line
+            for line in caplog.text.splitlines()
+        )
     assert launches.read_text().splitlines() == ["launch"] * len(pending)
 
 

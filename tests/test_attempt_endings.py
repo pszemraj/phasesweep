@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
@@ -210,7 +211,7 @@ def test_a_crash_keeps_its_failure_when_a_ctrl_c_lands_in_the_helper_settle(
 
 @pytest.mark.integration
 def test_a_crash_whose_runner_was_killed_is_recovered_as_a_failure_that_trips_the_streak(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A trainer that exited 1 while its runner was SIGKILLed is recovered as that failure, and ``max_consecutive_failures: 1`` aborts instead of rerunning it."""
     exited = tmp_path / "exited"
@@ -254,7 +255,10 @@ def test_a_crash_whose_runner_was_killed_is_recovered_as_a_failure_that_trips_th
         time.sleep(0.05)
     assert stale.state.name == "RUNNING" and TRIAL_OUTCOME_ATTR not in stale.user_attrs
 
-    with pytest.raises(PhaseSweepError, match="max_consecutive_failures"):
+    with (
+        caplog.at_level(logging.INFO, logger="phasesweep"),
+        pytest.raises(PhaseSweepError, match="max_consecutive_failures"),
+    ):
         run_experiment(experiment)
 
     (trial,) = phase_trials(experiment)
@@ -262,6 +266,13 @@ def test_a_crash_whose_runner_was_killed_is_recovered_as_a_failure_that_trips_th
         "FAIL",
         "non-zero exit code 1; stderr: assertion failed in data loader",
     )
+    # Recovery reports the crash as the trial's own line, noted recovered, not as a warning.
+    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("p  trial 0")]
+    assert line.startswith("p  trial 0  FAIL  ")
+    assert line.endswith(
+        "  recovered  reason: non-zero exit code 1; stderr: assertion failed in data loader"
+    )
+    assert all(r.levelno < logging.WARNING for r in caplog.records if "trial 0" in r.getMessage())
     parsed = _parsed_trial_outcome(trial.user_attrs[TRIAL_OUTCOME_ATTR])
     assert parsed is not None and parsed.abort is not None
     assert _record_reruns(phase_study(experiment)) == []

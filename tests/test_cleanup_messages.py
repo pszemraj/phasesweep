@@ -116,7 +116,7 @@ def test_confirm_does_not_count_an_already_complete_trial_as_a_recovered_result(
     assert confirmed.exit_code == 0, confirmed.output
     assert "kept 0 completed trial result(s)" in confirmed.output
     assert "confirmed 1 cleanup-uncertain trial(s)" in confirmed.output
-    assert "Kept completed trial result" not in caplog.text
+    assert not any(line.endswith("  recovered") for line in caplog.text.splitlines())
     retained = study.get_trials()[number]
     assert retained.state == optuna.trial.TrialState.COMPLETE
     assert retained.value == 0.5
