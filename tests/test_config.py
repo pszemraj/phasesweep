@@ -145,7 +145,7 @@ def test_an_envelope_at_a_captured_stream_fails_config_load() -> None:
 def test_config_load_normalizes_evidence_paths_and_refuses_one_outside_the_trial(
     tmp_path: Path,
 ) -> None:
-    """Load stores ``./x.json`` as ``x.json`` and refuses a path that is absolute or leaves the trial."""
+    """Load stores ``./x.json`` as ``x.json`` and refuses a path that is absolute or has a ``..`` part."""
     payload = make_experiment(
         metric=Metric(extractor=JsonExtractor(type="json", path="x.json", key="loss"))
     ).model_dump(mode="json")
@@ -154,9 +154,9 @@ def test_config_load_normalizes_evidence_paths_and_refuses_one_outside_the_trial
     assert isinstance(loaded.metric.extractor, JsonExtractor)
     assert loaded.metric.extractor.path == "x.json"
 
-    for outside in ("/tmp/x.json", "a/../../x.json"):
+    for outside in ("/tmp/x.json", "a/../x.json"):
         payload["metric"]["extractor"]["path"] = outside
-        with pytest.raises(ValidationError, match="is absolute or leaves the trial directory"):
+        with pytest.raises(ValidationError, match="trial-relative path required"):
             load_experiment(write_yaml(tmp_path, yaml.safe_dump(payload)))
 
 

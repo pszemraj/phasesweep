@@ -52,19 +52,16 @@ def _validate_trial_path(value: str) -> str:
     the captured stream exactly as ``stdout.log`` does and both are one config.
 
     :param str value: Candidate trial-relative path.
-    :raises ValueError: If ``value`` is empty, contains a NUL byte that no filesystem call
-        can accept, or after normalization is absolute or escapes upward, which could only
-        fail the trial after it trained.
+    :raises ValueError: If ``value`` is empty, absolute, has a ``..`` part, or contains a
+        NUL byte that no filesystem call can accept.
     :return str: The normalized trial-relative path.
     """
-    if not value or "\0" in value:
+    path = Path(value)
+    if not value or "\0" in value or path.is_absolute() or ".." in path.parts:
         raise ValueError(f"trial-relative path required; got {value!r}.")
-    normalized = Path(posixpath.normpath(value))
-    if normalized.is_absolute() or normalized.parts[:1] == ("..",):
-        raise ValueError(
-            f"trial-relative path required; {value!r} is absolute or leaves the trial directory."
-        )
-    return str(normalized)
+    # With no `..` part, normalizing only drops `.` parts and repeated slashes, so the
+    # result names the same file whatever links the path crosses.
+    return posixpath.normpath(value)
 
 
 def _validate_trial_file_path(value: str) -> str:
