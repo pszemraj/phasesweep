@@ -194,7 +194,7 @@ def test_wandb_real_sdk_error_causes_are_preserved(tmp_path, monkeypatch, status
         attempts.clear()
         monkeypatch.setattr(
             "phasesweep.evidence.evaluation.poll_wandb_summary",
-            lambda trial_dir, environment, **kwargs: _wandb_poll(**kwargs),
+            lambda attempt_dir, environment, **kwargs: _wandb_poll(**kwargs),
         )
         extractor = WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss")
         with pytest.raises(EvidenceUnreadableError, match=str(status)):
@@ -922,7 +922,7 @@ def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monk
     monkeypatch.setattr(public, "Api", lambda **kwargs: SimpleNamespace(run=lookup))
     monkeypatch.setattr(
         "phasesweep.evidence.evaluation.poll_wandb_summary",
-        lambda trial_dir, environment, **kwargs: _poll_wandb_summary(**kwargs),
+        lambda attempt_dir, environment, **kwargs: _poll_wandb_summary(**kwargs),
     )
     result = evaluate_gates(
         make_trial_context(tmp_path),
@@ -998,7 +998,7 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
         "entity": "entity",
         "project": "project",
         "run_id": "attempt",
-        "trial_dir": tmp_path,
+        "attempt_dir": tmp_path,
         "poll_seconds": 0.01,
         "timeout_seconds": 5,
         "environment": {"HTTPS_PROXY": "https://transport.test", "PYTHONHOME": "/trainer/python"},
@@ -1028,7 +1028,7 @@ def test_wandb_worker_crash_preserves_private_stderr(wandb_worker_sdk, tmp_path)
             entity="e",
             project="p",
             run_id="attempt",
-            trial_dir=tmp_path,
+            attempt_dir=tmp_path,
             poll_seconds=0.01,
             timeout_seconds=5,
         )
@@ -1292,7 +1292,7 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch,
             stdout=output,
             stderr=output,
             timeout=5,
-            trial_dir=tmp_path,
+            attempt_dir=tmp_path,
             attempt_id="attempt",
         )
     assert result.cleanup_confirmed
@@ -1316,7 +1316,7 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch,
         "entity": "e",
         "project": "p",
         "run_id": "attempt",
-        "trial_dir": tmp_path,
+        "attempt_dir": tmp_path,
         "poll_seconds": 0.01,
         "timeout_seconds": 5,
     }
@@ -1329,7 +1329,8 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch,
     assert lifecycle is not None and lifecycle.state == "exited"
     assert lifecycle.cleanup_confirmed is True
     assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds >= 0
-    assert lifecycle.return_code is not None and lifecycle.return_code != 0
+    assert lifecycle.ended_by == "not_started"
+    assert lifecycle.return_code is None
     assert aborted_groups
     assert all(not process._process_group_alive(pgid) for pgid in aborted_groups)
 
@@ -1362,7 +1363,7 @@ def test_wandb_supervision_bounds_blocked_sdk_and_descendants(wandb_worker_sdk, 
             entity="e",
             project="p",
             run_id="attempt",
-            trial_dir=tmp_path,
+            attempt_dir=tmp_path,
             poll_seconds=0.01,
             timeout_seconds=2,
         )
@@ -1401,7 +1402,7 @@ def test_wandb_position_worker_stopped_at_its_deadline_records_no_position(
         entity="e",
         project="p",
         run_id="attempt",
-        trial_dir=tmp_path,
+        attempt_dir=tmp_path,
         poll_seconds=0.01,
         timeout_seconds=2,
         metric_key="loss",
@@ -1977,7 +1978,7 @@ def test_wandb_worker_reports_a_missing_run_before_the_supervisor_stops_it(
             entity="e",
             project="p",
             run_id="attempt",
-            trial_dir=tmp_path,
+            attempt_dir=tmp_path,
             poll_seconds=0.01,
             timeout_seconds=_WORKER_POLL_BUDGET_SECONDS,
         )

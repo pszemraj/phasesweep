@@ -22,6 +22,7 @@ from phasesweep.engine.state import (
     RERUN_OF_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     constraint_attr,
 )
@@ -71,6 +72,7 @@ def _add_trial(
         FEASIBLE_ATTR: feasible,
         GENERATION_ID_ATTR: "generation-test",
         ATTEMPT_ID_ATTR: f"attempt-{len(study.trials)}",
+        TRIAL_DIR_ATTR: f"/runs/p/trial-{len(study.trials)}",
         OBJECTIVE_PROVENANCE_ATTR: _objective_provenance_json(),
         **_ALLOCATION_ATTRS,
     }

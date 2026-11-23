@@ -167,24 +167,33 @@ def record_name(path: Path) -> str:
 
     :param Path path: A delivery record under ``tracking/<generation>/delivery``, a summary
         run's creation intent under ``tracking/<generation>``, or an attempt run's creation
-        intent in its trial directory.
+        intent in its attempt directory.
     :return str: For example ``the summary record of generation <id>`` or ``attempt record
         attempt-<id> of generation <id>``.
     """
     if path.name == PENDING_GENERATION_BINDING_FILE:
         return f"the summary-run creation record of generation {path.parent.name}"
     if is_creation_intent(path):
-        # pending_creation_records finds these only in trial_<n>__generation_<id>__attempt_<id>.
-        # The markers fix the parse, as a generation id may hold "__" itself: an MCP run's is
-        # named after its catalog id, which may. An attempt id is hex.
-        generation, _, attempt = path.parent.name.partition("__generation_")[2].rpartition(
-            "__attempt_"
-        )
-        return f"the run-creation record of attempt {attempt} of generation {generation}"
+        # pending_creation_records finds these only in an attempt directory, named by its id.
+        generation = _intent_generation(path) or "unknown"
+        return f"the run-creation record of attempt {path.parent.name} of generation {generation}"
     generation = path.parent.parent.name
     if path.stem == SUMMARY_RECORD:
         return f"the summary record of generation {generation}"
     return f"{path.stem.split('-', 1)[0]} record {path.stem} of generation {generation}"
+
+
+def _intent_generation(path: Path) -> str | None:
+    """Read the generation an attempt run's pending creation was requested for.
+
+    :param Path path: The creation intent in an attempt directory.
+    :return str | None: Its generation id, or ``None`` when the intent cannot be read,
+        which the reconciliation that reads it in full reports.
+    """
+    try:
+        return validate_identity(read_record(path).get("identity"))["generation_id"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def is_creation_intent(path: Path) -> bool:
@@ -327,7 +336,12 @@ def bind_mlflow_run(run_id: str) -> None:
     """
     from mlflow import MlflowClient
 
-    directory = Path(os.environ["PHASESWEEP_TRIAL_DIR"])
+    from phasesweep.engine.paths import _attempt_dir
+
+    # The binding belongs to this attempt, whose records sit beside the trial directory.
+    directory = _attempt_dir(
+        Path(os.environ["PHASESWEEP_TRIAL_DIR"]).parent, os.environ["PHASESWEEP_ATTEMPT_ID"]
+    )
     expected = read_record(directory / EXPECTED_BINDING_FILE)
     if (
         expected["run_mode"] != "trainer"
@@ -600,13 +614,14 @@ def pending_creation_records(
 
     scope = generation_id or "*"
     attempt_pending = Path(BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
+    # Attempt directories sit at <phase>/attempts/<attempt_id>, as _attempt_dir builds them.
     records = sorted(
         tracking_root(experiment).glob(f"{scope}/{PENDING_GENERATION_BINDING_FILE}")
-    ) + sorted(
-        _experiment_dir(experiment).glob(
-            f"*/trial_*__generation_{scope}__attempt_*/{attempt_pending}"
-        )
-    )
+    ) + [
+        path
+        for path in sorted(_experiment_dir(experiment).glob(f"*/attempts/*/{attempt_pending}"))
+        if generation_id is None or _intent_generation(path) == generation_id
+    ]
     if skip is None:
         return records
     skipped = set(pending_creation_records(experiment, skip))

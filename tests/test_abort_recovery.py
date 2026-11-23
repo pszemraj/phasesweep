@@ -18,7 +18,7 @@ from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import StudySchemaMismatchError, TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.paths import _last_successful_generation_path, _run_log_path
+from phasesweep.engine.paths import _attempt_dir, _last_successful_generation_path, _run_log_path
 from phasesweep.engine.preview import _recorded_phase
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
@@ -169,8 +169,10 @@ def test_evidence_pending_preview_routes_to_resume(tmp_path: Path) -> None:
     """Completed trainer evidence makes dry-run request recovery rather than a config edit."""
     directory = tmp_path / "trial"
     directory.mkdir()
+    attempt_dir = _attempt_dir(directory.parent, "attempt")
+    attempt_dir.mkdir(parents=True)
     write_attempt_lifecycle(
-        directory,
+        attempt_dir,
         attempt_id="attempt",
         state="exited",
         ended_by="trainer",

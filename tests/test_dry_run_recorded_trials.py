@@ -33,7 +33,7 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
-from phasesweep.engine.paths import _last_successful_generation_path, _trial_dir_for
+from phasesweep.engine.paths import _attempt_dir, _last_successful_generation_path, _trial_dir_for
 from phasesweep.engine.preview import _placeholder_winner, validate_trial_targets
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
@@ -354,16 +354,10 @@ def test_accepted_partial_replay_proves_the_winners_evidence_but_the_preview_lea
     """
     accepting, winner = _accept_partial_timeout(tmp_path)
     assert winner.source is not None
-    source = (
-        _trial_dir_for(
-            accepting,
-            "a",
-            winner.source.trial_number,
-            generation_id=winner.source.generation_id,
-            attempt_id=winner.source.attempt_id,
-        )
-        / "stdout.log"
+    trial_dir = _trial_dir_for(
+        accepting, "a", winner.source.trial_number, attempt_id=winner.source.attempt_id
     )
+    source = _attempt_dir(trial_dir.parent, winner.source.attempt_id) / "stdout.log"
     original = source.read_bytes()
     source.write_bytes(b"y" + original[1:])
     assert source.stat().st_size == len(original)
@@ -957,8 +951,10 @@ def test_validate_counts_a_running_failure_as_finished_as_a_launch_does(tmp_path
 def _add_pending_evidence(experiment: Experiment, phase: str, directory: Path) -> None:
     """Add a RUNNING trial whose trainer exited cleanly, so its evidence awaits extraction."""
     directory.mkdir()
+    attempt_dir = _attempt_dir(directory.parent, "pending")
+    attempt_dir.mkdir(parents=True)
     write_attempt_lifecycle(
-        directory,
+        attempt_dir,
         attempt_id="pending",
         state="exited",
         ended_by="trainer",

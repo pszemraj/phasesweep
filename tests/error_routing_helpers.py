@@ -100,6 +100,7 @@ def registered_entry(experiment: Experiment, trial_dir: Path) -> Path:
         study_name="t::p",
         trial_number=0,
         trial_dir=trial_dir,
+        attempt_dir=trial_dir,
         generation_id="generation",
     )
     return _attempts_dir(experiment) / "attempt.json"

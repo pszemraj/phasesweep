@@ -20,9 +20,9 @@ from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
-    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     _parsed_trial_outcome,
+    _trial_attempt_dir,
 )
 from phasesweep.engine.study_policy import _load_phase_policy_state, _record_reruns
 from phasesweep.errors import PhaseSweepError
@@ -110,7 +110,7 @@ def test_each_ending_leaves_its_own_record(
             stderr=err,
             timeout=None if cap else timeout,
             wallclock_deadline=time.monotonic() + timeout if cap and timeout else None,
-            trial_dir=tmp_path,
+            attempt_dir=tmp_path,
             attempt_id="attempt",
             cwd=cwd,
         )
@@ -245,10 +245,10 @@ def test_a_crash_whose_runner_was_killed_is_recovered_as_a_failure_that_trips_th
                 runner.wait(timeout=5)
     (stale,) = phase_trials(experiment)
     attempt = stale.user_attrs[ATTEMPT_ID_ATTR]
+    attempt_dir = _trial_attempt_dir(stale)
+    assert attempt_dir is not None
     while (
-        lifecycle := read_attempt_lifecycle(
-            Path(stale.user_attrs[TRIAL_DIR_ATTR]), expected_attempt_id=attempt
-        )
+        lifecycle := read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt)
     ) is None or lifecycle.state != "exited":
         assert time.monotonic() < deadline + 15, "the guardian never recorded the exit"
         time.sleep(0.05)
@@ -270,15 +270,15 @@ def test_a_crash_whose_runner_was_killed_is_recovered_as_a_failure_that_trips_th
 def test_a_reboot_leaves_its_launching_attempt_interrupted(tmp_path: Path) -> None:
     """An attempt a reboot cut off, still ``launching`` with an identity from another boot, reruns as interrupted."""
     experiment = make_experiment(persistent=tmp_path, n_trials=1)
-    study, trial_dir, number = fabricate_stale_trial(experiment, "p", attempt_id="rebooted")
-    write_attempt_lifecycle(trial_dir, attempt_id="rebooted", state="launching")
+    stale = fabricate_stale_trial(experiment, "p", attempt_id="rebooted")
+    write_attempt_lifecycle(stale.attempt_dir, attempt_id="rebooted", state="launching")
     write_trial_identity(
-        trial_dir, attempt_id="rebooted", pid=4242, starttime=1, boot_id="previous-boot"
+        stale.attempt_dir, attempt_id="rebooted", pid=4242, starttime=1, boot_id="previous-boot"
     )
 
-    assert _reap_stale_trials(study, experiment, "p", confirm=True) == 1
+    assert _reap_stale_trials(stale.study, experiment, "p", confirm=True) == 1
 
-    trial = study.get_trials(deepcopy=False)[number]
+    trial = stale.study.get_trials(deepcopy=False)[stale.number]
     assert _outcome(trial)[0] == "INTERRUPTED"
-    lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id="rebooted")
+    lifecycle = read_attempt_lifecycle(stale.attempt_dir, expected_attempt_id="rebooted")
     assert lifecycle is not None and lifecycle.ended_by == "cancelled"

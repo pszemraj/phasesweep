@@ -84,13 +84,10 @@ def _reap_stale_trials(
             continue
         attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
         record: _AttemptRecord | None
+        trial_dir = None
         try:
-            trial_dir = _trial_dir_from_attr(
-                trial,
-                study.study_name,
-                fallback=partial(_trial_dir_for, experiment, phase_name, trial.number),
-            )
             if TRIAL_DIR_ATTR in trial.user_attrs:
+                trial_dir = _trial_dir_from_attr(trial, f"reap RUNNING trial {trial.number}")
                 record = _require_trial_attempt(trial, phase_name, trial_dir, study.study_name)
                 terminated = _resolve_attempt(
                     record,
@@ -105,8 +102,15 @@ def _reap_stale_trials(
                     process_actions[record] = terminated
             else:
                 # The launch path records the directory before any process can
-                # start, so this allocation launched nothing to resolve.
-                record = _trial_attempt_record(trial, phase_name, trial_dir)
+                # start, so this allocation launched nothing to resolve. A runner
+                # killed between recording the attempt id and the directory still
+                # leaves the registry entry this record clears.
+                record = None
+                if isinstance(attempt_id, str) and attempt_id:
+                    trial_dir = _trial_dir_for(
+                        experiment, phase_name, trial.number, attempt_id=attempt_id
+                    )
+                    record = _trial_attempt_record(trial, phase_name, trial_dir)
                 if confirm:
                     _restore_prelaunch_environment_identity(study, trial)
         except ProcessCleanupUncertainError:
@@ -220,7 +224,9 @@ def _recover_cleanup_uncertain_trials(
             and _trial_requires_cleanup_recovery(trial)
         ):
             continue
-        trial_dir = _trial_dir_from_attr(trial, study.study_name)
+        trial_dir = _trial_dir_from_attr(
+            trial, f"recover cleanup-uncertain trial {trial.number} in study {study.study_name}"
+        )
         record = _require_trial_attempt(trial, phase_name, trial_dir, study.study_name)
         terminated = _resolve_attempt(
             record,

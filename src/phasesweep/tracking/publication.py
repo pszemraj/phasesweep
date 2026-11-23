@@ -420,15 +420,16 @@ def publish_trial(
     """
     from optuna.trial import TrialState
 
-    from phasesweep.engine.state import TRIAL_DIR_ATTR
+    from phasesweep.engine.state import _trial_attempt_dir
 
-    if trial.state == TrialState.COMPLETE:
-        directory = Path(trial.user_attrs[TRIAL_DIR_ATTR])
-    else:
-        stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
-        if not isinstance(stored, str) or not (Path(stored) / BINDING_FILE).is_file():
-            return
-        directory = Path(stored)
+    # The binding lives in the attempt's own directory, beside the trial directory.
+    directory = _trial_attempt_dir(trial)
+    if directory is None:
+        if trial.state == TrialState.COMPLETE:
+            raise ValueError(f"Completed trial {trial.number} records no attempt directory.")
+        return
+    if trial.state != TrialState.COMPLETE and not (directory / BINDING_FILE).is_file():
+        return
     binding = read_binding(directory)
     paths = _save_attempt_intents(
         experiment,
@@ -447,20 +448,20 @@ def _unrecorded_attempts(
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
-    :return list[tuple[Path, RunBinding]]: Trial directory and binding of each such attempt.
+    :return list[tuple[Path, RunBinding]]: Attempt directory and binding of each such attempt.
     """
     from phasesweep.engine.paths import _experiment_dir
 
-    # Trial directories are named by _trial_dir_for.
-    pattern = f"*/trial_*__generation_{generation_id}__attempt_*/{BINDING_FILE}"
+    # Attempt directories sit at <phase>/attempts/<attempt_id>, as _attempt_dir builds them.
     attempts = [
         (path.parent, read_binding(path.parent))
-        for path in sorted(_experiment_dir(experiment).glob(pattern))
+        for path in sorted(_experiment_dir(experiment).glob(f"*/attempts/*/{BINDING_FILE}"))
     ]
     return [
         (directory, binding)
         for directory, binding in attempts
-        if not delivery_record_path(
+        if binding["generation_id"] == generation_id
+        and not delivery_record_path(
             experiment, generation_id, f"attempt-{binding['attempt_id']}"
         ).exists()
     ]

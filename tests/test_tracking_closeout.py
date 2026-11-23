@@ -23,7 +23,7 @@ from phasesweep.engine.errors import (
     TrackingSyncRefusedError,
 )
 from phasesweep.engine.ledger import validate_ledger
-from phasesweep.engine.paths import _experiment_dir
+from phasesweep.engine.paths import _attempt_dir, _experiment_dir, _phase_dir
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.errors import ProcessCleanupUncertainError
@@ -1220,15 +1220,16 @@ def test_a_silent_search_names_a_creation_record_whatever_its_generation_id_hold
     """A search MLflow does not answer stops the pass at the first creation record and names it.
 
     An MCP run's generation id is named after its catalog id, which may hold ``__``. The
-    record's warning names the attempt and the generation read between the fixed markers of its
-    trial directory, no local error is reported, and the second record is not searched.
+    record's warning names the attempt and the generation its identity holds, no local error is
+    reported, and the second record is not searched.
     """
     experiment = native_experiment(tmp_path)
     generation = "lr__sweep-" + "a" * 8
     attempts = ["b" * 32, "c" * 32]
-    for number, attempt in enumerate(attempts):
-        trial = f"trial_{number:05d}__generation_{generation}__attempt_{attempt}"
-        path = _experiment_dir(experiment) / "depth" / trial / "mlflow-binding.pending.json"
+    for attempt in attempts:
+        path = (
+            _attempt_dir(_phase_dir(experiment, "depth"), attempt) / "mlflow-binding.pending.json"
+        )
         path.parent.mkdir(parents=True)
         intent = {"identity": attempt_identity(generation, attempt), "run_name": "r"}
         session.write_record(path, {"schema_version": 1, **intent})

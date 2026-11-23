@@ -434,8 +434,8 @@ def test_trial_launch_refuses_an_unreadable_pid_namespace_before_anything_exists
         "_spawn_blocked_supervisor",
         lambda **_kwargs: pytest.fail("no trial may start without a recorded namespace"),
     )
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
+    attempt_dir = tmp_path / "attempt"
+    attempt_dir.mkdir()
 
     with (tmp_path / "out.log").open("w") as out, pytest.raises(PhaseSweepError) as caught:
         run_supervised(
@@ -444,13 +444,13 @@ def test_trial_launch_refuses_an_unreadable_pid_namespace_before_anything_exists
             stdout=out,
             stderr=out,
             timeout=None,
-            trial_dir=trial_dir,
+            attempt_dir=attempt_dir,
             attempt_id="ns-attempt",
         )
 
     assert caught.value.action is OperatorAction.FIX_CONFIG
     assert "PID namespace" in str(caught.value)
-    assert list(trial_dir.iterdir()) == []
+    assert list(attempt_dir.iterdir()) == []
 
 
 def test_read_stale_process_identity_requires_pid_namespace(tmp_path: Path) -> None:

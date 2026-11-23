@@ -22,6 +22,7 @@ from phasesweep.engine.errors import (
     WinnerIntegrityError,
 )
 from phasesweep.engine.optuna import _trial_count_state
+from phasesweep.engine.paths import _valid_trial_dir_name
 from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.repeats import (
@@ -34,6 +35,7 @@ from phasesweep.engine.state import (
     PHASE_FINGERPRINT_PAYLOAD_ATTR,
     TRAINER_ENV_ATTR,
     Winner,
+    _trial_attempt_dir,
 )
 from phasesweep.engine.study_policy import _describe_environment_changes
 from phasesweep.engine.trial import _environment_identity
@@ -138,7 +140,9 @@ def _write_trials_csv(
 
     Every user attribute is a column except the tracked trainer environment, which is
     ledger provenance: its ``PATH`` and ``HOME`` values are noise in a results table.
-    A rerun's source therefore shows as ``user_attr:phasesweep_rerun_of``.
+    A rerun's source therefore shows as ``user_attr:phasesweep_rerun_of``. The
+    ``attempt_dir`` column names the directory holding the attempt's own logs and records;
+    ``user_attr:phasesweep_trial_dir`` is the trainer's directory.
 
     :param optuna.Study study: Study whose trials are serialized.
     :param Path path: Destination CSV path.
@@ -157,6 +161,7 @@ def _write_trials_csv(
         "datetime_start",
         "datetime_complete",
         "duration",
+        "attempt_dir",
         *(["repeat_group"] if repeats is not None else []),
         *[f"param:{n}" for n in param_names],
         *[f"user_attr:{n}" for n in attr_names],
@@ -173,6 +178,7 @@ def _write_trials_csv(
                 "datetime_start": t.datetime_start,
                 "datetime_complete": t.datetime_complete,
                 "duration": t.duration,
+                "attempt_dir": _trial_attempt_dir(t),
             }
             if repeats is not None:
                 row["repeat_group"] = labels.get(t.number)
@@ -267,6 +273,7 @@ def _winner_common_payload(winner: Winner) -> dict[str, Any]:
         "completion": winner.completion,
         "generation_id": winner.generation_id,
         "attempt_id": winner.attempt_id,
+        "trial_dir": winner.trial_dir,
         "winner_source": asdict(source),
         "trainer_input": winner.trainer_input,
         "confound": winner.confound,
@@ -407,6 +414,7 @@ def _load_winner(
             phase_fingerprint=stored_fp,
             generation_id=data["generation_id"],
             attempt_id=data["attempt_id"],
+            trial_dir=_valid_trial_dir_name(data["trial_dir"], label="winner trial_dir"),
             source=validated.source,
             objective_provenance=dict(data["objective_provenance"]),
             trainer_input=dict(data["trainer_input"]),

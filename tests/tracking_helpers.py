@@ -130,6 +130,7 @@ def mlflow_trial_context(tmp_path: Path) -> TrialContext:
         attempt_id="b" * 32,
         overrides_sha256="c" * 64,
         trial_dir=tmp_path,
+        attempt_dir=tmp_path,
         run_name="test",
         return_code=0,
         duration_seconds=1,
@@ -341,7 +342,7 @@ def leak_tracking_worker(monkeypatch, *, action="publish", name=None):
                 stdout=sink,
                 stderr=sink,
                 timeout=10,
-                trial_dir=directory,
+                attempt_dir=directory,
                 attempt_id=operation_id,
             )
         process.write_attempt_lifecycle(
@@ -396,7 +397,7 @@ def hang_uploads_until_killed(monkeypatch: pytest.MonkeyPatch, started: list[str
                 stdout=sink,
                 stderr=sink,
                 timeout=60,
-                trial_dir=directory,
+                attempt_dir=directory,
                 attempt_id=operation_id,
                 label="MLflow request",
             )
@@ -464,7 +465,7 @@ def killed_sweep(
             run_experiment(experiment, generation_id=generation_id)
     assert not any(session.tracking_root(experiment).glob("*/delivery/generation.json"))
     if not persistent:
-        bindings = sorted(_experiment_dir(experiment).glob(f"*/trial_*/{session.BINDING_FILE}"))
+        bindings = sorted(_experiment_dir(experiment).glob(f"*/attempts/*/{session.BINDING_FILE}"))
         assert len(bindings) == n_jobs
         return experiment, uploads, [session.read_binding(b.parent)["attempt_id"] for b in bindings]
     trials = read_phase_trials(validate_ledger(experiment), "depth").trials

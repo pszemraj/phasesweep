@@ -25,17 +25,20 @@ demo/
       phases/<phase>/winner.yaml
   <phase>/
     trials.csv
-    trial_00000__generation_<id>__attempt_<id>/
-      attempt_lifecycle.json
-      process_identity.json
+    trial_00000__<attempt-id>/  # {trial_dir} and PHASESWEEP_TRIAL_DIR, named by the attempt that opened it
       trainer_config.yaml       # yaml_file only
       overrides.json            # json_file only; nested trainer_config with overrides applied
       overrides_resolved.json
+      result.json               # when produced by the trainer
+    attempts/<attempt-id>/      # one per attempt: PhaseSweep's own records, never the trainer's
+      attempt_lifecycle.json
+      process_identity.json
       command.txt
       stdout.log
       stderr.log
-      result.json               # when produced by the trainer
 ```
+
+A trial directory holds what the trainer writes and the trial's input. Each attempt's own records sit beside it under `<phase>/attempts/<attempt-id>/`, so a trainer that clears its output directory cannot remove the process identity recovery depends on. `trials.csv` names both: the `attempt_dir` column and `user_attr:phasesweep_trial_dir`.
 
 `last_successful_generation.yaml` points to the immutable generation that represents the latest successful result. Its `generation_id` locates `generations/<generation-id>/summary.yaml` and `generations/<generation-id>/phases/<phase>/winner.yaml`. The summary retains each winner's `observed`, `repeats` and `confound` blocks, plus the recorded top-level `trainer_config` under `override_format: argparse` ([trainer inputs](config.md#trainer-inputs)). Use the [inspection commands](#inspection-commands) to read published or unfinished results.
 
@@ -47,7 +50,7 @@ The root `generation.yaml` names the latest [generation](#timeouts-cleanup-and-c
 
 The generated `trainer_config.yaml` or `overrides.json` holds the trainer base with the effective overrides applied. For these file formats, `overrides_resolved.json` is an overrides-only audit record. For argparse and Hydra, it is the actual flattened input, merging the trainer base with effective overrides before command placeholders expand. Winner observations are empty when none were recorded; `repeats` is `null` outside a repeats phase.
 
-MLflow stores native run bindings in trial directories, and [delivery and recovery records](mlflow.md#result-delivery-and-recovery) under `tracking/<generation-id>/delivery/` and `tracking/<generation-id>/cleanup-receipts/`.
+MLflow stores native run bindings in attempt directories, and [delivery and recovery records](mlflow.md#result-delivery-and-recovery) under `tracking/<generation-id>/delivery/` and `tracking/<generation-id>/cleanup-receipts/`.
 
 W&B readers and MLflow workers use disposable scratch under `~/.cache/phasesweep/<backend>/workers/`, or the corresponding `XDG_CACHE_HOME/phasesweep` root; the default home comes from `Path.home()`. Each operation removes its temporary directory. Host locks use a [separate location](#storage-and-locks).
 
@@ -62,7 +65,7 @@ Private records inside the tree have these additional requirements:
 | Path | Mode | PhaseSweep refuses to |
 | --- | --- | --- |
 | `generations/<generation-id>/config.snapshot.yaml` | `0600` | replace it unless the existing file is an owner-only regular file with no other hard links |
-| `environment.json` in a trial directory, written only when `execution.record_env` is set | `0600` | replace it under the same condition |
+| `environment.json` in an attempt directory, written only when `execution.record_env` is set | `0600` | replace it under the same condition |
 | `attempts/`, the attempt registry | `0700` directory of `0600` entries | read it through a symlink or with shared permissions |
 
 The two files are owner-only while their directories keep ordinary permissions, so only the publishing user can fully validate a published tree: another user is refused as unable to read the publication, which is not corruption, until the publishing user re-reads it or read permission is restored. The same validated, no-follow path handling protects the runtime lock namespace and the MCP `state_dir`.
@@ -101,11 +104,11 @@ Finished in 3.0s: 2 phases, 4 trials, 0 from a previous run
   depth          2 complete
                  winner  trial 0  eval_loss 0.3  model.n_layers=8
                  runs/phasesweep_starter/depth/
-                 trial_00000__generation_43ddc73d84534e679d13d41e93834d02__attempt_427a82a35fa741e9b821d63c678fb30e
+                 trial_00000__427a82a35fa741e9b821d63c678fb30e
   learning_rate  2 complete
                  winner  trial 0  eval_loss 0.3  optimizer.lr=0.0003
                  runs/phasesweep_starter/learning_rate/
-                 trial_00000__generation_43ddc73d84534e679d13d41e93834d02__attempt_1a74729fd30f4851ae3ac2cc9ab4ae74
+                 trial_00000__1a74729fd30f4851ae3ac2cc9ab4ae74
 
 Written under runs/phasesweep_starter
   generations/43ddc73d84534e679d13d41e93834d02/summary.yaml

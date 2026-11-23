@@ -10,6 +10,7 @@ import math
 import typing
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, ClassVar
 
 import optuna
@@ -58,6 +59,7 @@ from phasesweep.engine.state import (
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
+    TRIAL_DIR_ATTR,
     Winner,
     _unreplaced_attempts,
     _validate_observed_block,
@@ -198,6 +200,8 @@ class SelectedTrial:
     metric: float
     generation_id: str
     attempt_id: str
+    # Name of the trial directory inside its phase that the attempt ran in.
+    trial_dir: str
     # Frozen evidence provenance recorded when the trial's objective was
     # extracted.
     objective_provenance: dict[str, Any]
@@ -466,6 +470,7 @@ def select_winner(
         gates=gates,
         generation_id=str(best.user_attrs[GENERATION_ID_ATTR]),
         attempt_id=str(best.user_attrs[ATTEMPT_ID_ATTR]),
+        trial_dir=Path(str(best.user_attrs[TRIAL_DIR_ATTR])).name,
         objective_provenance=objective_provenance,
         # Allocation writes both before the trainer can run, so every
         # completed trial carries them.
@@ -726,6 +731,7 @@ def _repeats_record(
                 "metric": _trial_value(t),
                 "generation_id": str(t.user_attrs[GENERATION_ID_ATTR]),
                 "attempt_id": str(t.user_attrs[ATTEMPT_ID_ATTR]),
+                "trial_dir": Path(str(t.user_attrs[TRIAL_DIR_ATTR])).name,
                 "objective_provenance": _trial_objective_provenance(t),
                 "trainer_input": dict(t.user_attrs[TRAINER_INPUT_ATTR]),
                 "constraints": {

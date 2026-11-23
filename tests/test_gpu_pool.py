@@ -467,13 +467,13 @@ def test_gpu_lease_survives_orchestrator_hard_exit(tmp_path, monkeypatch) -> Non
     worker_pid: int | None = None
     if orchestrator_pid == 0:
         try:
-            trial_dir = tmp_path / "trial"
-            trial_dir.mkdir()
+            attempt_dir = tmp_path / "attempt"
+            attempt_dir.mkdir()
             pool = GpuPool.create(n_jobs=1, explicit_ids=[0])
             with (
                 pool.acquire() as assignment,
-                (trial_dir / "stdout.log").open("w") as stdout,
-                (trial_dir / "stderr.log").open("w") as stderr,
+                (attempt_dir / "stdout.log").open("w") as stdout,
+                (attempt_dir / "stderr.log").open("w") as stderr,
             ):
                 run_supervised(
                     command,
@@ -481,7 +481,7 @@ def test_gpu_lease_survives_orchestrator_hard_exit(tmp_path, monkeypatch) -> Non
                     stdout=stdout,
                     stderr=stderr,
                     timeout=10.0,
-                    trial_dir=trial_dir,
+                    attempt_dir=attempt_dir,
                     attempt_id="hard-exit-attempt",
                     gpu_lease_fds=assignment.lease_fds,
                 )

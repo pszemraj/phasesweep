@@ -6,7 +6,7 @@
     "sha256": "66ca9aa184e8b9780c9695fcc9db655dba75f6b5117ab47144878daca599fc69"
   },
   "experiment": "t",
-  "generation_id": "71ac569248aa422faddf79bdf5eec1f6",
+  "generation_id": "9c19648377114d0cb56b09310cc9d5bc",
   "generation_id_source": "engine",
   "phase_config_fingerprints": [
     {
@@ -21,9 +21,9 @@
   "schema_version": 3,
   "schema_versions": {
     "experiment_fingerprint": 6,
-    "generation_summary": 6,
+    "generation_summary": 7,
     "phase_fingerprint": 7,
     "reproducibility": 3,
-    "study_storage": 12
+    "study_storage": 13
   }
 }

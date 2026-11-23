@@ -49,6 +49,7 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
+    _attempt_dir,
     _attempts_dir,
 )
 from phasesweep.engine.phase import _abort_record, _failure_policy_abort_record, _finish_phase
@@ -830,9 +831,9 @@ def _locator_cleared(entry: Path) -> None:
     entry.write_text(json.dumps(payload))
 
 
-def _trial_dir_removed(entry: Path) -> None:
-    """Remove the trial directory a registry entry names."""
-    Path(json.loads(entry.read_text())["trial_dir"]).rmdir()
+def _attempt_dir_removed(entry: Path) -> None:
+    """Remove the attempt directory a registry entry names."""
+    Path(json.loads(entry.read_text())["attempt_dir"]).rmdir()
 
 
 def _tracking_kind_malformed(entry: Path) -> None:
@@ -919,7 +920,9 @@ def _reap_trial_with_foreign_lifecycle(tmp_path: Path, monkeypatch: pytest.Monke
     """Reap a RUNNING trial whose lifecycle record names another attempt."""
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
-    write_attempt_lifecycle(trial_dir, attempt_id="another", state="launching")
+    attempt_dir = _attempt_dir(trial_dir.parent, "attempt")
+    attempt_dir.mkdir(parents=True)
+    write_attempt_lifecycle(attempt_dir, attempt_id="another", state="launching")
     return _reap_running_trial(
         tmp_path, **{TRIAL_DIR_ATTR: str(trial_dir), ATTEMPT_ID_ATTR: "attempt"}
     )
@@ -1316,8 +1319,8 @@ ORIGIN_CASES = (
         message="has an unsupported or partial schema.",
     ),
     RoutingCase(
-        id="registry_entry_trial_dir_missing",
-        trigger=_scan_registry(damage=_trial_dir_removed),
+        id="registry_entry_attempt_dir_missing",
+        trigger=_scan_registry(damage=_attempt_dir_removed),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
         message="its process state cannot be verified.",

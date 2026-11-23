@@ -95,11 +95,10 @@ def test_full_sweep_and_replay(tmp_path):
     assert provenance is not None
     assert provenance["extractor"]["kind"] == "json_envelope"
     winner_trial_dirs = [
-        d
-        for d in (exp_dir / "depth").glob("trial_*")
-        if d.name.endswith(f"attempt_{depth_winner.attempt_id}")
+        d for d in (exp_dir / "depth").glob("trial_*") if d.name.endswith(depth_winner.attempt_id)
     ]
     assert len(winner_trial_dirs) == 1
+    assert winner_trial_dirs[0].name == depth_winner.trial_dir
     evidence = winner_trial_dirs[0] / provenance["source"]["path"]
     assert provenance["source"]["sha256"] == hashlib.sha256(evidence.read_bytes()).hexdigest()
     stored = yaml.safe_load((generation_dir / "phases/depth/winner.yaml").read_text())

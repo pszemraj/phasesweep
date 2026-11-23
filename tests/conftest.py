@@ -1200,6 +1200,7 @@ def make_trial_context(
         attempt_id="attempt-test",
         overrides_sha256="a" * 64,
         trial_dir=tmp_path,
+        attempt_dir=tmp_path,
         run_name=run_name or f"{experiment}-{phase}-{trial_id}-attempt-test",
         return_code=0,
         duration_seconds=0.0,

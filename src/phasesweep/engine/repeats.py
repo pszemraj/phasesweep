@@ -17,6 +17,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, get_args
 
+from phasesweep.engine.paths import _valid_trial_dir_name
 from phasesweep.engine.state import _validate_observed_block
 from phasesweep.runtime.json import JsonObject, json_object, nonempty_text
 
@@ -79,6 +80,7 @@ _MEMBER_KEYS = (
     "metric",
     "generation_id",
     "attempt_id",
+    "trial_dir",
     "objective_provenance",
     "trainer_input",
     "constraints",
@@ -104,6 +106,8 @@ class RepeatMember(TypedDict):
     metric: float
     generation_id: str
     attempt_id: str
+    # The trial directory's name inside its phase, the one the attempt ran in.
+    trial_dir: str
     objective_provenance: JsonObject
     trainer_input: JsonObject
     constraints: dict[str, float]
@@ -221,6 +225,7 @@ class EvidenceMember:
     trial_number: int
     generation_id: str
     attempt_id: str
+    trial_dir: str
     metric: float
     objective_provenance: Mapping[str, object]
     trainer_input: Mapping[str, object]
@@ -243,6 +248,11 @@ class EvidenceSource(Protocol):
     @property
     def attempt_id(self) -> str | None:
         """Attempt that ran the scalar source trial."""
+        ...
+
+    @property
+    def trial_dir(self) -> str | None:
+        """Name of the trial directory the scalar source trial ran in."""
         ...
 
     @property
@@ -533,6 +543,7 @@ def _validate_member(data: object) -> RepeatMember:
         "metric": _finite_number(data["metric"], label="member metric"),
         "generation_id": nonempty_text(data["generation_id"], label="repeats member generation_id"),
         "attempt_id": nonempty_text(data["attempt_id"], label="repeats member attempt_id"),
+        "trial_dir": _valid_trial_dir_name(data["trial_dir"], label="repeats member trial_dir"),
         "objective_provenance": provenance,
         "trainer_input": trainer_input,
         "constraints": {
@@ -555,6 +566,7 @@ def _representative_fields(member: RepeatMember) -> dict[str, object]:
         "trial_number": member["trial_number"],
         "generation_id": member["generation_id"],
         "attempt_id": member["attempt_id"],
+        "trial_dir": member["trial_dir"],
         "objective_provenance": member["objective_provenance"],
         "trainer_input": member["trainer_input"],
         "constraints": member["constraints"],
@@ -728,6 +740,7 @@ def evidence_members(source: EvidenceSource) -> list[EvidenceMember]:
                 trial_number=member["trial_number"],
                 generation_id=member["generation_id"],
                 attempt_id=member["attempt_id"],
+                trial_dir=member["trial_dir"],
                 metric=member["metric"],
                 objective_provenance=member["objective_provenance"],
                 trainer_input=member["trainer_input"],
@@ -737,13 +750,21 @@ def evidence_members(source: EvidenceSource) -> list[EvidenceMember]:
         ]
     generation_id, attempt_id = source.generation_id, source.attempt_id
     provenance, trainer_input = source.objective_provenance, source.trainer_input
-    if generation_id is None or attempt_id is None or provenance is None or trainer_input is None:
+    trial_dir = source.trial_dir
+    if (
+        generation_id is None
+        or attempt_id is None
+        or trial_dir is None
+        or provenance is None
+        or trainer_input is None
+    ):
         raise ValueError("a winner without execution identity has no evidence to verify")
     return [
         EvidenceMember(
             trial_number=source.trial_number,
             generation_id=generation_id,
             attempt_id=attempt_id,
+            trial_dir=trial_dir,
             metric=source.metric,
             objective_provenance=provenance,
             trainer_input=trainer_input,

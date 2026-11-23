@@ -36,8 +36,8 @@ from phasesweep.engine.errors import TrackingSyncRefusedError
 from phasesweep.engine.guards import _reconcile_existing_studies
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
+    _attempt_dir,
     _attempts_dir,
-    _experiment_dir,
     _generation_record_path,
     _trial_dir_for,
 )
@@ -732,11 +732,13 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
 
     mark_current_format(experiment)
     attempt_id = "registry-only-attempt"
-    trial_dir = _experiment_dir(experiment) / "p" / "trial_registry_only"
+    trial_dir = _trial_dir_for(experiment, "p", 0, attempt_id=attempt_id)
     trial_dir.mkdir(parents=True)
-    write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
+    attempt_dir.mkdir(parents=True)
+    write_attempt_lifecycle(attempt_dir, attempt_id=attempt_id, state="allocated")
     write_trial_identity(
-        trial_dir,
+        attempt_dir,
         attempt_id=attempt_id,
         pid=reaped_pid(),
         starttime=222,
@@ -748,6 +750,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
         study_name="srv::removed-phase",
         trial_number=0,
         trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         generation_id=run_id,
     )
     entry_path = _attempts_dir(experiment) / f"{attempt_id}.json"
@@ -1133,13 +1136,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
     phase = experiment.phases[0]
     study = _load_first_phase_study(attempt_config)
     attempt_id = f"stale-attempt-{trial_number}"
-    trial_dir = _trial_dir_for(
-        experiment,
-        phase.name,
-        trial_number,
-        generation_id=later_generation_id,
-        attempt_id=attempt_id,
-    )
+    trial_dir = _trial_dir_for(experiment, phase.name, trial_number, attempt_id=attempt_id)
     _register_active_attempt(
         experiment,
         attempt_id=attempt_id,
@@ -1147,6 +1144,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
         study_name=study.study_name,
         trial_number=trial_number,
         trial_dir=trial_dir,
+        attempt_dir=_attempt_dir(trial_dir.parent, attempt_id),
         generation_id=later_generation_id,
     )
     if changed_storage:
@@ -1273,15 +1271,16 @@ def test_registered_trial_recovery_counts_match_preflight_and_ledger(
     assert isinstance(experiment, Experiment)
     phase = experiment.phases[0]
     attempt_id = f"stale-attempt-{trial_number}"
+    trial_dir = _trial_dir_for(experiment, phase.name, trial_number, attempt_id=attempt_id)
+    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
     _register_active_attempt(
         experiment,
         attempt_id=attempt_id,
         phase_name=phase.name,
         study_name=f"{experiment.experiment}::{phase.name}",
         trial_number=trial_number,
-        trial_dir=_trial_dir_for(
-            experiment, phase.name, trial_number, generation_id=run_id, attempt_id=attempt_id
-        ),
+        trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         generation_id=run_id,
     )
     _app, registry, store = make_mcp_app(
@@ -1296,9 +1295,7 @@ def test_registered_trial_recovery_counts_match_preflight_and_ledger(
 
     if terminal:
         write_attempt_lifecycle(
-            _trial_dir_for(
-                experiment, phase.name, trial_number, generation_id=run_id, attempt_id=attempt_id
-            ),
+            attempt_dir,
             attempt_id=attempt_id,
             state="exited",
             ended_by="trainer",

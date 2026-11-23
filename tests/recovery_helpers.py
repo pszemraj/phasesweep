@@ -13,7 +13,7 @@ from phasesweep.config.io import load_experiment
 from phasesweep.config.models import Experiment
 from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.paths import _experiment_dir, _trial_dir_for
+from phasesweep.engine.paths import _attempt_dir, _experiment_dir, _trial_dir_for
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
@@ -38,7 +38,7 @@ from tests.conftest import mark_current_format, reaped_pid
 
 
 def write_trial_identity(
-    trial_dir: Path,
+    attempt_dir: Path,
     *,
     attempt_id: str,
     pid: int,
@@ -52,7 +52,7 @@ def write_trial_identity(
     ``pgid`` defaults to ``pid``, ``boot_id`` to this boot, and ``pid_namespace`` to this process's.
     """
     _write_process_identity(
-        trial_dir / PROCESS_IDENTITY_FILE,
+        attempt_dir / PROCESS_IDENTITY_FILE,
         StaleProcessIdentity(
             schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
             attempt_id=attempt_id,
@@ -79,11 +79,15 @@ def new_phase_study(experiment: Experiment, phase_name: str) -> optuna.Study:
 
 
 class StaleTrial(NamedTuple):
-    """A RUNNING trial an orchestrator abandoned: its study, directory and number."""
+    """A RUNNING trial an orchestrator abandoned: its study, directories and number.
+
+    ``attempt_dir`` holds the attempt's lifecycle record and process identity.
+    """
 
     study: optuna.Study
     trial_dir: Path
     number: int
+    attempt_dir: Path
 
 
 def stamp_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
@@ -112,20 +116,16 @@ def fabricate_stale_trial(
     identity = _environment_identity(experiment, phase_name)
     trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
     trial.set_user_attr(TRAINER_ENV_ATTR, dict(identity.tracked))
-    trial_dir = _trial_dir_for(
-        experiment,
-        phase_name,
-        trial.number,
-        generation_id=generation_id,
-        attempt_id=attempt_id,
-    )
+    trial_dir = _trial_dir_for(experiment, phase_name, trial.number, attempt_id=attempt_id)
     trial_dir.mkdir(parents=True)
+    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
+    attempt_dir.mkdir(parents=True)
     if persist_generation_id:
         trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
     if persist_attempt_id:
         trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
-    return StaleTrial(study, trial_dir, trial.number)
+    return StaleTrial(study, trial_dir, trial.number, attempt_dir)
 
 
 def fabricate_registered_attempt(
@@ -151,6 +151,7 @@ def fabricate_registered_attempt(
         study_name=stale.study.study_name,
         trial_number=stale.number,
         trial_dir=stale.trial_dir,
+        attempt_dir=stale.attempt_dir,
         generation_id="old-generation",
     )
     return stale
@@ -172,16 +173,12 @@ def write_launched_stale_trial(
     study = new_phase_study(exp, phase.name)
     trial = study.ask()
     attempt_id = f"stale-attempt-{trial.number}"
-    trial_dir = _trial_dir_for(
-        exp,
-        phase.name,
-        trial.number,
-        generation_id=generation_id,
-        attempt_id=attempt_id,
-    )
+    trial_dir = _trial_dir_for(exp, phase.name, trial.number, attempt_id=attempt_id)
     trial_dir.mkdir(parents=True)
+    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
+    attempt_dir.mkdir(parents=True)
     write_trial_identity(
-        trial_dir,
+        attempt_dir,
         attempt_id=attempt_id,
         pid=pid or reaped_pid(),
         starttime=222,
@@ -206,16 +203,12 @@ def write_uncertain_failed_trial(
     study = new_phase_study(exp, phase.name)
     trial = study.ask()
     attempt_id = f"stale-attempt-{trial.number}"
-    trial_dir = _trial_dir_for(
-        exp,
-        phase.name,
-        trial.number,
-        generation_id=generation_id,
-        attempt_id=attempt_id,
-    )
+    trial_dir = _trial_dir_for(exp, phase.name, trial.number, attempt_id=attempt_id)
     trial_dir.mkdir(parents=True)
+    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
+    attempt_dir.mkdir(parents=True)
     write_trial_identity(
-        trial_dir,
+        attempt_dir,
         attempt_id=attempt_id,
         pid=pid or reaped_pid(),
         starttime=111,

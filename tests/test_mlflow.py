@@ -799,18 +799,12 @@ def test_unreadable_creation_response_leaves_the_run_recoverable(
     tmp_path, monkeypatch, slot, reply, recovery
 ):
     """A response the controller cannot read says nothing about a creation, whatever it held."""
-    from phasesweep.engine.paths import _trial_dir_for
+    from phasesweep.engine.paths import _attempt_dir, _phase_dir
     from phasesweep.tracking import session
 
     experiment = native_experiment(tmp_path)
     identity = attempt_identity()
-    directory = _trial_dir_for(
-        experiment,
-        "p",
-        3,
-        generation_id=identity["generation_id"],
-        attempt_id=identity["attempt_id"],
-    )
+    directory = _attempt_dir(_phase_dir(experiment, "p"), identity["attempt_id"])
     directory.mkdir(parents=True)
     bind, path = mlflow_binder(
         tmp_path, slot, experiment=experiment, identity=identity, directory=directory
@@ -862,30 +856,30 @@ def test_sync_binds_late_runs_and_retires_expired_misses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Bind found runs at any age and retire absent ones outside the request window."""
-    from phasesweep.engine.paths import _trial_dir_for
+    from phasesweep.engine.paths import _attempt_dir, _phase_dir
     from phasesweep.tracking import session
 
     experiment = native_experiment(tmp_path)
     first, second = "1" * 32, "2" * 32
     root = session.tracking_root(experiment)
 
-    def attempt_dir(generation, attempt):
-        return _trial_dir_for(experiment, "p", 3, generation_id=generation, attempt_id=attempt)
+    def attempt_dir(attempt):
+        return _attempt_dir(_phase_dir(experiment, "p"), attempt)
 
     pending = {
         "generation": _write_pending(
             root / first / "generation-binding.pending.json", attempt_identity(first, first)
         ),
         "absent": _write_pending(
-            attempt_dir(first, "absent") / "mlflow-binding.pending.json",
+            attempt_dir("absent") / "mlflow-binding.pending.json",
             attempt_identity(first, "absent"),
         ),
         "bound": _write_pending(
-            attempt_dir(first, "bound") / "mlflow-binding.pending.json",
+            attempt_dir("bound") / "mlflow-binding.pending.json",
             attempt_identity(first, "bound"),
         ),
         "other": _write_pending(
-            attempt_dir(second, "late") / "mlflow-binding.pending.json",
+            attempt_dir("late") / "mlflow-binding.pending.json",
             attempt_identity(second, "late"),
         ),
     }
@@ -1368,6 +1362,7 @@ def test_failed_trainer_never_reads_remote_metrics(tmp_path, monkeypatch):
         attempt_id="b" * 32,
         overrides_sha256="c" * 64,
         trial_dir=tmp_path,
+        attempt_dir=tmp_path,
         run_name="test",
         return_code=1,
         duration_seconds=1,
@@ -1404,7 +1399,9 @@ def test_pending_sync_uses_retained_projection(tmp_path, monkeypatch):
     claim_ledger(validate_ledger(experiment))
     trial_dir = tmp_path / "unfinished-training"
     trial_dir.mkdir()
-    write_attempt_lifecycle(trial_dir, attempt_id="d" * 32, state="allocated")
+    attempt_dir = tmp_path / "unfinished-attempt"
+    attempt_dir.mkdir()
+    write_attempt_lifecycle(attempt_dir, attempt_id="d" * 32, state="allocated")
     _register_active_attempt(
         experiment,
         attempt_id="d" * 32,
@@ -1412,6 +1409,7 @@ def test_pending_sync_uses_retained_projection(tmp_path, monkeypatch):
         study_name="training",
         trial_number=0,
         trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         generation_id=binding["generation_id"],
     )
 
@@ -1897,16 +1895,20 @@ def test_later_phase_rechecks_a_bound_target(tmp_path, monkeypatch, error, expec
 def test_binding_helper_checks_target_and_preserves_parent(tmp_path, monkeypatch, problem):
     import sys
 
+    from phasesweep.engine.paths import _attempt_dir
     from phasesweep.tracking import bind_mlflow_run
     from phasesweep.tracking.session import read_binding, write_record
 
     binding = {**mlflow_binding(), "run_mode": "trainer"}
+    trial_dir = tmp_path / "trial_00000__attempt"
+    attempt_dir = _attempt_dir(tmp_path, binding["attempt_id"])
+    attempt_dir.mkdir(parents=True)
     write_record(
-        tmp_path / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
+        attempt_dir / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
     )
     for key in ("attempt_id", "generation_id", "overrides_sha256"):
         monkeypatch.setenv("PHASESWEEP_" + key.upper(), binding[key])
-    monkeypatch.setenv("PHASESWEEP_TRIAL_DIR", str(tmp_path))
+    monkeypatch.setenv("PHASESWEEP_TRIAL_DIR", str(trial_dir))
     run = mlflow_run(binding, status="FINISHED" if problem == "finished" else "RUNNING")
     run.data.tags = {"mlflow.parentRunId": "trainer-parent"}
     if problem == "experiment":
@@ -1927,10 +1929,10 @@ def test_binding_helper_checks_target_and_preserves_parent(tmp_path, monkeypatch
         with pytest.raises(ValueError, match="different experiment|another attempt|RUNNING"):
             bind_mlflow_run(binding["run_id"])
         assert not updates
-        assert not (tmp_path / "mlflow-binding.json").exists()
+        assert not (attempt_dir / "mlflow-binding.json").exists()
     else:
         bind_mlflow_run(binding["run_id"])
-        assert read_binding(tmp_path) == binding
+        assert read_binding(attempt_dir) == binding
         assert run.data.tags["mlflow.parentRunId"] == "trainer-parent"
 
 

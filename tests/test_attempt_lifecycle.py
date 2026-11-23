@@ -69,10 +69,10 @@ def test_attempt_process_resolution_table(
 
 
 def test_read_attempt_lifecycle_rejects_unreadable_record(tmp_path: Path) -> None:
-    trial_dir = tmp_path / "trial"
-    (trial_dir / ATTEMPT_LIFECYCLE_FILE).mkdir(parents=True)
+    attempt_dir = tmp_path / "attempt"
+    (attempt_dir / ATTEMPT_LIFECYCLE_FILE).mkdir(parents=True)
     with pytest.raises(ValueError, match="is unreadable"):
-        read_attempt_lifecycle(trial_dir, expected_attempt_id="expected")
+        read_attempt_lifecycle(attempt_dir, expected_attempt_id="expected")
 
 
 @pytest.mark.parametrize(
@@ -108,8 +108,8 @@ def test_read_attempt_lifecycle_rejects_every_malformed_shape(
     tmp_path: Path, fields: JsonObject | str, message: str
 ) -> None:
     """Malformed state, identity and elapsed-time fields use the reader's ValueError contract."""
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
+    attempt_dir = tmp_path / "attempt"
+    attempt_dir.mkdir()
     if isinstance(fields, str):
         payload = fields
     else:
@@ -120,9 +120,9 @@ def test_read_attempt_lifecycle_rejects_every_malformed_shape(
         }
         record.update(fields)
         payload = json.dumps(record)
-    (trial_dir / ATTEMPT_LIFECYCLE_FILE).write_text(payload)
+    (attempt_dir / ATTEMPT_LIFECYCLE_FILE).write_text(payload)
     with pytest.raises(ValueError, match=message):
-        read_attempt_lifecycle(trial_dir, expected_attempt_id="expected")
+        read_attempt_lifecycle(attempt_dir, expected_attempt_id="expected")
 
 
 @pytest.mark.parametrize(
@@ -161,7 +161,7 @@ def test_an_attempt_settled_without_signalling_is_routine_in_a_run_and_collected
         ended_by=ended_by,
         cleanup_confirmed=cleanup_confirmed,
     )
-    record = _AttemptRecord("a1", tmp_path, "generation", "p", 3)
+    record = _AttemptRecord("a1", tmp_path, tmp_path / "trial", "generation", "p", 3)
     expected = f"Attempt a1 phase='p' trial=3: {text}"
 
     collected: dict[_AttemptRecord, str] = {}
@@ -231,7 +231,7 @@ def test_a_stale_group_warns_only_when_cleanup_signalled_it(
     monkeypatch.setattr(attempts, "read_stale_process_identity", lambda *_a, **_k: identity)
     monkeypatch.setattr(attempts, "cleanup_stale_trial_process", cleanup)
     monkeypatch.setattr(attempts, "_record_attempt_exited", lambda *_a, **_k: None)
-    record = _AttemptRecord("a1", tmp_path, "generation", "p", 3)
+    record = _AttemptRecord("a1", tmp_path, tmp_path / "trial", "generation", "p", 3)
 
     with caplog.at_level(logging.INFO, logger="phasesweep"):
         assert (
@@ -267,8 +267,8 @@ def test_unreadable_ledger_blocks_stale_guardian_cancellation(
         guardian_pid=42,
         guardian_starttime=10,
     )
-    _write_process_identity(stale.trial_dir / PROCESS_IDENTITY_FILE, identity)
-    write_attempt_lifecycle(stale.trial_dir, attempt_id="a1", state="launching")
+    _write_process_identity(stale.attempt_dir / PROCESS_IDENTITY_FILE, identity)
+    write_attempt_lifecycle(stale.attempt_dir, attempt_id="a1", state="launching")
     monkeypatch.setattr(reaper, "read_boot_id", lambda: identity.boot_id)
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: identity.pid_namespace)
     monkeypatch.setattr(reaper, "_stale_guardian_state", lambda _: "alive")

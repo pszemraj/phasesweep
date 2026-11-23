@@ -119,8 +119,8 @@ class LogRegexExtractor(_Frozen):
     file: _TrialFilePath = Field(
         default="stdout.log",
         description=(
-            "File relative to trial_dir. 'stdout.log' and 'stderr.log' are written "
-            "automatically; supply a custom path if your trainer logs elsewhere."
+            "File relative to trial_dir. 'stdout.log' and 'stderr.log' name the attempt's "
+            "own captured streams; supply a custom path if your trainer logs elsewhere."
         ),
     )
     pattern: str = Field(

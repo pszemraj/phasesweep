@@ -478,20 +478,20 @@ def reap_child(pid: int) -> bool:
 
 
 def read_stale_process_identity(
-    trial_dir: Path,
+    attempt_dir: Path,
     *,
     expected_attempt_id: str,
 ) -> StaleProcessIdentity:
     """Load and validate the atomic identity for a possibly-stale trial.
 
-    :param Path trial_dir: Trial directory containing ``process_identity.json``.
+    :param Path attempt_dir: Attempt directory containing ``process_identity.json``.
     :param str expected_attempt_id: Attempt identity stored on the Optuna trial.
     :raises OSError: The identity record is missing or unreadable.
     :raises ValueError: The identity record is malformed, partial, of an unsupported schema, or
         belongs to another attempt.
     :return StaleProcessIdentity: A complete, attempt-bound identity.
     """
-    path = trial_dir / PROCESS_IDENTITY_FILE
+    path = attempt_dir / PROCESS_IDENTITY_FILE
     try:
         payload = strict_json_loads(path.read_text(encoding="utf-8"))
     except ValueError as exc:

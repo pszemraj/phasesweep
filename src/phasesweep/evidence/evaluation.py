@@ -88,21 +88,26 @@ def _file_digest(raw: bytes) -> dict[str, Any]:
     return {"sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}
 
 
+#: Log names that resolve to the attempt's own captured streams in its attempt directory,
+#: so a ``log_regex`` reads only what this attempt printed.
+CAPTURED_STREAMS = frozenset({"stdout.log", "stderr.log"})
+
+
 class OutsideAttemptError(OSError):
-    """A trial-relative evidence path resolves outside its attempt directory."""
+    """A trial-relative evidence path resolves outside its trial directory."""
 
 
 def attempt_file(trial_dir: Path, relative: str | Path) -> Path:
-    """Return a trial-relative evidence path, refusing one that resolves outside the attempt.
+    """Return a trial-relative evidence path, refusing one that resolves outside the trial.
 
     PhaseSweep reads a trial's objective, constraints, observations, gate values and
-    digests only from files inside that attempt's directory. Config load already refuses
+    digests only from files inside that trial's directory. Config load already refuses
     absolute and ``..`` paths, so a link is the only way out, and several trials whose
     links name one shared file would all be scored from whichever trainer wrote it last.
-    A link that stays inside the attempt, such as ``latest -> checkpoint-500``, reads as
+    A link that stays inside the trial, such as ``latest -> checkpoint-500``, reads as
     usual. A missing file resolves inside and keeps the caller's own not-found handling.
 
-    :param Path trial_dir: The attempt directory the file must resolve inside.
+    :param Path trial_dir: The trial directory the file must resolve inside.
     :param str | Path relative: Configured trial-relative path.
     :raises OutsideAttemptError: The path resolves outside ``trial_dir``.
     :return Path: ``trial_dir / relative``, unchanged, for the caller to read.
@@ -116,10 +121,28 @@ def attempt_file(trial_dir: Path, relative: str | Path) -> Path:
         return path
     if not resolved.is_relative_to(trial_dir.resolve()):
         raise OutsideAttemptError(
-            f"`{relative}` in attempt directory {trial_dir} resolves to {resolved}, outside the "
-            "attempt. Have the trainer write it under PHASESWEEP_TRIAL_DIR."
+            f"`{relative}` in trial directory {trial_dir} resolves to {resolved}, outside the "
+            "trial. Have the trainer write it under PHASESWEEP_TRIAL_DIR."
         )
     return path
+
+
+def trial_file(trial_dir: Path, attempt_dir: Path, relative: str | Path) -> Path:
+    """Return where a configured trial path is read from.
+
+    A captured stream (:data:`CAPTURED_STREAMS`) is the attempt's own, kept in its attempt
+    directory; any other path is a trainer file inside the trial directory, as
+    :func:`attempt_file` resolves it.
+
+    :param Path trial_dir: The trial directory the trainer writes into.
+    :param Path attempt_dir: The attempt's directory, holding its captured streams.
+    :param str | Path relative: Configured trial-relative path.
+    :raises OutsideAttemptError: A trainer path resolves outside ``trial_dir``.
+    :return Path: The path to read.
+    """
+    if str(relative) in CAPTURED_STREAMS:
+        return attempt_dir / relative
+    return attempt_file(trial_dir, relative)
 
 
 def load_json_value(
@@ -325,7 +348,9 @@ class TrialContext:
     generation_id: str
     attempt_id: str
     overrides_sha256: str
+    # The trainer's directory, and beside it the attempt's own records and process slot.
     trial_dir: Path
+    attempt_dir: Path
     run_name: str  # "{experiment}-{phase}-{trial_id}-{attempt_id}"
     return_code: int
     duration_seconds: float
@@ -530,7 +555,8 @@ def _extract_log_regex(
     the digest. Warn when a numeric result leaves unparseable captures behind.
     Provenance includes the selected 1-based line and numeric match count.
 
-    :param TrialContext ctx: Trial identity; the log is read from its ``trial_dir``.
+    :param TrialContext ctx: Trial identity; the log is read from its ``trial_dir``, or its
+        ``attempt_dir`` for a captured stream.
     :param LogRegexExtractor cfg: Log path, named value group, and first/last/min/max selector.
     :param dict | None provenance: Optional source-evidence sink.
     :raises ExtractorError: The log is missing, outside the attempt, unreadable, has no
@@ -539,7 +565,7 @@ def _extract_log_regex(
     :return float: Selected match value.
     """
     try:
-        target = attempt_file(ctx.trial_dir, cfg.file)
+        target = trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.file)
     except OutsideAttemptError as exc:
         raise ExtractorError(str(exc)) from exc
     if not target.is_file():
@@ -674,7 +700,7 @@ def _capture_wandb(
                 entity=source.entity,
                 project=source.project,
                 run_id=ctx.attempt_id,
-                trial_dir=ctx.trial_dir,
+                attempt_dir=ctx.attempt_dir,
                 poll_seconds=source.poll_seconds,
                 timeout_seconds=source.timeout_seconds,
                 required_keys=query.numeric_keys,
@@ -816,7 +842,7 @@ def locate_objective_position(
         entity=cfg.entity,
         project=cfg.project,
         run_id=ctx.attempt_id,
-        trial_dir=ctx.trial_dir,
+        attempt_dir=ctx.attempt_dir,
         poll_seconds=cfg.poll_seconds,
         timeout_seconds=cfg.timeout_seconds,
         metric_key=cfg.metric_key,
@@ -855,13 +881,13 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
         raise ExtractorError("MLflow capture requires a configured target and query.")
     try:
         # Managed runs are bound before launch, so only a trainer-owned run can be missing.
-        if not (ctx.trial_dir / BINDING_FILE).is_file():
+        if not (ctx.attempt_dir / BINDING_FILE).is_file():
             raise ValueError(
                 "The trainer never bound its MLflow run; call "
                 "phasesweep.tracking.bind_mlflow_run(run_id) inside its active run."
             )
-        binding = read_binding(ctx.trial_dir)
-        expected = read_record(ctx.trial_dir / EXPECTED_BINDING_FILE)
+        binding = read_binding(ctx.attempt_dir)
+        expected = read_record(ctx.attempt_dir / EXPECTED_BINDING_FILE)
         if (
             any(binding.get(k) != v for k, v in expected.items())
             or binding["attempt_id"] != ctx.attempt_id
@@ -879,7 +905,7 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
                 "timeout_at": stop,
             },
             operation_id=ctx.attempt_id,
-            directory=ctx.trial_dir,
+            directory=ctx.attempt_dir,
             environment=ctx.mlflow_environment or {},
             deadline=min(stop, deadline) if deadline is not None else stop,
         )

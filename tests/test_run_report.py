@@ -702,9 +702,7 @@ def test_verbose_leaves_the_console_unchanged_and_deepens_run_log(
     assert transcripts["plain"] == transcripts["verbose"]
     assert "trial 1  COMPLETE" in transcripts["plain"]
     # The summary names the winning trial's directory, relative to the working directory or whole.
-    assert re.search(
-        r"(?m)^ +\S*/NAME/runs/t/p/trial_00000__generation_ID__attempt_ID$", transcripts["plain"]
-    )
+    assert re.search(r"(?m)^ +\S*/NAME/runs/t/p/trial_00000__ID$", transcripts["plain"])
     assert not re.search(r"^\S+ \S+ D ", logs["plain"], re.MULTILINE)
     assert re.search(r"^\S+ \S+ D phasesweep\.", logs["verbose"], re.MULTILINE)
 
@@ -1308,9 +1306,9 @@ def test_a_repeats_run_summary_lists_each_winning_member_under_one_parent(
     assert len(members) == 2
     written = next(i for i, line in enumerate(lines) if line.startswith("Written under"))
     summary_lines = lines[lines.index("  p  4 complete") : written - 1]
-    names = [line for line in summary_lines if "__generation_" in line]
+    names = [line for line in summary_lines if re.match(r"\s+trial_\d{5}__", line)]
     assert [int(name.strip().split("__")[0].removeprefix("trial_")) for name in names] == members
-    assert all(re.fullmatch(r"\s+trial_\d{5}__generation_\w{32}__attempt_\w{32}", n) for n in names)
+    assert all(re.fullmatch(r"\s+trial_\d{5}__\w{32}", n) for n in names)
     parent = str(_phase_dir(experiment, "p")) + "/"
     assert summary_lines.count(f"     {parent}") == 1
     assert not any(parent + "trial_" in line for line in summary_lines)

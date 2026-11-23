@@ -27,10 +27,11 @@ from phasesweep.engine.ledger import (
     validate_ledger,
 )
 from phasesweep.engine.paths import (
+    _attempt_dir,
     _experiment_dir,
     _generation_dir,
     _generation_record_path,
-    _trial_dir_for,
+    _phase_dir,
 )
 from phasesweep.engine.read import experiment_status, read_status
 from phasesweep.engine.run import run_experiment
@@ -47,8 +48,8 @@ from phasesweep.engine.state import (
     RETURN_CODE_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
-    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
+    _trial_attempt_dir,
     _trial_interrupted,
     constraint_attr,
 )
@@ -146,7 +147,7 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
                     stdout=sink,
                     stderr=sink,
                     timeout=10,
-                    trial_dir=directory,
+                    attempt_dir=directory,
                     attempt_id=operation_id,
                 )
             if outcome == "uncertain":
@@ -176,8 +177,11 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
             run_experiment(experiment)
     (original,) = read_phase_trials(validate_ledger(experiment), "depth").trials
     assert original.state == TrialState.RUNNING
-    trial_dir = Path(original.user_attrs[TRIAL_DIR_ATTR])
-    lifecycle = process.read_attempt_lifecycle(trial_dir, expected_attempt_id=created["attempt_id"])
+    attempt_dir = _trial_attempt_dir(original)
+    assert attempt_dir is not None
+    lifecycle = process.read_attempt_lifecycle(
+        attempt_dir, expected_attempt_id=created["attempt_id"]
+    )
     assert lifecycle is not None and lifecycle.state == "allocated"
     assert experiment_status(experiment)["tracking_delivery"]["pending"] == 1
 
@@ -189,7 +193,7 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
     assert retried.params == original.params
     assert retried.user_attrs[RERUN_OF_ATTR] == original.number
     assert search_generations == [reports[0].generation_id]
-    assert session.read_binding(trial_dir) == created
+    assert session.read_binding(attempt_dir) == created
     assert _sent(uploads, [created["attempt_id"]]) == ["KILLED"]
     assert publication.delivery_status(experiment)["pending"] == 0
 
@@ -317,12 +321,16 @@ def _add_bound_attempt(
     experiment, study, phase, generation, attempt, number, *, trial, run_mode="managed"
 ):
     """Persist a fresh trial and its native binding in the same attempt directory."""
-    directory = _trial_dir_for(
-        experiment, phase, number, generation_id=generation, attempt_id=attempt
-    )
+    directory = _attempt_dir(_phase_dir(experiment, phase), attempt)
     write_record(
         directory / BINDING_FILE,
-        {**mlflow_binding(), "phase": phase, "attempt_id": attempt, "run_mode": run_mode},
+        {
+            **mlflow_binding(),
+            "phase": phase,
+            "generation_id": generation,
+            "attempt_id": attempt,
+            "run_mode": run_mode,
+        },
     )
     trial.user_attrs.update({ATTEMPT_ID_ATTR: attempt, GENERATION_ID_ATTR: generation})
     study.add_trial(trial)
@@ -1129,8 +1137,8 @@ def test_sync_binds_and_finishes_a_run_created_after_its_attempt_gave_up(
     reports = []
     run_experiment(experiment, terminal_callback=reports.append)
     generation = reports[0].generation_id
-    pattern = f"*/trial_*__generation_{generation}__attempt_{late['attempt_id']}"
-    [attempt_directory] = _experiment_dir(experiment).glob(pattern)
+    attempt_directory = _attempt_dir(_phase_dir(experiment, "depth"), late["attempt_id"])
+    assert attempt_directory.is_dir()
     pending = attempt_directory / "mlflow-binding.pending.json"
     # An existing run is bound before sync, directly or by the search that follows an unreadable
     # reply. A run that does not exist yet leaves its pending record for sync to resolve.
@@ -1404,8 +1412,13 @@ def test_only_an_in_memory_generation_ends_an_attempt_its_ledger_lost(
         {**mlflow_binding(), "phase": "generation", "attempt_id": generation},
     )
     attempt = "1" * 32
-    directory = _trial_dir_for(experiment, "depth", 0, generation_id=generation, attempt_id=attempt)
-    binding = {**mlflow_binding(), "phase": "depth", "attempt_id": attempt}
+    directory = _attempt_dir(_phase_dir(experiment, "depth"), attempt)
+    binding = {
+        **mlflow_binding(),
+        "phase": "depth",
+        "generation_id": generation,
+        "attempt_id": attempt,
+    }
     write_record(directory / BINDING_FILE, binding)
 
     publication._rebuild_attempt_intents(experiment, ledger, [generation])

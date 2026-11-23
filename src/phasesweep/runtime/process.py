@@ -338,7 +338,7 @@ def _attempt_end(value: object) -> AttemptEnd | None:
 
 
 def write_attempt_lifecycle(
-    trial_dir: Path,
+    attempt_dir: Path,
     *,
     attempt_id: str,
     state: str,
@@ -349,8 +349,8 @@ def write_attempt_lifecycle(
 ) -> None:
     """Atomically persist the attempt's coarse lifecycle state.
 
-    :param Path trial_dir: Per-trial directory (attempt-scoped, so states from different
-        attempts can never collide).
+    :param Path attempt_dir: The attempt's own records directory, so states from different
+        attempts can never collide.
     :param str attempt_id: Immutable attempt identity binding the record.
     :param str state: Allocated, launching, terminating, or exited lifecycle state.
     :param AttemptEnd | None ended_by: How the attempt ended, ``None`` until that is known.
@@ -363,7 +363,7 @@ def write_attempt_lifecycle(
     if state not in _ATTEMPT_LIFECYCLE_STATES:
         raise ValueError(f"Unknown attempt lifecycle state {state!r}.")
     _supervisor.write_lifecycle_record(
-        trial_dir / ATTEMPT_LIFECYCLE_FILE,
+        attempt_dir / ATTEMPT_LIFECYCLE_FILE,
         attempt_id=attempt_id,
         state=state,
         ended_by=ended_by,
@@ -374,13 +374,13 @@ def write_attempt_lifecycle(
 
 
 def read_attempt_lifecycle(
-    trial_dir: Path,
+    attempt_dir: Path,
     *,
     expected_attempt_id: str,
 ) -> AttemptLifecycle | None:
     """Load and validate the attempt lifecycle record, if one exists.
 
-    :param Path trial_dir: Trial directory that may contain ``attempt_lifecycle.json``.
+    :param Path attempt_dir: Attempt directory that may contain ``attempt_lifecycle.json``.
     :param str expected_attempt_id: Attempt identity stored on the Optuna trial.
     :raises ValueError: The record is unreadable, malformed, uses an unknown schema or state,
         or belongs to another attempt. Callers must treat this as cleanup uncertainty, not as
@@ -388,7 +388,7 @@ def read_attempt_lifecycle(
     :return AttemptLifecycle | None: The validated record, or ``None`` when no record exists.
         Current recovery callers decide whether absence is safe for their state.
     """
-    path = trial_dir / ATTEMPT_LIFECYCLE_FILE
+    path = attempt_dir / ATTEMPT_LIFECYCLE_FILE
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -434,7 +434,7 @@ def read_attempt_lifecycle(
     )
 
 
-def _record_attempt_exited(trial_dir: Path, *, attempt_id: str, ended_by: AttemptEnd) -> None:
+def _record_attempt_exited(attempt_dir: Path, *, attempt_id: str, ended_by: AttemptEnd) -> None:
     """Best-effort persistence of confirmed process cleanup.
 
     How the attempt ended, once recorded, survives repeated cleanup confirmations: the
@@ -442,13 +442,13 @@ def _record_attempt_exited(trial_dir: Path, *, attempt_id: str, ended_by: Attemp
     knows a trainer's code, so it records only endings without one.
     A write failure preserves the primary error; the retained identity permits recovery.
 
-    :param Path trial_dir: Per-trial directory holding the lifecycle record.
+    :param Path attempt_dir: Attempt directory holding the lifecycle record.
     :param str attempt_id: Immutable attempt identity binding the record.
     :param AttemptEnd ended_by: The controller's account of the ending, used only when the
         record holds none.
     """
     try:
-        lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
+        lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt_id)
         if (
             lifecycle is not None
             and lifecycle.state == "exited"
@@ -464,7 +464,7 @@ def _record_attempt_exited(trial_dir: Path, *, attempt_id: str, ended_by: Attemp
             else None
         )
         write_attempt_lifecycle(
-            trial_dir,
+            attempt_dir,
             attempt_id=attempt_id,
             state="exited",
             ended_by=ended_by if recorded is None else recorded.ended_by,
@@ -711,7 +711,7 @@ def run_supervised(
     stdout: IO[str],
     stderr: IO[str],
     timeout: float | None,
-    trial_dir: Path,
+    attempt_dir: Path,
     attempt_id: str,
     wallclock_deadline: float | None = None,
     cwd: str | None = None,
@@ -735,7 +735,7 @@ def run_supervised(
     :param IO[str] stdout: Open stdout destination.
     :param IO[str] stderr: Open stderr destination.
     :param float | None timeout: Seconds from call entry, or ``None`` for no relative deadline.
-    :param Path trial_dir: Directory for ``process_identity.json`` and lifecycle records.
+    :param Path attempt_dir: Directory for ``process_identity.json`` and lifecycle records.
     :param str attempt_id: Attempt identity already persisted in Optuna.
     :param float | None wallclock_deadline: Absolute ``time.monotonic()`` phase/run deadline.
     :param str | None cwd: Trainer working directory; ``None`` retains invocation cwd.
@@ -769,7 +769,7 @@ def run_supervised(
     pgid: int | None = None
     ack_write: int | None = None
     status_read: int | None = None
-    identity_path = trial_dir / PROCESS_IDENTITY_FILE
+    identity_path = attempt_dir / PROCESS_IDENTITY_FILE
     # Read the inherited PID namespace before writing or spawning; unreadable
     # identity must refuse launch without side effects.
     pid_namespace = read_pid_namespace()
@@ -791,7 +791,7 @@ def run_supervised(
             # payload has crossed, so recovery settles launching without an identity
             # without signalling; once it exists, recovery must validate and clean it.
             write_attempt_lifecycle(
-                trial_dir,
+                attempt_dir,
                 attempt_id=attempt_id,
                 state="launching",
             )
@@ -800,7 +800,7 @@ def run_supervised(
                 stderr=stderr,
                 deadline=deadline,
                 gpu_lease_fds=gpu_lease_fds,
-                lifecycle_args=(str(trial_dir), attempt_id, str(started)),
+                lifecycle_args=(str(attempt_dir), attempt_id, str(started)),
                 label=label,
             )
             identity = _trial_process_identity(
@@ -842,7 +842,7 @@ def run_supervised(
             pid = pgid if pgid is not None else proc.pid
             return_code = _guardian_return_code(proc)
         if cleanup_confirmed:
-            _record_attempt_exited(trial_dir, attempt_id=attempt_id, ended_by="not_started")
+            _record_attempt_exited(attempt_dir, attempt_id=attempt_id, ended_by="not_started")
         log.warning(
             "Trial launch deadline expired before the trainer started (pid %d): %s",
             pid,
@@ -874,7 +874,7 @@ def run_supervised(
             # proof that recovery may settle the childless attempt.
             try:
                 write_attempt_lifecycle(
-                    trial_dir,
+                    attempt_dir,
                     attempt_id=attempt_id,
                     state="exited",
                     ended_by="not_started",
@@ -903,7 +903,7 @@ def run_supervised(
         )
         cleanup_confirmed = _abort_launch(proc, pgid)
         if cleanup_confirmed:
-            _record_attempt_exited(trial_dir, attempt_id=attempt_id, ended_by="not_started")
+            _record_attempt_exited(attempt_dir, attempt_id=attempt_id, ended_by="not_started")
         if control_flow_exception:
             if not cleanup_confirmed:
                 raise UnsafeProcessCleanupError(
@@ -1024,7 +1024,7 @@ def run_supervised(
                     pgid,
                 )
                 write_attempt_lifecycle(
-                    trial_dir,
+                    attempt_dir,
                     attempt_id=attempt_id,
                     state="terminating",
                     ended_by="guardian_lost",
@@ -1060,7 +1060,7 @@ def run_supervised(
                 "cleanup could not be confirmed."
             ) from exc
         try:
-            _record_attempt_exited(trial_dir, attempt_id=attempt_id, ended_by="cancelled")
+            _record_attempt_exited(attempt_dir, attempt_id=attempt_id, ended_by="cancelled")
         except Exception:
             log.exception(
                 "Trial process group %d was cleaned after an unexpected wait failure, but "
@@ -1078,7 +1078,7 @@ def run_supervised(
     # after confirming the whole group is gone.
     if cleanup_confirmed:
         # The guardian's own verdict, written before it exited, outranks this account.
-        _record_attempt_exited(trial_dir, attempt_id=attempt_id, ended_by=controller_ending)
+        _record_attempt_exited(attempt_dir, attempt_id=attempt_id, ended_by=controller_ending)
 
     duration = (time.monotonic() if root_exited is None else root_exited) - started
     return ProcessResult(

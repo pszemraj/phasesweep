@@ -298,7 +298,7 @@ def _record_trainer_environment(
     experiment: Experiment,
     identity: EnvironmentIdentity,
     env: Mapping[str, str],
-    trial_dir: Path,
+    attempt_dir: Path,
 ) -> None:
     """Write the trainer's exact environment to an owner-only file when record_env is enabled.
 
@@ -308,7 +308,7 @@ def _record_trainer_environment(
     :param Experiment experiment: Experiment supplying the environment contract.
     :param EnvironmentIdentity identity: Composed environment and tracked identity.
     :param Mapping[str, str] env: Final environment passed to the trainer process.
-    :param Path trial_dir: Existing trial directory.
+    :param Path attempt_dir: Existing attempt directory.
     :raises OSError: The record could not be written.
     :raises UnsafePrivatePathError: An existing environment.json is not a private,
         unshared regular file.
@@ -322,7 +322,7 @@ def _record_trainer_environment(
         "env": dict(env),
     }
     private_atomic_write_text(
-        trial_dir / "environment.json",
+        attempt_dir / "environment.json",
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         require_private_dir=False,
     )
@@ -380,21 +380,21 @@ def _printable_line(raw: str) -> str:
     return " ".join("".join(kept).split())
 
 
-def _stderr_last_line(trial_dir: Path) -> str | None:
-    """Return the last non-empty line of a trial's ``stderr.log``, ready to quote.
+def _stderr_last_line(attempt_dir: Path) -> str | None:
+    """Return the last non-empty line of an attempt's ``stderr.log``, ready to quote.
 
     Reads at most :data:`_STDERR_TAIL_BYTES` from the end of the file in the
-    operator-trusted trial directory. A line cut by that window is quoted from
+    operator-trusted attempt directory. A line cut by that window is quoted from
     where the window starts. A line longer than :data:`_STDERR_QUOTE_CHARS` is cut
     and ends in ``...``. A line with nothing printable left, such as binary
     output, does not count, so the line before it is quoted.
 
-    :param Path trial_dir: Trial directory holding ``stderr.log``.
+    :param Path attempt_dir: Attempt directory holding ``stderr.log``.
     :return str | None: The line, or ``None`` when the file is missing, unreadable
         or has no printable line.
     """
     try:
-        with (trial_dir / "stderr.log").open("rb") as handle:
+        with (attempt_dir / "stderr.log").open("rb") as handle:
             size = handle.seek(0, os.SEEK_END)
             handle.seek(max(0, size - _STDERR_TAIL_BYTES))
             tail = handle.read(_STDERR_TAIL_BYTES)
@@ -726,6 +726,7 @@ def launch_trial(
     generation_id: str,
     attempt_id: str,
     trial_dir: Path,
+    attempt_dir: Path,
     overrides: dict[str, Any],
     timeout_seconds: float | None,
     wallclock_deadline: float | None = None,
@@ -743,7 +744,9 @@ def launch_trial(
     :param int trial_id: Optuna trial number.
     :param str generation_id: Invocation identity.
     :param str attempt_id: Immutable subprocess attempt identity.
-    :param Path trial_dir: Resolved trial directory; created if missing.
+    :param Path trial_dir: Resolved trial directory, the trainer's; created if missing.
+    :param Path attempt_dir: The attempt's records directory: command, streams, environment
+        record, tracker bindings and process slot; created if missing.
     :param dict overrides: Inherited, fixed, and sampled overrides.
     :param float | None timeout_seconds: Optional per-trial wallclock budget.
     :param float | None wallclock_deadline: Absolute phase/run deadline including launch
@@ -763,6 +766,7 @@ def launch_trial(
     """
     workdir = trial_dir
     workdir.mkdir(parents=True, exist_ok=True)
+    attempt_dir.mkdir(parents=True, exist_ok=True)
     # Trial artifacts use ordinary paths in the operator-trusted workdir.
     run_name = trial_run_name(experiment, phase_name, trial_id, attempt_id)
     trainer_input = prepared_input
@@ -778,7 +782,7 @@ def launch_trial(
         materialized_input_path=workdir / trainer_input.filename,
     )
     overrides_sha256 = trainer_input.sha256
-    (workdir / "command.txt").write_text(cmd + "\n", encoding="utf-8")
+    (attempt_dir / "command.txt").write_text(cmd + "\n", encoding="utf-8")
 
     env = dict(environment_identity.values)
     phase = experiment.phase(phase_name)
@@ -790,11 +794,11 @@ def launch_trial(
         from phasesweep.runtime.json import json_text
         from phasesweep.tracking.session import EXPECTED_BINDING_FILE, read_binding, read_record
 
-        expected = read_record(workdir / EXPECTED_BINDING_FILE)
+        expected = read_record(attempt_dir / EXPECTED_BINDING_FILE)
         env.pop("MLFLOW_EXPERIMENT_NAME", None)
         env["MLFLOW_EXPERIMENT_ID"] = json_text(expected, "experiment_id")
         if experiment.mlflow.run_mode == "managed":
-            env["MLFLOW_RUN_ID"] = read_binding(workdir)["run_id"]
+            env["MLFLOW_RUN_ID"] = read_binding(attempt_dir)["run_id"]
     # The launch preflight checked this directory, but it can vanish while a phase runs.
     missing_cwd = _missing_trainer_cwd(experiment)
     if missing_cwd is not None:
@@ -831,18 +835,21 @@ def launch_trial(
         gpu_id=gpu_id,
         gpu_lease_fds=gpu_lease_fds,
     )
-    _record_trainer_environment(experiment, environment_identity, env, workdir)
+    _record_trainer_environment(experiment, environment_identity, env, attempt_dir)
 
     log.info("[%s/trial_%d] %s", phase_name, trial_id, cmd)
 
-    with (workdir / "stdout.log").open("w") as fout, (workdir / "stderr.log").open("w") as ferr:
+    with (
+        (attempt_dir / "stdout.log").open("w") as fout,
+        (attempt_dir / "stderr.log").open("w") as ferr,
+    ):
         proc_result = run_supervised(
             cmd,
             env=env,
             stdout=fout,
             stderr=ferr,
             timeout=timeout_seconds,
-            trial_dir=workdir,
+            attempt_dir=attempt_dir,
             attempt_id=attempt_id,
             wallclock_deadline=wallclock_deadline,
             cwd=None if trainer_cwd is None else str(trainer_cwd),
@@ -857,6 +864,7 @@ def launch_trial(
         attempt_id=attempt_id,
         overrides_sha256=overrides_sha256,
         trial_dir=workdir,
+        attempt_dir=attempt_dir,
         run_name=run_name,
         return_code=proc_result.return_code,
         duration_seconds=proc_result.duration_seconds,
@@ -920,7 +928,7 @@ def extract_trial_result(
         )
 
     if rc != 0 and failure_reason is None:
-        stderr_line = _stderr_last_line(executed.ctx.trial_dir)
+        stderr_line = _stderr_last_line(executed.ctx.attempt_dir)
         failure_reason = _nonzero_exit_reason(rc)
         if stderr_line is not None:
             failure_reason += f"; stderr: {stderr_line}"

@@ -32,6 +32,7 @@ from phasesweep.engine.state import (
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
+    TRIAL_DIR_ATTR,
     constraint_attr,
     observed_attr,
 )
@@ -65,6 +66,7 @@ def test_retry_replaces_optional_trial_results(tmp_path: Path) -> None:
         TRAINER_ENV_ATTR: {},
         TRAINER_ENV_DIGEST_ATTR: "a" * 64,
         TRAINER_INPUT_ATTR: {"schema_version": 1},
+        TRIAL_DIR_ATTR: str(tmp_path / "runs" / "retry" / "p" / "trial_00000__attempt"),
     }.items():
         trial.set_user_attr(key, value)
     original = TrialResult(

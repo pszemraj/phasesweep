@@ -28,7 +28,7 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.engine.paths import _run_log_path
-from phasesweep.engine.state import ATTEMPT_ID_ATTR, FAILURE_REASON_ATTR, TRIAL_DIR_ATTR
+from phasesweep.engine.state import ATTEMPT_ID_ATTR, FAILURE_REASON_ATTR, _trial_attempt_dir
 from phasesweep.errors import PhaseSweepError
 from phasesweep.mcp.runs import RUNNER_STOP_GRACE_SECONDS
 from phasesweep.runtime import process, reaper, supervisor
@@ -182,26 +182,26 @@ def _trainer(tmp_path: Path, body: str) -> tuple[Path, Path]:
 
 
 def _supervise(
-    trial_dir: Path, argv: list[str], *, timeout: float, gpu_lease_fds: tuple[int, ...] = ()
+    attempt_dir: Path, argv: list[str], *, timeout: float, gpu_lease_fds: tuple[int, ...] = ()
 ) -> ProcessResult:
-    """Run ``argv`` as a supervised trial in ``trial_dir``.
+    """Run ``argv`` as a supervised trial in ``attempt_dir``.
 
-    :param Path trial_dir: Attempt directory, created here.
+    :param Path attempt_dir: Attempt directory, created here.
     :param list[str] argv: Trainer command, run through ``exec`` so it is the group root.
     :param float timeout: Trial wallclock budget.
     :param tuple[int, ...] gpu_lease_fds: Descriptors the guardian inherits as its leases.
     :return ProcessResult: The supervision result.
     """
-    trial_dir.mkdir()
-    with (trial_dir / "out.log").open("w") as out, (trial_dir / "err.log").open("w") as err:
+    attempt_dir.mkdir()
+    with (attempt_dir / "out.log").open("w") as out, (attempt_dir / "err.log").open("w") as err:
         return run_supervised(
             "exec " + shlex.join(argv),
             env=os.environ.copy(),
             stdout=out,
             stderr=err,
             timeout=timeout,
-            trial_dir=trial_dir,
-            attempt_id=trial_dir.name,
+            attempt_dir=attempt_dir,
+            attempt_id=attempt_dir.name,
             gpu_lease_fds=gpu_lease_fds,
         )
 
@@ -227,13 +227,13 @@ def _wait_for_mark(mark: Path) -> None:
         time.sleep(0.01)
 
 
-def _assert_exited(trial_dir: Path, return_code: int) -> None:
+def _assert_exited(attempt_dir: Path, return_code: int) -> None:
     """Assert the guardian recorded a confirmed exit with ``return_code``.
 
-    :param Path trial_dir: Attempt directory whose name is its attempt ID.
+    :param Path attempt_dir: Attempt directory whose name is its attempt ID.
     :param int return_code: Expected recorded return code.
     """
-    lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=trial_dir.name)
+    lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt_dir.name)
     assert lifecycle is not None
     assert (lifecycle.state, lifecycle.return_code, lifecycle.cleanup_confirmed) == (
         "exited",
@@ -272,17 +272,17 @@ def test_a_helper_that_exits_within_the_settle_keeps_the_roots_exit(
 def test_a_trials_time_ends_when_its_root_exits(tmp_path: Path) -> None:
     """A root that exits at once and leaves a helper alive for three seconds reports its own short time, in the result and in the lifecycle record."""
     trainer, marks = _trainer(tmp_path, _HELPER_TRAINER)
-    trial_dir = tmp_path / "time"
+    attempt_dir = tmp_path / "time"
 
     started = time.monotonic()
     result = _supervise(
-        trial_dir, [sys.executable, str(trainer), str(marks), "3.0", "0"], timeout=30.0
+        attempt_dir, [sys.executable, str(trainer), str(marks), "3.0", "0"], timeout=30.0
     )
     elapsed = time.monotonic() - started
 
     assert (result.return_code, result.failure_reason) == (0, None)
     assert (marks / "helper_done").exists(), "the guardian did not wait for the helper"
-    lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=trial_dir.name)
+    lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt_dir.name)
     assert lifecycle is not None and lifecycle.duration_seconds is not None
     assert elapsed - result.duration_seconds > 2.0
     assert elapsed - lifecycle.duration_seconds > 2.0
@@ -295,9 +295,9 @@ def test_a_persistent_child_is_terminated_after_the_settle_and_named(
     caplog.set_level(logging.INFO, logger="phasesweep.runtime.process")
     use_guardian_timing(monkeypatch, tmp_path, settle_seconds=0.5, term_grace_seconds=0.5)
     trainer, marks = _trainer(tmp_path, _PERSISTENT_TRAINER)
-    trial_dir = tmp_path / "persistent"
+    attempt_dir = tmp_path / "persistent"
 
-    result = _supervise(trial_dir, [sys.executable, str(trainer), str(marks)], timeout=30.0)
+    result = _supervise(attempt_dir, [sys.executable, str(trainer), str(marks)], timeout=30.0)
 
     child_pid = int((marks / "child_pid").read_text())
     assert_descendant_dies(child_pid, on_timeout_msg=f"child {child_pid} survived the guardian")
@@ -315,8 +315,8 @@ def test_a_persistent_child_is_terminated_after_the_settle_and_named(
         assert f": {child_pid} ({executable})." in result.failure_reason
     named = [r.levelno for r in caplog.records if "still had live descendants" in r.getMessage()]
     assert named == [logging.INFO]
-    _assert_exited(trial_dir, 1)
-    assert (trial_dir / PROCESS_IDENTITY_FILE).exists()
+    _assert_exited(attempt_dir, 1)
+    assert (attempt_dir / PROCESS_IDENTITY_FILE).exists()
     root_exit = float((marks / "root_exit").read_text())
     assert float((marks / "child_sigterm").read_text()) - root_exit >= 0.5
 
@@ -398,10 +398,10 @@ def test_a_killed_launchers_session_escaped_child_holds_the_lease_until_terminat
         return real_wait(proc)
 
     monkeypatch.setattr(process, "_wait_for_guardian_exit", wait_for_cleanup)
-    trial_dir = tmp_path / "launcher"
+    attempt_dir = tmp_path / "launcher"
     try:
         result = _supervise(
-            trial_dir,
+            attempt_dir,
             [sys.executable, str(trainer), str(marks)],
             timeout=30.0,
             gpu_lease_fds=(lease_write,),
@@ -420,7 +420,7 @@ def test_a_killed_launchers_session_escaped_child_holds_the_lease_until_terminat
     executable = Path(sys.executable).resolve().name
     named = f"still had live descendants 0.5s later ({child_pid} ({executable}))"
     assert [r.levelno for r in caplog.records if named in r.getMessage()] == [logging.INFO]
-    _assert_exited(trial_dir, -signal.SIGKILL)
+    _assert_exited(attempt_dir, -signal.SIGKILL)
     root_exit = float((marks / "root_exit").read_text())
     assert float((marks / "child_sigterm").read_text()) - root_exit >= 0.5
 
@@ -432,10 +432,10 @@ def test_a_session_escaped_helper_that_exits_within_the_settle_keeps_the_roots_e
 ) -> None:
     """A helper in a session of its own is waited for, not signalled, and the root's exit stands."""
     trainer, marks = _trainer(tmp_path, _HELPER_TRAINER)
-    trial_dir = tmp_path / f"escaped-{code}"
+    attempt_dir = tmp_path / f"escaped-{code}"
 
     result = _supervise(
-        trial_dir,
+        attempt_dir,
         [sys.executable, str(trainer), str(marks), "0.3", str(code), "session"],
         timeout=30.0,
     )
@@ -447,7 +447,7 @@ def test_a_session_escaped_helper_that_exits_within_the_settle_keeps_the_roots_e
     )
     assert (marks / "helper_done").exists(), "the guardian did not wait for the adopted helper"
     assert not (marks / "helper_sigterm").exists()
-    _assert_exited(trial_dir, code)
+    _assert_exited(attempt_dir, code)
 
 
 @_LINUX_ADOPTION
@@ -463,17 +463,17 @@ def test_a_refused_subreaper_leaves_only_the_roots_group_watched(
         patch=_REFUSED_SUBREAPER_PATCH,
     )
     trainer, marks = _trainer(tmp_path, _HELPER_TRAINER)
-    trial_dir = tmp_path / "refused"
+    attempt_dir = tmp_path / "refused"
 
     result = _supervise(
-        trial_dir,
+        attempt_dir,
         [sys.executable, str(trainer), str(marks), "1.0", "0", "session"],
         timeout=30.0,
     )
 
     assert (result.return_code, result.failure_reason, result.cleanup_confirmed) == (0, None, True)
     assert not (marks / "helper_done").exists(), "the guardian waited for a helper it cannot adopt"
-    _assert_exited(trial_dir, 0)
+    _assert_exited(attempt_dir, 0)
     _wait_for_mark(marks / "helper_done")
 
 
@@ -1017,8 +1017,9 @@ def test_restart_during_the_settle_keeps_the_killed_controllers_finished_trial(
         (trial,) = phase_trials(experiment)
         assert trial.state == optuna.trial.TrialState.RUNNING
         attempt = trial.user_attrs[ATTEMPT_ID_ATTR]
-        trial_dir = Path(trial.user_attrs[TRIAL_DIR_ATTR])
-        identity = reaper.read_stale_process_identity(trial_dir, expected_attempt_id=attempt)
+        attempt_dir = _trial_attempt_dir(trial)
+        assert attempt_dir is not None
+        identity = reaper.read_stale_process_identity(attempt_dir, expected_attempt_id=attempt)
         assert identity.guardian_starttime is not None
         assert _parent_of(helper_pid) == identity.guardian_pid
         deadline = time.monotonic() + 5
@@ -1057,7 +1058,7 @@ def test_restart_during_the_settle_keeps_the_killed_controllers_finished_trial(
         assert (recovered.state, recovered.value) == (optuna.trial.TrialState.COMPLETE, 0.5)
         assert winners["p"].trial_number == trial.number
         assert (marks / "calls").read_text().splitlines() == ["run"]
-        lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt)
+        lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt)
         assert lifecycle is not None
         assert (lifecycle.state, lifecycle.return_code, lifecycle.cleanup_confirmed) == (
             "exited",

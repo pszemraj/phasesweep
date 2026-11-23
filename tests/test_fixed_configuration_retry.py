@@ -308,9 +308,11 @@ def test_stale_recovered_fixed_configuration_attempt_reruns_at_the_same_target(
     """An attempt a kill or reboot left RUNNING recovers as interrupted and reruns without a raised target."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=0)
     exp = _fixed(tmp_path, trainer, 1)
-    study, trial_dir, _number = fabricate_stale_trial(exp, "p", attempt_id="killed-attempt")
+    study, _trial_dir, _number, attempt_dir = fabricate_stale_trial(
+        exp, "p", attempt_id="killed-attempt"
+    )
     study.set_user_attr(PHASE_FINGERPRINT_ATTR, _phase_fingerprint(exp, exp.phases[0], {}))
-    write_attempt_lifecycle(trial_dir, attempt_id="killed-attempt", state="allocated")
+    write_attempt_lifecycle(attempt_dir, attempt_id="killed-attempt", state="allocated")
 
     assert run_experiment(exp)["p"].metric == 1.0
     assert _call_count(calls) == 1

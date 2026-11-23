@@ -58,8 +58,8 @@ from phasesweep.engine.paths import (
     _generation_dir,
     _generation_summary_path,
     _generation_winner_path,
+    _phase_dir,
     _run_log_path,
-    _trial_dir_for,
     _trials_csv_path,
 )
 from phasesweep.engine.preview import validate_trial_targets
@@ -1278,15 +1278,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                         {
                             "trial_number": member["trial_number"],
                             "repeat": member["repeat"],
-                            "trial_dir": str(
-                                _trial_dir_for(
-                                    experiment,
-                                    name,
-                                    member["trial_number"],
-                                    generation_id=member["generation_id"],
-                                    attempt_id=member["attempt_id"],
-                                )
-                            ),
+                            "trial_dir": str(_phase_dir(experiment, name) / member["trial_dir"]),
                         }
                         for member in detail["members"]
                     ]

@@ -39,10 +39,12 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
+    _attempt_dir,
     _experiment_dir,
     _generation_path,
     _generation_record_path,
     _generation_summary_path,
+    _phase_dir,
     _trial_dir_for,
 )
 from phasesweep.engine.read import read_status
@@ -179,10 +181,11 @@ def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path
             )
         status = read_status(experiment)
         if status["phases"][0]["trials"].get("RUNNING", 0) >= 1:
-            phase_dir = _trial_dir_for(experiment, "p", 0).parent
-            for trial_dir in phase_dir.glob("trial_00000__*"):
-                if (trial_dir / PROCESS_IDENTITY_FILE).is_file():
-                    return trial_dir
+            identities = sorted(
+                _phase_dir(experiment, "p").glob(f"attempts/*/{PROCESS_IDENTITY_FILE}")
+            )
+            if identities:
+                return identities[0].parent
         time.sleep(0.2)
     raise AssertionError(f"trial never reached RUNNING; log:\n{log_path.read_text()}")
 
@@ -1171,15 +1174,11 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     trial = study.ask()
     attempt_id = "terminal-identity-attempt"
     generation_id = "earlier-generation"
-    trial_dir = _trial_dir_for(
-        experiment,
-        phase.name,
-        trial.number,
-        generation_id=generation_id,
-        attempt_id=attempt_id,
-    )
+    trial_dir = _trial_dir_for(experiment, phase.name, trial.number, attempt_id=attempt_id)
     trial_dir.mkdir(parents=True)
-    write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
+    attempt_dir.mkdir(parents=True)
+    write_attempt_lifecycle(attempt_dir, attempt_id=attempt_id, state="allocated")
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
     trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
     trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
@@ -1191,6 +1190,7 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
         study_name=study.study_name,
         trial_number=trial.number,
         trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         generation_id=generation_id,
     )
 
@@ -1896,8 +1896,8 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
     status_path = store.status_path(run_id)
     log_path = store.log_path(run_id)
     with _spawned_runner(store, run_id, config, cwd=tmp_path) as proc:
-        trial_dir = _wait_for_running_trial(config, proc, log_path)
-        trial_pgid = json.loads((trial_dir / PROCESS_IDENTITY_FILE).read_text())["pgid"]
+        attempt_dir = _wait_for_running_trial(config, proc, log_path)
+        trial_pgid = json.loads((attempt_dir / PROCESS_IDENTITY_FILE).read_text())["pgid"]
 
         # The manual stop targets the runner; its handler stops the separate trial group.
         proc.terminate()

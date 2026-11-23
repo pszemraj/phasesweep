@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from phasesweep.config.search import Repeats
+from phasesweep.engine.paths import _trial_dir_name
 from phasesweep.engine.repeats import (
     RepeatAxis,
     _check_repeats_axis,
@@ -37,6 +38,7 @@ def _member(number: int, seed: int, metric: float, observed: dict[str, float]) -
         "metric": metric,
         "generation_id": "generation-a" if number < 4 else "generation-b",
         "attempt_id": f"attempt-{number}",
+        "trial_dir": _trial_dir_name(number, f"attempt-{number}"),
         "objective_provenance": {"schema_version": 1, "trial": number},
         "trainer_input": {"schema_version": 1, "sha256": f"{number:064d}"},
         "constraints": {"memory": 1.0 + number},
@@ -57,6 +59,7 @@ def _payload(reduce: str = "mean") -> JsonObject:
         "trial_number": last["trial_number"],
         "generation_id": last["generation_id"],
         "attempt_id": last["attempt_id"],
+        "trial_dir": last["trial_dir"],
         "objective_provenance": last["objective_provenance"],
         "trainer_input": last["trainer_input"],
         "constraints": last["constraints"],
@@ -290,6 +293,8 @@ def _tampered(edit: str) -> JsonObject:
         stats["sd"] = 0.0
     elif edit == "representative-attempt":
         payload["attempt_id"] = "attempt-1"
+    elif edit == "representative-trial-dir":
+        payload["trial_dir"] = first["trial_dir"]
     elif edit == "representative-trial":
         payload["trial_number"] = 1
     elif edit == "order":
@@ -315,6 +320,7 @@ def _tampered(edit: str) -> JsonObject:
         pytest.param("member-metric", "mean of the member metrics differs", id="aggregate"),
         pytest.param("spread", "spread differs", id="spread"),
         pytest.param("representative-attempt", "disagrees with the winner's attempt_id", id="rep"),
+        pytest.param("representative-trial-dir", "winner's trial_dir", id="rep-trial-dir"),
         pytest.param("representative-trial", "winner's trial_number", id="rep-trial"),
         pytest.param("order", "ascending and distinct", id="order"),
         pytest.param("repeat-value", "repeat a repeat value", id="repeat-value"),

@@ -303,7 +303,7 @@ def test_stale_trial_holding_last_grid_point_recovers(tmp_path: Path) -> None:
             Phase(name="p", n_trials=1, sampler=Sampler(type="grid"), search_space=search_space)
         ],
     )
-    _, _trial_dir, stale_number = fabricate_stale_trial(exp, "p", attempt_id="grid-attempt")
+    stale_number = fabricate_stale_trial(exp, "p", attempt_id="grid-attempt").number
     # Recovery reopens the phase study with its configured GridSampler, as the
     # engine does; the stale trial must also hold a grid point, so give it the
     # attrs GridSampler.before_trial would have written at ask time.
@@ -829,12 +829,12 @@ def test_abort_after_gpu_acquire_prevents_queued_trials(
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(exp)
 
-    # Count actual subprocess launches (each launch creates a stdout.log).
+    # Count actual subprocess launches (each launch creates a stdout.log in its attempt directory).
     # With the post-acquire recheck, the first failure aborts queued threads
     # before they launch their subprocess. Without it, all 4 would launch.
     runs_dir = Path(exp.workdir).expanduser().resolve() / exp.experiment / exp.phases[0].name
-    trial_dirs = sorted(runs_dir.glob("trial_*"))
-    launched = [d for d in trial_dirs if (d / "stdout.log").exists()]
+    attempt_dirs = sorted((runs_dir / "attempts").glob("*"))
+    launched = [d for d in attempt_dirs if (d / "stdout.log").exists()]
     assert 1 <= len(launched) <= 2, (
         f"With max_consecutive_failures=1 and a 1-slot GPU pool, expected at "
         f"least 1 and at most 2 trial launches (1 failing + at most 1 in-flight "
@@ -1161,11 +1161,11 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
                 "fake-sdk",
                 statuses=frozenset({"ok"}),
                 run_id=ctx.attempt_id,
-                trial_dir=ctx.trial_dir,
+                attempt_dir=ctx.attempt_dir,
                 environment={},
                 deadline=time.monotonic() + 10,
             )
-            lifecycle = read_attempt_lifecycle(ctx.trial_dir, expected_attempt_id=ctx.attempt_id)
+            lifecycle = read_attempt_lifecycle(ctx.attempt_dir, expected_attempt_id=ctx.attempt_id)
             assert result.return_code == worker_return_code
             assert lifecycle is not None and lifecycle.return_code == worker_return_code
         return original_extract(
@@ -1213,17 +1213,16 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
         assert [trial.state for trial in trials] == [
             optuna.trial.TrialState.FAIL,
             optuna.trial.TrialState.COMPLETE,
-            optuna.trial.TrialState.COMPLETE,
         ]
         assert trials[0].user_attrs[TRIAL_OUTCOME_ATTR] == {
             "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
             "sequence": 1,
-            "outcome": "interrupted",
-            "cause": "stale RUNNING trial recovered after its orchestrator stopped",
+            "outcome": "failure",
+            "cause": "non-zero exit code 1",
         }
-        assert trials[1].user_attrs[RERUN_OF_ATTR] == 0
-        assert _load_phase_policy_state(study).max_sequence == 3
-        assert launches.read_text().splitlines() == ["0", "1", "2"]
+        assert not any(RERUN_OF_ATTR in trial.user_attrs for trial in trials)
+        assert _load_phase_policy_state(study).max_sequence == 2
+        assert launches.read_text().splitlines() == ["0", "1"]
 
 
 @pytest.mark.integration
@@ -1305,14 +1304,14 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
             # fault injection. Restore a durable pre-exit shape: with an identity,
             # preflight must consult it and our cleanup verdict; without one, the
             # identity write failed before any payload crossed.
-            trial_dir = Path(str(kwargs["trial_dir"]))
+            attempt_dir = Path(str(kwargs["attempt_dir"]))
             write_attempt_lifecycle(
-                trial_dir,
+                attempt_dir,
                 attempt_id=str(kwargs["attempt_id"]),
                 state="allocated" if identity_persists else "launching",
             )
             if not identity_persists:
-                (trial_dir / PROCESS_IDENTITY_FILE).unlink()
+                (attempt_dir / PROCESS_IDENTITY_FILE).unlink()
         return result
 
     def maybe_refuse_cleanup_attr(
@@ -1942,7 +1941,7 @@ def test_sdk_worker_ignores_the_user_site_exactly_when_its_controller_does(
     monkeypatch.setattr(process_module, "run_supervised", launch)
     with pytest.raises(InterruptedError) as launched:
         run_worker(
-            {}, worker, "sdk", statuses=frozenset(), run_id="a", trial_dir=tmp_path,
+            {}, worker, "sdk", statuses=frozenset(), run_id="a", attempt_dir=tmp_path,
             environment={}, deadline=time.monotonic() + 10,
         )  # fmt: skip
     # The flags must precede the script, or the interpreter passes them to the script.

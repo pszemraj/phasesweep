@@ -132,6 +132,8 @@ class Winner:
     phase_fingerprint: str | None = None
     generation_id: str | None = None
     attempt_id: str | None = None
+    # Name of the trial directory inside its phase that the source attempt ran in.
+    trial_dir: str | None = None
     source: WinnerSource | None = None
     # Frozen evidence provenance captured when the winning objective was
     # extracted: extractor config fingerprint plus source digest / frozen
@@ -167,7 +169,7 @@ class PhaseCounts:
     """A phase's trials by recorded state when the phase ended, as the run's summary reports them.
 
     ``earlier`` counts the trials of a state in :data:`FINISHED_TRIAL_STATES` that a previous run
-    recorded, so it is a part of :attr:`counted`. ``winner_dirs`` holds the attempt directory of
+    recorded, so it is a part of :attr:`counted`. ``winner_dirs`` holds the trial directory of
     each trial the phase's winner stands on, in trial order, leaving out one that recorded none;
     it is read for the summary and never saved.
     """
@@ -205,7 +207,7 @@ PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
 # it so a refusal can name which keys changed instead of two opaque hashes.
 PHASE_FINGERPRINT_PAYLOAD_ATTR = "phasesweep_fingerprint_payload"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 12
+STUDY_SCHEMA_VERSION = 13
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The
@@ -528,11 +530,26 @@ def _trial_lifecycle(trial: FrozenTrial | Trial) -> AttemptLifecycle | None:
     """
     from phasesweep.runtime.process import read_attempt_lifecycle
 
-    directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
+    directory = _trial_attempt_dir(trial)
     attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
-    if not isinstance(directory, str) or not isinstance(attempt_id, str):
+    if directory is None or not isinstance(attempt_id, str):
         return None
-    return read_attempt_lifecycle(Path(directory), expected_attempt_id=attempt_id)
+    return read_attempt_lifecycle(directory, expected_attempt_id=attempt_id)
+
+
+def _trial_attempt_dir(trial: FrozenTrial | Trial) -> Path | None:
+    """Return the records directory of the attempt a trial recorded, beside its trial directory.
+
+    :param FrozenTrial | Trial trial: Trial whose directory and attempt id attributes name it.
+    :return Path | None: The attempt directory, or ``None`` when either attribute is missing.
+    """
+    from phasesweep.engine.paths import _attempt_dir
+
+    directory = _recorded_trial_dir(trial)
+    attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+    if directory is None or not isinstance(attempt_id, str) or not attempt_id:
+        return None
+    return _attempt_dir(directory.parent, attempt_id)
 
 
 def _recovered_trial_state(
@@ -560,7 +577,7 @@ def _recovered_trial_state(
         return "INTERRUPTED"
     if lifecycle is not None and _completed_trainer_duration(trial, lifecycle) is not None:
         return "EVIDENCE_PENDING"
-    directory = _recorded_trial_dir(trial)
+    directory = _trial_attempt_dir(trial)
     if directory is not None and _trainer_failure_reason(trial, lifecycle, directory) is not None:
         return "FAIL"
     return "INTERRUPTED"
@@ -637,17 +654,17 @@ def _stands_under_winner(trial: FrozenTrial, standing: Mapping[int, str | None])
     return attempt is None or trial.user_attrs.get(ATTEMPT_ID_ATTR) == attempt
 
 
-def _recorded_trial_dir(trial: FrozenTrial) -> Path | None:
-    """Return the attempt directory a trial recorded when it launched.
+def _recorded_trial_dir(trial: FrozenTrial | Trial) -> Path | None:
+    """Return the trial directory a trial recorded when it launched.
 
-    :param FrozenTrial trial: Trial to read.
+    :param FrozenTrial | Trial trial: Trial to read.
     :return Path | None: The directory, or ``None`` when none was recorded.
     """
     directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
     return Path(directory) if isinstance(directory, str) and directory else None
 
 
-GENERATION_SUMMARY_SCHEMA_VERSION = 6
+GENERATION_SUMMARY_SCHEMA_VERSION = 7
 PUBLICATION_POINTER_SCHEMA_VERSION = 2
 # Configuration and reproducibility files frozen into every generation namespace at claim time.
 GENERATION_CONFIG_SNAPSHOT_FILENAME = "config.snapshot.yaml"

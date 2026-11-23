@@ -346,7 +346,7 @@ def request_operation(
             "mlflow",
             statuses=_STATUSES,
             run_id=operation_id,
-            trial_dir=directory,
+            attempt_dir=directory,
             environment=environment,
             deadline=deadline,
         )

@@ -54,6 +54,7 @@ from phasesweep.engine.paths import (
     _generation_config_snapshot_path,
     _last_successful_generation_path,
     _phase_dir,
+    _trial_dir_for,
 )
 from phasesweep.engine.preview import _preview_ledger
 from phasesweep.engine.read import read_trial_tables
@@ -68,12 +69,12 @@ from phasesweep.engine.state import (
     PHASE_FINGERPRINT_ATTR,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
-    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
     _parsed_trial_outcome,
     _recovered_trial_state,
+    _trial_attempt_dir,
     _trial_interrupted,
 )
 from phasesweep.engine.study_policy import (
@@ -333,9 +334,11 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
     trainer = write_param_echo_trainer(tmp_path)
     control = make_experiment(persistent=tmp_path / "control", trainer=trainer, n_trials=3)
     exp = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=3)
-    study, trial_dir, _number = fabricate_stale_trial(exp, "p", attempt_id="killed-attempt")
+    study, _trial_dir, _number, attempt_dir = fabricate_stale_trial(
+        exp, "p", attempt_id="killed-attempt"
+    )
     study.set_user_attr(PHASE_FINGERPRINT_ATTR, _phase_fingerprint(exp, exp.phases[0], {}))
-    write_attempt_lifecycle(trial_dir, attempt_id="killed-attempt", state="allocated")
+    write_attempt_lifecycle(attempt_dir, attempt_id="killed-attempt", state="allocated")
 
     caplog.set_level(logging.INFO, logger="phasesweep")
     winner = run_experiment(exp)["p"]
@@ -794,12 +797,16 @@ def test_completed_orphan_evidence_survives_runner_sigkill(
         f"""
         import argparse, json, os, signal, sys, time
         from pathlib import Path
+        from phasesweep.engine.paths import _attempt_dir
         parser = argparse.ArgumentParser()
         parser.add_argument("--out", required=True)
         args, _ = parser.parse_known_args()
         def terminate(*_):
             if {guardian_cancel!r}:
-                lifecycle = Path(args.out).parent / "attempt_lifecycle.json"
+                attempt_dir = _attempt_dir(
+                    Path(args.out).parent.parent, os.environ["PHASESWEEP_ATTEMPT_ID"]
+                )
+                lifecycle = attempt_dir / "attempt_lifecycle.json"
                 Path({str(termination_intent)!r}).write_text(lifecycle.read_text())
                 os.kill(int(Path({str(runner_pid)!r}).read_text()), signal.SIGKILL)
             sys.exit(0)
@@ -882,9 +889,9 @@ def extract_with_worker(ctx, cfg, **kwargs):
         "attempt_id": ctx.attempt_id,
         "overrides_sha256": ctx.overrides_sha256,
     }
-    session.write_record(ctx.trial_dir / "mlflow-binding.json", binding)
+    session.write_record(ctx.attempt_dir / "mlflow-binding.json", binding)
     session.write_record(
-        ctx.trial_dir / "mlflow-expected.json",
+        ctx.attempt_dir / "mlflow-expected.json",
         {k: v for k, v in binding.items() if k != "run_id"},
     )
     remote = experiment.model_copy(update={
@@ -936,9 +943,11 @@ else:
             assert reached.exists()
             (trial,) = phase_trials(experiment)
             directory = Path(trial.user_attrs["phasesweep_trial_dir"])
+            attempt_dir = _trial_attempt_dir(trial)
+            assert attempt_dir is not None
             attempt = trial.user_attrs["phasesweep_attempt_id"]
             orphan_identity = reaper.read_stale_process_identity(
-                directory, expected_attempt_id=attempt
+                attempt_dir, expected_attempt_id=attempt
             )
             if shutdown_sdk or recovery_stage == "shutdown-trainer":
                 runner.send_signal(signal.SIGINT)
@@ -960,12 +969,12 @@ else:
                 release.touch()
             (trial,) = phase_trials(experiment)
             if (sdk_worker and not shutdown_sdk) or (terminated and not guardian_cancel):
-                lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
+                lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt)
                 assert lifecycle is not None and lifecycle.state == "launching"
                 assert reaper._process_group_alive(orphan_identity.pgid)
             else:
                 while time.monotonic() < deadline:
-                    lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
+                    lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt)
                     if lifecycle is not None and lifecycle.state == "exited":
                         break
                     time.sleep(0.02)
@@ -1078,9 +1087,9 @@ else:
                     assert TRIAL_OUTCOME_ATTR not in pending.user_attrs
                     assert (_attempts_dir(experiment) / f"{attempt}.json").is_file()
                 orphan_identity = reaper.read_stale_process_identity(
-                    directory, expected_attempt_id=attempt
+                    attempt_dir, expected_attempt_id=attempt
                 )
-                lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
+                lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt)
                 assert lifecycle is not None and lifecycle.state == (
                     "exited" if recovery_stage == "interrupt-extraction-signal" else "launching"
                 )
@@ -1120,7 +1129,7 @@ else:
                 assert pending.user_attrs[TRIAL_OUTCOME_ATTR]["metric"] == 1.0
                 saved_outcome = json_object(pending.user_attrs[TRIAL_OUTCOME_ATTR])
                 if recovery_stage == "finished":
-                    objective = directory / "stdout.log"
+                    objective = attempt_dir / "stdout.log"
                     original = objective.read_bytes()
                     objective.unlink()
                     with pytest.raises(TrialEvidenceMissingError, match="missing or unreadable"):
@@ -1267,7 +1276,7 @@ else:
             assert launches.read_text() == "launch\n"
             assert not reaper._process_group_alive(orphan_identity.pgid)
             if terminated:
-                lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
+                lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt)
                 assert lifecycle is not None and lifecycle.return_code is None
                 assert lifecycle.ended_by == (
                     "timed_out" if recovery_stage == "timeout-trainer" else "cancelled"
@@ -1289,9 +1298,9 @@ else:
                     recovery_runner.kill()
                 recovery_runner.wait(timeout=5)
             if orphan_identity is not None:
-                if (directory / reaper.PROCESS_IDENTITY_FILE).exists():
+                if (attempt_dir / reaper.PROCESS_IDENTITY_FILE).exists():
                     orphan_identity = reaper.read_stale_process_identity(
-                        directory, expected_attempt_id=attempt
+                        attempt_dir, expected_attempt_id=attempt
                     )
                 reaper.cleanup_stale_trial_process(orphan_identity, grace_seconds=0.2)
 
@@ -1619,9 +1628,9 @@ def test_tracker_outage_preserves_a_parallel_peers_failure_limit_abort(
         original_stop_launches(run)
         launches_stopped.set()
 
-    def outage(*, run_id: str, trial_dir: Path, **_options: object) -> JsonObject:
+    def outage(*, run_id: str, **_options: object) -> JsonObject:
         both_reading.wait(10)
-        if trial_dir.name.startswith("trial_00000__"):
+        if _trial_dir_for(experiment, experiment.phases[0].name, 0, attempt_id=run_id).is_dir():
             raise WandbSetupError(run_id, "HTTP 401")
         # The peer's verdict comes after the outage has already stopped new launches.
         assert launches_stopped.wait(10)
@@ -1848,9 +1857,10 @@ def test_recovery_defers_a_killed_runs_finished_trial_while_its_tracker_is_unrea
             time.sleep(0.02)
         assert tracker.hung.exists()
         (trial,) = phase_trials(experiment)
-        directory = Path(trial.user_attrs[TRIAL_DIR_ATTR])
+        attempt_dir = _trial_attempt_dir(trial)
+        assert attempt_dir is not None
         reader = reaper.read_stale_process_identity(
-            directory, expected_attempt_id=trial.user_attrs[ATTEMPT_ID_ATTR]
+            attempt_dir, expected_attempt_id=trial.user_attrs[ATTEMPT_ID_ATTR]
         )
         runner.kill()
         runner.wait(timeout=5)
@@ -1925,7 +1935,7 @@ def test_recovery_preview_names_trial_group_liveness(
     monkeypatch.setattr(
         reaper, "_terminate_process_group", lambda pgid, **_: signalled.append(pgid) or True
     )
-    record = _AttemptRecord("preview", tmp_path, "generation", "p", 0)
+    record = _AttemptRecord("preview", tmp_path, tmp_path, "generation", "p", 0)
     attempts_module._resolve_attempt(
         record,
         context="RUNNING trial 0",

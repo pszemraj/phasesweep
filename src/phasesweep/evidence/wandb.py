@@ -200,7 +200,7 @@ def poll_wandb_summary(
     entity: str,
     project: str,
     run_id: str,
-    trial_dir: Path,
+    attempt_dir: Path,
     poll_seconds: float,
     timeout_seconds: float,
     required_keys: Iterable[str] = (),
@@ -214,7 +214,7 @@ def poll_wandb_summary(
     :param str entity: W&B entity that owns the project.
     :param str project: W&B project containing the run.
     :param str run_id: Immutable attempt ID, also used by process recovery.
-    :param Path trial_dir: Existing attempt directory and durable process slot.
+    :param Path attempt_dir: Existing attempt directory and durable process slot.
     :param float poll_seconds: Delay between summary polls.
     :param float timeout_seconds: Visibility budget for the whole capture.
     :param Iterable[str] required_keys: Numeric keys required before accepting a capture.
@@ -265,7 +265,7 @@ def poll_wandb_summary(
             }
         ),
         run_id=run_id,
-        trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         environment=environment,
         deadline=deadline,
     )
@@ -318,7 +318,7 @@ def locate_wandb_position(
     entity: str,
     project: str,
     run_id: str,
-    trial_dir: Path,
+    attempt_dir: Path,
     poll_seconds: float,
     timeout_seconds: float,
     metric_key: str,
@@ -335,7 +335,7 @@ def locate_wandb_position(
     :param str entity: W&B entity that owns the project.
     :param str project: W&B project containing the run.
     :param str run_id: Immutable attempt ID, also used by process recovery.
-    :param Path trial_dir: Existing attempt directory and durable process slot.
+    :param Path attempt_dir: Existing attempt directory and durable process slot.
     :param float poll_seconds: Summary poll interval, the delay between
         history reads up to ``_HISTORY_RETRY_SECONDS``.
     :param float timeout_seconds: Budget for the whole read.
@@ -370,7 +370,7 @@ def locate_wandb_position(
         "wandb",
         statuses=frozenset({"position", "import_error"}),
         run_id=run_id,
-        trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         environment=environment,
         deadline=deadline,
     )

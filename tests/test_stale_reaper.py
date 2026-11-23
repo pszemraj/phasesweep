@@ -38,7 +38,7 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.guards import _preflight_existing_studies, _reconcile_existing_studies
-from phasesweep.engine.paths import _attempts_dir, _experiment_dir, _trial_dir_for
+from phasesweep.engine.paths import _attempt_dir, _attempts_dir, _experiment_dir, _trial_dir_for
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.selection import PhaseAbortRefusedError
@@ -299,11 +299,11 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         # The env names the orphan before the trial is fabricated, so its
         # recorded trainer-env identity matches the run that must reap it.
         experiment = experiment.model_copy(update={"env": {"STALE_PID": str(stale.pid)}})
-        study, trial_dir, stale_number = fabricate_stale_trial(
+        study, _trial_dir, stale_number, attempt_dir = fabricate_stale_trial(
             experiment, "b", attempt_id="old-attempt"
         )
         write_trial_identity(
-            trial_dir,
+            attempt_dir,
             attempt_id="old-attempt",
             pid=stale.pid,
             pgid=os.getpgid(stale.pid),
@@ -471,6 +471,7 @@ def test_preflight_keeps_attempts_reaped_before_a_later_refusal(
     ) -> int:
         recovered_attempts["reaped"] = _AttemptRecord(
             attempt_id="reaped",
+            attempt_dir=Path("."),
             trial_dir=Path("."),
             generation_id="gen-reaped",
             phase_name=name,
@@ -478,6 +479,7 @@ def test_preflight_keeps_attempts_reaped_before_a_later_refusal(
         )
         recovered_attempts["no-generation"] = _AttemptRecord(
             attempt_id="no-generation",
+            attempt_dir=Path("."),
             trial_dir=Path("."),
             generation_id=None,
             phase_name=name,
@@ -1158,7 +1160,7 @@ def test_reaper_keeps_uncertain_cleanup_actionable(
     )
     stale = fabricate_stale_trial(experiment, "p", attempt_id="uncertain-attempt")
     write_trial_identity(
-        stale.trial_dir, attempt_id="uncertain-attempt", pid=99999, pgid=99998, starttime=12345
+        stale.attempt_dir, attempt_id="uncertain-attempt", pid=99999, pgid=99998, starttime=12345
     )
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process", lambda _, **_kwargs: False
@@ -1198,9 +1200,11 @@ def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -
         n_trials=2,
         sampler=Sampler(type="random", seed=1),
     )
-    study, trial_dir, stale_number = fabricate_stale_trial(exp, "p", attempt_id="queued-attempt")
+    study, _trial_dir, stale_number, attempt_dir = fabricate_stale_trial(
+        exp, "p", attempt_id="queued-attempt"
+    )
     study.set_user_attr(PHASE_FINGERPRINT_ATTR, _phase_fingerprint(exp, exp.phases[0], {}))
-    write_attempt_lifecycle(trial_dir, attempt_id="queued-attempt", state="allocated")
+    write_attempt_lifecycle(attempt_dir, attempt_id="queued-attempt", state="allocated")
 
     winners = run_experiment(exp)
 
@@ -1224,7 +1228,9 @@ def test_exited_attempt_recovers_without_signalling(
         workdir=tmp_path / "runs",
         storage=f"journal:///{tmp_path / 'e.journal'}",
     )
-    study, trial_dir, stale_number = fabricate_stale_trial(exp, "p", attempt_id="exited-attempt")
+    study, _trial_dir, stale_number, attempt_dir = fabricate_stale_trial(
+        exp, "p", attempt_id="exited-attempt"
+    )
     child = subprocess.Popen(["sleep", "30"], start_new_session=True)
     try:
         starttime = read_proc_starttime(child.pid)
@@ -1233,14 +1239,14 @@ def test_exited_attempt_recovers_without_signalling(
         child.kill()
         child.wait(timeout=5)
     write_trial_identity(
-        trial_dir,
+        attempt_dir,
         attempt_id="exited-attempt",
         pid=child.pid,
         pgid=pgid,
         starttime=starttime,
     )
     write_attempt_lifecycle(
-        trial_dir,
+        attempt_dir,
         attempt_id="exited-attempt",
         state="exited",
         ended_by="trainer",
@@ -1273,8 +1279,8 @@ def test_recovery_refuses_a_study_bound_to_another_artifact_root(
     owner = write_fixture_config(tmp_path / "b.yaml", ledger_dir=ledger_dir, workdir=tmp_path / "b")
     config_a = tmp_path / "a.yaml"
     recovering = write_fixture_config(config_a, ledger_dir=ledger_dir, workdir=tmp_path / "a")
-    study, trial_dir, owned_number = fabricate_stale_trial(owner, "p", attempt_id="b-attempt")
-    write_attempt_lifecycle(trial_dir, attempt_id="b-attempt", state="allocated")
+    study, _, owned_number, attempt_dir = fabricate_stale_trial(owner, "p", attempt_id="b-attempt")
+    write_attempt_lifecycle(attempt_dir, attempt_id="b-attempt", state="allocated")
     ledger_file = ledger_dir / "study.journal"
     before = ledger_file.read_bytes()
 
@@ -1310,14 +1316,10 @@ def _fabricate_registered_journal_attempt(
     )
     study = new_phase_study(experiment, "p")
     trial = study.ask()
-    trial_dir = _trial_dir_for(
-        experiment,
-        "p",
-        trial.number,
-        generation_id="old-generation",
-        attempt_id=attempt_id,
-    )
+    trial_dir = _trial_dir_for(experiment, "p", trial.number, attempt_id=attempt_id)
     trial_dir.mkdir(parents=True)
+    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
+    attempt_dir.mkdir(parents=True)
     _register_active_attempt(
         experiment,
         attempt_id=attempt_id,
@@ -1325,9 +1327,10 @@ def _fabricate_registered_journal_attempt(
         study_name=study.study_name,
         trial_number=trial.number,
         trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         generation_id="old-generation",
     )
-    write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+    write_attempt_lifecycle(attempt_dir, attempt_id=attempt_id, state="allocated")
     return experiment, ledger, _attempts_dir(experiment) / f"{attempt_id}.json"
 
 
@@ -1440,10 +1443,10 @@ def test_registry_discards_attempt_whose_journal_ledger_is_gone_without_recreati
         )
 
     gone = tmp_path / "gone.journal"
-    _study, trial_dir, _number = fabricate_registered_attempt(
+    _study, _trial_dir, _number, attempt_dir = fabricate_registered_attempt(
         _exp("gone.journal"), "p", attempt_id="gone-attempt"
     )
-    write_attempt_lifecycle(trial_dir, attempt_id="gone-attempt", state="allocated")
+    write_attempt_lifecycle(attempt_dir, attempt_id="gone-attempt", state="allocated")
     entry_path = _attempts_dir(_exp("gone.journal")) / "gone-attempt.json"
     gone.unlink()
 
@@ -1486,9 +1489,9 @@ def test_registry_refuses_a_foreign_ledger_holding_unsupported_state(tmp_path: P
     foreign_unmarked_study.add_trial(
         optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE)
     )
-    trial_dir = tmp_path / "foreign-attempt"
-    trial_dir.mkdir()
-    write_attempt_lifecycle(trial_dir, attempt_id="foreign-attempt", state="allocated")
+    attempt_dir = tmp_path / "foreign-attempt"
+    attempt_dir.mkdir()
+    write_attempt_lifecycle(attempt_dir, attempt_id="foreign-attempt", state="allocated")
     # Registered through the foreign config, so the entry records that ledger.
     _register_active_attempt(
         _exp("foreign.journal"),
@@ -1496,7 +1499,8 @@ def test_registry_refuses_a_foreign_ledger_holding_unsupported_state(tmp_path: P
         phase_name="p",
         study_name="foreign-ledger::p",
         trial_number=stale_trial.number,
-        trial_dir=trial_dir,
+        trial_dir=attempt_dir,
+        attempt_dir=attempt_dir,
         generation_id="old-generation",
     )
     entry_path = _attempts_dir(current) / "foreign-attempt.json"
@@ -1526,7 +1530,9 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
     )
     old_dir = tmp_path / "old-attempt"
     old_dir.mkdir()
-    write_attempt_lifecycle(old_dir, attempt_id="old-attempt", state="allocated")
+    old_attempt_dir = tmp_path / "old-attempt-records"
+    old_attempt_dir.mkdir()
+    write_attempt_lifecycle(old_attempt_dir, attempt_id="old-attempt", state="allocated")
     _register_active_attempt(
         experiment,
         attempt_id="old-attempt",
@@ -1534,6 +1540,7 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
         study_name="terminal-identity::p",
         trial_number=0,
         trial_dir=old_dir,
+        attempt_dir=old_attempt_dir,
         generation_id="old-generation",
     )
     # A restored divergent ledger can reuse the number without preserving
@@ -1614,8 +1621,10 @@ def test_attempt_registry_refuses_unsafe_private_authority(
         workdir=tmp_path / "runs",
         storage=f"journal:///{tmp_path / 'study.journal'}",
     )
-    trial_dir = _experiment_dir(experiment) / "p" / "trial_00000__unsafe"
+    trial_dir = _trial_dir_for(experiment, "p", 0, attempt_id="unsafe-attempt")
     trial_dir.mkdir(parents=True)
+    attempt_dir = _attempt_dir(trial_dir.parent, "unsafe-attempt")
+    attempt_dir.mkdir(parents=True)
     _register_active_attempt(
         experiment,
         attempt_id="unsafe-attempt",
@@ -1623,6 +1632,7 @@ def test_attempt_registry_refuses_unsafe_private_authority(
         study_name="unsafe-registry::p",
         trial_number=0,
         trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         generation_id="unsafe-generation",
     )
     attempts_dir = _attempts_dir(experiment)
@@ -1661,12 +1671,10 @@ def test_relative_registry_storage_recovers_from_the_registration_cwd(
         storage="journal:///studies.journal",
         n_trials=1,
     )
-    _study, trial_dir, stale_number = fabricate_registered_attempt(
-        experiment,
-        "p",
-        attempt_id="relative-attempt",
+    _study, _, stale_number, attempt_dir = fabricate_registered_attempt(
+        experiment, "p", attempt_id="relative-attempt"
     )
-    write_attempt_lifecycle(trial_dir, attempt_id="relative-attempt", state="allocated")
+    write_attempt_lifecycle(attempt_dir, attempt_id="relative-attempt", state="allocated")
 
     monkeypatch.chdir(recovery_cwd)
     report = _PreflightCleanupReport()
@@ -1698,7 +1706,7 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
         n_trials=2,
         sampler=Sampler(type="random", seed=1),
     )
-    study, trial_dir, stale_number = fabricate_registered_attempt(
+    study, _trial_dir, stale_number, attempt_dir = fabricate_registered_attempt(
         experiment,
         "p",
         attempt_id="partial-attempt",
@@ -1708,7 +1716,7 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
     study.set_user_attr(
         PHASE_FINGERPRINT_ATTR, _phase_fingerprint(experiment, experiment.phases[0], {})
     )
-    write_attempt_lifecycle(trial_dir, attempt_id="partial-attempt", state="allocated")
+    write_attempt_lifecycle(attempt_dir, attempt_id="partial-attempt", state="allocated")
 
     winners = run_experiment(experiment)
 
@@ -1730,9 +1738,11 @@ def test_in_memory_attempt_registry_accepts_locatorless_entries(tmp_path: Path) 
         workdir=tmp_path / "runs",
         storage=None,
     )
-    trial_dir = _experiment_dir(experiment) / "p" / "trial_00000__memory-attempt"
+    trial_dir = _trial_dir_for(experiment, "p", 0, attempt_id="memory-attempt")
     trial_dir.mkdir(parents=True)
-    write_attempt_lifecycle(trial_dir, attempt_id="memory-attempt", state="allocated")
+    attempt_dir = _attempt_dir(trial_dir.parent, "memory-attempt")
+    attempt_dir.mkdir(parents=True)
+    write_attempt_lifecycle(attempt_dir, attempt_id="memory-attempt", state="allocated")
     _register_active_attempt(
         experiment,
         attempt_id="memory-attempt",
@@ -1740,6 +1750,7 @@ def test_in_memory_attempt_registry_accepts_locatorless_entries(tmp_path: Path) 
         study_name="memory-registry::p",
         trial_number=0,
         trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         generation_id="memory-generation",
     )
 
@@ -1771,7 +1782,7 @@ def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -
         )
 
     old_exp = _exp("old_phase")
-    old_study, trial_dir, stale_number = fabricate_registered_attempt(
+    old_study, _trial_dir, stale_number, attempt_dir = fabricate_registered_attempt(
         old_exp, "old_phase", attempt_id="renamed-attempt"
     )
     stale = subprocess.Popen(["sleep", "60"], start_new_session=True)
@@ -1779,7 +1790,7 @@ def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -
         starttime = read_proc_starttime(stale.pid)
         assert starttime is not None
         write_trial_identity(
-            trial_dir,
+            attempt_dir,
             attempt_id="renamed-attempt",
             pid=stale.pid,
             pgid=os.getpgid(stale.pid),
@@ -1808,7 +1819,9 @@ def test_wandb_worker_parent_death_is_recovered_after_phase_removal(
     old = make_experiment(
         workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'study.journal'}", n_trials=1
     )
-    study, trial_dir, number = fabricate_registered_attempt(old, "p", attempt_id="remote-attempt")
+    study, _trial_dir, number, attempt_dir = fabricate_registered_attempt(
+        old, "p", attempt_id="remote-attempt"
+    )
     started = tmp_path / "worker-started"
     wandb_worker_sdk(f"""
         import time
@@ -1822,7 +1835,7 @@ def test_wandb_worker_parent_death_is_recovered_after_phase_removal(
 from pathlib import Path
 from phasesweep.evidence.wandb import poll_wandb_summary
 poll_wandb_summary(base_url="https://example.test", entity="e", project="p",
-    run_id="remote-attempt", trial_dir=Path({str(trial_dir)!r}),
+    run_id="remote-attempt", attempt_dir=Path({str(attempt_dir)!r}),
     poll_seconds=0.01, timeout_seconds=120)
 """
     parent = subprocess.Popen([sys.executable, "-c", parent_code])
@@ -1833,7 +1846,7 @@ poll_wandb_summary(base_url="https://example.test", entity="e", project="p",
             assert parent.poll() is None
             time.sleep(0.02)
         assert started.exists()
-        identity = read_stale_process_identity(trial_dir, expected_attempt_id="remote-attempt")
+        identity = read_stale_process_identity(attempt_dir, expected_attempt_id="remote-attempt")
         parent.kill()
         parent.wait(timeout=5)
         monkeypatch.setitem(sys.modules, "wandb", None)
@@ -1876,10 +1889,10 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
         )
 
     old_exp = _exp("old.journal")
-    old_study, trial_dir, stale_number = fabricate_registered_attempt(
+    old_study, _trial_dir, stale_number, attempt_dir = fabricate_registered_attempt(
         old_exp, "p", attempt_id="moved-attempt"
     )
-    write_attempt_lifecycle(trial_dir, attempt_id="moved-attempt", state="allocated")
+    write_attempt_lifecycle(attempt_dir, attempt_id="moved-attempt", state="allocated")
 
     report = _PreflightCleanupReport()
     _preflight_active_attempts(_exp("new.journal"), report, confirm=True)
@@ -1956,7 +1969,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     # Nothing was launched: no marker, and no durable process identity.
     assert not launched.exists()
     phase_dir = tmp_path / "runs" / "unregistrable" / "p"
-    assert not list(phase_dir.glob(f"trial_*/{PROCESS_IDENTITY_FILE}"))
+    assert not list(phase_dir.glob(f"attempts/*/{PROCESS_IDENTITY_FILE}"))
 
     # The failure is a visible, valid terminal row - not an invisible RUNNING one.
     study = optuna.load_study(

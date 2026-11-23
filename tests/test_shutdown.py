@@ -616,15 +616,15 @@ def test_trainer_starts_with_the_signals_python_ignores_at_default(tmp_path: Pat
 def _trainer_signal_masks(tmp_path: Path) -> tuple[int, int]:
     """Run a supervised trainer that records its own signal dispositions as it starts.
 
-    :param Path tmp_path: Scratch directory for the trial and the recorded status.
+    :param Path tmp_path: Scratch directory for the attempt and the recorded status.
     :return tuple[int, int]: The trainer's ignored and caught signal masks from procfs.
     """
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
+    attempt_dir = tmp_path / "attempt"
+    attempt_dir.mkdir()
     status_out = tmp_path / "status.txt"
     with (
-        (trial_dir / "stdout.log").open("w") as stdout,
-        (trial_dir / "stderr.log").open("w") as stderr,
+        (attempt_dir / "stdout.log").open("w") as stdout,
+        (attempt_dir / "stderr.log").open("w") as stderr,
     ):
         result = run_supervised(
             f"cp /proc/self/status {status_out}",
@@ -632,7 +632,7 @@ def _trainer_signal_masks(tmp_path: Path) -> tuple[int, int]:
             stdout=stdout,
             stderr=stderr,
             timeout=30.0,
-            trial_dir=trial_dir,
+            attempt_dir=attempt_dir,
             attempt_id="signal-mask-attempt",
         )
     assert result.return_code == 0
@@ -913,8 +913,8 @@ def test_a_tracker_worker_is_launched_under_the_name_the_interrupt_line_gives_it
 
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setattr(runtime_process, "run_supervised", launch)
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
+    attempt_dir = tmp_path / "attempt"
+    attempt_dir.mkdir()
 
     run_worker(
         {},
@@ -922,7 +922,7 @@ def test_a_tracker_worker_is_launched_under_the_name_the_interrupt_line_gives_it
         backend,
         statuses=frozenset({"ok"}),
         run_id="attempt",
-        trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         environment={},
         deadline=time.monotonic() + 10,
     )
@@ -1077,11 +1077,11 @@ def test_a_launch_while_a_shutdown_is_serviced_starts_no_process(
         "phasesweep.runtime.process.servicing_shutdown_signal", lambda: signal.SIGTERM
     )
     ran = tmp_path / "ran"
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
+    attempt_dir = tmp_path / "attempt"
+    attempt_dir.mkdir()
     with (
-        (trial_dir / "stdout.log").open("w") as stdout,
-        (trial_dir / "stderr.log").open("w") as stderr,
+        (attempt_dir / "stdout.log").open("w") as stdout,
+        (attempt_dir / "stderr.log").open("w") as stderr,
         pytest.raises(
             ShutdownLaunchRefusedError,
             match="^trainer launch refused: orchestrator interrupted by SIGTERM$",
@@ -1093,12 +1093,12 @@ def test_a_launch_while_a_shutdown_is_serviced_starts_no_process(
             stdout=stdout,
             stderr=stderr,
             timeout=10.0,
-            trial_dir=trial_dir,
+            attempt_dir=attempt_dir,
             attempt_id="refused-attempt",
         )
     assert not ran.exists()
-    assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
-    lifecycle = json.loads((trial_dir / ATTEMPT_LIFECYCLE_FILE).read_text())
+    assert not (attempt_dir / PROCESS_IDENTITY_FILE).exists()
+    lifecycle = json.loads((attempt_dir / ATTEMPT_LIFECYCLE_FILE).read_text())
     assert lifecycle["state"] == "exited"
     assert lifecycle["cleanup_confirmed"] is True
 

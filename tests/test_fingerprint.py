@@ -41,6 +41,7 @@ from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.ledger import ClaimedLedger, _resolve_storage
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
+    _attempt_dir,
     _attempts_dir,
     _experiment_dir,
     _generation_path,
@@ -49,6 +50,7 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
     _last_successful_generation_path,
     _phase_dir,
+    _trial_dir_for,
 )
 from phasesweep.engine.read import read_result, read_status
 from phasesweep.engine.resume import _reject_bound_descendant_topups
@@ -1389,11 +1391,13 @@ def _fabricate_interrupted_attempt(
     study_name = f"{experiment.experiment}::{phase_name}"
     study = optuna.load_study(study_name=study_name, storage=_resolve_storage(storage))
     trial = study.ask()
-    trial_dir = _phase_dir(experiment, phase_name) / f"trial_{trial.number:05d}__stale"
+    trial_dir = _trial_dir_for(experiment, phase_name, trial.number, attempt_id=attempt_id)
     trial_dir.mkdir(parents=True, exist_ok=True)
+    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
+    attempt_dir.mkdir(parents=True, exist_ok=True)
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
     trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
-    write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+    write_attempt_lifecycle(attempt_dir, attempt_id=attempt_id, state="allocated")
     _register_active_attempt(
         experiment,
         attempt_id=attempt_id,
@@ -1401,6 +1405,7 @@ def _fabricate_interrupted_attempt(
         study_name=study_name,
         trial_number=trial.number,
         trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         generation_id="g-stale",
     )
     return study_name, trial.number, _attempts_dir(experiment) / f"{attempt_id}.json"

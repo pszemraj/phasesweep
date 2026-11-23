@@ -11,7 +11,7 @@ from phasesweep import run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import Repeats, Sampler
-from phasesweep.engine.paths import _generation_winner_path, _phase_dir
+from phasesweep.engine.paths import _attempt_dir, _generation_winner_path, _phase_dir
 from phasesweep.engine.repeats import ReduceName
 from tests.conftest import make_experiment, write_experiment_config
 from tests.ledger_fixtures import published_generation_id
@@ -53,9 +53,9 @@ def _assert_member_directories(experiment: Experiment, saved: bytes) -> None:
         row = rows[member["trial_number"]]
         directory = Path(row["user_attr:phasesweep_trial_dir"])
         assert directory.is_dir()
-        assert (directory / "stdout.log").is_file()
+        assert (_attempt_dir(directory.parent, member["attempt_id"]) / "stdout.log").is_file()
         assert row["param:seed"] == str(member["repeat"])
-        assert member["generation_id"] in directory.name
+        assert directory.name == member["trial_dir"]
         assert member["attempt_id"] in directory.name
 
 
@@ -88,7 +88,7 @@ def _assert_repeat_summary(saved: bytes, output: str) -> None:
         assert member["repeat"] == expected["repeat"]
         directory = Path(member["trial_dir"])
         assert directory.is_dir()
-        assert expected["generation_id"] in directory.name
+        assert directory.name == expected["trial_dir"]
         assert expected["attempt_id"] in directory.name
     assert (
         f"# metric is the {repeats['reduce']} over {repeats['spread']['n']} repeats."

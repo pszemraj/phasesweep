@@ -1066,7 +1066,7 @@ class TrialTable:
     """One phase's trials as table rows, in trial-number order.
 
     ``columns`` lists the keys every row carries, in display order: ``trial``,
-    ``state``, ``value``, ``params``, ``duration_s``, ``trial_dir`` (the attempt directory the
+    ``state``, ``value``, ``params``, ``duration_s``, ``trial_dir`` (the trial directory the
     trial recorded, ``None`` when it recorded none), then ``repeat_group`` for a
     repeats phase, ``rerun_of`` once any trial is a rerun, one ``observed:<name>``
     per report-only value any trial recorded, an optional ``reason`` when any
@@ -1292,7 +1292,7 @@ def _trial_reason(trial: optuna.trial.FrozenTrial) -> str | None:
 
 
 def _trial_dir_text(trial: optuna.trial.FrozenTrial) -> str | None:
-    """Read the attempt directory a trial recorded, as text.
+    """Read the trial directory a trial recorded, as text.
 
     :param optuna.trial.FrozenTrial trial: Trial whose directory is displayed.
     :return str | None: The directory, or ``None`` when none was recorded.

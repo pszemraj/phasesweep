@@ -192,7 +192,7 @@ def _late_creation(server, tmp_path, monkeypatch, *, timeout_seconds):
     from mlflow import MlflowClient
     from mlflow.exceptions import MlflowException
 
-    from phasesweep.engine.paths import _trial_dir_for
+    from phasesweep.engine.paths import _attempt_dir, _phase_dir
     from phasesweep.runtime.json import json_object
     from phasesweep.tracking import mlflow as worker
     from phasesweep.tracking import session
@@ -232,15 +232,9 @@ def _late_creation(server, tmp_path, monkeypatch, *, timeout_seconds):
         "experiment": experiment.experiment,
         "experiment_id": server.experiment_id,
     }
-    trial_dir = _trial_dir_for(
-        experiment,
-        identity["phase"],
-        0,
-        generation_id=identity["generation_id"],
-        attempt_id=identity["attempt_id"],
-    )
-    trial_dir.mkdir(parents=True)
-    bind, path = mlflow_binder(trial_dir, "attempt", experiment=experiment, identity=identity)
+    attempt_dir = _attempt_dir(_phase_dir(experiment, identity["phase"]), identity["attempt_id"])
+    attempt_dir.mkdir(parents=True)
+    bind, path = mlflow_binder(attempt_dir, "attempt", experiment=experiment, identity=identity)
     return bind, path, calls, experiment
 
 
@@ -599,7 +593,7 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(experiment)
 
-    (directory,) = (_experiment_dir(experiment) / "p").glob("trial_*")
+    (directory,) = (_experiment_dir(experiment) / "p").glob("attempts/*")
     binding = read_binding(directory)
     remote = client.get_run(binding["run_id"])
     assert (remote.info.status, remote.data.tags["phasesweep.outcome"]) == ("FAILED", "FAILED")

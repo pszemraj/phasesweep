@@ -10,7 +10,6 @@ import threading
 import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 from uuid import uuid4
 
@@ -44,7 +43,7 @@ from phasesweep.engine.optuna import (
     _finished_trial_count,
     _suggest,
 )
-from phasesweep.engine.paths import _phase_dir, _trial_dir_for, _trials_csv_path
+from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trial_dir_for, _trials_csv_path
 from phasesweep.engine.progress import (
     _log_finished_trial,
     _log_reruns,
@@ -78,6 +77,7 @@ from phasesweep.engine.state import (
     WinnerSource,
     _completed_trainer_duration,
     _parsed_trial_outcome,
+    _trial_attempt_dir,
     _trial_lifecycle,
     _trial_outcome_payload,
 )
@@ -1112,22 +1112,18 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     overrides = _composed_overrides(experiment, phase, sampled, run.inherited_winners)
 
     attempt_id = uuid4().hex
-    trial_dir = _trial_dir_for(
-        experiment,
-        phase.name,
-        trial.number,
-        generation_id=run.generation_id,
-        attempt_id=attempt_id,
-    )
+    trial_dir = _trial_dir_for(experiment, phase.name, trial.number, attempt_id=attempt_id)
+    attempt_dir = _attempt_dir(_phase_dir(experiment, phase.name), attempt_id)
     # Persist allocated before discovery and GPU waiting; no identity then means no launch.
     try:
         trial_dir.mkdir(parents=True, exist_ok=True)
-        write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        write_attempt_lifecycle(attempt_dir, attempt_id=attempt_id, state="allocated")
     except OSError as exc:
         raise _active_attempt_persistence_error(
             "persist",
             f"the allocated lifecycle marker for trial {trial.number} (attempt {attempt_id})",
-            trial_dir,
+            attempt_dir,
             exc,
         ) from exc
     # Register before leasing or launch; retain unsafe-cleanup entries until recovery.
@@ -1138,6 +1134,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         study_name=run.study.study_name,
         trial_number=trial.number,
         trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         generation_id=run.generation_id,
     )
     trial.set_user_attr(GENERATION_ID_ATTR, run.generation_id)
@@ -1168,7 +1165,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     run_name=trial_run_name(experiment, phase.name, trial.number, attempt_id),
                     overrides_sha256=prepared_input.sha256,
                     inherited=run.inherited_winners,
-                    directory=trial_dir,
+                    directory=attempt_dir,
                     environment=run.environment_identity.values,
                     deadline=run.optimize_deadline,
                 )
@@ -1202,6 +1199,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     generation_id=run.generation_id,
                     attempt_id=attempt_id,
                     trial_dir=trial_dir,
+                    attempt_dir=attempt_dir,
                     overrides=overrides,
                     timeout_seconds=phase.timeout_seconds_per_trial,
                     wallclock_deadline=run.optimize_deadline,
@@ -1219,7 +1217,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                 cleanup_error = UnsafeProcessCleanupError(
                     f"Trial {trial.number} cleanup could not be confirmed: "
                     f"{executed.process.failure_reason or 'no reason was recorded'} "
-                    f"(trial_dir={trial_dir}, pid={executed.process.pid})."
+                    f"(attempt_dir={attempt_dir}, pid={executed.process.pid})."
                 )
                 run.record_fatal(cleanup_error)
 
@@ -1261,7 +1259,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             lifecycle = _trial_lifecycle(trial)
         except ValueError:
             lifecycle = None
-        reason = _trainer_failure_reason(trial, lifecycle, trial_dir)
+        reason = _trainer_failure_reason(trial, lifecycle, attempt_dir)
         if reason is None:
             raise _InterruptedTrialError(interruption_cause(signum))
         raise TrialExecutionError(reason)
@@ -1397,11 +1395,11 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             except ValueError as lifecycle_error:
                 raise exc from lifecycle_error
             if _completed_trainer_duration(trial, lifecycle) is None:
-                directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
+                directory = _trial_attempt_dir(trial)
                 reason = (
-                    _trainer_failure_reason(trial, lifecycle, Path(directory))
-                    if isinstance(directory, str)
-                    else None
+                    None
+                    if directory is None
+                    else _trainer_failure_reason(trial, lifecycle, directory)
                 )
                 if reason is None:
                     _record_outcome(run, trial, "interrupted", cause=interruption_cause(exc.signum))
@@ -1949,6 +1947,7 @@ def _select_phase_winner(
         phase_fingerprint=phase_fingerprint,
         generation_id=selected.generation_id,
         attempt_id=selected.attempt_id,
+        trial_dir=selected.trial_dir,
         source=WinnerSource(
             kind="phase_trial",
             phase=phase.name,

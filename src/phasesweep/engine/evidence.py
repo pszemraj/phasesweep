@@ -15,7 +15,7 @@ from phasesweep.config.models import Experiment, Phase, _wandb_query
 from phasesweep.engine.errors import (
     TrialEvidenceMissingError,
 )
-from phasesweep.engine.paths import _phase_dir, _trial_dir_for
+from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trial_dir_for
 from phasesweep.engine.repeats import evidence_members
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -41,6 +41,7 @@ from phasesweep.evidence.evaluation import (
     attempt_file,
     extractor_config_fingerprint,
     json_float,
+    trial_file,
 )
 from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
 from phasesweep.evidence.models import (
@@ -62,12 +63,10 @@ from phasesweep.runtime.process import (
 if TYPE_CHECKING:
     from phasesweep.engine.selection import SelectedTrial
 
+
 # Audit artifacts every launched attempt writes into its own trial directory
 # before the trainer starts, so their absence is proof the directory is no
 # longer the one that attempt produced.
-_REQUIRED_TRIAL_EVIDENCE_FILES = ("overrides_resolved.json", "command.txt")
-
-
 def _selection_candidate_identity(trial: optuna.trial.FrozenTrial) -> tuple[str, str] | None:
     """Return execution identity for COMPLETE, finite, feasible trials with nonempty ids.
 
@@ -280,6 +279,7 @@ def _valid_progress_record(record: object, *, nullable: bool) -> TypeGuard[Mappi
 
 def _verify_objective_source_evidence(
     trial_dir: Path,
+    attempt_dir: Path,
     provenance: Mapping[str, Any] | None,
     *,
     subject: str,
@@ -287,10 +287,12 @@ def _verify_objective_source_evidence(
 ) -> None:
     """Verify the retained local source or the frozen remote capture.
 
-    Local records name a file that must resolve inside this attempt's directory, as
-    extraction required. Remote records are validated without contacting the service again.
+    Local records name a file found where extraction read it, through
+    :func:`phasesweep.evidence.evaluation.trial_file`. Remote records are validated
+    without contacting the service again.
 
     :param Path trial_dir: Structurally translated directory for the trial.
+    :param Path attempt_dir: The producing attempt's directory, holding its captured streams.
     :param Mapping[str, Any] | None provenance: Parsed objective provenance.
     :param str subject: Caller-built label naming the study, phase, and trial.
     :param bool verify_digest: Also re-hash the source and compare it against
@@ -310,7 +312,7 @@ def _verify_objective_source_evidence(
     # _validate_objective_provenance refused any path but a trial-relative one.
     raw_path = str(source["path"])
     try:
-        source_path = attempt_file(trial_dir, raw_path)
+        source_path = trial_file(trial_dir, attempt_dir, raw_path)
     except OutsideAttemptError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r}, but {exc}"
@@ -462,7 +464,7 @@ class _EvidenceVerification:
         """Verify a ledger measurement against the attempt's retained evidence.
 
         :param optuna.trial.FrozenTrial trial: Trial holding the input, provenance and constraints.
-        :param Path trial_dir: Evidence directory for the producing attempt.
+        :param Path trial_dir: Trial directory the producing attempt ran in.
         :param str attempt_id: Attempt whose evidence is required.
         :param float metric: Recorded objective.
         :param str subject: Trial description for a refusal.
@@ -496,12 +498,14 @@ def _verify_trial_evidence_dir(
     metric_value: float,
     constraints: Mapping[str, Any],
 ) -> None:
-    """Require a trial's translated evidence directory and its recorded artifacts.
+    """Require a trial's translated directories and its recorded artifacts.
 
-    A lifecycle record must belong to the attempt. Its state is not constrained:
-    writing ``exited`` is best-effort, so completed trials may retain ``launching``.
+    The trainer input and objective source live in the trial directory; the lifecycle
+    record, audit artifacts and tracker binding in the attempt's directory beside it. A
+    lifecycle record must belong to the attempt. Its state is not constrained: writing
+    ``exited`` is best-effort, so completed trials may retain ``launching``.
 
-    :param Path trial_dir: Translated evidence directory for the trial.
+    :param Path trial_dir: Translated trial directory the attempt ran in.
     :param str subject: Caller-built label naming the study, phase, and trial.
     :param str attempt_id: Attempt identity the lifecycle record must belong to.
     :param Mapping[str, Any] | None provenance: Parsed objective provenance.
@@ -514,12 +518,14 @@ def _verify_trial_evidence_dir(
         generated trainer input, or recorded objective source is missing,
         foreign, or altered.
     """
-    if not trial_dir.is_dir():
-        raise TrialEvidenceMissingError(
-            f"{subject} has no evidence directory at {str(trial_dir)!r}."
-        )
+    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
+    for directory in (trial_dir, attempt_dir):
+        if not directory.is_dir():
+            raise TrialEvidenceMissingError(
+                f"{subject} has no evidence directory at {str(directory)!r}."
+            )
     try:
-        lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
+        lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt_id)
     except ValueError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} has an attempt lifecycle record that is malformed or belongs to "
@@ -527,14 +533,19 @@ def _verify_trial_evidence_dir(
         ) from exc
     if lifecycle is None:
         raise TrialEvidenceMissingError(f"{subject} has no attempt lifecycle record.")
-    for filename in _REQUIRED_TRIAL_EVIDENCE_FILES:
-        if not (trial_dir / filename).is_file():
+    # The resolved overrides are the trial's input; the command is the attempt's own record.
+    for directory, filename in (
+        (trial_dir, "overrides_resolved.json"),
+        (attempt_dir, "command.txt"),
+    ):
+        if not (directory / filename).is_file():
             raise TrialEvidenceMissingError(
-                f"{subject} is missing its {filename!r} audit artifact under {str(trial_dir)!r}."
+                f"{subject} is missing its {filename!r} audit artifact under {str(directory)!r}."
             )
     _verify_trainer_input_evidence(trial_dir, trainer_input, subject=subject)
     _verify_objective_source_evidence(
         trial_dir,
+        attempt_dir,
         provenance,
         subject=subject,
         verify_digest=verify_objective_digest,
@@ -578,8 +589,8 @@ def _verify_trial_evidence_dir(
         from phasesweep.tracking.session import EXPECTED_BINDING_FILE, read_binding, read_record
 
         try:
-            binding = read_binding(trial_dir)
-            expected = read_record(trial_dir / EXPECTED_BINDING_FILE)
+            binding = read_binding(attempt_dir)
+            expected = read_record(attempt_dir / EXPECTED_BINDING_FILE)
             if (
                 capture is None
                 or capture.get("kind") != "mlflow"
@@ -669,7 +680,7 @@ def _validate_selection_evidence(
             identity = _selection_candidate_identity(trial)
             if identity is None:
                 continue
-            generation_id, attempt_id = identity
+            _, attempt_id = identity
             assert trial.value is not None
             subject = (
                 f"Study {study.study_name!r} phase {phase_name!r} trial {trial.number} "
@@ -682,21 +693,16 @@ def _validate_selection_evidence(
                     f"{stored!r}, so its evidence cannot be located."
                 )
             # Identity binding: the persisted directory name must be exactly the
-            # one _trial_dir_for builds for this trial's number, generation, and
-            # attempt. A name that disagrees means the study record and the
-            # directory are not describing the same execution.
+            # one _trial_dir_for builds for this trial's number and attempt. A name
+            # that disagrees means the study record and the directory are not
+            # describing the same execution.
             expected_name = _trial_dir_for(
-                experiment,
-                phase_name,
-                trial.number,
-                generation_id=generation_id,
-                attempt_id=attempt_id,
+                experiment, phase_name, trial.number, attempt_id=attempt_id
             ).name
             if Path(stored).name != expected_name:
                 raise TrialEvidenceMissingError(
                     f"{subject} records evidence directory {Path(stored).name!r}, which does "
-                    f"not name this trial's own generation/attempt identity (expected "
-                    f"{expected_name!r})."
+                    f"not name this trial's own attempt (expected {expected_name!r})."
                 )
             verification.verify_trial(
                 trial,
@@ -737,13 +743,7 @@ def _verify_winner_evidence(
     verification = _EvidenceVerification(experiment, phase)
     for member in evidence_members(winner):
         _verify_trial_evidence_dir(
-            _trial_dir_for(
-                experiment,
-                phase_name,
-                member.trial_number,
-                generation_id=member.generation_id,
-                attempt_id=member.attempt_id,
-            ),
+            _phase_dir(experiment, phase_name) / member.trial_dir,
             subject=(
                 f"{subject} {member.trial_number} "
                 f"(generation {member.generation_id!r}, attempt {member.attempt_id!r})"

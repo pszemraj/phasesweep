@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from phasesweep.config.models import Experiment
@@ -50,31 +51,59 @@ def _run_log_path(experiment: Experiment) -> Path:
     return _experiment_dir(experiment) / "run.log"
 
 
+def _trial_dir_name(trial_number: int, attempt_id: str) -> str:
+    """Name the directory a trial's trainer writes into.
+
+    :param int trial_number: Number of the trial that opened the directory.
+    :param str attempt_id: Attempt that opened it, which keeps names unique across
+        in-memory runs that restart trial numbers.
+    :return str: The directory name, ``trial_{n:05d}__{attempt_id}``.
+    """
+    return f"trial_{trial_number:05d}__{attempt_id}"
+
+
+_TRIAL_DIR_NAME = re.compile(r"trial_\d{5,}__[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+
+def _valid_trial_dir_name(value: object, *, label: str) -> str:
+    """Require a recorded trial directory name, one path component inside its phase.
+
+    :param object value: The stored name.
+    :param str label: What the value is, for the error.
+    :raises ValueError: The value is not a name :func:`_trial_dir_name` builds.
+    :return str: The name.
+    """
+    if not isinstance(value, str) or not _TRIAL_DIR_NAME.fullmatch(value):
+        raise ValueError(f"invalid {label} {value!r}")
+    return value
+
+
 def _trial_dir_for(
-    experiment: Experiment,
-    phase_name: str,
-    trial_number: int,
-    *,
-    generation_id: str | None = None,
-    attempt_id: str | None = None,
+    experiment: Experiment, phase_name: str, trial_number: int, *, attempt_id: str
 ) -> Path:
-    """Return a trial directory, scoped by generation and attempt when both are supplied.
+    """Return the directory a trial's trainer writes into, as the attempt that opened it names it.
 
     :param Experiment experiment: Configuration naming the experiment directory.
     :param str phase_name: Phase containing the trial.
-    :param int trial_number: Study-local trial number encoded in the directory name.
-    :param str | None generation_id: Generation identity, supplied together with attempt_id.
-    :param str | None attempt_id: Execution attempt identity, supplied together with generation_id.
-    :raises ValueError: Exactly one execution identity is supplied.
-    :return Path: Phase-local trial path, including both execution identities when supplied.
+    :param int trial_number: Number of the trial that opened the directory.
+    :param str attempt_id: Attempt that opened it.
+    :return Path: The trial directory, ``{trial_dir}`` and ``PHASESWEEP_TRIAL_DIR``.
     """
-    if generation_id is None and attempt_id is None:
-        return _phase_dir(experiment, phase_name) / f"trial_{trial_number:05d}"
-    if generation_id is None or attempt_id is None:
-        raise ValueError("generation_id and attempt_id must be supplied together")
-    return _phase_dir(experiment, phase_name) / (
-        f"trial_{trial_number:05d}__generation_{generation_id}__attempt_{attempt_id}"
-    )
+    return _phase_dir(experiment, phase_name) / _trial_dir_name(trial_number, attempt_id)
+
+
+def _attempt_dir(phase_dir: Path, attempt_id: str) -> Path:
+    """Return the directory holding one attempt's own records, beside the trial directories.
+
+    The lifecycle record, process identity, command, captured streams, environment record,
+    tracker bindings and evidence baseline live here rather than in the trial directory, so
+    a trainer that clears its output directory cannot delete its own process identity.
+
+    :param Path phase_dir: Phase directory holding the trial directory.
+    :param str attempt_id: Attempt whose records are addressed.
+    :return Path: ``<phase>/attempts/<attempt_id>``.
+    """
+    return phase_dir / "attempts" / attempt_id
 
 
 def _attempts_dir(experiment: Experiment) -> Path:
