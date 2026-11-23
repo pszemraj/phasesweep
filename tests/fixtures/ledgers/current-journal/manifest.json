@@ -20,9 +20,9 @@
     "p"
   ],
   "produced_by": {
-    "cwd": "/home/pszemraj/workspace/projects/productivity/phasesweep",
+    "cwd": "/home/pszemraj/workspace/projects/productivity/phasesweep/.claude/worktrees/agent-a67f0a1c6049c49cd",
     "optuna": "4.9.0",
-    "phasesweep_git": "v0.3.15-3-g946e1325-dirty",
+    "phasesweep_git": "v0.3.15-16-gff625259",
     "python": "3.13.16",
     "sqlite": "3.54.0"
   }
