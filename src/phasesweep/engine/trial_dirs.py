@@ -9,7 +9,7 @@ corrupt state, and the retry exists to run it again.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import NamedTuple
 
@@ -37,30 +37,33 @@ from phasesweep.runtime.process import read_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 
 
-def _directory_owner(trials: Mapping[int, FrozenTrial], trial: FrozenTrial) -> FrozenTrial:
-    """Return the trial whose directory ``trial`` runs in.
+def _interrupted_directory_sources(
+    trials: Mapping[int, FrozenTrial], trial: FrozenTrial
+) -> Iterator[FrozenTrial]:
+    """Yield the interrupted ancestors that recorded their directory, newest first.
 
-    Follow the rerun chain back while each source was interrupted and recorded a
-    directory: an interrupted rerun's own rerun keeps the directory too.
+    A rerun can be interrupted before recording its directory. Continue through those
+    ancestors to find the last attempt that could have used the directory and its opener.
+    A failed source ends the chain because its retry runs in a fresh directory.
 
     :param Mapping[int, FrozenTrial] trials: The study's trials by number.
     :param FrozenTrial trial: The trial about to launch, or one already launched.
     :raises ProcessCleanupUncertainError: An interrupted source's recorded directory is malformed.
-    :return FrozenTrial: The earliest such trial, ``trial`` itself when it is no such rerun.
+    :return Iterator[FrozenTrial]: Directory sources, from the most recent to the opener.
     """
-    owner = trial
+    current = trial
     while True:
-        source_number = owner.user_attrs.get(RERUN_OF_ATTR)
+        source_number = current.user_attrs.get(RERUN_OF_ATTR)
         source = trials.get(source_number) if type(source_number) is int else None
         if source is None or not _trial_interrupted(source):
-            return owner
+            return
         try:
             recorded = _recorded_trial_dir(source)
         except ValueError as exc:
             raise _unusable_directory_error(source, exc) from exc
-        if recorded is None:
-            return owner
-        owner = source
+        if recorded is not None:
+            yield source
+        current = source
 
 
 def _unusable_directory_error(owner: FrozenTrial, exc: ValueError) -> ProcessCleanupUncertainError:
@@ -111,7 +114,8 @@ def _expected_trial_dir_name(trials: Mapping[int, FrozenTrial], trial: FrozenTri
     :return str | None: The name :func:`_trial_dir_for` builds for the trial that opened its
         directory, or ``None`` when that trial records no attempt.
     """
-    owner = _directory_owner(trials, trial)
+    sources = list(_interrupted_directory_sources(trials, trial))
+    owner = sources[-1] if sources else trial
     attempt_id = owner.user_attrs.get(ATTEMPT_ID_ATTR)
     if not isinstance(attempt_id, str) or not attempt_id:
         return None
@@ -148,12 +152,12 @@ def _trial_dir_for_attempt(
         the trial number and attempt that opened it: ``trial`` and ``attempt_id`` themselves
         for a directory of its own.
     """
-    owner = _directory_owner(trials, trial)
-    if owner is trial:
+    sources = list(_interrupted_directory_sources(trials, trial))
+    if not sources:
         path = _trial_dir_for(experiment, phase_name, trial.number, attempt_id=attempt_id)
         return TrialDirectory(path, trial.number, attempt_id)
     phase_dir = _phase_dir(experiment, phase_name)
-    source = trials[int(trial.user_attrs[RERUN_OF_ATTR])]
+    source = sources[0]
     source_attempt = source.user_attrs.get(ATTEMPT_ID_ATTR)
     if source.number not in recovered:
         lifecycle = None
@@ -178,4 +182,4 @@ def _trial_dir_for_attempt(
                 "first, so two processes never write one trial directory.",
                 action=OperatorAction.INSPECT_LOGS,
             )
-    return _owner_directory(phase_dir, owner)
+    return _owner_directory(phase_dir, sources[-1])

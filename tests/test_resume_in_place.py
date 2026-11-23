@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+import signal
+import subprocess
+import sys
 from pathlib import Path
 
 import optuna
@@ -205,6 +208,47 @@ def test_a_killed_runs_trial_resumes_its_checkpoint_in_the_next_run(tmp_path: Pa
     assert (first_attempt / "command.txt").read_text() == (
         rerun_attempt / "command.txt"
     ).read_text()
+
+
+@pytest.mark.integration
+def test_an_interruption_before_a_reruns_launch_keeps_the_earlier_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """Recovery crosses a rerun interrupted before directory allocation to resume the original checkpoint."""
+    experiment = _interrupt_first_attempt(
+        tmp_path, _trainer(tmp_path, _CHECKPOINTING, _RESUMING), _JSON_METRIC
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    # Killing a separate controller leaves the claimed trial RUNNING without a directory.
+    program = """
+import os, signal, sys
+from phasesweep import run_experiment
+from phasesweep.config.io import load_experiment
+from phasesweep.engine import phase
+
+def interrupt_launch(*args, **kwargs):
+    os.kill(os.getpid(), signal.SIGKILL)
+
+phase._trial_dir_for_attempt = interrupt_launch
+run_experiment(load_experiment(sys.argv[1]))
+"""
+    runner = subprocess.run(
+        [sys.executable, "-c", program, str(config)], capture_output=True, timeout=15, check=False
+    )
+    assert runner.returncode == -signal.SIGKILL, runner.stderr.decode()
+    first, unlaunched = phase_trials(experiment)
+    assert unlaunched.state == optuna.trial.TrialState.RUNNING
+    assert unlaunched.user_attrs[RERUN_OF_ATTR] == first.number
+    assert TRIAL_DIR_ATTR not in unlaunched.user_attrs
+
+    winner = run_experiment(experiment)["p"]
+    _, settled, rerun = phase_trials(experiment)
+    outcome = _parsed_trial_outcome(settled.user_attrs[TRIAL_OUTCOME_ATTR])
+    assert outcome is not None and outcome.outcome == "interrupted"
+    assert rerun.user_attrs[RERUN_OF_ATTR] == unlaunched.number
+    assert rerun.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
+    assert winner.metric == 5.0 and winner.trial_number == rerun.number
+    _verify_winner_evidence(experiment, experiment.phases[0], winner)
 
 
 @pytest.mark.integration
