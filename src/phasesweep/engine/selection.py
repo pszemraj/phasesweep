@@ -25,6 +25,7 @@ from phasesweep.config.search import (
     sampler_search_space,
 )
 from phasesweep.engine.artifacts import _winner_common_payload
+from phasesweep.engine.attempts import _attempt_process_resolution
 from phasesweep.engine.confound import (
     ConfoundBlock,
     RevisionRead,
@@ -42,7 +43,13 @@ from phasesweep.engine.optuna import (
     _finished_trial_count,
     _trial_count_state,
 )
-from phasesweep.engine.paths import TRIALS_CSV_FILENAME, _experiment_dir, _trials_csv_path
+from phasesweep.engine.paths import (
+    TRIALS_CSV_FILENAME,
+    _attempt_dir,
+    _experiment_dir,
+    _phase_dir,
+    _trials_csv_path,
+)
 from phasesweep.engine.provenance import _load_generation_code_revision
 from phasesweep.engine.repeats import (
     RankedGroup,
@@ -64,6 +71,7 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_ATTR,
     TRIAL_DIR_ATTR,
     Winner,
+    _required_trial_dir,
     _unreplaced_attempts,
     _validate_observed_block,
     constraint_attr,
@@ -78,17 +86,21 @@ from phasesweep.engine.study_policy import (
     _recovery_advice,
     _replayed_streak_abort,
 )
+from phasesweep.engine.trial_dirs import _interrupted_directory_sources
 from phasesweep.errors import (
     FRESH_STUDY,
     STORAGE_NULL_KEEPS_NOTHING,
     OperatorAction,
     PhaseSweepError,
+    ProcessCleanupUncertainError,
     as_sentence,
     timeout_step,
     unreadable_objective_step,
 )
 from phasesweep.evidence.models import MlflowExtractor
 from phasesweep.runtime.json import JsonObject, float_or_none, json_object, json_text_map
+from phasesweep.runtime.process import read_attempt_lifecycle
+from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 from phasesweep.runtime.terminal import (
     display_path,
     objective_text,
@@ -504,12 +516,16 @@ def select_winner(
     phase = next((phase for phase in experiment.phases if phase.name == phase_name), None)
     untried_cells = _untried_grid_cells(phase, trials)
     extractor = experiment.metric.extractor
+    revision_sources = _ranked_revision_sources(
+        trials, survivors, phase_dir=None if phase is None else _phase_dir(experiment, phase.name)
+    )
     confound = _assess_population(
         trials,
         survivors,
         best,
         provenance=provenance,
-        revisions=_ranked_code_revisions(experiment, survivors),
+        revisions=_ranked_code_revisions(experiment, survivors, sources=revision_sources),
+        revision_sources=revision_sources,
         axis=repeats,
         groups=None if ranking is None else ranking.groups,
         incomplete_group=() if ranking is None else ranking.incomplete_group,
@@ -916,10 +932,70 @@ def _observed_values(trial: optuna.trial.FrozenTrial, *, subject: str) -> dict[s
         ) from exc
 
 
+def _ranked_revision_sources(
+    trials: Sequence[optuna.trial.FrozenTrial],
+    ranked: Sequence[optuna.trial.FrozenTrial],
+    *,
+    phase_dir: Path | None,
+) -> dict[int, list[str]]:
+    """Find generations that may have trained in each ranked trial's reused directory.
+
+    :param Sequence[optuna.trial.FrozenTrial] trials: The phase's full trial history.
+    :param Sequence[optuna.trial.FrozenTrial] ranked: The trials eligible for selection.
+    :param Path | None phase_dir: The phase's current directory, if known.
+    :return dict[int, list[str]]: Possible contributing generations per ranked trial, oldest first.
+    """
+    sources: dict[int, list[str]] = {}
+    if len(ranked) < 2:
+        return sources
+    by_number = {trial.number: trial for trial in trials}
+    for trial in ranked:
+        generations: list[str] = []
+        # A malformed ancestor must not turn a code revision advisory into a refusal.
+        with contextlib.suppress(ProcessCleanupUncertainError):
+            for source in _interrupted_directory_sources(by_number, trial):
+                generation = source.user_attrs.get(GENERATION_ID_ATTR)
+                if (
+                    isinstance(generation, str)
+                    and generation
+                    and _may_have_trained(source, phase_dir)
+                ):
+                    generations.append(generation)
+        if generations:
+            sources[trial.number] = generations[::-1]
+    return sources
+
+
+def _may_have_trained(source: optuna.trial.FrozenTrial, phase_dir: Path | None) -> bool:
+    """Exclude an interrupted ancestor only when its lifecycle proves no trainer ran.
+
+    :param optuna.trial.FrozenTrial source: Interrupted source with a recorded trial directory.
+    :param Path | None phase_dir: Current phase directory, if known.
+    :return bool: Whether the attempt could have contributed to a retained checkpoint.
+    """
+    attempt_id = source.user_attrs.get(ATTEMPT_ID_ATTR)
+    if not isinstance(attempt_id, str) or not attempt_id:
+        return True
+    attempt_dir = _attempt_dir(phase_dir or _required_trial_dir(source).parent, attempt_id)
+    try:
+        lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt_id)
+        if lifecycle is not None and lifecycle.ended_by == "not_started":
+            return False
+        resolution = _attempt_process_resolution(
+            lifecycle, identity_exists=(attempt_dir / PROCESS_IDENTITY_FILE).exists()
+        )
+    except (OSError, ValueError):
+        return True
+    return resolution not in {"allocated", "payload_withheld"}
+
+
 def _ranked_code_revisions(
-    experiment: Experiment, ranked: Sequence[optuna.trial.FrozenTrial]
+    experiment: Experiment,
+    ranked: Sequence[optuna.trial.FrozenTrial],
+    *,
+    sources: Mapping[int, Sequence[str]] | None = None,
 ) -> dict[str, RevisionRead]:
-    """Read the trainer revision each ranked trial's generation recorded, once per generation.
+    """Read each recorded trainer revision that a ranked trial may share, once per generation.
 
     A missing or invalid record is ``unreadable`` rather than an error: the check that uses
     these is advisory, and a trial that lost must not fail selection.
@@ -927,6 +1003,8 @@ def _ranked_code_revisions(
     :param Experiment experiment: Parsed experiment; locates the generation records.
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials; selection requires each
         to carry a generation id (:func:`_eligible`).
+    :param Mapping[int, Sequence[str]] | None sources: Possible contributing generations per
+        ranked trial, before the generation that finished it.
     :return dict[str, RevisionRead]: Each ranked generation's revision, ``unknown`` when it
         recorded none; empty for fewer than two ranked trials, which the check does not run on.
     """
@@ -935,6 +1013,8 @@ def _ranked_code_revisions(
         return revisions
     artifact_root = _experiment_dir(experiment)
     generation_ids = dict.fromkeys(str(trial.user_attrs[GENERATION_ID_ATTR]) for trial in ranked)
+    if sources is not None:
+        generation_ids.update(dict.fromkeys(g for earlier in sources.values() for g in earlier))
     for generation_id in generation_ids:
         try:
             revision = _load_generation_code_revision(artifact_root, generation_id)

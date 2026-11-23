@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
+import sys
 from pathlib import Path
 
 import optuna
@@ -23,15 +25,22 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.provenance import _code_revision
 from phasesweep.engine.selection import _ranked_code_revisions
-from phasesweep.engine.state import GENERATION_ID_ATTR, REPRODUCIBILITY_SCHEMA_VERSION
+from phasesweep.engine.state import (
+    GENERATION_ID_ATTR,
+    REPRODUCIBILITY_SCHEMA_VERSION,
+    RERUN_OF_ATTR,
+)
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
+    phase_trials,
     write_experiment_config,
     write_param_echo_trainer,
+    write_trainer,
     write_trial_zero_trainer,
 )
 from tests.ledger_fixtures import published_generation_id, winner_payload
+from tests.recovery_helpers import runner_once
 
 
 @pytest.fixture
@@ -369,6 +378,80 @@ def test_a_top_up_under_another_commit_is_disclosed_on_the_winner(
     assert summary["verdict"] == "heterogeneous"
     assert (summary["generations"], summary["commits"], summary["dirty"]) == (2, 2, 0)
     assert "rename" not in summary["remedy"] and "retrain" not in summary["remedy"]
+
+
+@pytest.mark.integration
+def test_ranked_rerun_discloses_prior_training_in_its_directory(
+    tmp_path: Path, hermetic_git: None
+) -> None:
+    """A saved checkpoint can contribute its source revision to a later ranking, but an allocated attempt cannot."""
+    repo = tmp_path / "repo"
+    first_head = _committed_repo(repo)
+    marker = tmp_path / "first-ready"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+import os, time
+from pathlib import Path
+
+checkpoint = Path(os.environ["PHASESWEEP_TRIAL_DIR"]) / "checkpoint"
+marker = Path({str(marker)!r})
+if not marker.exists():
+    checkpoint.write_text("first attempt trained")
+    marker.touch()
+    time.sleep(60)
+print("x=0.7" if checkpoint.is_file() else "x=0.9")
+""",
+    )
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        n_trials=2,
+        gpu_policy="none",
+        execution=ExecutionContext(cwd=str(repo)),
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    with runner_once(config, marker):
+        pass
+
+    (repo / "tracked.txt").write_text("v2\n")
+    _git(repo, "commit", "-q", "-am", "allocate a rerun")
+    # This runner persists the rerun's directory and allocated lifecycle, then stops at launch.
+    program = """
+import os, signal, sys
+from phasesweep import run_experiment
+from phasesweep.config.io import load_experiment
+from phasesweep.engine import phase
+
+def interrupt_launch(*args, **kwargs):
+    os.kill(os.getpid(), signal.SIGKILL)
+
+phase.launch_trial = interrupt_launch
+run_experiment(load_experiment(sys.argv[1]))
+"""
+    runner = subprocess.run(
+        [sys.executable, "-c", program, str(config)], capture_output=True, timeout=15, check=False
+    )
+    assert runner.returncode == -signal.SIGKILL, runner.stderr.decode()
+    (repo / "tracked.txt").write_text("v3\n")
+    _git(repo, "commit", "-q", "-am", "resume the trainer")
+    final_head = _git(repo, "rev-parse", "HEAD")
+
+    winner = run_experiment(experiment)["p"]
+    first, allocated, rerun, peer = phase_trials(experiment)
+    assert rerun.user_attrs[RERUN_OF_ATTR] == allocated.number
+    assert winner.metric == 0.7 and winner.trial_number == rerun.number
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    check = winner_payload(experiment, generation_id)["confound"]["checks"]["code_revision"]
+    assert check["verdict"] == "heterogeneous"
+    assert [
+        (entry["generation_id"], entry["commit"], entry["trials"])
+        for entry in check["detail"]["generations"]
+    ] == [
+        (first.user_attrs[GENERATION_ID_ATTR], first_head, [rerun.number]),
+        (generation_id, final_head, [rerun.number, peer.number]),
+    ]
 
 
 @pytest.mark.integration

@@ -97,7 +97,7 @@ class TieDetail(TypedDict):
 
 
 class GenerationRevision(TypedDict):
-    """The trainer revision one generation of ranked trials recorded.
+    """The trainer revision one generation contributed to ranked trials.
 
     ``record`` is ``recorded`` with the revision in ``commit`` and ``dirty``, ``unknown`` when
     the generation found no git work tree to read, or ``unreadable`` when its record could
@@ -112,7 +112,7 @@ class GenerationRevision(TypedDict):
 
 
 class CodeRevisionDetail(TypedDict):
-    """Every generation the ranked trials ran in, ordered by its first ranked trial."""
+    """Every generation that may have trained a ranked trial, ordered by its first ranked trial."""
 
     generations: list[GenerationRevision]
 
@@ -212,6 +212,7 @@ def _assess_population(
     *,
     provenance: Mapping[int, Mapping[str, object]],
     revisions: Mapping[str, RevisionRead],
+    revision_sources: Mapping[int, Sequence[str]] | None = None,
     axis: RepeatAxis | None = None,
     groups: Sequence[RankedGroup] | None = None,
     incomplete_group: Collection[int] = (),
@@ -233,6 +234,8 @@ def _assess_population(
     :param Mapping[str, RevisionRead] revisions: What selection read of the trainer revision each
         ranked generation recorded, keyed by generation id; a generation without an entry
         counts as unreadable.
+    :param Mapping[int, Sequence[str]] | None revision_sources: Possible contributing generations
+        per ranked trial, before the generation that finished it.
     :param RepeatAxis | None axis: The phase's repeat axis, which keys configurations by
         repeat group, or ``None`` for a phase without repeats.
     :param Sequence[RankedGroup] | None groups: The complete repeat groups
@@ -268,7 +271,7 @@ def _assess_population(
             "tie": _tie(ordered, winner)
             if ordered_groups is None
             else _group_tie(ordered_groups, winner),
-            "code_revision": _code_revision_check(ordered, revisions),
+            "code_revision": _code_revision_check(ordered, revisions, sources=revision_sources),
         },
     }
 
@@ -556,9 +559,12 @@ def _group_tie(
 
 
 def _code_revision_check(
-    ranked: Sequence[optuna.trial.FrozenTrial], revisions: Mapping[str, RevisionRead]
+    ranked: Sequence[optuna.trial.FrozenTrial],
+    revisions: Mapping[str, RevisionRead],
+    *,
+    sources: Mapping[int, Sequence[str]] | None,
 ) -> CodeRevisionCheck:
-    """Compare the trainer revisions of the generations the ranked trials ran in.
+    """Compare the trainer revisions of generations that may have trained ranked trials.
 
     One generation is one recorded code state, so a population from one generation is never
     flagged. Across generations the check flags more than one commit, any dirty tree (two
@@ -571,13 +577,18 @@ def _code_revision_check(
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials by number; each carries
         its generation id, which selection requires.
     :param Mapping[str, RevisionRead] revisions: The revision read for each generation.
+    :param Mapping[int, Sequence[str]] | None sources: Possible contributing generations per
+        ranked trial, before the generation that finished it.
     :return CodeRevisionCheck: The check record.
     """
     if len(ranked) < 2:
         return {"verdict": "n/a", "reason": "only one trial was ranked"}
     members: dict[str, list[int]] = {}
     for trial in ranked:
-        members.setdefault(str(trial.user_attrs[GENERATION_ID_ATTR]), []).append(trial.number)
+        earlier = () if sources is None else sources.get(trial.number, ())
+        trial_generations = dict.fromkeys((*earlier, str(trial.user_attrs[GENERATION_ID_ATTR])))
+        for generation in trial_generations:
+            members.setdefault(generation, []).append(trial.number)
     generations = [
         _generation_revision(generation_id, revisions.get(generation_id, "unreadable"), numbers)
         for generation_id, numbers in members.items()
@@ -602,7 +613,7 @@ def _code_revision_check(
 def _generation_revision(
     generation_id: str, read: RevisionRead, trials: list[int]
 ) -> GenerationRevision:
-    """Record one generation's revision beside the ranked trials that ran in it.
+    """Record one generation's revision beside the ranked trials it may have trained.
 
     :param str generation_id: The generation.
     :param RevisionRead read: What selection read of its recorded revision.

@@ -278,12 +278,12 @@ class TieSummary(_SnapshotModel):
 
 
 class CodeRevisionSummary(_SnapshotModel):
-    """Whether every ranked trial ran under one recorded trainer code state.
+    """Whether ranked results may have used more than one recorded trainer code state.
 
     A generation is one recorded state: the trainer working directory's git commit, and
     whether tracked files differed from it. Edits made during a generation, and differences
-    between two dirty trees, are not recorded. A changed commit is allowed on resume; this
-    only reports what the winner was chosen among.
+    between two dirty trees, are not recorded. An interrupted attempt that may have trained
+    in a ranked rerun's directory contributes its generation to the comparison.
     """
 
     verdict: ConfoundVerdict = Field(
@@ -297,7 +297,7 @@ class CodeRevisionSummary(_SnapshotModel):
         description="What the ranking compared and what to weigh; null unless flagged."
     )
     generations: NonNegativeInt | None = Field(
-        description="Generations the ranked trials ran in; null when not checked."
+        description="Generations that may have trained the ranked trials; null when not checked."
     )
     commits: NonNegativeInt | None = Field(
         description="Distinct commits those generations recorded; null when not checked."
