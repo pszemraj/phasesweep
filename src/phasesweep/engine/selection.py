@@ -70,7 +70,6 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import (
     _accepted_trial_target,
-    _as_sentence,
     _awaits_cleanup_recovery,
     _config_retires_abort,
     _PhasePolicyState,
@@ -83,6 +82,7 @@ from phasesweep.errors import (
     FRESH_STUDY,
     OperatorAction,
     PhaseSweepError,
+    as_sentence,
     timeout_step,
     unreadable_objective_step,
 )
@@ -304,7 +304,7 @@ def _prior_phase_abort_error(
     advice = _recovery_advice(phase, study, abort_record, dependents=dependents)
     return PhaseAbortRefusedError(
         f"Phase {phase.name!r} previously aborted at its accepted "
-        f"n_trials={abort_record['trial_target']}: {_as_sentence(abort_record['cause'])}",
+        f"n_trials={abort_record['trial_target']}: {as_sentence(abort_record['cause'])}",
         action=_recovery_action(study, abort_record),
         remediation=advice,
     )

@@ -85,7 +85,6 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import (
     _abort_record,
     _AcceptedPartialDecision,
-    _as_sentence,
     _consecutive_failure_threshold_tripped,
     _failure_policy_abort_record,
     _initialize_study_schema,
@@ -125,6 +124,7 @@ from phasesweep.errors import (
     PhaseSweepError,
     ProcessCleanupUncertainError,
     UnsafeProcessCleanupError,
+    as_sentence,
 )
 from phasesweep.run_report import phase_start, report
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
@@ -1453,7 +1453,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         )
         abort_error = PhaseTrialsInfeasibleError if all_infeasible else PhaseTrialsFailedError
         raise abort_error(
-            f"Phase {phase.name!r} aborted: {_as_sentence(abort['cause'])} {evidence}",
+            f"Phase {phase.name!r} aborted: {as_sentence(abort['cause'])} {evidence}",
             action=(
                 _recovery_action(study, abort)
                 if experiment.persistent

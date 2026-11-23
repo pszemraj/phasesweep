@@ -212,6 +212,18 @@ OTHER_FORMAT_STEP = "Set a new `experiment` name, and a new ledger if `storage` 
 ACCEPT_INCOMPLETE_STEP = "Set allow_incomplete_on_timeout: true to use the incomplete result."
 
 
+def as_sentence(text: object) -> str:
+    """End recorded text as a sentence, so the text after it starts a new one.
+
+    :param object text: A recorded cause or diagnostic, which an exception's text may leave
+        unpunctuated.
+    :return str: ``text`` without trailing whitespace, with a period added unless it already
+        ends in sentence punctuation.
+    """
+    ended = str(text).rstrip()
+    return ended if ended.endswith((".", "!", "?")) else f"{ended}."
+
+
 def short_digest(digest: str) -> str:
     """Shorten a SHA-256 digest the way every message that prints one does.
 

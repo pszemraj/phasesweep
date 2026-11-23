@@ -188,16 +188,6 @@ def _failure_policy_abort_record(
     }
 
 
-def _as_sentence(cause: object) -> str:
-    """End a recorded abort cause as a sentence, so the text after it starts a new one.
-
-    :param object cause: A recorded abort cause, which an exception's text may leave unpunctuated.
-    :return str: ``cause`` with a period added unless it already ends in sentence punctuation.
-    """
-    text = str(cause)
-    return text if text.rstrip().endswith((".", "!", "?")) else f"{text}."
-
-
 def _replayed_streak_abort(
     phase: Phase, study: optuna.Study, policy_state: _PhasePolicyState
 ) -> JsonObject | None:
