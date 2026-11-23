@@ -545,18 +545,24 @@ def _recovered_trial_state(
 
     :param FrozenTrial trial: Trial whose finished training may await extraction.
     :param _ParsedTrialOutcome | None outcome: Its unique committed outcome, if any.
-    :return RecoveredTrialState: Pending evidence, a recorded failure, or an interruption.
+    :return RecoveredTrialState: Pending evidence, a recorded failure or a trainer's own
+        crash, or an interruption.
     """
     if outcome is not None:
         if outcome.metric is not None:
             return "EVIDENCE_PENDING"
         return "INTERRUPTED" if outcome.outcome == "interrupted" else "FAIL"
+    from phasesweep.engine.trial import _trainer_failure_reason
+
     try:
         lifecycle = _trial_lifecycle(trial)
     except ValueError:
         return "INTERRUPTED"
     if lifecycle is not None and _completed_trainer_duration(trial, lifecycle) is not None:
         return "EVIDENCE_PENDING"
+    directory = _recorded_trial_dir(trial)
+    if directory is not None and _trainer_failure_reason(trial, lifecycle, directory) is not None:
+        return "FAIL"
     return "INTERRUPTED"
 
 

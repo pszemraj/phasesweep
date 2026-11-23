@@ -1253,6 +1253,15 @@ else:
                     with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
                         run_experiment(experiment)
                 assert len(phase_trials(experiment)) == 1
+            elif recovery_stage in {"finished", "timeout-trainer"}:
+                # A crash or a per-trial timeout is the trainer's own failure, kept though
+                # the runner died before recording it.
+                assert not _trial_interrupted(recovered)
+                assert (_cause(recovered) or "").startswith(
+                    "timeout after "
+                    if recovery_stage == "timeout-trainer"
+                    else "non-zero exit code 7"
+                )
             else:
                 assert _trial_interrupted(recovered)
             assert launches.read_text() == "launch\n"
@@ -1264,6 +1273,7 @@ else:
                     "timed_out" if recovery_stage == "timeout-trainer" else "cancelled"
                 )
                 assert recovered.value is None
+            if terminated and recovery_stage != "timeout-trainer":
                 release.touch()
                 assert run_experiment(experiment)["p"].metric == 1.0
                 rerun = phase_trials(experiment)[1]

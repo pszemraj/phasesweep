@@ -1485,7 +1485,7 @@ def _fail_stale_running_trial(
         recovered = False
     if not recovered:
         if outcome is None:
-            _record_stale_trial_outcome(study, trial)
+            _record_unfinished_trial_outcome(study, trial, record=record, experiment=experiment)
         _record_cleanup_recovery(study, trial)
         try:
             study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
@@ -1495,6 +1495,63 @@ def _fail_stale_running_trial(
                 f"in study {study.study_name!r} could not be marked FAIL: {exc}"
             ) from exc
     return True
+
+
+def _record_unfinished_trial_outcome(
+    study: optuna.Study,
+    trial: optuna.trial.FrozenTrial,
+    *,
+    record: _AttemptRecord | None,
+    experiment: Experiment | None,
+) -> None:
+    """Record the verdict of a stale trial no outcome and no measurement settled.
+
+    A trainer that crashed before its runner died keeps its failure, as on the live path,
+    and counts toward the producing phase's ``max_consecutive_failures``: a deterministic
+    crash must not rerun forever. Anything PhaseSweep stopped or never started, or whose
+    ending is unknown, is interrupted and reruns.
+
+    :param optuna.Study study: Owning study.
+    :param optuna.trial.FrozenTrial trial: Stale trial being settled.
+    :param _AttemptRecord | None record: Its attempt, whose directory holds the lifecycle record.
+    :param Experiment | None experiment: Recovery invocation supplying the artifact root.
+    :raises WinnerIntegrityError: A failure's producing configuration snapshot is unavailable.
+    :raises StudySchemaMismatchError: The durable completion order is invalid.
+    :raises StudyStorageUnavailableError: The verdict could not be recorded.
+    """
+    from phasesweep.engine.trial import _trainer_failure_reason
+
+    reason = None
+    if record is not None:
+        try:
+            lifecycle = read_attempt_lifecycle(
+                record.trial_dir, expected_attempt_id=record.attempt_id
+            )
+        except ValueError:
+            lifecycle = None
+        reason = _trainer_failure_reason(trial, lifecycle, record.trial_dir)
+    if reason is None or record is None:
+        _record_stale_trial_outcome(study, trial)
+        return
+    policy_phase = None
+    if record.generation_id is not None and experiment is not None:
+        producing = _load_generation_experiment(_experiment_dir(experiment), record.generation_id)
+        policy_phase = producing.phase(record.phase_name)
+    _record_stale_trial_outcome(study, trial, "failure", cause=reason, policy_phase=policy_phase)
+    if FAILURE_REASON_ATTR not in trial.user_attrs:
+        try:
+            optuna.Trial(study, trial._trial_id).set_user_attr(FAILURE_REASON_ATTR, reason)
+        except Exception as exc:
+            raise StudyStorageUnavailableError(
+                f"The failure of stale RUNNING trial {trial.number} in study "
+                f"{study.study_name!r} was recorded, but its reason could not be saved."
+            ) from exc
+    log.warning(
+        "Recovered trial %d in phase %r failed before its run stopped: %s",
+        trial.number,
+        record.phase_name,
+        reason,
+    )
 
 
 def _cleanup_recovered_trial_numbers(study: optuna.Study) -> set[int]:

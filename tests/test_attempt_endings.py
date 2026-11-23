@@ -15,11 +15,23 @@ from optuna.trial import FrozenTrial
 from phasesweep import run_experiment
 from phasesweep.config.models import Experiment
 from phasesweep.engine import phase as phase_module
+from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import TRIAL_OUTCOME_ATTR, _parsed_trial_outcome
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    TRIAL_DIR_ATTR,
+    TRIAL_OUTCOME_ATTR,
+    _parsed_trial_outcome,
+)
 from phasesweep.engine.study_policy import _load_phase_policy_state, _record_reruns
-from phasesweep.runtime.process import AttemptEnd, read_attempt_lifecycle, run_supervised
+from phasesweep.errors import PhaseSweepError
+from phasesweep.runtime.process import (
+    AttemptEnd,
+    read_attempt_lifecycle,
+    run_supervised,
+    write_attempt_lifecycle,
+)
 from tests.conftest import (
     make_experiment,
     phase_study,
@@ -27,6 +39,7 @@ from tests.conftest import (
     write_experiment_config,
     write_trainer,
 )
+from tests.recovery_helpers import fabricate_stale_trial, write_trial_identity
 
 _RUNNER = (
     "import sys\n"
@@ -193,3 +206,79 @@ def test_a_crash_keeps_its_failure_when_a_ctrl_c_lands_in_the_helper_settle(
     assert _outcome(trial) == ("FAIL", "non-zero exit code 1; stderr: loss went NaN at step 7")
     assert _load_phase_policy_state(phase_study(experiment)).consecutive_failures == 1
     assert _record_reruns(phase_study(experiment)) == []
+
+
+@pytest.mark.integration
+def test_a_crash_whose_runner_was_killed_is_recovered_as_a_failure_that_trips_the_streak(
+    tmp_path: Path,
+) -> None:
+    """A trainer that exited 1 while its runner was SIGKILLed is recovered as that failure, and ``max_consecutive_failures: 1`` aborts instead of rerunning it."""
+    exited = tmp_path / "exited"
+    experiment = _exec_trainer(
+        tmp_path,
+        f"""
+        import subprocess, sys
+        from pathlib import Path
+        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
+        print("assertion failed in data loader", file=sys.stderr, flush=True)
+        Path({str(exited)!r}).touch()
+        sys.exit(1)
+        """,
+        n_trials=3,
+        max_consecutive_failures=1,
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    with (tmp_path / "runner.log").open("w") as output:
+        runner = subprocess.Popen(
+            [sys.executable, "-c", _RUNNER, str(config)], stdout=output, stderr=output
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while not exited.exists():
+                assert runner.poll() is None and time.monotonic() < deadline
+                time.sleep(0.02)
+            runner.kill()  # the guardian, in a session of its own, still records the exit
+            runner.wait(timeout=5)
+        finally:
+            if runner.poll() is None:
+                runner.kill()
+                runner.wait(timeout=5)
+    (stale,) = phase_trials(experiment)
+    attempt = stale.user_attrs[ATTEMPT_ID_ATTR]
+    while (
+        lifecycle := read_attempt_lifecycle(
+            Path(stale.user_attrs[TRIAL_DIR_ATTR]), expected_attempt_id=attempt
+        )
+    ) is None or lifecycle.state != "exited":
+        assert time.monotonic() < deadline + 15, "the guardian never recorded the exit"
+        time.sleep(0.05)
+    assert stale.state.name == "RUNNING" and TRIAL_OUTCOME_ATTR not in stale.user_attrs
+
+    with pytest.raises(PhaseSweepError, match="max_consecutive_failures"):
+        run_experiment(experiment)
+
+    (trial,) = phase_trials(experiment)
+    assert _outcome(trial) == (
+        "FAIL",
+        "non-zero exit code 1; stderr: assertion failed in data loader",
+    )
+    parsed = _parsed_trial_outcome(trial.user_attrs[TRIAL_OUTCOME_ATTR])
+    assert parsed is not None and parsed.abort is not None
+    assert _record_reruns(phase_study(experiment)) == []
+
+
+def test_a_reboot_leaves_its_launching_attempt_interrupted(tmp_path: Path) -> None:
+    """An attempt a reboot cut off, still ``launching`` with an identity from another boot, reruns as interrupted."""
+    experiment = make_experiment(persistent=tmp_path, n_trials=1)
+    study, trial_dir, number = fabricate_stale_trial(experiment, "p", attempt_id="rebooted")
+    write_attempt_lifecycle(trial_dir, attempt_id="rebooted", state="launching")
+    write_trial_identity(
+        trial_dir, attempt_id="rebooted", pid=4242, starttime=1, boot_id="previous-boot"
+    )
+
+    assert _reap_stale_trials(study, experiment, "p", confirm=True) == 1
+
+    trial = study.get_trials(deepcopy=False)[number]
+    assert _outcome(trial)[0] == "INTERRUPTED"
+    lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id="rebooted")
+    assert lifecycle is not None and lifecycle.ended_by == "cancelled"
