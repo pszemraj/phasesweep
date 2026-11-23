@@ -529,8 +529,8 @@ def grid_target_refusal(phase: Phase, *, finished: int, measured: int) -> tuple[
     Finished failures remain spent. Raising the target may retry each failed
     cell once, or visit an unvisited cell; a completed cell is closed even if
     its metric was infeasible. With nothing finished there are no failures to count or retry,
-    so the diagnosis says only that the target exceeds the grid's cells. A larger grid is a
-    changed search space, which the study's fingerprint refusal answers with its own step.
+    so the diagnosis says only that the target exceeds the grid's cells. A grid that gained
+    values continues its study, and its ceiling counts the new cells.
 
     :param Phase phase: Phase whose target is checked.
     :param int finished: Finished attempts, excluding interruptions.

@@ -31,7 +31,12 @@ from phasesweep.config.search import (
     grid_search_space,
     sampler_search_space,
 )
-from phasesweep.engine.grid_order import GridCell, grid_axis_names, grid_cell_order
+from phasesweep.engine.grid_order import (
+    GridCell,
+    grid_axis_names,
+    grid_cell_order,
+    recorded_search_space,
+)
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FAILURE_REASON_ATTR,
@@ -338,6 +343,54 @@ def _position_seed(base_seed: int, study_name: str, position: int, label: str) -
     return int.from_bytes(hashlib.sha256(material).digest()[:4], "big")
 
 
+def _distribution(param: SearchParam) -> optuna.distributions.BaseDistribution:
+    """Return the Optuna distribution ``_suggest`` registers for a search parameter.
+
+    :param SearchParam param: A search parameter.
+    :return optuna.distributions.BaseDistribution: Its distribution.
+    """
+    if isinstance(param, FloatParam):
+        return optuna.distributions.FloatDistribution(
+            param.low, param.high, log=param.log, step=param.step
+        )
+    if isinstance(param, IntParam):
+        return optuna.distributions.IntDistribution(
+            param.low, param.high, log=param.log, step=param.step
+        )
+    return optuna.distributions.CategoricalDistribution(param.choices)
+
+
+def _distribution_at(
+    study: optuna.Study,
+    position: int,
+    param_name: str,
+    current: optuna.distributions.BaseDistribution,
+) -> optuna.distributions.BaseDistribution:
+    """Return the distribution a configuration starting at ``position`` draws ``param_name`` from.
+
+    A configuration belongs to the search space that was in effect at its first position, so a
+    repeats slot drawn partly before its range widened draws its remaining members from the
+    range its first members drew from. Every other new draw is at or past the newest space's
+    first position and draws from ``current``.
+
+    :param optuna.Study study: The active study, whose identity record holds its search spaces.
+    :param int position: The configuration's first draw position.
+    :param str param_name: The parameter being drawn.
+    :param optuna.distributions.BaseDistribution current: The configured distribution.
+    :return optuna.distributions.BaseDistribution: The distribution to draw from.
+    """
+    record = _recorded_identity(study)
+    if record is None:
+        return current
+    entries = [entry for entry in record["search_spaces"] if entry["first_position"] <= position]
+    if not entries or entries[-1] is record["search_spaces"][-1]:
+        return current
+    recorded = entries[-1]["search_space"].get(param_name)
+    if recorded is None:
+        return current
+    return _distribution(recorded_search_space({param_name: recorded})[param_name])
+
+
 class _PositionRandomSampler(optuna.samplers.RandomSampler):
     """Seeded random sampler whose every draw is a function of the trial's draw position."""
 
@@ -377,17 +430,21 @@ class _PositionRandomSampler(optuna.samplers.RandomSampler):
         :param optuna.distributions.BaseDistribution param_distribution: The
             parameter's distribution.
         :return object: The repeat value for the repeat key, otherwise the value a
-            fresh ``RandomSampler`` seeded by :func:`_position_seed` draws.
+            fresh ``RandomSampler`` seeded by :func:`_position_seed` draws from the search space
+            in effect at the configuration's first position (:func:`_distribution_at`).
         """
         position = _draw_position(study, trial)
+        first = position
         if self._repeats is not None:
             count = len(self._repeats.values)
             if param_name == self._repeats.key:
                 return self._repeats.values[position % count]
             position //= count
+            first = position * count
         seed = _position_seed(self._base_seed, study.study_name, position, param_name)
         sampler = optuna.samplers.RandomSampler(seed=seed)
-        return sampler.sample_independent(study, trial, param_name, param_distribution)
+        distribution = _distribution_at(study, first, param_name, param_distribution)
+        return sampler.sample_independent(study, trial, param_name, distribution)
 
 
 class _PositionGridSampler(optuna.samplers.GridSampler):
@@ -784,22 +841,31 @@ def _suggest_all(trial: optuna.Trial, phase: Phase) -> dict[str, object]:
 
     A grid's numeric choices register as an int or float range spanning them
     (:func:`_grid_axis_kind`); the grid sampler returns the cell's value, so the trial records
-    the configured value with its type.
+    the configured value with its type. A param the trial already holds, as a rerun holds its
+    source's, is returned as recorded.
 
     :param optuna.Trial trial: The active Optuna trial.
     :param Phase phase: Phase whose ``search_space`` and repeat axis are drawn.
     :return dict[str, object]: The drawn value of every axis, by name.
     """
     grid = phase.sampler.type == "grid"
+    recorded = trial.params
     sampled: dict[str, object] = {}
     for name, param in sampler_search_space(phase).items():
-        kind = _grid_axis_kind(param.choices) if isinstance(param, CategoricalParam) else None
-        if grid and kind == "int":
-            sampled[name] = trial.suggest_int(name, min(param.choices), max(param.choices))
-        elif grid and kind == "float":
-            sampled[name] = trial.suggest_float(name, min(param.choices), max(param.choices))
-        else:
-            sampled[name] = _suggest(trial, name, param)
+        if name in recorded:
+            # A rerun carries its source's value under its source's distribution, which a grown
+            # space widened; suggesting it again would return the same value and only warn.
+            sampled[name] = recorded[name]
+            continue
+        if grid and isinstance(param, CategoricalParam):
+            kind = _grid_axis_kind(param.choices)
+            if kind == "int":
+                sampled[name] = trial.suggest_int(name, min(param.choices), max(param.choices))
+                continue
+            if kind == "float":
+                sampled[name] = trial.suggest_float(name, min(param.choices), max(param.choices))
+                continue
+        sampled[name] = _suggest(trial, name, param)
     return sampled
 
 

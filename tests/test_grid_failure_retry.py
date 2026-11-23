@@ -16,7 +16,7 @@ from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
-from phasesweep.engine.errors import StudyFingerprintMismatchError, TrialTargetRefusedError
+from phasesweep.engine.errors import TrialTargetRefusedError
 from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
@@ -760,25 +760,11 @@ def test_validate_refuses_an_oversized_fresh_persistent_grid(
 
 
 @pytest.mark.integration
-def test_oversized_grid_target_over_a_recorded_study_names_the_maximum_and_a_larger_grid_renames(
-    tmp_path: Path,
-) -> None:
-    """A target past a measured grid names its maximum; a larger grid meets the fingerprint refusal, whose rename step runs."""
+def test_oversized_grid_target_over_a_recorded_study_names_the_maximum(tmp_path: Path) -> None:
+    """A target past a measured grid names its maximum and launches nothing."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=0)
     assert run_experiment(_grid(tmp_path, trainer, 2))["p"].metric == 1.0
     with pytest.raises(TrialTargetRefusedError) as refused:
         run_experiment(_grid(tmp_path, trainer, 4))
     assert refused.value.remediation == "Set phases[p].n_trials to at most 2."
-
-    enlarged = _grid(tmp_path, trainer, 4, cells=4)
-    with pytest.raises(StudyFingerprintMismatchError) as changed:
-        run_experiment(enlarged)
-    assert changed.value.remediation == (
-        "Restore the recorded value(s), or give `p` a new `name`, which runs it again from scratch."
-    )
-
-    # Following that step runs: the renamed phase is a new study and measures every cell again.
-    (phase,) = enlarged.phases
-    renamed = enlarged.model_copy(update={"phases": [phase.model_copy(update={"name": "p_v2"})]})
-    assert run_experiment(renamed)["p_v2"].metric == 1.0
-    assert len(calls.read_text().splitlines()) == 2 + 4
+    assert len(calls.read_text().splitlines()) == 2

@@ -71,14 +71,14 @@ def _refusal(study: optuna.Study, experiment: Experiment) -> StudyFingerprintMis
 
 @pytest.mark.integration
 def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
-    """Widening one bound refuses the study, names that key with both values, and offers the phase rename that then runs."""
+    """Narrowing one bound refuses the study, names that key with both values and what it dropped, and offers the phase rename that then runs."""
     project = project_directory(tmp_path)
     config = write_anchored_config(
         project / "exp.yaml",
         workdir="runs",
         storage="journal:///study.journal",
         execution={"cwd": "."},
-        phases=[anchored_phase(3)],
+        phases=[anchored_phase(4)],
     )
     run_experiment(load_experiment(config))
     write_anchored_config(
@@ -86,18 +86,20 @@ def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
         workdir="runs",
         storage="journal:///study.journal",
         execution={"cwd": "."},
-        phases=[anchored_phase(4)],
+        phases=[anchored_phase(3)],
     )
 
     with pytest.raises(StudyFingerprintMismatchError, match="different config") as caught:
         run_experiment(load_experiment(config))
 
-    assert "Changed: phase.search_space.x.high: 3 -> 4." in str(caught.value)
+    assert str(caught.value).endswith(
+        "Changed: phase.search_space.x.high: 4 -> 3. search_space 'x' dropped high 4; added "
+        "values alone keep the study and run only the new ones."
+    )
     assert "execution.cwd" not in str(caught.value)
     assert caught.value.action is OperatorAction.FRESH_NAMESPACE
-    assert caught.value.remediation is not None
     assert caught.value.remediation == (
-        "Restore the recorded value(s), or give `p` a new `name`, which runs it again from scratch."
+        "Put back x high 4, or give `p` a new `name`, which runs it again from scratch."
     )
 
     write_anchored_config(
@@ -105,9 +107,9 @@ def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
         workdir="runs",
         storage="journal:///study.journal",
         execution={"cwd": "."},
-        phases=[{**anchored_phase(4), "name": "wider"}],
+        phases=[{**anchored_phase(3), "name": "narrower"}],
     )
-    assert set(run_experiment(load_experiment(config))) == {"wider"}
+    assert set(run_experiment(load_experiment(config))) == {"narrower"}
 
 
 @pytest.mark.integration
@@ -123,26 +125,25 @@ def test_refusal_for_an_inherited_phase_names_the_dependents_to_rename(tmp_path:
         name="q", inherits=["p"], search_space={"y": {"type": "int", "low": 0, "high": 3}}
     )
     config = write_anchored_config(
-        project / "exp.yaml", phases=[anchored_phase(3), child], **fields
+        project / "exp.yaml", phases=[anchored_phase(4), child], **fields
     )
     run_experiment(load_experiment(config))
-    write_anchored_config(config, phases=[anchored_phase(4), child], **fields)
+    write_anchored_config(config, phases=[anchored_phase(3), child], **fields)
 
     with pytest.raises(StudyFingerprintMismatchError, match="::p'") as caught:
         run_experiment(load_experiment(config))
 
-    assert caught.value.remediation is not None
     assert caught.value.remediation == (
-        "Restore the recorded value(s), or give `p` and `q` new names and update the `inherits` "
+        "Put back x high 4, or give `p` and `q` new names and update the `inherits` "
         "that name them, which runs them again from scratch."
     )
 
     renamed = [
-        {**anchored_phase(4), "name": "wider"},
-        {**child, "name": "after", "inherits": ["wider"]},
+        {**anchored_phase(3), "name": "narrower"},
+        {**child, "name": "after", "inherits": ["narrower"]},
     ]
     write_anchored_config(config, phases=renamed, **fields)
-    assert set(run_experiment(load_experiment(config))) == {"wider", "after"}
+    assert set(run_experiment(load_experiment(config))) == {"narrower", "after"}
 
 
 def test_refusal_names_the_trainer_cwd_when_the_same_config_runs_from_another_directory(

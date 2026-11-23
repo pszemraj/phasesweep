@@ -24,7 +24,7 @@ from phasesweep.engine.artifact_roots import (
     _check_published_phase_studies,
 )
 from phasesweep.engine.errors import StudyStorageUnavailableError
-from phasesweep.engine.fingerprints import _phase_fingerprint, _verify_fingerprint
+from phasesweep.engine.fingerprints import _judge_identity, _phase_fingerprint, describe_gains
 from phasesweep.engine.guards import _raise_collected_errors
 from phasesweep.engine.ledger import open_preview_study, read_phase_studies, validate_ledger
 from phasesweep.engine.optuna import (
@@ -387,9 +387,26 @@ def _preview_phase(
         and recorded.study.get_trials(deepcopy=False)
     ):
         if not any(winner.placeholder_keys for winner in inherited_winners.values()):
-            phase_fingerprint = _verify_fingerprint(
-                recorded.study, experiment, phase, inherited_winners
+            # Judged only: the preview reads a snapshot and records nothing.
+            verdict = _judge_identity(
+                recorded.study,
+                experiment,
+                phase,
+                {
+                    parent: inherited_winners[parent].effective_overrides
+                    for parent in phase.inherits
+                },
             )
+            phase_fingerprint = verdict.fingerprint
+            if verdict.gained:
+                unit = "new cell" if phase.sampler.type == "grid" else "new trial"
+                log.info(
+                    "DRY RUN phase=%s search_space gains %s: keeps its %s, would launch %s.",
+                    phase.name,
+                    describe_gains(verdict.gained),
+                    plural(finished, "finished trial"),
+                    plural(remaining, unit),
+                )
         else:
             # Its own config was compared before any phase previewed (_reached_study_refusals).
             warn_dry_run(

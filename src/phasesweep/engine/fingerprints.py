@@ -6,6 +6,8 @@ import hashlib
 import json
 import logging
 import platform
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +15,8 @@ import optuna
 
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import StudyFingerprintMismatchError
+from phasesweep.engine.growth import _GrowthVerdict, _search_space_growth
+from phasesweep.engine.optuna import _draw_positions
 from phasesweep.engine.state import (
     PHASE_IDENTITY_ATTR,
     PHASE_IDENTITY_SCHEMA_VERSION,
@@ -380,17 +384,16 @@ def _payload_search_space(payload: JsonObject) -> JsonObject:
     return space
 
 
-def _fresh_identity(
-    experiment: Experiment, phase: Phase, inherited_winners: dict[str, Winner]
-) -> PhaseIdentityRecord:
+def _fresh_identity(experiment: Experiment, phase: Phase, inherited: object) -> PhaseIdentityRecord:
     """Build the identity a study with no trials is bound to: one search space, from position 0.
 
     :param Experiment experiment: Current experiment config.
     :param Phase phase: Phase whose identity is built.
-    :param dict[str, Winner] inherited_winners: Parent winners contributing to identity.
+    :param object inherited: Effective overrides by parent, the payload's
+        ``inherited_effective_overrides``.
     :return PhaseIdentityRecord: The record.
     """
-    payload = _phase_fingerprint_payload(experiment, phase, inherited_winners)
+    payload = _identity_payload(experiment, phase, inherited)
     return _identity_record(
         _semantic_payload_digest(payload),
         payload,
@@ -413,18 +416,103 @@ def _verify_fingerprint(
     phase: Phase,
     inherited_winners: dict[str, Winner],
 ) -> str:
-    """Stamp a fresh study, or rebind an empty one, with its fingerprint; refuse a populated mismatch.
+    """Bind the study to the phase's current identity, or refuse the change; see :func:`_judge_identity`.
 
     :param optuna.Study study: Study being verified or stamped.
     :param Experiment experiment: Current experiment config.
     :param Phase phase: Phase whose fingerprint must match.
     :param dict[str, Winner] inherited_winners: Parent winners contributing to identity.
     :raises StudyFingerprintMismatchError: The populated study has no persisted
-        fingerprint or an incompatible one; the message names the keys that changed.
+        fingerprint or a change it cannot continue under; the message names the keys that
+        changed.
     :return str: Verified current fingerprint.
     """
-    fresh = _fresh_identity(experiment, phase, inherited_winners)
-    payload, fp = fresh["payload"], fresh["fingerprint"]
+    inherited = {parent: inherited_winners[parent].effective_overrides for parent in phase.inherits}
+    verdict = _judge_identity(study, experiment, phase, inherited)
+    if verdict.record is not None:
+        if verdict.rebound_from is not None:
+            log.warning(
+                "Rebinding the fingerprint of empty study %s (%s -> %s): no trial "
+                "ever ran under the previous config.",
+                study.study_name,
+                short_digest(verdict.rebound_from),
+                short_digest(verdict.fingerprint),
+            )
+        if verdict.gained:
+            log.info(
+                "[%s] search_space gains %s: its finished trials stand and new configurations "
+                "run from draw position %d.",
+                phase.name,
+                describe_gains(verdict.gained),
+                verdict.record["search_spaces"][-1]["first_position"],
+            )
+        _stamp_identity(study, verdict.record)
+    return verdict.fingerprint
+
+
+@dataclass(frozen=True)
+class _IdentityVerdict:
+    """What :func:`_judge_identity` found, and the record a run writes for it."""
+
+    #: The current config's fingerprint.
+    fingerprint: str
+    #: The identity to record, or None when the recorded one stands unchanged.
+    record: PhaseIdentityRecord | None
+    #: The values each grown key gains over the space the study continues; empty otherwise.
+    gained: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    #: The fingerprint an empty study was bound to before, when it is rebound.
+    rebound_from: str | None = None
+
+
+def describe_gains(gained: Mapping[str, Sequence[str]]) -> str:
+    """Name the values a grown search space adds, key by key.
+
+    :param Mapping[str, Sequence[str]] gained: Added values or widened ranges, by key.
+    :return str: Such as ``lr 0.003, 0.01; wd 0..0.1 -> 0..0.3``.
+    """
+    return "; ".join(f"{key} {', '.join(values)}" for key, values in gained.items())
+
+
+def _next_draw_position(trials: Sequence[optuna.trial.FrozenTrial], phase: Phase) -> int:
+    """Return the draw position a search space taking effect now starts at.
+
+    Under repeats it is rounded up to a whole configuration, so every member of a configuration
+    is drawn under one space.
+
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the study.
+    :param Phase phase: Phase whose repeat axis groups positions.
+    :return int: The first position no trial holds, rounded up under repeats.
+    """
+    drawn = len(set(_draw_positions(trials).values()))
+    count = 1 if phase.repeats is None else len(phase.repeats.values)
+    return -(-drawn // count) * count
+
+
+def _judge_identity(
+    study: optuna.Study, experiment: Experiment, phase: Phase, inherited: object
+) -> _IdentityVerdict:
+    """Judge the current config against a study's recorded identity, writing nothing.
+
+    A study with no trials takes the current identity outright. A populated one continues when
+    only its ``search_space`` changed and every changed key only gains values
+    (:func:`~phasesweep.engine.growth._search_space_growth`): the record gains an entry that
+    takes effect at the next whole configuration, so every finished trial stands and only new
+    configurations run. A newest entry no trial was drawn under is replaced, or dropped when the
+    config is back to the space before it, so an unused growth never binds the study.
+
+    :param optuna.Study study: The phase's study, live or a read-only snapshot.
+    :param Experiment experiment: Current experiment config.
+    :param Phase phase: Phase the study belongs to.
+    :param object inherited: Effective overrides by parent, the payload's
+        ``inherited_effective_overrides``.
+    :raises StudyFingerprintMismatchError: The populated study has no recorded identity, or its
+        config changed in a way it cannot continue under; the message names what changed.
+    :raises StudySchemaMismatchError: The recorded identity is malformed.
+    :return _IdentityVerdict: The current fingerprint and the record to write, if any.
+    """
+    fresh = _fresh_identity(experiment, phase, inherited)
+    payload, fingerprint = fresh["payload"], fresh["fingerprint"]
+    space = fresh["search_spaces"][0]["search_space"]
     record = _recorded_identity(study)
     trials = study.get_trials(deepcopy=False)
     if record is None:
@@ -433,23 +521,77 @@ def _verify_fingerprint(
                 f"Phase {phase.name!r} study {study.study_name!r} has no semantic fingerprint.",
                 remediation=NEW_STUDY_STEP,
             )
-        _stamp_identity(study, fresh)
-    elif record["fingerprint"] != fp:
-        # A zero-trial study has no result semantics to preserve. This includes
-        # a process that died after recording its trial target but before Optuna
-        # created the first trial.
-        if not trials:
-            log.warning(
-                "Rebinding the fingerprint of empty study %s (%s -> %s): no trial "
-                "ever ran under the previous config.",
-                study.study_name,
-                short_digest(record["fingerprint"]),
-                short_digest(fp),
-            )
-            _stamp_identity(study, fresh)
-            return fp
-        raise _mismatch_refusal(study, experiment, phase, recorded=record, payload=payload)
-    return fp
+        return _IdentityVerdict(fingerprint, fresh)
+    if record["fingerprint"] == fingerprint:
+        return _IdentityVerdict(fingerprint, None)
+    if not trials:
+        # A zero-trial study has no result semantics to preserve. This includes a process that
+        # died after recording its trial target but before Optuna created the first trial.
+        return _IdentityVerdict(fingerprint, fresh, rebound_from=record["fingerprint"])
+    entries = record["search_spaces"]
+    first = _next_draw_position(trials, phase)
+    base = entries[:-1] if len(entries) > 1 and first <= entries[-1]["first_position"] else entries
+    base_payload = _with_search_space(record["payload"], base[-1]["search_space"])
+    if base_payload == payload and base is not entries:
+        return _IdentityVerdict(fingerprint, _identity_record(fingerprint, payload, list(base)))
+    growth = _growth_verdicts(base_payload, payload, phase)
+    if growth is not None and all(verdict.grows for verdict in growth.values()):
+        entry: SearchSpaceEntry = {"search_space": space, "first_position": first}
+        grown = [*base, entry]
+        return _IdentityVerdict(
+            fingerprint,
+            _identity_record(fingerprint, payload, grown),
+            gained={key: verdict.gained for key, verdict in growth.items() if verdict.gained},
+        )
+    raise _mismatch_refusal(
+        study,
+        experiment,
+        phase,
+        existing=record["fingerprint"],
+        recorded=base_payload,
+        payload=payload,
+        growth=growth,
+    )
+
+
+def _with_search_space(payload: JsonObject, space: JsonObject) -> JsonObject:
+    """Return a fingerprint payload with its phase search space replaced.
+
+    :param JsonObject payload: A canonical phase fingerprint payload.
+    :param JsonObject space: The search space to put in its place.
+    :return JsonObject: The new payload; ``payload`` is unchanged.
+    """
+    phase = payload.get("phase")
+    if not isinstance(phase, dict):
+        return payload
+    return {**payload, "phase": {**phase, "search_space": space}}
+
+
+def _growth_verdicts(
+    recorded_payload: JsonObject, payload: JsonObject, phase: Phase
+) -> dict[str, _GrowthVerdict] | None:
+    """Judge each changed search-space key, when ``search_space`` is all that changed.
+
+    Keys are compared whole, not through :func:`_changed_payload_keys`'s dotted paths, since a
+    search-space key such as ``optimizer.lr`` holds dots itself.
+
+    :param JsonObject recorded_payload: The payload of the space the study continues.
+    :param JsonObject payload: The current payload.
+    :param Phase phase: Phase whose sampler judges the change.
+    :return dict[str, _GrowthVerdict] | None: A verdict per changed key, or None when anything
+        outside ``search_space`` changed, or a key was added or removed, which old trials never
+        recorded or still hold.
+    """
+    recorded, current = _payload_search_space(recorded_payload), _payload_search_space(payload)
+    if _with_search_space(recorded_payload, current) != payload or set(recorded) != set(current):
+        return None
+    verdicts: dict[str, _GrowthVerdict] = {}
+    for key in sorted(key for key in current if recorded[key] != current[key]):
+        old, new = recorded[key], current[key]
+        if not isinstance(old, dict) or not isinstance(new, dict):
+            return None
+        verdicts[key] = _search_space_growth(old, new, sampler=phase.sampler)
+    return verdicts or None
 
 
 def _verify_recorded_identity(study: optuna.Study, experiment: Experiment, phase: Phase) -> None:
@@ -464,7 +606,7 @@ def _verify_recorded_identity(study: optuna.Study, experiment: Experiment, phase
     :param Experiment experiment: Current experiment config.
     :param Phase phase: Phase the study belongs to.
     :raises StudyFingerprintMismatchError: The study's own config differs from the one it
-        recorded; the refusal :func:`_verify_fingerprint` gives for it.
+        recorded in a way it cannot continue under; the refusal :func:`_judge_identity` gives.
     """
     record = _recorded_identity(study)
     if (
@@ -473,11 +615,39 @@ def _verify_recorded_identity(study: optuna.Study, experiment: Experiment, phase
         or not study.get_trials(deepcopy=False)
     ):
         return
-    payload = _identity_payload(
-        experiment, phase, record["payload"]["inherited_effective_overrides"]
-    )
-    if _semantic_payload_digest(payload) != record["fingerprint"]:
-        raise _mismatch_refusal(study, experiment, phase, recorded=record, payload=payload)
+    _judge_identity(study, experiment, phase, record["payload"]["inherited_effective_overrides"])
+
+
+def _growth_refusal(
+    experiment: Experiment, phase: Phase, growth: Mapping[str, _GrowthVerdict]
+) -> tuple[str, str] | None:
+    """Say why a search space that changed alone cannot continue, and the step for it.
+
+    :param Experiment experiment: Experiment whose phases may inherit ``phase``.
+    :param Phase phase: Phase whose search space changed.
+    :param Mapping[str, _GrowthVerdict] growth: A verdict per changed key.
+    :return tuple[str, str] | None: The sentence and the step, or None when every key grows.
+    """
+    rename = rename_step([phase.name, *experiment.phases_inheriting(phase.name)])
+    dropped = {key: verdict.dropped for key, verdict in growth.items() if verdict.dropped}
+    if dropped:
+        named = "; ".join(f"{key} {', '.join(values)}" for key, values in dropped.items())
+        sentences = " ".join(
+            f"search_space {key!r} dropped {', '.join(values)};" for key, values in dropped.items()
+        )
+        return (
+            f"{sentences} added values alone keep the study and run only the new ones.",
+            f"Put back {named}, or {rename}.",
+        )
+    for key, verdict in growth.items():
+        if verdict.refusal is not None:
+            lead = (
+                f"Restore {_RECORDED_VALUES}"
+                if verdict.route is None
+                else verdict.route.format(phase=phase.name)
+            )
+            return f"search_space {key!r} {verdict.refusal}.", f"{lead}, or {rename}."
+    return None
 
 
 def _mismatch_refusal(
@@ -485,23 +655,28 @@ def _mismatch_refusal(
     experiment: Experiment,
     phase: Phase,
     *,
-    recorded: PhaseIdentityRecord,
+    existing: str,
+    recorded: JsonObject,
     payload: JsonObject,
+    growth: Mapping[str, _GrowthVerdict] | None = None,
 ) -> StudyFingerprintMismatchError:
     """Build the refusal of a populated study whose recorded fingerprint differs from ``payload``.
 
     :param optuna.Study study: The populated study.
     :param Experiment experiment: Current experiment config.
     :param Phase phase: Phase the study belongs to.
-    :param PhaseIdentityRecord recorded: The identity the study recorded.
-    :param JsonObject payload: The current payload, whose digest differs from the recorded one.
+    :param str existing: The fingerprint the study recorded.
+    :param JsonObject recorded: The payload of the config the study's trials ran under.
+    :param JsonObject payload: The current payload, whose digest differs from ``existing``.
+    :param Mapping[str, _GrowthVerdict] | None growth: A verdict per changed key when only the
+        search space changed, so the refusal names what was dropped and the step for it.
     :return StudyFingerprintMismatchError: The refusal, naming the keys that changed.
     """
-    existing = recorded["fingerprint"]
-    changes = _changed_payload_keys(recorded["payload"], payload)
+    changes = _changed_payload_keys(recorded, payload)
     cwd_unset = experiment.execution.cwd is None and any(
         path == "execution.cwd" for path, _old, _new in changes
     )
+    refused = None if growth is None else _growth_refusal(experiment, phase, growth)
     # A recorded payload equal to the current one under a different digest was not written by
     # PhaseSweep, so the two digests are all the message can show.
     if not changes:
@@ -510,6 +685,9 @@ def _mismatch_refusal(
             f" (fingerprint {short_digest(existing)} != "
             f"{short_digest(_semantic_payload_digest(payload))})."
         )
+    elif refused is not None:
+        found = f". {_describe_changed_keys(changes)} {refused[0]}"
+        way_forward = refused[1]
     else:
         found = f". {_describe_changed_keys(changes)}"
         if all(path.startswith("phase.") for path, _old, _new in changes):

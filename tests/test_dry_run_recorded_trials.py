@@ -151,9 +151,9 @@ def _record(
     stamp_artifact_root(study, experiment)
     study.set_user_attr(TRIAL_TARGET_ATTR, target)
     recorded_phase = next(item for item in experiment.phases if item.name == phase)
-    _stamp_identity(
-        study, _fresh_identity(experiment, recorded_phase, _stand_ins(experiment, recorded_phase))
-    )
+    stand_ins = _stand_ins(experiment, recorded_phase)
+    inherited = {name: winner.effective_overrides for name, winner in stand_ins.items()}
+    _stamp_identity(study, _fresh_identity(experiment, recorded_phase, inherited))
     identity = _environment_identity(experiment, phase)
     for sequence, state in enumerate(states, 1):
         attrs: dict[str, object] = {
@@ -693,7 +693,7 @@ def test_raised_upstream_target_over_a_bound_descendant_is_refused_as_a_run_refu
 def test_a_top_up_of_a_changed_phase_is_refused_as_a_changed_study_first(
     tmp_path: Path, changed: str
 ) -> None:
-    """A raised target on a phase whose search space also changed is refused as a changed study.
+    """A raised target on a phase whose search space also lost values is refused as a changed study.
 
     The top-up refusal says the phase keeps its trials, which a changed study does not, so the
     run and its dry run both refuse the change first, for the first phase or a later one. With
@@ -704,28 +704,29 @@ def test_a_top_up_of_a_changed_phase_is_refused_as_a_changed_study_first(
         _persistent(tmp_path, *(_phase(name, 2, inherits=up) for name, up in chain.items()))
     )
 
-    def edited(*, widen: bool) -> Experiment:
+    def edited(*, narrow: bool) -> Experiment:
         phases = []
         for name, up in chain.items():
             phase = _phase(name, 3 if name == changed else 2, inherits=up)
-            if widen and name == changed:
-                space = {f"{name}_x": IntParam(type="int", low=0, high=20)}
+            if narrow and name == changed:
+                space = {f"{name}_x": IntParam(type="int", low=0, high=5)}
                 phase = phase.model_copy(update={"search_space": space})
             phases.append(phase)
         return _persistent(tmp_path, *phases)
 
     refusal = _refusals_match(
-        edited(widen=True),
+        edited(narrow=True),
         tmp_path,
         StudyFingerprintMismatchError,
         rf"Study 't::{changed}' was created with a different config\. Changed: "
-        rf"phase\.search_space\.{changed}_x\.high: 10 -> 20\.$",
+        rf"phase\.search_space\.{changed}_x\.high: 10 -> 5\. search_space '{changed}_x' dropped "
+        r"high 10; added values alone keep the study and run only the new ones\.$",
     )
     assert isinstance(refusal, StudyFingerprintMismatchError)
     assert refusal.remediation is not None
-    assert refusal.remediation.startswith("Restore the recorded value(s), or give ")
+    assert refusal.remediation.startswith(f"Put back {changed}_x high 10, or give ")
     _refusals_match(
-        edited(widen=False),
+        edited(narrow=False),
         tmp_path,
         StudyContextConflictError,
         rf"Phase '{changed}' has 1 top-up trial remaining",

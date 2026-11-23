@@ -203,7 +203,7 @@ def _fake_top_up_study(*, completed: int = 0, fingerprint: str | None = None) ->
 
 @pytest.mark.integration
 def test_fingerprint_mismatch_raises(tmp_path):
-    """Changing phase config and re-running should fail, not silently mix results."""
+    """Dropping a recorded grid value and re-running fails, not silently mixing results."""
     trainer = copy_fake_train(tmp_path)
 
     def experiment(choices: list[int]) -> Experiment:
@@ -222,9 +222,8 @@ def test_fingerprint_mismatch_raises(tmp_path):
 
     run_experiment(experiment([4, 8]))
 
-    # Now change the search space and re-run — should fail.
-    with pytest.raises(RuntimeError, match="different config"):
-        run_experiment(experiment([4, 8, 12]))
+    with pytest.raises(RuntimeError, match="'n_layers' dropped 8;"):
+        run_experiment(experiment([4, 12]))
 
 
 def test_persistent_storage_requires_declared_provenance(tmp_path: Path) -> None:
