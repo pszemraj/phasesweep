@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 from copy import deepcopy
 from pathlib import Path
@@ -763,7 +764,10 @@ def test_republishing_refuses_a_winner_whose_objective_bytes_changed(tmp_path: P
     source.write_bytes(b"y" + original[1:])
     assert source.stat().st_size == len(original)
 
-    with pytest.raises(TrialEvidenceMissingError, match="now hashes to .*: its bytes have changed"):
+    with pytest.raises(
+        TrialEvidenceMissingError,
+        match=f"now hashes to .* at {re.escape(repr(str(source)))}: its bytes have changed",
+    ):
         run_experiment(_evidence_experiment(tmp_path))
 
     assert _pointer_bytes(experiment) == pointer_before

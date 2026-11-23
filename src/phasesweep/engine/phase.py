@@ -1449,7 +1449,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         evidence = (
             "The tripping trials were INFEASIBLE: outside the metric bounds or constraints."
             if all_infeasible
-            else f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
+            else f"Inspect {_phase_dir(experiment, phase.name) / 'attempts'} for stderr logs."
         )
         abort_error = PhaseTrialsInfeasibleError if all_infeasible else PhaseTrialsFailedError
         raise abort_error(

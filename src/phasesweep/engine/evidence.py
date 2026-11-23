@@ -330,7 +330,8 @@ def _verify_objective_source_evidence(
     if stat_result.st_size != recorded_size:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r} as "
-            f"{recorded_size} bytes, but that file is now {stat_result.st_size} bytes."
+            f"{recorded_size} bytes, but that file is now {stat_result.st_size} bytes at "
+            f"{str(source_path)!r}."
         )
     if not verify_digest:
         return
@@ -346,7 +347,7 @@ def _verify_objective_source_evidence(
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r} with sha256 "
             f"{short_digest(recorded_digest)}, but that file now hashes to "
-            f"{short_digest(actual_digest)}: its bytes have changed."
+            f"{short_digest(actual_digest)} at {str(source_path)!r}: its bytes have changed."
         )
 
 
@@ -419,7 +420,7 @@ def _verify_trainer_input_evidence(
     if actual_size != recorded_size:
         raise TrialEvidenceMissingError(
             f"{subject} recorded trainer input {filename!r} as {recorded_size} bytes, but "
-            f"that file is now {actual_size} bytes."
+            f"that file is now {actual_size} bytes at {str(input_path)!r}."
         )
     try:
         actual_digest = file_sha256(input_path)
@@ -432,7 +433,7 @@ def _verify_trainer_input_evidence(
         raise TrialEvidenceMissingError(
             f"{subject} recorded trainer input {filename!r} with sha256 "
             f"{short_digest(recorded_digest)}, but that file now hashes to "
-            f"{short_digest(actual_digest)}: its bytes have changed."
+            f"{short_digest(actual_digest)} at {str(input_path)!r}: its bytes have changed."
         )
 
 

@@ -731,7 +731,7 @@ def test_in_memory_grid_abort_gets_no_recovery_advice(tmp_path: Path) -> None:
     )
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(make_experiment(trainer=trainer, phases=[phase]))
-    assert str(aborted.value).endswith("for stderr logs.")
+    assert str(aborted.value).endswith("/p/attempts for stderr logs.")
 
 
 def test_validate_refuses_an_oversized_fresh_persistent_grid(
