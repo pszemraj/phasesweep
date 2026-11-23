@@ -143,15 +143,17 @@ def _metric_semantics_payload(metric: Metric) -> JsonObject:
 
 
 def _field_text(value: JsonValue) -> str:
-    """Write one extractor field's value, quoted when it holds a space or a quote.
+    """Write one extractor field's value as configured, in double quotes when it needs them.
 
     :param JsonValue value: The value of a dumped extractor field.
-    :return str: A string as is unless it is empty or holds whitespace or a quote, in which case
-        it is quoted; a boolean in lower case; any other value as ``str`` writes it.
+    :return str: A string as is unless it is empty or holds whitespace or a double quote, in
+        which case it is in double quotes with only an embedded double quote escaped, so a regex
+        keeps its backslashes; a boolean in lower case; any other value as ``str`` writes it.
     """
     if isinstance(value, str):
-        quoted = not value or any(char.isspace() or char in "'\"" for char in value)
-        return repr(value) if quoted else value
+        if value and not any(char.isspace() or char == '"' for char in value):
+            return value
+        return '"' + value.replace('"', '\\"') + '"'
     return str(value).lower() if isinstance(value, bool) else str(value)
 
 

@@ -11,7 +11,9 @@ import time
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
+from phasesweep.cli import cli as cli_main
 from phasesweep.config.models import Experiment
 from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.publication import _resolve_publication_pointer
@@ -25,6 +27,7 @@ from tests.conftest import (
     write_experiment_config,
     write_trainer,
 )
+from tests.experiments import write_experiment
 
 _DIAGNOSIS = (
     "Phase 'phase' aborted: 2 consecutive failed/infeasible trials reached "
@@ -208,6 +211,34 @@ def test_validate_wraps_its_contract_lines_under_their_prefix_without_dict_synta
     assert "{" not in "\n".join(lines[1:5])
     # The experiment's contract lines up to the trainer cwd, whose path stays whole.
     assert all(len(line) <= 60 for line in lines[1:11])
+
+
+def test_validate_prints_a_string_extractor_field_as_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A field with whitespace is in double quotes with its backslashes as written, so it pastes back into a config."""
+    pattern = r"throughput \{tok/s\}: (?P<value>\d+\.\d+) \[avg over last 100 steps\]"
+    quoted = r'say "hi" (?P<value>\d+)'
+    config = write_experiment(
+        tmp_path / "exp.yaml",
+        observe=[
+            {
+                "name": "tps",
+                "extractor": {"type": "log_regex", "file": "stdout.log", "pattern": pattern},
+            },
+            {
+                "name": "greeting",
+                "extractor": {"type": "log_regex", "file": "stdout.log", "pattern": quoted},
+            },
+        ],
+    )
+    monkeypatch.setenv("COLUMNS", "500")
+
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert f'pattern="{pattern}"' in result.output
+    assert 'pattern="say \\"hi\\" (?P<value>\\d+)"' in result.output
 
 
 @pytest.mark.integration
