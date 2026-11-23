@@ -538,7 +538,7 @@ def _judge_identity(
     first = _next_draw_position(trials, phase)
     base = entries[:-1] if len(entries) > 1 and first <= entries[-1]["first_position"] else entries
     base_payload = _with_search_space(record["payload"], base[-1]["search_space"])
-    if base_payload == payload and base is not entries:
+    if base is not entries and _same_value(base_payload, payload):
         return _IdentityVerdict(fingerprint, _identity_record(fingerprint, payload, list(base)))
     growth = _growth_verdicts(base_payload, payload, phase)
     if growth is not None and all(verdict.grows for verdict in growth.values()):

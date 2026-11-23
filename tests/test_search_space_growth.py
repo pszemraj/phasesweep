@@ -294,6 +294,20 @@ def test_respelling_one_value_refuses_naming_both_spellings() -> None:
     assert error.remediation == f"Put back lr 8, or {_RENAME}."
 
 
+def test_reverting_unused_growth_preserves_override_types() -> None:
+    """Reverting an unused grid expansion still refuses a changed fixed override type."""
+    overrides = {"flag": True}
+    original = _phase([4, 8]).model_copy(update={"fixed_overrides": overrides})
+    study = _stamped(original)
+    grown = _phase([4, 8, 12]).model_copy(update={"fixed_overrides": overrides})
+    _verify_fingerprint(study, make_experiment(phases=[grown]), grown, {})
+    before = _recorded_identity(study)
+
+    changed = original.model_copy(update={"fixed_overrides": {"flag": 1}})
+    assert "phase.fixed_overrides.flag: true -> 1" in str(_refusal(study, changed))
+    assert _recorded_identity(study) == before
+
+
 @pytest.mark.integration
 def test_dropping_a_value_refuses_and_names_it(tmp_path: Path) -> None:
     """A removal beside an addition refuses before any trial launches, names the dropped value, and leaves the record as it was."""
