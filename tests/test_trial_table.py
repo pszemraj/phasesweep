@@ -7,9 +7,10 @@ from pathlib import Path
 
 import pytest
 
+from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Repeats, Sampler
-from phasesweep.engine.read import RepeatGroupView, TrialTable, TrialTables
+from phasesweep.engine.read import RepeatGroupView, TrialTable, TrialTables, read_trial_tables
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.trial_table import render_trial_tables, unsettled_running_comment
@@ -19,6 +20,7 @@ from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
     terminal_stream,
+    write_constant_trainer,
 )
 
 GENERATION = "6413d5c1edd5475998cfadd4d3b59980"
@@ -77,6 +79,7 @@ def _table(
     finished: int | None = None,
     uncounted: tuple[tuple[str, int], ...] = (),
     refusal: tuple[str, str] | None = None,
+    recorded_metric: tuple[str, str] | None = None,
 ) -> TrialTable:
     """Build a table whose columns are the core ones plus every optional key any row carries.
 
@@ -97,6 +100,7 @@ def _table(
         uncounted=uncounted,
         groups=groups,
         refusal=refusal,
+        recorded_metric=recorded_metric,
     )
 
 
@@ -254,6 +258,48 @@ def test_a_recorded_refusal_and_its_fix_print_under_the_heading() -> None:
         "  fix: Fix the cause, then raise phases[search].n_trials above 8 and rerun.",
         "          trial  eval_loss  x  state  time",
     ]
+
+
+def test_the_table_is_headed_with_the_recorded_metric_and_names_a_changed_config_metric() -> None:
+    """Values print under the metric the study recorded; a config naming another says so under the heading."""
+    phase = _phase("search", n_trials=8, x=IntParam(type="int", low=0, high=9))
+    rows = [_row(index, 0.5, {"x": index}) for index in range(6)]
+    tables = _tables(
+        _table("search", rows, recorded_metric=("loss", "minimize")),
+        represented=None,
+        published=None,
+        winners={},
+    )
+
+    lines = _render(tables, phase, goal="maximize").splitlines()
+
+    assert lines[3:6] == [
+        "search: 6 of 8 trials, loss (lower is better)",
+        "  the config names eval_loss (higher is better); a run refuses this study",
+        "          trial  loss  x  state     time",
+    ]
+    # An unchanged metric prints no note, so a clean listing is the one the config alone gives.
+    unchanged = _table("search", rows, recorded_metric=("eval_loss", "minimize"))
+    clean = _render(_tables(unchanged, represented=None, published=None, winners={}), phase)
+    assert "the config names" not in clean
+
+
+def test_the_recorded_metric_comes_from_the_study_the_trials_were_read_from(
+    tmp_path: Path,
+) -> None:
+    """``read_trial_tables`` carries the study's recorded name and goal, not the edited config's."""
+    experiment = make_experiment(persistent=tmp_path, trainer=write_constant_trainer(tmp_path))
+    run_experiment(experiment)
+    edited = experiment.model_copy(
+        update={
+            "metric": experiment.metric.model_copy(update={"name": "renamed", "goal": "maximize"})
+        }
+    )
+
+    (table,) = read_trial_tables(edited).phases
+
+    assert table.recorded_metric == (experiment.metric.name, experiment.metric.goal)
+    assert table.recorded_metric != (edited.metric.name, edited.metric.goal)
 
 
 def test_unreadable_trial_data_is_reported_without_a_table() -> None:

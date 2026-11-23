@@ -386,6 +386,15 @@ def _generation_line(tables: TrialTables) -> str:
     return f"{state} generation {represented}"
 
 
+def _direction(goal: str) -> str:
+    """Say which values are better under a metric goal.
+
+    :param str goal: ``minimize`` or ``maximize``.
+    :return str: ``lower`` for ``minimize``, else ``higher``.
+    """
+    return "lower" if goal == "minimize" else "higher"
+
+
 def _phase_lines(
     table: TrialTable,
     phase: Phase,
@@ -399,11 +408,14 @@ def _phase_lines(
     """Render one phase: its heading, any notes under it, its trials and its repeat groups.
 
     The heading reads ``finished of target trials``, then in parentheses the rows that do not
-    count toward the target, by state.
+    count toward the target, by state, then the metric the study recorded and its direction.
+    When the config names another metric name or goal, a note under the heading says so,
+    since the trial values belong to the recorded one. A phase a run would refuse prints that
+    refusal and its fix before any other note.
 
     :param TrialTable table: The phase's trials.
     :param Phase phase: The configured phase.
-    :param Experiment experiment: The experiment, for the metric's name and direction.
+    :param Experiment experiment: The experiment, for the configured metric's name and goal.
     :param TrialTables tables: All tables, for the winner generation of each phase.
     :param Path | None csv_root: Artifact directory of an experiment that keeps no ledger.
     :param int width: Terminal width the prose wraps to.
@@ -425,13 +437,23 @@ def _phase_lines(
         if table.uncounted:
             others = ", ".join(f"{rows} {state.lower()}" for state, rows in table.uncounted)
             count = f"{count} ({others})"
-    metric = experiment.metric
-    direction = "lower" if metric.goal == "minimize" else "higher"
+    configured = (experiment.metric.name, experiment.metric.goal)
+    name, goal = table.recorded_metric or configured
     lines = wrap(
-        f"{table.phase}: {count}, {metric.name} ({direction} is better)",
+        f"{table.phase}: {count}, {name} ({_direction(goal)} is better)",
         width,
         subsequent_indent=INDENT,
     )
+    if (name, goal) != configured:
+        lines.extend(
+            wrap(
+                f"the config names {configured[0]} ({_direction(configured[1])} is better); "
+                "a run refuses this study",
+                width,
+                indent=INDENT,
+                subsequent_indent=INDENT,
+            )
+        )
     if table.refusal is not None:
         diagnosis, step = table.refusal
         lines.extend(wrap(diagnosis, width, indent=INDENT, subsequent_indent=INDENT))
@@ -445,7 +467,7 @@ def _phase_lines(
     for note in notes:
         lines.extend(wrap(note, width, indent=INDENT, subsequent_indent=INDENT))
     if table.rows:
-        lines.extend(_trial_lines(table, phase, metric.name, width=width, color=color))
+        lines.extend(_trial_lines(table, phase, name, width=width, color=color))
     if table.groups:
         lines.extend(_group_lines(table.groups, phase, width=width, color=color))
     return lines
