@@ -43,6 +43,7 @@ from phasesweep.engine.state import (
     constraint_attr,
     observed_attr,
 )
+from phasesweep.evidence.baseline import write_evidence_baseline
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
     EvidenceUnreadableError,
@@ -836,6 +837,8 @@ def launch_trial(
         gpu_lease_fds=gpu_lease_fds,
     )
     _record_trainer_environment(experiment, environment_identity, env, attempt_dir)
+    # Before the trainer starts: what an earlier attempt left in this directory is refused.
+    baseline = write_evidence_baseline(experiment, phase, workdir, attempt_dir)
 
     log.info("[%s/trial_%d] %s", phase_name, trial_id, cmd)
 
@@ -873,6 +876,7 @@ def launch_trial(
         mlflow_settings=None if experiment.mlflow is None else experiment.mlflow.target(),
         mlflow_query=compile_mlflow_query(experiment, phase.gates),
         mlflow_environment=env if experiment.mlflow is not None else None,
+        baseline=baseline,
     )
 
     return ExecutedTrial(ctx=ctx, process=proc_result)

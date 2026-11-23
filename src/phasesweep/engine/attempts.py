@@ -1218,6 +1218,7 @@ def _recover_completed_trial(
         record_trial_result,
         trial_run_name,
     )
+    from phasesweep.evidence.baseline import read_evidence_baseline
     from phasesweep.evidence.evaluation import TrialContext
     from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
     from phasesweep.runtime.process import ProcessResult
@@ -1244,6 +1245,13 @@ def _recover_completed_trial(
             record.attempt_id, record.phase_name, trial.number, persistent=True
         )
         return None
+    try:
+        baseline = read_evidence_baseline(record.attempt_dir)
+    except ValueError as exc:
+        # Launch writes it before the trainer starts; without it no value file can be shown
+        # to be this attempt's own, so the training is not accepted and the trial reruns.
+        log.warning("Attempt %s cannot be recovered as finished: %s", record.attempt_id, exc)
+        return False
     experiment = _load_generation_experiment(_experiment_dir(current), record.generation_id)
     phase = experiment.phase(record.phase_name)
     environment = _environment_identity(
@@ -1277,6 +1285,7 @@ def _recover_completed_trial(
         mlflow_query=compile_mlflow_query(experiment, phase.gates),
         wandb_environment=environment,
         mlflow_environment=environment,
+        baseline=baseline,
     )
     active_trial = optuna.Trial(study, trial._trial_id)
     try:

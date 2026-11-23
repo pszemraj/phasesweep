@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from phasesweep.errors import UnsafeProcessCleanupError
+from phasesweep.evidence.baseline import EvidenceBaseline, file_stamp
 from phasesweep.evidence.models import (
     ArtifactSizeGate,
     Gate,
@@ -94,11 +95,17 @@ CAPTURED_STREAMS = frozenset({"stdout.log", "stderr.log"})
 
 
 class OutsideAttemptError(OSError):
-    """A trial-relative evidence path resolves outside its trial directory."""
+    """A trial-relative evidence path this attempt may not be scored from."""
 
 
-def attempt_file(trial_dir: Path, relative: str | Path) -> Path:
-    """Return a trial-relative evidence path, refusing one that resolves outside the trial.
+class StaleEvidenceError(OutsideAttemptError):
+    """A value file is exactly as it was before the attempt ran, so the attempt did not write it."""
+
+
+def attempt_file(
+    trial_dir: Path, relative: str | Path, *, baseline: EvidenceBaseline | None = None
+) -> Path:
+    """Return a trial-relative evidence path, refusing one the attempt may not be scored from.
 
     PhaseSweep reads a trial's objective, constraints, observations, gate values and
     digests only from files inside that trial's directory. Config load already refuses
@@ -107,9 +114,16 @@ def attempt_file(trial_dir: Path, relative: str | Path) -> Path:
     A link that stays inside the trial, such as ``latest -> checkpoint-500``, reads as
     usual. A missing file resolves inside and keeps the caller's own not-found handling.
 
+    With a ``baseline``, a value file is also refused when its identity is the one it had
+    before the attempt ran: a rerun continues in its trial's directory, where an earlier
+    attempt may have left a result this one never wrote (:mod:`phasesweep.evidence.baseline`).
+
     :param Path trial_dir: The trial directory the file must resolve inside.
     :param str | Path relative: Configured trial-relative path.
+    :param EvidenceBaseline | None baseline: Value-file identities recorded before the
+        attempt ran, or ``None`` for a read that tests artifacts or verifies recorded evidence.
     :raises OutsideAttemptError: The path resolves outside ``trial_dir``.
+    :raises StaleEvidenceError: The file is unchanged since before the attempt ran.
     :return Path: ``trial_dir / relative``, unchanged, for the caller to read.
     """
     path = trial_dir / relative
@@ -124,25 +138,40 @@ def attempt_file(trial_dir: Path, relative: str | Path) -> Path:
             f"`{relative}` in trial directory {trial_dir} resolves to {resolved}, outside the "
             "trial. Have the trainer write it under PHASESWEEP_TRIAL_DIR."
         )
+    before = None if baseline is None else baseline.get(str(relative))
+    if before is not None and file_stamp(path) == before:
+        raise StaleEvidenceError(
+            f"`{relative}` in trial directory {trial_dir} was not written by this attempt: it "
+            "is unchanged since an earlier attempt left it. Have the trainer write it on every "
+            "run, including one that resumes from a checkpoint."
+        )
     return path
 
 
-def trial_file(trial_dir: Path, attempt_dir: Path, relative: str | Path) -> Path:
+def trial_file(
+    trial_dir: Path,
+    attempt_dir: Path,
+    relative: str | Path,
+    *,
+    baseline: EvidenceBaseline | None = None,
+) -> Path:
     """Return where a configured trial path is read from.
 
     A captured stream (:data:`CAPTURED_STREAMS`) is the attempt's own, kept in its attempt
     directory; any other path is a trainer file inside the trial directory, as
-    :func:`attempt_file` resolves it.
+    :func:`attempt_file` resolves and checks it.
 
     :param Path trial_dir: The trial directory the trainer writes into.
     :param Path attempt_dir: The attempt's directory, holding its captured streams.
     :param str | Path relative: Configured trial-relative path.
-    :raises OutsideAttemptError: A trainer path resolves outside ``trial_dir``.
+    :param EvidenceBaseline | None baseline: Passed to :func:`attempt_file`.
+    :raises OutsideAttemptError: A trainer path resolves outside ``trial_dir``, or, as
+        :class:`StaleEvidenceError`, is unchanged since before the attempt ran.
     :return Path: The path to read.
     """
     if str(relative) in CAPTURED_STREAMS:
         return attempt_dir / relative
-    return attempt_file(trial_dir, relative)
+    return attempt_file(trial_dir, relative, baseline=baseline)
 
 
 def load_json_value(
@@ -151,6 +180,7 @@ def load_json_value(
     key: str,
     *,
     digest: dict[str, Any] | None = None,
+    baseline: EvidenceBaseline | None = None,
 ) -> tuple[Path, Any]:
     """Load a dotted JSON value from a trial-relative file.
 
@@ -160,7 +190,9 @@ def load_json_value(
     :param dict[str, Any] | None digest: Optional sink that receives the
         ``sha256``/``size_bytes`` of the exact bytes parsed, for evidence
         provenance.
-    :raises OutsideAttemptError: If ``relative_path`` resolves outside ``trial_dir``.
+    :param EvidenceBaseline | None baseline: Passed to :func:`attempt_file`.
+    :raises OutsideAttemptError: If ``relative_path`` resolves outside ``trial_dir``, or,
+        as :class:`StaleEvidenceError`, is unchanged since before the attempt ran.
     :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular
         file under ``trial_dir``.
     :raises JsonKeyMissingError: If a segment of the dotted ``key`` path is missing, with the
@@ -171,7 +203,7 @@ def load_json_value(
         duplicate object keys, or a rejected JSON constant).
     :return tuple[Path, Any]: Resolved JSON file path and loaded value.
     """
-    target = attempt_file(trial_dir, relative_path)
+    target = attempt_file(trial_dir, relative_path, baseline=baseline)
     if not target.is_file():
         raise FileNotFoundError(target)
     raw = target.read_bytes()
@@ -363,6 +395,9 @@ class TrialContext:
     mlflow_query: MlflowQuery | None = None
     mlflow_environment: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
     mlflow_capture: JsonObject = field(default_factory=dict, compare=False)
+    # Value-file identities recorded before the attempt ran; a value file still matching
+    # its entry was left by an earlier attempt and is refused. ``None`` checks nothing.
+    baseline: EvidenceBaseline | None = field(default=None, compare=False)
 
 
 def _extract_json(
@@ -390,7 +425,9 @@ def _extract_json(
                 f"with the numeric key `{cfg.key}`"
             ),
         ):
-            _, cur = load_json_value(ctx.trial_dir, cfg.path, cfg.key, digest=digest)
+            _, cur = load_json_value(
+                ctx.trial_dir, cfg.path, cfg.key, digest=digest, baseline=ctx.baseline
+            )
     except JsonKeyMissingError as exc:
         raise ExtractorError(
             f"Key {cfg.key!r} not found in {target} (failed at {exc.segment!r}; {exc.found})."
@@ -565,7 +602,7 @@ def _extract_log_regex(
     :return float: Selected match value.
     """
     try:
-        target = trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.file)
+        target = trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.file, baseline=ctx.baseline)
     except OutsideAttemptError as exc:
         raise ExtractorError(str(exc)) from exc
     if not target.is_file():
@@ -1048,7 +1085,7 @@ def _json_equals(ctx: TrialContext, gate: JsonEqualsGate) -> GateResult:
     :return GateResult: Pass/fail result and human-readable detail.
     """
     try:
-        _, actual = load_json_value(ctx.trial_dir, gate.path, gate.key)
+        _, actual = load_json_value(ctx.trial_dir, gate.path, gate.key, baseline=ctx.baseline)
     except Exception as exc:
         return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
     if type(actual) is type(gate.value) and actual == gate.value:
@@ -1069,7 +1106,7 @@ def _json_scalar_bound(ctx: TrialContext, gate: JsonScalarBoundGate) -> GateResu
     :return GateResult: Pass/fail result and human-readable detail.
     """
     try:
-        _, raw_value = load_json_value(ctx.trial_dir, gate.path, gate.key)
+        _, raw_value = load_json_value(ctx.trial_dir, gate.path, gate.key, baseline=ctx.baseline)
         value = json_float(raw_value, label=gate.key)
     except Exception as exc:
         return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
@@ -1135,7 +1172,7 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
     else:
         assert gate.key is not None
         try:
-            _, raw_size = load_json_value(ctx.trial_dir, gate.path, gate.key)
+            _, raw_size = load_json_value(ctx.trial_dir, gate.path, gate.key, baseline=ctx.baseline)
         except Exception as exc:
             return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
         if not isinstance(raw_size, int) or isinstance(raw_size, bool):
