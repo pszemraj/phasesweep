@@ -4,7 +4,7 @@ PhaseSweep reads metrics that your trainer logs natively to MLflow, selects winn
 
 ## Run the CPU example locally
 
-Install the optional client and, for a local server, matching full MLflow:
+Install the optional client and, for a local server, matching full MLflow. PhaseSweep supports MLflow 3.17 up to but not including 4:
 
 ```bash
 pip install "phasesweep[mlflow]" "mlflow>=3.17,<4"
