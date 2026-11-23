@@ -1366,11 +1366,11 @@ def sync_tracking(
 ) -> dict[str, int]:
     """Retry pending result projections without selecting or training.
 
-    Check the artifact-root binding and ledger format as every writer does, then
-    rebuild missing attempt records from Optuna, the summary-run record of each ended
-    unpublished generation from its lifecycle record, and winner records from committed
-    generation artifacts, reconcile unresolved creations, and send what is pending
-    until MLflow stops answering, through the core run closeout shares.
+    Check the artifact-root binding and ledger format as every writer does, and confirm
+    cleanup of registered tracking workers across generations. Then rebuild missing attempt
+    records from Optuna, summary-run records from ended generations' lifecycle records, and
+    winner records from committed generation artifacts. Reconcile unresolved creations and
+    send what is pending until MLflow stops answering through the core run closeout shares.
     Report local creation or lifecycle record errors after delivering independent records
     in the selected scope.
 
@@ -1387,6 +1387,7 @@ def sync_tracking(
         nothing is written.
     :raises StudySchemaMismatchError: The ledger holds unsupported study state; nothing is written.
     :raises StudyStorageUnavailableError: An unbound tree's ledger cannot be inspected.
+    :raises ProcessCleanupUncertainError: A tracking worker's cleanup is uncertain.
     :raises PhaseSweepError: The MLflow SDK is not installed, or a published
         generation's artifacts no longer validate.
     :return dict[str, int]: Remaining pending and delivered counts in that scope.
@@ -1410,12 +1411,12 @@ def sync_tracking(
     with signal_handler_scope(), _experiment_lock(experiment):
         # Refuse a tree this checkout cannot own before anything here writes to it.
         ledger = validate_ledger(experiment)
+        # A later run registers its own workers even when they send an earlier run's records.
         _preflight_active_attempts(
             experiment,
             _PreflightCleanupReport(),
             confirm=True,
             tracking_only=True,
-            generation_id=generation_id,
         )
         root = tracking_root(experiment)
         had_creations = bool(pending_creation_records(experiment, generation_id))

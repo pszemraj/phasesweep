@@ -7,6 +7,7 @@ import os
 import shlex
 import signal
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,7 +27,12 @@ from phasesweep.engine.ledger import (
     read_phase_trials,
     validate_ledger,
 )
-from phasesweep.engine.paths import _experiment_dir, _generation_dir, _generation_record_path
+from phasesweep.engine.paths import (
+    _attempts_dir,
+    _experiment_dir,
+    _generation_dir,
+    _generation_record_path,
+)
 from phasesweep.engine.read import experiment_status, read_status
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -1061,6 +1067,73 @@ def test_scoped_sync_reads_only_its_generations_attempt_records(
     write_record(source, {**recorded, "schema_version": 1})
     with pytest.raises(ValueError, match="Unsupported MLflow tracking record format"):
         publication.sync_tracking(reopened, "newer")
+
+
+def test_scoped_sync_confirms_workers_from_other_generations_before_retrying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An earlier record waits for a later run's worker to clear before its upload can retry."""
+    experiment = native_experiment(tmp_path)
+    ledger = validate_ledger(experiment)
+    claim_ledger(ledger)
+    binding = {**mlflow_binding(), "generation_id": "older"}
+    record = publication._save_intent(
+        experiment,
+        "older",
+        "attempt-probe",
+        binding,
+        publication._projection(metrics={}, params={}, tags={}, summary={}),
+    )
+    write_record(
+        session.summary_binding_path(experiment, "newer"),
+        {**binding, "generation_id": "newer", "attempt_id": "newer"},
+    )
+    uploads: list[tuple[str, Path]] = []
+
+    def upload(
+        request: Mapping[str, object], *, operation_id: str, directory: Path, **_: object
+    ) -> dict[str, object]:
+        """Leave the newer run's worker unresolved as it sends the older record."""
+        assert request["action"] == "publish"
+        assert request["binding"] == binding
+        uploads.append((operation_id, directory))
+        if directory.parent.parent.name == "newer":
+            process.write_attempt_lifecycle(
+                directory,
+                attempt_id=operation_id,
+                state="terminating",
+                ended_by="cancelled",
+                cleanup_confirmed=False,
+            )
+            raise ProcessCleanupUncertainError("The upload worker's cleanup is unconfirmed.")
+        return {}
+
+    monkeypatch.setattr(worker, "require_mlflow_sdk", lambda: None)
+    monkeypatch.setattr(session, "request_operation", upload)
+    with pytest.raises(ProcessCleanupUncertainError, match="upload worker's cleanup"):
+        publication.deliver_ended_generations(experiment, ledger, "newer", DeliveryTally())
+    ((operation_id, directory),) = uploads
+    entry = _attempts_dir(experiment) / f"{operation_id}.json"
+    with pytest.raises(ProcessCleanupUncertainError, match="durable process identity is missing"):
+        publication.sync_tracking(experiment, "older")
+    assert entry.is_file()
+    assert uploads == [(operation_id, directory)]
+    assert read_record(record)["state"] == "pending"
+
+    process.write_attempt_lifecycle(
+        directory,
+        attempt_id=operation_id,
+        state="exited",
+        ended_by="cancelled",
+        cleanup_confirmed=True,
+        duration_seconds=1.0,
+    )
+    assert publication.sync_tracking(experiment, "older") == {"pending": 0, "delivered": 1}
+    assert not entry.exists()
+    assert [path.parent.parent.name for _, path in uploads] == ["newer", "older"]
+    assert read_record(record)["state"] == "delivered"
+    assert publication.sync_tracking(experiment, "older") == {"pending": 0, "delivered": 1}
+    assert len(uploads) == 2
 
 
 @pytest.mark.integration
