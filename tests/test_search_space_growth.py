@@ -420,7 +420,29 @@ def test_cmaes_range_change_refused() -> None:
     error = _refusal(study, _phase([], sampler=sampler, param=wide, n_trials=2))
 
     assert "search_space 'lr' changed under CMA-ES" in str(error)
-    assert error.remediation == f"{CMAES_ROUTE}, or {_RENAME}."
+    assert error.remediation == f"{CMAES_ROUTE.format(phase='p')}, or {_RENAME}."
+
+
+def test_the_printed_route_loads_where_an_inheriting_phase_is_refused() -> None:
+    """The step a refusal prints names a phase with no `inherits` and its own `fixed_overrides`, which loads; an inheriting phase over the sampled key does not."""
+    for route in (CHOICES_ROUTE, CMAES_ROUTE):
+        assert "no `inherits`" in route and "`fixed_overrides`" in route
+    parent = _phase(["a", "b"], sampler=Sampler(type="random", seed=0), n_trials=2).model_copy(
+        update={"fixed_overrides": {"wd": 0.1}}
+    )
+    more = Phase(
+        name="q",
+        n_trials=1,
+        gpu_policy="none",
+        sampler=Sampler(type="grid", seed=0),
+        fixed_overrides={"wd": 0.1},
+        search_space={"lr": CategoricalParam(type="categorical", choices=["c"])},
+    )
+
+    make_experiment(phases=[parent, more])
+
+    with pytest.raises(ValueError, match="re-samples key"):
+        make_experiment(phases=[parent, more.model_copy(update={"inherits": ["p"]})])
 
 
 def test_repeat_values_change_refused() -> None:

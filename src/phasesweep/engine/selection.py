@@ -34,6 +34,7 @@ from phasesweep.engine.confound import (
 )
 from phasesweep.engine.errors import TrialEvidenceMissingError, WinnerIntegrityError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
+from phasesweep.engine.growth import STANDALONE_PHASE
 from phasesweep.engine.optuna import (
     _any_objective_unreadable,
     _any_trial_timed_out,
@@ -727,7 +728,8 @@ def _edge_remedy(phase: Phase, param: SearchParam) -> str:
 
     A grid, and an int or float range under random or TPE, grow in place; choices under random
     or TPE and a CMA-ES range cannot (:func:`phasesweep.engine.growth._search_space_growth`),
-    so the values past the end go to an inheriting phase.
+    so the values past the end go to a phase with no ``inherits``: an inheriting phase may not
+    search a key the phase it inherits sampled.
 
     :param Phase phase: The phase whose winner sits on the end.
     :param SearchParam param: The parameter at its configured end.
@@ -737,9 +739,13 @@ def _edge_remedy(phase: Phase, param: SearchParam) -> str:
     if phase.sampler.type == "grid":
         return f"add values beyond the bound to search_space and raise n_trials to the new grid size{kept}"
     if phase.sampler.type == "cmaes":
-        return "add an inheriting seeded random or TPE phase over the wider range"
+        return "add a seeded random or TPE phase over the wider range, " + STANDALONE_PHASE.format(
+            phase=phase.name
+        )
     if isinstance(param, CategoricalParam):
-        return f"add a phase that inherits `{phase.name}` with a grid over values beyond the bound"
+        return "add a phase over values beyond the bound, " + STANDALONE_PHASE.format(
+            phase=phase.name
+        )
     return f"widen the range in search_space and raise n_trials{kept}"
 
 

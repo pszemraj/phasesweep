@@ -39,14 +39,18 @@ from phasesweep.runtime.json import JsonObject
 
 _SEARCH_PARAM: TypeAdapter[SearchParam] = TypeAdapter(SearchParam)
 
-#: The step after choices that cannot grow in place; ``{phase}`` is the grown phase's name.
+#: What a phase that retrains nothing and loads carries: an inheriting phase may not search a key
+#: the phase it inherits sampled, so it takes no ``inherits`` and sets the other values itself.
+#: ``{phase}`` is the phase being grown.
+STANDALONE_PHASE = "with no `inherits` and `{phase}`'s other values set in `fixed_overrides`"
+#: The step after choices that cannot grow in place.
 CHOICES_ROUTE = (
-    "Restore the choices and add a phase that inherits `{phase}` with a grid over only the "
-    "added choices"
+    f"Restore the choices and add a phase over only the added choices, {STANDALONE_PHASE}"
 )
 #: The step after a range that changed under CMA-ES.
 CMAES_ROUTE = (
-    "Restore the range and add an inheriting seeded random or TPE phase over the wider range"
+    f"Restore the range and add a seeded random or TPE phase over the wider range, "
+    f"{STANDALONE_PHASE}"
 )
 
 

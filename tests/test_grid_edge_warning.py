@@ -68,7 +68,8 @@ _GROW_GRID = (
 _WIDEN_RANGE = (
     "; widen the range in search_space and raise n_trials; the study keeps its finished trials"
 )
-_INHERIT_CHOICES = "; add a phase that inherits `p` with a grid over values beyond the bound"
+_STANDALONE = "with no `inherits` and `p`'s other values set in `fixed_overrides`"
+_INHERIT_CHOICES = f"; add a phase over values beyond the bound, {_STANDALONE}"
 
 
 def _edge_warnings(
@@ -174,7 +175,8 @@ def test_edge_warning_uses_the_ordered_numeric_values_tried(
     """Every sampler gets the one rule; only numeric axes with three values tried have edges.
 
     At the bound, a grid and a range under random or TPE grow in place, and choices under random
-    or TPE, which cannot grow, go to an inheriting phase.
+    or TPE, which cannot grow, go to a phase of their own, since an inheriting phase may not
+    search a key its parent sampled.
     """
     values = grid_search_space({"x": param})["x"]
     rows: list[Row] = [({"x": item}, 0.1 if item == value else 0.5) for item in values]
@@ -189,10 +191,10 @@ def test_edge_warning_uses_the_ordered_numeric_values_tried(
     assert warnings == ([] if warning is None else [f"[p] no trial ran {warning}{remedy}"])
 
 
-def test_a_cmaes_range_at_its_bound_goes_to_an_inheriting_phase(
+def test_a_cmaes_range_at_its_bound_goes_to_a_phase_of_its_own(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """CMA-ES cannot widen a recorded range, so the warning names an inheriting phase instead."""
+    """CMA-ES cannot widen a recorded range, so the warning names a phase with no `inherits`."""
     space: dict[str, SearchParam] = {
         "x": FloatParam(type="float", low=0.1, high=0.3, step=0.1),
         "y": FloatParam(type="float", low=0.0, high=1.0),
@@ -204,7 +206,7 @@ def test_a_cmaes_range_at_its_bound_goes_to_an_inheriting_phase(
     ]
     assert _edge_warnings(caplog, space, rows, sampler_type="cmaes") == [
         "[p] no trial ran above the winner's x=0.3 (tried 0.1..0.3, at the configured upper "
-        "bound); add an inheriting seeded random or TPE phase over the wider range"
+        f"bound); add a seeded random or TPE phase over the wider range, {_STANDALONE}"
     ]
 
 
