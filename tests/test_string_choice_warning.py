@@ -19,6 +19,12 @@ _STRING_CHOICES_WARNING = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _wide_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give ``validate`` room to print the warning on one line, so a test reads it whole."""
+    monkeypatch.setenv("COLUMNS", "500")
+
+
 def _write_choices_config(tmp_path: Path, choices: str) -> Path:
     """Write a grid config whose categorical choices are the raw YAML text ``choices``."""
     path = tmp_path / "exp.yaml"
