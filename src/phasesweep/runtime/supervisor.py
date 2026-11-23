@@ -51,12 +51,12 @@ ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 4
 # The controller cancels a trial at its per-trial timeout with this signal instead of
 # SIGTERM, so the guardian can record the timeout apart from a shutdown or a deadline cap.
 TIMEOUT_CANCEL_SIGNAL = signal.SIGUSR1
-# How an attempt ended, as ``ended_by`` records it. Only ``trainer`` carries a return code.
+# The endings the guardian itself records as ``ended_by``, spelled as the package's
+# ``runtime.process.AttemptEnd`` spells them. Only ``trainer`` carries a return code.
 ENDED_BY_TRAINER = "trainer"
 ENDED_BY_CANCELLED = "cancelled"
 ENDED_BY_TIMED_OUT = "timed_out"
 ENDED_BY_NOT_STARTED = "not_started"
-ENDED_BY_GUARDIAN_LOST = "guardian_lost"
 # The one byte the launch child writes to the exec pipe when it fails before ``execve``.
 _NOT_STARTED_BYTE = b"N"
 

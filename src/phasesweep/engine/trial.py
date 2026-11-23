@@ -73,12 +73,16 @@ from phasesweep.runtime.files import atomic_write_text, private_atomic_write_tex
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import (
     TIMEOUT_REASON_PREFIX,
+    AttemptEnd,
     AttemptLifecycle,
     ProcessResult,
     run_supervised,
 )
 
 log = logging.getLogger("phasesweep.engine.trial")
+
+# Endings that leave the trial interrupted: PhaseSweep stopped the trainer, or it never ran.
+_STOPPED_OR_NEVER_STARTED: frozenset[AttemptEnd] = frozenset({"cancelled", "not_started"})
 
 
 @dataclass
@@ -481,10 +485,10 @@ def _trainer_failure_reason(
     :return str | None: The failure reason, or ``None`` when the trainer was interrupted,
         never started, or exited 0.
     """
-    if lifecycle is not None and lifecycle.ended_by in {"cancelled", "not_started"}:
+    ended_by = None if lifecycle is None else lifecycle.ended_by
+    if ended_by in _STOPPED_OR_NEVER_STARTED:
         return None
     recorded_code = trial.user_attrs.get(RETURN_CODE_ATTR)
-    ended_by = None if lifecycle is None else lifecycle.ended_by
     if type(recorded_code) is not int and ended_by is None:
         return None
     recorded_reason = trial.user_attrs.get(FAILURE_REASON_ATTR)

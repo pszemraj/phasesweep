@@ -20,7 +20,7 @@ import time
 from collections.abc import Collection
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import IO, Any, Literal
+from typing import IO, Any, Literal, TypeGuard, get_args
 
 from phasesweep.errors import OperatorAction, PhaseSweepError, UnsafeProcessCleanupError
 from phasesweep.runtime import supervisor as _supervisor
@@ -293,13 +293,16 @@ _ATTEMPT_LIFECYCLE_STATES = frozenset({"allocated", "launching", "terminating", 
 # cap or recovery. ``timed_out``: its per-trial timeout. ``not_started``: the trainer never
 # reached ``execve``. ``guardian_lost``: the guardian exited without leaving a verdict.
 AttemptEnd = Literal["trainer", "cancelled", "timed_out", "not_started", "guardian_lost"]
-_ATTEMPT_ENDINGS: dict[str, AttemptEnd] = {
-    "trainer": "trainer",
-    "cancelled": "cancelled",
-    "timed_out": "timed_out",
-    "not_started": "not_started",
-    "guardian_lost": "guardian_lost",
-}
+_ATTEMPT_ENDINGS: frozenset[str] = frozenset(get_args(AttemptEnd))
+
+
+def _is_attempt_end(value: str) -> TypeGuard[AttemptEnd]:
+    """Return whether a recorded string is one of the :data:`AttemptEnd` values.
+
+    :param str value: The recorded string.
+    :return bool: Whether it names an ending.
+    """
+    return value in _ATTEMPT_ENDINGS
 
 
 @dataclass(frozen=True)
@@ -331,10 +334,9 @@ def _attempt_end(value: object) -> AttemptEnd | None:
     """
     if value is None:
         return None
-    ending = _ATTEMPT_ENDINGS.get(value) if isinstance(value, str) else None
-    if ending is None:
+    if not isinstance(value, str) or not _is_attempt_end(value):
         raise ValueError(f"Unknown attempt ending {value!r}.")
-    return ending
+    return value
 
 
 def write_attempt_lifecycle(
