@@ -268,7 +268,7 @@ def _changed_payload_keys(
                 old.get(key, _ABSENT), new.get(key, _ABSENT), f"{path}.{key}" if path else key
             )
         return changes
-    return [] if old == new else [(path, old, new)]
+    return [] if _same_value(old, new) else [(path, old, new)]
 
 
 def _render_value(value: object) -> str:
@@ -280,6 +280,19 @@ def _render_value(value: object) -> str:
     if value is _ABSENT:
         return "<absent>"
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _same_value(old: object, new: object) -> bool:
+    """Say whether two payload values have the same JSON text, which is what the digest hashes.
+
+    Python equality would equate ``8`` with ``8.0`` and ``1`` with ``True``, values whose
+    fingerprints differ.
+
+    :param object old: Stored payload value, or ``_ABSENT``.
+    :param object new: Current payload value, or ``_ABSENT``.
+    :return bool: Whether both render to the same text.
+    """
+    return _render_value(old) == _render_value(new)
 
 
 def _render_changed_values(old: object, new: object) -> tuple[str, str]:
@@ -585,10 +598,12 @@ def _growth_verdicts(
         recorded or still hold.
     """
     recorded, current = _payload_search_space(recorded_payload), _payload_search_space(payload)
-    if _with_search_space(recorded_payload, current) != payload or set(recorded) != set(current):
+    if _changed_payload_keys(_with_search_space(recorded_payload, current), payload) or set(
+        recorded
+    ) != set(current):
         return None
     verdicts: dict[str, _GrowthVerdict] = {}
-    for key in sorted(key for key in current if recorded[key] != current[key]):
+    for key in sorted(key for key in current if not _same_value(recorded[key], current[key])):
         old, new = recorded[key], current[key]
         if not isinstance(old, dict) or not isinstance(new, dict):
             return None

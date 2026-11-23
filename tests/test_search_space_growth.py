@@ -291,6 +291,16 @@ def test_int_to_float_choice_is_a_removal() -> None:
     assert error.remediation == f"Put back lr 4, 8, or {_RENAME}."
 
 
+def test_respelling_one_value_refuses_naming_both_spellings() -> None:
+    """Respelling `8` as `8.0` changes the digest although Python equates them, so the refusal names the two spellings and offers restoring one."""
+    study = _stamped(_phase([4, 8, 12]))
+    error = _refusal(study, _phase([4, 8.0, 12]))
+
+    assert "[4,8,12] -> [4,8.0,12]" in str(error)
+    assert "fingerprint" not in str(error)
+    assert error.remediation == f"Put back lr 8, or {_RENAME}."
+
+
 @pytest.mark.integration
 def test_dropping_a_value_refuses_and_names_it(tmp_path: Path) -> None:
     """A removal beside an addition refuses before any trial launches, names the dropped value, and leaves the record as it was."""
