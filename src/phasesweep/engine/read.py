@@ -59,7 +59,6 @@ from phasesweep.engine.paths import (
     _generation_summary_path,
     _generation_winner_path,
 )
-from phasesweep.engine.phase import _phase_refusal
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.publication import PublicationPointer, _resolve_publication_pointer
 from phasesweep.engine.publication_validation import ValidatedWinner, _parse_phase_plan
@@ -81,6 +80,7 @@ from phasesweep.engine.selection import (
     _edge_advisory,
     _eligible,
     _no_feasible_remedy,
+    _phase_refusal,
     _rank_groups,
     tie_group_comparisons,
 )
@@ -1085,7 +1085,7 @@ class TrialTable:
     uncounted: tuple[tuple[str, int], ...]
     groups: tuple[RepeatGroupView, ...] = ()
     #: The diagnosis and step a run of the same config would be refused with, from the phase's
-    #: recorded abort or failure streak (:func:`phasesweep.engine.phase._phase_refusal`).
+    #: recorded abort or failure streak (:func:`phasesweep.engine.selection._phase_refusal`).
     refusal: tuple[str, str] | None = None
     #: The metric name and goal the study recorded, which its trial values were measured under;
     #: ``None`` when the phase has no study or the study kept no identity payload.
@@ -1166,7 +1166,7 @@ def phase_refusals(
     :param Experiment experiment: Current config, which decides whether a recorded abort is
         retired.
     :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
-    :return dict[str, PhaseAbortRefusedError]: The refusal :func:`phasesweep.engine.phase._phase_refusal`
+    :return dict[str, PhaseAbortRefusedError]: The refusal :func:`phasesweep.engine.selection._phase_refusal`
         builds, by phase name, for each phase that has one; empty without a readable ledger.
     """
     if not experiment.persistent:

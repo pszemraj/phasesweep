@@ -18,7 +18,11 @@ from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import StudyFingerprintMismatchError, TrialTargetRefusedError
 from phasesweep.engine.preview import validate_trial_targets
-from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
+from phasesweep.engine.selection import (
+    NoFeasibleTrialError,
+    PhaseAbortRefusedError,
+    _streak_at_limit_error,
+)
 from phasesweep.engine.state import PHASE_RECOVERY_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.evidence.models import LogRegexExtractor
@@ -464,7 +468,7 @@ def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> N
         phase, consecutive_failures=2, completion_sequence=2, trial_target=4
     )
 
-    refused = phase_ops._streak_at_limit_error(phase, streak, phase_study(original), dependents=())
+    refused = _streak_at_limit_error(phase, streak, phase_study(original), dependents=())
     message = _operational_error_text(refused)
     assert "has 2 consecutive failed/infeasible trials" in message
     assert "meets max_consecutive_failures=2" in message
@@ -494,7 +498,7 @@ def test_infeasible_streak_advice_sends_a_bounds_change_to_a_new_experiment(
     streak = phase_ops._failure_policy_abort_record(
         phase, consecutive_failures=2, completion_sequence=2, trial_target=4
     )
-    at_limit = phase_ops._streak_at_limit_error(phase, streak, phase_study(original), dependents=())
+    at_limit = _streak_at_limit_error(phase, streak, phase_study(original), dependents=())
 
     for message in map(_operational_error_text, (aborted.value, refused.value, at_limit)):
         _assert_advises_limit(message, 2, 2)

@@ -8,7 +8,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
 from uuid import uuid4
@@ -53,10 +53,10 @@ from phasesweep.engine.progress import (
 from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
-    PhaseAbortRefusedError,
     PhaseTrialsFailedError,
     PhaseTrialsInfeasibleError,
     ReplayWithoutFeasibleTrialError,
+    _phase_refusal,
     select_winner,
 )
 from phasesweep.engine.state import (
@@ -83,11 +83,11 @@ from phasesweep.engine.state import (
     _trial_outcome_payload,
 )
 from phasesweep.engine.study_policy import (
-    _accepted_trial_target,
+    _abort_record,
     _AcceptedPartialDecision,
-    _awaits_cleanup_recovery,
-    _config_retires_abort,
+    _as_sentence,
     _consecutive_failure_threshold_tripped,
+    _failure_policy_abort_record,
     _initialize_study_schema,
     _launch_preflight,
     _load_accepted_partial_decision,
@@ -101,6 +101,7 @@ from phasesweep.engine.study_policy import (
     _record_trial_target,
     _recovery_action,
     _recovery_advice,
+    _replayed_streak_abort,
     _streak_trials_all_infeasible,
     _validate_study_direction,
     _validate_trial_target,
@@ -349,68 +350,6 @@ def _winner_overrides(
     return effective
 
 
-def _failure_policy_abort_record(
-    phase: Phase,
-    *,
-    consecutive_failures: int,
-    completion_sequence: int,
-    trial_target: int,
-) -> JsonObject:
-    """Build a durable consecutive-failure abort record.
-
-    :param Phase phase: Phase supplying ``max_consecutive_failures`` for the
-        recorded threshold and cause message.
-    :param int consecutive_failures: Observed consecutive failure/infeasible
-        count that tripped the policy.
-    :param int completion_sequence: Orchestrator completion sequence at which
-        the trip was observed.
-    :param int trial_target: Durable accepted ``n_trials`` target to attach
-        to the record.
-    :return JsonObject: A ``schema_version=1`` abort record ready to
-        record with the tripping outcome.
-    """
-    return {
-        **_abort_record(
-            policy="max_consecutive_failures",
-            completion_sequence=completion_sequence,
-            trial_target=trial_target,
-            cause=(
-                f"{consecutive_failures} consecutive failed/infeasible trials reached "
-                f"max_consecutive_failures={phase.max_consecutive_failures}."
-            ),
-        ),
-        "threshold": phase.max_consecutive_failures,
-        "consecutive_failures": consecutive_failures,
-    }
-
-
-def _abort_record(
-    *,
-    policy: str,
-    completion_sequence: int,
-    trial_target: int,
-    cause: str,
-) -> JsonObject:
-    """Build the common fields of a durable phase abort record.
-
-    :param str policy: Policy that stopped the phase, such as
-        ``"unsafe_process_cleanup"``.
-    :param int completion_sequence: Completion sequence of the tripping outcome.
-    :param int trial_target: Durable accepted ``n_trials`` target to attach
-        to the record.
-    :param str cause: Explanation the operator reads.
-    :return JsonObject: A ``schema_version=1`` abort record ready to
-        record with the tripping outcome.
-    """
-    return {
-        "schema_version": 1,
-        "policy": policy,
-        "completion_sequence": completion_sequence,
-        "trial_target": trial_target,
-        "cause": cause,
-    }
-
-
 def _abort_decision(
     phase: Phase,
     trial_number: int,
@@ -457,121 +396,6 @@ def _abort_decision(
         completion_sequence=sequence,
         trial_target=phase.n_trials,
     )
-
-
-def _as_sentence(cause: object) -> str:
-    """End a recorded abort cause as a sentence, so the text after it starts a new one.
-
-    :param object cause: A recorded abort cause, which an exception's text may leave unpunctuated.
-    :return str: ``cause`` with a period added unless it already ends in sentence punctuation.
-    """
-    text = str(cause)
-    return text if text.rstrip().endswith((".", "!", "?")) else f"{text}."
-
-
-def _prior_phase_abort_error(
-    phase: Phase, abort_record: JsonObject, study: optuna.Study, *, dependents: Sequence[str]
-) -> PhaseAbortRefusedError:
-    """Build the refusal of a phase whose recorded abort the current config does not retire.
-
-    The advice comes from :func:`~phasesweep.engine.study_policy._recovery_advice` and
-    the action from :func:`~phasesweep.engine.study_policy._recovery_action`.
-
-    :param Phase phase: Phase whose accepted trial target is quoted in the
-        message.
-    :param JsonObject abort_record: Recorded abort; supplies
-        ``trial_target`` and ``cause``.
-    :param optuna.Study study: The phase's study.
-    :param Sequence[str] dependents: The phases that inherit ``phase``.
-    :return PhaseAbortRefusedError: The refusal, for the caller to raise or report.
-    """
-    advice = _recovery_advice(phase, study, abort_record, dependents=dependents)
-    return PhaseAbortRefusedError(
-        f"Phase {phase.name!r} previously aborted at its accepted "
-        f"n_trials={abort_record['trial_target']}: {_as_sentence(abort_record['cause'])}",
-        action=_recovery_action(study, abort_record),
-        remediation=advice,
-    )
-
-
-def _streak_at_limit_error(
-    phase: Phase, abort_record: JsonObject, study: optuna.Study, *, dependents: Sequence[str]
-) -> PhaseAbortRefusedError:
-    """Build the refusal of new work while the resumed failure streak meets the current limit.
-
-    :param Phase phase: Phase whose current ``max_consecutive_failures`` the
-        streak meets.
-    :param JsonObject abort_record: The abort the streak would record, from
-        :func:`_failure_policy_abort_record`; supplies the replayed count and the
-        accepted target.
-    :param optuna.Study study: The phase's study.
-    :param Sequence[str] dependents: The phases that inherit ``phase``.
-    :return PhaseAbortRefusedError: The refusal, for the caller to raise or report.
-    """
-    advice = _recovery_advice(phase, study, abort_record, dependents=dependents)
-    return PhaseAbortRefusedError(
-        f"Phase {phase.name!r} has {abort_record['consecutive_failures']} consecutive "
-        f"failed/infeasible trials, which meets "
-        f"max_consecutive_failures={phase.max_consecutive_failures}.",
-        action=OperatorAction.FIX_CONFIG,
-        remediation=advice,
-    )
-
-
-def _replayed_streak_abort(
-    phase: Phase, study: optuna.Study, policy_state: _PhasePolicyState
-) -> JsonObject | None:
-    """Return the abort a replayed failure streak at the current limit would record.
-
-    :param Phase phase: The phase being judged.
-    :param optuna.Study study: The phase's study.
-    :param _PhasePolicyState policy_state: The study's replayed failure-policy state.
-    :return JsonObject | None: The abort, or ``None`` when one is already recorded, the phase
-        has no work remaining, or the streak is under the limit.
-    """
-    if (
-        policy_state.abort is not None
-        or _finished_trial_count(study.get_trials(deepcopy=False)) >= phase.n_trials
-        or not _consecutive_failure_threshold_tripped(policy_state.consecutive_failures, phase)
-    ):
-        return None
-    return _failure_policy_abort_record(
-        phase,
-        consecutive_failures=policy_state.consecutive_failures,
-        completion_sequence=policy_state.max_sequence,
-        trial_target=_accepted_trial_target(study),
-    )
-
-
-def _phase_refusal(
-    phase: Phase,
-    study: optuna.Study,
-    policy_state: _PhasePolicyState,
-    *,
-    dependents: Sequence[str],
-) -> PhaseAbortRefusedError | None:
-    """Return the refusal a run would raise for the phase's recorded abort or failure streak.
-
-    A recorded abort refuses until the current config retires it or its cleanup recovery runs,
-    and a replayed streak at the current limit refuses until ``n_trials`` exceeds the accepted
-    target. ``run`` raises it and ``status`` prints it, so both give one diagnosis and step.
-
-    :param Phase phase: The phase being judged.
-    :param optuna.Study study: The phase's study.
-    :param _PhasePolicyState policy_state: The study's replayed failure-policy state.
-    :param Sequence[str] dependents: The phases that inherit ``phase``.
-    :return PhaseAbortRefusedError | None: The refusal, or ``None`` when the phase may run.
-    """
-    abort = policy_state.abort
-    if abort is not None and (
-        _awaits_cleanup_recovery(study, abort)
-        or not _config_retires_abort(phase, study.get_trials(deepcopy=False), abort)
-    ):
-        return _prior_phase_abort_error(phase, abort, study, dependents=dependents)
-    streak = _replayed_streak_abort(phase, study, policy_state)
-    if streak is not None and phase.n_trials <= _accepted_trial_target(study):
-        return _streak_at_limit_error(phase, streak, study, dependents=dependents)
-    return None
 
 
 @dataclass(frozen=True)

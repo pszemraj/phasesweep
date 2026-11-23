@@ -126,6 +126,103 @@ def _consecutive_failure_threshold_tripped(consecutive_failures: int, phase: Pha
     return consecutive_failures >= phase.max_consecutive_failures
 
 
+def _abort_record(
+    *,
+    policy: str,
+    completion_sequence: int,
+    trial_target: int,
+    cause: str,
+) -> JsonObject:
+    """Build the common fields of a durable phase abort record.
+
+    :param str policy: Policy that stopped the phase, such as
+        ``"unsafe_process_cleanup"``.
+    :param int completion_sequence: Completion sequence of the tripping outcome.
+    :param int trial_target: Durable accepted ``n_trials`` target to attach
+        to the record.
+    :param str cause: Explanation the operator reads.
+    :return JsonObject: A ``schema_version=1`` abort record ready to
+        record with the tripping outcome.
+    """
+    return {
+        "schema_version": 1,
+        "policy": policy,
+        "completion_sequence": completion_sequence,
+        "trial_target": trial_target,
+        "cause": cause,
+    }
+
+
+def _failure_policy_abort_record(
+    phase: Phase,
+    *,
+    consecutive_failures: int,
+    completion_sequence: int,
+    trial_target: int,
+) -> JsonObject:
+    """Build a durable consecutive-failure abort record.
+
+    :param Phase phase: Phase supplying ``max_consecutive_failures`` for the
+        recorded threshold and cause message.
+    :param int consecutive_failures: Observed consecutive failure/infeasible
+        count that tripped the policy.
+    :param int completion_sequence: Orchestrator completion sequence at which
+        the trip was observed.
+    :param int trial_target: Durable accepted ``n_trials`` target to attach
+        to the record.
+    :return JsonObject: A ``schema_version=1`` abort record ready to
+        record with the tripping outcome.
+    """
+    return {
+        **_abort_record(
+            policy="max_consecutive_failures",
+            completion_sequence=completion_sequence,
+            trial_target=trial_target,
+            cause=(
+                f"{consecutive_failures} consecutive failed/infeasible trials reached "
+                f"max_consecutive_failures={phase.max_consecutive_failures}."
+            ),
+        ),
+        "threshold": phase.max_consecutive_failures,
+        "consecutive_failures": consecutive_failures,
+    }
+
+
+def _as_sentence(cause: object) -> str:
+    """End a recorded abort cause as a sentence, so the text after it starts a new one.
+
+    :param object cause: A recorded abort cause, which an exception's text may leave unpunctuated.
+    :return str: ``cause`` with a period added unless it already ends in sentence punctuation.
+    """
+    text = str(cause)
+    return text if text.rstrip().endswith((".", "!", "?")) else f"{text}."
+
+
+def _replayed_streak_abort(
+    phase: Phase, study: optuna.Study, policy_state: _PhasePolicyState
+) -> JsonObject | None:
+    """Return the abort a replayed failure streak at the current limit would record.
+
+    :param Phase phase: The phase being judged.
+    :param optuna.Study study: The phase's study.
+    :param _PhasePolicyState policy_state: The study's replayed failure-policy state.
+    :return JsonObject | None: The abort, or ``None`` when one is already recorded, the phase
+        has no work remaining, or the streak is under the limit.
+    """
+    if (
+        policy_state.abort is not None
+        or _finished_trial_count(study.get_trials(deepcopy=False)) >= phase.n_trials
+        or not _consecutive_failure_threshold_tripped(policy_state.consecutive_failures, phase)
+    ):
+        return None
+    return _failure_policy_abort_record(
+        phase,
+        consecutive_failures=policy_state.consecutive_failures,
+        completion_sequence=policy_state.max_sequence,
+        trial_target=_accepted_trial_target(study),
+    )
+
+
 @dataclass(frozen=True)
 class _AcceptedPartialDecision:
     """Durable terminal decision to select from an incomplete timed-out phase."""
