@@ -986,8 +986,8 @@ def _phase_header(phase: Phase) -> str:
 def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> None:
     """Render phase summaries and sampler capability lines for ``validate``.
 
-    Each contract line wraps to the terminal under its own prefix, later lines hanging two more
-    columns in, and each warning wraps under its ``warning:`` label.
+    The phase header and each contract line wrap to the terminal under their own prefix, later
+    lines hanging two more columns in, and each warning wraps under its ``warning:`` label.
 
     :param Experiment experiment: Experiment whose phases should be printed.
     :param str indent: Prefix to place before each rendered phase line.
@@ -996,7 +996,8 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
     for phase, lines in experiment_disclosures(experiment):
         prefix = indent
         if phase is not None:
-            click.echo(f"{indent}- {_phase_header(phase)}")
+            header = fit_lines(f"- {_phase_header(phase)}", width - len(indent), hanging="  ")
+            click.echo("\n".join(f"{indent}{part}" for part in header))
             prefix += "    "
         for warning, line in lines:
             if warning:

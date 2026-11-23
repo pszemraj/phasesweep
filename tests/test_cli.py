@@ -597,35 +597,6 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
     assert all("sampler=" not in line for line in result.output.splitlines() if "baseline" in line)
 
 
-def test_validate_names_inherited_phases_without_list_syntax(tmp_path: Path) -> None:
-    """A phase header lists the phases it inherits as bare names, comma-separated."""
-    p = _write_validation_config(
-        tmp_path,
-        """
-        - name: a
-          n_trials: 1
-          fixed_overrides: { x: 1 }
-        - name: b
-          n_trials: 1
-          fixed_overrides: { y: 2 }
-        - name: c
-          inherits: [a]
-          n_trials: 1
-        - name: d
-          inherits: [a, b]
-          n_trials: 1
-        """,
-        phase_name=None,
-    )
-
-    result = CliRunner().invoke(cli_main, ["validate", str(p)])
-
-    assert result.exit_code == 0, result.output
-    assert "- c: n_trials=1 (fixed configuration) inherits=a\n" in result.output
-    assert "- d: n_trials=1 (fixed configuration) inherits=a,b\n" in result.output
-    assert "[" not in result.output
-
-
 def test_validate_says_an_in_memory_phase_cannot_resume(tmp_path: Path) -> None:
     """Without persistent storage the study ends with the process, so no phase line claims a resume."""
     p = _write_validation_config(

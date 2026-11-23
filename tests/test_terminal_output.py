@@ -27,7 +27,7 @@ from tests.conftest import (
     write_experiment_config,
     write_trainer,
 )
-from tests.experiments import write_experiment
+from tests.experiments import phase_payload, write_experiment
 
 _DIAGNOSIS = (
     "Phase 'phase' aborted: 2 consecutive failed/infeasible trials reached "
@@ -239,6 +239,79 @@ def test_validate_prints_a_string_extractor_field_as_configured(
     assert result.exit_code == 0, result.output
     assert f'pattern="{pattern}"' in result.output
     assert 'pattern="say \\"hi\\" (?P<value>\\d+)"' in result.output
+
+
+_LONG_PHASES = [
+    phase_payload(gpu_policy="none", name="first_phase_with_a_long_name"),
+    phase_payload(
+        gpu_policy="none",
+        name="second_phase_with_a_long_name",
+        inherits=["first_phase_with_a_long_name"],
+        search_space={"y": {"type": "int", "low": 0, "high": 3}},
+    ),
+    phase_payload(
+        gpu_policy="none",
+        name="third_phase_with_long_name_and_many_inherits",
+        inherits=["first_phase_with_a_long_name", "second_phase_with_a_long_name"],
+        search_space={"z": {"type": "int", "low": 0, "high": 3}},
+    ),
+]
+_PHASE_HEADERS_AT_80 = [
+    "  - first_phase_with_a_long_name: n_trials=1 sampler=random",
+    "  - second_phase_with_a_long_name: n_trials=1 sampler=random",
+    "    inherits=first_phase_with_a_long_name",
+    "  - third_phase_with_long_name_and_many_inherits: n_trials=1 sampler=random",
+    "    inherits=first_phase_with_a_long_name,second_phase_with_a_long_name",
+]
+_PHASE_HEADERS_AT_60 = [
+    "  - first_phase_with_a_long_name: n_trials=1 sampler=random",
+    "  - second_phase_with_a_long_name: n_trials=1 sampler=random",
+    "    inherits=first_phase_with_a_long_name",
+    "  - third_phase_with_long_name_and_many_inherits: n_trials=1",
+    "    sampler=random",
+    "    inherits=first_phase_with_a_long_name,second_phase_with_a_long_name",
+]
+
+
+@pytest.mark.parametrize(
+    ("columns", "expected"), [(80, _PHASE_HEADERS_AT_80), (60, _PHASE_HEADERS_AT_60)]
+)
+def test_validate_wraps_a_phase_header_hanging_under_its_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, columns: int, expected: list[str]
+) -> None:
+    """A phase header that overruns the terminal breaks at spaces and hangs under the text after its dash, a long name or inherits list staying whole."""
+    config = write_experiment(tmp_path / "exp.yaml", phases=_LONG_PHASES)
+
+    with terminal_stream("stdout", columns) as stdout:
+        assert invoke_cli_boundary(["validate", str(config)], monkeypatch) == 0
+
+    lines = stdout.text.splitlines()
+    first = next(index for index, line in enumerate(lines) if line.startswith("  - "))
+    headers = [line for line in lines[first:] if re.match(r"(  - |    \S)", line)]
+    assert headers == expected
+
+
+def test_validate_names_inherited_phases_without_list_syntax(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A phase header lists the phases it inherits as bare names, comma-separated."""
+    config = write_experiment(
+        tmp_path / "exp.yaml",
+        phases=[
+            {"name": "a", "n_trials": 1, "fixed_overrides": {"x": 1}},
+            {"name": "b", "n_trials": 1, "fixed_overrides": {"y": 2}},
+            {"name": "c", "n_trials": 1, "inherits": ["a"]},
+            {"name": "d", "n_trials": 1, "inherits": ["a", "b"]},
+        ],
+    )
+    monkeypatch.setenv("COLUMNS", "500")
+
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "- c: n_trials=1 (fixed configuration) inherits=a\n" in result.output
+    assert "- d: n_trials=1 (fixed configuration) inherits=a,b\n" in result.output
+    assert "[" not in result.output
 
 
 @pytest.mark.integration
