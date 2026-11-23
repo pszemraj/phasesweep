@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal, NoReturn, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, ParamSpec, TypeVar
 
 import optuna
 import pytest
@@ -72,6 +72,9 @@ from phasesweep.runtime.darwin import read_process_info
 from phasesweep.runtime.files import file_url_path
 from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.runtime.reaper import _read_proc_stat
+
+if TYPE_CHECKING:
+    from tests.recovery_helpers import RerunHarness
 
 # Repository root, derived from the conftest location. Tests that copy/edit
 # the example experiment.yaml read this so they don't hard-code paths.
@@ -1232,3 +1235,21 @@ def wandb_worker_sdk(tmp_path, monkeypatch):
         (apis / "public.py").write_text(textwrap.dedent(source))
 
     return install
+
+
+@pytest.fixture
+def harness(tmp_path: Path) -> Iterator[RerunHarness]:
+    """Yield a harness and kill whatever its runs leave alive.
+
+    :param Path tmp_path: The test's scratch directory.
+    :return Iterator[RerunHarness]: The harness.
+    """
+    # recovery_helpers imports this module, so the class is imported at call time.
+    from tests.recovery_helpers import RerunHarness
+
+    built = RerunHarness(tmp_path)
+    try:
+        yield built
+    finally:
+        built.kill_survivors()
+        built.release()

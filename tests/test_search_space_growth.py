@@ -38,7 +38,7 @@ from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_DIR_ATTR, _recorded_identity
 from phasesweep.runtime.json import dump_json
 from tests.conftest import make_experiment, phase_study, phase_trials, write_trainer
-from tests.test_rerun_real_runs import _Harness, harness  # noqa: F401
+from tests.recovery_helpers import RerunHarness
 
 _ORIGINAL = [1e-4, 3e-4, 1e-3, 3e-3]
 _GROWN = [1e-5, *_ORIGINAL, 1e-2, 3e-2]
@@ -197,7 +197,7 @@ def _gated_phase(values: list[float]) -> Phase:
 
 @pytest.mark.integration
 def test_grown_grid_resumed_after_sigkill_covers_each_new_cell_once(
-    harness: _Harness,  # noqa: F811
+    harness: RerunHarness,
 ) -> None:
     """A grown grid whose run is SIGKILLed on a new cell resumes and measures every cell exactly once."""
     run_experiment(harness.experiment("interrupted", _gated_phase(_ORIGINAL)))
@@ -218,7 +218,7 @@ def test_grown_grid_resumed_after_sigkill_covers_each_new_cell_once(
 
 @pytest.mark.integration
 def test_interrupted_old_cell_reruns_in_place_before_the_grown_cells(
-    harness: _Harness,  # noqa: F811
+    harness: RerunHarness,
 ) -> None:
     """A cell interrupted before its grid grew reruns first, in its source's directory with its params and grid_id, and the grown run then draws every other cell once."""
     original = harness.experiment("interrupted", _gated_phase(_ORIGINAL))
