@@ -80,7 +80,7 @@ phases: list[object] (required)
     # An interrupted attempt reruns as a new attempt with the same command in the same trial directory, so the trainer's own checkpoint-resume logic continues it; the rerun must write its result files again.
     # When the target is reached with no eligible feasible attempt, the phase fails.
     # On persistent storage a raised target runs the remaining attempts in the same study, and a lowered one is refused.
-    # While a phase that inherits from this one, even indirectly, has trials, a run that would add trials here is refused. Give each phase that inherits this one a new `name`, updating every `inherits` to match: this phase keeps its finished trials and runs the rest, and the renamed phases start new studies and run again. A new experiment name reruns every phase.
+    # While a phase that inherits from this one, even indirectly, has trials, a run that would add trials here is refused. Give each phase that inherits this one a new `name`, updating every `inherits` to match: this phase keeps its finished trials and runs the rest, and the renamed phases start new studies and run again. Or run a config without those phases first, then put them back: one whose inherited values come out unchanged keeps its trials. A new experiment name reruns every phase.
     # Recommended: one trial per configuration, spending the budget on more distinct values, such as 7 to 8 log-spaced learning rates.
     # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation for retries, aborts and partial results.
     n_trials: int (required)
@@ -111,6 +111,8 @@ phases: list[object] (required)
     # validate and run --dry-run warn about such an n_trials above 1, and refuse, as a launch does, one above the recorded failed attempts plus one.
     # Empty with repeats: a seed audit, one configuration run once per repeat value.
     # A key whose last component is seed, data_seed or random_state, matched case-sensitively, fails config load, because a searched seed lets noise win.
+    # Once the phase has trials, the search space may only gain values: a grid's numeric choices or ranges may add values (raise n_trials to the new grid size), and a seeded random or tpe int or float range may widen. The study keeps its finished trials and runs only the new configurations.
+    # Removing or changing a recorded value, adding or removing a key, and changing string, boolean or mixed choices, choices under random or tpe, or anything under cmaes are refused as a changed study.
     search_space: map[string, categorical | float | int] = {}
       # Example dotted trainer key; replace optimizer.lr with your parameter name.
       optimizer.lr: categorical | float | int (required)
@@ -184,7 +186,7 @@ phases: list[object] (required)
       # Sampler seed, an integer from 0 to 4294967295, independent of any trainer seed.
       # Requires: set when the phase draws with random, tpe or cmaes on persistent storage.
       # Seeded random, tpe and cmaes draws also use the study name <experiment>::<phase>, so renaming either changes them.
-      # For grid the seed alone fixes the matrix order, which also decides which points a partial grid runs. An unset grid seed orders it as seed 0 does.
+      # For grid the seed alone fixes the matrix order, which also decides which points a partial grid runs. An unset grid seed orders it as seed 0 does. A grid that gains values keeps every drawn point in place and shuffles the rest of the grown grid after them.
       # Unset: random, tpe and cmaes draw unseeded.
       seed: int | null = null
 

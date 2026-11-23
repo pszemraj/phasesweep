@@ -181,7 +181,7 @@ Within `phasesweep.engine`, responsibilities map to modules as follows:
 | Ledger storage: the only module that constructs Optuna storage | `ledger` |
 | Locks and stale-attempt cleanup | `locking`, `attempts`, `cleanup` |
 | Root ownership and retained evidence checks | `artifact_roots`, `evidence` |
-| Paths, state records, and fingerprints | `paths`, `state`, `fingerprints` |
+| Paths, state records, and fingerprints | `paths`, `state`, `fingerprints`, `growth`, `grid_order` |
 | Advisory confound verdicts on the ranked population, frozen at selection | `confound` |
 | Publication and read-only views | `generation`, `publication`, `publication_validation`, `read` |
 
@@ -292,6 +292,9 @@ These have been requested and declined. Check this list before proposing one aga
 - **`init` writing a toy `train.py` beside the config.** A project that already has a `train.py` would hit `init`'s no-overwrite refusal, and `init` would write two files. The local templates run the packaged `phasesweep-fake-train` console script and the mlflow template runs `phasesweep-mlflow-train`.
 - **Dropping the launch preflight's trial-program check.** Without it a missing program fails every trial after its draw is allocated and records each as a failure. The check judges only what it can read without running a shell and never refuses a command it cannot judge; the [trainer contract](config.md#trainer-contract) lists what that is.
 - **A failing exit status when every catalog entry fails to load.** The server starts in its stale-catalog state, where each response names the failing ids and their fix, whether one entry failed or all of them. A catalog that cannot be read as a whole still exits 2.
+- **Growing string, boolean or mixed choice lists in place, or any choices under `random` or `tpe`.** Optuna's journal rejects a changed categorical list: the writing process raises and a process replaying the journal drops the param. Add a phase that inherits the grown one with a grid over only the added choices.
+- **Growing `repeats.values` in place.** Seeded random groups trials by draw position divided by the repeat count, so a new count regroups every recorded trial.
+- **Growing a search space in place under `cmaes`.** CMA-ES uses only params whose distribution is the same in every trial, so a widened param would silently fall back to random sampling for the rest of the study. Add an inheriting seeded `random` or `tpe` phase over the wider range.
 - **`validate` refusing an `n_trials` below a study's recorded target.** `validate` reads the ledger only to refuse a fixed-configuration or grid target above its retry ceiling. A lowered target is a resume refusal, which `run --dry-run` reports with the rest of the launch contract.
 - **A new MCP failure code once `recover-run` settles a `cleanup_uncertain` run.** The code names why the run stopped. Whether a step remains is `recovery_required`, which reads false after recovery, and the `remediation` says that cleanup is settled and that a new run resumes.
 - **Retrying a held lock inside `try_lock_file`.** Only a run taking its experiment locks must outlast a `status` probe. The probe, the GPU leases and the MCP launch and run leases need the immediate answer.
