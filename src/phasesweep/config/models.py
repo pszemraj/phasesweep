@@ -49,7 +49,6 @@ from phasesweep.evidence.models import (
     POSITIONED_EXTRACTOR_KINDS,
     Gate,
     JsonEnvelopeExtractor,
-    JsonExtractor,
     LocalExtractor,
     MlflowExtractor,
     ObjectiveExtractor,
@@ -143,18 +142,42 @@ def _metric_semantics_payload(metric: Metric) -> JsonObject:
     }
 
 
+def _field_text(value: JsonValue) -> str:
+    """Write one extractor field's value, quoted when it holds a space or a quote.
+
+    :param JsonValue value: The value of a dumped extractor field.
+    :return str: A string as is unless it is empty or holds whitespace or a quote, in which case
+        it is quoted; a boolean in lower case; any other value as ``str`` writes it.
+    """
+    if isinstance(value, str):
+        quoted = not value or any(char.isspace() or char in "'\"" for char in value)
+        return repr(value) if quoted else value
+    return str(value).lower() if isinstance(value, bool) else str(value)
+
+
+def _extractor_text(extractor: _Frozen) -> str:
+    """Describe an extractor as its kind, then each field it sets as ``key=value``.
+
+    :param _Frozen extractor: A configured metric or observation extractor.
+    :return str: The kind followed by its set fields in declaration order.
+    """
+    fields = extractor.model_dump(mode="json", exclude_none=True)
+    kind = fields.pop("type")
+    return " ".join([str(kind), *(f"{key}={_field_text(value)}" for key, value in fields.items())])
+
+
 def _metric_scoring_line(metric: Metric) -> str:
     """Describe the metric's name, goal, viability bounds, and extractor config.
 
     :param Metric metric: Configured optimization metric.
     :return str: One line naming the metric, its goal, its viability bounds when set, and
-        its extractor config.
+        its extractor as the kind and its ``key=value`` fields.
     """
     bounds = metric.model_dump(mode="json", include={"min", "max"}, exclude_none=True)
     return (
         f"metric={metric.name!r} goal={metric.goal} "
-        + (f"bounds={bounds} " if bounds else "")
-        + f"extractor={metric.extractor.model_dump(mode='json', exclude_none=True)}"
+        + "".join(f"{key}={value} " for key, value in bounds.items())
+        + f"extractor={_extractor_text(metric.extractor)}"
     )
 
 
@@ -305,19 +328,7 @@ def _observation_line(observation: Observation) -> str:
     :param Observation observation: One configured ``observe`` entry.
     :return str: One line with the observation's name, its source and a report-only marker.
     """
-    extractor = observation.extractor
-    if isinstance(extractor, JsonExtractor):
-        source = f"json {extractor.path} key {extractor.key}"
-    elif isinstance(extractor, JsonEnvelopeExtractor):
-        source = (
-            f"json_envelope {extractor.path} objective {extractor.objective_name} "
-            f"split {extractor.split} policy {extractor.policy}"
-        )
-    else:
-        source = (
-            f"log_regex {extractor.file} pattern {extractor.pattern!r} select {extractor.select}"
-        )
-    return f"observe {observation.name}: {source} (report-only)"
+    return f"observe {observation.name}: {_extractor_text(observation.extractor)} (report-only)"
 
 
 def _evaluation_point_line(metric: Metric) -> str:

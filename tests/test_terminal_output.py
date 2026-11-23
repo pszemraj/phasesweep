@@ -54,10 +54,10 @@ _AT_60 = [
 
 _PAD = " " * 10
 _STARTER_DRY_RUN_AT_80 = [
-    "HH:MM:SS  DRY RUN metric='eval_loss' goal=minimize extractor={'type':",
-    f"{_PAD}'json_envelope', 'path': 'result.json', 'objective_name': 'eval_loss',",
-    f"{_PAD}'split': 'validation', 'policy': 'synthetic', 'checkpoint':",
-    f"{_PAD}'toy_formula', 'expected_step': 100, 'evaluation_axis': 'step'}}",
+    "HH:MM:SS  DRY RUN metric='eval_loss' goal=minimize extractor=json_envelope",
+    f"{_PAD}path=result.json objective_name=eval_loss split=validation",
+    f"{_PAD}policy=synthetic checkpoint=toy_formula expected_step=100",
+    f"{_PAD}evaluation_axis=step",
     "HH:MM:SS  DRY RUN evaluation_point check: supported (axis 'step' from the",
     f"{_PAD}envelope; any other axis from evaluation.progress)",
     "HH:MM:SS  DRY RUN environment: inherit_env=none (digested: PATH, HOME, LANG,",
@@ -186,6 +186,28 @@ def test_a_dry_run_wraps_its_lines_to_the_terminal_and_keeps_its_commands_whole(
         for line in stderr.text.splitlines()
     ]
     assert lines == _STARTER_DRY_RUN_AT_80
+
+
+def test_validate_wraps_its_contract_lines_under_their_prefix_without_dict_syntax(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``validate`` prints the extractor as ``key=value`` words and wraps each line, hanging two columns in."""
+    config = tmp_path / "starter.yaml"
+    assert invoke_cli_boundary(["init", "-o", str(config)], monkeypatch) == 0
+
+    with terminal_stream("stdout", 60) as stdout:
+        assert invoke_cli_boundary(["validate", str(config)], monkeypatch) == 0
+
+    lines = stdout.text.splitlines()
+    assert lines[1:5] == [
+        "  metric='eval_loss' goal=minimize extractor=json_envelope",
+        "    path=result.json objective_name=eval_loss",
+        "    split=validation policy=synthetic checkpoint=toy_formula",
+        "    expected_step=100 evaluation_axis=step",
+    ]
+    assert "{" not in "\n".join(lines[1:5])
+    # The experiment's contract lines up to the trainer cwd, whose path stays whole.
+    assert all(len(line) <= 60 for line in lines[1:11])
 
 
 @pytest.mark.integration

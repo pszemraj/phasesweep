@@ -129,6 +129,7 @@ from phasesweep.runtime.shutdown import (
 from phasesweep.runtime.terminal import (
     command_line,
     display_path,
+    fit_lines,
     plural,
     terminal_width,
     use_color,
@@ -963,9 +964,13 @@ def validate(config_path: Path, settings: tuple[str, ...]) -> None:
 def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> None:
     """Render phase summaries and sampler capability lines for ``validate``.
 
+    Each contract line wraps to the terminal under its own prefix, later lines hanging two more
+    columns in, and each warning wraps under its ``warning:`` label.
+
     :param Experiment experiment: Experiment whose phases should be printed.
     :param str indent: Prefix to place before each rendered phase line.
     """
+    width = terminal_width(sys.stdout)
     for phase, lines in experiment_disclosures(experiment):
         prefix = indent
         if phase is not None:
@@ -976,7 +981,13 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
             click.echo(f"{indent}- {phase.name}: n_trials={phase.n_trials} {sampling}{deps}")
             prefix += "    "
         for warning, line in lines:
-            click.echo(f"{prefix}{'warning: ' if warning else ''}{line}")
+            if warning:
+                shown = wrap_labeled("warning:", line, width, indent=prefix)
+            else:
+                shown = [
+                    f"{prefix}{part}" for part in fit_lines(line, width - len(prefix), hanging="  ")
+                ]
+            click.echo("\n".join(shown))
         if phase is not None:
             _render_phase_comment(phase.comment, prefix=f"{indent}    # ")
 

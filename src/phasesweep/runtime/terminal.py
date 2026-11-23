@@ -158,6 +158,27 @@ def wrap_labeled(label: str, text: str, width: int, *, indent: str = "") -> list
     return lines
 
 
+def fit_lines(message: str, width: int, *, hanging: str = "") -> list[str]:
+    """Draw a message's own lines, wrapping each flush-left one that is wider than ``width``.
+
+    A wrapped line breaks at spaces and its later lines start with ``hanging``; a word wider
+    than the line, such as a path, stays whole. A line that starts with whitespace holds text
+    to copy, such as the example command, so it stays whole.
+
+    :param str message: The text, one logical line per line break.
+    :param int width: Columns available to each line, ``hanging`` included.
+    :param str hanging: Prefix of every wrapped line after the first, defaults to none.
+    :return list[str]: The lines to print, at least one.
+    """
+    lines: list[str] = []
+    for line in message.splitlines() or [""]:
+        if len(line) <= width or line[0].isspace():
+            lines.append(line)
+        else:
+            lines.extend(wrap(line, width, subsequent_indent=hanging))
+    return lines
+
+
 def hang(lead: str, lines: Sequence[str], *, visible: int | None = None) -> list[str]:
     """Put ``lead`` before the first of ``lines`` and blanks as wide as it before each later one.
 

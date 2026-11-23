@@ -242,7 +242,6 @@ The principal test groups and what each covers:
 - TODO(runtime): Use the recorded phase's repeat grouping to rebuild its `trials.csv` after recovery with a renamed or incompatible phase. An interrupted in-memory run also needs its final CSV snapshot taken while the settled study is still available.
 - TODO(runtime): Recover draws whose bookkeeping failed before the trainer started. A fatal pre-launch write can currently spend the draw and require a top-up.
 - TODO(runtime): Print a recovered trial's kept result as a report line in the trial-line style. Recovery logs `Kept completed trial result: …` as a warning, which is the console's only record of the recovered value and carries the `warning:` label for good news.
-- TODO(runtime): Fit `validate`'s contract lines to the terminal and print the extractor without Python dict syntax. `run --dry-run` already wraps the same facts; `validate` prints them as single lines of up to several hundred columns.
 - TODO(runtime): Account for repeated configuration–seed pairs so running the same seed twice does not inflate the pooled noise band's effective sample size.
 - TODO(runtime): Recheck process identity in `_signal_members` so PID reuse between enumeration and signalling cannot redirect a signal to another group.
 - TODO(runtime): Withhold edge advice when a restored journal cannot be matched to the population that selected the published winner.

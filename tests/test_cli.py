@@ -71,6 +71,12 @@ from tests.ledger_fixtures import materialize, published_generation_id
 from tests.recovery_helpers import recover_run_cli
 
 
+@pytest.fixture(autouse=True)
+def _wide_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give ``validate`` room to print each contract line whole, so a test reads it as one line."""
+    monkeypatch.setenv("COLUMNS", "500")
+
+
 @pytest.mark.parametrize(
     ("extractor", "details"),
     [
@@ -1475,6 +1481,7 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """``status --trials`` prints a table per phase, leaves plain status as YAML, and exits alike."""
+    monkeypatch.setenv("COLUMNS", "80")
     materialized = materialize("current-journal", tmp_path, mode="tree")
     config_path = materialized.config_path
     generation_id = published_generation_id(materialized.experiment)

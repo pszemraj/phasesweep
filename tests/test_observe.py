@@ -217,14 +217,14 @@ def test_validate_and_dry_run_name_each_observation(
     config = tmp_path / "experiment.yaml"
     write_experiment_config(config, experiment)
     expected = [
-        "observe heldout_f05: json result.json key heldout_f05 (report-only)",
-        "observe mem: log_regex stdout.log pattern 'mem=(?P<value>[0-9.]+)' select last "
+        "observe heldout_f05: json path=result.json key=heldout_f05 (report-only)",
+        "observe mem: log_regex file=stdout.log pattern=mem=(?P<value>[0-9.]+) select=last "
         "(report-only)",
-        "observe envelope: json_envelope result.json objective loss split test policy final "
-        "(report-only)",
+        "observe envelope: json_envelope path=result.json objective_name=loss split=test "
+        "policy=final evaluation_axis=step (report-only)",
     ]
 
-    result = CliRunner().invoke(cli, ["validate", str(config)])
+    result = CliRunner().invoke(cli, ["validate", str(config)], env={"COLUMNS": "500"})
     assert result.exit_code == 0, result.output
     assert all(f"  {line}\n" in result.output for line in expected)
 

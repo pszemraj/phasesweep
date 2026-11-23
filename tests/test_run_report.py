@@ -743,10 +743,9 @@ def test_a_dry_run_prints_every_info_line_of_the_starter(
     # A later line of a record sits under the text, where the first line has the time.
     lines = [re.sub(r"^(\d\d:\d\d:\d\d| {8})  ", "", line) for line in captured.err.splitlines()]
     assert [line.replace(root, "TMP") for line in lines] == [
-        "DRY RUN metric='eval_loss' goal=minimize extractor={'type': 'json_envelope', "
-        "'path': 'result.json', 'objective_name': 'eval_loss', 'split': 'validation', "
-        "'policy': 'synthetic', 'checkpoint': 'toy_formula', 'expected_step': 100, "
-        "'evaluation_axis': 'step'}",
+        "DRY RUN metric='eval_loss' goal=minimize extractor=json_envelope path=result.json "
+        "objective_name=eval_loss split=validation policy=synthetic checkpoint=toy_formula "
+        "expected_step=100 evaluation_axis=step",
         "DRY RUN evaluation_point check: supported (axis 'step' from the envelope; "
         "any other axis from evaluation.progress)",
         "DRY RUN environment: inherit_env=none (digested: PATH, HOME, LANG, LC_ALL, USER, "
