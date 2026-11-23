@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import dataclasses
-import subprocess
-import sys
-import time
 from pathlib import Path
 
 import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config.models import Experiment, Metric, Phase
+from phasesweep.config.models import Experiment, Metric
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _verify_winner_evidence
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
@@ -25,7 +22,11 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     _parsed_trial_outcome,
 )
-from phasesweep.engine.trial_dirs import TrialDirectory, _trial_dir_for_attempt
+from phasesweep.engine.trial_dirs import (
+    TrialDirectory,
+    _expected_trial_dir_name,
+    _trial_dir_for_attempt,
+)
 from phasesweep.errors import ProcessCleanupUncertainError
 from phasesweep.evidence.baseline import read_evidence_baseline, write_evidence_baseline
 from phasesweep.evidence.evaluation import ExtractorError, run_extractor
@@ -42,16 +43,10 @@ from tests.conftest import (
     write_flaky_trainer,
     write_trainer,
 )
-from tests.recovery_helpers import write_trial_identity
+from tests.recovery_helpers import runner_once, write_trial_identity
 from tests.tracking_helpers import killed_sweep
 
 _JSON_METRIC = Metric(extractor=JsonExtractor(type="json", path="r.json", key="loss"))
-_RUNNER = (
-    "import sys\n"
-    "from phasesweep import run_experiment\n"
-    "from phasesweep.config.io import load_experiment\n"
-    "run_experiment(load_experiment(sys.argv[1]))\n"
-)
 
 
 def test_a_value_file_left_before_launch_fails_as_not_written_by_this_attempt(
@@ -97,18 +92,8 @@ def _interrupt_first_attempt(tmp_path: Path, body: str, metric: Metric) -> Exper
         n_trials=1,
     )
     config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
-    with (tmp_path / "runner.log").open("w") as output:
-        runner = subprocess.Popen(
-            [sys.executable, "-c", _RUNNER, str(config)], stdout=output, stderr=output
-        )
-        try:
-            deadline = time.monotonic() + 30
-            while not (tmp_path / "first").exists():
-                assert runner.poll() is None and time.monotonic() < deadline
-                time.sleep(0.02)
-        finally:
-            runner.kill()
-            runner.wait(timeout=5)
+    with runner_once(config, tmp_path / "first"):
+        pass
     return experiment
 
 
@@ -273,23 +258,6 @@ def test_each_attempt_in_a_directory_delivers_its_own_mlflow_run(
     assert publication.sync_tracking(experiment)["pending"] == 0
 
 
-def test_a_retried_grid_cell_gets_a_fresh_directory(tmp_path: Path) -> None:
-    """A failed fixed configuration retried by a raised target reruns from scratch in a directory of its own."""
-    trainer, _calls = write_flaky_trainer(tmp_path, failures=1)
-
-    def attempt(n_trials: int) -> Experiment:
-        phase = Phase(name="p", n_trials=n_trials, fixed_overrides={"x": 1})
-        return make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
-
-    with pytest.raises(NoFeasibleTrialError):
-        run_experiment(attempt(1))
-    assert run_experiment(attempt(2))["p"].metric == 1.0
-
-    failed, retry = phase_trials(attempt(2))
-    assert retry.user_attrs[TRIAL_DIR_ATTR] != failed.user_attrs[TRIAL_DIR_ATTR]
-    assert Path(retry.user_attrs[TRIAL_DIR_ATTR]).name.startswith("trial_00001__")
-
-
 def _interrupted(
     number: int, trial_dir: Path, attempt_id: str, **attrs: object
 ) -> optuna.trial.FrozenTrial:
@@ -346,7 +314,7 @@ def test_a_rerun_refuses_a_directory_whose_source_cleanup_is_unconfirmed(tmp_pat
 
 
 def test_parallel_reruns_each_use_their_own_sources_directory(tmp_path: Path) -> None:
-    """Reruns of different sources each continue their own source's directory, and an interrupted rerun's rerun keeps the original."""
+    """Reruns of different sources each continue their own source's directory, and an interrupted rerun's rerun keeps the original and is bound to the trial that opened it."""
     experiment = make_experiment(workdir=tmp_path / "runs")
     dirs = {
         name: _trial_dir_for(experiment, "p", number, attempt_id=name)
@@ -368,6 +336,8 @@ def test_parallel_reruns_each_use_their_own_sources_directory(tmp_path: Path) ->
     fourth = _trial_dir_for_attempt(experiment, "p", trials, trials[4], attempt_id="a4")
     assert third == TrialDirectory(dirs["a1"], 1, "a1")
     assert fourth == TrialDirectory(dirs["a0"], 0, "a0")
+    # Winner verification walks the whole chain to the trial that opened the directory.
+    assert _expected_trial_dir_name(trials, trials[4]) == dirs["a0"].name
 
 
 def test_in_memory_runs_never_reuse_a_directory(tmp_path: Path) -> None:

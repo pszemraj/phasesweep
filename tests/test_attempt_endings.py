@@ -6,7 +6,6 @@ import logging
 import os
 import signal
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -33,6 +32,7 @@ from phasesweep.runtime.process import (
     run_supervised,
     write_attempt_lifecycle,
 )
+from phasesweep.runtime.reaper import read_proc_starttime
 from tests.conftest import (
     make_experiment,
     phase_study,
@@ -40,14 +40,7 @@ from tests.conftest import (
     write_experiment_config,
     write_trainer,
 )
-from tests.recovery_helpers import fabricate_stale_trial, write_trial_identity
-
-_RUNNER = (
-    "import sys\n"
-    "from phasesweep import run_experiment\n"
-    "from phasesweep.config.io import load_experiment\n"
-    "run_experiment(load_experiment(sys.argv[1]))\n"
-)
+from tests.recovery_helpers import fabricate_stale_trial, runner_once, write_trial_identity
 
 
 def _outcome(trial: FrozenTrial) -> tuple[str, str | None]:
@@ -187,22 +180,10 @@ def test_a_crash_keeps_its_failure_when_a_ctrl_c_lands_in_the_helper_settle(
         max_consecutive_failures=5,
     )
     config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
-    with (tmp_path / "runner.log").open("w") as output:
-        runner = subprocess.Popen(
-            [sys.executable, "-c", _RUNNER, str(config)], stdout=output, stderr=output
-        )
-        try:
-            deadline = time.monotonic() + 15
-            while not exited.exists():
-                assert runner.poll() is None and time.monotonic() < deadline
-                time.sleep(0.02)
-            time.sleep(0.5)  # the root has exited; its helper keeps the guardian settling
-            runner.send_signal(signal.SIGINT)
-            assert runner.wait(timeout=30) == 128 + signal.SIGINT
-        finally:
-            if runner.poll() is None:
-                runner.kill()
-                runner.wait(timeout=5)
+    with runner_once(config, exited, timeout=15) as runner:
+        time.sleep(0.5)  # the root has exited; its helper keeps the guardian settling
+        runner.send_signal(signal.SIGINT)
+        assert runner.wait(timeout=30) == 128 + signal.SIGINT
     (trial,) = phase_trials(experiment)
     assert _outcome(trial) == ("FAIL", "non-zero exit code 1; stderr: loss went NaN at step 7")
     assert _load_phase_policy_state(phase_study(experiment)).consecutive_failures == 1
@@ -229,29 +210,17 @@ def test_a_crash_whose_runner_was_killed_is_recovered_as_a_failure_that_trips_th
         max_consecutive_failures=1,
     )
     config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
-    with (tmp_path / "runner.log").open("w") as output:
-        runner = subprocess.Popen(
-            [sys.executable, "-c", _RUNNER, str(config)], stdout=output, stderr=output
-        )
-        try:
-            deadline = time.monotonic() + 15
-            while not exited.exists():
-                assert runner.poll() is None and time.monotonic() < deadline
-                time.sleep(0.02)
-            runner.kill()  # the guardian, in a session of its own, still records the exit
-            runner.wait(timeout=5)
-        finally:
-            if runner.poll() is None:
-                runner.kill()
-                runner.wait(timeout=5)
+    with runner_once(config, exited, timeout=15):
+        pass  # killed: the guardian, in a session of its own, still records the exit
     (stale,) = phase_trials(experiment)
     attempt = stale.user_attrs[ATTEMPT_ID_ATTR]
     attempt_dir = _trial_attempt_dir(stale)
     assert attempt_dir is not None
+    deadline = time.monotonic() + 15
     while (
         lifecycle := read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt)
     ) is None or lifecycle.state != "exited":
-        assert time.monotonic() < deadline + 15, "the guardian never recorded the exit"
+        assert time.monotonic() < deadline, "the guardian never recorded the exit"
         time.sleep(0.05)
     assert stale.state.name == "RUNNING" and TRIAL_OUTCOME_ATTR not in stale.user_attrs
 
@@ -279,16 +248,27 @@ def test_a_crash_whose_runner_was_killed_is_recovered_as_a_failure_that_trips_th
 
 
 def test_a_reboot_leaves_its_launching_attempt_interrupted(tmp_path: Path) -> None:
-    """An attempt a reboot cut off, still ``launching`` with an identity from another boot, reruns as interrupted."""
+    """An attempt a reboot cut off, still ``launching`` with an identity from another boot, reruns as interrupted, and the live process that now holds its pid and start time is left alone."""
     experiment = make_experiment(persistent=tmp_path, n_trials=1)
     stale = fabricate_stale_trial(experiment, "p", attempt_id="rebooted")
     write_attempt_lifecycle(stale.attempt_dir, attempt_id="rebooted", state="launching")
-    write_trial_identity(
-        stale.attempt_dir, attempt_id="rebooted", pid=4242, starttime=1, boot_id="previous-boot"
-    )
+    # Only the boot id tells this process from the trainer the identity names.
+    holder = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        write_trial_identity(
+            stale.attempt_dir,
+            attempt_id="rebooted",
+            pid=holder.pid,
+            starttime=read_proc_starttime(holder.pid),
+            boot_id="previous-boot",
+        )
 
-    assert _reap_stale_trials(stale.study, experiment, "p", confirm=True) == 1
+        assert _reap_stale_trials(stale.study, experiment, "p", confirm=True) == 1
 
+        assert holder.poll() is None
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
     trial = stale.study.get_trials(deepcopy=False)[stale.number]
     assert _outcome(trial)[0] == "INTERRUPTED"
     lifecycle = read_attempt_lifecycle(stale.attempt_dir, expected_attempt_id="rebooted")

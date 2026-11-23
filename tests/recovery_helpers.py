@@ -1,7 +1,12 @@
-"""Durable state that stale-trial recovery acts on, and the operator command that acts on it."""
+"""Durable state that stale-trial recovery acts on, the operator command that acts on it, and the runner process a test stops to leave it."""
 
 from __future__ import annotations
 
+import contextlib
+import subprocess
+import sys
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
 
@@ -240,3 +245,41 @@ def recover_run_cli(state_dir: Path | str, run_id: str, *, confirm: bool = False
     """Return the outcome of ``phasesweep mcp recover-run`` run in-process as the operator types it."""
     argv = ["mcp", "recover-run", "--state-dir", str(state_dir), "--run-id", run_id]
     return CliRunner().invoke(cli_main, [*argv, "--confirm"] if confirm else argv)
+
+
+_RUNNER = (
+    "import sys\n"
+    "from phasesweep import run_experiment\n"
+    "from phasesweep.config.io import load_experiment\n"
+    "run_experiment(load_experiment(sys.argv[1]))\n"
+)
+
+
+@contextlib.contextmanager
+def runner_once(
+    config: Path, marker: Path, *, timeout: float = 30
+) -> Iterator[subprocess.Popen[bytes]]:
+    """Run ``config`` in a runner process of its own, and hand it over once ``marker`` exists.
+
+    The runner's output goes to ``runner.log`` beside ``config``. On exit a runner still
+    running is SIGKILLed, so the run it leaves is the one a killed runner leaves.
+
+    :param Path config: Experiment config to run.
+    :param Path marker: File the trainer creates when the runner is to be stopped.
+    :param float timeout: Seconds to wait for ``marker``, defaults to 30.
+    :return Iterator[subprocess.Popen[bytes]]: The runner, while ``marker`` exists.
+    """
+    with (config.parent / "runner.log").open("w") as output:
+        runner = subprocess.Popen(
+            [sys.executable, "-c", _RUNNER, str(config)], stdout=output, stderr=output
+        )
+        try:
+            deadline = time.monotonic() + timeout
+            while not marker.exists():
+                assert runner.poll() is None and time.monotonic() < deadline
+                time.sleep(0.02)
+            yield runner
+        finally:
+            if runner.poll() is None:
+                runner.kill()
+            runner.wait(timeout=5)
