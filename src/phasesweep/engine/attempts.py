@@ -42,6 +42,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     _completed_trainer_duration,
     _parsed_trial_outcome,
+    _required_trial_dir,
     _trial_outcome_payload,
     _unique_trial_outcomes,
 )
@@ -167,10 +168,12 @@ def _trial_dir_from_attr(trial: optuna.trial.FrozenTrial, what: str) -> Path:
         missing or invalid, so identity files cannot be located safely.
     :return Path: Persisted trial directory.
     """
-    stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
-    if not isinstance(stored, str) or not stored:
-        raise _unusable_attribute_error(what, TRIAL_DIR_ATTR, stored)
-    return Path(stored)
+    try:
+        return _required_trial_dir(trial)
+    except ValueError as exc:
+        raise _unusable_attribute_error(
+            what, TRIAL_DIR_ATTR, trial.user_attrs.get(TRIAL_DIR_ATTR)
+        ) from exc
 
 
 def _active_attempt_persistence_error(

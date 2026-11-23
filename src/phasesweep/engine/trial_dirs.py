@@ -28,6 +28,8 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     RERUN_OF_ATTR,
     TRIAL_DIR_ATTR,
+    _recorded_trial_dir,
+    _required_trial_dir,
     _trial_interrupted,
 )
 from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
@@ -43,19 +45,36 @@ def _directory_owner(trials: Mapping[int, FrozenTrial], trial: FrozenTrial) -> F
 
     :param Mapping[int, FrozenTrial] trials: The study's trials by number.
     :param FrozenTrial trial: The trial about to launch, or one already launched.
+    :raises ProcessCleanupUncertainError: An interrupted source's recorded directory is malformed.
     :return FrozenTrial: The earliest such trial, ``trial`` itself when it is no such rerun.
     """
     owner = trial
     while True:
         source_number = owner.user_attrs.get(RERUN_OF_ATTR)
         source = trials.get(source_number) if type(source_number) is int else None
-        if (
-            source is None
-            or not _trial_interrupted(source)
-            or not isinstance(source.user_attrs.get(TRIAL_DIR_ATTR), str)
-        ):
+        if source is None or not _trial_interrupted(source):
+            return owner
+        try:
+            recorded = _recorded_trial_dir(source)
+        except ValueError as exc:
+            raise _unusable_directory_error(source, exc) from exc
+        if recorded is None:
             return owner
         owner = source
+
+
+def _unusable_directory_error(owner: FrozenTrial, exc: ValueError) -> ProcessCleanupUncertainError:
+    """Refuse a rerun whose source recorded a directory it cannot be found by.
+
+    :param FrozenTrial owner: The trial whose recorded directory is unusable.
+    :param ValueError exc: Why it is unusable.
+    :return ProcessCleanupUncertainError: Error routed to restoring the ledger.
+    """
+    return ProcessCleanupUncertainError(
+        f"Trial {owner.number} records an unusable {TRIAL_DIR_ATTR!r}, so its rerun "
+        f"cannot find the directory it continues in: {exc}.",
+        action=OperatorAction.RESTORE_LEDGER,
+    )
 
 
 class TrialDirectory(NamedTuple):
@@ -71,21 +90,17 @@ def _owner_directory(phase_dir: Path, owner: FrozenTrial) -> TrialDirectory:
 
     :param Path phase_dir: The phase directory, which may have moved since.
     :param FrozenTrial owner: A trial that recorded its directory.
-    :raises ProcessCleanupUncertainError: The recorded directory is not a name PhaseSweep builds.
+    :raises ProcessCleanupUncertainError: The recorded directory is malformed or not a name
+        PhaseSweep builds.
     :return TrialDirectory: The directory, its opener's number and attempt.
     """
     try:
-        name = _valid_trial_dir_name(
-            Path(str(owner.user_attrs[TRIAL_DIR_ATTR])).name, label="trial directory"
-        )
+        # The name carries the opener's number and attempt, which the trainer sees.
+        name = _valid_trial_dir_name(_required_trial_dir(owner).name, label="trial directory")
         number, _, attempt_id = name.removeprefix("trial_").partition("__")
         return TrialDirectory(phase_dir / name, int(number), attempt_id)
     except ValueError as exc:
-        raise ProcessCleanupUncertainError(
-            f"Trial {owner.number} records an unusable {TRIAL_DIR_ATTR!r}, so its rerun "
-            f"cannot find the directory it continues in: {exc}.",
-            action=OperatorAction.RESTORE_LEDGER,
-        ) from exc
+        raise _unusable_directory_error(owner, exc) from exc
 
 
 def _expected_trial_dir_name(trials: Mapping[int, FrozenTrial], trial: FrozenTrial) -> str | None:

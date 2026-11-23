@@ -601,8 +601,9 @@ def _trial_lifecycle(trial: FrozenTrial | Trial) -> AttemptLifecycle | None:
     """Read the attempt lifecycle record in the directory a trial recorded for its attempt.
 
     :param FrozenTrial | Trial trial: Trial whose directory and attempt id attributes name the record.
-    :raises ValueError: The record is unreadable, malformed or belongs to another attempt. A
-        caller that acts on the process treats that as cleanup uncertainty, not as absence.
+    :raises ValueError: The recorded trial directory is malformed, or the record is
+        unreadable, malformed or belongs to another attempt. A caller that acts on the process
+        treats that as cleanup uncertainty, not as absence.
     :return AttemptLifecycle | None: The validated record, or ``None`` when the trial recorded
         no directory or attempt id, or its directory holds no record.
     """
@@ -619,6 +620,7 @@ def _trial_attempt_dir(trial: FrozenTrial | Trial) -> Path | None:
     """Return the records directory of the attempt a trial recorded, beside its trial directory.
 
     :param FrozenTrial | Trial trial: Trial whose directory and attempt id attributes name it.
+    :raises ValueError: The recorded trial directory is malformed.
     :return Path | None: The attempt directory, or ``None`` when either attribute is missing.
     """
     from phasesweep.engine.paths import _attempt_dir
@@ -733,13 +735,34 @@ def _stands_under_winner(trial: FrozenTrial, standing: Mapping[int, str | None])
 
 
 def _recorded_trial_dir(trial: FrozenTrial | Trial) -> Path | None:
-    """Return the trial directory a trial recorded when it launched.
+    """Return the trial directory a trial recorded when it launched, if it recorded one.
 
     :param FrozenTrial | Trial trial: Trial to read.
-    :return Path | None: The directory, or ``None`` when none was recorded.
+    :raises ValueError: The attribute is present but malformed (:func:`_required_trial_dir`);
+        a damaged record is never read as no record.
+    :return Path | None: The directory, or ``None`` when the attribute is absent.
     """
-    directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
-    return Path(directory) if isinstance(directory, str) and directory else None
+    if TRIAL_DIR_ATTR not in trial.user_attrs:
+        return None
+    return _required_trial_dir(trial)
+
+
+def _required_trial_dir(trial: FrozenTrial | Trial) -> Path:
+    """Return the trial directory a trial recorded when it launched.
+
+    PhaseSweep records the absolute path of the directory it built, so any other value is a
+    damaged ledger.
+
+    :param FrozenTrial | Trial trial: Trial to read.
+    :raises ValueError: The attribute is absent, or not a non-empty absolute path string.
+    :return Path: The directory.
+    """
+    stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
+    if not isinstance(stored, str) or not stored or not Path(stored).is_absolute():
+        raise ValueError(
+            f"its {TRIAL_DIR_ATTR!r} user attribute is missing or invalid ({stored!r})"
+        )
+    return Path(stored)
 
 
 GENERATION_SUMMARY_SCHEMA_VERSION = 7

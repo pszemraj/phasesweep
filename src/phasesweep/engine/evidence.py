@@ -26,6 +26,7 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
     Winner,
+    _required_trial_dir,
     constraint_attr,
 )
 from phasesweep.engine.trial_dirs import _expected_trial_dir_name
@@ -688,21 +689,23 @@ def _validate_selection_evidence(
                 f"Study {study.study_name!r} phase {phase_name!r} trial {trial.number} "
                 "is eligible to win selection but"
             )
-            stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
-            if not isinstance(stored, str) or not stored or not Path(stored).is_absolute():
+            try:
+                recorded = _required_trial_dir(trial).name
+            except ValueError:
                 raise TrialEvidenceMissingError(
                     f"{subject} records an invalid {TRIAL_DIR_ATTR!r} user attribute "
-                    f"{stored!r}, so its evidence cannot be located."
-                )
+                    f"{trial.user_attrs.get(TRIAL_DIR_ATTR)!r}, so its evidence cannot be "
+                    "located."
+                ) from None
             # Identity binding: the persisted directory name must be exactly the one
             # _trial_dir_for builds for the trial and attempt that opened it, this trial's
             # own or, for a rerun that continued an interrupted trial, that trial's. A name
             # that disagrees means the study record and the directory are not describing
             # the same execution.
             expected_name = _expected_trial_dir_name(trials, trial)
-            if expected_name is None or Path(stored).name != expected_name:
+            if expected_name is None or recorded != expected_name:
                 raise TrialEvidenceMissingError(
-                    f"{subject} records evidence directory {Path(stored).name!r}, which does "
+                    f"{subject} records evidence directory {recorded!r}, which does "
                     f"not name the attempt that opened it (expected {expected_name!r})."
                 )
             verification.verify_trial(
