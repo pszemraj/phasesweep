@@ -62,7 +62,7 @@ Row = tuple[dict[str, JsonValue], float | str]
 """One trial: its params, and its metric or the state ``fail``, ``infeasible`` or ``interrupted``."""
 
 _GROW_GRID = (
-    "; add values beyond the bound to search_space and raise n_trials to the new grid size; "
+    "; add values beyond the bound to search_space and raise n_trials to cover the enlarged grid; "
     "the study keeps its finished trials"
 )
 _WIDEN_RANGE = (
@@ -79,6 +79,7 @@ def _edge_warnings(
     *,
     sampler_type: str = "random",
     repeats: Repeats | None = None,
+    persistent: bool = True,
 ) -> list[str]:
     """Select a winner over ``rows`` in phase ``p`` and return its untried-beyond warnings."""
     phase = Phase(
@@ -89,7 +90,7 @@ def _edge_warnings(
         repeats=repeats,
         allow_partial_grid=sampler_type == "grid" and repeats is None,
     )
-    experiment = make_experiment(phases=[phase])
+    experiment = make_experiment(phases=[phase], storage="auto" if persistent else None)
     study = optuna.create_study(direction="minimize")
     for number, (params, outcome) in enumerate(rows):
         distributions = {
@@ -189,6 +190,43 @@ def test_edge_warning_uses_the_ordered_numeric_values_tried(
         else _WIDEN_RANGE
     )
     assert warnings == ([] if warning is None else [f"[p] no trial ran {warning}{remedy}"])
+
+
+@pytest.mark.parametrize(
+    ("choices", "sampler_type", "persistent", "remedy"),
+    [
+        ([1, 2.5, 3], "grid", True, _INHERIT_CHOICES),
+        (
+            [1, 2, 3],
+            "grid",
+            False,
+            "; extend search_space beyond the bound and raise n_trials to the new grid size "
+            "and rerun; storage: null keeps no completed trials between runs",
+        ),
+        (
+            [1, 2, 3],
+            "tpe",
+            False,
+            "; extend search_space beyond the bound and rerun; "
+            "storage: null keeps no completed trials between runs",
+        ),
+    ],
+)
+def test_edge_remedy_can_extend_the_axis_under_the_configured_storage(
+    caplog: pytest.LogCaptureFixture,
+    choices: list[int | float],
+    sampler_type: str,
+    persistent: bool,
+    remedy: str,
+) -> None:
+    """Mixed numeric grid choices need a new persistent phase; volatile studies start over."""
+    param = CategoricalParam(type="categorical", choices=choices)
+    rows: list[Row] = [({"x": x}, 0.1 if x == 1 else 0.5) for x in choices]
+    assert _edge_warnings(
+        caplog, {"x": param}, rows, sampler_type=sampler_type, persistent=persistent
+    ) == [
+        f"[p] no trial ran below the winner's x=1 (tried 1..3, at the configured lower bound){remedy}"
+    ]
 
 
 def test_a_cmaes_range_at_its_bound_goes_to_a_phase_of_its_own(

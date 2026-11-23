@@ -34,7 +34,7 @@ from phasesweep.engine.confound import (
 )
 from phasesweep.engine.errors import TrialEvidenceMissingError, WinnerIntegrityError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
-from phasesweep.engine.growth import STANDALONE_PHASE
+from phasesweep.engine.growth import STANDALONE_PHASE, _grid_kind
 from phasesweep.engine.optuna import (
     _any_objective_unreadable,
     _any_trial_timed_out,
@@ -80,6 +80,7 @@ from phasesweep.engine.study_policy import (
 )
 from phasesweep.errors import (
     FRESH_STUDY,
+    STORAGE_NULL_KEEPS_NOTHING,
     OperatorAction,
     PhaseSweepError,
     as_sentence,
@@ -539,7 +540,12 @@ def select_winner(
         # show-winners command as typed, which prints each flagged check's counts and remedy.
         log.warning("[%s] %s", phase_name or study.study_name, "; ".join(flagged))
     if phase is not None and emit_advisories:
-        edge = _edge_advisory(phase, trials, best.params if winning is None else winning.params)
+        edge = _edge_advisory(
+            phase,
+            trials,
+            best.params if winning is None else winning.params,
+            persistent=experiment.persistent,
+        )
         if edge is not None:
             log.warning("[%s] %s", phase.name, edge)
         if winning is not None and ranking is not None and phase.cost_key is not None:
@@ -669,7 +675,11 @@ def _at_configured_end(param: SearchParam, value: float, end: float) -> bool:
 
 
 def _edge_advisory(
-    phase: Phase, trials: Sequence[optuna.trial.FrozenTrial], params: Mapping[str, object]
+    phase: Phase,
+    trials: Sequence[optuna.trial.FrozenTrial],
+    params: Mapping[str, object],
+    *,
+    persistent: bool,
 ) -> str | None:
     """Say which searched numeric parameters no finished trial tried beyond the winner's value.
 
@@ -678,12 +688,14 @@ def _edge_advisory(
     or all-numeric categorical choices) with at least three distinct values across the trials
     that finished, COMPLETE, INFEASIBLE or FAIL, whose winning value is the lowest or highest of
     them. A failed or infeasible trial beyond the winner counts as tried, and an interrupted one
-    tried nothing. Boolean and mixed choices have no order; the repeat axis is not searched.
+    tried nothing. Choices containing booleans or strings have no numeric order. The repeat
+    axis is not searched.
 
     :param Phase phase: Configured search space.
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
     :param Mapping[str, object] params: The winning configuration's params; for a repeats
         phase, the winning group's.
+    :param bool persistent: Whether subsequent runs can keep the finished trials.
     :return str | None: One clause per such parameter, naming the values tried and whether the
         winner sits on the configured end, then how to search past each configured end
         reached; ``None`` when no parameter qualifies.
@@ -717,28 +729,34 @@ def _edge_advisory(
             f"(tried {param_text(tried[0])}..{param_text(tried[-1])}, {place})"
         )
         if at_end:
-            remedies[_edge_remedy(phase, param)] = None
+            remedies[_edge_remedy(phase, param, persistent=persistent)] = None
     if not clauses:
         return None
     return "; ".join(["no trial ran " + " or ".join(clauses), *remedies])
 
 
-def _edge_remedy(phase: Phase, param: SearchParam) -> str:
-    """Say how to search past a configured end the winner sits on, without retraining.
+def _edge_remedy(phase: Phase, param: SearchParam, *, persistent: bool) -> str:
+    """Say how to search beyond the configured end the winner sits on.
 
-    A grid, and an int or float range under random or TPE, grow in place; choices under random
-    or TPE and a CMA-ES range cannot (:func:`phasesweep.engine.growth._search_space_growth`),
-    so the values past the end go to a phase with no ``inherits``: an inheriting phase may not
-    search a key the phase it inherits sampled.
+    A persistent grid's int or float axis and a range under random or TPE can grow in place.
+    An axis Optuna records as categorical or a CMA-ES range needs a separate phase to keep
+    the earlier trials. An in-memory run can change its original phase and starts over.
 
     :param Phase phase: The phase whose winner sits on the end.
     :param SearchParam param: The parameter at its configured end.
+    :param bool persistent: Whether subsequent runs can keep the finished trials.
     :return str: The remedy clause.
     """
+    sampler = phase.sampler.type
+    if not persistent:
+        target = " and raise n_trials to the new grid size" if sampler == "grid" else ""
+        return (
+            f"extend search_space beyond the bound{target} and rerun; {STORAGE_NULL_KEEPS_NOTHING}"
+        )
     kept = "; the study keeps its finished trials"
-    if phase.sampler.type == "grid":
-        return f"add values beyond the bound to search_space and raise n_trials to the new grid size{kept}"
-    if phase.sampler.type == "cmaes":
+    if sampler == "grid" and _grid_kind(param) != "categorical":
+        return f"add values beyond the bound to search_space and raise n_trials to cover the enlarged grid{kept}"
+    if sampler == "cmaes":
         return "add a seeded random or TPE phase over the wider range, " + STANDALONE_PHASE.format(
             phase=phase.name
         )

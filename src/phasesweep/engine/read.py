@@ -600,7 +600,12 @@ def winner_advisories(
         and winner.finished_trials is not None
         and winner.finished_trials <= len(finished)
     ):
-        edge = _edge_advisory(phase, finished[: winner.finished_trials], winner.params)
+        edge = _edge_advisory(
+            phase,
+            finished[: winner.finished_trials],
+            winner.params,
+            persistent=experiment.persistent,
+        )
         edge_status = "not_at_edge" if edge is None else "available"
     return WinnerAdvisories(
         cost_advisory=cost,

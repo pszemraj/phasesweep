@@ -1448,7 +1448,8 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
     # The failed trials at x=5 and x=6 count as tried, so the winner's x=0 is the lowest of four.
     assert warnings[1:] == [
         "[p] no trial ran below the winner's x=0 (tried 0..6, at the configured lower bound); "
-        "widen the range in search_space and raise n_trials; the study keeps its finished trials"
+        "extend search_space beyond the bound and rerun; "
+        "storage: null keeps no completed trials between runs"
     ]
     # One warning per phase: each flagged check's sentence, stating the fact alone.
     assert warnings[0] == (
