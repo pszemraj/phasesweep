@@ -127,6 +127,7 @@ from phasesweep.runtime.shutdown import (
     install_signal_handlers,
 )
 from phasesweep.runtime.terminal import (
+    ReportFields,
     command_line,
     display_path,
     fit_lines,
@@ -1001,11 +1002,15 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
             prefix += "    "
         for warning, line in lines:
             if warning:
-                shown = wrap_labeled("warning:", line, width, indent=prefix)
+                shown = wrap_labeled("warning:", str(line), width, indent=prefix)
             else:
-                shown = [
-                    f"{prefix}{part}" for part in fit_lines(line, width - len(prefix), hanging="  ")
-                ]
+                room = width - len(prefix)
+                parts = (
+                    line.render(room, color=False, hanging="  ")
+                    if isinstance(line, ReportFields)
+                    else fit_lines(line, room, hanging="  ")
+                )
+                shown = [f"{prefix}{part}" for part in parts]
             click.echo("\n".join(shown))
         if phase is not None:
             _render_phase_comment(phase.comment, prefix=f"{indent}    # ")

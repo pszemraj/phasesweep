@@ -213,18 +213,22 @@ def test_validate_wraps_its_contract_lines_under_their_prefix_without_dict_synta
     assert all(len(line) <= 60 for line in lines[1:11])
 
 
-def test_validate_prints_a_string_extractor_field_as_configured(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("dry_run", [False, True], ids=["validate", "dry-run"])
+def test_launch_contract_keeps_extractor_literals_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool
 ) -> None:
-    """A field with whitespace is in double quotes with its backslashes as written, so it pastes back into a config."""
-    pattern = r"throughput \{tok/s\}: (?P<value>\d+\.\d+) \[avg over last 100 steps\]"
+    """Narrow terminals keep literal spaces, quotes and backslashes in each extractor field."""
+    pattern = r"throughput \{tok/s\}:  (?P<value>\d+\.\d+) \[avg over last 100 steps\]"
     quoted = r'say "hi" (?P<value>\d+)'
+    multiline = "score:\n  " + r"(?P<value>\d+)"
     config = write_experiment(
         tmp_path / "exp.yaml",
+        metric={"extractor": {"type": "log_regex", "pattern": pattern}},
+        phases=[phase_payload(gpu_policy="none")],
         observe=[
             {
-                "name": "tps",
-                "extractor": {"type": "log_regex", "file": "stdout.log", "pattern": pattern},
+                "name": "multiline",
+                "extractor": {"type": "log_regex", "file": "stdout.log", "pattern": multiline},
             },
             {
                 "name": "greeting",
@@ -232,13 +236,15 @@ def test_validate_prints_a_string_extractor_field_as_configured(
             },
         ],
     )
-    monkeypatch.setenv("COLUMNS", "500")
+    monkeypatch.setenv("COLUMNS", "40")
 
-    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+    command = ["run", str(config), "--dry-run"] if dry_run else ["validate", str(config)]
+    result = CliRunner().invoke(cli_main, command)
 
     assert result.exit_code == 0, result.output
     assert f'pattern="{pattern}"' in result.output
     assert 'pattern="say \\"hi\\" (?P<value>\\d+)"' in result.output
+    assert f"pattern={multiline!r}" in result.output
 
 
 _LONG_PHASES = [

@@ -76,6 +76,7 @@ from phasesweep.runtime.files import (
     local_storage_url,
 )
 from phasesweep.runtime.json import JsonObject
+from phasesweep.runtime.terminal import ReportFields
 from phasesweep.tracking.models import MlflowSettings
 
 OverrideFormat = Literal["yaml_file", "argparse", "hydra", "json_file"]
@@ -146,48 +147,56 @@ def _field_text(value: JsonValue) -> str:
     """Write one extractor field's value as configured, in double quotes when it needs them.
 
     :param JsonValue value: The value of a dumped extractor field.
-    :return str: A string as is unless it is empty or holds whitespace or a double quote, in
-        which case it is in double quotes with only an embedded double quote escaped, so a regex
-        keeps its backslashes; a boolean in lower case; any other value as ``str`` writes it.
+    :return str: A multiline string as an escaped literal; a single-line string as is unless
+        empty or holding whitespace or a double quote, in which case double quotes enclose it
+        and its backslashes stay as written; a boolean in lower case; any other value as
+        ``str`` writes it.
     """
     if isinstance(value, str):
+        if value and value.splitlines() != [value]:
+            return repr(value)
         if value and not any(char.isspace() or char == '"' for char in value):
             return value
         return '"' + value.replace('"', '\\"') + '"'
     return str(value).lower() if isinstance(value, bool) else str(value)
 
 
-def _extractor_text(extractor: _Frozen) -> str:
-    """Describe an extractor as its kind, then each field it sets as ``key=value``.
+def _extractor_fields(extractor: _Frozen) -> tuple[str, ...]:
+    """Describe an extractor as the individual fields of its launch contract.
 
     :param _Frozen extractor: A configured metric or observation extractor.
-    :return str: The kind followed by its set fields in declaration order.
+    :return tuple[str, ...]: The kind followed by set ``key=value`` fields in declaration order.
     """
     fields = extractor.model_dump(mode="json", exclude_none=True)
     kind = fields.pop("type")
-    return " ".join([str(kind), *(f"{key}={_field_text(value)}" for key, value in fields.items())])
+    return (str(kind), *(f"{key}={_field_text(value)}" for key, value in fields.items()))
 
 
-def _metric_scoring_line(metric: Metric) -> str:
+def _metric_scoring_line(metric: Metric) -> ReportFields:
     """Describe the metric's name, goal, viability bounds, and extractor config.
 
     :param Metric metric: Configured optimization metric.
-    :return str: One line naming the metric, its goal, its viability bounds when set, and
+    :return ReportFields: A line naming the metric, its goal, its viability bounds when set, and
         its extractor as the kind and its ``key=value`` fields.
     """
     bounds = metric.model_dump(mode="json", include={"min", "max"}, exclude_none=True)
-    return (
-        f"metric={metric.name!r} goal={metric.goal} "
-        + "".join(f"{key}={value} " for key, value in bounds.items())
-        + f"extractor={_extractor_text(metric.extractor)}"
+    kind, *fields = _extractor_fields(metric.extractor)
+    return ReportFields(
+        (
+            f"metric={metric.name!r}",
+            f"goal={metric.goal}",
+            *(f"{key}={value}" for key, value in bounds.items()),
+            f"extractor={kind}",
+            *fields,
+        )
     )
 
 
-def experiment_contract_lines(experiment: Experiment) -> list[str]:
+def experiment_contract_lines(experiment: Experiment) -> list[str | ReportFields]:
     """List the experiment-level contract lines that ``validate`` and ``run --dry-run`` print.
 
     :param Experiment experiment: Loaded experiment.
-    :return list[str]: One line per experiment-wide contract, in print order.
+    :return list[str | ReportFields]: One line per experiment-wide contract, in print order.
     """
     return [
         _metric_scoring_line(experiment.metric),
@@ -230,7 +239,7 @@ def experiment_warnings(experiment: Experiment) -> list[str]:
 
 def experiment_disclosures(
     experiment: Experiment,
-) -> Iterator[tuple[Phase | None, list[tuple[bool, str]]]]:
+) -> Iterator[tuple[Phase | None, list[tuple[bool, str | ReportFields]]]]:
     """Yield shared contract and warning lines in their display order.
 
     The experiment block comes first, followed by one block per configured
@@ -238,7 +247,7 @@ def experiment_disclosures(
     each line's boolean marks advisory warnings without prescribing a sink.
 
     :param Experiment experiment: Loaded experiment to describe.
-    :return Iterator[tuple[Phase | None, list[tuple[bool, str]]]]: Context and
+    :return Iterator[tuple[Phase | None, list[tuple[bool, str | ReportFields]]]]: Context and
         ordered warning/content pairs; ``None`` identifies the experiment block.
     """
     yield (
@@ -324,13 +333,20 @@ def _argparse_boolean_flags(experiment: Experiment) -> list[str]:
     return flags
 
 
-def _observation_line(observation: Observation) -> str:
+def _observation_line(observation: Observation) -> ReportFields:
     """Describe one report-only observation's name and scalar source.
 
     :param Observation observation: One configured ``observe`` entry.
-    :return str: One line with the observation's name, its source and a report-only marker.
+    :return ReportFields: A line with the observation's name, source and report-only marker.
     """
-    return f"observe {observation.name}: {_extractor_text(observation.extractor)} (report-only)"
+    return ReportFields(
+        (
+            "observe",
+            f"{observation.name}:",
+            *_extractor_fields(observation.extractor),
+            "(report-only)",
+        )
+    )
 
 
 def _evaluation_point_line(metric: Metric) -> str:

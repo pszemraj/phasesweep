@@ -1132,11 +1132,11 @@ def test_metric_bounds_are_optional_finite_and_ordered() -> None:
     with pytest.raises(ValidationError, match="must be numbers, not booleans"):
         metric(max=True)
 
-    plain = experiment_contract_lines(make_experiment(metric=unbounded))[0]
-    bounded = experiment_contract_lines(make_experiment(metric=metric(min=0.5, max=2)))[0]
+    plain = str(experiment_contract_lines(make_experiment(metric=unbounded))[0])
+    bounded = str(experiment_contract_lines(make_experiment(metric=metric(min=0.5, max=2)))[0])
     assert "max=" not in plain and "min=" not in plain
     assert " max=2.0 min=0.5 " in bounded
-    only_max = experiment_contract_lines(make_experiment(metric=metric(max=2)))[0]
+    only_max = str(experiment_contract_lines(make_experiment(metric=metric(max=2)))[0])
     assert " max=2.0 " in only_max and "min=" not in only_max
 
 

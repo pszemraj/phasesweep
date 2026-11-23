@@ -75,6 +75,7 @@ from phasesweep.runtime.shutdown import (
     service_pending_shutdown,
     signal_handler_scope,
 )
+from phasesweep.runtime.terminal import ReportFields
 
 if TYPE_CHECKING:
     from phasesweep.tracking.session import DeliveryTally
@@ -729,6 +730,8 @@ def _run_experiment_inner(
             for warning, line in lines:
                 if warning:
                     warn_dry_run("%s", line)
+                elif isinstance(line, ReportFields):
+                    report.info(ReportFields(("DRY RUN", *line.fields)))
                 else:
                     report.info("DRY RUN %s", line)
         preloaded_winners = resume_ops._preflight_skipped_winners(
