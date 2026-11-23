@@ -291,6 +291,37 @@ def test_validate_wraps_a_phase_header_hanging_under_its_text(
     assert headers == expected
 
 
+def test_validate_wraps_a_warning_under_its_label_at_80_columns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A long warning breaks at spaces and hangs under the text after ``warning:``."""
+    choices = ["1e-4", "3e-4", "1e-3", "3e-3"]
+    config = write_experiment(
+        tmp_path / "exp.yaml",
+        phases=[
+            phase_payload(
+                gpu_policy="none",
+                name="wd_sweep",
+                n_trials=4,
+                sampler={"type": "grid"},
+                search_space={"lr": {"type": "categorical", "choices": choices}},
+            )
+        ],
+    )
+
+    with terminal_stream("stdout", 80) as stdout:
+        assert invoke_cli_boundary(["validate", str(config)], monkeypatch) == 0
+
+    lines = stdout.text.splitlines()
+    first = next(index for index, line in enumerate(lines) if "warning:" in line)
+    assert lines[first : first + 4] == [
+        "      warning: Phase 'wd_sweep': search_space 'lr' has categorical choices that",
+        "               load as strings, not numbers: '1e-4', '3e-4', '1e-3', '3e-3'",
+        "               (YAML 1.1 reads an exponent without a decimal point and sign as",
+        "               text). Write 1e-4 as 1.0e-4 or 0.0001, and the rest likewise.",
+    ]
+
+
 def test_validate_names_inherited_phases_without_list_syntax(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
