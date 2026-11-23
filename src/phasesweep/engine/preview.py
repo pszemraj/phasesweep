@@ -24,7 +24,8 @@ from phasesweep.engine.artifact_roots import (
     _check_published_phase_studies,
 )
 from phasesweep.engine.errors import StudyStorageUnavailableError
-from phasesweep.engine.fingerprints import _judge_identity, _phase_fingerprint, describe_gains
+from phasesweep.engine.fingerprints import _judge_identity, _phase_fingerprint
+from phasesweep.engine.growth import describe_gains
 from phasesweep.engine.guards import _raise_collected_errors
 from phasesweep.engine.ledger import open_preview_study, read_phase_studies, validate_ledger
 from phasesweep.engine.optuna import (
@@ -403,7 +404,7 @@ def _preview_phase(
                 log.info(
                     "DRY RUN phase=%s search_space gains %s: keeps its %s, would launch %s.",
                     phase.name,
-                    describe_gains(verdict.gained),
+                    describe_gains(verdict.gained, sampler=phase.sampler),
                     plural(finished, "finished trial"),
                     plural(remaining, unit),
                 )

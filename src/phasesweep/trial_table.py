@@ -459,10 +459,15 @@ def _phase_lines(
         diagnosis, step = table.refusal
         lines.extend(wrap(diagnosis, width, indent=INDENT, subsequent_indent=INDENT))
         lines.extend(wrap_labeled("fix:", step, width, indent=INDENT))
-    notes[:0] = [
-        f"search_space grew at draw position {position}: {gains}"
-        for position, gains in table.growth
-    ]
+    for position, gains in table.growth:
+        lines.extend(
+            wrap(
+                f"search_space grew at draw position {position}: {gains}",
+                width,
+                indent=INDENT,
+                subsequent_indent=INDENT * 2,
+            )
+        )
     sources = set(tables.winner_generations.values())
     source = tables.winner_generations.get(table.phase)
     if len(sources) > 1 and source is not None:

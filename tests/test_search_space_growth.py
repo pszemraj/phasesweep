@@ -161,16 +161,20 @@ def _refusal(study: optuna.Study, phase: Phase) -> StudyFingerprintMismatchError
 
 
 @pytest.mark.integration
-def test_grown_grid_runs_exactly_the_added_cells(tmp_path: Path) -> None:
-    """A grid that gains three values keeps its four trials, runs the three new cells once each, and selects over all seven."""
+def test_grown_grid_runs_exactly_the_added_cells(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A grid that gains three values keeps its four trials, runs the three new cells once each, selects over all seven, and logs the gain as `+value`s."""
     trainer, calls = _trainer(tmp_path)
     original = _experiment(tmp_path, trainer, _phase(_ORIGINAL))
     run_experiment(original)
     before = {t.number: t.params for t in phase_trials(original)}
 
     grown = _experiment(tmp_path, trainer, _phase(_GROWN))
+    caplog.set_level(logging.INFO, logger="phasesweep")
     winners = run_experiment(grown)
 
+    assert any("search_space gains lr +1e-05, +0.01, +0.03:" in m for m in caplog.messages)
     assert sorted(_calls(calls)[len(_ORIGINAL) :]) == [1e-5, 1e-2, 3e-2]
     trials = phase_trials(grown)
     assert {t.number: t.params for t in trials[: len(_ORIGINAL)]} == before
@@ -365,7 +369,7 @@ def test_dry_run_of_grown_phase_leaves_the_journal_unchanged(
     assert journal.read_bytes() == before
     assert len(_calls(calls)) == len(_ORIGINAL)
     assert (
-        "DRY RUN phase=p search_space gains lr 1e-05, 0.01, 0.03: keeps its 4 finished trials, "
+        "DRY RUN phase=p search_space gains lr +1e-05, +0.01, +0.03: keeps its 4 finished trials, "
         "would launch 3 new cells."
     ) in caplog.messages
 

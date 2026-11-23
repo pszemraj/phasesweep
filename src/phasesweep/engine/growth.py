@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import itertools
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 
@@ -194,6 +195,22 @@ def _search_space_growth(
     return _range_growth(old, new)
 
 
+def describe_gains(gained: Mapping[str, Sequence[str]], *, sampler: Sampler) -> str:
+    """Name the values a grown search space adds, key by key, the same way on every surface.
+
+    A grid's added values read ``+value``; the other samplers gain a widened range, which
+    already reads ``old -> new``.
+
+    :param Mapping[str, Sequence[str]] gained: Added values or widened ranges, by key.
+    :param Sampler sampler: The sampler the growth was judged under.
+    :return str: Such as ``lr +0.003, +0.01``, or ``wd 0..0.1 -> 0..0.3`` for a range.
+    """
+    sign = "+" if sampler.type == "grid" else ""
+    return "; ".join(
+        f"{key} {', '.join(f'{sign}{value}' for value in values)}" for key, values in gained.items()
+    )
+
+
 def recorded_growth(record: PhaseIdentityRecord) -> tuple[tuple[int, str], ...]:
     """Name each growth a study's identity records, as the draw position it took effect at.
 
@@ -210,15 +227,13 @@ def recorded_growth(record: PhaseIdentityRecord) -> tuple[tuple[int, str], ...]:
     sampler = Sampler.model_validate(raw_sampler)
     steps: list[tuple[int, str]] = []
     for before, entry in itertools.pairwise(record["search_spaces"]):
-        parts: list[str] = []
+        gained: dict[str, tuple[str, ...]] = {}
         for key, new in sorted(entry["search_space"].items()):
             old = before["search_space"].get(key)
             if old == new or not isinstance(old, dict) or not isinstance(new, dict):
                 continue
-            gained = _search_space_growth(old, new, sampler=sampler).gained
-            values = [f"+{value}" for value in gained] if sampler.type == "grid" else gained
-            if values:
-                parts.append(f"{key} {', '.join(values)}")
-        if parts:
-            steps.append((entry["first_position"], "; ".join(parts)))
+            if values := _search_space_growth(old, new, sampler=sampler).gained:
+                gained[key] = values
+        if gained:
+            steps.append((entry["first_position"], describe_gains(gained, sampler=sampler)))
     return tuple(steps)

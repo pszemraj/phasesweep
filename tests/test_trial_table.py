@@ -286,6 +286,24 @@ def test_each_search_space_growth_prints_under_the_heading_after_the_refusal() -
     ]
 
 
+def test_a_wrapped_growth_note_hangs_under_its_first_line() -> None:
+    """A growth note too long for the width continues on lines indented past the note, so it never reads as another item."""
+    phase = _phase("search", n_trials=16, lr=CategoricalParam(type="categorical", choices=[0.001]))
+    growth = ((12, "lr " + ", ".join(f"+{n / 1000}" for n in range(3, 12))),)
+    tables = _tables(
+        _table("search", [_row(0, 0.5, {"lr": 0.001})], growth=growth),
+        represented=None,
+        published=None,
+        winners={},
+    )
+
+    lines = _render(tables, phase, width=40).splitlines()
+
+    start = next(i for i, line in enumerate(lines) if "search_space grew" in line)
+    assert lines[start].startswith("  search_space grew at draw position 12:")
+    assert lines[start + 1].startswith("    ") and not lines[start + 1].startswith("     ")
+
+
 def test_the_table_is_headed_with_the_recorded_metric_and_names_a_changed_config_metric() -> None:
     """Values print under the metric the study recorded; a config naming another says so under the heading."""
     phase = _phase("search", n_trials=8, x=IntParam(type="int", low=0, high=9))

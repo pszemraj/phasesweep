@@ -15,7 +15,7 @@ import optuna
 
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import StudyFingerprintMismatchError
-from phasesweep.engine.growth import _GrowthVerdict, _search_space_growth
+from phasesweep.engine.growth import _GrowthVerdict, _search_space_growth, describe_gains
 from phasesweep.engine.optuna import _draw_positions
 from phasesweep.engine.state import (
     PHASE_IDENTITY_ATTR,
@@ -458,7 +458,7 @@ def _verify_fingerprint(
                 "[%s] search_space gains %s: its finished trials stand and new configurations "
                 "run from draw position %d.",
                 phase.name,
-                describe_gains(verdict.gained),
+                describe_gains(verdict.gained, sampler=phase.sampler),
                 verdict.record["search_spaces"][-1]["first_position"],
             )
         _stamp_identity(study, verdict.record)
@@ -477,15 +477,6 @@ class _IdentityVerdict:
     gained: dict[str, tuple[str, ...]] = field(default_factory=dict)
     #: The fingerprint an empty study was bound to before, when it is rebound.
     rebound_from: str | None = None
-
-
-def describe_gains(gained: Mapping[str, Sequence[str]]) -> str:
-    """Name the values a grown search space adds, key by key.
-
-    :param Mapping[str, Sequence[str]] gained: Added values or widened ranges, by key.
-    :return str: Such as ``lr 0.003, 0.01; wd 0..0.1 -> 0..0.3``.
-    """
-    return "; ".join(f"{key} {', '.join(values)}" for key, values in gained.items())
 
 
 def _next_draw_position(trials: Sequence[optuna.trial.FrozenTrial], phase: Phase) -> int:
