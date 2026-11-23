@@ -30,6 +30,7 @@ from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport
 from phasesweep.mcp.redaction import status_payload
 from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.snapshots import StatusSnapshot
 from tests.conftest import invoke_cli_boundary, make_experiment
 from tests.experiments import write_experiment
 from tests.ledger_fixtures import published_generation_id
@@ -262,8 +263,9 @@ def test_an_mcp_replay_succeeds_without_a_generation_and_a_refusal_still_reports
     assert not any(status["phases"][0]["generation_trials"].values())
     payload = status_payload(
         "srv",
-        status,
+        StatusSnapshot.model_validate(status),
         {"run_id": "srv-replay"},
+        tracking_delivery=None,
         result_source="frozen_run_snapshot",
         elapsed_seconds=None,
     )
@@ -274,8 +276,9 @@ def test_an_mcp_replay_succeeds_without_a_generation_and_a_refusal_still_reports
     assert phase["target_already_satisfied"] is True
     first_payload = status_payload(
         "srv",
-        first["result_snapshot"]["status"],
+        StatusSnapshot.model_validate(first["result_snapshot"]["status"]),
         {"run_id": "srv-first"},
+        tracking_delivery=None,
         result_source="frozen_run_snapshot",
         elapsed_seconds=None,
     )
@@ -293,8 +296,9 @@ def test_an_mcp_replay_succeeds_without_a_generation_and_a_refusal_still_reports
     # The refused run's ID names no generation, so it represents none.
     refused_payload = status_payload(
         "srv",
-        refused["result_snapshot"]["status"],
+        StatusSnapshot.model_validate(refused["result_snapshot"]["status"]),
         {"run_id": "srv-lowered"},
+        tracking_delivery=None,
         result_source="frozen_run_snapshot",
         elapsed_seconds=None,
     )

@@ -171,11 +171,13 @@ def _journal_experiment(tmp_path: Path, *, published: bool) -> tuple[Experiment,
 def _status_phases(experiment: Experiment, status: dict[str, Any]) -> list[dict[str, Any]]:
     """Return the first phase of every status surface a journal read feeds."""
     from phasesweep.mcp.redaction import status_payload
+    from phasesweep.mcp.snapshots import status_snapshot
 
     mcp_status = status_payload(
         "exp",
-        status,
+        status_snapshot(status),
         {"run_id": "mcp-run"},
+        tracking_delivery=None,
         result_source="current_shared_study",
         elapsed_seconds=None,
     )
@@ -436,7 +438,7 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
     """The same status flags select the same remedy whatever damaged the ledger."""
     from phasesweep.errors import ProcessCleanupUncertainError
     from phasesweep.mcp.redaction import status_payload
-    from phasesweep.mcp.snapshots import capture_result_snapshot
+    from phasesweep.mcp.snapshots import capture_result_snapshot, status_snapshot
 
     experiment = make_experiment(
         workdir=tmp_path / "runs",
@@ -473,8 +475,9 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
     cli_status = experiment_status(experiment)
     mcp_status = status_payload(
         experiment_id="t",
-        status=status,
+        status=status_snapshot(status),
         run={"run_id": "mcp-run"},
+        tracking_delivery=None,
         result_source="current_shared_study",
         elapsed_seconds=None,
     )

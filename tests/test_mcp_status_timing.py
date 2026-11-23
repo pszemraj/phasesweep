@@ -16,7 +16,7 @@ from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.state import Winner, WinnerSource
 from phasesweep.mcp.redaction import status_payload
 from phasesweep.mcp.runs import RunState, RunStore
-from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.mcp.snapshots import StatusSnapshot, capture_result_snapshot
 from phasesweep.mcp.tools import (
     AWAIT_DEFAULT_TIMEOUT_SECONDS,
     AWAIT_MAX_TIMEOUT_SECONDS,
@@ -77,7 +77,7 @@ def test_elapsed_seconds_terminal(
 
 
 def _status_payload(phase_counts: dict[str, dict[str, int]]) -> JsonObject:
-    """Map a one-phase ``read_status`` payload with the given counts to the MCP status."""
+    """Map a one-phase status snapshot with the given counts to the MCP status."""
     status = {
         "current_generation_id": "generation-current",
         "published_generation_id": None,
@@ -87,7 +87,7 @@ def _status_payload(phase_counts: dict[str, dict[str, int]]) -> JsonObject:
         "result_context": "current_config",
         "published_config_matches_current": None,
         "result_phase_plan": ["p"],
-        "metric": {"name": "loss", "goal": "minimize"},
+        "metric": {"name": "loss", "goal": "minimize", "objective_evidence": {"kind": "json"}},
         "summary_present": False,
         "phases": [
             {
@@ -101,8 +101,9 @@ def _status_payload(phase_counts: dict[str, dict[str, int]]) -> JsonObject:
     }
     return status_payload(
         "srv",
-        status,
+        StatusSnapshot.model_validate(status),
         {"run_id": "run-1"},
+        tracking_delivery=None,
         result_source="current_shared_study",
         elapsed_seconds=None,
     )
@@ -487,7 +488,7 @@ def test_await_run_storage_read_does_not_block_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app, _registry, _store = _app_with_run(tmp_path)
-    target_id, status, run, handle, result_source = app._read_status_target(
+    target_id, status, run, handle, result_source, delivery = app._read_status_target(
         run_id="r1",
     )
     assert run is not None and handle is not None
@@ -498,7 +499,7 @@ def test_await_run_storage_read_does_not_block_event_loop(
     def blocked_read(**_kwargs: object):
         entered.set()
         release.wait(timeout=2.0)
-        return target_id, status, terminal_run, handle, result_source
+        return target_id, status, terminal_run, handle, result_source, delivery
 
     monkeypatch.setattr(app, "_read_status_target", blocked_read)
 

@@ -24,7 +24,7 @@ from phasesweep.mcp.redaction import (
     status_payload,
     winners_payload,
 )
-from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.mcp.snapshots import capture_result_snapshot, status_snapshot
 from phasesweep.runtime.json import json_object
 from tests.conftest import make_experiment, write_experiment_config, write_trainer
 from tests.mcp_helpers import (
@@ -461,8 +461,9 @@ def test_trial_failure_reasons_and_their_stderr_quote_never_reach_status_or_snap
         status,
         status_payload(
             "srv",
-            status,
+            status_snapshot(status),
             {"run_id": "run-1"},
+            tracking_delivery=None,
             result_source="current_shared_study",
             elapsed_seconds=None,
         ),

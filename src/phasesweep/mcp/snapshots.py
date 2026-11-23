@@ -131,6 +131,22 @@ class StatusSnapshot(_SnapshotModel):
     """Phase plan the represented generation published under."""
 
 
+def status_snapshot(status: EngineStatus) -> StatusSnapshot:
+    """Project an engine status read onto the model frozen reads and redaction share.
+
+    Engine-only keys (the experiment label, the operator-only publication error and the
+    mutable tracking counts) have no snapshot field and are dropped.
+
+    :param EngineStatus status: Path-free status from :func:`phasesweep.engine.read.read_status`
+        or :func:`phasesweep.engine.read.read_result`.
+    :raises ValidationError: The read does not fit the strict snapshot model.
+    :return StatusSnapshot: Validated status.
+    """
+    return StatusSnapshot.model_validate(
+        {key: value for key, value in status.items() if key in StatusSnapshot.model_fields}
+    )
+
+
 class WinnerSourceSnapshot(_SnapshotModel):
     """Concrete source trial for an exposed phase winner."""
 
@@ -475,29 +491,6 @@ class RunResultSnapshot(_SnapshotModel):
     represented_config_fingerprint: str | None = None
     """Represented config's semantic fingerprint, captured using the run's working directory."""
 
-    def status_payload(self) -> EngineStatus:
-        """Return the stored status in the engine reader's path-free shape.
-
-        :return EngineStatus: Status mapping accepted by the MCP payload builder.
-        """
-        status = self.status
-        return {
-            "current_generation_id": status.current_generation_id,
-            "published_generation_id": status.published_generation_id,
-            "represented_generation_id": status.represented_generation_id,
-            "is_published": status.is_published,
-            "publication_integrity": status.publication_integrity,
-            "metric": status.metric.model_dump(mode="json"),
-            "phases": [
-                phase.model_dump(mode="json", exclude={"running_attempts"})
-                for phase in status.phases
-            ],
-            "summary_present": status.summary_present,
-            "result_context": status.result_context,
-            "published_config_matches_current": status.published_config_matches_current,
-            "result_phase_plan": list(status.result_phase_plan),
-        }
-
 
 def capture_pre_generation_result_snapshot(experiment: Experiment) -> RunResultSnapshot:
     """Freeze config shape with zero trial counts, no winners and no generation ID.
@@ -598,9 +591,7 @@ def capture_result_snapshot(
         status["represented_generation_id"] = None
     snapshot = RunResultSnapshot(
         schema_version=RESULT_SNAPSHOT_SCHEMA_VERSION,
-        status=StatusSnapshot.model_validate(
-            {key: value for key, value in status.items() if key in StatusSnapshot.model_fields}
-        ),
+        status=status_snapshot(status),
         winners=winner_snapshots,
         represented_config_fingerprint=(
             _experiment_semantic_fingerprint(
