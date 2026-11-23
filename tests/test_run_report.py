@@ -1392,8 +1392,9 @@ def test_a_resumed_run_counts_the_trials_a_previous_run_recorded(
     assert re.search(r"Finished in \d+\.\ds: 1 phase, 4 trials, 2 from a previous run", err)
     assert f"Next: phasesweep status {config} --set 'phases[p].n_trials=4' --trials" in err
     # The constant trainer ties every trial, so the winner's flagged line gives the command
-    # that prints the tie's numbers, with the overrides the run was typed with.
-    assert "flagged: tie\n" in err
+    # that prints the tie's numbers, with the overrides the run was typed with. The two
+    # generations also flag code_revision when the trainer's directory is dirty or no git tree.
+    assert re.search(r"flagged: tie(, code_revision)?\n", err)
     assert f"details: phasesweep show-winners {config} --set 'phases[p].n_trials=4'\n" in err
 
 
