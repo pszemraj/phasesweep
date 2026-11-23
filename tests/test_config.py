@@ -1103,10 +1103,10 @@ def test_metric_bounds_are_optional_finite_and_ordered() -> None:
 
     plain = experiment_contract_lines(make_experiment(metric=unbounded))[0]
     bounded = experiment_contract_lines(make_experiment(metric=metric(min=0.5, max=2)))[0]
-    assert "bounds" not in plain
-    assert "bounds={'max': 2.0, 'min': 0.5}" in bounded
+    assert "max=" not in plain and "min=" not in plain
+    assert " max=2.0 min=0.5 " in bounded
     only_max = experiment_contract_lines(make_experiment(metric=metric(max=2)))[0]
-    assert "bounds={'max': 2.0}" in only_max
+    assert " max=2.0 " in only_max and "min=" not in only_max
 
 
 _LOG_EXTRACTOR: JsonObject = {"type": "log_regex", "pattern": r"m=(?P<value>[0-9.]+)"}
