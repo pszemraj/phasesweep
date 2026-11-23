@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from typing import Literal, TypeAlias, TypedDict, get_args
+from typing import Literal, NotRequired, TypeAlias, TypedDict, get_args
 
 import optuna
 
@@ -154,7 +154,19 @@ class CodeRevisionChecked(TypedDict):
 
 EvaluationCheck: TypeAlias = EvaluationChecked | NotChecked
 TieCheck: TypeAlias = TieChecked | NotChecked
-CodeRevisionCheck: TypeAlias = CodeRevisionChecked | NotChecked
+
+
+class CodeRevisionNotChecked(NotChecked):
+    """A ``code_revision`` check that could not run.
+
+    When it ran out of revisions to compare rather than out of trials, it keeps the
+    generations it listed, so a reader sees which ones recorded none.
+    """
+
+    detail: NotRequired[CodeRevisionDetail]
+
+
+CodeRevisionCheck: TypeAlias = CodeRevisionChecked | CodeRevisionNotChecked
 
 RevisionRead: TypeAlias = CodeRevision | Literal["unknown", "unreadable"]
 """What selection read of one generation's recorded trainer revision."""
@@ -551,8 +563,10 @@ def _code_revision_check(
     One generation is one recorded code state, so a population from one generation is never
     flagged. Across generations the check flags more than one commit, any dirty tree (two
     dirty trees at one commit may differ and the record cannot show them equal), and any
-    generation whose revision is unknown or unreadable. A changed commit stays allowed on
-    resume; this only says what the winner was chosen among.
+    generation whose revision is unknown or unreadable, unless every generation is unknown:
+    then nothing was recorded to compare, and the check is ``n/a`` with the generations
+    listed. A changed commit stays allowed on resume; this only says what the winner was
+    chosen among.
 
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials by number; each carries
         its generation id, which selection requires.
@@ -560,7 +574,7 @@ def _code_revision_check(
     :return CodeRevisionCheck: The check record.
     """
     if len(ranked) < 2:
-        return _not_checked("only one trial was ranked")
+        return {"verdict": "n/a", "reason": "only one trial was ranked"}
     members: dict[str, list[int]] = {}
     for trial in ranked:
         members.setdefault(str(trial.user_attrs[GENERATION_ID_ATTR]), []).append(trial.number)
@@ -568,6 +582,12 @@ def _code_revision_check(
         _generation_revision(generation_id, revisions.get(generation_id, "unreadable"), numbers)
         for generation_id, numbers in members.items()
     ]
+    if len(generations) > 1 and all(entry["record"] == "unknown" for entry in generations):
+        return {
+            "verdict": "n/a",
+            "reason": "no ranked generation recorded a code revision to compare",
+            "detail": {"generations": generations},
+        }
     commits = {entry["commit"] for entry in generations if entry["commit"] is not None}
     # A dirty flag of None is a generation with no revision to compare.
     flagged = len(generations) > 1 and (
@@ -650,7 +670,6 @@ def _validate_confound_block(data: object, *, winner_trial: int) -> ConfoundBloc
         raise ValueError("confound check 'survivorship' always runs and cannot be n/a")
     evaluation = _checked_record("evaluation_point", checks["evaluation_point"])
     tie = _checked_record("tie", checks["tie"])
-    revision = _checked_record("code_revision", checks["code_revision"])
     return {
         "schema_version": CONFOUND_SCHEMA_VERSION,
         "ranked_trials": ranked,
@@ -673,16 +692,36 @@ def _validate_confound_block(data: object, *, winner_trial: int) -> ConfoundBloc
                 if tie is None
                 else {"verdict": tie[0], "detail": _validate_tie_detail(tie[1])}
             ),
-            "code_revision": (
-                _not_checked(_reason(checks["code_revision"]))
-                if revision is None
-                else {
-                    "verdict": revision[0],
-                    "detail": _validate_code_revision_detail(revision[1]),
-                }
-            ),
+            "code_revision": _validate_code_revision_check(checks["code_revision"]),
         },
     }
+
+
+def _validate_code_revision_check(check: object) -> CodeRevisionCheck:
+    """Validate a ``code_revision`` record, whose ``n/a`` may keep the generations it listed.
+
+    :param object check: Parsed record.
+    :raises ValueError: The record is malformed, or an ``n/a`` record that keeps generations
+        lists one that recorded a revision or fewer than two generations.
+    :return CodeRevisionCheck: The validated record.
+    """
+    if isinstance(check, Mapping) and check.get("verdict") == "n/a" and "detail" in check:
+        if set(check) != {"verdict", "reason", "detail"}:
+            raise ValueError("confound check 'code_revision' is n/a without a reason")
+        reason = check["reason"]
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("confound check 'code_revision' is n/a without a reason")
+        detail = _validate_code_revision_detail(check["detail"])
+        generations = detail["generations"]
+        if len(generations) < 2 or any(entry["record"] != "unknown" for entry in generations):
+            raise ValueError(
+                "confound code_revision n/a lists a generation that recorded a revision"
+            )
+        return {"verdict": "n/a", "reason": reason, "detail": detail}
+    revision = _checked_record("code_revision", check)
+    if revision is None:
+        return {"verdict": "n/a", "reason": _reason(check)}
+    return {"verdict": revision[0], "detail": _validate_code_revision_detail(revision[1])}
 
 
 def _validate_ranked_groups(value: object) -> list[list[int]] | None:
@@ -1251,7 +1290,8 @@ def _confound_summary(
     tie_detail = None if tie["verdict"] == "n/a" else tie["detail"]
     survivorship = checks["survivorship"]
     revision = checks["code_revision"]
-    generations = None if revision["verdict"] == "n/a" else revision["detail"]["generations"]
+    revision_detail = revision.get("detail")
+    generations = None if revision_detail is None else revision_detail["generations"]
     return {
         "flagged": list(_flagged_checks(block)),
         "evaluation_point": {

@@ -287,6 +287,32 @@ def test_code_revision_flags_what_cannot_be_shown_equal_and_never_raises() -> No
     )
 
 
+def test_code_revision_is_unjudged_when_no_generation_recorded_a_revision() -> None:
+    """Generations that all recorded no revision leave nothing to compare, so the check is ``n/a`` with them listed."""
+    pair = _generation_trials("g1", "g2")
+    block = _assess(pair, pair, revisions={"g1": "unknown", "g2": "unknown"})
+
+    check = block["checks"]["code_revision"]
+    assert check["verdict"] == "n/a"
+    assert [(entry["record"], entry["trials"]) for entry in check["detail"]["generations"]] == [
+        ("unknown", [0]),
+        ("unknown", [1]),
+    ]
+    assert _flagged_checks(block) == []
+    assert _validate_confound_block(block, winner_trial=1) == block
+    summary = _confound_summary(
+        block, winner_trial=1, extractor_kind="json_envelope", persistent=True
+    )["code_revision"]
+    assert (summary["verdict"], summary["generations"], summary["unknown"]) == ("n/a", 2, 2)
+
+    mixed = _assess(
+        pair, pair, revisions={"g1": "unknown", "g2": {"commit": _COMMIT_A, "dirty": False}}
+    )
+    assert mixed["checks"]["code_revision"]["verdict"] == "heterogeneous"
+    unreadable = _assess(pair, pair, revisions={"g1": "unknown"})
+    assert unreadable["checks"]["code_revision"]["verdict"] == "heterogeneous"
+
+
 def test_verdicts_are_three_distinct_values_and_not_checked_is_never_ok() -> None:
     """``n/a`` means not checked; nothing may collapse it into ``ok``."""
     assert CONFOUND_VERDICTS == ("ok", "heterogeneous", "n/a")
