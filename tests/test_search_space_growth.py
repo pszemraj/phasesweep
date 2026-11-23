@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import signal
-from collections.abc import Iterator
 from pathlib import Path
 
 import optuna
@@ -39,7 +38,7 @@ from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_DIR_ATTR, _recorded_identity
 from phasesweep.runtime.json import dump_json
 from tests.conftest import make_experiment, phase_study, phase_trials, write_trainer
-from tests.test_rerun_real_runs import _Harness
+from tests.test_rerun_real_runs import _Harness, harness  # noqa: F401
 
 _ORIGINAL = [1e-4, 3e-4, 1e-3, 3e-3]
 _GROWN = [1e-5, *_ORIGINAL, 1e-2, 3e-2]
@@ -183,21 +182,6 @@ def test_grown_grid_runs_exactly_the_added_cells(
     assert winners["p"].params["lr"] == 1e-5
 
 
-@pytest.fixture
-def harness(tmp_path: Path) -> Iterator[_Harness]:
-    """Yield a real-run harness and kill whatever its runs leave alive.
-
-    :param Path tmp_path: The test's scratch directory.
-    :return Iterator[_Harness]: The harness.
-    """
-    built = _Harness(tmp_path)
-    try:
-        yield built
-    finally:
-        built.kill_survivors()
-        built.release()
-
-
 def _gated_phase(values: list[float]) -> Phase:
     """Build the grid phase over ``optimizer.lr``, the override the gated trainer accepts.
 
@@ -212,7 +196,9 @@ def _gated_phase(values: list[float]) -> Phase:
 
 
 @pytest.mark.integration
-def test_grown_grid_resumed_after_sigkill_covers_each_new_cell_once(harness: _Harness) -> None:
+def test_grown_grid_resumed_after_sigkill_covers_each_new_cell_once(
+    harness: _Harness,  # noqa: F811
+) -> None:
     """A grown grid whose run is SIGKILLed on a new cell resumes and measures every cell exactly once."""
     run_experiment(harness.experiment("interrupted", _gated_phase(_ORIGINAL)))
     grown = harness.experiment("interrupted", _gated_phase(_GROWN))
@@ -231,7 +217,9 @@ def test_grown_grid_resumed_after_sigkill_covers_each_new_cell_once(harness: _Ha
 
 
 @pytest.mark.integration
-def test_interrupted_old_cell_reruns_in_place_before_the_grown_cells(harness: _Harness) -> None:
+def test_interrupted_old_cell_reruns_in_place_before_the_grown_cells(
+    harness: _Harness,  # noqa: F811
+) -> None:
     """A cell interrupted before its grid grew reruns first, in its source's directory with its params and grid_id, and the grown run then draws every other cell once."""
     original = harness.experiment("interrupted", _gated_phase(_ORIGINAL))
     harness.interrupt(harness.config(original), 1, signal.SIGKILL)
@@ -267,6 +255,7 @@ def test_failed_old_cell_retries_above_the_grown_size(tmp_path: Path) -> None:
     retry = phase_trials(raised)[-1]
     assert retry.user_attrs[RERUN_OF_ATTR] == failed.number
     assert retry.system_attrs["grid_id"] == failed.system_attrs["grid_id"]
+    assert retry.user_attrs[TRIAL_DIR_ATTR] != failed.user_attrs[TRIAL_DIR_ATTR]
     assert _complete_lrs(raised) == sorted(_GROWN)
 
 
