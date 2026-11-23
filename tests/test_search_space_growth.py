@@ -27,7 +27,12 @@ from phasesweep.config.search import (
 )
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.fingerprints import _verify_fingerprint
-from phasesweep.engine.growth import CHOICES_ROUTE, CMAES_ROUTE, _search_space_growth
+from phasesweep.engine.growth import (
+    CHOICES_ROUTE,
+    CMAES_ROUTE,
+    _search_space_growth,
+    recorded_growth,
+)
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _build_sampler, _draw_positions, _suggest_all
 from phasesweep.engine.preview import validate_trial_targets
@@ -384,6 +389,25 @@ def test_from_phase_past_grown_phase_names_from_phase_step(tmp_path: Path) -> No
     assert len(_calls(calls)) == len(worse) + child.n_trials
     assert winners["p"].params["lr"] == 1e-4
     assert set(winners) == {"p", "q"}
+
+
+def test_recorded_growth_names_each_growth_at_its_draw_position() -> None:
+    """Each recorded growth reads as its first draw position and the values it added, a grid's as ``+value`` and a range's as old -> new."""
+    study = _stamped(_phase(_ORIGINAL), trials=2)
+    grown = _phase([*_ORIGINAL, 1e-2, 3e-2])
+    _verify_fingerprint(study, make_experiment(phases=[grown]), grown, {})
+    record = _recorded_identity(study)
+    assert record is not None
+    assert recorded_growth(record) == ((2, "lr +0.01, +0.03"),)
+
+    sampler = Sampler(type="random", seed=0)
+    narrow = FloatParam(type="float", low=0.0, high=1.0)
+    ranged = _stamped(_phase([], sampler=sampler, param=narrow, n_trials=4), trials=1)
+    wide = _phase([], sampler=sampler, param=narrow.model_copy(update={"high": 2.0}), n_trials=4)
+    _verify_fingerprint(ranged, make_experiment(phases=[wide]), wide, {})
+    record = _recorded_identity(ranged)
+    assert record is not None
+    assert recorded_growth(record) == ((1, "lr 0.0..1.0 -> 0.0..2.0"),)
 
 
 def test_cmaes_range_change_refused() -> None:

@@ -80,6 +80,7 @@ def _table(
     uncounted: tuple[tuple[str, int], ...] = (),
     refusal: tuple[str, str] | None = None,
     recorded_metric: tuple[str, str] | None = None,
+    growth: tuple[tuple[int, str], ...] = (),
 ) -> TrialTable:
     """Build a table whose columns are the core ones plus every optional key any row carries.
 
@@ -101,6 +102,7 @@ def _table(
         groups=groups,
         refusal=refusal,
         recorded_metric=recorded_metric,
+        growth=growth,
     )
 
 
@@ -257,6 +259,30 @@ def test_a_recorded_refusal_and_its_fix_print_under_the_heading() -> None:
         "  failed/infeasible trials reached max_consecutive_failures=3.",
         "  fix: Fix the cause, then raise phases[search].n_trials above 8 and rerun.",
         "          trial  eval_loss  x  state  time",
+    ]
+
+
+def test_each_search_space_growth_prints_under_the_heading_after_the_refusal() -> None:
+    """A grown phase names each growth's first draw position and added values, after any refusal and its fix."""
+    phase = _phase("search", n_trials=16, lr=CategoricalParam(type="categorical", choices=[0.001]))
+    refusal = ("Phase 'search' previously aborted.", "Raise phases[search].n_trials and rerun.")
+    rows = [_row(index, 0.5, {"lr": 0.001}) for index in range(2)]
+    growth = ((12, "lr +0.003, +0.01"), (14, "lr +0.03"))
+    tables = _tables(
+        _table("search", rows, refusal=refusal, growth=growth),
+        represented=None,
+        published=None,
+        winners={},
+    )
+
+    lines = _render(tables, phase).splitlines()
+
+    assert lines[3:8] == [
+        "search: 2 of 16 trials, eval_loss (lower is better)",
+        "  Phase 'search' previously aborted.",
+        "  fix: Raise phases[search].n_trials and rerun.",
+        "  search_space grew at draw position 12: lr +0.003, +0.01",
+        "  search_space grew at draw position 14: lr +0.03",
     ]
 
 

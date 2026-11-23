@@ -34,6 +34,7 @@ from phasesweep.engine.fingerprints import (
     _experiment_semantic_fingerprint,
     _recorded_config_matches,
 )
+from phasesweep.engine.growth import recorded_growth
 from phasesweep.engine.ledger import (
     ValidatedLedger,
     log_storage_read_failure,
@@ -1090,6 +1091,9 @@ class TrialTable:
     #: The metric name and goal the study recorded, which its trial values were measured under;
     #: ``None`` when the phase has no study or the study kept no identity payload.
     recorded_metric: tuple[str, str] | None = None
+    #: Each search-space growth the study recorded: the draw position it took effect at and the
+    #: values it added (:func:`phasesweep.engine.growth.recorded_growth`).
+    growth: tuple[tuple[int, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1350,6 +1354,7 @@ def _trial_table(
     available: bool = True,
     refusal: tuple[str, str] | None = None,
     recorded_metric: tuple[str, str] | None = None,
+    growth: tuple[tuple[int, str], ...] = (),
 ) -> TrialTable:
     """Build one phase's table from its trials and the winner the publication holds for it.
 
@@ -1364,6 +1369,8 @@ def _trial_table(
     :param tuple[str, str] | None refusal: The diagnosis and step a run would be refused with,
         defaults to none.
     :param tuple[str, str] | None recorded_metric: The name and goal the study recorded,
+        defaults to none.
+    :param tuple[tuple[int, str], ...] growth: The search-space growths the study recorded,
         defaults to none.
     :return TrialTable: The rows and the columns they carry.
     """
@@ -1420,6 +1427,7 @@ def _trial_table(
         groups=_repeat_group_views(experiment, phase, trials, rows),
         refusal=refusal,
         recorded_metric=recorded_metric,
+        growth=growth,
     )
 
 
@@ -1570,6 +1578,7 @@ def read_trial_tables(
             _load_phase_policy_state(study),
             dependents=experiment.phases_inheriting(phase.name),
         )
+        identity = _recorded_identity(study)
         tables.append(
             _trial_table(
                 experiment,
@@ -1578,6 +1587,7 @@ def read_trial_tables(
                 winners.get(phase.name),
                 refusal=(str(refusal), operator_step(refusal)) if refusal is not None else None,
                 recorded_metric=_recorded_metric(study),
+                growth=() if identity is None else recorded_growth(identity),
             )
         )
     return TrialTables(

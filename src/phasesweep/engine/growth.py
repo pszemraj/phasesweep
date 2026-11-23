@@ -18,6 +18,7 @@ text, so ``1`` and ``1.0``, or ``true`` and ``1``, are a removal plus an additio
 
 from __future__ import annotations
 
+import itertools
 import json
 from dataclasses import dataclass
 from fractions import Fraction
@@ -33,6 +34,7 @@ from phasesweep.config.search import (
     grid_search_space,
 )
 from phasesweep.engine.optuna import _grid_axis_kind
+from phasesweep.engine.state import PhaseIdentityRecord
 from phasesweep.runtime.json import JsonObject
 
 _SEARCH_PARAM: TypeAdapter[SearchParam] = TypeAdapter(SearchParam)
@@ -186,3 +188,33 @@ def _search_space_growth(
     if sampler.type == "grid":
         return _grid_growth(old, new)
     return _range_growth(old, new)
+
+
+def recorded_growth(record: PhaseIdentityRecord) -> tuple[tuple[int, str], ...]:
+    """Name each growth a study's identity records, as the draw position it took effect at.
+
+    Each recorded search space after the first gained values over the one before it, judged under
+    the sampler the study recorded, so the text reads the same whatever the config says now.
+
+    :param PhaseIdentityRecord record: The study's identity record.
+    :raises pydantic.ValidationError: The record holds an invalid sampler or search parameter.
+    :return tuple[tuple[int, str], ...]: ``(first_position, gains)`` per growth, such as
+        ``(12, "lr +0.003, +0.01")``; a range reads ``wd 0..0.1 -> 0..0.3``.
+    """
+    phase = record["payload"].get("phase")
+    raw_sampler = phase.get("sampler") if isinstance(phase, dict) else None
+    sampler = Sampler.model_validate(raw_sampler)
+    steps: list[tuple[int, str]] = []
+    for before, entry in itertools.pairwise(record["search_spaces"]):
+        parts: list[str] = []
+        for key, new in sorted(entry["search_space"].items()):
+            old = before["search_space"].get(key)
+            if old == new or not isinstance(old, dict) or not isinstance(new, dict):
+                continue
+            gained = _search_space_growth(old, new, sampler=sampler).gained
+            values = [f"+{value}" for value in gained] if sampler.type == "grid" else gained
+            if values:
+                parts.append(f"{key} {', '.join(values)}")
+        if parts:
+            steps.append((entry["first_position"], "; ".join(parts)))
+    return tuple(steps)

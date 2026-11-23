@@ -411,7 +411,8 @@ def _phase_lines(
     count toward the target, by state, then the metric the study recorded and its direction.
     When the config names another metric name or goal, a note under the heading says so,
     since the trial values belong to the recorded one. A phase a run would refuse prints that
-    refusal and its fix before any other note.
+    refusal and its fix before any other note. Each search-space growth the study recorded then
+    gets a note naming the draw position it took effect at and the values it added.
 
     :param TrialTable table: The phase's trials.
     :param Phase phase: The configured phase.
@@ -458,6 +459,10 @@ def _phase_lines(
         diagnosis, step = table.refusal
         lines.extend(wrap(diagnosis, width, indent=INDENT, subsequent_indent=INDENT))
         lines.extend(wrap_labeled("fix:", step, width, indent=INDENT))
+    notes[:0] = [
+        f"search_space grew at draw position {position}: {gains}"
+        for position, gains in table.growth
+    ]
     sources = set(tables.winner_generations.values())
     source = tables.winner_generations.get(table.phase)
     if len(sources) > 1 and source is not None:
