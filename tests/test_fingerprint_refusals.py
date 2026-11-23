@@ -34,7 +34,7 @@ from phasesweep.engine.fingerprints import (
 )
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
-from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, _recorded_identity
+from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, Winner, _recorded_identity
 from phasesweep.errors import (
     FRESH_STUDY,
     NEW_STUDY_STEP,
@@ -383,6 +383,37 @@ def test_a_study_bound_to_another_root_gets_a_step_that_fits(tmp_path: Path) -> 
     assert caught.value.remediation == (
         "Restore the `workdir` and `experiment` that give the recorded artifact root, or "
         f"{FRESH_STUDY}."
+    )
+
+
+def test_a_changed_inherited_winner_sends_the_dependent_to_a_new_name_not_a_new_experiment() -> (
+    None
+):
+    """When only an inherited value changed, the fix line gives the dependent and its dependents new names and does not retrain the parent."""
+    parent = Phase(
+        name="p",
+        n_trials=1,
+        gpu_policy="none",
+        search_space={"lr": IntParam(type="int", low=0, high=3)},
+        sampler=Sampler(type="random", seed=0),
+    )
+    child = Phase(name="q", n_trials=1, gpu_policy="none", inherits=["p"])
+    grandchild = Phase(name="r", n_trials=1, gpu_policy="none", inherits=["q"])
+    experiment = make_experiment(phases=[parent, child, grandchild])
+
+    def winners(lr: int) -> dict[str, Winner]:
+        return {"p": Winner(trial_number=0, params={}, effective_overrides={"lr": lr}, metric=0.0)}
+
+    study = optuna.create_study()
+    _verify_fingerprint(study, experiment, child, winners(1))
+    study.optimize(lambda trial: 0.0, n_trials=1)
+
+    with pytest.raises(StudyFingerprintMismatchError) as caught:
+        _verify_fingerprint(study, experiment, child, winners(2))
+
+    assert "inherited_effective_overrides.p.lr: 1 -> 2" in str(caught.value)
+    assert caught.value.remediation == (
+        f"A phase it inherits now has a different winner; {rename_step(['q', 'r'])}."
     )
 
 

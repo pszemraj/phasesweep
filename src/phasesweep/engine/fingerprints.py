@@ -239,6 +239,8 @@ _MAX_REPORTED_VALUE_CHARS = 80
 _REPORTED_VALUE_LEAD_CHARS = 24
 #: The refusal shows each recorded value, so restoring it is the first way out.
 _RECORDED_VALUES = "the recorded value(s)"
+#: Where the payload's inherited values start in a changed path.
+_INHERITED_PREFIX = "inherited_effective_overrides."
 _CWD_FOLLOWS_INVOCATION = (
     "execution.cwd is unset, so the trainer runs where phasesweep is started: run from the "
     "original directory, or set execution.cwd to it."
@@ -692,6 +694,11 @@ def _mismatch_refusal(
         found = f". {_describe_changed_keys(changes)}"
         if all(path.startswith("phase.") for path, _old, _new in changes):
             way_forward = restore_or_rename_step(experiment, phase, recorded=_RECORDED_VALUES)
+        elif all(path.startswith(_INHERITED_PREFIX) for path, _old, _new in changes):
+            # A new experiment name would retrain the parent too; the inherited phase's trials
+            # stay valid and only this phase and its dependents start over.
+            names = [phase.name, *experiment.phases_inheriting(phase.name)]
+            way_forward = f"A phase it inherits now has a different winner; {rename_step(names)}."
         else:
             way_forward = restore_or_new_study(_RECORDED_VALUES)
     return StudyFingerprintMismatchError(
