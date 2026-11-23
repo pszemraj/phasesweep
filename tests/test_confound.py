@@ -49,6 +49,7 @@ from phasesweep.engine.state import (
     RERUN_OF_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
+    TRIAL_DIR_ATTR,
     Winner,
 )
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
@@ -1393,6 +1394,7 @@ def _candidate_attrs(number: int, provenance: dict[str, Any]) -> dict[str, Any]:
         FEASIBLE_ATTR: True,
         GENERATION_ID_ATTR: "generation-test",
         ATTEMPT_ID_ATTR: f"attempt-{number}",
+        TRIAL_DIR_ATTR: f"/runs/p/trial_{number:05d}__attempt-{number}",
         OBJECTIVE_PROVENANCE_ATTR: json.dumps(provenance),
         TRAINER_ENV_DIGEST_ATTR: "a" * 64,
         TRAINER_INPUT_ATTR: {"schema_version": 1},
