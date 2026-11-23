@@ -6,13 +6,14 @@ import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast, get_args
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, get_args
 
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.engine.errors import StudySchemaMismatchError
 from phasesweep.runtime.json import JsonObject, finite_nonnegative, json_object
 
 if TYPE_CHECKING:
+    from optuna import Study
     from optuna.trial import FrozenTrial, Trial
 
     from phasesweep.engine.confound import ConfoundBlock
@@ -202,10 +203,12 @@ class PhaseCounts:
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"
 GENERATION_ID_ATTR = "phasesweep_generation_id"
 ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
-PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
-# The canonical payload PHASE_FINGERPRINT_ATTR is the digest of, recorded beside
-# it so a refusal can name which keys changed instead of two opaque hashes.
-PHASE_FINGERPRINT_PAYLOAD_ATTR = "phasesweep_fingerprint_payload"
+# A phase study's identity: its fingerprint, the canonical payload that fingerprint digests
+# (so a refusal can name which keys changed instead of two opaque hashes), and every search
+# space the study has run under with the draw position each took effect at. One attr, so a
+# crash cannot leave a fingerprint beside a payload or history it does not describe.
+PHASE_IDENTITY_ATTR = "phasesweep_phase_identity"
+PHASE_IDENTITY_SCHEMA_VERSION = 1
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
 STUDY_SCHEMA_VERSION = 13
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
@@ -283,6 +286,81 @@ def _study_schema_supported(version: object, has_trials: bool) -> bool:
     return (type(version) is int and version == STUDY_SCHEMA_VERSION) or (
         version is None and not has_trials
     )
+
+
+class SearchSpaceEntry(TypedDict):
+    """One search space a phase's study ran under, from the draw position it took effect at."""
+
+    #: The phase's ``search_space`` as its fingerprint payload holds it, key by key.
+    search_space: JsonObject
+    #: The first draw position drawn under this space; zero for the study's first entry.
+    first_position: int
+
+
+class PhaseIdentityRecord(TypedDict):
+    """The identity a phase's study was bound to, under :data:`PHASE_IDENTITY_ATTR`."""
+
+    schema_version: int
+    #: SHA-256 of ``payload``.
+    fingerprint: str
+    #: The canonical fingerprint payload of the config the study is bound to.
+    payload: JsonObject
+    #: Every search space the study ran under, oldest first; the last is ``payload``'s.
+    search_spaces: list[SearchSpaceEntry]
+
+
+def _parsed_search_space_entry(value: object, *, previous: int | None) -> SearchSpaceEntry:
+    """Parse one recorded search-space entry.
+
+    :param object value: Decoded entry.
+    :param int | None previous: The previous entry's ``first_position``, or None for the first.
+    :raises ValueError: The entry is malformed, or its position does not follow the previous one.
+    :return SearchSpaceEntry: The entry.
+    """
+    if not isinstance(value, dict) or set(value) != {"search_space", "first_position"}:
+        raise ValueError("a search-space entry needs exactly search_space and first_position")
+    position = value["first_position"]
+    if type(position) is not int or (position != 0 if previous is None else position < previous):
+        raise ValueError(f"first_position {position!r} does not follow {previous!r}")
+    return {"search_space": json_object(value["search_space"]), "first_position": position}
+
+
+def _recorded_identity(study: Study) -> PhaseIdentityRecord | None:
+    """Read the identity a phase's study was bound to.
+
+    :param Study study: A phase's study, live or a read-only snapshot.
+    :raises StudySchemaMismatchError: The recorded identity is malformed.
+    :return PhaseIdentityRecord | None: The record, or None when the study has none yet.
+    """
+    value: object = study.user_attrs.get(PHASE_IDENTITY_ATTR)
+    if value is None:
+        return None
+    try:
+        if not isinstance(value, dict) or set(value) != PhaseIdentityRecord.__required_keys__:
+            raise ValueError("the record's fields differ from the current format")
+        if value["schema_version"] != PHASE_IDENTITY_SCHEMA_VERSION:
+            raise ValueError(f"schema_version {value['schema_version']!r}")
+        fingerprint, payload, entries = (
+            value["fingerprint"],
+            value["payload"],
+            value["search_spaces"],
+        )
+        if not isinstance(fingerprint, str) or not isinstance(entries, list) or not entries:
+            raise ValueError("fingerprint or search_spaces is malformed")
+        parsed: list[SearchSpaceEntry] = []
+        for entry in entries:
+            previous = parsed[-1]["first_position"] if parsed else None
+            parsed.append(_parsed_search_space_entry(entry, previous=previous))
+        return {
+            "schema_version": PHASE_IDENTITY_SCHEMA_VERSION,
+            "fingerprint": fingerprint,
+            "payload": json_object(payload),
+            "search_spaces": parsed,
+        }
+    except (KeyError, ValueError) as exc:
+        raise StudySchemaMismatchError(
+            f"Study {study.study_name!r} has a malformed {PHASE_IDENTITY_ATTR!r} record: {exc}."
+        ) from exc
 
 
 def constraint_attr(name: str) -> str:

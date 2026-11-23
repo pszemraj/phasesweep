@@ -32,9 +32,9 @@ from phasesweep.engine.repeats import (
     repeat_axis,
 )
 from phasesweep.engine.state import (
-    PHASE_FINGERPRINT_PAYLOAD_ATTR,
     TRAINER_ENV_ATTR,
     Winner,
+    _recorded_identity,
     _trial_attempt_dir,
 )
 from phasesweep.engine.study_policy import _describe_environment_changes
@@ -201,8 +201,8 @@ def _refresh_recovered_trials_csv(
     # Recovery can settle earlier work even when the supplied phase will be refused at launch.
     # Keep the prior projection when that phase cannot supply the study's repeat grouping.
     try:
-        recorded: object = study.user_attrs.get(PHASE_FINGERPRINT_PAYLOAD_ATTR)
-        if isinstance(recorded, dict) and recorded.get(
+        recorded = _recorded_identity(study)
+        if recorded is not None and recorded["payload"].get(
             "phase"
         ) == fingerprint_ops._semantic_phase_dump(phase):
             _write_trials_csv(

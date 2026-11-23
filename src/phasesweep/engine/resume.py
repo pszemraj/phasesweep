@@ -17,7 +17,7 @@ from phasesweep.engine.errors import PhaseTimeoutError, StudyContextConflictErro
 from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication_validation import ValidatedPublication
-from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
+from phasesweep.engine.state import Winner, _recorded_identity
 from phasesweep.errors import phase_names, rename_step
 from phasesweep.runtime.terminal import plural
 
@@ -201,7 +201,7 @@ def _reject_bound_descendant_topups(
             name
             for name in sorted(experiment.phases_inheriting(phase.name))
             if (dependent := existing_studies.get(name)) is not None
-            and isinstance(dependent.user_attrs.get(PHASE_FINGERPRINT_ATTR), str)
+            and _recorded_identity(dependent) is not None
             and dependent.get_trials(deepcopy=False)
         ]
         if bound:

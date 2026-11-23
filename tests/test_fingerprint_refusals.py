@@ -24,19 +24,17 @@ from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
 )
 from phasesweep.engine.fingerprints import (
+    _fresh_identity,
     _phase_fingerprint,
     _phase_fingerprint_payload,
     _render_changed_values,
     _semantic_payload_digest,
+    _stamp_identity,
     _verify_fingerprint,
 )
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
-from phasesweep.engine.state import (
-    ARTIFACT_ROOT_ATTR,
-    PHASE_FINGERPRINT_ATTR,
-    PHASE_FINGERPRINT_PAYLOAD_ATTR,
-)
+from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, _recorded_identity
 from phasesweep.errors import (
     FRESH_STUDY,
     NEW_STUDY_STEP,
@@ -191,12 +189,13 @@ def test_stored_payload_hashes_to_the_stored_fingerprint(tmp_path: Path) -> None
 
     fingerprint = _verify_fingerprint(study, experiment, phase, {})
 
-    stored = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage_url)).user_attrs
-    assert stored[PHASE_FINGERPRINT_ATTR] == fingerprint
-    assert _semantic_payload_digest(stored[PHASE_FINGERPRINT_PAYLOAD_ATTR]) == fingerprint
-    assert stored[PHASE_FINGERPRINT_PAYLOAD_ATTR] == _phase_fingerprint_payload(
-        experiment, phase, {}
+    stored = _recorded_identity(
+        optuna.load_study(study_name="t::p", storage=_resolve_storage(storage_url))
     )
+    assert stored is not None
+    assert stored["fingerprint"] == fingerprint
+    assert _semantic_payload_digest(stored["payload"]) == fingerprint
+    assert stored["payload"] == _phase_fingerprint_payload(experiment, phase, {})
     assert fingerprint == _phase_fingerprint(experiment, phase, {})
 
 
@@ -208,8 +207,16 @@ def test_rebinding_an_empty_study_replaces_the_stored_payload() -> None:
 
     fingerprint = _verify_fingerprint(study, wide, wide.phases[0], {})
 
-    assert study.user_attrs[PHASE_FINGERPRINT_ATTR] == fingerprint
-    assert _semantic_payload_digest(study.user_attrs[PHASE_FINGERPRINT_PAYLOAD_ATTR]) == fingerprint
+    stored = _recorded_identity(study)
+    assert stored is not None
+    assert stored["fingerprint"] == fingerprint
+    assert _semantic_payload_digest(stored["payload"]) == fingerprint
+    assert stored["search_spaces"] == [
+        {
+            "search_space": {"x": {"type": "int", "low": 0, "high": 11, "log": False, "step": 1}},
+            "first_position": 0,
+        }
+    ]
 
 
 def test_refusal_lists_ten_changed_keys_then_counts_the_rest() -> None:
@@ -250,11 +257,13 @@ def test_refusal_for_a_configured_cwd_omits_the_unset_cwd_advice() -> None:
     assert error.action is OperatorAction.FRESH_NAMESPACE
 
 
-def test_refusal_without_a_stored_payload_keeps_the_hash_only_message() -> None:
-    """A stored digest with no payload beside it still refuses, naming only the hashes."""
+def test_refusal_of_a_digest_its_payload_does_not_explain_names_only_the_hashes() -> None:
+    """A recorded digest that differs from its own unchanged payload refuses, naming only the hashes."""
     experiment = make_experiment()
     study = optuna.create_study()
-    study.set_user_attr(PHASE_FINGERPRINT_ATTR, "0" * 64)
+    _stamp_identity(
+        study, {**_fresh_identity(experiment, experiment.phases[0], {}), "fingerprint": "0" * 64}
+    )
     study.optimize(lambda trial: 0.0, n_trials=1)
 
     error = _refusal(study, experiment)

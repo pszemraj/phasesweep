@@ -23,7 +23,7 @@ from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.phase import GpuPool
 from phasesweep.engine.read import read_result
-from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR
+from phasesweep.engine.state import _recorded_identity
 from tests.conftest import (
     REPO,
     copy_fake_train,
@@ -161,7 +161,7 @@ def test_bound_topup_survives_child_preflight_failure_with_empty_fingerprinted_s
 
     child_study = optuna.load_study(study_name="t::child", storage=storage)
     assert child_study.get_trials(deepcopy=False) == []
-    assert isinstance(child_study.user_attrs.get(PHASE_FINGERPRINT_ATTR), str)
+    assert _recorded_identity(child_study) is not None
 
     topped_up = experiment.model_copy(
         update={"phases": [parent.model_copy(update={"n_trials": 2}), child]}
@@ -173,7 +173,9 @@ def test_bound_topup_survives_child_preflight_failure_with_empty_fingerprinted_s
     assert len(parent_study.trials) == 2
     assert child_study_after.get_trials(deepcopy=False)
     expected_fingerprint = _phase_fingerprint(topped_up, child, {"parent": winners["parent"]})
-    assert child_study_after.user_attrs[PHASE_FINGERPRINT_ATTR] == expected_fingerprint
+    recorded = _recorded_identity(child_study_after)
+    assert recorded is not None
+    assert recorded["fingerprint"] == expected_fingerprint
 
 
 def test_appended_phase_runs_alone_and_inherits_the_replayed_winner(tmp_path: Path) -> None:

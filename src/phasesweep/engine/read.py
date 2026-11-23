@@ -90,7 +90,6 @@ from phasesweep.engine.state import (
     FINISHED_TRIAL_STATES,
     GENERATION_SUMMARY_SCHEMA_VERSION,
     OBSERVED_PREFIX,
-    PHASE_FINGERPRINT_PAYLOAD_ATTR,
     RERUN_OF_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_STATE_NAMES,
@@ -98,6 +97,7 @@ from phasesweep.engine.state import (
     WinnerSource,
     _parse_winner_source,
     _parsed_trial_outcome,
+    _recorded_identity,
     _recorded_trial_dir,
     _stands_under_winner,
     _unreplaced_attempts,
@@ -1430,10 +1430,10 @@ def _recorded_metric(study: optuna.Study) -> tuple[str, str] | None:
     labels them with these, whatever the config names now.
 
     :param optuna.Study study: The phase's study.
-    :return tuple[str, str] | None: ``(name, goal)``, or ``None`` when the study kept no payload.
+    :return tuple[str, str] | None: ``(name, goal)``, or ``None`` when the study kept no identity.
     """
-    payload = study.user_attrs.get(PHASE_FINGERPRINT_PAYLOAD_ATTR)
-    metric = payload.get("metric") if isinstance(payload, dict) else None
+    record = _recorded_identity(study)
+    metric = None if record is None else record["payload"].get("metric")
     name = metric.get("name") if isinstance(metric, dict) else None
     goal = metric.get("goal") if isinstance(metric, dict) else None
     return (name, goal) if isinstance(name, str) and isinstance(goal, str) else None

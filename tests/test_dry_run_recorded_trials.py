@@ -30,7 +30,7 @@ from phasesweep.engine.errors import (
     TrialTargetRefusedError,
     WinnerIntegrityError,
 )
-from phasesweep.engine.fingerprints import _phase_fingerprint
+from phasesweep.engine.fingerprints import _fresh_identity, _stamp_identity
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import _attempt_dir, _last_successful_generation_path, _trial_dir_for
@@ -38,7 +38,6 @@ from phasesweep.engine.preview import _placeholder_winner, validate_trial_target
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
-    PHASE_FINGERPRINT_ATTR,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRIAL_DIR_ATTR,
@@ -152,9 +151,8 @@ def _record(
     stamp_artifact_root(study, experiment)
     study.set_user_attr(TRIAL_TARGET_ATTR, target)
     recorded_phase = next(item for item in experiment.phases if item.name == phase)
-    study.set_user_attr(
-        PHASE_FINGERPRINT_ATTR,
-        _phase_fingerprint(experiment, recorded_phase, _stand_ins(experiment, recorded_phase)),
+    _stamp_identity(
+        study, _fresh_identity(experiment, recorded_phase, _stand_ins(experiment, recorded_phase))
     )
     identity = _environment_identity(experiment, phase)
     for sequence, state in enumerate(states, 1):

@@ -13,7 +13,14 @@ import optuna
 
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import StudyFingerprintMismatchError
-from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, PHASE_FINGERPRINT_PAYLOAD_ATTR, Winner
+from phasesweep.engine.state import (
+    PHASE_IDENTITY_ATTR,
+    PHASE_IDENTITY_SCHEMA_VERSION,
+    PhaseIdentityRecord,
+    SearchSpaceEntry,
+    Winner,
+    _recorded_identity,
+)
 from phasesweep.errors import (
     NEW_STUDY_STEP,
     OperatorAction,
@@ -340,19 +347,64 @@ def restore_or_rename_step(experiment: Experiment, phase: Phase, *, recorded: st
     return f"Restore {recorded}, or {rename_step(names)}."
 
 
-def _stamp_fingerprint(study: optuna.Study, fingerprint: str, payload: JsonObject) -> None:
-    """Record a study's fingerprint beside the payload it digests.
+def _identity_record(
+    fingerprint: str, payload: JsonObject, search_spaces: list[SearchSpaceEntry]
+) -> PhaseIdentityRecord:
+    """Build the identity record a study is bound to.
 
-    The payload goes first: a process that dies between the two writes leaves
-    a study with no fingerprint, which the next run stamps again, never one
-    whose stored digest has no payload to explain it.
-
-    :param optuna.Study study: Study being bound to the phase config.
     :param str fingerprint: Digest of ``payload``.
     :param JsonObject payload: Canonical payload the fingerprint covers.
+    :param list[SearchSpaceEntry] search_spaces: The study's search-space history, ending with
+        ``payload``'s own search space.
+    :return PhaseIdentityRecord: The record.
     """
-    study.set_user_attr(PHASE_FINGERPRINT_PAYLOAD_ATTR, payload)
-    study.set_user_attr(PHASE_FINGERPRINT_ATTR, fingerprint)
+    return {
+        "schema_version": PHASE_IDENTITY_SCHEMA_VERSION,
+        "fingerprint": fingerprint,
+        "payload": payload,
+        "search_spaces": search_spaces,
+    }
+
+
+def _payload_search_space(payload: JsonObject) -> JsonObject:
+    """Return the phase search space a fingerprint payload holds.
+
+    :param JsonObject payload: A canonical phase fingerprint payload.
+    :raises ValueError: The payload holds no phase search space object.
+    :return JsonObject: Its ``phase.search_space``.
+    """
+    phase = payload.get("phase")
+    space = phase.get("search_space") if isinstance(phase, dict) else None
+    if not isinstance(space, dict):
+        raise ValueError("The fingerprint payload holds no phase.search_space object.")
+    return space
+
+
+def _fresh_identity(
+    experiment: Experiment, phase: Phase, inherited_winners: dict[str, Winner]
+) -> PhaseIdentityRecord:
+    """Build the identity a study with no trials is bound to: one search space, from position 0.
+
+    :param Experiment experiment: Current experiment config.
+    :param Phase phase: Phase whose identity is built.
+    :param dict[str, Winner] inherited_winners: Parent winners contributing to identity.
+    :return PhaseIdentityRecord: The record.
+    """
+    payload = _phase_fingerprint_payload(experiment, phase, inherited_winners)
+    return _identity_record(
+        _semantic_payload_digest(payload),
+        payload,
+        [{"search_space": _payload_search_space(payload), "first_position": 0}],
+    )
+
+
+def _stamp_identity(study: optuna.Study, record: PhaseIdentityRecord) -> None:
+    """Bind a study to an identity in one write.
+
+    :param optuna.Study study: Study being bound to the phase config.
+    :param PhaseIdentityRecord record: The identity to record.
+    """
+    study.set_user_attr(PHASE_IDENTITY_ATTR, record)
 
 
 def _verify_fingerprint(
@@ -371,18 +423,18 @@ def _verify_fingerprint(
         fingerprint or an incompatible one; the message names the keys that changed.
     :return str: Verified current fingerprint.
     """
-    payload = _phase_fingerprint_payload(experiment, phase, inherited_winners)
-    fp = _semantic_payload_digest(payload)
-    existing = study.user_attrs.get(PHASE_FINGERPRINT_ATTR)
+    fresh = _fresh_identity(experiment, phase, inherited_winners)
+    payload, fp = fresh["payload"], fresh["fingerprint"]
+    record = _recorded_identity(study)
     trials = study.get_trials(deepcopy=False)
-    if existing is None:
+    if record is None:
         if trials:
             raise StudyFingerprintMismatchError(
                 f"Phase {phase.name!r} study {study.study_name!r} has no semantic fingerprint.",
                 remediation=NEW_STUDY_STEP,
             )
-        _stamp_fingerprint(study, fp, payload)
-    elif existing != fp:
+        _stamp_identity(study, fresh)
+    elif record["fingerprint"] != fp:
         # A zero-trial study has no result semantics to preserve. This includes
         # a process that died after recording its trial target but before Optuna
         # created the first trial.
@@ -391,12 +443,12 @@ def _verify_fingerprint(
                 "Rebinding the fingerprint of empty study %s (%s -> %s): no trial "
                 "ever ran under the previous config.",
                 study.study_name,
-                short_digest(str(existing)),
+                short_digest(record["fingerprint"]),
                 short_digest(fp),
             )
-            _stamp_fingerprint(study, fp, payload)
+            _stamp_identity(study, fresh)
             return fp
-        raise _mismatch_refusal(study, experiment, phase, existing=str(existing), payload=payload)
+        raise _mismatch_refusal(study, experiment, phase, recorded=record, payload=payload)
     return fp
 
 
@@ -414,18 +466,18 @@ def _verify_recorded_identity(study: optuna.Study, experiment: Experiment, phase
     :raises StudyFingerprintMismatchError: The study's own config differs from the one it
         recorded; the refusal :func:`_verify_fingerprint` gives for it.
     """
-    stored = study.user_attrs.get(PHASE_FINGERPRINT_PAYLOAD_ATTR)
-    existing = study.user_attrs.get(PHASE_FINGERPRINT_ATTR)
+    record = _recorded_identity(study)
     if (
-        not isinstance(stored, dict)
-        or "inherited_effective_overrides" not in stored
-        or not isinstance(existing, str)
+        record is None
+        or "inherited_effective_overrides" not in record["payload"]
         or not study.get_trials(deepcopy=False)
     ):
         return
-    payload = _identity_payload(experiment, phase, stored["inherited_effective_overrides"])
-    if _semantic_payload_digest(payload) != existing:
-        raise _mismatch_refusal(study, experiment, phase, existing=existing, payload=payload)
+    payload = _identity_payload(
+        experiment, phase, record["payload"]["inherited_effective_overrides"]
+    )
+    if _semantic_payload_digest(payload) != record["fingerprint"]:
+        raise _mismatch_refusal(study, experiment, phase, recorded=record, payload=payload)
 
 
 def _mismatch_refusal(
@@ -433,7 +485,7 @@ def _mismatch_refusal(
     experiment: Experiment,
     phase: Phase,
     *,
-    existing: str,
+    recorded: PhaseIdentityRecord,
     payload: JsonObject,
 ) -> StudyFingerprintMismatchError:
     """Build the refusal of a populated study whose recorded fingerprint differs from ``payload``.
@@ -441,18 +493,17 @@ def _mismatch_refusal(
     :param optuna.Study study: The populated study.
     :param Experiment experiment: Current experiment config.
     :param Phase phase: Phase the study belongs to.
-    :param str existing: The fingerprint the study recorded.
-    :param JsonObject payload: The current payload, whose digest differs from ``existing``.
-    :return StudyFingerprintMismatchError: The refusal, naming the keys that changed when the
-        study kept the payload its fingerprint digests.
+    :param PhaseIdentityRecord recorded: The identity the study recorded.
+    :param JsonObject payload: The current payload, whose digest differs from the recorded one.
+    :return StudyFingerprintMismatchError: The refusal, naming the keys that changed.
     """
-    stored = study.user_attrs.get(PHASE_FINGERPRINT_PAYLOAD_ATTR)
-    changes = _changed_payload_keys(stored, payload) if isinstance(stored, dict) else []
+    existing = recorded["fingerprint"]
+    changes = _changed_payload_keys(recorded["payload"], payload)
     cwd_unset = experiment.execution.cwd is None and any(
         path == "execution.cwd" for path, _old, _new in changes
     )
-    # The message shows the recorded values only when the study kept the payload they came
-    # from; without them the two digests are all it can show.
+    # A recorded payload equal to the current one under a different digest was not written by
+    # PhaseSweep, so the two digests are all the message can show.
     if not changes:
         way_forward = NEW_STUDY_STEP
         found = (

@@ -41,7 +41,7 @@ from phasesweep.engine.errors import (
     TrackingTargetUnavailableError,
     TrialEvidenceMissingError,
 )
-from phasesweep.engine.fingerprints import _phase_fingerprint
+from phasesweep.engine.fingerprints import _fresh_identity, _stamp_identity
 from phasesweep.engine.guards import _reconcile_existing_studies
 from phasesweep.engine.optuna import (
     _draw_positions,
@@ -66,7 +66,6 @@ from phasesweep.engine.state import (
     FAILURE_REASON_ATTR,
     FEASIBLE_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
-    PHASE_FINGERPRINT_ATTR,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
@@ -337,7 +336,7 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
     study, _trial_dir, _number, attempt_dir = fabricate_stale_trial(
         exp, "p", attempt_id="killed-attempt"
     )
-    study.set_user_attr(PHASE_FINGERPRINT_ATTR, _phase_fingerprint(exp, exp.phases[0], {}))
+    _stamp_identity(study, _fresh_identity(exp, exp.phases[0], {}))
     write_attempt_lifecycle(attempt_dir, attempt_id="killed-attempt", state="allocated")
 
     caplog.set_level(logging.INFO, logger="phasesweep")

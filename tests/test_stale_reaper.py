@@ -35,7 +35,7 @@ from phasesweep.engine.errors import (
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
-from phasesweep.engine.fingerprints import _phase_fingerprint
+from phasesweep.engine.fingerprints import _fresh_identity, _stamp_identity
 from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.guards import _preflight_existing_studies, _reconcile_existing_studies
 from phasesweep.engine.paths import _attempt_dir, _attempts_dir, _experiment_dir, _trial_dir_for
@@ -47,7 +47,6 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
-    PHASE_FINGERPRINT_ATTR,
     RERUN_OF_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
@@ -191,7 +190,6 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
         storage=engine_ledger._resolve_storage(storage),
         direction="minimize",
     )
-    study.set_user_attr("phasesweep_fingerprint", "OLD-FINGERPRINT")
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     t = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
     # Don't call study.tell — leave it RUNNING.
@@ -236,6 +234,9 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     )
 
     stamp_artifact_root(study, exp)
+    _stamp_identity(
+        study, {**_fresh_identity(exp, exp.phases[0], {}), "fingerprint": "OLD-FINGERPRINT"}
+    )
     identity = _environment_identity(exp, "a")
     t.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
     t.set_user_attr(TRAINER_ENV_ATTR, dict(identity.tracked))
@@ -309,10 +310,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
             pgid=os.getpgid(stale.pid),
             starttime=starttime,
         )
-        study.set_user_attr(
-            PHASE_FINGERPRINT_ATTR,
-            _phase_fingerprint(experiment, experiment.phases[1], {}),
-        )
+        _stamp_identity(study, _fresh_identity(experiment, experiment.phases[1], {}))
         run_experiment(experiment)
 
         marker = next(
@@ -1203,7 +1201,7 @@ def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -
     study, _trial_dir, stale_number, attempt_dir = fabricate_stale_trial(
         exp, "p", attempt_id="queued-attempt"
     )
-    study.set_user_attr(PHASE_FINGERPRINT_ATTR, _phase_fingerprint(exp, exp.phases[0], {}))
+    _stamp_identity(study, _fresh_identity(exp, exp.phases[0], {}))
     write_attempt_lifecycle(attempt_dir, attempt_id="queued-attempt", state="allocated")
 
     winners = run_experiment(exp)
@@ -1713,9 +1711,7 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
         persist_trial_attempt_id=False,
         persist_trial_generation_id=False,
     )
-    study.set_user_attr(
-        PHASE_FINGERPRINT_ATTR, _phase_fingerprint(experiment, experiment.phases[0], {})
-    )
+    _stamp_identity(study, _fresh_identity(experiment, experiment.phases[0], {}))
     write_attempt_lifecycle(attempt_dir, attempt_id="partial-attempt", state="allocated")
 
     winners = run_experiment(experiment)

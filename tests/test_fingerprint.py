@@ -58,6 +58,7 @@ from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
+    PHASE_IDENTITY_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
@@ -187,8 +188,15 @@ def _fake_top_up_study(*, completed: int = 0, fingerprint: str | None = None) ->
         surface :func:`_reject_bound_descendant_topups` uses.
     """
     trials = [SimpleNamespace(state=optuna.trial.TrialState.COMPLETE, user_attrs={})] * completed
+    entries = [{"search_space": {}, "first_position": 0}]
+    record = {
+        "schema_version": 1,
+        "fingerprint": fingerprint,
+        "payload": {},
+        "search_spaces": entries,
+    }
     return SimpleNamespace(
-        user_attrs={} if fingerprint is None else {"phasesweep_fingerprint": fingerprint},
+        user_attrs={} if fingerprint is None else {PHASE_IDENTITY_ATTR: record},
         get_trials=lambda *, deepcopy: trials,
     )
 
