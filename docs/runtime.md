@@ -335,6 +335,51 @@ A rerun continues where the interrupted attempt stopped. It runs the same comman
 
 Every trial has a draw position. A trial that is not a rerun takes the next one, 0, 1, 2 and so on, and a rerun takes its source's. Samplers draw by position rather than trial number, so an interruption never repeats or skips a draw; a discrete space can still yield the same configuration twice. Grid and seeded random reproduce an uninterrupted run at any `n_jobs`; seeded TPE and CMA-ES do at `n_jobs: 1`, given the same trial values. [Invariant 29](invariants.md#29-a-seeded-phase-draws-by-position-so-an-interruption-never-repeats-or-skips-a-draw) gives the position contract. Grid shuffles with a fixed seed when none is set, so it reproduces unseeded too. `validate` and the dry run print this per phase as `(resumable, reproducible)` or `(resumable)`; on `storage: null`, where nothing resumes, they print `(reproducible, not resumable: in-memory storage)` or `(not resumable: in-memory storage)`.
 
+### Leaving a sweep unattended
+
+Rerunning the same command is the whole recovery, so a service manager that reruns it keeps a long sweep going through a reboot, a killed runner or a tracker outage. PhaseSweep schedules and wraps nothing itself; it only exits with a status that tells the manager whether rerunning can help.
+
+- Finished trials are kept, and a rerun adds only the trials still missing.
+- An interrupted trial continues in its own trial directory, so the trainer must write checkpoints into that directory and resume from the latest one it finds there; see [interrupted trials rerun](#interrupted-trials-rerun).
+- A trial whose training finished while the tracker gave no answer stays `RUNNING` with its training kept, and the next run reads the tracker first, before any new work ([trial execution and evidence](#trial-execution-and-evidence)).
+- A finished sweep's command replays its published result and exits 0, so starting the service again after a reboot is harmless.
+
+Three kinds of ending matter to a manager. Status 75 is a refusal that clears without a change to the command or config, such as another run holding the experiment lock or a tracker that gave no answer. Statuses 1, 2 and 70 need a person, after the `fix:` line or the traceback. A runner killed by a signal, such as SIGKILL from the kernel's out-of-memory killer, leaves no status, and the next run recovers its stale trial.
+
+A systemd user unit, saved as `~/.config/systemd/user/phasesweep-sweep.service`, reruns the command after a signal death and after every nonzero status except 1, 2 and 70:
+
+```ini
+[Unit]
+Description=PhaseSweep sweep
+
+[Service]
+WorkingDirectory=/path/to/trainer/repo
+Environment=PATH=/path/to/env/bin:/usr/bin:/bin
+# Add one Environment= line for each variable execution.inherit_env names.
+ExecStart=/path/to/env/bin/phasesweep run /path/to/config.yaml
+KillMode=mixed
+Restart=on-failure
+RestartSec=300
+RestartPreventExitStatus=1 2 70
+
+[Install]
+WantedBy=default.target
+```
+
+`Restart=on-failure` restarts after any nonzero exit status, including 75 and the 143 of an external SIGTERM, and after death by a signal such as SIGKILL; it does not restart after exit 0 or after `systemctl stop`. `RestartPreventExitStatus=1 2 70` leaves the unit stopped on those statuses, and `systemctl --user status` then shows it as failed. `RestartSec=300` waits five minutes between starts, so an outage that lasts hours costs one target check every five minutes. `KillMode=mixed` sends the stop signal to `phasesweep` alone, which asks the trainer's guardian to cancel and records the trial as interrupted; the default would also SIGTERM the trainer directly, which can record a failed trial that counts toward `max_consecutive_failures` ([interrupted trials rerun](#interrupted-trials-rerun)). A persistent study refuses new trials when the trainer environment changed, and a service starts with neither a login shell's `PATH` nor its variables, so set the `PATH` with the Python environment first and one `Environment=` line for each `execution.inherit_env` name, with the values the study recorded ([resolve a changed study or trainer environment](#resolve-a-changed-study-or-trainer-environment)).
+
+```bash
+loginctl enable-linger "$USER"
+systemctl --user enable --now phasesweep-sweep.service
+journalctl --user -u phasesweep-sweep.service -f
+```
+
+`enable-linger` keeps the user's service manager running without a login, so the unit starts at boot. `enable --now` links the unit, reloads the manager and starts it. The journal holds the console output, and `run.log` holds the same lines under the workdir.
+
+To ride out a short tracker outage without a restart, raise `timeout_seconds` on the tracker block (`mlflow` or `wandb`, default 120). It is the one deadline over each tracker operation, retries included, so a read that meets an outage shorter than it keeps retrying and the run goes on. A longer outage ends the run with status 75, which the unit restarts. The key is not part of the study fingerprint, so changing it keeps the study.
+
+A tracker refusal that no outage explains, such as rejected credentials, also exits 75 and repeats every `RestartSec` with the training kept, until the credentials are fixed; read the `fix:` line in the journal. The unit does not chain different sweeps, which is a [declined request](development.md#declined-requests); a status of 1 or 2 stays stopped until a person reads the `fix:` line.
+
 ## Inspection commands
 
 Use `validate`, `run --dry-run`, `status` and `show-winners` to inspect an experiment without launching work. `validate` reads existing studies only to check [raised fixed or grid targets](#retry-fixed-configurations-and-grids), and never compares the config with a study's recorded identity, so an edit that study refuses, such as a changed search space or `timeout_seconds_per_trial`, passes `validate` and is refused by the dry run. `validate` and `run --dry-run` print the same contract facts, each wrapped to the terminal: the metric and each `observe` entry give their extractor as its kind followed by `key=value` fields, a value holding a space quoted. A passing `validate` says so in a closing sentence wrapped to the terminal, `Checked the config alone. A dry run also compares it with the recorded study and its trials' environment, and checks the trial program on PATH:`, followed by the `phasesweep run CONFIG --dry-run` command as typed on a line of its own, unbroken so it can be pasted. The dry run captures the journal once without writing and reports each phase's `finished`, `remaining` and [rerun](#interrupted-trials-rerun) counts. A met target or accepted partial target replays its recorded winner, so children preview with real inherited values. Otherwise their sample commands use stand-ins. `DRY RUN example command` names those keys and the parent that must publish, as in `(placeholders until 'architecture' publishes a winner: model.name)`. Keys the child fixes itself are real values.
