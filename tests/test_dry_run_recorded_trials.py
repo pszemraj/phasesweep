@@ -684,7 +684,9 @@ def test_raised_upstream_target_over_a_bound_descendant_is_refused_as_a_run_refu
     assert isinstance(refusal, StudyContextConflictError)
     assert refusal.remediation == (
         "Give `b` and `c` new names and update the `inherits` that name them, which runs them "
-        "again from scratch; `a` keeps its trials and runs the rest."
+        "again from scratch; `a` keeps its trials and runs the rest. Or run a config without its "
+        "dependents first, then put them back: a dependent whose inherited values come out "
+        "unchanged keeps its trials."
     )
 
 

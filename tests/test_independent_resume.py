@@ -140,7 +140,8 @@ def test_from_phase_after_a_changed_parent_names_the_step_its_storage_allows(
         assert message.endswith(
             "fix: Restore the config that produced the winner of `parent`, or give `parent` and "
             "`child` new names and update the `inherits` that name them, which runs them again "
-            "from scratch."
+            "from scratch. If its search_space only gained values, run from `parent` "
+            "(`--from-phase parent`)."
         )
     else:
         assert message.endswith(

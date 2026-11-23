@@ -214,7 +214,8 @@ def _reject_bound_descendant_topups(
                 f"{'is' if len(bound) == 1 else 'are'} bound to its published winner.",
                 remediation=(
                     f"{rename[0].upper()}{rename[1:]}; `{phase.name}` keeps its trials and runs "
-                    "the rest."
+                    "the rest. Or run a config without its dependents first, then put them back: "
+                    "a dependent whose inherited values come out unchanged keeps its trials."
                 ),
             )
 

@@ -854,7 +854,8 @@ def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path)
     # The rename step names only the dependent, so the enlarged phase keeps its trials.
     assert refused.value.remediation == (
         "Give `lr` a new `name`, which runs it again from scratch; `arch` keeps its trials and "
-        "runs the rest."
+        "runs the rest. Or run a config without its dependents first, then put them back: a "
+        "dependent whose inherited values come out unchanged keeps its trials."
     )
 
     parent_after = optuna.load_study(study_name="t::arch", storage=_resolve_storage(storage)).trials

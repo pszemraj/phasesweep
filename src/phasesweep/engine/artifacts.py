@@ -386,7 +386,9 @@ def _load_winner(
             f"{short_digest(stored_fp)} != current {short_digest(current_fp)}).",
             action=OperatorAction.FIX_CONFIG,
             remediation=(
-                fingerprint_ops.restore_or_rename_step(experiment, phase, recorded=produced)
+                f"{fingerprint_ops.restore_or_rename_step(experiment, phase, recorded=produced)} "
+                f"If its search_space only gained values, run from `{phase.name}` "
+                f"(`--from-phase {phase.name}`)."
                 if experiment.persistent
                 else f"Restore {produced}, or run {_WITHOUT_FROM_PHASE_IN_MEMORY}."
             ),

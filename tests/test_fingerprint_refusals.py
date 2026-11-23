@@ -431,7 +431,9 @@ def test_a_raised_target_is_run_by_renaming_only_the_phases_that_inherit_it(
     assert refused.value.remediation is not None
     assert refused.value.remediation == (
         "Give `b` and `c` new names and update the `inherits` that name them, which runs them "
-        "again from scratch; `a` keeps its trials and runs the rest."
+        "again from scratch; `a` keeps its trials and runs the rest. Or run a config without its "
+        "dependents first, then put them back: a dependent whose inherited values come out "
+        "unchanged keeps its trials."
     )
 
     renamed = chain(a_trials=3, suffix="2")

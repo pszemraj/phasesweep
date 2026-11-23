@@ -332,6 +332,37 @@ def test_dry_run_of_grown_phase_leaves_the_journal_unchanged(
     ) in caplog.messages
 
 
+@pytest.mark.integration
+def test_from_phase_past_grown_phase_names_from_phase_step(tmp_path: Path) -> None:
+    """Skipping a grown phase is refused with the step that runs it; running from it, with the dependent left out and put back, keeps every trial."""
+    trainer, calls = _trainer(tmp_path)
+    child = Phase(
+        name="q",
+        inherits=["p"],
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="random", seed=0),
+        search_space={"wd": FloatParam(type="float", low=0.0, high=0.1)},
+    )
+    run_experiment(_experiment(tmp_path, trainer, _phase(_ORIGINAL), child))
+    # The added values all lose to the recorded winner, so the dependent's inherited lr holds.
+    worse = [*_ORIGINAL, 1e-2, 3e-2]
+    grown = _experiment(tmp_path, trainer, _phase(worse), child)
+
+    with pytest.raises(StudyFingerprintMismatchError) as caught:
+        run_experiment(grown, from_phase="q")
+    assert caught.value.remediation is not None
+    assert caught.value.remediation.endswith(
+        "If its search_space only gained values, run from `p` (`--from-phase p`)."
+    )
+
+    run_experiment(_experiment(tmp_path, trainer, _phase(worse)))
+    winners = run_experiment(grown)
+    assert len(_calls(calls)) == len(worse) + child.n_trials
+    assert winners["p"].params["lr"] == 1e-4
+    assert set(winners) == {"p", "q"}
+
+
 def test_cmaes_range_change_refused() -> None:
     """Under CMA-ES a widened range refuses with the step that keeps every trial."""
     narrow = FloatParam(type="float", low=0.0, high=1.0)
