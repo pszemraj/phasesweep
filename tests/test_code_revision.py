@@ -19,17 +19,25 @@ from phasesweep import run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import ExecutionContext, Experiment
 from phasesweep.engine.paths import (
+    _attempt_dir,
     _experiment_dir,
     _generation_dir,
     _generation_reproducibility_path,
 )
 from phasesweep.engine.provenance import _code_revision
-from phasesweep.engine.selection import _ranked_code_revisions
+from phasesweep.engine.selection import _ranked_code_revisions, _ranked_revision_sources
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    FAILURE_REASON_ATTR,
     GENERATION_ID_ATTR,
     REPRODUCIBILITY_SCHEMA_VERSION,
     RERUN_OF_ATTR,
+    RETURN_CODE_ATTR,
+    TRIAL_DIR_ATTR,
+    TRIAL_OUTCOME_ATTR,
+    _trial_outcome_payload,
 )
+from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
@@ -324,6 +332,44 @@ def test_a_ranked_generation_without_a_readable_record_reads_as_unreadable(
         "missing-1": "unreadable",
     }
     assert _ranked_code_revisions(experiment, trials[:1]) == {}
+
+
+@pytest.mark.parametrize("worker_state", ["launching", "exited"])
+def test_ranked_rerun_keeps_trainer_revision_when_worker_never_started(
+    tmp_path: Path, worker_state: str
+) -> None:
+    """An evidence worker's unused process slot does not erase a successful trainer's revision."""
+    study = optuna.create_study()
+    attempt_id = "source-attempt"
+    attempt_dir = _attempt_dir(tmp_path, attempt_id)
+    attempt_dir.mkdir(parents=True)
+    write_attempt_lifecycle(
+        attempt_dir,
+        attempt_id=attempt_id,
+        state=worker_state,
+        ended_by="not_started" if worker_state == "exited" else None,
+        cleanup_confirmed=True if worker_state == "exited" else None,
+    )
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=optuna.trial.TrialState.FAIL,
+            user_attrs={
+                ATTEMPT_ID_ATTR: attempt_id,
+                FAILURE_REASON_ATTR: "phase deadline expired before the evidence worker launched",
+                GENERATION_ID_ATTR: "source-generation",
+                RETURN_CODE_ATTR: 0,
+                TRIAL_DIR_ATTR: str(tmp_path / f"trial_00000__{attempt_id}"),
+                TRIAL_OUTCOME_ATTR: _trial_outcome_payload(1, "interrupted"),
+            },
+        )
+    )
+    study.add_trial(optuna.trial.create_trial(value=0.5, user_attrs={RERUN_OF_ATTR: 0}))
+    study.add_trial(optuna.trial.create_trial(value=0.6))
+    trials = study.get_trials(deepcopy=False)
+
+    assert _ranked_revision_sources(trials, trials[1:], phase_dir=tmp_path) == {
+        1: ["source-generation"]
+    }
 
 
 @pytest.mark.integration

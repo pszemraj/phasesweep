@@ -66,6 +66,7 @@ from phasesweep.engine.state import (
     GATES_ATTR,
     GENERATION_ID_ATTR,
     OBSERVED_PREFIX,
+    RETURN_CODE_ATTR,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
@@ -967,12 +968,18 @@ def _ranked_revision_sources(
 
 
 def _may_have_trained(source: optuna.trial.FrozenTrial, phase_dir: Path | None) -> bool:
-    """Exclude an interrupted ancestor only when its lifecycle proves no trainer ran.
+    """Use the trainer's ledger result before interpreting the shared process slot.
+
+    A tracker evidence worker can leave a never-started lifecycle after a successful
+    trainer exit. The recorded trainer return code still proves it could contribute.
 
     :param optuna.trial.FrozenTrial source: Interrupted source with a recorded trial directory.
     :param Path | None phase_dir: Current phase directory, if known.
     :return bool: Whether the attempt could have contributed to a retained checkpoint.
     """
+    return_code = source.user_attrs.get(RETURN_CODE_ATTR)
+    if type(return_code) is int and return_code == 0:
+        return True
     attempt_id = source.user_attrs.get(ATTEMPT_ID_ATTR)
     if not isinstance(attempt_id, str) or not attempt_id:
         return True
