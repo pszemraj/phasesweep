@@ -33,6 +33,7 @@ demo/
     attempts/<attempt-id>/      # one per attempt: PhaseSweep's own records, never the trainer's
       attempt_lifecycle.json
       process_identity.json
+      evidence_baseline.json    # identity of each value file the attempt could read, taken before the trainer starts
       command.txt
       stdout.log
       stderr.log
@@ -46,7 +47,7 @@ The root `generation.yaml` names the latest [generation](#timeouts-cleanup-and-c
 
 `trials.csv` is a snapshot of the phase's trials with sampled parameters and user attributes, including [`observe`](config.md#report-only-observations) readings as `user_attr:observed:<name>` and a rerun's source as `user_attr:phasesweep_rerun_of`. It uses the state labels of [`status --trials`](#inspection-commands), and a repeats phase adds `repeat_group` ([repeat groups](#repeat-groups)). Persistent sweeps refresh it periodically during training and at phase exit. Continuation preflight (including a replay) and confirmed [`recover-run`](mcp.md#run-state-and-recovery) refresh it after reconciling recorded trials when the supplied phase matches the study's recorded semantics. This keeps a changed repeat configuration from relabeling recorded trials. With `storage: null`, PhaseSweep writes it at each trial's terminal callback. A winner's `completion` block records the counts checked against the publication. `finished_trials` counts `COMPLETE`, `INFEASIBLE` and `FAIL`. `completed_trials` counts `COMPLETE` alone, as `status` does.
 
-`config.snapshot.yaml` is the executed configuration, including materialized defaults and the resolved invocation context. `reproducibility.json` is the shareable generation identity record. Its `code_revision` is the git commit of the trainer's working directory (`execution.cwd`, or the invocation directory when unset) and whether tracked files differ from it, or `null` outside a git work tree or when git fails. A resume never compares it and a changed commit is not refused; only the [`code_revision` confound check](#confound-verdicts) reads it, to say when ranked trials ran under different revisions. `show-winners` prints the publishing generation's as a `# publication code revision:` line, `unknown` for `null` and with `(dirty)` added when tracked files differed. A winner carried from an earlier generation was produced under that generation's revision, so its `# winner generation:` line adds the source generation's own revision in the same form, or `unreadable` when that generation's record is gone or invalid. Trial directories retain local evidence and attempt lifecycle information used for supported continuation and winner validation.
+`config.snapshot.yaml` is the executed configuration, including materialized defaults and the resolved invocation context. `reproducibility.json` is the shareable generation identity record. Its `code_revision` is the git commit of the trainer's working directory (`execution.cwd`, or the invocation directory when unset) and whether tracked files differ from it, or `null` outside a git work tree or when git fails. A resume never compares it and a changed commit is not refused; only the [`code_revision` confound check](#confound-verdicts) reads it, to say when ranked trials ran under different revisions. `show-winners` prints the publishing generation's as a `# publication code revision:` line, `unknown` for `null` and with `(dirty)` added when tracked files differed. A winner carried from an earlier generation was produced under that generation's revision, so its `# winner generation:` line adds the source generation's own revision in the same form, or `unreadable` when that generation's record is gone or invalid. Trial directories retain the trainer's local evidence, and the attempt directories under `<phase>/attempts/` retain the attempt lifecycle and process records used for supported continuation and winner validation.
 
 The generated `trainer_config.yaml` or `overrides.json` holds the trainer base with the effective overrides applied. For these file formats, `overrides_resolved.json` is an overrides-only audit record. For argparse and Hydra, it is the actual flattened input, merging the trainer base with effective overrides before command placeholders expand. Winner observations are empty when none were recorded; `repeats` is `null` outside a repeats phase.
 
@@ -107,8 +108,7 @@ Finished in 3.0s: 2 phases, 4 trials, 0 from a previous run
 
   depth          2 complete
                  winner  trial 0  eval_loss 0.3  model.n_layers=8
-                 runs/phasesweep_starter/depth/
-                 trial_00000__427a82a35fa741e9b821d63c678fb30e
+                 runs/phasesweep_starter/depth/trial_00000__427a82a35fa741e9b821d63c678fb30e
   learning_rate  2 complete
                  winner  trial 0  eval_loss 0.3  optimizer.lr=0.0003
                  runs/phasesweep_starter/learning_rate/
@@ -243,7 +243,7 @@ No environment variable sets a config key, and the YAML has no `${VAR}` interpol
 
 ## Trial execution and evidence
 
-Each trial has an attempt-scoped directory and process group. Evidence identifies the generated configuration for YAML, the nested overrides file for JSON, or the resolved overrides and command for Argparse and Hydra. PhaseSweep verifies historical inputs using their recorded format. See [interrupted trials](#interrupted-trials-rerun) for recovery of completed training.
+Each attempt has its own process group and records directory, and its trial directory is the one the trainer writes into. Evidence identifies the generated configuration for YAML, the nested overrides file for JSON, or the resolved overrides and command for Argparse and Hydra. PhaseSweep verifies historical inputs using their recorded format. See [interrupted trials](#interrupted-trials-rerun) for recovery of completed training.
 
 W&B polling starts after successful trainer cleanup and GPU-lease release. It uses the same durable attempt slot and process supervisor, so recovery can find the reader after abrupt parent exit, even if its phase was removed. Uncertain cleanup blocks further work. One absolute polling deadline covers worker startup, SDK construction, requests, retries and summary visibility. Phase or run deadlines can shorten it, and cleanup grace stays separate. The worker reserves the last 2 seconds, or half the time it has left if shorter, for receiving an in-flight answer and reporting the result. When the phase or run deadline capped the polling budget, a polling timeout becomes an [interruption](#timeouts-cleanup-and-continuation) regardless of what the last poll saw. A final lookup that found no run becomes an interruption too. The extractor's own `timeout_seconds` can instead yield a failure or an unreadable tracker, as below.
 

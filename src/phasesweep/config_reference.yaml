@@ -401,7 +401,7 @@ storage: string | null = null
 
 # Directory for per-experiment generations, attempt directories, logs and winner files. Write . for the config file's directory; "" fails config load.
 # Warning: changing execution.cwd does not move it. Give trainer outputs a trial-specific path through trainer_config or trial_command.
-# Warning: nothing under it is pruned. Every trial, interrupted attempt and rerun keeps its directory, so have the trainer bound its own checkpoints.
+# Warning: nothing under it is pruned. Every trial keeps its directory, which an interrupted trial's rerun reuses, and every attempt keeps its records, so have the trainer bound its own checkpoints.
 workdir: string = "./runs"
 
 # Operator-defined identifiers of inputs outside this YAML that git does not capture, such as dataset_revision and dependency versions.
