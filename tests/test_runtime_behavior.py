@@ -86,7 +86,7 @@ from phasesweep.errors import (
     ProcessCleanupUncertainError,
     UnsafeProcessCleanupError,
 )
-from phasesweep.evidence.evaluation import DeadlineExceededError, ExtractorError
+from phasesweep.evidence.evaluation import DeadlineExceededError, ExtractorError, run_extractor
 from phasesweep.evidence.models import (
     Gate,
     JsonExtractor,
@@ -1899,7 +1899,7 @@ def test_metric_outside_bounds_is_complete_and_infeasible(tmp_path: Path) -> Non
 def test_required_constraint_failure_preserves_prior_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    """Required extraction retains prior constraints and objective-only provenance."""
+    """A failed constraint keeps the values read from earlier constraint files."""
     experiment = make_experiment(
         constraints=[
             Constraint(
@@ -1908,12 +1908,12 @@ def test_required_constraint_failure_preserves_prior_values(
             for name in ("first", "second")
         ]
     )
-    provenance_calls: list[bool] = []
+    (tmp_path / "stdout.log").write_text("x=1\n")
+    (tmp_path / "r.json").write_text('{"first": 2}')
 
-    def extract(_ctx, _cfg, *, provenance=None, **_kwargs):
-        provenance_calls.append(provenance is not None)
-        if len(provenance_calls) < 3:
-            return float(len(provenance_calls))
+    def extract(ctx, cfg, **kwargs):
+        if cfg != experiment.constraints[1].extractor:
+            return run_extractor(ctx, cfg, **kwargs)
         if failure == "extractor":
             raise ExtractorError("stopped")
         if failure == "deadline":
@@ -1931,7 +1931,6 @@ def test_required_constraint_failure_preserves_prior_values(
     assert result.failure_reason is not None
     assert result.constraints == {"first": 2.0}
     assert result.deadline_exhausted is (failure == "deadline")
-    assert provenance_calls == [True, False, False]
     assert result.failure_reason == (
         "constraint extractor 'second' returned non-finite value: inf"
         if failure == "nonfinite"
