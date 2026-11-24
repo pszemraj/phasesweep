@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config.models import Constraint, Experiment
+from phasesweep.config.models import Constraint, Experiment, Phase
+from phasesweep.engine.errors import ResumeBoundsChangedError
+from phasesweep.engine.paths import _experiment_dir, _generations_dir
 from phasesweep.engine.read import read_trial_tables
 from phasesweep.engine.selection import PhaseAbortRefusedError, PhaseTrialsInfeasibleError
 from phasesweep.evidence.models import LogRegexExtractor
@@ -124,3 +126,49 @@ def test_tightening_a_bound_replaces_a_winner_it_rules_out_without_retraining(
         2: "COMPLETE",
     }
     assert [trial.number for trial in phase_trials(tightened)] == [0, 1, 2]
+
+
+@pytest.mark.parametrize("bound", ["metric", "constraint"])
+@pytest.mark.parametrize("tighten", [True, False], ids=["tighten", "loosen"])
+def test_from_phase_requires_reselection_when_bounds_change(
+    tmp_path: Path, bound: str, tighten: bool
+) -> None:
+    """A skipped selection cannot be carried after either direction of a bound edit.
+
+    :param Path tmp_path: Scratch trainer, journal and artifacts.
+    :param str bound: Whether the objective or a constraint provides the bound.
+    :param bool tighten: Tighten the bounds if true, otherwise loosen them.
+    """
+    loose = _experiment(tmp_path, **({} if bound == "metric" else {"memory_max": 100.0}))
+    tight = (
+        _experiment(tmp_path, min=0.5)
+        if bound == "metric"
+        else _experiment(tmp_path, memory_max=25.0)
+    )
+    child = Phase(name="q", n_trials=1, inherits=["p"], fixed_overrides={"x": 0}, gpu_policy="none")
+    previous, current = (loose, tight) if tighten else (tight, loose)
+    previous = previous.model_copy(update={"phases": [*previous.phases, child]})
+    current = current.model_copy(update={"phases": [*current.phases, child]})
+    original = run_experiment(previous)
+    assert original["p"].metric == (0.3 if tighten else 1.0)
+    assert _launches(tmp_path) == 4
+    generations = _generations_dir(_experiment_dir(previous))
+    before = set(generations.iterdir())
+
+    for dry_run in (True, False):
+        with pytest.raises(
+            ResumeBoundsChangedError, match="Skipped phase 'p' was selected under different"
+        ) as refused:
+            run_experiment(current, from_phase="q", dry_run=dry_run)
+        assert refused.value.remediation == (
+            "Run with `--from-phase p` to reselect from the phase's recorded trials."
+        )
+    assert _launches(tmp_path) == 4
+    assert set(generations.iterdir()) == before
+
+    replay = run_experiment(current, from_phase="p")
+    assert replay["p"].metric == (1.0 if tighten else 0.3)
+    assert replay["p"].generation_id == original["p"].generation_id
+    assert _launches(tmp_path) == 4
+    assert run_experiment(current, from_phase="q")["p"] == replay["p"]
+    assert _launches(tmp_path) == 4

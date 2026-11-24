@@ -38,6 +38,7 @@ from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     PublicationAccessError,
     PublicationIntegrityError,
+    ResumeBoundsChangedError,
     ResumeWinnerMissingError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -1597,6 +1598,19 @@ class PhaseSweepMCP:
                 return ResumePublicationUnusableError(reg.id, from_phase, state)
             if isinstance(exc, ResumeWinnerMissingError):
                 return ResumeNotReadyError(reg.id, from_phase, phase_name)
+            if isinstance(exc, ResumeBoundsChangedError):
+                return ResumeNotReadyError(
+                    reg.id,
+                    from_phase,
+                    phase_name,
+                    reason=(
+                        "was selected under different metric or constraint bounds. Call "
+                        f"launch_run with from_phase={phase_name!r} to reselect from recorded trials"
+                        if reg.experiment.persistent
+                        else "was selected under different metric or constraint bounds. Call "
+                        "launch_run without from_phase to restart"
+                    ),
+                )
             if isinstance(
                 exc, (RuntimeError, KeyError, TypeError, ValueError, AttributeError, OSError)
             ):

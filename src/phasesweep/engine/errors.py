@@ -22,6 +22,12 @@ class StudyFingerprintMismatchError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
 
 
+class ResumeBoundsChangedError(StudyFingerprintMismatchError):
+    """Raised when skipping a phase would reuse a winner selected under different bounds."""
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
+
+
 class StudySchemaMismatchError(PhaseSweepError):
     """Raised when populated storage uses an unsupported PhaseSweep schema."""
 

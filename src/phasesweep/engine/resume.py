@@ -14,7 +14,8 @@ import phasesweep.engine.guards as guard_ops
 import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.engine.errors import PhaseTimeoutError, phase_timeout
+from phasesweep.engine.bounds import selection_bounds
+from phasesweep.engine.errors import PhaseTimeoutError, ResumeBoundsChangedError, phase_timeout
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.state import Winner, _recorded_identity
@@ -59,6 +60,7 @@ def _preflight_skipped_winners(
         or incomplete.
     :raises StudyFingerprintMismatchError: A skipped phase's winner fingerprint
         disagrees with the current config.
+    :raises ResumeBoundsChangedError: The current bounds require reselecting a skipped winner.
     :raises TrialEvidenceMissingError: A skipped winner's source trial evidence
         is missing or changed.
     :raises PublicationAccessError: The recorded publication cannot be read as
@@ -145,12 +147,23 @@ def _accept_skipped_winner(
         partial-result policy.
     :raises StudyFingerprintMismatchError: The winner was produced by a
         different config.
+    :raises ResumeBoundsChangedError: The current bounds require reselecting the winner.
     :raises TrialEvidenceMissingError: The winner's source trial evidence is
         missing or changed.
     :return Winner: The accepted winner.
     """
     inherited = {parent: winners[parent] for parent in phase.inherits}
     winner = artifact_io._load_winner(experiment, phase, inherited, publication=publication)
+    assert publication is not None
+    if publication.bounds != selection_bounds(experiment.metric, experiment.constraints):
+        raise ResumeBoundsChangedError(
+            f"Skipped phase {phase.name!r} was selected under different metric or constraint bounds.",
+            remediation=(
+                f"Run with `--from-phase {phase.name}` to reselect from the phase's recorded trials."
+                if experiment.persistent
+                else "Run without --from-phase to start every phase again."
+            ),
+        )
     evidence_ops._verify_winner_evidence(experiment, phase, winner)
     return winner
 

@@ -9,12 +9,26 @@ so correcting a bound re-judges the recorded trials instead of retraining them.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 
 import optuna
 
-from phasesweep.config.models import Experiment
+from phasesweep.config.models import Constraint, Experiment, Metric
 from phasesweep.engine.state import constraint_attr
+from phasesweep.runtime.json import JsonObject
+
+
+def selection_bounds(metric: Metric, constraints: Iterable[Constraint]) -> JsonObject:
+    """Capture the bounds that determine which measured trials can win.
+
+    :param Metric metric: Configured objective and bounds.
+    :param Iterable[Constraint] constraints: Configured constraints with names and bounds.
+    :return JsonObject: Metric bounds and constraint bounds by name.
+    """
+    return {
+        "metric": {"min": metric.min, "max": metric.max},
+        "constraints": {c.name: {"min": c.min, "max": c.max} for c in constraints},
+    }
 
 
 def _bound_violations_of(

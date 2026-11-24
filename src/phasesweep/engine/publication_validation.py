@@ -15,8 +15,9 @@ import yaml
 
 import phasesweep.engine.paths as path_ops
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
-from phasesweep.config.models import Experiment, Metric, _metric_semantics_payload
+from phasesweep.config.models import Constraint, Experiment, Metric, _metric_semantics_payload
 from phasesweep.config.search import Repeats
+from phasesweep.engine.bounds import selection_bounds
 from phasesweep.engine.confound import ConfoundBlock, _validate_confound_block
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.optuna import _belongs_to_phase
@@ -46,8 +47,10 @@ class PlannedPhase(NamedTuple):
 
 
 class GenerationProvenance(NamedTuple):
-    """Phase layout, argparse base and code revision from a generation's provenance files."""
+    """Selection bounds, phase layout, argparse base and code revision from provenance files."""
 
+    bounds: JsonObject
+    """Metric and constraint bounds from the configuration snapshot."""
     inherits: Mapping[str, tuple[str, ...]]
     """Each phase's parents, in plan order."""
     repeats: Mapping[str, Repeats | None]
@@ -89,6 +92,8 @@ class ValidatedPublication:
     """Each planned phase's parents, from the validated config snapshot."""
     metric: Mapping[str, Any]
     """The summary's metric semantics, checked against the config snapshot."""
+    bounds: JsonObject
+    """The bounds under which this generation's winners were selected."""
     winners: Mapping[str, ValidatedWinner]
     """Every manifest-listed winner, keyed by the phase that exposes it."""
     argparse_trainer_config: JsonObject | None
@@ -441,6 +446,7 @@ def _validate_generation_manifest(
         phase_plan=phase_plan,
         inherits=provenance.inherits,
         metric=metric,
+        bounds=provenance.bounds,
         winners=winners,
         argparse_trainer_config=provenance.argparse_trainer_config,
         code_revision=provenance.code_revision,
@@ -473,9 +479,8 @@ def _validate_generation_provenance_files(
     :raises PublicationIntegrityError: Whatever ``fail`` builds, when a provenance file is
         listed without its partner, is absent, unreadable, altered,
         unparsable, or disagrees with the summary's own identity.
-    :return GenerationProvenance: Each snapshot phase's parents, in plan order, its
-        configured ``repeats``, the producing argparse base when applicable, and the
-        reproducibility record's ``code_revision``.
+    :return GenerationProvenance: The snapshot's bound settings, phase plan and configured
+        ``repeats``, the argparse base when applicable, and the recorded ``code_revision``.
     """
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         if (generation_dir / filename).is_file() and kind not in listed_files:
@@ -554,6 +559,13 @@ def _validate_generation_provenance_files(
         raise fail("config_snapshot artifact has malformed metric semantics") from exc
     if summary.get("metric") != _metric_semantics_payload(snapshot_metric):
         raise fail("summary metric semantics disagree with the config_snapshot artifact")
+    raw_constraints = snapshot.get("constraints", [])
+    if not isinstance(raw_constraints, list):
+        raise fail("config_snapshot artifact has malformed constraints")
+    try:
+        constraints = [Constraint.model_validate(raw) for raw in raw_constraints]
+    except ValueError as exc:
+        raise fail("config_snapshot artifact has malformed constraints") from exc
 
     # Rebuilding a generation's lineage reads this graph, never the current
     # config's, so every parent must name a phase planned before its child.
@@ -582,6 +594,7 @@ def _validate_generation_provenance_files(
         except ValueError as exc:
             raise fail("config_snapshot artifact has a malformed trainer_config") from exc
     return GenerationProvenance(
+        bounds=selection_bounds(snapshot_metric, constraints),
         inherits=inherits,
         repeats=repeats,
         argparse_trainer_config=argparse_trainer_config,

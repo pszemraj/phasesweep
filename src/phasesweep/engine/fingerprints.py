@@ -15,6 +15,7 @@ import optuna
 
 from phasesweep.config.common import TRACKER_READ_CONTROLS
 from phasesweep.config.models import Experiment, Phase
+from phasesweep.engine.bounds import selection_bounds
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.growth import _GrowthVerdict, _search_space_growth, describe_gains
 from phasesweep.engine.optuna import _draw_positions, _phase_namespace
@@ -191,13 +192,7 @@ def _experiment_semantic_fingerprint(
         "fingerprint_schema_version": EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
         "experiment": experiment.experiment,
         **_semantic_core(experiment),
-        "bounds": {
-            "metric": experiment.metric.model_dump(mode="json", include=set(_BOUND_KEYS)),
-            "constraints": {
-                c.name: c.model_dump(mode="json", include=set(_BOUND_KEYS))
-                for c in experiment.constraints
-            },
-        },
+        "bounds": selection_bounds(experiment.metric, experiment.constraints),
         "phases": _semantic_phase_plan(experiment, experiment.phases[:phase_count]),
     }
     return _semantic_payload_digest(payload)
