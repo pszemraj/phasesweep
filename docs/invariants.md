@@ -226,7 +226,7 @@ The generation's own summary and winners are read back and validated before `las
 
 #### 19. A published result is read once
 
-Validation refuses symlinks and paths outside the generations root, reads each artifact once, and returns those bytes to inspection, MCP snapshotting and `--from-phase` resume. Carried winners are embedded, so validating the represented generation needs no older publication. Selection and resume still verify trial evidence directly. Unfinished, failed and pinned generations outside the validated publication use permissive file reads. The resume gate used by `run`, its dry run and MCP launch raises `PublicationIntegrityError` for invalid publication evidence or `PublicationAccessError` when permissions prevent validation.
+Validation refuses symlinks and paths outside the generations root, reads each artifact once, and returns those bytes to inspection, MCP snapshotting and `--from-phase` resume. The winner and its summary must name the same valid trial directory. Carried winners are embedded, so validating the represented generation needs no older publication. Selection and resume still verify trial evidence directly. Unfinished, failed and pinned generations outside the validated publication use permissive file reads. The resume gate used by `run`, its dry run and MCP launch raises `PublicationIntegrityError` for invalid publication evidence or `PublicationAccessError` when permissions prevent validation.
 
 The pointer names the only namespace containing the summary and winners, `generations/<id>/`. See [output layout](runtime.md#output-layout) for artifact paths.
 

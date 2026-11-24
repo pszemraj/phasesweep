@@ -346,6 +346,10 @@ def _validate_generation_manifest(
             metric_value = None
         if metric_value is None or metric_value != item.get("metric"):
             raise _fail(f"winner for phase {name!r} disagrees with the summary metric value")
+        try:
+            path_ops._valid_trial_dir_name(payload.get("trial_dir"), label="winner trial_dir")
+        except ValueError as exc:
+            raise _fail(f"winner for phase {name!r} has {exc}") from exc
         for field in (
             "params",
             "effective_overrides",
@@ -354,6 +358,7 @@ def _validate_generation_manifest(
             "completion",
             "generation_id",
             "attempt_id",
+            "trial_dir",
             "winner_source",
             "trainer_input",
         ):
