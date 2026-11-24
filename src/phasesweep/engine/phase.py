@@ -977,7 +977,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     overrides = _composed_overrides(experiment, phase, sampled, run.inherited_winners)
 
     attempt_id = uuid4().hex
-    # An interrupted trial's rerun continues in its directory, under the opener's names.
+    # A rerun of an interrupted or failed trial continues in its directory, under the opener's names.
     try:
         trials = {frozen.number: frozen for frozen in run.study.get_trials(deepcopy=False)}
         directory = _trial_dir_for_attempt(

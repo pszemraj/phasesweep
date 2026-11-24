@@ -87,7 +87,7 @@ from phasesweep.engine.study_policy import (
     _recovery_advice,
     _replayed_streak_abort,
 )
-from phasesweep.engine.trial_dirs import _interrupted_directory_sources
+from phasesweep.engine.trial_dirs import _rerun_directory_sources
 from phasesweep.errors import (
     FRESH_STUDY,
     STORAGE_NULL_KEEPS_NOTHING,
@@ -948,7 +948,7 @@ def _ranked_revision_sources(
         generations: list[str] = []
         # A malformed ancestor must not turn a code revision advisory into a refusal.
         with contextlib.suppress(ProcessCleanupUncertainError):
-            for source in _interrupted_directory_sources(by_number, trial):
+            for source in _rerun_directory_sources(by_number, trial):
                 generation = source.user_attrs.get(GENERATION_ID_ATTR)
                 if (
                     isinstance(generation, str)

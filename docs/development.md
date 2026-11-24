@@ -225,7 +225,7 @@ The principal test groups and what each covers:
 - `tests/test_extractors.py`, `tests/test_trial_evidence.py`, and `tests/test_trial_launch.py`: scalar evidence, shared W&B captures, gates, supervised trials, and durable input verification.
 - `tests/test_attempt_lifecycle.py`, `tests/test_process_supervision.py` and `tests/test_guardian_settle.py`: lifecycle parsing, process identity and launch ordering, descendant cleanup including descendants the guardian adopts after they leave the trainer's group, the helper settle after a trainer root exits, and guardian completion evidence.
 - `tests/test_attempt_endings.py`: the `ended_by` value each way an attempt can end records in its lifecycle record, and the verdict each earns live and in recovery, including a crash that a shutdown or a killed runner follows.
-- `tests/test_resume_in_place.py`: an interrupted trial's rerun in its own trial directory, scored only from files its attempt wrote, and the cases that get a fresh directory instead.
+- `tests/test_resume_in_place.py`: a trial's rerun in its own trial directory, scored only from files its attempt wrote.
 - `tests/test_search_space_growth.py`: a search space that only gains values keeps its finished trials and runs only the added cells, and the refusals for a dropped value, `repeats.values` and CMA-ES.
 - `tests/test_mlflow.py` and `tests/test_mlflow_terminal_delivery.py`: native history selection, run bindings, shared captures, and terminal delivery retries.
 - `tests/test_mlflow_integration.py`: both ownership modes against a temporary HTTP server, stopped-server replay, worker cleanup, and delivery retries.

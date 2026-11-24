@@ -244,7 +244,7 @@ def test_interrupted_old_cell_reruns_in_place_before_the_grown_cells(
 
 @pytest.mark.integration
 def test_failed_old_cell_retries_above_the_grown_size(tmp_path: Path) -> None:
-    """A recorded failed cell is not retried by the grown grid's own size, only by a target above it, at its own grid_id."""
+    """A recorded failed cell is not retried by the grown grid's own size, only by a target above it, at its own grid_id and in the failed trial's directory."""
     trainer, calls = _trainer(tmp_path, fail_value=3e-4)
     original = _experiment(tmp_path, trainer, _phase(_ORIGINAL))
     run_experiment(original)
@@ -259,7 +259,7 @@ def test_failed_old_cell_retries_above_the_grown_size(tmp_path: Path) -> None:
     retry = phase_trials(raised)[-1]
     assert retry.user_attrs[RERUN_OF_ATTR] == failed.number
     assert retry.system_attrs["grid_id"] == failed.system_attrs["grid_id"]
-    assert retry.user_attrs[TRIAL_DIR_ATTR] != failed.user_attrs[TRIAL_DIR_ATTR]
+    assert retry.user_attrs[TRIAL_DIR_ATTR] == failed.user_attrs[TRIAL_DIR_ATTR]
     assert _complete_lrs(raised) == sorted(_GROWN)
 
 

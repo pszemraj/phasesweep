@@ -1,10 +1,11 @@
-"""Which trial directory an attempt runs in: its own, or the one an interrupted trial left.
+"""Which trial directory an attempt runs in: its own, or the one the trial it reruns opened.
 
-An interrupted trial's rerun runs the same command in the same directory, so a trainer that
-resumes from the latest checkpoint in its output directory continues where it was stopped.
-PhaseSweep hands the trainer no pointer and copies nothing. A rerun of a failed grid cell or
-fixed configuration runs from scratch in a directory of its own: its failure may have left
-corrupt state, and the retry exists to run it again.
+Every rerun of a recorded trial, interrupted or failed, runs the same command in the
+directory that trial's chain opened, so a trainer that resumes from the latest checkpoint in
+its output directory continues where it stopped. PhaseSweep hands the trainer no pointer and
+copies nothing. Whether a checkpoint a failure left is usable is the trainer's own resume
+logic to decide, as it is after a killed runner; the evidence baseline makes the rerun count
+only the files it writes itself.
 """
 
 from __future__ import annotations
@@ -31,7 +32,6 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     _recorded_trial_dir,
     _required_trial_dir,
-    _trial_interrupted,
 )
 from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
 from phasesweep.runtime.files import broken_symlink_detail
@@ -39,25 +39,25 @@ from phasesweep.runtime.process import read_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 
 
-def _interrupted_directory_sources(
+def _rerun_directory_sources(
     trials: Mapping[int, FrozenTrial], trial: FrozenTrial
 ) -> Iterator[FrozenTrial]:
-    """Yield the interrupted ancestors that recorded their directory, newest first.
+    """Yield the ancestors in a trial's rerun chain that recorded their directory, newest first.
 
-    A rerun can be interrupted before recording its directory. Continue through those
-    ancestors to find the last attempt that could have used the directory and its opener.
-    A failed source ends the chain because its retry runs in a fresh directory.
+    The chain follows :data:`~phasesweep.engine.state.RERUN_OF_ATTR` whether each source was
+    interrupted or failed. A rerun can stop before recording its directory; the walk continues
+    through it to find the last attempt that could have used the directory, and its opener.
 
     :param Mapping[int, FrozenTrial] trials: The study's trials by number.
     :param FrozenTrial trial: The trial about to launch, or one already launched.
-    :raises ProcessCleanupUncertainError: An interrupted source's recorded directory is malformed.
+    :raises ProcessCleanupUncertainError: A source's recorded directory is malformed.
     :return Iterator[FrozenTrial]: Directory sources, from the most recent to the opener.
     """
     current = trial
     while True:
         source_number = current.user_attrs.get(RERUN_OF_ATTR)
         source = trials.get(source_number) if type(source_number) is int else None
-        if source is None or not _trial_interrupted(source):
+        if source is None:
             return
         try:
             recorded = _recorded_trial_dir(source)
@@ -116,7 +116,7 @@ def _expected_trial_dir_name(trials: Mapping[int, FrozenTrial], trial: FrozenTri
     :return str | None: The name :func:`_trial_dir_for` builds for the trial that opened its
         directory, or ``None`` when that trial records no attempt.
     """
-    sources = list(_interrupted_directory_sources(trials, trial))
+    sources = list(_rerun_directory_sources(trials, trial))
     owner = sources[-1] if sources else trial
     attempt_id = owner.user_attrs.get(ATTEMPT_ID_ATTR)
     if not isinstance(attempt_id, str) or not attempt_id:
@@ -154,7 +154,7 @@ def _trial_dir_for_attempt(
         the trial number and attempt that opened it: ``trial`` and ``attempt_id`` themselves
         for a directory of its own.
     """
-    sources = list(_interrupted_directory_sources(trials, trial))
+    sources = list(_rerun_directory_sources(trials, trial))
     if not sources:
         path = _trial_dir_for(experiment, phase_name, trial.number, attempt_id=attempt_id)
         return TrialDirectory(path, trial.number, attempt_id)
@@ -178,7 +178,7 @@ def _trial_dir_for_attempt(
             settled = False
         if not settled:
             raise ProcessCleanupUncertainError(
-                f"Trial {trial.number} reruns interrupted trial {source.number} in its directory, "
+                f"Trial {trial.number} reruns trial {source.number} in its directory, "
                 f"but attempt {source_attempt!r} of trial {source.number} may still be running "
                 f"(lifecycle {None if lifecycle is None else lifecycle.state!r}). Recover the run "
                 "first, so two processes never write one trial directory.",
