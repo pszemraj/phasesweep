@@ -357,7 +357,7 @@ def test_unpublished_winner_discloses_semantic_config_drift(tmp_path: Path) -> N
     _last_successful_generation_path(materialized.experiment).unlink()
     path = materialized.config_path
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    payload["metric"]["name"] = "changed_metric"
+    payload["provenance"]["revision"] = "changed-revision"
     path.write_text(yaml.safe_dump(payload), encoding="utf-8")
 
     result = CliRunner().invoke(cli, ["show-winners", str(path)])
