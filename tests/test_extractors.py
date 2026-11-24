@@ -14,6 +14,7 @@ import pytest
 from pydantic import ValidationError
 
 from phasesweep.evidence.evaluation import (
+    EVIDENCE_PROVENANCE_SCHEMA_VERSION,
     DeadlineExceededError,
     EvidenceUnreadableError,
     ExtractorError,
@@ -1692,7 +1693,7 @@ def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):
     value = run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
 
     assert value == pytest.approx(0.42)
-    assert provenance["schema_version"] == 4
+    assert provenance["schema_version"] == EVIDENCE_PROVENANCE_SCHEMA_VERSION
     assert provenance["extractor"]["kind"] == "json"
     assert provenance["extractor"]["config_sha256"] == extractor_config_fingerprint(cfg)
     assert provenance["source"] == {
