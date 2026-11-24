@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import os
 import signal
 import subprocess
@@ -35,6 +36,7 @@ from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUnc
 from phasesweep.evidence.baseline import read_evidence_baseline, write_evidence_baseline
 from phasesweep.evidence.evaluation import ExtractorError, TrialContext, run_extractor
 from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
 from phasesweep.tracking import publication, session
 from tests.conftest import (
@@ -105,6 +107,32 @@ def test_a_rewritten_value_file_is_fresh_and_an_untouched_one_is_stale(tmp_path:
 
     result.write_text('{"loss": 0.1}', encoding="utf-8")
     assert run_extractor(ctx, _JSON_METRIC.extractor) == 0.1
+
+
+def test_a_resumed_log_is_scored_from_every_line(tmp_path: Path) -> None:
+    """A trainer log kept across attempts selects over the earlier attempt's lines too once the rerun appends, and fails as not written by this attempt while untouched."""
+    extractor = LogRegexExtractor(
+        type="log_regex", file="train.log", pattern=r"x=(?P<value>[0-9.]+)", select="min"
+    )
+    (tmp_path / "trial").mkdir()
+    log = tmp_path / "trial" / "train.log"
+    log.write_text("x=0.5\nx=0.1\n", encoding="utf-8")
+    _, ctx = _resumed_context(tmp_path, extractor)
+    with pytest.raises(ExtractorError, match="was not written by this attempt"):
+        run_extractor(ctx, extractor)
+
+    with log.open("a", encoding="utf-8") as stream:
+        stream.write("x=0.7\n")
+    provenance: JsonObject = {}
+    assert run_extractor(ctx, extractor, provenance=provenance) == 0.1
+    assert provenance["source"] == {
+        "kind": "file",
+        "path": "train.log",
+        "sha256": hashlib.sha256(b"x=0.5\nx=0.1\nx=0.7\n").hexdigest(),
+        "size_bytes": 18,
+        "matched_line": 2,
+        "match_count": 3,
+    }
 
 
 def test_a_retargeted_link_reads_a_file_modified_after_launch(tmp_path: Path) -> None:

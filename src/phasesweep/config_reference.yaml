@@ -585,6 +585,7 @@ LogRegexExtractor:
 
   # Log file, for example stdout.log. stdout.log and stderr.log name the attempt's own captured streams, kept beside the trial directory; Python logging writes to stderr by default.
   # Any other file must resolve inside the trial directory, so a symlink out of it fails the read.
+  # A trainer log kept across a trial's attempts counts every line once the rerun writes to it; a trainer that starts over should truncate it.
   file: string = "stdout.log"
 
   # Python regular expression whose required group (?P<value>...) captures the whole metric token. Use loss=(?P<value>\S+) for whitespace delimiters or loss=(?P<value>[^\s,]+) when a comma can follow.
