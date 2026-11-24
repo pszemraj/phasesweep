@@ -431,6 +431,7 @@ def _engine_winner_view(
         ),
         incomplete=bool(winner.completion.get("incomplete", False)),
         source=winner.source,
+        study_name=winner.study_name,
         confound=_confound_summary(
             winner.confound,
             winner_trial=winner.trial_number,
