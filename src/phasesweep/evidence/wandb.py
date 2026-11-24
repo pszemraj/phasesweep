@@ -24,9 +24,8 @@ _HistoryRead = Literal["settled", "lagging", "retry"]
 transient failure worth another read."""
 
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
-# How long the public API may lag a run it already reports finished: a summary
-# still missing required keys, or history behind the summary. Complete history
-# reads may use the remaining deadline.
+# How long history may lag the summary of a run whose capture was accepted. Complete
+# history reads may use the remaining deadline.
 _FINISH_SETTLE_SECONDS = 30.0
 _HISTORY_RETRY_SECONDS = 2.0
 # Server row cap for unsampled history requests and scan pages.
@@ -70,9 +69,10 @@ class WandbRunTerminalError(RuntimeError):
 
 @dataclass(eq=False)
 class WandbRunStaleError(RuntimeError):
-    """A rerun's run still showed no history row logged after the rerun launched."""
+    """A rerun's run still showed no history row logged after the rerun launched at the deadline."""
 
     run_id: str
+    waited_seconds: float
 
 
 @dataclass(eq=False)
@@ -85,11 +85,12 @@ class WandbSetupError(RuntimeError):
 
 @dataclass(eq=False)
 class WandbMissingKeysError(RuntimeError):
-    """The finished run's summary still lacked required keys after the settle window."""
+    """The finished run's summary still lacked required keys at the deadline."""
 
     run_id: str
     missing: list[str]
     available: list[str]
+    waited_seconds: float
 
 
 WANDB_SDK_MISSING = 'W&B evidence requires the optional SDK: pip install "phasesweep[wandb]".'
@@ -238,11 +239,12 @@ def poll_wandb_summary(
     :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget; it was
         reached only when the worker reports that its last poll got an answer about the run.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
-    :raises WandbRunStaleError: The rerun's run never showed a row logged after it launched.
+    :raises WandbRunStaleError: By the deadline the rerun's run never showed a row logged
+        after it launched.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
-    :raises WandbMissingKeysError: The finished run's summary still lacked
-        required keys once the settle window passed.
+    :raises WandbMissingKeysError: At the deadline the finished run's summary still lacked
+        required keys.
     :raises ValueError: A requested scalar is invalid.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     """
@@ -292,16 +294,21 @@ def poll_wandb_summary(
         raise WandbRunTerminalError(run_id, json_text(response, "state"))
     if response.get("status") == "run_missing":
         raise WandbRunMissingError(run_id)
+    waited = finite_nonnegative(response.get("waited_seconds"))
     if response.get("status") == "stale":
-        raise WandbRunStaleError(run_id)
+        if waited is None:
+            raise RuntimeError(
+                f"W&B evidence worker returned a malformed stale-run report for attempt {attempt_id!r}."
+            )
+        raise WandbRunStaleError(run_id, float(waited))
     if response.get("status") == "missing_keys":
         missing = json_text_list(response.get("missing"))
         available = json_text_list(response.get("available"))
-        if missing is None or available is None:
+        if missing is None or available is None or waited is None:
             raise RuntimeError(
                 f"W&B evidence worker returned a malformed missing-keys report for attempt {attempt_id!r}."
             )
-        raise WandbMissingKeysError(run_id, missing, available)
+        raise WandbMissingKeysError(run_id, missing, available, float(waited))
     if response.get("status") == "invalid_evidence":
         raise ValueError(response["cause"])
     if response.get("status") == "import_error":
@@ -508,19 +515,21 @@ def _poll_wandb_summary(
 ) -> dict[str, Any]:
     """Poll an exact run using refreshed SDK clients within the parent's deadline.
 
-    No lookup starts after the deadline, but the answer to one in flight is used. A finished
-    summary may still gain values while the public API catches up,
-    so a finished summary can establish missing required keys only once
-    ``_FINISH_SETTLE_SECONDS`` have passed since the first finished read that
-    lacked them. An unanswered poll at that boundary keeps polling until the
-    tracker answers or the deadline arrives.
+    No lookup starts after the deadline, but the answer to one in flight is used. Every poll
+    builds a new client, because a client keeps the run it first fetched.
+
+    The public API reports a run ``finished`` with its full history count as soon as
+    ``wandb.finish()`` returns, but may serve the summary minutes later: first empty, or
+    for a resumed run still the earlier attempt's. So nothing short of the deadline
+    establishes that a finished summary lacks a key. A summary counts only once it is as
+    far as the history the same answer reports (:func:`_summary_matches_history`), so a
+    half-ingested one is never captured.
 
     A rerun resumes the run an earlier attempt of its trial left, in whatever state that
     attempt's end left it. Until the summary's ``_timestamp``, the time of the last logged
     history row, passes ``logged_after``, the state and summary are the earlier attempt's,
     so neither a terminal state nor a finished summary decides anything; a run that still
-    shows nothing newer once the settle window has passed, or at the deadline, was not
-    written by this attempt.
+    shows nothing newer at the deadline was not written by this attempt.
 
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
@@ -537,11 +546,12 @@ def _poll_wandb_summary(
     :raises WandbPollTimeout: The run did not finish with the required keys in time,
         reached when the last poll got an answer about the run.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
-    :raises WandbRunStaleError: The run showed no row logged after ``logged_after``.
+    :raises WandbRunStaleError: At the deadline the run still showed no row logged after
+        ``logged_after``.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
-    :raises WandbMissingKeysError: The finished run's summary still lacked
-        required keys once the settle window passed.
+    :raises WandbMissingKeysError: At the deadline the finished run's summary still lacked
+        required keys.
     :raises ValueError: A requested scalar is invalid or non-finite.
     """
     from wandb.apis.public import Api
@@ -550,13 +560,16 @@ def _poll_wandb_summary(
     from phasesweep.evidence.evaluation import json_float
     from phasesweep.runtime.time import utc_now_iso
 
-    deadline = time.monotonic() + timeout_seconds if deadline is None else deadline
+    started = time.monotonic()
+    deadline = started + timeout_seconds if deadline is None else deadline
     last_error: Exception | None = None
     # Whether the latest poll got an answer about the run rather than failing in transport.
     reached = False
     # Whether the latest answered poll still showed only an earlier attempt's run.
     stale = False
-    settle_by = math.inf
+    # The keys the latest answered poll's finished summary lacked, and the keys it had.
+    missing: list[str] = []
+    available: list[str] = []
     required = tuple(required_keys)
     while time.monotonic() < deadline:
         try:
@@ -592,18 +605,21 @@ def _poll_wandb_summary(
                 # the reserve before the supervisor's deadline exists to report it.
                 last_error = None
                 reached = True
-                stale = logged_after is not None and not _logged_since(
-                    run.summary_metrics, logged_after
-                )
+                missing = []
+                summary = run.summary_metrics
+                stale = logged_after is not None and not _logged_since(summary, logged_after)
                 if stale:
-                    observed_at = time.monotonic()
-                    settle_by = min(settle_by, observed_at + _FINISH_SETTLE_SECONDS)
-                    if settle_by <= observed_at:
-                        raise WandbRunStaleError(run_id)
+                    last_error = RuntimeError(
+                        "The summary records no row logged since the attempt launched."
+                    )
                 elif run.state in {"failed", "crashed", "killed", "preempted"}:
                     raise WandbRunTerminalError(run_id, run.state)
+                elif run.state == "finished" and not _summary_matches_history(run, summary):
+                    last_error = RuntimeError(
+                        f"The summary's _step {summary.get('_step')!r} does not match the "
+                        f"history's last step {_last_history_step(run)!r}."
+                    )
                 elif run.state == "finished":
-                    summary = run.summary_metrics
                     if all(key in summary for key in required):
                         values = {}
                         for key in required:
@@ -618,23 +634,46 @@ def _poll_wandb_summary(
                         }
                     missing = sorted(key for key in required if key not in summary)
                     available = sorted(summary)
-                    observed_at = time.monotonic()
-                    settle_by = min(settle_by, observed_at + _FINISH_SETTLE_SECONDS)
-                    # An earlier incomplete summary cannot establish absence while reads fail.
-                    if settle_by <= observed_at:
-                        raise WandbMissingKeysError(run_id, missing, available)
-                    last_error = RuntimeError(
-                        f"Missing required summary keys: {missing!r}; "
-                        f"available summary keys: {available!r}."
-                    )
-        now = time.monotonic()
-        wake_by = min(deadline, settle_by) if now < settle_by else deadline
-        time.sleep(min(poll_seconds, max(0.0, wake_by - now)))
+        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+    waited = time.monotonic() - started
     if isinstance(last_error, WandbRunMissingError):
         raise last_error
     if reached and stale:
-        raise WandbRunStaleError(run_id)
+        raise WandbRunStaleError(run_id, waited)
+    if reached and missing:
+        raise WandbMissingKeysError(run_id, missing, available, waited)
     raise WandbPollTimeout(run_id, timeout_seconds, reached=reached, last_error=last_error)
+
+
+def _last_history_step(run: object) -> int | float | None:
+    """Return the last history step from the same answer as the run's state and summary.
+
+    ``Api.run`` fetches the run's ``historyKeys`` index with its state and summary, so the
+    two describe one moment, unlike a separate ``lastHistoryStep`` query.
+
+    :param object run: Public-API run.
+    :return int | float | None: The step, or ``None`` when the run has no history row or
+        the answer carried no index.
+    """
+    index = getattr(run, "history_keys", None)
+    return finite_nonnegative(index.get("lastStep")) if isinstance(index, Mapping) else None
+
+
+def _summary_matches_history(run: object, summary: Mapping[str, object]) -> bool:
+    """Say whether a finished run's summary is as far as its history.
+
+    The summary's ``_step`` is the step of the last logged row, so a summary behind the
+    history, or empty while history exists, is still being ingested. An answer without
+    a history index leaves nothing to compare, so its summary is taken as it is.
+
+    :param object run: Public-API run.
+    :param Mapping[str, object] summary: Its decoded summary.
+    :return bool: Whether the summary's ``_step`` equals the history's last step, both
+        absent counting as equal, or the answer carried no index.
+    """
+    if not isinstance(getattr(run, "history_keys", None), Mapping):
+        return True
+    return finite_nonnegative(summary.get("_step")) == _last_history_step(run)
 
 
 def _logged_since(summary: Mapping[str, object], logged_after: float) -> bool:
@@ -750,11 +789,16 @@ def main(argv: list[str] | None = None) -> int:
     except WandbRunTerminalError as exc:
         response = {"status": "terminal_error", "state": exc.state}
     except WandbMissingKeysError as exc:
-        response = {"status": "missing_keys", "missing": exc.missing, "available": exc.available}
+        response = {
+            "status": "missing_keys",
+            "missing": exc.missing,
+            "available": exc.available,
+            "waited_seconds": exc.waited_seconds,
+        }
     except WandbRunMissingError:
         response = {"status": "run_missing"}
-    except WandbRunStaleError:
-        response = {"status": "stale"}
+    except WandbRunStaleError as exc:
+        response = {"status": "stale", "waited_seconds": exc.waited_seconds}
     except WandbPollTimeout as exc:
         response = {
             "status": "timeout",

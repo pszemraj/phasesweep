@@ -889,15 +889,18 @@ def _capture_wandb(
             raise ExtractorError(
                 f"W&B run {target} ended in {exc.state!r}; only finished runs can provide evidence."
             ) from exc
+        # Both are verdicts reached only at the deadline, so an execution deadline that was
+        # the binding limit cut the wait short instead.
         except WandbRunStaleError as exc:
-            raise ExtractorError(
-                f"W&B run {target} was not written by this attempt: its summary records no "
-                "wandb.log() call after the attempt launched."
+            raise (DeadlineExceededError if capped else ExtractorError)(
+                f"W&B run {target} was not written by this attempt: after "
+                f"{exc.waited_seconds:.0f} s its summary still records no wandb.log() call "
+                "after the attempt launched."
             ) from exc
         except WandbMissingKeysError as exc:
-            raise ExtractorError(
-                f"W&B run {target} finished without required summary key(s) {exc.missing!r}; "
-                f"available summary keys: {exc.available!r}."
+            raise (DeadlineExceededError if capped else ExtractorError)(
+                f"W&B run {target} finished without required summary key(s) {exc.missing!r} "
+                f"after {exc.waited_seconds:.0f} s; available summary keys: {exc.available!r}."
             ) from exc
         except ImportError as exc:
             raise EvidenceUnreadableError(WANDB_SDK_MISSING) from exc

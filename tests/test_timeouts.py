@@ -790,13 +790,10 @@ def test_slow_wandb_position_read_never_costs_an_accepted_trial(
     class Run:
         state = "finished"
         summary_metrics = {"eval/loss": 0.2, "_step": 1}
-        history_keys: dict = {}
+        history_keys = {"lastStep": 1, "keys": {"eval/loss": {"typeCounts": [{"count": 1}]}}}
 
         def load(self, force: bool = False) -> None:
-            self.history_keys = {
-                "lastStep": 1,
-                "keys": {"eval/loss": {"typeCounts": [{"count": 1}]}},
-            }
+            pass
 
         def history(self, keys: list[str], samples: int, pandas: bool) -> list[dict]:
             clock[0] += read_seconds

@@ -193,7 +193,9 @@ class _WandbSummarySource(_Frozen):
     entity: str = Field(min_length=1, pattern=r"^[^/\s]+$")
     project: str = Field(min_length=1, pattern=r"^[^/\s]+$")
     poll_seconds: ConfigFloat = Field(default=2.0, gt=0, allow_inf_nan=False)
-    timeout_seconds: ConfigFloat = Field(default=120.0, ge=1, allow_inf_nan=False)
+    # W&B can serve a finished run's summary minutes after the run finished, longest for a
+    # resumed run, so the default rides out that lag.
+    timeout_seconds: ConfigFloat = Field(default=600.0, ge=1, allow_inf_nan=False)
 
     @field_validator("base_url")
     @classmethod

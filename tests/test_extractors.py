@@ -242,7 +242,8 @@ def test_wandb_invalid_scalar_is_not_retryable(monkeypatch, value):
         ("WandbPollTimeout", ("attempt", 1.0, False)),
         ("WandbRunTerminalError", ("attempt", "crashed")),
         ("WandbSetupError", ("attempt", "denied")),
-        ("WandbMissingKeysError", ("attempt", ["loss"], ["eval/loss"])),
+        ("WandbMissingKeysError", ("attempt", ["loss"], ["eval/loss"], 1.0)),
+        ("WandbRunStaleError", ("attempt", 1.0)),
     ],
 )
 def test_wandb_errors_unwind_through_context_managers(name, arguments):
@@ -618,7 +619,7 @@ def _wandb_failures() -> dict[str, tuple[Exception, bool]]:
         "worker": (RuntimeError("worker exited"), True),
         "missing-run": (wandb_evidence.WandbRunMissingError(attempt), False),
         "terminal": (wandb_evidence.WandbRunTerminalError(attempt, "crashed"), False),
-        "missing-keys": (wandb_evidence.WandbMissingKeysError(attempt, ["loss"], []), False),
+        "missing-keys": (wandb_evidence.WandbMissingKeysError(attempt, ["loss"], [], 1.0), False),
         "invalid": (ValueError("not a finite number"), False),
     }
 
@@ -1045,7 +1046,7 @@ def test_wandb_worker_crash_preserves_private_stderr(wandb_worker_sdk, tmp_path)
 def test_wandb_missing_summary_key_reports_available_names_after_polling(
     wandb_worker_sdk, tmp_path
 ):
-    """A settle window longer than the timeout ends as a timeout that names the keys."""
+    """A finished summary that never gains the key fails at the deadline, naming the missing and available keys."""
     calls = tmp_path / "lookup-count"
     wandb_worker_sdk(f"""
         from pathlib import Path
@@ -1106,10 +1107,6 @@ def test_wandb_finished_summary_can_gain_a_required_key(wandb_worker_sdk, tmp_pa
     assert run_extractor(make_trial_context(tmp_path), extractor) == 0.25
 
 
-# A trainer that logs ``train_runtime`` while the sweep asks for ``train/train_runtime``.
-_RUNTIME_SUMMARY = {"train_runtime": 812.5, "_runtime": 815}
-
-
 def _fake_wandb_clock(monkeypatch: pytest.MonkeyPatch) -> ManualClock:
     """Advance fake monotonic time by the poller's sleeps.
 
@@ -1120,165 +1117,6 @@ def _fake_wandb_clock(monkeypatch: pytest.MonkeyPatch) -> ManualClock:
     monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", clock.monotonic)
     monkeypatch.setattr("phasesweep.evidence.wandb.time.sleep", clock.sleep)
     return clock
-
-
-def _wandb_reads(monkeypatch, state, summary):
-    """Serve the run's ``state(read)`` and ``summary(read)`` on each zero-based read."""
-    public = pytest.importorskip("wandb.apis.public")
-    reads = []
-
-    def lookup(path):
-        reads.append(path)
-        index = len(reads) - 1
-        return SimpleNamespace(state=state(index), summary_metrics=summary(index))
-
-    monkeypatch.setattr(public, "Api", lambda **kwargs: SimpleNamespace(run=lookup))
-    return reads
-
-
-def test_wandb_finished_run_missing_a_key_fails_after_the_settle_window(monkeypatch):
-    """A finished run exposes missing keys after its full settle window."""
-    from phasesweep.evidence.wandb import _FINISH_SETTLE_SECONDS, WandbMissingKeysError
-
-    clock = _fake_wandb_clock(monkeypatch)
-    reads = _wandb_reads(monkeypatch, lambda read: "finished", lambda read: _RUNTIME_SUMMARY)
-    with pytest.raises(WandbMissingKeysError) as caught:
-        _wandb_poll(required_keys=["train/train_runtime"], poll_seconds=5, timeout_seconds=240)
-    assert caught.value.missing == ["train/train_runtime"]
-    assert caught.value.available == ["_runtime", "train_runtime"]
-    # The window opens at the first finished read; the last read is at its end.
-    assert clock.now == _FINISH_SETTLE_SECONDS < 240
-    assert len(reads) == _FINISH_SETTLE_SECONDS / 5 + 1
-
-
-@pytest.mark.parametrize("recovers", [False, True], ids=["outage", "recovers"])
-def test_wandb_unanswered_lookup_at_settle_boundary_keeps_polling(monkeypatch, recovers):
-    """An incomplete summary does not prove that the keys are missing through an outage."""
-    from phasesweep.evidence.wandb import _FINISH_SETTLE_SECONDS, WandbPollTimeout
-
-    clock = _fake_wandb_clock(monkeypatch)
-    recovered_at = _FINISH_SETTLE_SECONDS + 5
-    timeout = recovered_at + 5
-
-    def summary(read: int) -> dict[str, float]:
-        if read == 0:
-            return _RUNTIME_SUMMARY
-        if recovers and clock.now == recovered_at:
-            return {**_RUNTIME_SUMMARY, "loss": 0.25}
-        raise ConnectionError("tracker offline")
-
-    reads = _wandb_reads(monkeypatch, lambda read: "finished", summary)
-    if recovers:
-        capture = _wandb_poll(required_keys=["loss"], poll_seconds=5, timeout_seconds=timeout)
-        assert capture["values"] == {"loss": 0.25}
-        assert clock.now == recovered_at
-    else:
-        with pytest.raises(WandbPollTimeout) as caught:
-            _wandb_poll(required_keys=["loss"], poll_seconds=5, timeout_seconds=timeout)
-        assert not caught.value.reached
-        assert "ConnectionError" in str(caught.value.last_error)
-        assert clock.now == timeout
-    assert len(reads) == recovered_at / 5 + 1
-
-
-def test_wandb_missing_key_failure_reason_names_missing_and_available_keys(tmp_path, monkeypatch):
-    """A settled missing-key reply in the reporting reserve fails the trial with details."""
-    from phasesweep.evidence import wandb as wandb_evidence
-
-    clock = _fake_wandb_clock(monkeypatch)
-    settle_by = wandb_evidence._FINISH_SETTLE_SECONDS
-    poll_cutoff = settle_by + 0.5
-    deadline = poll_cutoff + wandb_evidence._REPORT_SECONDS
-
-    def summary(_read: int) -> dict[str, float]:
-        if clock.now == settle_by:
-            clock.sleep(0.75)
-        return _RUNTIME_SUMMARY
-
-    _wandb_reads(monkeypatch, lambda read: "finished", summary)
-
-    def in_process_worker(request, _worker_path, _backend, **_):
-        # The worker's own entry point, so the report crosses its JSON response.
-        directory = tmp_path / "worker"
-        directory.mkdir(mode=0o700)
-        request_path, response_path = directory / "request.json", directory / "response.json"
-        request_path.write_text(json.dumps(dict(request)))
-        assert wandb_evidence.main([str(request_path), str(response_path)]) == 0
-        response = json.loads(response_path.read_text())
-        assert response["status"] == "missing_keys"
-        return SimpleNamespace(timed_out=False, return_code=0), response, None
-
-    monkeypatch.setattr(wandb_evidence, "run_worker", in_process_worker)
-    extractor = WandbExtractor(
-        type="wandb",
-        entity="e",
-        project="p",
-        metric_key="train/train_runtime",
-        poll_seconds=5,
-        timeout_seconds=240,
-    )
-    ctx = make_trial_context(tmp_path)
-    with pytest.raises(ExtractorError) as caught:
-        run_extractor(ctx, extractor, deadline=deadline)
-    assert type(caught.value) is ExtractorError
-    assert str(caught.value) == (
-        f"W&B run https://api.wandb.ai/e/p/{ctx.attempt_id} finished without required "
-        "summary key(s) ['train/train_runtime']; available summary keys: "
-        "['_runtime', 'train_runtime']."
-    )
-    assert poll_cutoff < clock.now < deadline
-
-
-@pytest.mark.parametrize("appears_at_read", [3, 6], ids=["mid-window", "window-end"])
-def test_wandb_key_appearing_within_the_settle_window_is_accepted(monkeypatch, appears_at_read):
-    """A key arriving by the settle boundary is accepted without another wait."""
-    clock = _fake_wandb_clock(monkeypatch)
-    reads = _wandb_reads(
-        monkeypatch,
-        lambda read: "finished",
-        lambda read: (
-            {**_RUNTIME_SUMMARY, "train/train_runtime": 812.5}
-            if read >= appears_at_read
-            else _RUNTIME_SUMMARY
-        ),
-    )
-    capture = _wandb_poll(
-        required_keys=["train/train_runtime"], poll_seconds=5, timeout_seconds=240
-    )
-    assert capture["values"] == {"train/train_runtime": 812.5}
-    assert len(reads) == appears_at_read + 1
-    assert clock.now == 5 * appears_at_read
-
-
-@pytest.mark.parametrize("finished_from_read", [None, 44], ids=["running", "finished-late"])
-def test_wandb_missing_keys_without_a_full_window_poll_until_the_deadline(
-    monkeypatch, finished_from_read
-):
-    """A running run, or a window the deadline cuts short, keeps polling until the deadline."""
-    from phasesweep.evidence.wandb import WandbPollTimeout
-
-    clock = _fake_wandb_clock(monkeypatch)
-    _wandb_reads(
-        monkeypatch,
-        lambda read: (
-            "finished"
-            if finished_from_read is not None and read >= finished_from_read
-            else "running"
-        ),
-        lambda read: _RUNTIME_SUMMARY,
-    )
-    with pytest.raises(WandbPollTimeout) as caught:
-        _wandb_poll(required_keys=["train/train_runtime"], poll_seconds=5, timeout_seconds=240)
-    assert clock.now == 240
-    # The run answered every poll, so the timeout is a verdict on the trial.
-    assert caught.value.reached is True
-    if finished_from_read is None:
-        assert caught.value.last_error is None
-    else:
-        # The window opened at 220 s, so the deadline arrives first.
-        assert "available summary keys: ['_runtime', 'train_runtime']" in str(
-            caught.value.last_error
-        )
 
 
 @pytest.mark.parametrize("request_kind", ["summary", "position"])
@@ -1867,7 +1705,12 @@ def test_wandb_missing_run_diagnostic_follows_the_last_observation(
     from requests import HTTPError, Response
     from wandb.errors import CommError
 
-    from phasesweep.evidence.wandb import WandbPollTimeout, WandbRunMissingError, WandbSetupError
+    from phasesweep.evidence.wandb import (
+        WandbMissingKeysError,
+        WandbPollTimeout,
+        WandbRunMissingError,
+        WandbSetupError,
+    )
 
     _fake_wandb_clock(monkeypatch)
     calls = 0
@@ -1899,6 +1742,8 @@ def test_wandb_missing_run_diagnostic_follows_the_last_observation(
         if last_observation == "missing"
         else WandbSetupError
         if last_observation == "permission"
+        else WandbMissingKeysError
+        if last_observation == "summary"
         else WandbPollTimeout
     )
     with pytest.raises(expected) as refused:

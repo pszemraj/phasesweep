@@ -413,7 +413,7 @@ def test_explain_prints_the_packaged_section_rules_and_shared_block_descriptions
     assert blocks[0].startswith("Section Constraints:\n")
     assert blocks[1].startswith("Shared block WandbTarget:\n")
     assert blocks[2].startswith(
-        "constraints[].extractor[type=wandb].timeout_seconds: float = 120.0\n"
+        "constraints[].extractor[type=wandb].timeout_seconds: float = 600.0\n"
     )
     assert len(blocks) == 3
     rules = PhaseSweepMCP.explain_config("phases[].gates[].entity")["rules"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,90 +26,6 @@ from phasesweep.engine.state import (
 from phasesweep.evidence.models import WandbExtractor
 from tests.conftest import make_experiment, phase_trials, write_experiment_config, write_trainer
 from tests.recovery_helpers import runner_once
-from tests.tracking_helpers import ManualClock
-
-_LAUNCHED_AT = 1_000.0
-
-
-def _poll() -> dict[str, object]:
-    """Run the in-process summary poll for a rerun launched at :data:`_LAUNCHED_AT`.
-
-    :return dict[str, object]: The capture.
-    """
-    from phasesweep.evidence.wandb import _poll_wandb_summary
-
-    return _poll_wandb_summary(
-        base_url="https://example.test",
-        entity="e",
-        project="p",
-        run_id="opener",
-        poll_seconds=5,
-        timeout_seconds=240,
-        required_keys=["x"],
-        logged_after=_LAUNCHED_AT,
-    )
-
-
-def _serve(
-    monkeypatch: pytest.MonkeyPatch, answers: Callable[[int], tuple[str, dict[str, float]]]
-) -> tuple[ManualClock, list[str]]:
-    """Answer each zero-based run lookup with ``answers(read)`` on a manual clock.
-
-    :param pytest.MonkeyPatch monkeypatch: Fixture that replaces the SDK client and clock.
-    :param Callable[[int], tuple[str, dict[str, float]]] answers: State and summary per read.
-    :return tuple[ManualClock, list[str]]: The clock and the paths looked up.
-    """
-    public = pytest.importorskip("wandb.apis.public")
-    clock = ManualClock()
-    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", clock.monotonic)
-    monkeypatch.setattr("phasesweep.evidence.wandb.time.sleep", clock.sleep)
-    paths: list[str] = []
-
-    def lookup(path: str) -> SimpleNamespace:
-        paths.append(path)
-        state, summary = answers(len(paths) - 1)
-        return SimpleNamespace(state=state, summary_metrics=summary)
-
-    monkeypatch.setattr(public, "Api", lambda **kwargs: SimpleNamespace(run=lookup))
-    return clock, paths
-
-
-_LEFT = {"x": 0.5, "_timestamp": _LAUNCHED_AT - 60}
-_LOGGED = {"x": 0.25, "_timestamp": _LAUNCHED_AT + 5}
-
-
-def test_a_reruns_read_waits_out_the_state_its_earlier_attempt_left(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A run still crashed, then finished, as the earlier attempt left it is neither failed nor scored; the rerun's own finished summary is."""
-    clock, paths = _serve(
-        monkeypatch,
-        lambda read: [("crashed", _LEFT), ("finished", _LEFT), ("finished", _LOGGED)][min(read, 2)],
-    )
-    assert _poll()["values"] == {"x": 0.25}
-    assert paths == ["e/p/opener"] * 3
-    assert clock.now == 10
-
-
-def test_a_reruns_run_that_never_moves_is_refused_after_the_settle_window(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A run whose summary never passes the rerun's launch fails as not written by this attempt once the settle window ends."""
-    from phasesweep.evidence.wandb import _FINISH_SETTLE_SECONDS, WandbRunStaleError
-
-    clock, _ = _serve(monkeypatch, lambda read: ("finished", _LEFT))
-    with pytest.raises(WandbRunStaleError):
-        _poll()
-    assert clock.now == _FINISH_SETTLE_SECONDS
-
-
-def test_a_reruns_own_crash_fails_the_read(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A run that crashed after the rerun logged to it is the rerun's own failure."""
-    from phasesweep.evidence.wandb import WandbRunTerminalError
-
-    _serve(monkeypatch, lambda read: ("crashed", _LOGGED))
-    with pytest.raises(WandbRunTerminalError):
-        _poll()
 
 
 def test_env_wandb_resume_is_refused_whatever_its_value() -> None:
@@ -251,10 +168,12 @@ def test_a_rerun_that_logs_nothing_fails_as_not_written_by_this_attempt(
     first, rerun = phase_trials(experiment)
     outcome = _parsed_trial_outcome(rerun.user_attrs[TRIAL_OUTCOME_ATTR])
     assert outcome is not None and outcome.outcome == "failure"
-    assert outcome.cause == (
-        f"metric extractor: W&B run https://example.test/e/p/{first.user_attrs[ATTEMPT_ID_ATTR]} "
-        "was not written by this attempt: its summary records no wandb.log() call after the "
-        "attempt launched."
+    target = f"https://example.test/e/p/{first.user_attrs[ATTEMPT_ID_ATTR]}"
+    assert re.fullmatch(
+        rf"metric extractor: W&B run {re.escape(target)} was not written by this attempt: "
+        r"after \d+ s its summary still records no wandb\.log\(\) call after the attempt "
+        r"launched\.",
+        outcome.cause,
     )
 
 

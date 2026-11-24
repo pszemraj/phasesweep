@@ -628,7 +628,7 @@ WandbExtractor:
 
   # Exact nonempty key in the finished summary, for example eval/loss, or eval/loss.min for a define_metric summary=min aggregate.
   # A bare key never stands in for its aggregate.
-  # Warning: a metric_key missing from the finished summary is polled up to 30 more seconds, then fails the read, so a misspelled key costs that every trial.
+  # Warning: a metric_key missing from the finished summary is polled until timeout_seconds runs out, then fails the read, so a misspelled key costs that every trial.
   metric_key: string (required)
 
   # Nonempty history key logged with metric_key that marks where it was measured, for example eval/step or tokens. _step is W&B's own step.
@@ -639,7 +639,7 @@ WandbExtractor:
 
 # The W&B target and polling fields of the wandb reader and the wandb_summary_required gate. Within a phase, every W&B reader and gate agrees on all five.
 # For seed ranking, phases[].repeats creates one trial and tracked run per seed and ranks configuration groups.
-# A run that ends failed, crashed, killed or preempted fails the read at once, and one that has not finished is polled until timeout_seconds runs out. For a rerun, a state or summary from before its first logged row is the earlier attempt's and is waited out; a run that still shows no such row 30 seconds after the first read, or when timeout_seconds runs out, fails the read as not written by this attempt.
+# A run that ends failed, crashed, killed or preempted fails the read at once, and one that has not finished is polled until timeout_seconds runs out. A finished summary counts once its _step matches the run's last history step. For a rerun, a state or summary from before its first logged row is the earlier attempt's and is waited out; a run that still shows no such row when timeout_seconds runs out fails the read as not written by this attempt.
 # Requires: the phasesweep[wandb] extra. The trainer's wandb.init() picks up the managed WANDB_* variables: WANDB_RUN_ID names the trial's run, with WANDB_RESUME never for the attempt that opens the trial directory and allow for a rerun in it.
 # Pass no project, entity, id or resume to wandb.init(); log into that one run, and call wandb.finish() only after the final log. A trainer that starts over instead of resuming logs after the earlier attempt's rows, so an aggregate key also covers them; use a plain key then.
 # Requires: env.WANDB_BASE_URL, WANDB_ENTITY and WANDB_PROJECT, when set, match the target, and env has no WANDB_RUN_ID or WANDB_RESUME.
@@ -658,7 +658,9 @@ WandbTarget:
   poll_seconds: float = 2.0
 
   # Seconds one attempt may spend capturing the finished summary, at least 1, worker startup, SDK calls and polling included. Phase and run deadlines cap it too.
+  # W&B can report a run finished minutes before it serves the run's summary, longest for a resumed run, so a key missing from a finished summary fails the read only when this runs out.
+  # Warning: a metric_key or gate key the trainer never logs therefore costs this much every trial.
   # After the objective is accepted, locating its history position gets a fresh budget of this length, capped by the same deadlines.
   # History has up to 30 seconds of that to catch up with the summary, and reading it may use the rest.
   # A capture that runs out fails the read. A position lookup that runs out only leaves the position unrecorded.
-  timeout_seconds: float = 120.0
+  timeout_seconds: float = 600.0
