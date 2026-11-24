@@ -10,7 +10,7 @@ from phasesweep import run_experiment
 from phasesweep.config.models import Constraint, Experiment, Phase
 from phasesweep.engine.errors import ResumeBoundsChangedError
 from phasesweep.engine.paths import _experiment_dir, _generations_dir
-from phasesweep.engine.read import read_trial_tables
+from phasesweep.engine.read import read_status, read_trial_tables
 from phasesweep.engine.selection import PhaseAbortRefusedError, PhaseTrialsInfeasibleError
 from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import bounded_metric, make_experiment, phase_trials, write_trainer
@@ -68,6 +68,30 @@ def _launches(tmp_path: Path) -> int:
     :return int: Number of launches.
     """
     return len((tmp_path / "launches").read_text().splitlines())
+
+
+def test_restoring_bounds_reselects_the_published_generation_after_a_failed_child(tmp_path) -> None:
+    """A replay after a claimed child failure restores the published view without training."""
+    loose = _experiment(tmp_path)
+    child = Phase(name="q", n_trials=1, inherits=["p"], gpu_policy="none", fixed_overrides={"y": 1})
+    loose = loose.model_copy(update={"phases": [*loose.phases, child]})
+    published = run_experiment(loose)
+    original = read_status(loose)
+    tight = loose.model_copy(update={"metric": bounded_metric(min=1.05)})
+    with pytest.raises(PhaseTrialsInfeasibleError):
+        run_experiment(tight)
+    failed = read_status(tight)
+    assert failed["current_generation_id"] != original["published_generation_id"]
+    launches = _launches(tmp_path)
+    generations = _generations_dir(_experiment_dir(loose))
+    before = set(generations.iterdir())
+
+    assert run_experiment(loose) == published
+    restored = read_status(loose)
+    assert restored["current_generation_id"] == original["published_generation_id"]
+    assert restored["is_published"]
+    assert _launches(tmp_path) == launches
+    assert set(generations.iterdir()) == before
 
 
 def test_loosening_a_bound_publishes_from_the_recorded_trials_and_clears_the_streak_abort(

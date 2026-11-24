@@ -733,8 +733,8 @@ def _current_pointer_generation_id(experiment: Experiment) -> str | None:
     """Read the mutable current-generation pointer's own id, or ``None``.
 
     Unlike the last-success pointer, the current pointer is not validated
-    against any artifact: it is progress bookkeeping, naming the most recently
-    claimed generation, and may legitimately name a failed or in-progress one.
+    against any artifact: it names the latest claim or the publication selected by
+    a successful replay, and may legitimately name a failed or in-progress claim.
 
     :param Experiment experiment: Experiment whose current pointer is read.
     :return str | None: The recorded ``generation_id``, or ``None`` when the

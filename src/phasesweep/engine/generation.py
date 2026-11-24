@@ -76,9 +76,7 @@ class InvocationGeneration:
     The engine calls it before the first trial allocation, or before publishing winners
     that differ from the current publication. Winners saved before the claim stay in
     memory and are written by it, so an invocation that launches nothing and publishes
-    nothing leaves no generation and leaves both pointers as they were. Such an invocation
-    sets ``replayed_generation_id`` to the published generation that already holds its
-    winners.
+    nothing leaves no generation. A matching replay makes the published generation current.
     """
 
     def __init__(
@@ -131,6 +129,32 @@ class InvocationGeneration:
                 )
             self._pending_winners.clear()
         return self.generation_id
+
+    def replay(self, published_id: str) -> None:
+        """Make the verified publication current after a replay of all its winners.
+
+        :param str published_id: Matching publication from :func:`_publication_holds`.
+        """
+        current = artifact_io.read_yaml_or_none(path_ops._generation_path(self.experiment))
+        if not (
+            isinstance(current, dict)
+            and current.get("generation_id") == published_id
+            and current.get("state") == "published"
+        ):
+            # The immutable lifecycle record can be missing after a post-publication crash.
+            record = artifact_io.read_yaml_or_none(
+                path_ops._generation_record_path(self.experiment, published_id)
+            )
+            from_phase = record.get("from_phase") if isinstance(record, dict) else None
+            _write_generation_state(
+                self.experiment,
+                generation_id=published_id,
+                state="published",
+                from_phase=from_phase if isinstance(from_phase, str) else None,
+                publish_current=True,
+                write_record=False,
+            )
+        self.replayed_generation_id = published_id
 
     def save_winner(self, phase_name: str, winner: Winner) -> None:
         """Write a phase winner into the claimed namespace, or hold it until the claim.

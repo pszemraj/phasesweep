@@ -283,8 +283,8 @@ def _run_experiment_outcome(
     """Run the phases and publish their winners while holding the experiment lock.
 
     The invocation's generation is created only when a phase launches a trial or the
-    winners differ from the current publication; a refusal or a no-op replay leaves
-    no generation and leaves both generation pointers as they were.
+    winners differ from the current publication. A refusal leaves both pointers untouched.
+    A matching replay restores the current pointer to that publication without a new generation.
 
     :param Experiment experiment: Parsed experiment config.
     :param str | None from_phase: Optional resume point; see :func:`run_experiment`.
@@ -817,7 +817,7 @@ def _run_experiment_inner(
                 "No trial launched and generation %s already publishes these winners.",
                 published_id,
             )
-            generation.replayed_generation_id = published_id
+            generation.replay(published_id)
             return winners
     generation_id = generation.claim()
     summary_path = path_ops._generation_summary_path(experiment, generation_id)
