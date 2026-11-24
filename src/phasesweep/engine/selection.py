@@ -361,8 +361,7 @@ def _phase_refusal(
     """
     abort = policy_state.abort
     if abort is not None and (
-        _awaits_cleanup_recovery(study, abort)
-        or not _config_retires_abort(phase, study.get_trials(deepcopy=False), abort)
+        _awaits_cleanup_recovery(study, abort) or not _config_retires_abort(phase, study, abort)
     ):
         return _prior_phase_abort_error(experiment, phase, abort, study)
     streak = _replayed_streak_abort(phase, study, policy_state)

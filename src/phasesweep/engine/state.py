@@ -210,9 +210,10 @@ ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
 # space the study has run under with the draw position each took effect at. One attr, so a
 # crash cannot leave a fingerprint beside a payload or history it does not describe.
 PHASE_IDENTITY_ATTR = "phasesweep_phase_identity"
+REREAD_FILL_ATTR = "phasesweep_reread_fill"
 PHASE_IDENTITY_SCHEMA_VERSION = 4
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 19
+STUDY_SCHEMA_VERSION = 20
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The

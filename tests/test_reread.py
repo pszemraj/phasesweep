@@ -27,11 +27,12 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.ledger import _resolve_storage, validate_ledger
 from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.read import inspect_status
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FAILURE_REASON_ATTR,
     PHASE_DECISION_ATTR,
+    PHASE_RECOVERY_ATTR,
     RERUN_OF_ATTR,
     TRIAL_DIR_ATTR,
 )
@@ -143,6 +144,85 @@ def test_a_misspelled_key_is_corrected_by_re_reading_every_finished_trial(tmp_pa
     assert [trial.state for trial in trials] == [optuna.trial.TrialState.COMPLETE] * 3
     assert sorted(trial.value for trial in trials) == [1.0, 1.0, 4.0]
     assert [t.number for t in trials] == [t.number for t in phase_study_of(typo).get_trials()]
+
+
+def test_reread_releases_retry_budget_for_cells_that_now_have_a_result(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An old retry budget can exceed what the reread grid is able to measure."""
+    trainer, launches = _counting_trainer(tmp_path)
+    typo = _experiment(tmp_path, trainer, _metric("los"))
+    with pytest.raises(NoFeasibleTrialError, match="No completed trials"):
+        run_experiment(typo)
+    phase = _phases()[0]
+    retry = phase.model_copy(update={"n_trials": 6})
+    with pytest.raises(NoFeasibleTrialError, match="5 consecutive failed/infeasible trials"):
+        run_experiment(_experiment(tmp_path, trainer, _metric("los"), phases=[retry]))
+    source = phase_study_of(typo).get_trials()
+    assert source[-1].state == optuna.trial.TrialState.WAITING
+    assert _launches(launches) == 5
+
+    fixed = _experiment(tmp_path, trainer, _metric("loss"), phases=[retry])
+    caplog.set_level(logging.INFO)
+    with pytest.raises(TrialTargetRefusedError, match="allow at most 5"):
+        run_experiment(fixed)
+    assert "reduce the accepted trial target from 6 to 5" in caplog.text
+
+    phase = phase.model_copy(update={"n_trials": 5})
+    corrected = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
+    assert run_experiment(corrected)["p"].metric == 1.0
+    assert _launches(launches) == 5
+    copied = phase_study_of(corrected).get_trials()
+    assert [(t.number, t.user_attrs[ATTEMPT_ID_ATTR]) for t in copied] == [
+        (t.number, t.user_attrs[ATTEMPT_ID_ATTR]) for t in source[:-1]
+    ]
+    assert phase_study_of(typo).get_trials()[-1].state == optuna.trial.TrialState.WAITING
+
+
+def test_reread_at_retry_ceiling_can_acknowledge_an_inherited_failure_streak(
+    tmp_path: Path,
+) -> None:
+    """A lowered target can replay after the new failure limit acknowledges an earlier abort."""
+    launches = tmp_path / "launches.txt"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import json, sys
+        from pathlib import Path
+        launches = Path({str(launches)!r})
+        with launches.open("a") as handle:
+            handle.write("launch\\n")
+        if len(launches.read_text().splitlines()) > 3:
+            sys.exit(1)
+        out = Path(sys.argv[sys.argv.index("--out") + 1])
+        out.write_text(json.dumps({{"loss": 1}}))
+        print("loss=1")
+        """,
+    )
+    typo = _experiment(tmp_path, trainer, _metric("los"))
+    with pytest.raises(NoFeasibleTrialError, match="No completed trials"):
+        run_experiment(typo)
+    phase = _phases()[0]
+    retry = phase.model_copy(update={"n_trials": 6, "max_consecutive_failures": 2})
+    with pytest.raises(NoFeasibleTrialError, match="2 consecutive failed/infeasible trials"):
+        run_experiment(_experiment(tmp_path, trainer, _metric("los"), phases=[retry]))
+    source = phase_study_of(typo)
+    assert source.user_attrs[PHASE_RECOVERY_ATTR]["trial_target"] == 6
+    metric = Metric(
+        name="loss",
+        extractor=LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[0-9]+)"),
+    )
+    corrected = retry.model_copy(update={"n_trials": 5})
+    fixed = _experiment(tmp_path, trainer, metric, phases=[corrected])
+    with pytest.raises(PhaseAbortRefusedError, match="accepted n_trials=6") as refusal:
+        run_experiment(fixed)
+    assert "raise phases[p].max_consecutive_failures above 2" in refusal.value.remediation
+    assert phase_study_of(fixed).user_attrs[PHASE_RECOVERY_ATTR]["trial_target"] == 5
+
+    acknowledged = corrected.model_copy(update={"max_consecutive_failures": 10})
+    result = run_experiment(_experiment(tmp_path, trainer, metric, phases=[acknowledged]))
+    assert result["p"].metric == 1
+    assert _launches(launches) == 5
 
 
 def test_a_flipped_goal_re_reads_into_a_study_of_the_other_direction(tmp_path: Path) -> None:
@@ -657,13 +737,13 @@ def test_a_fill_killed_part_way_is_finished_by_the_next_run(tmp_path: Path) -> N
 
 
 @pytest.mark.integration
-def test_an_interrupted_fill_keeps_its_source_trials_when_other_studies_grow(
+def test_an_interrupted_fill_reuses_new_source_trials_when_studies_grow(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Growth of the source and a competing study keeps the interrupted fill's original cutoff."""
+    """A resumed fill appends new trials from its pinned source even when another study grows."""
     trainer, launches = _counting_trainer(tmp_path)
 
-    def config(key: str, target: int) -> Experiment:
+    def config(key: str, target: int, *, goal: str = "minimize") -> Experiment:
         phase = Phase(
             name="p",
             n_trials=target,
@@ -671,14 +751,13 @@ def test_an_interrupted_fill_keeps_its_source_trials_when_other_studies_grow(
             sampler=Sampler(type="random", seed=0),
             search_space={"x": IntParam(type="int", low=1, high=100_000)},
         )
-        return _experiment(tmp_path, trainer, _metric(key), phases=[phase])
+        return _experiment(tmp_path, trainer, _metric(key, goal=goal), phases=[phase])
 
     run_experiment(config("loss", 1))
     run_experiment(config("acc", 2))
     original = config("loss", 3)
     run_experiment(original)
-    source_trials = phase_study_of(original).get_trials()
-    interrupted = config("mem", 3)
+    interrupted = config("mem", 4, goal="maximize")
     add_trial = optuna.Study.add_trial
 
     def stop_after_two(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
@@ -691,16 +770,19 @@ def test_an_interrupted_fill_keeps_its_source_trials_when_other_studies_grow(
         pytest.raises(RuntimeError, match="stop after the second copied trial"),
     ):
         run_experiment(interrupted)
-    run_experiment(config("loss", 4))
+    grown = config("loss", 4)
+    run_experiment(grown, dry_run=True)
+    run_experiment(grown)
+    source_trials = phase_study_of(grown).get_trials()
     run_experiment(config("acc", 5))
     before = _launches(launches)
 
     notice = inspect_status(interrupted, validate_ledger(interrupted)).refusals["p"]
-    assert "re-reads 1 finished trial" in notice.remediation
+    assert "re-read 2 finished trials" in notice.remediation
     caplog.set_level(logging.INFO)
     run_experiment(interrupted, dry_run=True)
-    assert "would re-read 1 finished trial from kept evidence" in caplog.text
-    assert "target met (3 of 3 trials recorded)" in caplog.text
+    assert "would re-read 2 finished trials from kept evidence" in caplog.text
+    assert "target met (4 of 4 trials recorded)" in caplog.text
 
     run_experiment(interrupted)
     assert _launches(launches) == before

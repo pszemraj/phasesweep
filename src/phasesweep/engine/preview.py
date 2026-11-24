@@ -30,12 +30,15 @@ from phasesweep.engine.fingerprints import (
     _judge_identity,
     _local_keys,
     _phase_fingerprint,
-    _recorded_goal,
     new_study_note,
     phase_study_name,
 )
 from phasesweep.engine.growth import describe_gains
-from phasesweep.engine.guards import _raise_collected_errors, known_studies
+from phasesweep.engine.guards import (
+    _raise_collected_errors,
+    _validate_known_study_direction,
+    known_studies,
+)
 from phasesweep.engine.ledger import open_preview_study, read_every_phase_study, validate_ledger
 from phasesweep.engine.optuna import (
     _finished_trial_count,
@@ -183,7 +186,7 @@ def _recorded_phase(
     :param Phase phase: The configured phase the study belongs to.
     :param optuna.Study | None study: The phase's snapshot study, or ``None`` when
         the ledger holds no such study, which counts zero attempts.
-    :param Sequence[optuna.trial.FrozenTrial] | None trials: The trial prefix of a pending fill,
+    :param Sequence[optuna.trial.FrozenTrial] | None trials: The source trials of a pending fill,
         or None to count the full study.
     :raises PhaseSweepError: A RUNNING attempt's completed trainer evidence awaits recovery,
         whose extraction decides the counts.
@@ -285,6 +288,8 @@ def _addressed_record(
     addressed = next(
         (r for r in recorded if r.study is not None and r.study.study_name == name), None
     )
+    if addressed is not None and addressed.study is not None:
+        _validate_study_direction(addressed.study, experiment.metric.goal)
     if addressed is not None and (
         addressed.study is None or _recorded_identity(addressed.study) is not None
     ):
@@ -431,7 +436,7 @@ def _refuse_as_a_launch_would(
     for phase in experiment.phases:
         for study in studies.get(phase.name, ()):
             try:
-                _validate_study_direction(study, _recorded_goal(study) or experiment.metric.goal)
+                _validate_known_study_direction(experiment, phase, study)
                 _validate_study_schema(study)
             except Exception as exc:
                 errors.append(exc)

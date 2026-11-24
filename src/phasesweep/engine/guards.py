@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 
 import optuna
 
-from phasesweep.config.models import Experiment
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.artifacts import _refresh_recovered_trials_csv
 from phasesweep.engine.attempts import (
     _AttemptRecord,
@@ -39,6 +39,27 @@ from phasesweep.errors import (
     ProcessCleanupUncertainError,
     operator_step,
 )
+
+
+def _validate_known_study_direction(
+    experiment: Experiment, phase: Phase, study: optuna.Study
+) -> None:
+    """Check a saved study's direction when its goal is known before phase selection.
+
+    :param Experiment experiment: Config that determines the reached root study.
+    :param Phase phase: Config for the phase that owns the study.
+    :param optuna.Study study: Existing study, which may be waiting for its identity.
+    :raises StudySchemaMismatchError: The study's stored direction contradicts its known goal.
+    """
+    goal = _recorded_goal(study)
+    if (
+        goal is None
+        and not phase.inherits
+        and study.study_name == phase_study_name(experiment, phase, {})
+    ):
+        goal = experiment.metric.goal
+    if goal is not None:
+        _validate_study_direction(study, goal)
 
 
 def _reconcile_existing_studies(
@@ -177,7 +198,7 @@ def _preflight_existing_studies(
         finally:
             _refresh_recovered_trials_csv(study, experiment, phase)
         try:
-            _validate_study_direction(study, _recorded_goal(study) or experiment.metric.goal)
+            _validate_known_study_direction(experiment, phase, study)
             _initialize_study_schema(study)
         except Exception as exc:
             errors.append(exc)

@@ -116,6 +116,7 @@ from phasesweep.engine.study_policy import (
     _recovery_action,
     _recovery_advice,
     _replayed_streak_abort,
+    _streak_at_reduced_target,
     _streak_trials_all_infeasible,
     _validate_study_direction,
     _validate_trial_target,
@@ -462,8 +463,8 @@ def _resume_phase(
     :param dict[str, Winner] inherited_winners: Winners loaded for phases
         earlier in the chain.
     :param optuna.Study study: The phase's live study.
-    :raises StudySchemaMismatchError: The study's schema or stored direction is
-        unsupported; what the recorded state contradicts is listed with
+    :raises StudySchemaMismatchError: The study's schema is unsupported; what
+        the recorded state contradicts is listed with
         :func:`_judge_recorded_phase`, whose other refusals also propagate.
     :raises StudyFingerprintMismatchError: The study was produced by a
         different config.
@@ -472,7 +473,6 @@ def _resume_phase(
     :return _PhaseResume | Winner: The validated state, or the winner an
         accepted partial-timeout decision replays.
     """
-    _validate_study_direction(study, experiment.metric.goal)
     _initialize_study_schema(study)
     _reap_stale_trials(study, experiment, phase.name, confirm=True)
     policy_state = _load_phase_policy_state(study, experiment)
@@ -1662,6 +1662,7 @@ def _run_phase(
     # The live opener also claims a newly created study's publication root,
     # before any inspection, reaping, or trial work below can run against it.
     study = open_phase_study(ledger, phase, study_name)
+    _validate_study_direction(study, experiment.metric.goal)
     if _recorded_identity(study) is None:
         # A changed reading setting addresses a study of its own; the trials another study of
         # the phase measured under the same values are re-read into it, never retrained.
@@ -1855,7 +1856,8 @@ def _replay_met_target(
 
     The winner is selected from the recorded trials again. Replay must neither
     require launch resources (GPU discovery on a CPU-only host) nor mutate the
-    durable accepted target.
+    durable accepted target. A higher failure limit can acknowledge an inherited
+    streak after a reread reduced the accepted target, so no recovery trial is needed.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase whose recorded trials meet its target.
@@ -1872,7 +1874,9 @@ def _replay_met_target(
         altered; only when ``verify_evidence`` is set.
     :return Winner: The winner the recorded trials select.
     """
-    if resume.recovery_abort is not None:
+    if resume.recovery_abort is not None and not _streak_at_reduced_target(
+        study, resume.recovery_abort
+    ):
         raise StudySchemaMismatchError(
             f"Phase {phase.name!r} accepted an abort recovery target but has no "
             "remaining trial slots."

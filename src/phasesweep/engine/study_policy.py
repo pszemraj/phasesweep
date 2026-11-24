@@ -56,6 +56,7 @@ from phasesweep.engine.state import (
     PHASE_DECISION_SCHEMA_VERSION,
     PHASE_RECOVERY_ATTR,
     PHASE_RECOVERY_SCHEMA_VERSION,
+    REREAD_FILL_ATTR,
     RERUN_OF_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
@@ -770,12 +771,27 @@ def _record_allocation_context(
 
 
 def _rerun_sources(trials: Sequence[optuna.trial.FrozenTrial]) -> list[optuna.trial.FrozenTrial]:
-    """Return interrupted trials not yet named by a rerun, in trial-number order.
+    """Return interrupted trials that still need a result, in trial-number order.
+
+    A reread may find a COMPLETE result in an earlier attempt of an interrupted retry.
+    That draw is already measured, so its interrupted attempt needs no rerun.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
-    :return list[optuna.trial.FrozenTrial]: Interrupted trials without a rerun.
+    :return list[optuna.trial.FrozenTrial]: Interrupted trials without a rerun or a measurement.
     """
-    return sorted(_unreplaced_attempts(trials, interrupted=True), key=lambda trial: trial.number)
+    sources = _unreplaced_attempts(trials, interrupted=True)
+    if not sources:
+        return []
+    positions = _draw_positions(trials)
+    measured = {
+        positions[trial.number]
+        for trial in trials
+        if trial.state == optuna.trial.TrialState.COMPLETE
+    }
+    return sorted(
+        (trial for trial in sources if positions[trial.number] not in measured),
+        key=lambda trial: trial.number,
+    )
 
 
 def _undrawn_grown_grid_cells(
@@ -940,17 +956,16 @@ def _streak_trials_all_infeasible(study: optuna.Study, policy_state: _PhasePolic
     )
 
 
-def _config_retires_abort(
-    phase: Phase, trials: Sequence[optuna.trial.FrozenTrial], abort: JsonObject
-) -> bool:
+def _config_retires_abort(phase: Phase, study: optuna.Study, abort: JsonObject) -> bool:
     """Say whether the current config lets a run recover from a recorded abort.
 
     A raised ``n_trials`` retires any abort. A ``max_consecutive_failures`` above the
-    count a streak abort recorded retires that abort too, but only while the target still
-    leaves trials to run: a recovery with none would replay an aborted phase as a result.
+    count a streak abort recorded retires it while the target still leaves trials to run.
+    It also retires an inherited streak when rereading reduced the accepted target below
+    the target at the abort, even if the corrected study has reached its ceiling.
 
     :param Phase phase: Phase whose current ``n_trials`` and limit are judged.
-    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
+    :param optuna.Study study: The phase's study whose accepted target and attempts are judged.
     :param JsonObject abort: The abort recorded after the recovery boundary.
     :return bool: Whether the run writes the recovery boundary before any new work.
     """
@@ -961,7 +976,25 @@ def _config_retires_abort(
     return (
         streak is not None
         and phase.max_consecutive_failures > streak
-        and _finished_trial_count(trials) < phase.n_trials
+        and (
+            _finished_trial_count(study.get_trials(deepcopy=False)) < phase.n_trials
+            or _streak_at_reduced_target(study, abort)
+        )
+    )
+
+
+def _streak_at_reduced_target(study: optuna.Study, abort: Mapping[str, object]) -> bool:
+    """Check whether the reread retry ceiling reduced the target of an inherited streak.
+
+    :param optuna.Study study: The study whose accepted target is compared.
+    :param Mapping[str, object] abort: The recorded abort and its original target.
+    :return bool: Whether this is a streak abort from a higher accepted target.
+    """
+    trial_target = abort["trial_target"]
+    return (
+        _tripped_streak(abort) is not None
+        and isinstance(trial_target, int)
+        and _accepted_trial_target(study) < trial_target
     )
 
 
@@ -1091,8 +1124,8 @@ def _recovery_remedies(
     it. Otherwise the step is a raised ``n_trials``, which retires any abort, a grid or fixed
     configuration raising it only as far as its retry ceiling allows. At that ceiling a
     streak abort with trials left is retired by a ``max_consecutive_failures`` above the
-    recorded count instead. A grid or fixed configuration with every cell measured has no
-    remedy, and says so.
+    recorded count instead. The same limit can acknowledge a streak inherited from a source
+    whose target was reduced after rereading, even when all admissible work has finished.
 
     :param Experiment experiment: Config whose bounds judge the recorded trials.
     :param Phase phase: Phase that aborted.
@@ -1119,6 +1152,11 @@ def _recovery_remedies(
         step = (
             f"raise phases[{name}].max_consecutive_failures above {streak} and rerun to run the "
             f"{plural(target - finished, 'trial')} still left."
+        )
+    if step is None and streak is not None and _streak_at_reduced_target(study, abort):
+        step = (
+            f"raise phases[{name}].max_consecutive_failures above {streak} "
+            "and rerun to select from its recorded trials."
         )
     if step is not None:
         return f"{lead_in}{step}"
@@ -1683,6 +1721,9 @@ def _reached_study_refusals(
     for item in reached:
         phase, study = item.phase, item.study
         try:
+            if REREAD_FILL_ATTR in study.user_attrs and _recorded_identity(study) is None:
+                # The phase checks its target and launchability after importing the source policy.
+                continue
             if item.predicted is None:
                 _validate_trial_target(study, phase)
                 partial = _load_accepted_partial_decision(study)

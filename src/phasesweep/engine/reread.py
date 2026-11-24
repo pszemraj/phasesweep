@@ -11,9 +11,9 @@ and each trial whose trainer finished is read again from its kept evidence under
 settings, through the one path recovery reads a finished attempt by
 (:func:`phasesweep.engine.attempts.read_finished_attempt`). No trainer launches.
 
-The fill is resumable. The source boundary is written before copying, each trial is appended
-in one storage write, and the identity is written last. A killed fill resumes from the same
-source and trial cutoff even if another study grew while the fill was stopped.
+The fill is resumable. The source name is written before copying, each trial is appended in
+one storage write, and the identity is written last. A killed fill resumes from its source's
+current ledger, including trials the source finished while the fill was stopped.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from typing import ClassVar
 import optuna
 
 from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.search import retry_target_ceiling
 from phasesweep.engine.attempts import (
     _pending_evidence_refusal,
     _trial_attempt_record,
@@ -51,7 +52,11 @@ from phasesweep.engine.fingerprints import (
     phase_study_name,
     reading_settings,
 )
-from phasesweep.engine.optuna import _measured_trial_count
+from phasesweep.engine.optuna import (
+    _finished_trial_count,
+    _measured_draw_count,
+    _measured_trial_count,
+)
 from phasesweep.engine.paths import _attempt_dir, _experiment_dir, _trial_dir_opener
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.state import (
@@ -62,11 +67,14 @@ from phasesweep.engine.state import (
     OVERRIDES_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_IDENTITY_ATTR,
+    PHASE_RECOVERY_ATTR,
+    REREAD_FILL_ATTR,
+    RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
     STUDY_SCHEMA_ATTR,
     TRIAL_OUTCOME_ATTR,
+    TRIAL_TARGET_ATTR,
     PhaseIdentityRecord,
-    _parsed_phase_identity,
     _parsed_trial_outcome,
     _recorded_identity,
     _recorded_trial_dir,
@@ -75,6 +83,7 @@ from phasesweep.engine.state import (
     _trial_outcome_payload,
 )
 from phasesweep.engine.study_policy import (
+    _accepted_trial_target,
     _initialize_study_schema,
     _parse_accepted_partial_decision,
 )
@@ -84,11 +93,12 @@ from phasesweep.evidence.baseline import read_evidence_baseline
 from phasesweep.runtime.json import JsonObject, finite_nonnegative, json_object
 from phasesweep.runtime.terminal import plural
 
-_FILL_ATTR = "phasesweep_reread_fill"
-REREAD_FILL_SCHEMA_VERSION = 2
-_FILL_FIELDS = frozenset({"schema_version", "study_name", "trial_count", "identity", "attrs"})
+REREAD_FILL_SCHEMA_VERSION = 3
+_FILL_FIELDS = frozenset({"schema_version", "study_name"})
 #: The source's identity, root, schema and any earlier fill belong to the source study.
-_NOT_COPIED = frozenset({_FILL_ATTR, PHASE_IDENTITY_ATTR, ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR})
+_NOT_COPIED = frozenset(
+    {REREAD_FILL_ATTR, PHASE_IDENTITY_ATTR, ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR}
+)
 #: The recorded outcomes a re-read replaces; an interruption or a fatal outcome stands as it was.
 _REREAD_OUTCOMES = frozenset({"success", "failure"})
 
@@ -103,55 +113,54 @@ class FillSource:
     rereads: int
     #: Each reading setting that changed, with its recorded and current value.
     changes: tuple[tuple[str, object, object], ...]
-    #: The trial prefix and study attributes at the boundary of the fill.
+    #: The source's current trials and study attributes.
     trials: list[optuna.trial.FrozenTrial]
     attrs: JsonObject
 
 
-@dataclass(frozen=True)
-class _FillBoundary:
-    """The source, trial cutoff and mutable study metadata recorded before copying."""
-
-    study_name: str
-    trial_count: int
-    identity: PhaseIdentityRecord
-    attrs: JsonObject
-
-
-def _fill_boundary(target: optuna.Study | None) -> _FillBoundary | None:
-    """Read the source recorded before a fill began.
+def _fill_source_name(target: optuna.Study | None) -> str | None:
+    """Read the study name recorded before a fill began.
 
     :param optuna.Study | None target: The addressed study, if it exists.
-    :raises StudySchemaMismatchError: The saved source boundary is malformed.
-    :return _FillBoundary | None: The saved boundary, or None for a fresh fill.
+    :raises StudySchemaMismatchError: The saved source record is malformed.
+    :return str | None: The saved source name, or None for a fresh fill.
     """
-    raw = None if target is None else target.user_attrs.get(_FILL_ATTR)
+    raw = None if target is None else target.user_attrs.get(REREAD_FILL_ATTR)
     if raw is None:
         return None
     assert target is not None
     try:
         record = json_object(raw)
         name = record["study_name"]
-        count = record["trial_count"]
-        identity = _parsed_phase_identity(record["identity"], target.study_name)
-        attrs = json_object(record["attrs"])
         if (
             record.keys() != _FILL_FIELDS
             or type(record.get("schema_version")) is not int
             or record["schema_version"] != REREAD_FILL_SCHEMA_VERSION
             or not isinstance(name, str)
             or not name
-            or type(count) is not int
-            or count < 1
-            or identity is None
-            or not _NOT_COPIED.isdisjoint(attrs)
         ):
-            raise ValueError("invalid source, trial count, identity or study attributes")
+            raise ValueError("invalid source name or schema version")
     except (KeyError, ValueError) as exc:
         raise StudySchemaMismatchError(
-            f"Study {target.study_name!r} has a malformed {_FILL_ATTR!r} record: {exc}."
+            f"Study {target.study_name!r} has a malformed {REREAD_FILL_ATTR!r} record: {exc}."
         ) from exc
-    return _FillBoundary(name, count, identity, attrs)
+    return name
+
+
+def _fill_candidates(name: str | None, others: Sequence[optuna.Study]) -> Sequence[optuna.Study]:
+    """Use only the already chosen source when resuming a fill.
+
+    :param str | None name: The pinned source name, if there is one.
+    :param Sequence[optuna.Study] others: Other studies of the phase, oldest first.
+    :raises StudySchemaMismatchError: The saved source is unavailable.
+    :return Sequence[optuna.Study]: Every candidate or just the saved source.
+    """
+    if name is None:
+        return others
+    for study in others:
+        if study.study_name == name:
+            return [study]
+    raise StudySchemaMismatchError(f"Saved fill source {name!r} is missing.")
 
 
 @dataclass(frozen=True)
@@ -161,6 +170,8 @@ class FillResult:
     copied: int
     rereads: int
     changed: int
+    #: The source's accepted target and the ceiling after re-reading, when they conflict.
+    adjusted_target: tuple[int, int] | None
 
 
 @dataclass
@@ -238,7 +249,7 @@ def fill_source(
     A candidate holds trials measured under the same inherited values and would continue
     under the current config once its reading settings are replaced. The
     candidate with the most trainer-finished trials wins, the most recently created on a tie.
-    An interrupted fill keeps the source, trial cutoff and metadata it already recorded.
+    An interrupted fill keeps its source and uses its latest trials and study metadata.
 
     :param Experiment experiment: Current config.
     :param Phase phase: The phase whose addressed study records no identity.
@@ -252,29 +263,22 @@ def fill_source(
     """
     reading = reading_settings(experiment, phase)
     values = _inherited_values(phase, inherited)
-    boundary = _fill_boundary(target)
+    pinned = _fill_source_name(target)
     copied = 0 if target is None else len(target.get_trials(deepcopy=False))
-    if boundary is not None:
-        others = [study for study in others if study.study_name == boundary.study_name]
-        if not others:
-            raise StudySchemaMismatchError(f"Saved fill source {boundary.study_name!r} is missing.")
     found: list[FillSource] = []
     refusal: StudyFingerprintMismatchError | None = None
-    for study in others:
-        record = _recorded_identity(study) if boundary is None else boundary.identity
+    for study in _fill_candidates(pinned, others):
+        record = _recorded_identity(study)
         trials = study.get_trials(deepcopy=False)
-        if boundary is not None:
-            if len(trials) < boundary.trial_count:
-                raise StudySchemaMismatchError(
-                    f"Saved fill source {study.study_name!r} holds fewer than "
-                    f"{plural(boundary.trial_count, 'trial')}."
-                )
-            trials = trials[: boundary.trial_count]
         if record is None or not trials:
+            if pinned is not None:
+                raise StudySchemaMismatchError(
+                    f"Saved fill source {study.study_name!r} has no identity or trials."
+                )
             continue
         payload = record["payload"]
         if not _same_value(payload.get("inherited_effective_overrides"), values):
-            if boundary is not None:
+            if pinned is not None:
                 raise StudySchemaMismatchError(
                     f"Saved fill source {study.study_name!r} records different inherited values."
                 )
@@ -294,12 +298,8 @@ def fill_source(
         recorded = payload.get(READING_KEY)
         changes = _changed_payload_keys(recorded if isinstance(recorded, dict) else {}, reading)
         rereads = sum(_trainer_seconds(trial) is not None for trial in trials[copied:])
-        attrs = (
-            json_object(
-                {key: value for key, value in study.user_attrs.items() if key not in _NOT_COPIED}
-            )
-            if boundary is None
-            else boundary.attrs
+        attrs = json_object(
+            {key: value for key, value in study.user_attrs.items() if key not in _NOT_COPIED}
         )
         found.append(FillSource(study, record, rereads, tuple(changes), trials, attrs))
     if not found:
@@ -494,6 +494,59 @@ def _reread_trial(
     )
 
 
+def _copy_study_attrs(
+    phase: Phase, target: optuna.Study, source: FillSource
+) -> tuple[int, int] | None:
+    """Copy the source policy with the retry capacity and measurements of the filled study.
+
+    :param Phase phase: The phase whose retry ceiling applies to the re-read results.
+    :param optuna.Study target: The study with all of the copied attempts.
+    :param FillSource source: The source study and its current attributes.
+    :raises StudySchemaMismatchError: The source's accepted target or timeout is malformed.
+    :return tuple[int, int] | None: The source target and reduced target, if it changed.
+    """
+    source_target = _accepted_trial_target(source.study)
+    trials = target.get_trials(deepcopy=False)
+    ceiling = retry_target_ceiling(
+        phase, finished=_finished_trial_count(trials), measured=_measured_draw_count(trials)
+    )
+    accepted = source_target if ceiling is None else min(source_target, ceiling)
+    attrs = {**source.attrs, TRIAL_TARGET_ATTR: accepted}
+    recovery = attrs.get(PHASE_RECOVERY_ATTR)
+    if accepted < source_target and isinstance(recovery, dict):
+        recovered_target = recovery["trial_target"]
+        assert type(recovered_target) is int  # Checked with the accepted target.
+        attrs[PHASE_RECOVERY_ATTR] = {**recovery, "trial_target": min(recovered_target, accepted)}
+    partial = _parse_accepted_partial_decision(
+        attrs.get(PHASE_DECISION_ATTR), source.study.study_name
+    )
+    if partial is not None:
+        retargeted = min(partial.trial_target, accepted)
+        if retargeted <= partial.finished_trials or (
+            partial.trial_target < source_target and retargeted == accepted
+        ):
+            attrs[PHASE_DECISION_ATTR] = None
+        else:
+            measured = _measured_trial_count(
+                trial
+                for trial in trials
+                if (outcome := _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR)))
+                is not None
+                and outcome.sequence <= partial.outcome_sequence
+            )
+            decision = json_object(attrs[PHASE_DECISION_ATTR])
+            attrs[PHASE_DECISION_ATTR] = {
+                **decision,
+                "trial_target": retargeted,
+                "measured_trials": measured,
+            }
+    stored = target.user_attrs
+    for key, value in attrs.items():
+        if stored.get(key) != value:
+            target.set_user_attr(key, value)
+    return (source_target, accepted) if accepted < source_target else None
+
+
 def fill_study(
     experiment: Experiment,
     phase: Phase,
@@ -506,9 +559,10 @@ def fill_study(
 
     The target is the study a run opened for the phase and records no identity: empty, or left
     part-way by a killed fill, whose trials are then the source's first ones, so the fill
-    appends the rest. An accepted partial decision keeps its timeout boundary and counts the
-    trials measured under the current settings at that boundary. The identity, the source's
-    with the current reading settings, is written last and marks the fill complete.
+    appends the rest. Queued reruns at the end have yet to launch. Scheduling them after the
+    fill uses the re-read outcomes, and a stopped fill does not copy a row that could gain
+    an outcome in the source before it resumes. The identity, the source's with the current
+    reading settings, is written last and marks the fill complete.
 
     :param Experiment experiment: Current config.
     :param Phase phase: The phase.
@@ -520,11 +574,14 @@ def fill_study(
     :raises TrackingTargetUnavailableError: A tracker gave no answer for a finished trial.
     :return FillResult: What the fill wrote in this call.
     """
-    trials = source.trials
+    end = len(source.trials)
+    while end > 0 and (
+        (trial := source.trials[end - 1]).state == optuna.trial.TrialState.WAITING
+        and RERUN_OF_ATTR in trial.user_attrs
+    ):
+        end -= 1
+    trials = source.trials[:end]
     present = target.get_trials(deepcopy=False)
-    partial = _parse_accepted_partial_decision(
-        source.attrs.get(PHASE_DECISION_ATTR), source.study.study_name
-    )
     if [(t.number, t.params, t.user_attrs.get(ATTEMPT_ID_ATTR)) for t in present] != [
         (t.number, t.params, t.user_attrs.get(ATTEMPT_ID_ATTR)) for t in trials[: len(present)]
     ]:
@@ -534,20 +591,14 @@ def fill_study(
         )
     _initialize_study_schema(target)
     stored = target.user_attrs
-    if _FILL_ATTR not in stored:
+    if REREAD_FILL_ATTR not in stored:
         target.set_user_attr(
-            _FILL_ATTR,
+            REREAD_FILL_ATTR,
             {
                 "schema_version": REREAD_FILL_SCHEMA_VERSION,
                 "study_name": source.study.study_name,
-                "trial_count": len(trials),
-                "identity": source.record,
-                "attrs": source.attrs,
             },
         )
-    for key, value in source.attrs.items():
-        if key != PHASE_DECISION_ATTR and stored.get(key) != value:
-            target.set_user_attr(key, value)
     by_number = {trial.number: trial for trial in trials}
     directory_reuses = _directory_reuses(
         trial for study in other_studies for trial in study.get_trials(deepcopy=False)
@@ -560,18 +611,9 @@ def fill_study(
             rereads += 1
             changed += (reread.state, reread.value) != (trial.state, trial.value)
         target.add_trial(trial if reread is None else reread)
-    if partial is not None:
-        measured = _measured_trial_count(
-            trial
-            for trial in target.get_trials(deepcopy=False)
-            if (outcome := _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR)))
-            is not None
-            and outcome.sequence <= partial.outcome_sequence
-        )
-        decision = json_object(source.attrs[PHASE_DECISION_ATTR])
-        target.set_user_attr(PHASE_DECISION_ATTR, {**decision, "measured_trials": measured})
+    adjusted_target = _copy_study_attrs(phase, target, source)
     _stamp_identity(target, _reread_record(source.record, reading_settings(experiment, phase)))
-    return FillResult(copied=len(trials) - len(present), rereads=rereads, changed=changed)
+    return FillResult(len(trials) - len(present), rereads, changed, adjusted_target)
 
 
 def describe_changes(changes: Sequence[tuple[str, object, object]]) -> str:
@@ -652,23 +694,20 @@ def pending_reread(
     if addressed is not None and _recorded_identity(addressed) is not None:
         return None
     others = [study for study in studies if study.study_name != study_name]
-    boundary = _fill_boundary(addressed)
-    inherited = None if boundary is None else _recorded_inheritance(boundary.identity)
-    if inherited is None:
-        for study in others:
-            record = _recorded_identity(study)
-            if record is None:
-                continue
-            recorded_inheritance = _recorded_inheritance(record)
-            if phase_study_name(experiment, phase, recorded_inheritance) == study_name:
-                inherited = recorded_inheritance
-                break
-    if inherited is None:
-        return None
-    source = fill_source(experiment, phase, inherited, others, target=addressed)
-    if source is None:
-        return None
-    return _pending_notice(source, phase.name)
+    pinned = _fill_source_name(addressed)
+    for study in _fill_candidates(pinned, others):
+        record = _recorded_identity(study)
+        if record is None:
+            continue
+        inherited = _recorded_inheritance(record)
+        if phase_study_name(experiment, phase, inherited) == study_name:
+            source = fill_source(experiment, phase, inherited, others, target=addressed)
+            return None if source is None else _pending_notice(source, phase.name)
+    if pinned is not None:
+        raise StudySchemaMismatchError(
+            f"Saved fill source {pinned!r} does not address study {study_name!r}."
+        )
+    return None
 
 
 def fill_note(source: FillSource, result: FillResult) -> str:
@@ -680,8 +719,14 @@ def fill_note(source: FillSource, result: FillResult) -> str:
     """
     unread = result.copied - result.rereads
     copied = f", {plural(unread, 'unfinished trial')} copied as recorded" if unread else ""
+    adjustment = ""
+    if result.adjusted_target is not None:
+        previous, accepted = result.adjusted_target
+        adjustment = (
+            f" The re-read results reduce the accepted trial target from {previous} to {accepted}."
+        )
     return (
         f"reading settings changed ({describe_changes(source.changes)}): re-read "
         f"{plural(result.rereads, 'finished trial')} from kept evidence, {result.changed} "
-        f"changed outcome{copied}; nothing was retrained."
+        f"changed outcome{copied}; nothing was retrained.{adjustment}"
     )
