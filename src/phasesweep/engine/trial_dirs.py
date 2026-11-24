@@ -50,15 +50,21 @@ def _rerun_directory_sources(
 
     :param Mapping[int, FrozenTrial] trials: The study's trials by number.
     :param FrozenTrial trial: The trial about to launch, or one already launched.
-    :raises ProcessCleanupUncertainError: A source's recorded directory is malformed.
+    :raises ProcessCleanupUncertainError: A source is invalid or its recorded directory is malformed.
     :return Iterator[FrozenTrial]: Directory sources, from the most recent to the opener.
     """
     current = trial
     while True:
         source_number = current.user_attrs.get(RERUN_OF_ATTR)
-        source = trials.get(source_number) if type(source_number) is int else None
-        if source is None:
+        if source_number is None:
             return
+        source = trials.get(source_number) if type(source_number) is int else None
+        if source is None or source.number >= current.number:
+            raise ProcessCleanupUncertainError(
+                f"Trial {current.number} names {source_number!r} under {RERUN_OF_ATTR!r}, "
+                "which is not an earlier trial of its study.",
+                action=OperatorAction.RESTORE_LEDGER,
+            )
         try:
             recorded = _recorded_trial_dir(source)
         except ValueError as exc:

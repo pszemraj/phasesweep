@@ -497,6 +497,17 @@ def _waiting_rerun(source: int) -> optuna.trial.FrozenTrial:
     )
 
 
+@pytest.mark.parametrize("ancestor", [0, 1, 2])
+def test_rerun_directory_rejects_a_source_that_is_not_earlier(ancestor: int) -> None:
+    """Every directory lineage edge must point to an existing, strictly earlier trial."""
+    trials = _trials(_waiting_rerun(ancestor), _waiting_rerun(0))
+
+    with pytest.raises(ProcessCleanupUncertainError, match="not an earlier trial") as refused:
+        _expected_trial_dir_name(trials, trials[1])
+
+    assert refused.value.action is OperatorAction.RESTORE_LEDGER
+
+
 def test_a_rerun_refuses_a_directory_whose_source_cleanup_is_unconfirmed(tmp_path: Path) -> None:
     """A rerun may enter its source's directory only once that attempt's cleanup is confirmed, so two processes never write one directory."""
     experiment = make_experiment(workdir=tmp_path / "runs")
