@@ -602,12 +602,18 @@ def _find(client: _SdkClient, request: FindRequest) -> FindResult:
 
 
 def _finished_without(
-    data: _SdkRunData, *, metrics: Iterable[str], params: Iterable[str], tags: Iterable[str]
+    data: _SdkRunData,
+    *,
+    metrics: Iterable[str],
+    earlier_metrics: Iterable[str],
+    params: Iterable[str],
+    tags: Iterable[str],
 ) -> str | None:
     """Name the required metrics, params and tags a finished run lacks, and the keys it has.
 
     :param _SdkRunData data: Logged data of the finished run.
     :param Iterable[str] metrics: Required metric names.
+    :param Iterable[str] earlier_metrics: Earlier metric keys usable for constraints.
     :param Iterable[str] params: Required param names.
     :param Iterable[str] tags: Required tag names.
     :return str | None: The failure text, or ``None`` when the run has everything required.
@@ -615,7 +621,7 @@ def _finished_without(
     lacking: list[str] = []
     available: list[str] = []
     for kind, wanted, present in (
-        ("metric", metrics, data.metrics),
+        ("metric", metrics, set(data.metrics).union(earlier_metrics)),
         ("param", params, data.params),
         ("tag", tags, data.tags),
     ):
@@ -655,7 +661,8 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     FINISHED runs fail immediately when required evidence is missing. Unfinished
     runs are polled until just before ``timeout_at``. Each metric's history is the bound
     run's merged over the earlier runs of the trial's resumed attempts, whatever their
-    status, and the bound run must have logged the metric itself.
+    status. The bound run must log the objective and gate evidence itself. A constraint
+    can use earlier history when the bound run omits its metric.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param CaptureRequest request: Trusted target, bound run, the trial's earlier runs
@@ -690,30 +697,36 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
             }
             gates = [MlflowRequiredGate.model_validate(gate) for gate in query["gates"]]
             keys = sorted({spec.metric_key for spec in selections.values()})
+            objective_key = MlflowExtractor.model_validate(query["objective"]).metric_key
+            fresh_keys = {objective_key, *(key for gate in gates for key in gate.metrics)}
+            earlier = request["earlier"]
+            earlier_metrics: set[str] = set()
+            for prior in earlier:
+                prior_run = client.get_run(prior["run_id"])
+                verify_remote(prior_run, prior)
+                earlier_metrics.update(
+                    key for key in prior_run.data.metrics if key not in fresh_keys
+                )
             lacking = _finished_without(
                 run.data,
                 metrics=keys,
+                earlier_metrics=earlier_metrics,
                 params=[key for gate in gates for key in gate.params],
                 tags=[key for gate in gates for key in gate.tags],
             )
             if lacking is not None:
-                if (
-                    binding["run_mode"] == "managed"
-                    and MlflowExtractor.model_validate(query["objective"]).metric_key
-                    not in run.data.metrics
-                ):
+                if binding["run_mode"] == "managed" and objective_key not in run.data.metrics:
                     raise ManagedObjectiveMissingError(lacking)
                 raise ValueError(lacking)
-            earlier = request["earlier"]
-            for prior in earlier:
-                verify_remote(client.get_run(prior["run_id"]), prior)
             observations: dict[str, Observation] = {}
             for key in keys:
-                history = _metric_records(client, binding["run_id"], key)
-                if not history:
-                    raise ValueError(
-                        f"MLflow run finished with metric {key!r} but no history for it."
-                    )
+                history = []
+                if key in run.data.metrics:
+                    history = _metric_records(client, binding["run_id"], key)
+                    if not history:
+                        raise ValueError(
+                            f"MLflow run finished with metric {key!r} but no history for it."
+                        )
                 records = merge_histories(
                     [*(_metric_records(client, prior["run_id"], key) for prior in earlier), history]
                 )

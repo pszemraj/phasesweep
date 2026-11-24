@@ -160,6 +160,7 @@ def test_shared_history_once():
     selectors = [spec("last"), spec("min"), spec("step", step=1)]
     query = {
         "revision": 1,
+        "objective": selectors[0].model_dump(),
         "selections": {observation_id(s): s.model_dump() for s in selectors},
         "gates": [],
     }

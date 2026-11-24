@@ -546,6 +546,59 @@ def test_a_resumed_trials_mlflow_objective_reads_its_attempts_merged_history() -
     assert capture["earlier_bindings"] == [earlier]
 
 
+@pytest.mark.parametrize("gate_requires_metric", [False, True], ids=["constraint", "gate-too"])
+def test_a_rerun_can_use_a_constraint_logged_once_on_the_first_attempt(
+    gate_requires_metric: bool,
+) -> None:
+    """A step-zero constraint survives a retry while a gate still requires current evidence."""
+    binding = mlflow_binding()
+    prior = {**binding, "attempt_id": "d" * 32, "run_id": "earlier"}
+    objective = MlflowExtractor(type="mlflow", metric_key="loss", select="min")
+    count = MlflowExtractor(type="mlflow", metric_key="n_params", select="last")
+    runs = {
+        binding["run_id"]: mlflow_run(binding, metrics={"loss": 0.4}),
+        prior["run_id"]: mlflow_run(prior, status="FAILED", metrics={"loss": 0.05, "n_params": 42}),
+    }
+    histories = {
+        (binding["run_id"], "loss"): [SimpleNamespace(value=0.4, step=7, timestamp=3)],
+        (prior["run_id"], "loss"): [
+            SimpleNamespace(value=0.2, step=2, timestamp=1),
+            SimpleNamespace(value=0.05, step=8, timestamp=2),
+        ],
+        (prior["run_id"], "n_params"): [SimpleNamespace(value=42, step=0, timestamp=1)],
+    }
+    client = SimpleNamespace(
+        get_run=runs.__getitem__, get_metric_history=lambda run, key: histories[run, key]
+    )
+    request = {
+        "binding": binding,
+        "earlier": [prior],
+        "query": {
+            "revision": 1,
+            "objective": objective.model_dump(),
+            "constraints": {"size": count.model_dump()},
+            "selections": {observation_id(s): s.model_dump() for s in (objective, count)},
+            "gates": [{"type": "mlflow_required", "metrics": ["n_params"]}]
+            if gate_requires_metric
+            else [],
+        },
+        "settings": {"timeout_seconds": 1, "poll_seconds": 0.01},
+        "timeout_at": time.monotonic() + 1,
+    }
+    if gate_requires_metric:
+        with pytest.raises(ValueError, match="without metric 'n_params'"):
+            mlflow_worker._capture(client, request)
+    else:
+        capture = mlflow_worker._capture(client, request)
+        assert capture["observations"][observation_id(count)] == {
+            "value": 42.0,
+            "step": 0,
+            "timestamp": 1,
+        }
+        assert capture["observations"][observation_id(objective)]["value"] == 0.2
+        assert capture["earlier_bindings"] == [prior]
+
+
 def _interrupted(
     number: int, trial_dir: Path, attempt_id: str, **attrs: object
 ) -> optuna.trial.FrozenTrial:
