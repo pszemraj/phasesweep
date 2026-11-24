@@ -52,7 +52,7 @@ from phasesweep.engine.phase import (
     _winner_overrides,
 )
 from phasesweep.engine.progress import _log_phase_header
-from phasesweep.engine.reread import describe_changes, fill_source
+from phasesweep.engine.reread import _trainer_seconds, describe_changes, fill_source
 from phasesweep.engine.state import (
     RecoveredTrialState,
     Winner,
@@ -299,9 +299,10 @@ def validate_trial_targets(experiment: Experiment) -> None:
     The attempts are counted as a launch counts them after its recovery: a RUNNING attempt
     that recovery settles as failed counts as finished. One whose completed trainer evidence
     awaits recovery also counts as a failure, the verdict that allows the most retries,
-    because validation recovers nothing and a launch's extraction may still record one. So a
-    target is refused only when a launch refuses it whatever those verdicts turn out to be,
-    and a launch enforces the real ceiling once it has recovered the evidence.
+    because validation recovers nothing and a launch's extraction may still record one. A
+    study waiting for a re-read uses its source's counts, and a trial still to be re-read also
+    counts as a failure for this check. A launch enforces the real ceiling once it has read
+    the evidence.
 
     A phase that inherits is judged here only when it has no study at all: which of its
     studies a launch addresses depends on winners its parents have yet to select, and the
@@ -327,13 +328,25 @@ def validate_trial_targets(experiment: Experiment) -> None:
             continue
         study = known.get(phase.name)
         trials = [] if study is None else study.get_trials(deepcopy=False)
+        measured = _measured_trial_count(trials)
+        if study is None or _recorded_identity(study) is None:
+            source = fill_source(
+                experiment, phase, {}, [other for other in every[phase.name] if other is not study]
+            )
+            if source is not None:
+                study = source.study
+                missing = study.get_trials(deepcopy=False)[len(trials) :]
+                measured += _measured_trial_count(
+                    trial for trial in missing if _trainer_seconds(trial) is None
+                )
+                trials = [*trials, *missing]
         recovered = [] if study is None else _recovered_running_states(study.study_name, trials)
         _validate_fixed_configuration_target(
             phase,
             finished=_finished_trial_count(trials)
             + recovered.count("FAIL")
             + recovered.count("EVIDENCE_PENDING"),
-            measured=_measured_trial_count(trials),
+            measured=measured,
         )
 
 

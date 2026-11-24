@@ -22,6 +22,7 @@ from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import FAILURE_REASON_ATTR, PHASE_DECISION_ATTR, TRIAL_DIR_ATTR
 from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
 from tests.conftest import (
+    invoke_cli_boundary,
     make_experiment,
     record_accepted_partial_timeout,
     study_name,
@@ -287,6 +288,38 @@ def test_a_dry_run_says_it_would_re_read_and_writes_nothing(
         'DRY RUN phase=p reading settings changed (metric.extractor.key: "loss" -> "acc"): '
         "would re-read 3 finished trials from kept evidence; nothing would retrain"
     ) in [record.getMessage() for record in caplog.records]
+
+
+def test_validate_counts_kept_grid_trials_when_the_reading_settings_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The read-only ceiling includes available attempts without reading their evidence."""
+    trainer, launches = _counting_trainer(tmp_path)
+    original = _experiment(tmp_path, trainer, _metric("missing"))
+    with pytest.raises(NoFeasibleTrialError, match="No completed trials"):
+        run_experiment(original)
+    phase = _phases()[0]
+    retry = _experiment(
+        tmp_path,
+        trainer,
+        _metric("still_missing"),
+        phases=[phase.model_copy(update={"n_trials": 4})],
+    )
+    retry_path = write_experiment_config(tmp_path / "retry.yaml", retry)
+    oversized = _experiment(
+        tmp_path,
+        trainer,
+        _metric("still_missing"),
+        phases=[phase.model_copy(update={"n_trials": 7})],
+    )
+    oversized_path = write_experiment_config(tmp_path / "oversized.yaml", oversized)
+    before = tree_snapshot(tmp_path)
+
+    assert invoke_cli_boundary(["validate", str(retry_path)], monkeypatch) == 0
+    assert invoke_cli_boundary(["validate", str(oversized_path)], monkeypatch) == 1
+    assert "allow at most 6" in capsys.readouterr().err
+    assert tree_changes(before, tree_snapshot(tmp_path)) == {}
+    assert _launches(launches) == 3
 
 
 @pytest.mark.integration
