@@ -357,6 +357,8 @@ A systemd user unit, saved as `~/.config/systemd/user/phasesweep-sweep.service`,
 Description=PhaseSweep sweep
 
 [Service]
+# If checkpoints require a mounted volume, uncomment and use its mount point.
+# ExecStartPre=/usr/bin/mountpoint -q /mnt/checkpoints
 WorkingDirectory=/path/to/trainer/repo
 Environment=PATH=/path/to/env/bin:/usr/bin:/bin
 # Add one Environment= line for each variable execution.inherit_env names.
