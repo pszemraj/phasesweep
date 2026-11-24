@@ -291,7 +291,7 @@ def _load_accepted_partial_decision(
         or type(measured_trials) is not int
         or measured_trials < 0
         or measured_trials > finished_trials
-        or timeout_scope not in {"phase", "run"}
+        or timeout_scope not in ("phase", "run")
         or (
             recovered_abort_sequence is not None
             and (
