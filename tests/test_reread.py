@@ -249,6 +249,44 @@ def test_reread_does_not_score_a_file_overwritten_from_another_reading_study(
     assert _launches(launches) == 4
 
 
+def test_reread_refuses_an_older_file_reached_through_a_retargeted_link(tmp_path: Path) -> None:
+    """A redirected result path gives no score even when its new target predates the retry.
+
+    :param Path tmp_path: Scratch directory for the experiment and trainer.
+    """
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import os
+        from pathlib import Path
+        root = Path(os.environ["PHASESWEEP_TRIAL_DIR"])
+        latest = root / "latest"
+        if latest.is_symlink():
+            latest.unlink()
+            latest.symlink_to("next")
+        else:
+            for checkpoint, value in (("prior", 0.1), ("next", 0.2)):
+                directory = root / checkpoint
+                directory.mkdir()
+                (directory / "loss.json").write_text(f'{{"loss": {value}}}')
+            latest.symlink_to("prior")
+            (root / "r.json").symlink_to("latest/loss.json")
+        """,
+    )
+    first = Phase(name="p", n_trials=1, gpu_policy="none")
+    retried = first.model_copy(update={"n_trials": 2})
+    for phase in (first, retried):
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(_experiment(tmp_path, trainer, _metric("typo"), phases=[phase]))
+
+    corrected = _experiment(tmp_path, trainer, _metric("loss"), phases=[retried])
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(corrected)
+    older, retry = phase_study_of(corrected).get_trials()
+    assert "changed after this attempt finished" in older.user_attrs[FAILURE_REASON_ATTR]
+    assert "last changed before this attempt started" in retry.user_attrs[FAILURE_REASON_ATTR]
+
+
 def test_an_added_constraint_is_measured_for_every_finished_trial(tmp_path: Path) -> None:
     """The new constraint reads each kept result, so the trial it rules out loses the phase."""
     trainer, launches = _counting_trainer(tmp_path)

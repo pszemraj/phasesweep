@@ -116,6 +116,33 @@ def broken_symlink_detail(
     return None
 
 
+def resolved_file_change_ns(directory: Path, path: Path) -> int:
+    """Return the newest change time of a checked file and the links that reach it.
+
+    A link can redirect a result to an older file without updating that file's inode.
+    Include links in a link's destination path as well as in the configured path.
+
+    :param Path directory: Owner directory that the configured path must resolve within.
+    :param Path path: File already checked to resolve inside ``directory``.
+    :raises OSError: The file or a component could not be inspected.
+    :return int: Latest inode change time in Unix nanoseconds.
+    """
+    newest = path.stat().st_ctime_ns
+    checked: set[Path] = set()
+    pending = [path]
+    while pending:
+        candidate = pending.pop()
+        for component in (candidate, *candidate.parents):
+            if component == directory.parent or component in checked:
+                break
+            checked.add(component)
+            info = component.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                newest = max(newest, info.st_ctime_ns)
+                pending.append(component.parent / component.readlink())
+    return newest
+
+
 class UnsafeLockPathError(PhaseSweepError):
     """Raised when a lock directory or file is inaccessible or unsafe to trust."""
 

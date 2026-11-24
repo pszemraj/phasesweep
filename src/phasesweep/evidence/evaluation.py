@@ -54,7 +54,7 @@ from phasesweep.evidence.wandb import (
     locate_wandb_position,
     poll_wandb_summary,
 )
-from phasesweep.runtime.files import broken_symlink_detail, file_sha256
+from phasesweep.runtime.files import broken_symlink_detail, file_sha256, resolved_file_change_ns
 from phasesweep.runtime.json import (
     NonFiniteJsonConstantError,
     finite_nonnegative,
@@ -242,7 +242,9 @@ def _require_fresh(
     """
     if is_captured_stream(relative):
         return
-    if evidence_before is not None and target.stat().st_ctime_ns > round(evidence_before * 1e9):
+    if evidence_before is not None and resolved_file_change_ns(trial_dir, target) > round(
+        evidence_before * 1e9
+    ):
         raise StaleEvidenceError(
             f"`{target}` changed after this attempt finished and another attempt reused its "
             "directory. The earlier value cannot be recovered from this file."
