@@ -819,23 +819,28 @@ def _scheduled_reruns(
 ) -> list[optuna.trial.FrozenTrial]:
     """Return the trials the next run reruns before any new draw and has not yet queued.
 
-    Interrupted trials without a rerun come first, then the failed grid cells a target above
-    the grid size retries, each in trial-number order. A retry takes one of the slots the
-    target leaves after the finished trials and reruns already counted. For a full grown grid,
-    reserve one slot per undrawn cell first.
+    Interrupted trials without a rerun come first, then failed trials a raised target retries,
+    each in trial-number order. A retry takes one of the slots the target leaves after the
+    finished trials and reruns already counted. For a full grown grid, reserve one slot per
+    undrawn cell first.
 
     :param optuna.Study study: Study holding the trials and grid history.
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
-    :param Phase | None phase: Phase whose target above grid cardinality may retry failed cells.
+    :param Phase | None phase: Phase whose target may retry a failed fixed trial or grid cell.
     :return list[optuna.trial.FrozenTrial]: The trials to rerun, in scheduling order.
     """
     sources = _rerun_sources(trials)
-    if (
-        phase is not None
-        and phase.sampler.type == "grid"
-        and phase_draws(phase)
-        and phase.n_trials > grid_cardinality(phase)
-    ):
+    if phase is None:
+        return sources
+    if not phase_draws(phase):
+        if (
+            not sources
+            and trials
+            and _trial_run_state(trials[-1]) == "FAIL"
+            and _finished_trial_count(trials) < phase.n_trials
+        ):
+            sources.append(trials[-1])
+    elif phase.sampler.type == "grid" and phase.n_trials > grid_cardinality(phase):
         waiting = sum(trial.state == optuna.trial.TrialState.WAITING for trial in trials)
         undrawn = _undrawn_grown_grid_cells(study, phase, trials)
         slots = max(
@@ -849,11 +854,11 @@ def _pending_rerun_count(study: optuna.Study, phase: Phase | None = None) -> int
     """Count the reruns a phase's next run launches before any new draw.
 
     That is every WAITING rerun already queued plus each trial :func:`_scheduled_reruns`
-    names: interrupted trials without a rerun and failed grid cells a raised target retries.
+    names: interrupted trials without a rerun and failed trials a raised target retries.
     All of them are among the trials the target still leaves to run.
 
     :param optuna.Study study: Study holding the trials and grid history.
-    :param Phase | None phase: Phase whose target above grid cardinality may retry failed cells.
+    :param Phase | None phase: Phase whose target may retry a failed fixed trial or grid cell.
     :return int: Reruns the next run that reaches the phase launches before any new draw.
     """
     trials = study.get_trials(deepcopy=False)

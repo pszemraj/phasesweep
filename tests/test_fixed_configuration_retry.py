@@ -31,7 +31,7 @@ from phasesweep.engine.selection import (
     PhaseTrialsInfeasibleError,
     ReplayWithoutFeasibleTrialError,
 )
-from phasesweep.engine.state import TRIAL_TARGET_ATTR
+from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_DIR_ATTR, TRIAL_TARGET_ATTR
 from phasesweep.engine.study_policy import _validate_trial_target
 from phasesweep.errors import REJUDGE_BOUNDS_STEP
 from phasesweep.evidence.models import LogRegexExtractor
@@ -132,6 +132,9 @@ def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
     assert _call_count(calls) == 2
     assert winners["p"].metric == 1.0
     assert _states(attempt(2)) == ["FAIL", "COMPLETE"]
+    first, retry = phase_trials(attempt(2))
+    assert retry.user_attrs[RERUN_OF_ATTR] == first.number
+    assert retry.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
 
     with pytest.raises(TrialTargetRefusedError) as repeated:
         run_experiment(attempt(3))
