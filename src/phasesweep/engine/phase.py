@@ -1729,11 +1729,11 @@ def _run_phase(
                 trainer_environment=environment_identity.digest,
             )
             # WAITING reruns precede new draws and share the allocation context.
-            reruns = _record_reruns(study, phase)
+            recorded_reruns = _record_reruns(study, phase)
             timeout = budget.timeout
             try:
                 while True:
-                    _log_reruns(experiment, phase, study, reruns)
+                    _log_reruns(experiment, phase, study, recorded_reruns)
                     finished_before = _finished_trial_count(study.get_trials(deepcopy=False))
                     study.optimize(
                         functools.partial(_objective, run),
@@ -1761,8 +1761,8 @@ def _run_phase(
                         timeout = budget.deadline - time.monotonic()
                         if timeout <= 0:
                             break
-                    reruns = _record_reruns(study)
-                    if not reruns:
+                    recorded_reruns = _record_reruns(study)
+                    if not recorded_reruns:
                         break
             except BaseException as exc:
                 # Drain workers before run reconciliation can reap their trials.
