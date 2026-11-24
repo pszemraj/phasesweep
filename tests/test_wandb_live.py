@@ -260,7 +260,7 @@ def test_a_resumed_trial_logs_every_attempt_to_its_one_wandb_run(tmp_path: Path)
     assert rerun.user_attrs[RERUN_OF_ATTR] == first.number, details
     assert winner.trial_number == rerun.number, details
     assert run.state == "finished", details
-    with pytest.raises(ValueError, match="Could not find run"):
+    with pytest.raises(wandb.errors.CommError, match="Could not find run"):
         api.run(f"{entity}/{project}/{rerun.user_attrs[ATTEMPT_ID_ATTR]}")
     # Every step once, and W&B's own step continuing across the resume.
     assert [row["eval/step"] for row in history] == list(range(1, CURVE_STEPS + 1)), details

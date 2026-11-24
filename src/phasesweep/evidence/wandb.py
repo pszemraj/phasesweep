@@ -188,13 +188,19 @@ def _error_detail(exc: Exception) -> str:
 
 
 def _is_missing_run_error(exc: Exception) -> bool:
-    """Recognize the public API's absent-run ValueError through SDK wrappers.
+    """Recognize the public API's absent-run answer by its message.
+
+    The SDK raises a ``ValueError`` and its error wrapper re-raises it as a ``CommError``
+    with the same message, keeping the original as the cause; either one in the chain
+    is the answer.
 
     :param Exception exc: Error raised by an exact ``Api.run`` lookup.
     :return bool: Whether W&B reported that the requested run could not be found.
     """
+    from wandb.errors import CommError
+
     return any(
-        isinstance(error, ValueError) and str(error).startswith("Could not find run ")
+        isinstance(error, (ValueError, CommError)) and str(error).startswith("Could not find run ")
         for error in _error_chain(exc)
     )
 

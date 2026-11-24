@@ -1699,6 +1699,23 @@ def test_wandb_real_sdk_missing_run_polls_until_the_visibility_deadline(
     assert len(lookups) == 3
 
 
+def test_wandb_missing_run_is_recognized_from_the_sdk_wrapper_alone(monkeypatch) -> None:
+    """The service's ``CommError: Could not find run`` answers the lookup without its cause."""
+    public = pytest.importorskip("wandb.apis.public")
+    from wandb.errors import CommError
+
+    from phasesweep.evidence.wandb import WandbRunMissingError
+
+    _fake_wandb_clock(monkeypatch)
+
+    def lookup(path: str) -> None:
+        raise CommError(f"Could not find run <Run {path} (None)>")
+
+    monkeypatch.setattr(public, "Api", lambda **_: SimpleNamespace(run=lookup))
+    with pytest.raises(WandbRunMissingError):
+        _wandb_poll(required_keys=["loss"], poll_seconds=5, timeout_seconds=15)
+
+
 @pytest.mark.parametrize(
     "last_observation", ["missing", "running", "network", "summary", "permission"]
 )

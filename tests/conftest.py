@@ -1220,7 +1220,9 @@ def wandb_worker_sdk(tmp_path, monkeypatch):
     apis.mkdir(parents=True)
     (root / "wandb" / "__init__.py").write_text("")
     (root / "wandb" / "errors.py").write_text(
-        "class AuthenticationError(Exception): pass\nclass UsageError(Exception): pass\n"
+        "class CommError(Exception): pass\n"
+        "class AuthenticationError(CommError): pass\n"
+        "class UsageError(Exception): pass\n"
     )
     (apis / "__init__.py").write_text("")
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(root), os.environ.get("PYTHONPATH", "")]))
