@@ -35,7 +35,7 @@ from phasesweep.engine.errors import (
     tracker_unreadable,
 )
 from phasesweep.engine.evidence import _verify_winner_evidence
-from phasesweep.engine.fingerprints import _verify_fingerprint
+from phasesweep.engine.fingerprints import _inherited_override_suppliers, _verify_fingerprint
 from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.ledger import ClaimedLedger, open_phase_study
 from phasesweep.engine.optuna import (
@@ -293,25 +293,22 @@ class CsvSnapshotThrottle:
 def _composed_overrides(
     experiment: Experiment,
     phase: Phase,
-    sampled: dict[str, Any],
+    sampled: dict[str, object],
     inherited_winners: dict[str, Winner],
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Merge inherited winners, fixed overrides, and sampled params.
 
     :param Experiment experiment: The experiment whose phase graph says which
         inherited keys an ancestor sampled.
     :param Phase phase: The phase whose ``fixed_overrides`` and inheritance list apply.
-    :param dict[str, Any] sampled: Values Optuna suggested for this trial.
+    :param dict[str, object] sampled: Values Optuna suggested for this trial.
     :param dict[str, Winner] inherited_winners: Parent-phase winners supplying
         the lowest-priority override layer.
     :raises ValueError: If the sampled parameters try to replace a value that
         an ancestor phase sampled. A sampled value replaces an inherited fixed
         one, and a repeat value replaces any inherited one.
-    :return dict[str, Any]: Fully composed overrides for the trainer command.
+    :return dict[str, object]: Fully composed overrides for the trainer command.
     """
-    inherited_overrides: dict[str, Any] = {}
-    for parent in phase.inherits:
-        inherited_overrides.update(inherited_winners[parent].effective_overrides)
     repeat_keys = set() if phase.repeats is None else {phase.repeats.key}
     resampled = experiment.sampled_locked_keys(phase.name) & (set(sampled) - repeat_keys)
     if resampled:
@@ -319,7 +316,10 @@ def _composed_overrides(
             f"Phase {phase.name!r} re-samples inherited winner key(s) {sorted(resampled)} "
             "that an ancestor sampled."
         )
-    out = dict(inherited_overrides)
+    out = {
+        key: inherited_winners[parent].effective_overrides[key]
+        for key, parent in _inherited_override_suppliers(phase, inherited_winners).items()
+    }
     out.update(phase.fixed_overrides)
     out.update(sampled)
     return out

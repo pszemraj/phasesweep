@@ -54,7 +54,7 @@ _RUN_CONTROL_KEYS = frozenset(
     }
 )
 # Increment the schema versions when their fingerprint payloads change.
-FINGERPRINT_SCHEMA_VERSION = 7
+FINGERPRINT_SCHEMA_VERSION = 8
 EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 6
 
 
@@ -172,6 +172,46 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     return dump
 
 
+def _inherited_override_suppliers(
+    phase: Phase, inherited_winners: Mapping[str, Winner]
+) -> dict[str, str]:
+    """Name the last parent supplying each key, retaining its first insertion position.
+
+    :param Phase phase: The phase whose inheritance order determines precedence.
+    :param Mapping[str, Winner] inherited_winners: Parent winners supplying overrides.
+    :return dict[str, str]: Parent by override key, in trainer override order.
+    """
+    return {
+        key: parent
+        for parent in phase.inherits
+        for key in inherited_winners[parent].effective_overrides
+    }
+
+
+def _inherited_override_payload(
+    phase: Phase, inherited_winners: Mapping[str, Winner]
+) -> dict[str, dict[str, object]]:
+    """Group inherited values the trainer actually receives by their supplying parent.
+
+    Fixed, sampled and repeat keys take their values from the current phase. The
+    parent grouping names which inherited values changed in a continuation refusal.
+
+    :param Phase phase: The phase whose local keys and inheritance precedence apply.
+    :param Mapping[str, Winner] inherited_winners: Parent winners supplying overrides.
+    :return dict[str, dict[str, object]]: The effective inherited values by parent and key.
+    """
+    local_keys = set(phase.fixed_overrides) | phase.search_space.keys()
+    if phase.repeats is not None:
+        local_keys.add(phase.repeats.key)
+    inherited: dict[str, dict[str, object]] = {}
+    for key, parent in _inherited_override_suppliers(phase, inherited_winners).items():
+        if key not in local_keys:
+            inherited.setdefault(parent, {})[key] = inherited_winners[parent].effective_overrides[
+                key
+            ]
+    return inherited
+
+
 def _phase_fingerprint_payload(
     experiment: Experiment,
     phase: Phase,
@@ -192,7 +232,7 @@ def _phase_fingerprint_payload(
     return _identity_payload(
         experiment,
         phase,
-        {parent: inherited_winners[parent].effective_overrides for parent in phase.inherits},
+        _inherited_override_payload(phase, inherited_winners),
     )
 
 
@@ -201,7 +241,7 @@ def _identity_payload(experiment: Experiment, phase: Phase, inherited: object) -
 
     :param Experiment experiment: Experiment supplying the experiment-level semantics.
     :param Phase phase: Phase whose semantic dump the payload holds.
-    :param object inherited: Effective overrides by parent, the payload's
+    :param object inherited: Effective inherited values by supplying parent, the payload's
         ``inherited_effective_overrides``.
     :return JsonObject: The payload, normalized to the JSON representation being hashed.
     """
@@ -442,7 +482,7 @@ def _verify_fingerprint(
         changed.
     :return str: Verified current fingerprint.
     """
-    inherited = {parent: inherited_winners[parent].effective_overrides for parent in phase.inherits}
+    inherited = _inherited_override_payload(phase, inherited_winners)
     verdict = _judge_identity(study, experiment, phase, inherited)
     if verdict.record is not None:
         if verdict.rebound_from is not None:
@@ -605,10 +645,10 @@ def _growth_verdicts(
 def _verify_recorded_identity(study: optuna.Study, experiment: Experiment, phase: Phase) -> None:
     """Refuse a populated study whose experiment or phase config changed, before any phase runs.
 
-    The phases it inherits from have not run yet, so their winners are held at the effective
-    overrides the study recorded: only a change to the study's own config refuses here, and
-    :func:`_verify_fingerprint` compares the inherited values once the phase is reached. A study
-    that kept no recorded payload, or no trials, is left to that comparison.
+    The phases it inherits from have not run yet, so the effective inherited values are
+    held at what the study recorded. This check refuses changes to the phase's own config;
+    :func:`_verify_fingerprint` compares the inherited values once the phase is reached.
+    A study without a recorded payload or trials is left to that comparison.
 
     :param optuna.Study study: A reached phase's existing study, which this never writes.
     :param Experiment experiment: Current experiment config.

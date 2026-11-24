@@ -74,7 +74,7 @@ Phases execute in declaration order. `inherits` names earlier phases whose winne
 
 Inheritance transfers parameters, not weights or checkpoints. Each trainer invocation owns initialization and any explicitly configured checkpoint loading.
 
-Every exported override key has an origin. A diamond is valid when both parent paths carry the same original key. If independent parents export the same key, the child must resolve it with an explicit `fixed_overrides` value, or by making it the phase's `repeats.key`; that child value becomes the new origin for descendants. A child may intentionally fix a key it inherits. It may also search a key its parents only fixed, and the sampled value replaces the inherited one; it may not search a key an inherited phase already sampled, because a winner's sampled value is not searched again.
+Every exported override key has an origin. A diamond is valid when both parent paths carry the same original key. If independent parents export the same key, the child must resolve it with an explicit `fixed_overrides` value, or by making it the phase's `repeats.key`; that child value becomes the new origin for descendants. A child may intentionally fix a key it inherits. Replacing a key with a local fixed, sampled or repeat value removes the parent's value from the child's study identity. It may also search a key its parents only fixed, and the sampled value replaces the inherited one; it may not search a key an inherited phase already sampled, because a winner's sampled value is not searched again.
 
 `phasesweep explain phases` prints the load-time rules on which keys a phase may fix, search or inherit, such as that `optimizer` and `optimizer.lr` cannot coexist, and `phasesweep explain 'phases[].name'` the naming rules.
 

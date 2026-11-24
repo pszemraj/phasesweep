@@ -8,7 +8,7 @@ launching trainers or changing the configured ledger or artifact tree.
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
 import optuna
@@ -24,7 +24,11 @@ from phasesweep.engine.artifact_roots import (
     _check_published_phase_studies,
 )
 from phasesweep.engine.errors import StudyStorageUnavailableError
-from phasesweep.engine.fingerprints import _judge_identity, _phase_fingerprint
+from phasesweep.engine.fingerprints import (
+    _inherited_override_payload,
+    _judge_identity,
+    _phase_fingerprint,
+)
 from phasesweep.engine.growth import describe_gains
 from phasesweep.engine.guards import _raise_collected_errors
 from phasesweep.engine.ledger import open_preview_study, read_phase_studies, validate_ledger
@@ -379,16 +383,13 @@ def _preview_phase(
         and recorded.study is not None
         and recorded.study.get_trials(deepcopy=False)
     ):
-        if not any(winner.placeholder_keys for winner in inherited_winners.values()):
+        if not _inherited_placeholder_keys(phase, inherited_winners):
             # Judged only: the preview reads a snapshot and records nothing.
             verdict = _judge_identity(
                 recorded.study,
                 experiment,
                 phase,
-                {
-                    parent: inherited_winners[parent].effective_overrides
-                    for parent in phase.inherits
-                },
+                _inherited_override_payload(phase, inherited_winners),
             )
             phase_fingerprint = verdict.fingerprint
             if verdict.gained:
@@ -487,33 +488,20 @@ def _preview_phase(
 def _inherited_placeholder_keys(
     phase: Phase,
     inherited_winners: dict[str, Winner],
-    *,
-    replaced: Collection[str],
 ) -> dict[str, list[str]]:
-    """Name the inherited override keys whose values are dry-run stand-ins, by parent.
-
-    A key belongs to the last parent in ``inherits`` order that sets it, as in
-    :func:`_composed_overrides`, and drops out when ``replaced`` sets it afresh.
+    """Name stand-ins among the values the current phase actually inherits.
 
     :param Phase phase: The phase whose inheritance order decides which parent supplies a key.
     :param dict[str, Winner] inherited_winners: Parent-phase winners, or stand-ins for them.
-    :param Collection[str] replaced: Keys the phase sets itself, which replace any inherited value.
     :return dict[str, list[str]]: Sorted stand-in keys per parent, in inheritance order, without
         the parents that supply none.
     """
-    supplier: dict[str, str] = {}
-    for parent in phase.inherits:
-        supplier.update(dict.fromkeys(inherited_winners[parent].effective_overrides, parent))
-    by_parent: dict[str, list[str]] = {}
-    for parent in phase.inherits:
-        keys = sorted(
-            key
-            for key in inherited_winners[parent].placeholder_keys
-            if supplier.get(key) == parent and key not in replaced
-        )
-        if keys:
-            by_parent[parent] = keys
-    return by_parent
+    inherited = _inherited_override_payload(phase, inherited_winners)
+    return {
+        parent: sorted(keys)
+        for parent in phase.inherits
+        if (keys := inherited_winners[parent].placeholder_keys & inherited.get(parent, {}).keys())
+    }
 
 
 def _replayed_phase_preview(
@@ -526,9 +514,7 @@ def _replayed_phase_preview(
     :param Winner winner: Replayed or placeholder winner with composed overrides.
     :return PhasePreview: Conditional replay and the values it passes on.
     """
-    carried = _inherited_placeholder_keys(
-        phase, inherited_winners, replaced=[*phase.fixed_overrides, *winner.params]
-    )
+    carried = _inherited_placeholder_keys(phase, inherited_winners)
     stand_ins = winner.placeholder_keys.union(*carried.values()) & winner.effective_overrides.keys()
     return PhasePreview(
         winner=replace(winner, placeholder_keys=stand_ins), launches=0, reruns=0, replays=True
@@ -559,9 +545,7 @@ def _placeholder_winner(
         else {name: value for name, value in sampled_params.items() if name in phase.search_space}
     )
     effective = _winner_overrides(experiment, phase, placeholder_params, inherited_winners)
-    carried = _inherited_placeholder_keys(
-        phase, inherited_winners, replaced=[*phase.fixed_overrides, *placeholder_params]
-    )
+    carried = _inherited_placeholder_keys(phase, inherited_winners)
     stand_ins = set(placeholder_params).union(*carried.values())
     return Winner(
         trial_number=-1,
@@ -620,9 +604,7 @@ def _dry_run_phase(
         run_name=f"{experiment.experiment}-{phase.name}-DRYRUN",
         trainer_config=experiment.trainer_config,
     )
-    stand_ins = _inherited_placeholder_keys(
-        phase, inherited_winners, replaced=[*phase.fixed_overrides, *sampled]
-    )
+    stand_ins = _inherited_placeholder_keys(phase, inherited_winners)
     note = ""
     if stand_ins:
         groups = "; ".join(
