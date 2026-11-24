@@ -339,8 +339,8 @@ def test_fingerprint_changes_when_parent_winner_changes():
         pytest.param(
             {"timeout_seconds_per_trial": 60.0},
             {"timeout_seconds_per_trial": 3600.0},
-            False,
-            id="timeout_seconds_per_trial",
+            True,
+            id="timeout_seconds_per_trial_is_run_control",
         ),
         pytest.param(
             {"gpu_policy": "single_per_trial"},

@@ -13,7 +13,7 @@
 # Numeric keys accept numeric strings, reject booleans and must be finite. Bounds are inclusive, and a lower bound may not exceed its upper bound.
 # Values passed to the trainer unchanged (trainer_config, fixed_overrides, choices, repeats.values) keep their YAML type, so quote what must stay a string.
 # Every key is in the study fingerprint, which a study with trials refuses to change, except storage, workdir, observe and timeout_seconds_per_run.
-# Also outside it: execution.record_env, mlflow.poll_seconds, mlflow.timeout_seconds and the run-control keys listed under Phases.
+# Also outside it: execution.record_env, metric.name, the poll_seconds and timeout_seconds of mlflow and of every W&B extractor and gate, and the run-control keys listed under Phases.
 # Notation: a `| null = null` key may be omitted, which turns its feature off unless an Unset: line says otherwise. TitleCase types are shared blocks.
 # Environment variables PhaseSweep reads: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#environment-variables. The MCP catalog is a separate file: https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md#the-catalog.
 
@@ -67,7 +67,7 @@ metric: object (required)
 # On storage null a grid's n_trials is at most the grid size, and a fixed configuration (empty search_space, no repeats) needs n_trials 1.
 # With repeats under seeded random, n_trials is a multiple of the number of repeat values, and exactly that number when search_space is empty.
 # On persistent storage, validate, the dry run and launch refuse an n_trials above the grid size plus the study's failed attempts. A fixed configuration is a one-cell grid.
-# Run-control keys, outside the fingerprint: n_trials, comment, cost_key, n_jobs, gpu_ids, gpu_devices, max_consecutive_failures, timeout_seconds_per_phase, allow_*.
+# Run-control keys, outside the fingerprint: n_trials, comment, cost_key, n_jobs, gpu_ids, gpu_devices, max_consecutive_failures, timeout_seconds_per_phase, timeout_seconds_per_trial, allow_*.
 # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#phase-composition
 
 # Ordered list of phase objects, at least one.
@@ -258,7 +258,7 @@ phases: list[object] (required)
     # Wallclock limit for one trainer process, in seconds, > 0. null means no limit.
     # Its clock starts at the supervised launch, after the GPU lease is held, so it excludes the lease wait and the evidence reads.
     # A trainer it kills fails the attempt. A trainer that a phase or run deadline stops first is interrupted instead, and it reruns.
-    # Unlike timeout_seconds_per_phase, this key is part of the phase's study identity: changing it after the phase has trials is refused as a changed study, so give the phase, and each phase that inherits it, a new `name`, updating every `inherits` to match, to run it under another value.
+    # Changing it continues a populated study; a grid cell or fixed configuration that timed out retries in its own trial directory when n_trials is raised.
     # Requires: phases[].allow_unbounded_trials true for null.
     timeout_seconds_per_trial: float | null = 259200.0
 

@@ -521,7 +521,6 @@ def _judge_recorded_phase(
     :return _PhaseResume | Winner: The validated state, or the winner an
         accepted partial-timeout decision replays.
     """
-    dependents = experiment.phases_inheriting(phase.name)
     _validate_trial_target(study, phase)
     partial_decision = _load_accepted_partial_decision(study)
     if _at_accepted_partial_target(partial_decision, phase):
@@ -555,7 +554,7 @@ def _judge_recorded_phase(
             ) from exc
     # A later success or a lowered failure limit does not clear a recorded abort. A live run's
     # preflight confirms cleanup before this point; a dry run cannot.
-    refusal = _phase_refusal(phase, study, policy_state, dependents=dependents)
+    refusal = _phase_refusal(phase, study, policy_state)
     if refusal is not None:
         raise refusal
     active_abort = policy_state.abort
@@ -1453,9 +1452,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         assert abort is not None  # an aborted run recorded its abort with the tripping outcome
         # Without storage there is no study to continue, so the whole run starts again.
         advice = (
-            _recovery_advice(
-                phase, study, abort, dependents=experiment.phases_inheriting(phase.name)
-            )
+            _recovery_advice(phase, study, abort)
             if experiment.persistent
             else ABORT_START_AGAIN_STEP
         )

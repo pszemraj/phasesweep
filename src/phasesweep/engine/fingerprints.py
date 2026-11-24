@@ -13,6 +13,7 @@ from typing import Any
 
 import optuna
 
+from phasesweep.config.common import TRACKER_READ_CONTROLS
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.growth import _GrowthVerdict, _search_space_growth, describe_gains
@@ -38,7 +39,8 @@ log = logging.getLogger(__name__)
 
 _RUN_CONTROL_KEYS = frozenset(
     {
-        # Run-control settings do not change trial semantics and stay outside fingerprints.
+        # Run-control settings bound or pace a run without changing what a finished trial
+        # measured, so they stay outside fingerprints and changing one continues the study.
         "n_trials",
         "n_jobs",
         "gpu_ids",
@@ -49,13 +51,16 @@ _RUN_CONTROL_KEYS = frozenset(
         "cost_key",
         "allow_unbounded_trials",
         "timeout_seconds_per_phase",
+        "timeout_seconds_per_trial",
         "allow_incomplete_on_timeout",
         "allow_partial_grid",
     }
 )
+#: Where W&B read controls sit inside a dumped phase: a summary-presence gate carries them.
+_PHASE_READ_CONTROLS = {"gates": {"__all__": set(TRACKER_READ_CONTROLS)}}
 # Increment the schema versions when their fingerprint payloads change.
-FINGERPRINT_SCHEMA_VERSION = 8
-EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 6
+FINGERPRINT_SCHEMA_VERSION = 9
+EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 7
 
 
 def _execution_identity(experiment: Experiment) -> dict[str, Any]:
@@ -88,10 +93,14 @@ def _semantic_payload_digest(payload: object) -> str:
 def _semantic_core(experiment: Experiment) -> dict[str, Any]:
     """Return the experiment-level fields both semantic fingerprints hash.
 
+    The metric's name only labels output, since every extractor reads by its own key, and a
+    tracker's read controls only bound the read, so neither is part of either identity.
+
     :param Experiment experiment: Experiment whose command, trainer input,
         environment, execution, provenance, metric, and constraints are read.
     :return dict[str, Any]: JSON-serializable payload fragment.
     """
+    extractor_exclude = {"extractor": set(TRACKER_READ_CONTROLS)}
     return {
         "trial_command": experiment.trial_command,
         "trainer_config": experiment.trainer_config,
@@ -99,8 +108,12 @@ def _semantic_core(experiment: Experiment) -> dict[str, Any]:
         "env": dict(sorted(experiment.env.items())),
         "execution": _execution_identity(experiment),
         "provenance": dict(sorted(experiment.provenance.items())),
-        "metric": experiment.metric.model_dump(mode="json"),
-        "constraints": [c.model_dump(mode="json") for c in experiment.constraints],
+        "metric": experiment.metric.model_dump(
+            mode="json", exclude={"name": True, **extractor_exclude}
+        ),
+        "constraints": [
+            c.model_dump(mode="json", exclude=extractor_exclude) for c in experiment.constraints
+        ],
         **(
             {"mlflow": experiment.mlflow.evidence_identity()}
             if experiment.mlflow is not None
@@ -159,7 +172,11 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     :param Phase phase: Phase whose semantic payload is being built.
     :return dict[str, Any]: JSON-serializable semantic phase payload.
     """
-    dump = {k: v for k, v in phase.model_dump(mode="json").items() if k not in _RUN_CONTROL_KEYS}
+    dump = {
+        k: v
+        for k, v in phase.model_dump(mode="json", exclude=_PHASE_READ_CONTROLS).items()
+        if k not in _RUN_CONTROL_KEYS
+    }
     if phase.gpu_policy == "whole_node":
         tokens = phase.gpu_ids if phase.gpu_ids is not None else phase.gpu_devices
         # Only macOS permits a discovered whole-node pool: one MPS device on

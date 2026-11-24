@@ -521,16 +521,10 @@ def test_crashed_trials_remedy_names_the_next_attempt_budget(
         assert "raise" not in remedy
 
 
-def _crashed_remedy(
-    tmp_path: Path, phase: Phase, reasons: list[str | None], *, inheriting: Phase | None = None
-) -> str:
-    """Return the remedy a persistent experiment gives when every trial of ``phase`` failed.
-
-    :param Phase | None inheriting: A later phase that inherits ``phase``, if the experiment has one.
-    """
-    phases = [phase] if inheriting is None else [phase, inheriting]
+def _crashed_remedy(tmp_path: Path, phase: Phase, reasons: list[str | None]) -> str:
+    """Return the remedy a persistent experiment gives when every trial of ``phase`` failed."""
     return no_winner_remedy(
-        make_experiment(persistent=tmp_path, phases=phases),
+        make_experiment(persistent=tmp_path, phases=[phase]),
         reasons,
         phase_name=phase.name,
         grid=phase.sampler.type == "grid",
@@ -602,7 +596,7 @@ def test_a_no_winner_remedy_names_the_phase_directory_it_sends_the_operator_to(
 def test_a_failure_that_was_not_a_timeout_says_nothing_about_the_timeout(
     tmp_path: Path,
 ) -> None:
-    """Raising the timeout in place is refused with its own rename step, so a plain crash does not mention it."""
+    """A plain crash's remedy does not mention the per-trial timeout."""
     phase = _sampled_phase(Sampler(type="random", seed=0))
 
     remedy = _crashed_remedy(tmp_path, phase, ["non-zero exit code 1", None])
@@ -611,39 +605,18 @@ def test_a_failure_that_was_not_a_timeout_says_nothing_about_the_timeout(
     assert "timeout" not in remedy
 
 
-@pytest.mark.parametrize(
-    ("child", "rename"),
-    [
-        pytest.param(
-            None, "give `p` a new `name`, which runs it again from scratch", id="no-dependents"
-        ),
-        pytest.param(
-            Phase(
-                name="q",
-                n_trials=2,
-                inherits=["p"],
-                sampler=Sampler(type="random", seed=0),
-                search_space={"y": FloatParam(type="float", low=0.1, high=1.0)},
-            ),
-            "give `p` and `q` new names and update the `inherits` that name them, which runs "
-            "them again from scratch",
-            id="one-dependent",
-        ),
-    ],
-)
-def test_a_timed_out_phase_is_told_to_rename_it_and_the_phases_that_inherit_it(
-    tmp_path: Path, child: Phase | None, rename: str
-) -> None:
-    """A recorded per-trial timeout leads the remedy: raising it needs a new name for the phase and each dependent."""
+def test_a_timed_out_phase_is_told_to_raise_its_timeout_and_continue(tmp_path: Path) -> None:
+    """A recorded per-trial timeout leads the remedy with the raised timeout, which continues the study, and names no rename."""
     phase = _sampled_phase(Sampler(type="random", seed=0))
     timeout = f"{TIMEOUT_REASON_PREFIX}5.0s"
 
-    remedy = _crashed_remedy(tmp_path, phase, [timeout, timeout], inheriting=child)
+    remedy = _crashed_remedy(tmp_path, phase, [timeout, timeout])
 
     assert (
-        f"For the timed-out trials, raise phases[p].timeout_seconds_per_trial and {rename}. "
-        "For any other failure, fix it, then raise phases[p].n_trials above 2"
+        "Raise phases[p].timeout_seconds_per_trial for the timed-out trials and fix any other "
+        "failure, then raise phases[p].n_trials above 2"
     ) in remedy
+    assert "new `name`" not in remedy
 
 
 @pytest.mark.parametrize(

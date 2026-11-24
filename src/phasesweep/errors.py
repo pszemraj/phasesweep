@@ -161,20 +161,17 @@ def rename_step(names: Sequence[str]) -> str:
     )
 
 
-def timeout_step(phase_name: str, dependents: Sequence[str]) -> str:
+def timeout_step(phase_name: str) -> str:
     """Say how to give a phase whose trials timed out a longer per-trial timeout.
 
-    The timeout is part of the phase's study identity, so a raised value is refused over the
-    recorded trials; a new phase name is the step that loses the least work.
+    The timeout bounds a run without changing what a trial measures, so a raised value
+    continues the study, and a retried trial resumes in its own trial directory.
 
     :param str phase_name: Phase whose trials timed out.
-    :param Sequence[str] dependents: The phases that inherit it.
-    :return str: The operator's step, one sentence.
+    :return str: The clause a step leads with, such as ``Raise
+        phases[p].timeout_seconds_per_trial for the timed-out trials``.
     """
-    return (
-        f"For the timed-out trials, raise phases[{phase_name}].timeout_seconds_per_trial and "
-        f"{rename_step([phase_name, *dependents])}."
-    )
+    return f"Raise phases[{phase_name}].timeout_seconds_per_trial for the timed-out trials"
 
 
 def unreadable_objective_step(*, persistent: bool) -> str:

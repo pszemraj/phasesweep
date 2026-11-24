@@ -25,6 +25,11 @@ SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 #: being loaded. Relative path fields resolve against it.
 CONFIG_DIR_CONTEXT = "config_dir"
 
+#: Fields of a W&B or MLflow source that bound or pace PhaseSweep's read of it and never change
+#: what it reads, so no study or extractor identity holds them; ``MlflowSettings.evidence_identity``
+#: leaves out the same two.
+TRACKER_READ_CONTROLS = frozenset({"poll_seconds", "timeout_seconds"})
+
 
 def _normalize_http_endpoint(parsed: SplitResult) -> str | None:
     """Normalize an HTTP(S) endpoint, or return None when invalid.

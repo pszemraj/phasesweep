@@ -943,9 +943,7 @@ def _raised_target_step(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]
     return f"{raise_to} {' and '.join(actions)}."
 
 
-def _recovery_advice(
-    phase: Phase, study: optuna.Study, abort: Mapping[str, object], *, dependents: Sequence[str]
-) -> str | None:
+def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, object]) -> str | None:
     """Say how to continue a phase whose study recorded ``abort``, or that nothing can.
 
     Recovery messages take their advice from here, and :func:`_recovery_action` routes it.
@@ -956,7 +954,6 @@ def _recovery_advice(
     :param Phase phase: Phase that aborted.
     :param optuna.Study study: The phase's study.
     :param Mapping[str, object] abort: The recorded abort.
-    :param Sequence[str] dependents: The phases that inherit ``phase``, named by the timeout step.
     :return str | None: The advice, or ``None`` when no remedy or explanation applies.
     """
     if _streak_trials_all_infeasible(study, _load_phase_policy_state(study)):
@@ -968,23 +965,20 @@ def _recovery_advice(
             f"those, {FRESH_STUDY}. {remedies}"
         )
     trials = study.get_trials(deepcopy=False)
-    timeout_lead = (
-        f"{timeout_step(phase.name, dependents)} " if _any_trial_timed_out(trials) else ""
-    )
     objective_lead = (
         f"{unreadable_objective_step(persistent=True)} "
         if _any_objective_unreadable(trials)
         else ""
     )
-    remedies = _recovery_remedies(
-        phase,
-        study,
-        abort,
-        lead_in="For any other cause, fix it, then " if timeout_lead else "Fix the cause, then ",
+    lead_in = (
+        f"{timeout_step(phase.name)} and fix any other cause, then "
+        if _any_trial_timed_out(trials)
+        else "Fix the cause, then "
     )
+    remedies = _recovery_remedies(phase, study, abort, lead_in=lead_in)
     if remedies is None:
         return None
-    return f"{timeout_lead}{objective_lead}{remedies}"
+    return f"{objective_lead}{remedies}"
 
 
 def _recovery_remedies(

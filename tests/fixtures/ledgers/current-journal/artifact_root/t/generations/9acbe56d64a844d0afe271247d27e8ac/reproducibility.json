@@ -1,17 +1,17 @@
 {
   "code_revision": null,
-  "config_fingerprint": "510eb146e62737707cbf637293fedb6a7f213d3715b3bada974b7f90d629f027",
+  "config_fingerprint": "d766c1c44c2964d2af7fdc9599adce0e764fae06dafc68828c6d5c40801b4fc4",
   "config_snapshot": {
     "path": "config.snapshot.yaml",
-    "sha256": "66ca9aa184e8b9780c9695fcc9db655dba75f6b5117ab47144878daca599fc69"
+    "sha256": "e081d50b1713acd022ae4d571007046ee5cdf2dd71f01002a56c1777d7395ecd"
   },
   "experiment": "t",
-  "generation_id": "823933234eff4102a560dcc0c4b9ad07",
+  "generation_id": "9acbe56d64a844d0afe271247d27e8ac",
   "generation_id_source": "engine",
   "phase_config_fingerprints": [
     {
       "name": "p",
-      "sha256": "c82c27b1264b827eeb8c503d921b136963075a34a1983d5a82f010dee08b70d2"
+      "sha256": "d73bde9d4d9e0cfbcb57053d058f0ac4b2302bb797f099c58048c714a215dcff"
     }
   ],
   "phasesweep_version": "0.3.15",
@@ -20,10 +20,10 @@
   },
   "schema_version": 3,
   "schema_versions": {
-    "experiment_fingerprint": 6,
+    "experiment_fingerprint": 7,
     "generation_summary": 7,
-    "phase_fingerprint": 8,
+    "phase_fingerprint": 9,
     "reproducibility": 3,
-    "study_storage": 14
+    "study_storage": 15
   }
 }

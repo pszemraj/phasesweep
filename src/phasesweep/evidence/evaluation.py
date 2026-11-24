@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from phasesweep.config.common import TRACKER_READ_CONTROLS
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence.baseline import (
     EVIDENCE_BASELINE_FILE,
@@ -68,7 +69,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # Objective-evidence provenance schema version.
-EVIDENCE_PROVENANCE_SCHEMA_VERSION = 4
+EVIDENCE_PROVENANCE_SCHEMA_VERSION = 5
 # Log-regex evaluation revision included in the extractor contract.
 LOG_REGEX_EVALUATION_REVISION = 3
 
@@ -76,11 +77,13 @@ LOG_REGEX_EVALUATION_REVISION = 3
 def extractor_config_fingerprint(cfg: ObjectiveExtractor) -> str:
     """Hash the extractor configuration and applicable evaluation revision.
 
+    A tracker's read controls bound how long the read waits, not what it reads, so they stay out.
+
     :param ObjectiveExtractor cfg: Concrete extractor config to fingerprint.
-    :return str: Hex SHA-256 of the canonical configuration and, for log-regex,
-        its evaluation revision.
+    :return str: Hex SHA-256 of the canonical configuration without its tracker read controls
+        and, for log-regex, its evaluation revision.
     """
-    payload = cfg.model_dump(mode="json")
+    payload = cfg.model_dump(mode="json", exclude=set(TRACKER_READ_CONTROLS))
     if isinstance(cfg, LogRegexExtractor):
         payload["evaluation_revision"] = LOG_REGEX_EVALUATION_REVISION
     dumped = json.dumps(payload, sort_keys=True, separators=(",", ":"))

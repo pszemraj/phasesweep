@@ -998,10 +998,10 @@ def test_timeout_remedy_matches_storage_and_budget(
 
 
 @pytest.mark.integration
-def test_a_per_trial_timeout_abort_names_the_rename_that_the_raised_timeout_needs(
+def test_a_per_trial_timeout_abort_advises_the_raised_timeout_that_continues_the_study(
     tmp_path: Path,
 ) -> None:
-    """The supervisor's recorded timeout leads the abort advice, and that advice's rename runs."""
+    """The supervisor's recorded timeout leads the abort advice, and following it continues the study with its trials kept."""
     trainer = write_trainer(
         tmp_path,
         """
@@ -1016,29 +1016,31 @@ def test_a_per_trial_timeout_abort_names_the_rename_that_the_raised_timeout_need
         """,
     )
 
-    def phase(name: str, timeout: float) -> Phase:
+    def phase(n_trials: int, timeout: float) -> Phase:
         return Phase(
-            name=name,
-            n_trials=2,
+            name="p",
+            n_trials=n_trials,
             max_consecutive_failures=2,
             timeout_seconds_per_trial=timeout,
             sampler=Sampler(type="random", seed=0),
             search_space={"x": IntParam(type="int", low=0, high=10)},
         )
 
-    short = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase("p", 0.5)])
+    short = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase(2, 0.5)])
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(short)
     message = _operational_error_text(aborted.value)
-    assert message.index(
-        "For the timed-out trials, raise phases[p].timeout_seconds_per_trial and give `p` a new "
-        "`name`, which runs it again from scratch."
-    ) < message.index("For any other cause, fix it, then raise phases[p].n_trials")
+    assert (
+        "Raise phases[p].timeout_seconds_per_trial for the timed-out trials and fix any other "
+        "cause, then raise phases[p].n_trials"
+    ) in message
+    assert "new `name`" not in message
 
-    raised = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase("p", 5.0)])
-    with pytest.raises(PhaseSweepError, match=r"phase\.timeout_seconds_per_trial: 0\.5 -> 5\.0"):
-        run_experiment(raised, dry_run=True)
-
-    renamed = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase("p2", 5.0)])
-    run_experiment(renamed)
-    assert [trial.state.name for trial in phase_trials(renamed, "p2")] == ["COMPLETE", "COMPLETE"]
+    raised = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase(4, 5.0)])
+    run_experiment(raised)
+    assert [trial.state.name for trial in phase_trials(raised, "p")] == [
+        "FAIL",
+        "FAIL",
+        "COMPLETE",
+        "COMPLETE",
+    ]

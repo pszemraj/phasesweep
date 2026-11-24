@@ -12,7 +12,6 @@ import pytest
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import ExecutionContext, Experiment, Phase
-from phasesweep.config.reference import lookup
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.artifact_roots import (
     _check_artifact_root_binding,
@@ -417,17 +416,12 @@ def test_a_changed_inherited_winner_sends_the_dependent_to_a_new_name_not_a_new_
 
 
 def test_the_rename_step_is_worded_once_and_names_every_phase_it_is_given() -> None:
-    """Every site that offers the rename builds it here, and the reference's timeout entry says it with no phase named."""
+    """Every site that offers the rename builds it here."""
     assert rename_step(("p",)) == "give `p` a new `name`, which runs it again from scratch"
     assert rename_step(("p", "q", "r")) == (
         "give `p`, `q` and `r` new names and update the `inherits` that name them, which runs "
         "them again from scratch"
     )
-    (timeout,) = lookup("phases[].timeout_seconds_per_trial")
-    assert (
-        "give the phase, and each phase that inherits it, a new `name`, updating every "
-        "`inherits` to match, to run it under another value."
-    ) in " ".join(timeout.comments)
 
 
 def test_long_values_are_windowed_around_their_first_difference() -> None:

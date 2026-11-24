@@ -1171,12 +1171,9 @@ class UnpublishedWinnerStep:
     fix: str
 
 
-def _status_phase_refusal(
-    experiment: Experiment, phase: Phase, study: optuna.Study
-) -> PhaseAbortRefusedError | None:
+def _status_phase_refusal(phase: Phase, study: optuna.Study) -> PhaseAbortRefusedError | None:
     """Give status the failure-policy refusal when a partial decision does not take precedence.
 
-    :param Experiment experiment: Current configuration, which identifies dependent phases.
     :param Phase phase: Phase whose target and failure limit apply.
     :param optuna.Study study: Read-only phase study containing the recorded decisions.
     :return PhaseAbortRefusedError | None: Failure-policy refusal to report, if any.
@@ -1184,12 +1181,7 @@ def _status_phase_refusal(
     policy = _load_phase_policy_state(study)
     if _at_accepted_partial_target(_load_accepted_partial_decision(study), phase):
         return None
-    return _phase_refusal(
-        phase,
-        study,
-        policy,
-        dependents=experiment.phases_inheriting(phase.name),
-    )
+    return _phase_refusal(phase, study, policy)
 
 
 def phase_refusals(
@@ -1218,7 +1210,7 @@ def phase_refusals(
         if study is None:
             continue
         try:
-            refusal = _status_phase_refusal(experiment, phase, study)
+            refusal = _status_phase_refusal(phase, study)
         except StudySchemaMismatchError as exc:
             refusals[phase.name] = exc
             continue
@@ -1604,7 +1596,7 @@ def read_trial_tables(
         if study is None:
             tables.append(_trial_table(experiment, phase, [], winners.get(phase.name)))
             continue
-        refusal = _status_phase_refusal(experiment, phase, study)
+        refusal = _status_phase_refusal(phase, study)
         identity = _recorded_identity(study)
         tables.append(
             _trial_table(
