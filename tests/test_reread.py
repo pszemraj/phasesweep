@@ -15,13 +15,19 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.config.models import Constraint, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, Sampler
-from phasesweep.engine.errors import StudyFingerprintMismatchError
+from phasesweep.engine.errors import PhaseTimeoutError, StudyFingerprintMismatchError
 from phasesweep.engine.ledger import _resolve_storage, validate_ledger
 from phasesweep.engine.read import inspect_status
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import FAILURE_REASON_ATTR, TRIAL_DIR_ATTR
+from phasesweep.engine.state import FAILURE_REASON_ATTR, PHASE_DECISION_ATTR, TRIAL_DIR_ATTR
 from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
-from tests.conftest import make_experiment, study_name, write_experiment_config, write_trainer
+from tests.conftest import (
+    make_experiment,
+    record_accepted_partial_timeout,
+    study_name,
+    write_experiment_config,
+    write_trainer,
+)
 from tests.ledger_fixtures import tree_changes, tree_snapshot
 
 
@@ -195,6 +201,40 @@ def test_a_child_follows_its_re_read_parent_from_its_own_study(tmp_path: Path) -
     assert _launches(launches) == 5
     assert winners["p"].effective_overrides == {"x": 4}
     assert winners["c"].effective_overrides == {"x": 4, "y": 0}
+
+
+@pytest.mark.parametrize("measured", [0, 1])
+def test_reread_keeps_the_partial_timeout_boundary_with_the_new_measurement_count(
+    tmp_path: Path, measured: int
+) -> None:
+    """A timed-out fill replays its boundary and selects only measurements the new reader has."""
+    trainer, launches = _counting_trainer(tmp_path)
+    short = _phases()[0].model_copy(update={"n_trials": 2, "allow_partial_grid": True})
+    original = _experiment(tmp_path, trainer, _metric("loss"), phases=[short])
+    run_experiment(original)
+    source = phase_study_of(original)
+    for trial in source.get_trials()[measured:]:
+        (Path(trial.user_attrs[TRIAL_DIR_ATTR]) / "r.json").write_text('{"loss": 1}')
+    record_accepted_partial_timeout(source, 3)
+    decision = source.user_attrs[PHASE_DECISION_ATTR]
+    accepting = short.model_copy(update={"n_trials": 3, "allow_incomplete_on_timeout": True})
+    changed = _experiment(tmp_path, trainer, _metric("acc"), phases=[accepting])
+
+    for _ in range(2):
+        if measured:
+            winner = run_experiment(changed)["p"]
+            assert winner.completion["incomplete"]
+            assert winner.completion["measured_trials"] == measured
+        else:
+            with pytest.raises(PhaseTimeoutError, match="no winner can be selected"):
+                run_experiment(changed)
+
+    assert _launches(launches) == 2
+    assert phase_study_of(changed).user_attrs[PHASE_DECISION_ATTR] == {
+        **decision,
+        "measured_trials": measured,
+    }
+    assert source.user_attrs[PHASE_DECISION_ATTR]["measured_trials"] == 2
 
 
 def test_a_changed_trainer_beside_a_changed_reader_is_refused_not_retrained(

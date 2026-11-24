@@ -49,6 +49,7 @@ from phasesweep.engine.fingerprints import (
     phase_study_name,
     reading_settings,
 )
+from phasesweep.engine.optuna import _measured_trial_count
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.state import (
@@ -56,6 +57,7 @@ from phasesweep.engine.state import (
     DURATION_ATTR,
     FAILURE_REASON_ATTR,
     OVERRIDES_ATTR,
+    PHASE_DECISION_ATTR,
     PHASE_IDENTITY_ATTR,
     RETURN_CODE_ATTR,
     STUDY_SCHEMA_ATTR,
@@ -67,7 +69,7 @@ from phasesweep.engine.state import (
     _trial_lifecycle,
     _trial_outcome_payload,
 )
-from phasesweep.engine.study_policy import _initialize_study_schema
+from phasesweep.engine.study_policy import _initialize_study_schema, _load_accepted_partial_decision
 from phasesweep.engine.trial import TrialResult, _failed_trial, record_trial_result
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.evidence.baseline import read_evidence_baseline
@@ -76,8 +78,10 @@ from phasesweep.runtime.terminal import plural
 
 #: Study attributes a fill does not copy: the identity is rebuilt under the current reading
 #: settings and written last, the opener already bound the artifact root, and the schema stamp
-#: is the run's own.
-_NOT_COPIED = frozenset({PHASE_IDENTITY_ATTR, ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR})
+#: is the run's own. The partial decision's measured count is rebuilt from the re-read trials.
+_NOT_COPIED = frozenset(
+    {PHASE_DECISION_ATTR, PHASE_IDENTITY_ATTR, ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR}
+)
 #: The recorded outcomes a re-read replaces; an interruption or a fatal outcome stands as it was.
 _REREAD_OUTCOMES = frozenset({"success", "failure"})
 
@@ -320,19 +324,22 @@ def fill_study(
 
     The target is the study a run opened for the phase and records no identity: empty, or left
     part-way by a killed fill, whose trials are then the source's first ones, so the fill
-    appends the rest. The identity, the source's with the current reading settings, is written
-    last and marks the fill complete.
+    appends the rest. An accepted partial decision keeps its timeout boundary and counts the
+    trials measured under the current settings at that boundary. The identity, the source's
+    with the current reading settings, is written last and marks the fill complete.
 
     :param Experiment experiment: Current config.
     :param Phase phase: The phase.
     :param optuna.Study target: The addressed study, writable.
     :param FillSource source: The study to fill from (:func:`fill_source`).
-    :raises StudySchemaMismatchError: The target holds trials the source does not.
+    :raises StudySchemaMismatchError: The target holds trials the source does not, or the
+        source's accepted partial decision is malformed.
     :raises TrackingTargetUnavailableError: A tracker gave no answer for a finished trial.
     :return FillResult: What the fill wrote in this call.
     """
     trials = source.study.get_trials(deepcopy=False)
     present = target.get_trials(deepcopy=False)
+    partial = _load_accepted_partial_decision(source.study)
     if [(trial.number, trial.params) for trial in present] != [
         (trial.number, trial.params) for trial in trials[: len(present)]
     ]:
@@ -354,6 +361,16 @@ def fill_study(
             rereads += 1
             changed += (reread.state, reread.value) != (trial.state, trial.value)
         target.add_trial(trial if reread is None else reread)
+    if partial is not None:
+        measured = _measured_trial_count(
+            trial
+            for trial in target.get_trials(deepcopy=False)
+            if (outcome := _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR)))
+            is not None
+            and outcome.sequence <= partial.outcome_sequence
+        )
+        decision = json_object(source.study.user_attrs[PHASE_DECISION_ATTR])
+        target.set_user_attr(PHASE_DECISION_ATTR, {**decision, "measured_trials": measured})
     _stamp_identity(target, _reread_record(source.record, reading_settings(experiment, phase)))
     return FillResult(copied=len(trials) - len(present), rereads=rereads, changed=changed)
 
