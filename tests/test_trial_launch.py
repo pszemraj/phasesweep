@@ -26,11 +26,13 @@ import yaml
 from phasesweep import run_experiment
 from phasesweep.config.models import ExecutionContext, Experiment, Metric
 from phasesweep.engine.artifacts import _warn_environment_drift
+from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.paths import _attempt_dir
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FAILURE_REASON_ATTR,
+    RERUN_OF_ATTR,
     TRIAL_DIR_ATTR,
     _trial_attempt_dir,
 )
@@ -1450,10 +1452,10 @@ def test_trial_directory_and_allocated_lifecycle_precede_launch(
 
 
 @pytest.mark.integration
-def test_guardian_sigkill_fails_one_trial_and_continues_phase(
+def test_guardian_sigkill_interrupts_its_trial_which_reruns_in_place(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A killed guardian leaves its live trainer for direct cleanup and later trials still run."""
+    """A killed guardian leaves its live trainer for direct cleanup; the trial is interrupted, not failed, and reruns in its directory in the same run."""
     import phasesweep.runtime.process as process
     from phasesweep.runtime.reaper import _process_group_alive, read_stale_process_identity
 
@@ -1465,7 +1467,9 @@ def test_guardian_sigkill_fails_one_trial_and_continues_phase(
         parser = argparse.ArgumentParser()
         parser.add_argument("--out", required=True)
         args, _ = parser.parse_known_args()
-        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+        marker = Path(os.environ["PHASESWEEP_TRIAL_DIR"]) / "guardian-killed"
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0" and not marker.exists():
+            marker.touch()
             signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
             Path(args.out).write_text(json.dumps({"x": 0.25}))
             os.kill(os.getppid(), signal.SIGKILL)
@@ -1497,6 +1501,7 @@ def test_guardian_sigkill_fails_one_trial_and_continues_phase(
         cancel_signal: int = signal.SIGTERM,
     ) -> dict[int, bool]:
         assert guardians is None
+        assert not cleaned, "only the first attempt loses its guardian"
         first = phase_study(experiment).trials[0]
         attempt_dir = _trial_attempt_dir(first)
         attempt = first.user_attrs[ATTEMPT_ID_ATTR]
@@ -1521,9 +1526,14 @@ def test_guardian_sigkill_fails_one_trial_and_continues_phase(
                 if _process_group_alive(identity.pgid):
                     real_terminate((identity.pgid,), grace_seconds=0.05)
 
-    first, second = phase_study(experiment).trials
-    assert [first.state.name, second.state.name] == ["FAIL", "COMPLETE"]
-    assert winners["p"].trial_number == second.number
+    first, second, rerun = phase_study(experiment).trials
+    assert [_trial_count_state(t) for t in (first, second, rerun)] == [
+        "INTERRUPTED",
+        "COMPLETE",
+        "COMPLETE",
+    ]
+    assert rerun.user_attrs[RERUN_OF_ATTR] == first.number
+    assert rerun.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
     assert winners["p"].metric == 0.5
     assert len(cleaned) == 1 and not _process_group_alive(cleaned[0])
     first_attempt_dir = _trial_attempt_dir(first)

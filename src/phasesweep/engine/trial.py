@@ -81,8 +81,11 @@ from phasesweep.runtime.process import (
 
 log = logging.getLogger("phasesweep.engine.trial")
 
+# Endings in which PhaseSweep stopped a running trainer: by cancelling it, or after its guardian
+# died, when the trainer's own ending is unknown and PhaseSweep terminates what is left of it.
+_STOPPED_BY_PHASESWEEP: frozenset[AttemptEnd] = frozenset({"cancelled", "guardian_lost"})
 # Endings that leave the trial interrupted: PhaseSweep stopped the trainer, or it never ran.
-_STOPPED_OR_NEVER_STARTED: frozenset[AttemptEnd] = frozenset({"cancelled", "not_started"})
+_STOPPED_OR_NEVER_STARTED: frozenset[AttemptEnd] = _STOPPED_BY_PHASESWEEP | {"not_started"}
 
 
 @dataclass
@@ -473,7 +476,10 @@ def _trainer_failure_reason(
     """Return the failure a trainer's own ending earned, for a trial PhaseSweep did not finish.
 
     A trainer that crashed keeps its crash whether a shutdown lands right after it or the
-    runner dies before recording it; one PhaseSweep stopped or never started is interrupted.
+    runner dies before recording it; one PhaseSweep stopped or never started is interrupted,
+    and so is one whose lease guardian died, since the trainer's own ending is then unknown
+    and PhaseSweep terminates what is left of it. A trainer that exited by itself before that
+    has the guardian's ``trainer`` verdict, so its return code still decides.
     A kill PhaseSweep did not send is the trainer's own ending: the OOM killer cannot be told
     from a person, and calling it an interruption would rerun a configuration that OOMs every
     time. The ledger's trainer exit attributes outrank the lifecycle record, whose process slot
@@ -501,8 +507,6 @@ def _trainer_failure_reason(
     elif ended_by == "timed_out":
         # The live timeout names its budget in seconds, which no attempt record keeps.
         return f"{TIMEOUT_REASON_PREFIX}the phase's timeout_seconds_per_trial"
-    elif ended_by == "guardian_lost":
-        return "the lease guardian exited without recording how the trainer ended"
     else:
         return None
     if return_code == 0:

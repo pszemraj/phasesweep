@@ -108,6 +108,7 @@ from phasesweep.engine.study_policy import (
     _validate_trial_target,
 )
 from phasesweep.engine.trial import (
+    _STOPPED_BY_PHASESWEEP,
     EnvironmentIdentity,
     TrialExecutionError,
     _trainer_failure_reason,
@@ -140,6 +141,7 @@ from phasesweep.runtime.shutdown import (
     servicing_shutdown_signal,
     shutdown_raised_over,
 )
+from phasesweep.runtime.terminal import plural
 
 if TYPE_CHECKING:
     from phasesweep.tracking.session import DeliveryTally
@@ -1166,6 +1168,18 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
 
     # Extraction releases the GPU but still consumes the phase/run budget.
     check_shutdown_after_trainer_exit()
+    if not executed.process.timed_out:
+        # A trainer PhaseSweep stopped outside a shutdown, as after its guardian died, is
+        # interrupted by the rule recovery applies (_trainer_failure_reason), and reruns in
+        # its directory. A deadline cap is a timeout, which the extraction below reports.
+        try:
+            lifecycle = _trial_lifecycle(trial)
+        except ValueError:
+            lifecycle = None
+        if lifecycle is not None and lifecycle.ended_by in _STOPPED_BY_PHASESWEEP:
+            raise _InterruptedTrialError(
+                executed.process.failure_reason or "PhaseSweep stopped the trainer"
+            )
     try:
         result = extract_trial_result(
             experiment=experiment,
@@ -1477,6 +1491,19 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         and not accepted_partial_timeout
         and not timed_out_incomplete
     ):
+        interrupted = _pending_rerun_count(study)
+        if interrupted:
+            # A pass whose every trial PhaseSweep stopped finished none, so the run stops
+            # rather than rerun them without end; the next run reruns them in place.
+            raise PhaseSweepError(
+                f"Phase {phase.name!r} stopped after {finished_after}/{phase.n_trials} "
+                f"finished trials with {plural(interrupted, 'interrupted trial')} left to rerun.",
+                action=OperatorAction.RETRY,
+                remediation=(
+                    f"Inspect {_phase_dir(experiment, phase.name) / 'attempts'} and run.log, "
+                    "then run the same command again; the interrupted trials rerun in place."
+                ),
+            )
         raise RuntimeError(
             f"Phase {phase.name!r} stopped after {finished_after}/{phase.n_trials} "
             "finished trials without an accepted timeout; refusing to publish "
@@ -1685,17 +1712,41 @@ def _run_phase(
                 trainer_environment=environment_identity.digest,
             )
             # WAITING reruns precede new draws and share the allocation context.
-            _log_reruns(experiment, phase, study, _record_reruns(study, phase))
+            reruns = _record_reruns(study, phase)
+            timeout = budget.timeout
             try:
-                study.optimize(
-                    functools.partial(_objective, run),
-                    n_trials=remaining,
-                    n_jobs=phase.n_jobs,
-                    timeout=budget.timeout,
-                    gc_after_trial=True,
-                    callbacks=[functools.partial(_after_trial, run)],
-                    catch=(TrialExecutionError,),
-                )
+                while True:
+                    _log_reruns(experiment, phase, study, reruns)
+                    finished_before = _finished_trial_count(study.get_trials(deepcopy=False))
+                    study.optimize(
+                        functools.partial(_objective, run),
+                        n_trials=remaining,
+                        n_jobs=phase.n_jobs,
+                        timeout=timeout,
+                        gc_after_trial=True,
+                        callbacks=[functools.partial(_after_trial, run)],
+                        catch=(TrialExecutionError,),
+                    )
+                    # A trainer PhaseSweep stopped while the run went on, as after its guardian
+                    # died, is interrupted; it reruns in its directory in this invocation while
+                    # each pass still finishes trials, and otherwise in the next one.
+                    finished_after = _finished_trial_count(study.get_trials(deepcopy=False))
+                    remaining = phase.n_trials - finished_after
+                    if (
+                        remaining <= 0
+                        or finished_after == finished_before
+                        or run.aborted
+                        or run.deadline_exhausted
+                        or run.fatal_error is not None
+                    ):
+                        break
+                    if budget.deadline is not None:
+                        timeout = budget.deadline - time.monotonic()
+                        if timeout <= 0:
+                            break
+                    reruns = _record_reruns(study)
+                    if not reruns:
+                        break
             except BaseException as exc:
                 # Drain workers before run reconciliation can reap their trials.
                 if phase.n_jobs > 1:
