@@ -244,7 +244,7 @@ phases: list[object] (required)
 
     # ---------- Phase limits ----------
     # The earliest of the per-trial, phase and run deadlines ends the work it covers. Cleanup and publication can run past a deadline.
-    # A failure a deadline causes, such as an evidence read cut short, records the attempt as interrupted, which counts toward neither n_trials nor the streak.
+    # A failure a deadline causes records the attempt as interrupted, which counts toward neither n_trials nor the streak. An evidence read it cuts short after the trainer exited 0 leaves the trial pending under persistent storage, and the next run extracts it without retraining.
     # When a deadline and a failure-streak abort stop the same phase short of n_trials, the deadline decides the outcome and the abort is retired.
     # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation
 

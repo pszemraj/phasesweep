@@ -1206,6 +1206,22 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     if result.deadline_exhausted:
         # Only a deadline-caused failure counts as a timeout.
         run.stop_for_deadline()
+        if experiment.persistent and _completed_trainer_duration(trial, None) is not None:
+            # Finished training that the deadline kept from being read stays pending, as after
+            # a tracker outage: no outcome is recorded, so the run stops before any partial
+            # decision freezes the phase's counts, and recovery extracts it on the next run.
+            _warn_deferred_extraction(attempt_id, phase.name, trial.number, persistent=True)
+            left_running = _TrialLeftRunning(
+                phase_timeout(
+                    f"Phase {phase.name!r} timed out via {run.timeout_source or 'wallclock'} "
+                    f"guard while reading the evidence of trial {trial.number}, which finished "
+                    "training.",
+                    scope=run.timeout_source,
+                    experiment=experiment,
+                )
+            )
+            run.record_fatal(left_running)
+            raise left_running
 
     with _persist_trial_evidence(run, trial):
         record_trial_result(

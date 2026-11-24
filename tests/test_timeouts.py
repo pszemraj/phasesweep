@@ -26,6 +26,9 @@ from phasesweep.engine.state import PHASE_DECISION_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
 from phasesweep.errors import ACCEPT_INCOMPLETE_STEP, PhaseSweepError
+from phasesweep.evidence.evaluation import TrialContext
+from phasesweep.evidence.models import ObjectiveExtractor
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import ProcessResult
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
@@ -35,6 +38,7 @@ from tests.conftest import (
     phase_study,
     phase_trials,
     write_constant_trainer,
+    write_flaky_trainer,
     write_trainer,
     write_trial_zero_trainer,
 )
@@ -970,6 +974,52 @@ def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
 
     assert elapsed < 20.0
     assert not _last_successful_generation_path(exp).exists()
+
+
+@pytest.mark.integration
+def test_a_deadline_during_a_finished_trainers_evidence_read_keeps_its_training(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A phase deadline that cuts the evidence read of a trainer that exited 0 stops the run as a timeout with the trial pending, and the trainer never runs again."""
+    trainer, calls = write_flaky_trainer(tmp_path, failures=0)
+
+    def phase(timeout: float) -> Phase:
+        return Phase(
+            name="p",
+            n_trials=1,
+            timeout_seconds_per_phase=timeout,
+            sampler=Sampler(type="random", seed=0),
+            search_space={"x": IntParam(type="int", low=0, high=10)},
+        )
+
+    import phasesweep.engine.trial as trial_mod
+
+    real_extractor = trial_mod.run_extractor
+    slowed: list[None] = []
+
+    def slow_once(
+        ctx: TrialContext,
+        cfg: ObjectiveExtractor,
+        *,
+        deadline: float | None = None,
+        provenance: JsonObject | None = None,
+    ) -> float:
+        if not slowed:
+            slowed.append(None)
+            time.sleep(1.5)
+        return real_extractor(ctx, cfg, deadline=deadline, provenance=provenance)
+
+    monkeypatch.setattr("phasesweep.engine.trial.run_extractor", slow_once)
+    short = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase(0.5)])
+    with pytest.raises(TimeoutError, match="while reading the evidence of trial 0, which finished"):
+        run_experiment(short)
+    assert len(calls.read_text().splitlines()) == 1
+
+    roomy = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase(60.0)])
+    winners = run_experiment(roomy)
+    assert winners["p"].trial_number == 0
+    assert [t.state.name for t in phase_trials(roomy)] == ["COMPLETE"]
+    assert len(calls.read_text().splitlines()) == 1
 
 
 @pytest.mark.parametrize("persistent", [False, True], ids=["memory", "persistent"])
