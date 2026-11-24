@@ -34,8 +34,18 @@ from phasesweep.engine.errors import (
     phase_timeout,
     tracker_unreadable,
 )
-from phasesweep.engine.evidence import _earlier_attempts, _verify_winner_evidence
-from phasesweep.engine.fingerprints import _inherited_override_suppliers, _verify_fingerprint
+from phasesweep.engine.evidence import (
+    _earlier_attempts,
+    _validate_selection_evidence,
+    _verify_winner_evidence,
+)
+from phasesweep.engine.fingerprints import (
+    _inherited_override_payload,
+    _inherited_override_suppliers,
+    _verify_fingerprint,
+    new_study_note,
+    phase_study_name,
+)
 from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.ledger import ClaimedLedger, open_phase_study
 from phasesweep.engine.optuna import (
@@ -1595,6 +1605,8 @@ def _run_phase(
 ) -> Winner:
     """Execute one phase end-to-end (sampler, study.optimize, winner selection).
 
+    Opens the study the parents' winners address (:func:`phase_study_name`), saying so when
+    it starts a new one beside the phase's other studies, which stay as they are.
     Validates the phase's durable state (:func:`_resume_phase`), runs Optuna's
     optimize loop with every worker sharing one :class:`_PhaseExecution`, and
     turns how that loop ended into the phase's winner or refusal
@@ -1640,10 +1652,29 @@ def _run_phase(
         abort, or exception, which violates the runner invariant.
     :return Winner: The selected phase winner.
     """
+    inherited = _inherited_override_payload(phase, inherited_winners)
+    study_name = phase_study_name(experiment, phase, inherited)
+    others = [
+        other for other in ledger.studies.get(phase.name, ()) if other.study_name != study_name
+    ]
     # The live opener also claims a newly created study's publication root,
     # before any inspection, reaping, or trial work below can run against it.
-    study = open_phase_study(ledger, phase)
+    study = open_phase_study(ledger, phase, study_name)
+    if not study.get_trials(deepcopy=False):
+        note = new_study_note(phase, inherited, others)
+        if note is not None:
+            report.info("%s  %s", phase.name, note)
     resumed = _resume_phase(experiment, phase, inherited_winners, study)
+    if phase.inherits:
+        # Its study was unknown before the run selected its parents' winners.
+        _validate_selection_evidence(experiment, {phase.name: study})
+    if others:
+        # Recovery refreshes trials.csv from each study it settles, which can leave it showing
+        # a study this run does not address. Like every trials.csv snapshot it is best-effort.
+        with contextlib.suppress(Exception):
+            _write_trials_csv(
+                study, _trials_csv_path(experiment, phase.name), repeats=repeat_axis(phase)
+            )
     if isinstance(resumed, Winner):
         return resumed
     resume = resumed

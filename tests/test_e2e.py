@@ -28,6 +28,7 @@ from tests.conftest import (
     REPO,
     copy_fake_train,
     make_experiment,
+    phase_study,
     write_constant_trainer,
     write_trainer,
 )
@@ -159,7 +160,7 @@ def test_bound_topup_survives_child_preflight_failure_with_empty_fingerprinted_s
     ):
         run_experiment(experiment)
 
-    child_study = optuna.load_study(study_name="t::child", storage=storage)
+    child_study = phase_study(experiment, "child")
     assert child_study.get_trials(deepcopy=False) == []
     assert _recorded_identity(child_study) is not None
 
@@ -169,7 +170,7 @@ def test_bound_topup_survives_child_preflight_failure_with_empty_fingerprinted_s
     winners = run_experiment(topped_up)
 
     parent_study = optuna.load_study(study_name="t::parent", storage=storage)
-    child_study_after = optuna.load_study(study_name="t::child", storage=storage)
+    child_study_after = phase_study(topped_up, "child")
     assert len(parent_study.trials) == 2
     assert child_study_after.get_trials(deepcopy=False)
     expected_fingerprint = _phase_fingerprint(topped_up, child, {"parent": winners["parent"]})
@@ -231,7 +232,7 @@ def test_appended_phase_runs_alone_and_inherits_the_replayed_winner(tmp_path: Pa
     assert winners["later"].effective_overrides["x"] == inherited_x
     storage = _resolve_storage(both.storage)
     assert len(optuna.load_study(study_name="t::first", storage=storage).trials) == 3
-    assert len(optuna.load_study(study_name="t::later", storage=storage).trials) == 2
+    assert len(phase_study(both, "later").trials) == 2
     _, (published,) = read_result(both, phase_names=["later"])
     assert published is not None
     assert published.params == winners["later"].params

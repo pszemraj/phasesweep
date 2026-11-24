@@ -391,7 +391,9 @@ def test_each_attempt_in_a_directory_delivers_its_own_mlflow_run(
 
     run_experiment(experiment)
 
-    first, rerun = read_phase_trials(validate_ledger(experiment), "depth").trials
+    first, rerun = read_phase_trials(
+        validate_ledger(experiment), f"{experiment.experiment}::depth"
+    ).trials
     assert rerun.user_attrs[RERUN_OF_ATTR] == first.number
     assert rerun.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
     resumed = rerun.user_attrs[ATTEMPT_ID_ATTR]

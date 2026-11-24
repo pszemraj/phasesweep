@@ -10,8 +10,8 @@ from pathlib import Path
 import optuna
 import pytest
 
+from phasesweep.engine.fingerprints import phase_study_name
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.state import Winner, WinnerSource
 from phasesweep.mcp.redaction import status_payload
@@ -39,7 +39,7 @@ from tests.mcp_helpers import (
 
 def _complete_trials(experiment, *, n: int) -> None:
     study = optuna.create_study(
-        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        study_name=phase_study_name(experiment, experiment.phases[0], {}),
         storage=_resolve_storage(experiment.resolved_storage),
         direction="minimize",
     )
@@ -287,7 +287,7 @@ def test_await_run_reports_failed_trial_progress_at_timeout(
     async def sleep_then_fail_trial(seconds: float) -> None:
         clock["now"] += seconds
         study = optuna.create_study(
-            study_name=_phase_study_name(experiment, experiment.phases[0]),
+            study_name=phase_study_name(experiment, experiment.phases[0], {}),
             storage=_resolve_storage(experiment.resolved_storage),
             direction="minimize",
         )

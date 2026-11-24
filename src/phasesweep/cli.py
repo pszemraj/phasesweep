@@ -1454,7 +1454,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
         for line in _operational_error_text(refusal).splitlines():
             click.echo(f"# {line}")
     if retained and suggest_resume and not refusals:
-        step = unpublished_winner_step(config, ledger)
+        step = unpublished_winner_step(config, ledger, inspection.study_names)
         if step is not None:
             click.echo(
                 "# Winner retained but not published"

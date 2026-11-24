@@ -215,8 +215,8 @@ def test_journal_malformed_record_before_its_end_never_means_absent(
             assert not any(phase["trials"].values())
     assert status["phases"][0]["running_attempts"] is None
     with pytest.raises(StudyStorageUnavailableError):
-        engine_ledger.open_existing_study(
-            engine_ledger.validate_ledger(experiment), experiment.phases[0]
+        engine_ledger.open_existing_studies(
+            engine_ledger.validate_ledger(experiment), experiment.phases[0].name
         )
     with pytest.raises(ProcessCleanupUncertainError):
         run_experiment(experiment)
@@ -267,10 +267,10 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_is_repaired_befor
             # Nothing before the bad line: Optuna reads no study at all.
             assert not any(phase["trials"].values())
             assert phase["published_study_unavailable"] is published
-    loaded = engine_ledger.open_existing_study(
-        engine_ledger.validate_ledger(experiment), experiment.phases[0]
+    loaded = engine_ledger.open_existing_studies(
+        engine_ledger.validate_ledger(experiment), experiment.phases[0].name
     )
-    assert (loaded is not None) is keep_prefix
+    assert bool(loaded) is keep_prefix
 
     if published and not keep_prefix:
         with pytest.raises(PublishedStudyMissingError):
@@ -310,6 +310,7 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     # scanned over the partial record would report every read unavailable.
     handle = engine_ledger.validate_ledger(experiment)
     assert handle.format_verified
+    study_names = {"p": f"{experiment.experiment}::p"}
     if change == "finish-partial":
         ledger.write_bytes(complete[:-1])
     real_fstat = engine_ledger.os.fstat
@@ -327,8 +328,8 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
 
     with monkeypatch.context() as patched:
         patched.setattr(engine_ledger.os, "fstat", change_after_capture)
-        first = engine_ledger.read_trial_stats(handle, {"p": expected})["p"]
-    second = engine_ledger.read_trial_stats(handle, {"p": expected})["p"]
+        first = engine_ledger.read_trial_stats(handle, {"p": expected}, study_names)["p"]
+    second = engine_ledger.read_trial_stats(handle, {"p": expected}, study_names)["p"]
 
     # The first read sees only the bytes present when it opened the file: all
     # of them, the journal less its final newline (a partial last record,
@@ -391,7 +392,10 @@ def test_phase_reads_capture_trial_data_once_whatever_the_phase_count(
     if reader == "status":
         counts = [phase["trials"] for phase in read_status(experiment)["phases"]]
     else:
-        snapshots = engine_ledger.read_phase_studies(engine_ledger.validate_ledger(experiment))
+        snapshots = engine_ledger.read_phase_studies(
+            engine_ledger.validate_ledger(experiment),
+            {phase.name: f"capture_count::{phase.name}" for phase in phases},
+        )
         counts = []
         for snapshot in snapshots.values():
             assert snapshot is not None
@@ -603,7 +607,9 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
     )
 
     stats = engine_ledger.read_trial_stats(
-        engine_ledger.validate_ledger(experiment), {"p": expected}
+        engine_ledger.validate_ledger(experiment),
+        {"p": expected},
+        {"p": f"{experiment.experiment}::p"},
     )["p"]
 
     assert stats.available

@@ -37,7 +37,6 @@ from phasesweep.errors import (
     FRESH_STUDY,
     NEW_STUDY_STEP,
     OperatorAction,
-    rename_step,
 )
 from tests.conftest import make_experiment
 from tests.experiments import (
@@ -111,8 +110,8 @@ def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
-def test_refusal_for_an_inherited_phase_names_the_dependents_to_rename(tmp_path: Path) -> None:
-    """A changed phase that another inherits reruns by renaming both, and the fix line names the dependent."""
+def test_refusal_for_an_inherited_phase_names_only_that_phase_to_rename(tmp_path: Path) -> None:
+    """A changed phase that another inherits reruns by renaming it alone: the dependent keeps its name, since its study is found by the values the renamed phase passes it."""
     project = project_directory(tmp_path)
     fields: dict[str, object] = {
         "workdir": "runs",
@@ -132,16 +131,12 @@ def test_refusal_for_an_inherited_phase_names_the_dependents_to_rename(tmp_path:
         run_experiment(load_experiment(config))
 
     assert caught.value.remediation == (
-        "Put back x high 4, or give `p` and `q` new names and update the `inherits` "
-        "that name them, which runs them again from scratch."
+        "Put back x high 4, or give `p` a new `name`, which runs it again from scratch."
     )
 
-    renamed = [
-        {**anchored_phase(3), "name": "narrower"},
-        {**child, "name": "after", "inherits": ["narrower"]},
-    ]
+    renamed = [{**anchored_phase(3), "name": "narrower"}, {**child, "inherits": ["narrower"]}]
     write_anchored_config(config, phases=renamed, **fields)
-    assert set(run_experiment(load_experiment(config))) == {"narrower", "after"}
+    assert set(run_experiment(load_experiment(config))) == {"narrower", "q"}
 
 
 def test_refusal_names_the_trainer_cwd_when_the_same_config_runs_from_another_directory(
@@ -415,46 +410,6 @@ def test_a_renamed_parent_that_supplies_the_same_values_keeps_the_childs_study()
 
     renamed, renamed_child = plan("p2")
     assert _verify_fingerprint(study, renamed, renamed_child, {"p2": winner()}) == recorded
-
-
-def test_a_changed_inherited_winner_sends_the_dependent_to_a_new_name_not_a_new_experiment() -> (
-    None
-):
-    """When only an inherited value changed, the fix line gives the dependent and its dependents new names and does not retrain the parent."""
-    parent = Phase(
-        name="p",
-        n_trials=1,
-        gpu_policy="none",
-        search_space={"lr": IntParam(type="int", low=0, high=3)},
-        sampler=Sampler(type="random", seed=0),
-    )
-    child = Phase(name="q", n_trials=1, gpu_policy="none", inherits=["p"])
-    grandchild = Phase(name="r", n_trials=1, gpu_policy="none", inherits=["q"])
-    experiment = make_experiment(phases=[parent, child, grandchild])
-
-    def winners(lr: int) -> dict[str, Winner]:
-        return {"p": Winner(trial_number=0, params={}, effective_overrides={"lr": lr}, metric=0.0)}
-
-    study = optuna.create_study()
-    _verify_fingerprint(study, experiment, child, winners(1))
-    study.optimize(lambda trial: 0.0, n_trials=1)
-
-    with pytest.raises(StudyFingerprintMismatchError) as caught:
-        _verify_fingerprint(study, experiment, child, winners(2))
-
-    assert "inherited_effective_overrides.lr: 1 -> 2" in str(caught.value)
-    assert caught.value.remediation == (
-        f"A phase it inherits now has a different winner; {rename_step(['q', 'r'])}."
-    )
-
-
-def test_the_rename_step_is_worded_once_and_names_every_phase_it_is_given() -> None:
-    """Every site that offers the rename builds it here."""
-    assert rename_step(("p",)) == "give `p` a new `name`, which runs it again from scratch"
-    assert rename_step(("p", "q", "r")) == (
-        "give `p`, `q` and `r` new names and update the `inherits` that name them, which runs "
-        "them again from scratch"
-    )
 
 
 def test_long_values_are_windowed_around_their_first_difference() -> None:

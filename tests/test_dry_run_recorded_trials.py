@@ -29,7 +29,12 @@ from phasesweep.engine.errors import (
     TrialTargetRefusedError,
     WinnerIntegrityError,
 )
-from phasesweep.engine.fingerprints import _fresh_identity, _stamp_identity
+from phasesweep.engine.fingerprints import (
+    _fresh_identity,
+    _inherited_override_payload,
+    _stamp_identity,
+    phase_study_name,
+)
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import _attempt_dir, _last_successful_generation_path, _trial_dir_for
@@ -243,12 +248,16 @@ def test_finished_phase_previews_a_replay_and_hands_its_child_the_real_winner(
     finished = run_experiment(_persistent(tmp_path, first, maximize=True))
     appended = _persistent(tmp_path, first, _phase("b", 2, inherits=("a",)), maximize=True)
     assert finished["a"].params["a_x"] != 0
+    child = appended.phases[1]
+    addressed = phase_study_name(
+        appended, child, _inherited_override_payload(child, {"a": finished["a"]})
+    )
 
     assert _preview(appended, tmp_path, caplog) == [
         "phase=a study=t::a finished=3 remaining=0 reruns=0 n_jobs=1",
         "DRY RUN phase=a target met (3 of 3 trials recorded): would replay its existing "
         "result and launch no trials",
-        "phase=b study=t::b finished=0 remaining=2 reruns=0 n_jobs=1",
+        f"phase=b study={addressed} finished=0 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=b would launch 2 trials",
     ]
     (command,) = _commands(caplog)
@@ -712,7 +721,7 @@ def test_a_top_up_of_a_changed_phase_is_refused_as_a_changed_study_first(
         _persistent(tmp_path, *phases),
         tmp_path,
         StudyFingerprintMismatchError,
-        rf"Study 't::{changed}' was created with a different config\. Changed: "
+        rf"Study 't::{changed}(::[0-9a-f]{{16}})?' was created with a different config\. Changed: "
         rf"phase\.search_space\.{changed}_x\.high: 10 -> 5\. search_space '{changed}_x' dropped "
         r"high 10; added values alone keep the study and run only the new ones\.$",
     )

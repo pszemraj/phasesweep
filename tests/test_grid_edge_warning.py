@@ -24,7 +24,7 @@ from phasesweep.config.search import (
     grid_search_space,
     sampler_warnings,
 )
-from phasesweep.engine.errors import StudyFingerprintMismatchError
+from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _generation_winner_path, _last_successful_generation_path
 from phasesweep.engine.read import read_result, read_trial_tables
 from phasesweep.engine.repeats import ranked_group, repeat_axis
@@ -296,6 +296,8 @@ def test_grown_parent_keeps_trials_and_checks_the_winner_before_child_work(
     parent_trials = phase_trials(experiment, parent.name)
     child_trials = phase_trials(experiment, child.name)
     grandchild_trials = phase_trials(experiment, grandchild.name)
+    child_study = phase_study(experiment, child.name).study_name
+    grandchild_study = phase_study(experiment, grandchild.name).study_name
     config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
     shown = CliRunner().invoke(cli, ["show-winners", str(config)])
     assert shown.exit_code == 0, shown.output
@@ -309,37 +311,40 @@ def test_grown_parent_keeps_trials_and_checks_the_winner_before_child_work(
     edited = experiment.model_copy(update={"phases": [grown, child, grandchild]})
     with caplog.at_level(logging.INFO, logger="phasesweep.report"):
         run_experiment(edited, dry_run=True)
+    # A dependent whose inherited values wait on the parent's new winner is previewed as a
+    # new study, the most the run can launch for it.
     for phase in (child, grandchild):
-        conditional = any(
-            f"phase={phase.name} comparison of its inherited values awaits" in message
+        awaits = any(
+            f"phase={phase.name} inherits values that are placeholders" in message
             for message in caplog.messages
         )
-        assert conditional is not child_fixes_x
-    assert "DRY RUN total: would launch 1 trial across 1 phase (2 other phases replay)" in (
-        caplog.messages
-    )
+        assert awaits is not child_fixes_x
+    assert (
+        "DRY RUN total: would launch 1 trial across 1 phase (2 other phases replay)"
+        if child_fixes_x
+        else "DRY RUN total: would launch 3 trials across 3 phases"
+    ) in caplog.messages
     assert pointer.read_bytes() == before
     assert phase_trials(edited, parent.name) == parent_trials
 
     changed_inherited_value = winner_changes and not child_fixes_x
+    current = run_experiment(edited)
+    assert current[parent.name].params == {"x": 4 if winner_changes else 3}
+    assert published_generation_id(edited) != published
     if changed_inherited_value:
-        with pytest.raises(
-            StudyFingerprintMismatchError, match=r"inherited_effective_overrides\.x: 3 -> 4"
-        ) as refused:
-            run_experiment(edited)
-        assert refused.value.remediation is not None
-        assert "give `child` and `grandchild` new names" in refused.value.remediation
-        assert pointer.read_bytes() == before
-        status, retained = read_result(experiment, generation_id=published)
-        assert status["publication_integrity"] == "ok"
-        assert [view.params for view in retained] == [{"x": 3}, {}, {}]
+        # The dependents ran again under the new value, beside the studies they had.
+        assert current[child.name].source != first[child.name].source
+        assert current[grandchild.name].effective_overrides == {"x": 4}
+        storage = _resolve_storage(experiment.resolved_storage)
+        for name, trials in ((child_study, child_trials), (grandchild_study, grandchild_trials)):
+            earlier = optuna.load_study(study_name=name, storage=storage)
+            assert earlier.get_trials(deepcopy=False) == trials
     else:
-        current = run_experiment(edited)
-        assert current[parent.name].params == {"x": 4 if winner_changes else 3}
         assert current[child.name].source == first[child.name].source
         assert current[grandchild.name].source == first[grandchild.name].source
         assert current[grandchild.name].effective_overrides == {"x": 1 if child_fixes_x else 3}
-        assert published_generation_id(edited) != published
+        assert phase_trials(edited, child.name) == child_trials
+        assert phase_trials(edited, grandchild.name) == grandchild_trials
         if child_fixes_x:
             skipped = run_experiment(edited, from_phase=grandchild.name)
             assert skipped[child.name].source == first[child.name].source
@@ -347,18 +352,6 @@ def test_grown_parent_keeps_trials_and_checks_the_winner_before_child_work(
     topped_up = phase_trials(edited, parent.name)
     assert topped_up[:-1] == parent_trials
     assert topped_up[-1].params == {"x": 4}
-    assert phase_trials(edited, child.name) == child_trials
-    assert phase_trials(edited, grandchild.name) == grandchild_trials
-    if changed_inherited_value:
-        next_child = child.model_copy(update={"name": "child2"})
-        next_grandchild = grandchild.model_copy(
-            update={"name": "grandchild2", "inherits": [next_child.name]}
-        )
-        repaired = experiment.model_copy(update={"phases": [grown, next_child, next_grandchild]})
-        result = run_experiment(repaired)
-        assert result["grandchild2"].effective_overrides == {"x": 4}
-        assert phase_trials(repaired, parent.name) == topped_up
-        assert published_generation_id(repaired) != published
 
 
 @pytest.mark.parametrize("sampler_type", ["random", "tpe", "grid"])

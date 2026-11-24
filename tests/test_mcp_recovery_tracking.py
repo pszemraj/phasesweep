@@ -272,7 +272,7 @@ def test_recover_run_finishes_the_mlflow_run_of_each_trial_it_settles(
 
     assert requests == ["resolve"] + ["publish"] * sends
     assert (run.sent(), run.summaries()) == ([finish], [finish])
-    read = read_phase_trials(validate_ledger(run.experiment), "depth")
+    read = read_phase_trials(validate_ledger(run.experiment), f"{run.experiment.experiment}::depth")
     [trial] = read.trials
     assert read.cleanup_recovered == {trial.number}
     if source != "running":

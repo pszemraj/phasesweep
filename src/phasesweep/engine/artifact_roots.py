@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -361,7 +361,7 @@ def _bind_study_artifact_root(study: optuna.Study, experiment: Experiment) -> No
 
 def _check_published_phase_studies(
     experiment: Experiment,
-    loaded: Mapping[str, optuna.Study],
+    loaded: Mapping[str, Sequence[optuna.Study]],
     *,
     from_phase: str | None = None,
 ) -> None:
@@ -371,8 +371,13 @@ def _check_published_phase_studies(
     a publication that needs operator attention. Only persistent storage carries
     published trials to require; an in-memory ledger starts empty on every launch.
 
+    A published winner came from whichever study of its phase its parents' published winners
+    addressed, so every study of the phase is searched for it; attempt identities are unique
+    across them.
+
     :param Experiment experiment: Experiment whose current publication is checked.
-    :param Mapping[str, optuna.Study] loaded: Already-inspected persistent studies.
+    :param Mapping[str, Sequence[optuna.Study]] loaded: Already-inspected persistent studies,
+        every study of each phase.
     :param str | None from_phase: Resume point; earlier phases only load winners.
     :raises PublishedStudyMissingError: A reached published trial is absent,
         replaced, or its recorded history boundary is missing.
@@ -393,15 +398,20 @@ def _check_published_phase_studies(
         phase_name = phase.name
         if phase_name not in published_trials:
             continue
-        study = loaded.get(phase_name)
+        studies = loaded.get(phase_name, ())
         expected = published_trials[phase_name]
         missing = "is missing"
-        if study is not None:
+        if studies:
             try:
-                trials = study.get_trials(deepcopy=False)
-                matched = expected is not None and any(
-                    _published_trial_matches(trial, expected) for trial in trials
-                )
+                every = [study.get_trials(deepcopy=False) for study in studies]
+                holding = [
+                    trials
+                    for trials in every
+                    if expected is not None
+                    and any(_published_trial_matches(trial, expected) for trial in trials)
+                ]
+                matched = bool(holding)
+                trials = holding[0] if holding else [trial for t in every for trial in t]
                 if matched and expected is not None:
                     finished = _finished_trial_count(trials)
                     completed = _completed_trial_count(trials)

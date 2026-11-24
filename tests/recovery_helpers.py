@@ -127,12 +127,14 @@ def fabricate_stale_trial(
     generation_id: str = "old-generation",
     persist_attempt_id: bool = True,
     persist_generation_id: bool = True,
+    study: optuna.Study | None = None,
 ) -> StaleTrial:
-    """Create the phase study, as a crashed engine run leaves it, holding one attribute-complete RUNNING trial."""
-    study = new_phase_study(experiment, phase_name)
-    phase = next(phase for phase in experiment.phases if phase.name == phase_name)
-    study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
-    stamp_artifact_root(study, experiment)
+    """Leave one attribute-complete RUNNING trial as a crashed engine run leaves it, in ``study`` or else in a new phase study."""
+    if study is None:
+        study = new_phase_study(experiment, phase_name)
+        phase = next(phase for phase in experiment.phases if phase.name == phase_name)
+        study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
+        stamp_artifact_root(study, experiment)
     trial = study.ask()
     identity = _environment_identity(experiment, phase_name)
     trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)

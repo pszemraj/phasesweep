@@ -136,29 +136,19 @@ def phase_names(names: Sequence[str]) -> str:
     return ", ".join(f"`{name}`" for name in names)
 
 
-def rename_step(names: Sequence[str]) -> str:
-    """Say how to start phases over under new names, which give them new studies.
+def rename_step(name: str) -> str:
+    """Say how to start a phase over under a new name, which gives it a new study.
 
-    A phase's study is named after the phase, so a new name is a new study for it. The caller
-    passes every inheriting phase too, since a renamed phase runs again and a different winner
-    would refuse an inheriting phase's study once the run reached it. Only the ``inherits`` entries that name a renamed phase
-    change. A new study keeps none of the old one's trials, so the clause says the renamed
-    phases run again.
+    A phase's study is named after the phase, so a new name is a new study for it. Phases that
+    inherit it keep their names: their studies are addressed by the values they inherit, so a
+    renamed phase whose winner changes sends them to new studies of their own. A new study keeps
+    none of the old one's trials, so the clause says the renamed phase runs again.
 
-    :param Sequence[str] names: The phases to rename, at least one: a phase followed by the
-        phases inheriting it (:meth:`~phasesweep.config.models.Experiment.phases_inheriting`),
-        or the inheriting phases alone.
-    :return str: A clause for a step to lead into, such as ``give `a` and `b` new names and
-        update the `inherits` that name them, which runs them again from scratch``.
+    :param str name: The phase to rename.
+    :return str: A clause for a step to lead into, such as ``give `a` a new `name`, which runs
+        it again from scratch``.
     """
-    quoted = [f"`{name}`" for name in names]
-    if len(quoted) == 1:
-        return f"give {quoted[0]} a new `name`, which runs it again from scratch"
-    listed = f"{', '.join(quoted[:-1])} and {quoted[-1]}"
-    return (
-        f"give {listed} new names and update the `inherits` that name them, which runs them "
-        "again from scratch"
-    )
+    return f"give `{name}` a new `name`, which runs it again from scratch"
 
 
 def timeout_step(phase_name: str) -> str:

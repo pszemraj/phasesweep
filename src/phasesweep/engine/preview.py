@@ -29,14 +29,16 @@ from phasesweep.engine.fingerprints import (
     _inherited_override_suppliers,
     _judge_identity,
     _phase_fingerprint,
+    new_study_note,
+    phase_study_name,
 )
 from phasesweep.engine.growth import describe_gains
-from phasesweep.engine.guards import _raise_collected_errors
-from phasesweep.engine.ledger import open_preview_study, read_phase_studies, validate_ledger
+from phasesweep.engine.guards import _raise_collected_errors, known_studies
+from phasesweep.engine.ledger import open_preview_study, read_every_phase_study, validate_ledger
 from phasesweep.engine.optuna import (
     _finished_trial_count,
     _measured_trial_count,
-    _phase_study_name,
+    _phase_namespace,
     _suggest_all,
 )
 from phasesweep.engine.paths import _phase_dir
@@ -191,27 +193,81 @@ def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
     )
 
 
-def _read_recorded_phases(experiment: Experiment) -> dict[str, RecordedPhase | None]:
-    """Read all phase studies from one write-free ledger capture.
+#: Every study of each phase as the ledger holds it, oldest first, by phase name.
+RecordedStudies = Mapping[str, Sequence[RecordedPhase]]
 
-    Missing studies count zero attempts. An unreadable ledger leaves phases unknown;
-    preview warns and uses fresh in-memory studies.
+
+def _read_recorded_phases(experiment: Experiment) -> RecordedStudies | None:
+    """Read every study of every phase from one write-free ledger capture.
+
+    A phase that inherits has a study for each set of values it inherited; the preview picks
+    the one its parents' winners address as it reaches the phase. An unreadable ledger leaves
+    phases unknown; preview warns and uses fresh in-memory studies.
 
     :param Experiment experiment: Parsed experiment being previewed.
     :raises ArtifactRootConflictError: The tree is bound to a different owner.
     :raises StudySchemaMismatchError: A ledger study uses an unsupported schema.
-    :return dict[str, RecordedPhase | None]: One entry per phase, by phase name;
-        ``None`` for every phase when the ledger could not be read.
+    :raises PhaseSweepError: A RUNNING attempt's completed trainer evidence awaits recovery.
+    :return RecordedStudies | None: Each phase's studies, a phase without one mapping to an
+        empty list; ``None`` when the ledger could not be read.
     """
     try:
-        studies = read_phase_studies(validate_ledger(experiment))
+        studies = read_every_phase_study(
+            validate_ledger(experiment), [phase.name for phase in experiment.phases]
+        )
     except StudyStorageUnavailableError as exc:
         warn_dry_run(
             "the ledger could not be inspected, and a real run refuses a ledger it cannot read: %s",
             exc,
         )
-        return {phase.name: None for phase in experiment.phases}
-    return {phase.name: _recorded_phase(phase, studies[phase.name]) for phase in experiment.phases}
+        return None
+    return {
+        phase.name: [_recorded_phase(phase, study) for study in studies[phase.name]]
+        for phase in experiment.phases
+    }
+
+
+def _addressed_record(
+    experiment: Experiment,
+    phase: Phase,
+    inherited_winners: dict[str, Winner],
+    recorded: Sequence[RecordedPhase],
+) -> tuple[str | None, RecordedPhase]:
+    """Pick what the ledger holds for the study a phase addresses under its parents' winners.
+
+    :param Experiment experiment: Parsed experiment config.
+    :param Phase phase: The phase being previewed.
+    :param dict[str, Winner] inherited_winners: Winners, or stand-ins for them.
+    :param Sequence[RecordedPhase] recorded: Every study the phase has.
+    :return tuple[str | None, RecordedPhase]: The study name, or ``None`` while a parent's
+        winner is a stand-in, and that study's record, empty for one the ledger lacks.
+    """
+    fresh = RecordedPhase(finished=0, measured=0, running=0, recovery_reruns=0, study=None)
+    stand_ins = _inherited_placeholder_keys(phase, inherited_winners)
+    if stand_ins and not any(record.study is not None for record in recorded):
+        # Nothing recorded to reuse, so the study it reaches is new whatever the winner.
+        return None, fresh
+    if stand_ins:
+        groups = "; ".join(f"{parent!r} ({', '.join(keys)})" for parent, keys in stand_ins.items())
+        warn_dry_run(
+            "phase=%s inherits values that are placeholders until %s selects a winner, so its "
+            "study is not known yet: it is previewed as a new study, and a winner equal to an "
+            "earlier one reuses the trials measured under it",
+            phase.name,
+            groups,
+        )
+        return None, fresh
+    inherited = _inherited_override_payload(phase, inherited_winners)
+    name = phase_study_name(experiment, phase, inherited)
+    for record in recorded:
+        if record.study is not None and record.study.study_name == name:
+            return name, record
+    note = new_study_note(
+        phase, inherited, [record.study for record in recorded if record.study is not None]
+    )
+    if note is not None:
+        log.info("DRY RUN phase=%s %s", phase.name, note)
+    return name, fresh
 
 
 def validate_trial_targets(experiment: Experiment) -> None:
@@ -226,6 +282,10 @@ def validate_trial_targets(experiment: Experiment) -> None:
     target is refused only when a launch refuses it whatever those verdicts turn out to be,
     and a launch enforces the real ceiling once it has recovered the evidence.
 
+    A phase that inherits is judged here only when it has no study at all: which of its
+    studies a launch addresses depends on winners its parents have yet to select, and the
+    launch judges that one when it reaches the phase.
+
     :param Experiment experiment: Config whose targets may retry recorded failures.
     :raises TrialTargetRefusedError: A fixed configuration or grid requests more attempts
         than its recorded attempts let it retry.
@@ -239,9 +299,12 @@ def validate_trial_targets(experiment: Experiment) -> None:
     ]
     if not phases:
         return
-    studies = read_phase_studies(validate_ledger(experiment))
+    every = read_every_phase_study(validate_ledger(experiment), [phase.name for phase in phases])
+    known = known_studies(experiment, every)
     for phase in phases:
-        study = studies[phase.name]
+        if phase.inherits and every[phase.name]:
+            continue
+        study = known.get(phase.name)
         trials = [] if study is None else study.get_trials(deepcopy=False)
         recovered = [] if study is None else _recovered_running_states(study.study_name, trials)
         _validate_fixed_configuration_target(
@@ -255,7 +318,7 @@ def validate_trial_targets(experiment: Experiment) -> None:
 
 def _refuse_as_a_launch_would(
     experiment: Experiment,
-    recorded: Mapping[str, RecordedPhase],
+    recorded: RecordedStudies,
     *,
     from_phase: str | None,
 ) -> None:
@@ -269,7 +332,7 @@ def _refuse_as_a_launch_would(
     and does not verify evidence.
 
     :param Experiment experiment: Parsed experiment being previewed.
-    :param Mapping[str, RecordedPhase] recorded: What the ledger holds for each phase.
+    :param RecordedStudies recorded: Every study the ledger holds for each phase.
     :param str | None from_phase: Optional first phase a launch would execute.
     :raises PublishedStudyMissingError: A reached phase has a published winner
         whose trial is missing from, or below the history boundary of, its study.
@@ -286,39 +349,43 @@ def _refuse_as_a_launch_would(
         than its phase requests, or a fixed configuration asks for more
         attempts than it may retry.
     """
-    studies = {name: record.study for name, record in recorded.items() if record.study is not None}
+    studies = {
+        name: tuple(record.study for record in records if record.study is not None)
+        for name, records in recorded.items()
+        if records
+    }
     _check_published_phase_studies(experiment, studies, from_phase=from_phase)
-    for bound_study in studies.values():
+    for bound_study in (study for every in studies.values() for study in every):
         _artifact_root_claim_needed(bound_study, experiment)
     resume_ops._preflight_missing_reached_phase_environments(
         experiment, studies, from_phase=from_phase
     )
     errors: list[Exception] = []
-    checked: dict[str, optuna.Study] = {}
+    checked: dict[str, tuple[optuna.Study, ...]] = {}
+    records = {
+        record.study.study_name: record
+        for every in recorded.values()
+        for record in every
+        if record.study is not None
+    }
     for phase in experiment.phases:
-        study = studies.get(phase.name)
-        if study is None:
+        for study in studies.get(phase.name, ()):
+            try:
+                _validate_study_direction(study, experiment.metric.goal)
+                _validate_study_schema(study)
+            except Exception as exc:
+                errors.append(exc)
+            else:
+                checked[phase.name] = (*checked.get(phase.name, ()), study)
+    known = known_studies(experiment, checked)
+    reached: list[ReachedStudy] = []
+    for _index, phase in experiment.phases_from(from_phase):
+        known_study = known.get(phase.name)
+        if known_study is None:
             continue
-        try:
-            _validate_study_direction(study, experiment.metric.goal)
-            _validate_study_schema(study)
-        except Exception as exc:
-            errors.append(exc)
-        else:
-            checked[phase.name] = study
-    reached = [
-        ReachedStudy(
-            phase,
-            checked[phase.name],
-            predicted=(
-                (recorded[phase.name].finished, recorded[phase.name].measured)
-                if recorded[phase.name].running
-                else None
-            ),
-        )
-        for _index, phase in experiment.phases_from(from_phase)
-        if phase.name in checked
-    ]
+        record = records[known_study.study_name]
+        predicted = (record.finished, record.measured) if record.running else None
+        reached.append(ReachedStudy(phase, known_study, predicted=predicted))
     errors.extend(_reached_study_refusals(experiment, reached))
     _raise_collected_errors(errors)
     resume_ops._reject_fixed_targets_without_study(
@@ -326,9 +393,7 @@ def _refuse_as_a_launch_would(
     )
 
 
-def _preview_ledger(
-    experiment: Experiment, *, from_phase: str | None
-) -> dict[str, RecordedPhase | None]:
+def _preview_ledger(experiment: Experiment, *, from_phase: str | None) -> RecordedStudies | None:
     """Read what the ledger holds and refuse what a launch would refuse over it.
 
     :param Experiment experiment: Parsed experiment being previewed.
@@ -338,13 +403,12 @@ def _preview_ledger(
         :func:`_refuse_as_a_launch_would` documents. A ledger that cannot be
         read is not refused here: the preview cannot tell what it holds, so it
         warns and previews every phase as fresh, where a launch refuses it.
-    :return dict[str, RecordedPhase | None]: One entry per phase, by phase name;
-        ``None`` for every phase when the ledger could not be read.
+    :return RecordedStudies | None: Every study of each phase, or ``None`` when the ledger
+        could not be read.
     """
     recorded = _read_recorded_phases(experiment)
-    readable = {name: record for name, record in recorded.items() if record is not None}
-    if len(readable) == len(recorded):
-        _refuse_as_a_launch_would(experiment, readable, from_phase=from_phase)
+    if recorded is not None:
+        _refuse_as_a_launch_would(experiment, recorded, from_phase=from_phase)
     return recorded
 
 
@@ -352,11 +416,12 @@ def _preview_phase(
     experiment: Experiment,
     phase: Phase,
     inherited_winners: dict[str, Winner],
-    recorded: RecordedPhase | None,
+    recorded_studies: Sequence[RecordedPhase] | None,
 ) -> PhasePreview:
     """Log and return the phase's predicted replay or trial work.
 
-    A replay supplies its recorded winner to children. Remaining work supplies a
+    The phase previews the study its parents' winners address, as a run would open it. A
+    replay supplies its recorded winner to children. Remaining work supplies a
     sampled placeholder. Unreadable studies and RUNNING studies needing recovery
     also use placeholders; the latter retain predicted counts without judging
     unrecovered state.
@@ -365,14 +430,21 @@ def _preview_phase(
     :param Phase phase: The phase being previewed.
     :param dict[str, Winner] inherited_winners: Winners, or stand-ins for them,
         for phases earlier in the chain.
-    :param RecordedPhase | None recorded: What the ledger holds for the phase,
-        or ``None`` when that could not be read and the phase previews as fresh.
+    :param Sequence[RecordedPhase] | None recorded_studies: Every study the ledger holds for
+        the phase, or ``None`` when that could not be read and the phase previews as fresh.
     :raises PhaseSweepError: A launch would refuse the phase's recorded state, or, for a phase
         previewed fresh from an unreadable ledger, its launch preflight
         (:func:`phasesweep.engine.study_policy._launch_preflight`) refuses.
     :return PhasePreview: The winner a replay would publish or a placeholder, the
         trials a launch would run, and whether the phase replays.
     """
+    recorded: RecordedPhase | None = None
+    study_name = _phase_namespace(experiment.experiment, phase.name)
+    if recorded_studies is not None:
+        addressed, recorded = _addressed_record(
+            experiment, phase, inherited_winners, recorded_studies
+        )
+        study_name = study_name if addressed is None else addressed
     finished = 0 if recorded is None else recorded.finished
     reruns = 0 if recorded is None else recorded.recovery_reruns
     remaining = max(0, phase.n_trials - finished)
@@ -384,29 +456,20 @@ def _preview_phase(
         and recorded.study is not None
         and recorded.study.get_trials(deepcopy=False)
     ):
-        if not _inherited_placeholder_keys(phase, inherited_winners):
-            # Judged only: the preview reads a snapshot and records nothing.
-            verdict = _judge_identity(
-                recorded.study,
-                experiment,
-                phase,
-                _inherited_override_payload(phase, inherited_winners),
-            )
-            phase_fingerprint = verdict.fingerprint
-            if verdict.gained:
-                log.info(
-                    "DRY RUN phase=%s search_space gains %s: keeps its %s.",
-                    phase.name,
-                    describe_gains(verdict.gained, sampler=phase.sampler),
-                    plural(finished, "finished trial"),
-                )
-        else:
-            # Its own config was compared before any phase previewed (_reached_study_refusals).
-            warn_dry_run(
-                "phase=%s comparison of its inherited values awaits the parent "
-                "winner whose values are placeholders. The preview assumes the inherited "
-                "values still match the study",
+        # Judged only: the preview reads a snapshot and records nothing.
+        verdict = _judge_identity(
+            recorded.study,
+            experiment,
+            phase,
+            _inherited_override_payload(phase, inherited_winners),
+        )
+        phase_fingerprint = verdict.fingerprint
+        if verdict.gained:
+            log.info(
+                "DRY RUN phase=%s search_space gains %s: keeps its %s.",
                 phase.name,
+                describe_gains(verdict.gained, sampler=phase.sampler),
+                plural(finished, "finished trial"),
             )
     if recorded is not None and not recorded.running and recorded.study is not None:
         study = recorded.study
@@ -434,7 +497,7 @@ def _preview_phase(
         resume = resumed
     _log_phase_header(
         phase,
-        _phase_study_name(experiment, phase),
+        study_name,
         finished=finished,
         remaining=remaining,
         reruns=reruns,
@@ -469,11 +532,12 @@ def _preview_phase(
                 experiment, phase, inherited_winners, study, resume, verify_evidence=False
             )
         return _replayed_phase_preview(phase, inherited_winners, winner)
-    if recorded is None:
-        # A readable ledger had every reached phase's launch preflighted before any phase
-        # previewed (_refuse_as_a_launch_would); one previewed fresh from an unreadable ledger
-        # gets it here.
-        _launch_preflight(experiment, phase.name, None)
+    if recorded is None or phase.inherits:
+        # A readable ledger had the launch of every reached phase whose study is known before
+        # any phase runs preflighted before any phase previewed (_refuse_as_a_launch_would).
+        # One previewed fresh from an unreadable ledger, or one whose study its parents'
+        # winners pick, gets it here, as a run's does when it reaches the phase.
+        _launch_preflight(experiment, phase.name, None if recorded is None else recorded.study)
     GpuPool.for_phase(phase, cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"))
     winner = _dry_run_phase(
         experiment,

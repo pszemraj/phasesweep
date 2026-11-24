@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
 import optuna
 
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.evidence as evidence_ops
 import phasesweep.engine.fingerprints as fingerprint_ops
+import phasesweep.engine.guards as guard_ops
 import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep.config.models import Experiment, Phase
@@ -186,7 +187,7 @@ def _reject_fixed_targets_without_study(
     experiment: Experiment,
     *,
     from_phase: str | None,
-    existing_studies: dict[str, optuna.Study],
+    existing_studies: Mapping[str, object],
 ) -> None:
     """Reject a fixed configuration's oversized target before any phase launches.
 
@@ -200,8 +201,9 @@ def _reject_fixed_targets_without_study(
     :param Experiment experiment: Parsed experiment whose phase chain is scanned
         from ``from_phase`` (or the start) onward.
     :param str | None from_phase: Optional resume point; phases before it are skipped.
-    :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
+    :param Mapping[str, object] existing_studies: Every existing study of each phase, keyed by
         phase name, as returned by :func:`phasesweep.engine.guards._preflight_existing_studies`.
+        A phase with any study is left to the check of the study it addresses.
     :raises TrialTargetRefusedError: A reached fixed configuration without a
         study asks for more than one trial; delegated to
         :func:`phasesweep.engine.study_policy._validate_fixed_configuration_target`.
@@ -216,7 +218,7 @@ def _preflight_reached_fingerprint(
     *,
     from_phase: str | None,
     preloaded_winners: dict[str, Winner],
-    existing_studies: dict[str, optuna.Study],
+    existing_studies: Mapping[str, Sequence[optuna.Study]],
 ) -> None:
     """Verify the first reached study before any phase runs.
 
@@ -225,17 +227,23 @@ def _preflight_reached_fingerprint(
     :param str | None from_phase: Optional resume point identifying the first
         phase that will actually execute.
     :param dict[str, Winner] preloaded_winners: Validated skipped-phase winners,
-        used to resolve the reached phase's inherited context.
-    :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
-        phase name; a no-op if the reached phase has none yet.
+        used to resolve the reached phase's inherited values and so its study.
+    :param Mapping[str, Sequence[optuna.Study]] existing_studies: Every existing study of each
+        phase, keyed by phase name; a no-op if the reached phase addresses none yet.
     :raises StudyFingerprintMismatchError: The reached study's stored
         fingerprint does not match the current config.
     """
     phase = experiment.phases[0]
     if from_phase is not None:
         phase = experiment.phase(from_phase)
-    study = existing_studies.get(phase.name)
+    inherited = {name: preloaded_winners[name] for name in phase.inherits}
+    study = guard_ops.addressed_study(
+        existing_studies,
+        phase.name,
+        fingerprint_ops.phase_study_name(
+            experiment, phase, fingerprint_ops._inherited_override_payload(phase, inherited)
+        ),
+    )
     if study is None:
         return
-    inherited = {name: preloaded_winners[name] for name in phase.inherits}
     fingerprint_ops._verify_fingerprint(study, experiment, phase, inherited)

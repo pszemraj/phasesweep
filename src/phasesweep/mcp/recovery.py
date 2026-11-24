@@ -40,7 +40,7 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.ledger import (
     ValidatedLedger,
-    open_existing_study,
+    open_existing_studies,
     repair_incomplete_journal_record,
     validate_ledger,
 )
@@ -696,12 +696,14 @@ def _publication_recovery_action(
 
 def _load_recovery_studies(
     config: Experiment, needs: _RecoveryNeeds, *, confirm: bool = False
-) -> tuple[ValidatedLedger, dict[str, optuna.Study]]:
+) -> tuple[ValidatedLedger, dict[str, tuple[optuna.Study, ...]]]:
     """Validate study ownership and load phases needed for trial cleanup recovery.
 
     Validate before opening or writing. Confirmed recovery holds the experiment lock and
     repairs an incomplete final journal record; inspection leaves it unchanged. Reject
-    studies bound to another artifact root and leave unclaimed studies unclaimed.
+    studies bound to another artifact root and leave unclaimed studies unclaimed. Every study
+    of each phase is loaded, whatever values its parents' winners addressed it by, since the
+    run may have left a trial RUNNING in any of them.
 
     When ownership storage was unavailable, verify published phase history before treating
     the run as owning no trials. Preserve engine refusal messages and remediation.
@@ -713,8 +715,8 @@ def _load_recovery_studies(
     :raises RunRecoveryError: The ledger is refused, a phase study belongs to
         another artifact root, or required storage or published studies cannot
         be read.
-    :return tuple[ValidatedLedger, dict[str, optuna.Study]]: The validated ledger, and its
-        loadable phase studies keyed by phase name.
+    :return tuple[ValidatedLedger, dict[str, tuple[optuna.Study, ...]]]: The validated ledger,
+        and every loadable study of each phase, oldest first, keyed by phase name.
     """
     # A storage refusal gains a recover-run retry here, but that retry cannot
     # succeed until the ledger is back, so these wraps route to restoring it.
@@ -735,15 +737,15 @@ def _load_recovery_studies(
         raise RunRecoveryError(
             f"{exc}{recovery_step}", action=OperatorAction.RESTORE_LEDGER
         ) from exc
-    loaded_studies = {}
+    loaded_studies: dict[str, tuple[optuna.Study, ...]] = {}
     for phase in config.phases:
         try:
-            study = open_existing_study(ledger, phase)
+            studies = open_existing_studies(ledger, phase.name)
         except StudyStorageUnavailableError as exc:
             raise RunRecoveryError(
                 f"{exc}{recovery_step}", action=OperatorAction.RESTORE_LEDGER
             ) from exc
-        if study is not None:
+        for study in studies:
             try:
                 _check_study_artifact_root(study, config)
             except ArtifactRootConflictError as exc:
@@ -754,7 +756,8 @@ def _load_recovery_studies(
                 raise RunRecoveryError.rewrap(
                     exc, str(exc), action=OperatorAction.RESTORE_TREE
                 ) from exc
-            loaded_studies[phase.name] = study
+        if studies:
+            loaded_studies[phase.name] = tuple(studies)
     if needs.ownership_storage_unavailable:
         try:
             _check_published_phase_studies(
@@ -806,7 +809,7 @@ def _recover_trial_evidence(
     causal_attempt_ids = store.cleanup_uncertain_attempt_ids(handle)
     inspected_attempts: dict[str, _AttemptRecord] = {}
     inspected_studies = 0
-    loaded_studies: dict[str, optuna.Study] = {}
+    loaded_studies: dict[str, tuple[optuna.Study, ...]] = {}
     if needs.cleanup_needed:
         ledger, loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
         active_report = _PreflightCleanupReport(inspection_messages={} if not confirm else None)
@@ -839,10 +842,8 @@ def _recover_trial_evidence(
             for operation_id, generation_id in _tracking_cleanup_receipts(config).items()
             if generation_id == run_id or operation_id in causal_attempt_ids
         )
-        for phase in config.phases:
-            study = loaded_studies.get(phase.name)
-            if study is None:
-                continue
+        every = [(each, s) for each in config.phases for s in loaded_studies.get(each.name, ())]
+        for phase, study in every:
             inspected_studies += 1
             # The study ledger precedes the run recovery record. Read evidence
             # left by an interrupted pass before this pass can append to it.
@@ -920,7 +921,9 @@ def _recover_trial_evidence(
         if pending_ids:
             if not loaded_studies:
                 _ledger, loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
-            for phase_name, study in loaded_studies.items():
+            for phase_name, study in (
+                (name, study) for name, studies in loaded_studies.items() for study in studies
+            ):
                 for trial in study.get_trials(deepcopy=False):
                     trial_attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
                     if (

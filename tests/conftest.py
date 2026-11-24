@@ -401,16 +401,24 @@ def bounded_metric(**bounds: float) -> Metric:
 
 
 def phase_study(experiment: Experiment, phase_name: str = "p") -> optuna.Study:
-    """Read one phase's study from the experiment's ledger.
+    """Read a phase's one study from the experiment's ledger.
+
+    A phase that inherits has one study per set of inherited values, named after the phase's
+    namespace; this reads the only one.
 
     :param Experiment experiment: Experiment whose ledger is read.
     :param str phase_name: Phase whose study is read.
     :return optuna.Study: Its recorded study.
+    :raises AssertionError: The phase has no study or more than one.
     """
-    return optuna.load_study(
-        study_name=f"{experiment.experiment}::{phase_name}",
-        storage=_resolve_storage(experiment.resolved_storage),
-    )
+    storage = _resolve_storage(experiment.resolved_storage)
+    namespace = f"{experiment.experiment}::{phase_name}"
+    (name,) = [
+        name
+        for name in optuna.get_all_study_names(storage=storage)
+        if name == namespace or name.startswith(f"{namespace}::")
+    ]
+    return optuna.load_study(study_name=name, storage=storage)
 
 
 def phase_trials(experiment: Experiment, phase_name: str = "p") -> list[optuna.trial.FrozenTrial]:

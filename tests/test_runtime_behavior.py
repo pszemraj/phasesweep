@@ -385,7 +385,7 @@ def test_persistent_execution_reattaches_configured_sampler_and_pruner(
         workdir=tmp_path / "runs",
         phases=[phase],
     )
-    study = open_phase_study(claim_ledger(validate_ledger(exp)), phase)
+    study = open_phase_study(claim_ledger(validate_ledger(exp)), phase, f"{exp.experiment}::p")
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     observed: dict[str, object] = {}
 

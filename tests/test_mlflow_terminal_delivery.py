@@ -175,7 +175,9 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
             stopped.setattr(phase_module, "_record_outcome", lambda *args, **kwargs: None)
         with pytest.raises(RunnerKilled if outcome == "completed" else UnsafeProcessCleanupError):
             run_experiment(experiment)
-    (original,) = read_phase_trials(validate_ledger(experiment), "depth").trials
+    (original,) = read_phase_trials(
+        validate_ledger(experiment), f"{experiment.experiment}::depth"
+    ).trials
     assert original.state == TrialState.RUNNING
     attempt_dir = _trial_attempt_dir(original)
     assert attempt_dir is not None
@@ -187,7 +189,9 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
 
     reports = []
     run_experiment(experiment, terminal_callback=reports.append)
-    original, retried = read_phase_trials(validate_ledger(experiment), "depth").trials
+    original, retried = read_phase_trials(
+        validate_ledger(experiment), f"{experiment.experiment}::depth"
+    ).trials
     assert _trial_interrupted(original)
     assert retried.state == TrialState.COMPLETE
     assert retried.params == original.params
@@ -352,7 +356,9 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
         {**mlflow_binding(), "phase": "generation", "attempt_id": generation},
     )
     ledger = claim_ledger(validate_ledger(experiment))
-    study = open_phase_study(ledger, experiment.phases[0])
+    study = open_phase_study(
+        ledger, experiment.phases[0], f"{experiment.experiment}::{experiment.phases[0].name}"
+    )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     attempts = {
         "1": ("managed", TrialState.RUNNING),  # no outcome until recovery records one
@@ -428,7 +434,7 @@ def test_failed_invocation_leaves_a_pending_trials_managed_run_open_only_when_pe
         {**mlflow_binding(), "phase": "generation", "attempt_id": generation},
     )
     ledger = claim_ledger(validate_ledger(experiment))
-    study = open_phase_study(ledger, phase)
+    study = open_phase_study(ledger, phase, f"{experiment.experiment}::{phase.name}")
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     attempt = "1" * 32
     directory = _add_bound_attempt(
@@ -480,7 +486,11 @@ def test_recovered_cleanup_settles_only_the_attempt_of_its_own_study(tmp_path, m
     ledger = claim_ledger(validate_ledger(experiment))
     # Trial 0 failed with unconfirmed cleanup in both studies; only depth's was recovered.
     for phase, digit, recovered in (("depth", "1", [0]), ("rate", "2", [])):
-        study = open_phase_study(ledger, next(p for p in experiment.phases if p.name == phase))
+        study = open_phase_study(
+            ledger,
+            next(p for p in experiment.phases if p.name == phase),
+            f"{experiment.experiment}::{phase}",
+        )
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
         if recovered:
             study.set_user_attr(CLEANUP_RECOVERED_TRIALS_ATTR, recovered)
@@ -507,7 +517,9 @@ def test_interrupted_attempt_finishes_its_managed_run_killed(tmp_path, monkeypat
     experiment = Experiment.model_validate(config)
     phase = experiment.phases[0]
     generation = "a" * 32
-    study = open_phase_study(claim_ledger(validate_ledger(experiment)), phase)
+    study = open_phase_study(
+        claim_ledger(validate_ledger(experiment)), phase, f"{experiment.experiment}::{phase.name}"
+    )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     for number, (digit, outcome) in enumerate((("1", "interrupted"), ("2", "failure"))):
         attempt = digit * 32
@@ -612,7 +624,7 @@ def test_the_run_that_confirms_an_attempts_cleanup_finishes_its_managed_run(tmp_
     assert journal.read_bytes() == before
 
     run_experiment(experiment)
-    read = read_phase_trials(validate_ledger(experiment), "depth")
+    read = read_phase_trials(validate_ledger(experiment), f"{experiment.experiment}::depth")
     failed = next(trial for trial in read.trials if trial.user_attrs[ATTEMPT_ID_ATTR] == attempt)
     assert failed.state == TrialState.FAIL
     assert failed.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
@@ -1330,7 +1342,9 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     monkeypatch.setattr(worker, "request_operation", capture_after_outage)
     with pytest.raises(TrackingTargetUnavailableError):
         run_experiment(experiment)
-    (pending,) = read_phase_trials(validate_ledger(experiment), "depth").trials
+    (pending,) = read_phase_trials(
+        validate_ledger(experiment), f"{experiment.experiment}::depth"
+    ).trials
     assert pending.state == TrialState.RUNNING
     attempt = pending.user_attrs[ATTEMPT_ID_ATTR]
     generation = pending.user_attrs[GENERATION_ID_ATTR]
@@ -1348,7 +1362,9 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     else:
         with pytest.raises(NoFeasibleTrialError):
             run_experiment(experiment)
-    (recovered,) = read_phase_trials(validate_ledger(experiment), "depth").trials
+    (recovered,) = read_phase_trials(
+        validate_ledger(experiment), f"{experiment.experiment}::depth"
+    ).trials
     assert recovered.state == (TrialState.COMPLETE if answer == "accepted" else TrialState.FAIL)
     record_path = delivery / f"attempt-{attempt}.json"
     if answer == "objective-missing":
@@ -1669,7 +1685,9 @@ def test_recovery_sends_nothing_to_a_tracker_that_is_down(tmp_path, monkeypatch)
     with pytest.raises(TrackingTargetUnavailableError):
         run_experiment(experiment)
     assert requests == ["resolve"]
-    trials = read_phase_trials(validate_ledger(experiment), "depth").trials
+    trials = read_phase_trials(
+        validate_ledger(experiment), f"{experiment.experiment}::depth"
+    ).trials
     assert all(_trial_interrupted(trial) for trial in trials)
     [generation] = {trial.user_attrs[GENERATION_ID_ATTR] for trial in trials}
     delivery = tracking_root(experiment) / generation / "delivery"
@@ -1741,7 +1759,9 @@ def test_an_upload_workers_unconfirmed_cleanup_is_not_charged_to_the_recovered_a
     assert report.failure_stage == "preflight"
     [recovered] = [
         trial
-        for trial in read_phase_trials(validate_ledger(experiment), "depth").trials
+        for trial in read_phase_trials(
+            validate_ledger(experiment), f"{experiment.experiment}::depth"
+        ).trials
         if trial.user_attrs[ATTEMPT_ID_ATTR] == attempt
     ]
     assert recovered.state == TrialState.FAIL
@@ -1773,7 +1793,9 @@ def test_a_run_killed_before_delivering_a_recovered_outcome_leaves_it_for_sync(
             run_experiment(experiment)
     [recovered] = [
         trial
-        for trial in read_phase_trials(validate_ledger(experiment), "depth").trials
+        for trial in read_phase_trials(
+            validate_ledger(experiment), f"{experiment.experiment}::depth"
+        ).trials
         if trial.user_attrs[ATTEMPT_ID_ATTR] == attempt
     ]
     assert _trial_interrupted(recovered)

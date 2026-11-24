@@ -230,7 +230,7 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
         elif read_path == "ledger-read_phase_trials":
             ledger = validate_ledger(materialized.experiment)
             for phase in materialized.experiment.phases:
-                read_phase_trials(ledger, phase)
+                read_phase_trials(ledger, f"{materialized.experiment.experiment}::{phase.name}")
         elif read_path == "mcp-snapshot":
             capture_result_snapshot(materialized.experiment)
         elif read_path == "cli-status":

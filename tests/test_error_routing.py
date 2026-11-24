@@ -409,7 +409,7 @@ def _validate_damaged(fixture: str, damage: Callable[[Path], None]) -> Trigger:
 def _run_while_discovery_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Start a run over the current golden ledger whose phase study cannot be read."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
-    monkeypatch.setattr(engine_ledger, "open_existing_study", raiser(_storage_gone()))
+    monkeypatch.setattr(engine_ledger, "open_existing_studies", raiser(_storage_gone()))
     return run_experiment(materialized.experiment)
 
 
@@ -526,7 +526,10 @@ def _preflight(
         if schema_check is not None:
             monkeypatch.setattr(guards, "_initialize_study_schema", schema_check)
         return guards._preflight_existing_studies(
-            replace(claimed, studies=MappingProxyType(dict(studies())))
+            replace(
+                claimed,
+                studies=MappingProxyType({name: (study,) for name, study in studies().items()}),
+            )
         )
 
     return trigger
@@ -572,7 +575,7 @@ _PREFLIGHT_AGGREGATE = "Experiment recovery preflight found multiple unsafe stud
 WRAP_CASES = (
     RoutingCase(
         id="claim_ledger_discovery_preserves_override",
-        trigger=_claim_while(engine_ledger, "open_existing_study", _ledger_busy),
+        trigger=_claim_while(engine_ledger, "open_existing_studies", _ledger_busy),
         raised=StudyStorageUnavailableError,
         action=OperatorAction.RETRY,
         message="Could not inspect persistent study storage for phase 'p'.",

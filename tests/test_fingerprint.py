@@ -804,8 +804,7 @@ def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path
     assert set(before) > {"."}
 
     for phase in bound.phases:
-        study = optuna.load_study(study_name=f"t::{phase.name}", storage=_resolve_storage(storage))
-        assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(bound_root)
+        assert phase_study(bound, phase.name).user_attrs[ARTIFACT_ROOT_ATTR] == str(bound_root)
 
     moved = bound.model_copy(update={"workdir": str(tmp_path / "runs_b")})
     with pytest.raises(ArtifactRootConflictError) as excinfo:
@@ -819,8 +818,7 @@ def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path
     assert excinfo.value.action is OperatorAction.FIX_CONFIG
     assert tree_snapshot(bound_root) == before
     for phase in bound.phases:
-        study = optuna.load_study(study_name=f"t::{phase.name}", storage=_resolve_storage(storage))
-        assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(bound_root)
+        assert phase_study(bound, phase.name).user_attrs[ARTIFACT_ROOT_ATTR] == str(bound_root)
 
 
 @pytest.mark.integration
@@ -1115,14 +1113,14 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
             study_name=f"t::{phase.name}", storage=_resolve_storage(storage), direction="minimize"
         )
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
-    real_loader = ledger.open_existing_study
+    real_loader = ledger.open_existing_studies
 
-    def _fail_for_lr(handle: ledger.ValidatedLedger, phase: Phase) -> optuna.Study | None:
-        if phase.name == "lr":
+    def _fail_for_lr(handle: ledger.ValidatedLedger, phase_name: str) -> list[optuna.Study]:
+        if phase_name == "lr":
             raise RuntimeError("storage went away")
-        return real_loader(handle, phase)
+        return real_loader(handle, phase_name)
 
-    monkeypatch.setattr(ledger, "open_existing_study", _fail_for_lr)
+    monkeypatch.setattr(ledger, "open_existing_studies", _fail_for_lr)
 
     with pytest.raises(ProcessCleanupUncertainError) as excinfo:
         run_experiment(experiment)
@@ -1179,11 +1177,11 @@ def test_published_study_requirement_starts_at_from_phase(
     published = published_generation_id(experiment)
     generation_before = _generation_path(experiment).read_bytes()
     resolved = _resolve_storage(storage)
-    optuna.delete_study(study_name=f"t::{missing_phase}", storage=resolved)
+    missing = phase_study(experiment, missing_phase).study_name
+    kept = phase_study(experiment, "lr").study_name
+    optuna.delete_study(study_name=missing, storage=resolved)
     if replacement == "empty":
-        study = optuna.create_study(
-            study_name=f"t::{missing_phase}", storage=resolved, direction="minimize"
-        )
+        study = optuna.create_study(study_name=missing, storage=resolved, direction="minimize")
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
 
     if missing_phase == "lr":
@@ -1196,7 +1194,7 @@ def test_published_study_requirement_starts_at_from_phase(
             assert "t::arch" not in optuna.get_all_study_names(storage=resolved)
         else:
             assert not optuna.load_study(study_name="t::arch", storage=resolved).trials
-        assert len(optuna.load_study(study_name="t::lr", storage=resolved).trials) == 1
+        assert len(optuna.load_study(study_name=kept, storage=resolved).trials) == 1
     assert _generation_path(experiment).read_bytes() == generation_before
     assert published_generation_id(experiment) == published
 
@@ -1351,17 +1349,17 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     assert entry_path.is_file()
 
     experiment_b = experiment_a.model_copy(update={"workdir": str(tmp_path / "runs_b")})
-    real_loader = ledger.open_existing_study
+    real_loader = ledger.open_existing_studies
     calls = {"count": 0}
 
-    def _fail_first_read(handle: ledger.ValidatedLedger, phase: Phase) -> optuna.Study | None:
+    def _fail_first_read(handle: ledger.ValidatedLedger, phase_name: str) -> list[optuna.Study]:
         calls["count"] += 1
         if calls["count"] == 1:
             raise RuntimeError("transient storage failure")
-        return real_loader(handle, phase)
+        return real_loader(handle, phase_name)
 
     with pytest.MonkeyPatch.context() as patched:
-        patched.setattr(ledger, "open_existing_study", _fail_first_read)
+        patched.setattr(ledger, "open_existing_studies", _fail_first_read)
         with pytest.raises(ProcessCleanupUncertainError) as excinfo:
             run_experiment(experiment_b)
 

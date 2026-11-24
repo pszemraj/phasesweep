@@ -9,7 +9,7 @@ import platform
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import optuna
 
@@ -17,7 +17,7 @@ from phasesweep.config.common import TRACKER_READ_CONTROLS
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.growth import _GrowthVerdict, _search_space_growth, describe_gains
-from phasesweep.engine.optuna import _draw_positions
+from phasesweep.engine.optuna import _draw_positions, _phase_namespace
 from phasesweep.engine.state import (
     PHASE_IDENTITY_ATTR,
     PHASE_IDENTITY_SCHEMA_VERSION,
@@ -34,6 +34,7 @@ from phasesweep.errors import (
     short_digest,
 )
 from phasesweep.runtime.json import JsonObject, json_object
+from phasesweep.runtime.terminal import plural
 
 log = logging.getLogger(__name__)
 
@@ -192,13 +193,25 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     return dump
 
 
+class CarriesOverrides(Protocol):
+    """A winner as a child sees it: the composed overrides it passes on."""
+
+    @property
+    def effective_overrides(self) -> Mapping[str, object]:
+        """Return the winner's composed overrides.
+
+        :return Mapping[str, object]: Override value by trainer key.
+        """
+        ...
+
+
 def _inherited_override_suppliers(
-    phase: Phase, inherited_winners: Mapping[str, Winner]
+    phase: Phase, inherited_winners: Mapping[str, CarriesOverrides]
 ) -> dict[str, str]:
     """Name the last parent supplying each key, retaining its first insertion position.
 
     :param Phase phase: The phase whose inheritance order determines precedence.
-    :param Mapping[str, Winner] inherited_winners: Parent winners supplying overrides.
+    :param Mapping[str, CarriesOverrides] inherited_winners: Parent winners supplying overrides.
     :return dict[str, str]: Parent by override key, in trainer override order.
     """
     return {
@@ -209,26 +222,96 @@ def _inherited_override_suppliers(
 
 
 def _inherited_override_payload(
-    phase: Phase, inherited_winners: Mapping[str, Winner]
+    phase: Phase, inherited_winners: Mapping[str, CarriesOverrides]
 ) -> dict[str, object]:
     """Return the inherited values the trainer actually receives, by key.
 
     Fixed, sampled and repeat keys take their values from the current phase. Which parent
     supplied a value is not recorded, so a parent renamed, reordered or replaced by one that
-    supplies the same values leaves a child's identity unchanged, and a refusal names each
-    changed key with both values.
+    supplies the same values leaves a child's study and identity unchanged.
 
     :param Phase phase: The phase whose local keys and inheritance precedence apply.
-    :param Mapping[str, Winner] inherited_winners: Parent winners supplying overrides.
+    :param Mapping[str, CarriesOverrides] inherited_winners: Parent winners supplying overrides.
     :return dict[str, object]: The effective inherited value of each key the phase does not set.
     """
-    local_keys = set(phase.fixed_overrides) | phase.search_space.keys()
-    if phase.repeats is not None:
-        local_keys.add(phase.repeats.key)
+    local_keys = _local_keys(phase)
     return {
         key: inherited_winners[parent].effective_overrides[key]
         for key, parent in _inherited_override_suppliers(phase, inherited_winners).items()
         if key not in local_keys
+    }
+
+
+def _local_keys(phase: Phase) -> set[str]:
+    """Return the trainer keys a phase sets itself, which no parent's value reaches.
+
+    :param Phase phase: The phase.
+    :return set[str]: Its fixed, searched and repeat keys.
+    """
+    local_keys = set(phase.fixed_overrides) | phase.search_space.keys()
+    if phase.repeats is not None:
+        local_keys.add(phase.repeats.key)
+    return local_keys
+
+
+#: Hex digits of the inherited-value digest in a study name; 64 bits keeps a collision
+#: between two winners of one parent out of reach.
+_ADDRESS_DIGEST_CHARS = 16
+
+
+def phase_study_name(experiment: Experiment, phase: Phase, inherited: Mapping[str, object]) -> str:
+    """Return the study that holds a phase's trials measured under the given inherited values.
+
+    The one rule for finding a phase's study: a phase that inherits nothing has one study, its
+    namespace; a phase that inherits has one study per set of values its parents' winners pass
+    it, so a changed winner addresses another study and a winner that returns to earlier values
+    addresses the study measured under them again. Each study holds exactly the trials measured
+    under its values, so the inherited values never need comparing.
+
+    :param Experiment experiment: Experiment supplying the namespace.
+    :param Phase phase: The phase.
+    :param Mapping[str, object] inherited: The values the phase inherits, by key: from its
+        parents' winners (:func:`_inherited_override_payload`), or from one of its own winners
+        (:func:`_winner_inherited_values`).
+    :return str: The study name.
+    """
+    namespace = _phase_namespace(experiment.experiment, phase.name)
+    if not phase.inherits:
+        return namespace
+    digest = _semantic_payload_digest(inherited)
+    return f"{namespace}::{digest[:_ADDRESS_DIGEST_CHARS]}"
+
+
+def _winner_inherited_values(phase: Phase, winner: CarriesOverrides) -> dict[str, object]:
+    """Return the inherited values a phase's own winner was measured under.
+
+    A winner's composed overrides hold every inherited value beside the phase's own keys, so
+    they name the study the winner was selected from without its parents' winners.
+
+    :param Phase phase: The winner's phase.
+    :param CarriesOverrides winner: One of the phase's winners.
+    :return dict[str, object]: Its inherited values, by key.
+    """
+    local_keys = _local_keys(phase)
+    return {
+        key: value for key, value in winner.effective_overrides.items() if key not in local_keys
+    }
+
+
+def addressed_study_names(
+    experiment: Experiment, winners: Mapping[str, CarriesOverrides]
+) -> dict[str, str]:
+    """Return the study each phase addresses under the given parent winners.
+
+    :param Experiment experiment: The experiment whose phases are addressed.
+    :param Mapping[str, CarriesOverrides] winners: Winners by phase name, from one capture.
+    :return dict[str, str]: Study name by phase name, for each phase whose parents all have a
+        winner; a phase missing from it has no study to address yet.
+    """
+    return {
+        phase.name: phase_study_name(experiment, phase, _inherited_override_payload(phase, winners))
+        for phase in experiment.phases
+        if all(parent in winners for parent in phase.inherits)
     }
 
 
@@ -299,8 +382,6 @@ _MAX_REPORTED_VALUE_CHARS = 80
 _REPORTED_VALUE_LEAD_CHARS = 24
 #: The refusal shows each recorded value, so restoring it is the first way out.
 _RECORDED_VALUES = "the recorded value(s)"
-#: Where the payload's inherited values start in a changed path.
-_INHERITED_PREFIX = "inherited_effective_overrides."
 _CWD_FOLLOWS_INVOCATION = (
     "execution.cwd is unset, so the trainer runs where phasesweep is started: run from the "
     "original directory, or set execution.cwd to it."
@@ -409,22 +490,52 @@ def _describe_changed_keys(changes: list[tuple[str, object, object]]) -> str:
     return f"Changed: {'; '.join(shown)}."
 
 
-def restore_or_rename_step(experiment: Experiment, phase: Phase, *, recorded: str) -> str:
+def restore_or_rename_step(phase: Phase, *, recorded: str) -> str:
     """Offer the rename that reruns a phase whose own keys changed, beside restoring them.
 
-    A phase's study is named after the phase, so a new name starts a new study and leaves
-    the other phases' studies valid. A phase that inherits the renamed one is named as well:
-    the renamed phase runs again, and a different winner would refuse the inheriting phase's
-    study once the run reached it. A persistent study's
-    refusals share this step, whether the recorded identity is the study's or its winner's.
+    A phase's studies are named after the phase, so a new name starts a new study and leaves
+    the other phases' studies valid. A phase inheriting it needs no new name: its study is
+    found by the values the renamed phase's winner passes it. A persistent study's refusals
+    share this step, whether the recorded identity is the study's or its winner's.
 
-    :param Experiment experiment: Experiment whose phases may inherit ``phase``.
     :param Phase phase: Phase whose own configuration differs from its study's.
     :param str recorded: What to restore, as the refusal can name it.
     :return str: The operator's step.
     """
-    names = [phase.name, *experiment.phases_inheriting(phase.name)]
-    return f"Restore {recorded}, or {rename_step(names)}."
+    return f"Restore {recorded}, or {rename_step(phase.name)}."
+
+
+def new_study_note(
+    phase: Phase, inherited: Mapping[str, object], others: Sequence[optuna.Study]
+) -> str | None:
+    """Say why a phase starts a new study beside the ones it already has, and that they stay.
+
+    :param Phase phase: The phase whose addressed study holds no trials yet.
+    :param Mapping[str, object] inherited: The values it now inherits.
+    :param Sequence[optuna.Study] others: The phase's other studies, oldest first.
+    :raises StudySchemaMismatchError: The most recent populated study's identity is malformed.
+    :return str | None: The sentence, or None when no other study holds a trial.
+    """
+    populated = [(study, study.get_trials(deepcopy=False)) for study in others]
+    populated = [(study, trials) for study, trials in populated if trials]
+    if not populated:
+        return None
+    latest, trials = populated[-1]
+    record = _recorded_identity(latest)
+    recorded = None if record is None else record["payload"].get("inherited_effective_overrides")
+    current = json_object(json.loads(json.dumps(dict(inherited), default=str)))
+    changes = _changed_payload_keys(recorded if isinstance(recorded, dict) else {}, current)
+    shown = "; ".join(
+        f"{path}: {' -> '.join(_render_changed_values(old, new))}"
+        for path, old, new in changes[:_MAX_REPORTED_CHANGES]
+    )
+    more = len(changes) - _MAX_REPORTED_CHANGES
+    if more > 0:
+        shown += f"; and {more} more"
+    return (
+        f"inherits {shown or 'different values'}, so it starts a new study; "
+        f"the earlier study keeps its {plural(len(trials), 'trial')}."
+    )
 
 
 def _identity_record(
@@ -666,10 +777,10 @@ def _growth_verdicts(
 def _verify_recorded_identity(study: optuna.Study, experiment: Experiment, phase: Phase) -> None:
     """Refuse a populated study whose experiment or phase config changed, before any phase runs.
 
-    The phases it inherits from have not run yet, so the effective inherited values are
-    held at what the study recorded. This check refuses changes to the phase's own config;
-    :func:`_verify_fingerprint` compares the inherited values once the phase is reached.
-    A study without a recorded payload or trials is left to that comparison.
+    A study is addressed by the values it inherits (:func:`phase_study_name`), so the values it
+    recorded are the ones it would run under, and only the phase's own config can differ. A
+    study without a recorded payload or trials is left to :func:`_verify_fingerprint` once the
+    phase is reached.
 
     :param optuna.Study study: A reached phase's existing study, which this never writes.
     :param Experiment experiment: Current experiment config.
@@ -687,17 +798,14 @@ def _verify_recorded_identity(study: optuna.Study, experiment: Experiment, phase
     _judge_identity(study, experiment, phase, record["payload"]["inherited_effective_overrides"])
 
 
-def _growth_refusal(
-    experiment: Experiment, phase: Phase, growth: Mapping[str, _GrowthVerdict]
-) -> tuple[str, str] | None:
+def _growth_refusal(phase: Phase, growth: Mapping[str, _GrowthVerdict]) -> tuple[str, str] | None:
     """Say why a search space that changed alone cannot continue, and the step for it.
 
-    :param Experiment experiment: Experiment whose phases may inherit ``phase``.
     :param Phase phase: Phase whose search space changed.
     :param Mapping[str, _GrowthVerdict] growth: A verdict per changed key.
     :return tuple[str, str] | None: The sentence and the step, or None when every key grows.
     """
-    rename = rename_step([phase.name, *experiment.phases_inheriting(phase.name)])
+    rename = rename_step(phase.name)
     dropped = {key: verdict.dropped for key, verdict in growth.items() if verdict.dropped}
     if dropped:
         named = "; ".join(f"{key} {', '.join(values)}" for key, values in dropped.items())
@@ -745,7 +853,7 @@ def _mismatch_refusal(
     cwd_unset = experiment.execution.cwd is None and any(
         path == "execution.cwd" for path, _old, _new in changes
     )
-    refused = None if growth is None else _growth_refusal(experiment, phase, growth)
+    refused = None if growth is None else _growth_refusal(phase, growth)
     # A recorded payload equal to the current one under a different digest was not written by
     # PhaseSweep, so the two digests are all the message can show.
     if not changes:
@@ -760,12 +868,7 @@ def _mismatch_refusal(
     else:
         found = f". {_describe_changed_keys(changes)}"
         if all(path.startswith("phase.") for path, _old, _new in changes):
-            way_forward = restore_or_rename_step(experiment, phase, recorded=_RECORDED_VALUES)
-        elif all(path.startswith(_INHERITED_PREFIX) for path, _old, _new in changes):
-            # A new experiment name would retrain the parent too; the inherited phase's trials
-            # stay valid and only this phase and its dependents start over.
-            names = [phase.name, *experiment.phases_inheriting(phase.name)]
-            way_forward = f"A phase it inherits now has a different winner; {rename_step(names)}."
+            way_forward = restore_or_rename_step(phase, recorded=_RECORDED_VALUES)
         else:
             way_forward = restore_or_new_study(_RECORDED_VALUES)
     return StudyFingerprintMismatchError(

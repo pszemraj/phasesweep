@@ -18,7 +18,6 @@ from phasesweep import experiment_status, run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Sampler
-from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_dir,
@@ -156,12 +155,12 @@ def test_inspection_uses_one_current_pointer_capture(
     assert pinned["represented_generation_id"] == generation
 
 
-def test_status_judges_a_refused_dependent_inside_its_one_pointer_capture(
+def test_status_counts_a_child_in_the_study_its_parents_latest_winner_addresses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Status reads the pointer once and judges a child refused after its parent's top-up with the winners from that read, even when a generation is claimed right after it."""
+    """Status reads the pointer once and counts a child whose parent's top-up changed its winner in the study that winner addresses, not the earlier one, even when a generation is claimed right after the read."""
 
-    def plan(choices: list[int]) -> Experiment:
+    def plan(choices: list[int], child_trials: int) -> Experiment:
         return make_experiment(
             persistent=tmp_path,
             phases=[
@@ -174,7 +173,7 @@ def test_status_judges_a_refused_dependent_inside_its_one_pointer_capture(
                 ),
                 Phase(
                     name="child",
-                    n_trials=1,
+                    n_trials=child_trials,
                     gpu_policy="none",
                     inherits=["parent"],
                     sampler=Sampler(type="random", seed=0),
@@ -183,10 +182,9 @@ def test_status_judges_a_refused_dependent_inside_its_one_pointer_capture(
             ],
         )
 
-    run_experiment(plan([3, 5]))
-    grown = plan([3, 5, 1])
-    with pytest.raises(StudyFingerprintMismatchError):
-        run_experiment(grown)
+    run_experiment(plan([3, 5], child_trials=2))
+    grown = plan([3, 5, 1], child_trials=1)
+    run_experiment(grown)
     config = write_experiment_config(tmp_path / "grown.yaml", grown)
     pointer = _generation_path(grown)
     _generation_dir(_experiment_dir(grown), "next-generation").mkdir()
@@ -206,8 +204,10 @@ def test_status_judges_a_refused_dependent_inside_its_one_pointer_capture(
 
     assert result.exit_code == 0, result.output
     assert len(reads) == 1
-    assert "# Study 't::child' was created with a different config." in result.output
-    assert "inherited_effective_overrides.x: 3 -> 1" in result.output
+    assert "different config" not in result.output
+    child = yaml.safe_load(result.output)["phases"][1]
+    assert child["name"] == "child"
+    assert child["trials"] == {"COMPLETE": 1}
 
 
 def test_experiment_status_shape_is_pinned(tmp_path: Path) -> None:

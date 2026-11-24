@@ -158,7 +158,7 @@ def _claimed_over(
     hand-built (or deliberately broken) study objects instead of running it.
 
     :param Experiment experiment: Experiment the handle is claimed for.
-    :param Mapping[str, object] studies: Study stand-ins keyed by phase name.
+    :param Mapping[str, object] studies: One study stand-in per phase name.
     :return engine_ledger.ClaimedLedger: Handle whose ``studies`` are ``studies``.
     """
     validated = engine_ledger.validate_ledger(experiment)
@@ -171,7 +171,7 @@ def _claimed_over(
         artifact_root=validated.artifact_root,
         binding_state="bound",
         format_scan_failure=None,
-        studies=MappingProxyType(dict(studies)),  # type: ignore[arg-type]
+        studies=MappingProxyType({name: (study,) for name, study in studies.items()}),
         memory_storage=None,
     )
 

@@ -19,7 +19,7 @@ import optuna
 from optuna.exceptions import ExperimentalWarning
 from optuna.samplers._lazy_random_state import LazyRandomState
 
-from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.models import Phase
 from phasesweep.config.search import (
     _OPTUNA_EXACT_INT_LIMIT,
     CategoricalParam,
@@ -88,8 +88,9 @@ class _PhaseTrialStats:
     second read: it lists the RUNNING trials those counts describe, and is
     ``None`` exactly when ``available`` is ``False`` (the counts are unknown).
     A confirmed absent study has known zero counts and an empty attempt list.
-    ``published_trial_available`` checks the requested published trial identity
-    in that same snapshot; false also covers unreadable or absent storage.
+    ``published_trial_available`` says whether the same snapshot holds the requested published
+    trial identity, in whichever of the phase's studies it was selected from, with that study's
+    recorded count boundary met; false also covers unreadable or absent storage.
     """
 
     counts: dict[str, int]
@@ -262,12 +263,7 @@ def _published_trial_history_available(
     :param _TrialRef | None published_trial: Published trial and count boundary.
     :return bool: ``True`` when identity and every recorded count boundary survive.
     """
-    if not stats.available or not stats.published_trial_available or published_trial is None:
-        return False
-    finished = sum(stats.counts.get(state, 0) for state in FINISHED_TRIAL_STATES)
-    return _meets_published_trial_history_boundary(
-        finished, stats.counts.get("COMPLETE", 0), published_trial
-    )
+    return stats.available and stats.published_trial_available and published_trial is not None
 
 
 def _published_trial_matches(trial: optuna.trial.FrozenTrial, expected: _TrialRef) -> bool:
@@ -331,7 +327,8 @@ def _position_seed(base_seed: int, study_name: str, position: int, label: str) -
     """Derive the seed of one random choice from the draw position that owns it.
 
     :param int base_seed: The phase's ``sampler.seed``.
-    :param str study_name: The phase's study name.
+    :param str study_name: The phase's namespace (:func:`_study_namespace`), so every study of
+        a phase draws the same configurations whatever values it inherits.
     :param int position: The trial's draw position.
     :param str label: What the seed is for, such as a parameter name.
     :return int: A 32-bit seed, the same in every process for the same inputs.
@@ -441,7 +438,9 @@ class _PositionRandomSampler(optuna.samplers.RandomSampler):
                 return self._repeats.values[position % count]
             position //= count
             first = position * count
-        seed = _position_seed(self._base_seed, study.study_name, position, param_name)
+        seed = _position_seed(
+            self._base_seed, _study_namespace(study.study_name), position, param_name
+        )
         sampler = optuna.samplers.RandomSampler(seed=seed)
         distribution = _distribution_at(study, first, param_name, param_distribution)
         return sampler.sample_independent(study, trial, param_name, distribution)
@@ -641,7 +640,7 @@ class _PositionTPESampler(optuna.samplers.TPESampler):
         position = _draw_position(study, trial)
         label = f"tpe:{param_name}"
         self._rng = LazyRandomState(
-            _position_seed(self._base_seed, study.study_name, position, label)
+            _position_seed(self._base_seed, _study_namespace(study.study_name), position, label)
         )
         return super().sample_independent(study, trial, param_name, param_distribution)
 
@@ -702,7 +701,7 @@ class _PositionCmaEsSampler(optuna.samplers.CmaEsSampler):
         """
         position = _draw_position(study, trial)
         self._cma_rng = LazyRandomState(
-            _position_seed(self._base_seed, study.study_name, position, "cmaes")
+            _position_seed(self._base_seed, _study_namespace(study.study_name), position, "cmaes")
         )
         positioned = copy.copy(trial)
         positioned.number = position
@@ -869,12 +868,37 @@ def _suggest_all(trial: optuna.Trial, phase: Phase) -> dict[str, object]:
     return sampled
 
 
-def _phase_study_name(experiment: Experiment, phase: Phase | str) -> str:
-    """Return the stable Optuna study name for a phase.
+def _phase_namespace(experiment_name: str, phase_name: str) -> str:
+    """Return the name every study of one phase starts with.
 
-    :param Experiment experiment: Parsed experiment config supplying the experiment name.
-    :param Phase | str phase: Phase or historical phase name appended to the namespace.
-    :return str: Stable Optuna study name for the experiment/phase pair.
+    A phase that inherits nothing has one study, named exactly this; each study of a phase that
+    inherits appends ``::`` and a digest of the values it inherits
+    (:func:`phasesweep.engine.fingerprints.phase_study_name`). Experiment and phase names are
+    safe names, so they hold no ``:``.
+
+    :param str experiment_name: The experiment's name.
+    :param str phase_name: The phase's name, configured or historical.
+    :return str: ``<experiment>::<phase>``.
     """
-    name = phase if isinstance(phase, str) else phase.name
-    return f"{experiment.experiment}::{name}"
+    return f"{experiment_name}::{phase_name}"
+
+
+def _study_namespace(study_name: str) -> str:
+    """Return the phase namespace a study name starts with, without any inherited-value digest.
+
+    :param str study_name: A phase study's name.
+    :return str: Its ``<experiment>::<phase>`` part.
+    """
+    return "::".join(study_name.split("::")[:2])
+
+
+def _belongs_to_phase(study_name: str, experiment_name: str, phase_name: str) -> bool:
+    """Say whether a study holds trials of one phase, under any inherited values.
+
+    :param str study_name: Study name read from storage.
+    :param str experiment_name: The experiment's name.
+    :param str phase_name: The phase's name.
+    :return bool: Whether the name is the phase's namespace, alone or with a digest.
+    """
+    namespace = _phase_namespace(experiment_name, phase_name)
+    return study_name == namespace or study_name.startswith(f"{namespace}::")

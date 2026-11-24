@@ -19,8 +19,8 @@ from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Constraint, ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialEvidenceMissingError
+from phasesweep.engine.fingerprints import phase_study_name
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
@@ -896,7 +896,7 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     payload = winner_payload(experiment, generation_id)
     assert payload["trainer_input"] == phase_trials(experiment)[0].user_attrs[TRAINER_INPUT_ATTR]
     optuna.delete_study(
-        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        study_name=phase_study_name(experiment, experiment.phases[0], {}),
         storage=_resolve_storage(experiment.storage),
     )
 

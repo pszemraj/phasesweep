@@ -19,7 +19,7 @@ import logging
 import os
 import stat
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,8 +49,12 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.optuna import (
+    _belongs_to_phase,
     _build_sampler,
-    _phase_study_name,
+    _completed_trial_count,
+    _finished_trial_count,
+    _meets_published_trial_history_boundary,
+    _phase_namespace,
     _PhaseTrialStats,
     _published_trial_matches,
     _trial_count_state,
@@ -82,10 +86,12 @@ __all__ = [
     "ValidatedLedger",
     "claim_ledger",
     "log_storage_read_failure",
-    "open_existing_study",
+    "open_existing_studies",
     "open_phase_study",
     "open_preview_study",
     "open_registry_study",
+    "phase_trials",
+    "read_every_phase_study",
     "read_phase_studies",
     "read_phase_trials",
     "read_trial_stats",
@@ -147,9 +153,10 @@ class ClaimedLedger(ValidatedLedger):
     empty study. Only this handle permits :func:`open_phase_study` for trial execution.
     """
 
-    #: Existing phase studies from the ownership-checked discovery pass.
-    #: Preflight reaps and validates these same objects; absent studies are omitted.
-    studies: Mapping[str, optuna.Study]
+    #: Every existing study of each configured phase, oldest first, from the ownership-checked
+    #: discovery pass, whatever values each was addressed by. Preflight reaps and validates
+    #: these same objects; a phase with no study is omitted.
+    studies: Mapping[str, tuple[optuna.Study, ...]]
     #: The one storage every phase of a ``"memory"`` ledger shares, so the
     #: invocation can still read its own trials after a phase fails; ``None``
     #: for a journal ledger.
@@ -174,7 +181,10 @@ def _resolve_storage(url: str) -> JournalStorage:
 
 
 def _build_phase_study(
-    experiment: Experiment, phase: Phase, storage: optuna.storages.BaseStorage | None
+    experiment: Experiment,
+    phase: Phase,
+    storage: optuna.storages.BaseStorage | None,
+    study_name: str,
 ) -> optuna.Study:
     """Load a phase's Optuna study from already-resolved storage, creating it only if absent.
 
@@ -182,12 +192,13 @@ def _build_phase_study(
     even when ``create_study(load_if_exists=True)`` finds an existing name.
 
     :param Experiment experiment: Parsed experiment config supplying the metric direction.
-    :param Phase phase: Phase whose sampler, search space, and study name are used.
+    :param Phase phase: Phase whose sampler and search space are used.
     :param optuna.storages.BaseStorage | None storage: Resolved Optuna storage, or
         ``None`` for a fresh in-memory study.
+    :param str study_name: The study the phase addresses
+        (:func:`phasesweep.engine.fingerprints.phase_study_name`).
     :return optuna.Study: Loaded or newly created Optuna study for the phase.
     """
-    study_name = _phase_study_name(experiment, phase)
     sampler = _build_sampler(
         phase.sampler,
         sampler_search_space(phase),
@@ -720,34 +731,66 @@ def _unavailable_phase_trial_stats(
     return _PhaseTrialStats({}, False, {}, None)
 
 
-def _phase_trial_stats(
-    snapshot: JournalStorage, study_name: str, published_trial: _TrialRef | None
-) -> _PhaseTrialStats:
-    """Read one study's counts and RUNNING identities from a captured snapshot.
+def _published_history_retained(
+    snapshot: JournalStorage,
+    experiment_name: str,
+    phase_name: str,
+    expected: _TrialRef | None,
+    addressed: optuna.Study | None,
+) -> bool:
+    """Say whether a phase's published trial and its history survive in a captured snapshot.
 
-    Counts, RUNNING identities, and published trial verification all come
-    from ``snapshot``, so they describe the same moment. An absent study
-    reports available zero counts.
+    The published winner came from whichever of the phase's studies its parents' published
+    winners addressed, which need not be the one the phase addresses now, so every study of
+    the phase is searched; attempt identities are unique across them. The addressed study,
+    already loaded by the caller, is searched first, so the usual read loads no study twice.
 
     :param JournalStorage snapshot: Captured journal replay to read.
-    :param str study_name: Ledger study name of the phase inspected.
-    :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
-    :return _PhaseTrialStats: The study's available counts and identities.
-    :raises StudySchemaMismatchError: The study is populated under an
-        unsupported schema.
+    :param str experiment_name: The experiment's name.
+    :param str phase_name: The published phase.
+    :param _TrialRef | None expected: The published trial and its count boundary.
+    :param optuna.Study | None addressed: The study the phase addresses now, if it exists.
+    :return bool: Whether a study of the phase holds the trial and meets the boundary.
+    :raises StudySchemaMismatchError: A study of the phase is populated under an unsupported
+        schema.
     """
-    study = _load_snapshot_study(snapshot, study_name)
+    if expected is None:
+        return False
+
+    def candidates() -> Iterator[optuna.Study | None]:
+        if addressed is not None:
+            yield addressed
+        for name in _phase_study_names(snapshot, experiment_name, phase_name):
+            if addressed is None or name != addressed.study_name:
+                yield _load_snapshot_study(snapshot, name)
+
+    for study in candidates():
+        trials = [] if study is None else study.get_trials(deepcopy=False)
+        if any(_published_trial_matches(trial, expected) for trial in trials):
+            return _meets_published_trial_history_boundary(
+                _finished_trial_count(trials), _completed_trial_count(trials), expected
+            )
+    return False
+
+
+def _phase_trial_stats(study: optuna.Study | None) -> _PhaseTrialStats:
+    """Read one captured study's counts and RUNNING identities.
+
+    Counts and RUNNING identities come from one snapshot, so they describe the same moment.
+    An absent study reports available zero counts.
+
+    :param optuna.Study | None study: The phase's addressed study from the snapshot, if any.
+    :return _PhaseTrialStats: The study's available counts and identities.
+    """
     if study is None:
         return _PhaseTrialStats({}, True, {}, [])
+    study_name = study.study_name
     trials = study.get_trials(deepcopy=False)
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_TrialRef] = []
-    published_trial_available = False
     outcomes = _unique_trial_outcomes(study_name, trials)
     for trial in trials:
-        if published_trial is not None and _published_trial_matches(trial, published_trial):
-            published_trial_available = True
         state = _trial_count_state(trial)
         counts[state] = counts.get(state, 0) + 1
         generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
@@ -765,9 +808,7 @@ def _phase_trial_stats(
                 recovers_as=_recovered_trial_state(trial, outcomes.get(trial.number)),
             )
         )
-    return _PhaseTrialStats(
-        counts, True, generation_counts, running_attempts, published_trial_available
-    )
+    return _PhaseTrialStats(counts, True, generation_counts, running_attempts)
 
 
 def resolved_ledger_path(experiment: Experiment) -> Path | None:
@@ -844,31 +885,66 @@ def validate_ledger(experiment: Experiment) -> ValidatedLedger:
     return ledger
 
 
-def open_existing_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.Study | None:
-    """Open an existing live study through a completely validated ledger.
+def _phase_study_names(
+    storage: JournalStorage | optuna.storages.InMemoryStorage,
+    experiment_name: str,
+    phase_name: str,
+) -> list[str]:
+    """List every study of one phase in captured storage, oldest first.
 
-    Confirm existence in a read-only snapshot before constructing live storage;
-    absence creates neither a study nor a ledger file. The live replay must retain
-    the snapshot's trial identities. The returned study is writable, so observational
-    callers use :func:`read_trial_stats` or :func:`read_phase_trials` instead.
+    :param JournalStorage | optuna.storages.InMemoryStorage storage: Captured or
+        invocation-local storage.
+    :param str experiment_name: The experiment's name.
+    :param str phase_name: The phase's name.
+    :return list[str]: The phase's study names, whatever values each was addressed by.
+    :raises StudyStorageUnavailableError: The storage could not be replayed.
+    """
+    try:
+        studies = sorted(storage.get_all_studies(), key=lambda study: study._study_id)
+    except Exception as exc:
+        raise StudyStorageUnavailableError(
+            f"Snapshot storage could not be replayed while listing the studies of phase "
+            f"{phase_name!r}."
+        ) from exc
+    return [
+        study.study_name
+        for study in studies
+        if _belongs_to_phase(study.study_name, experiment_name, phase_name)
+    ]
 
-    This opener does not check the study's artifact root. The claiming or recovery
+
+def open_existing_studies(ledger: ValidatedLedger, phase_name: str) -> list[optuna.Study]:
+    """Open every existing live study of one phase through a completely validated ledger.
+
+    A phase that inherits holds one study per set of inherited values it ran under, and each of
+    them can hold a trial a crashed run left RUNNING, so recovery opens them all. Confirm
+    existence in a read-only snapshot before constructing live storage; absence creates neither
+    a study nor a ledger file. The live replay must retain the snapshot's trial identities. The
+    returned studies are writable, so observational callers use :func:`read_trial_stats` or
+    :func:`read_phase_trials` instead.
+
+    This opener does not check the studies' artifact root. The claiming or recovery
     caller must do that before writing or reaping.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
-    :param Phase | str phase: Phase or historical phase name whose study is opened.
-    :return optuna.Study | None: Existing study, or ``None`` when none exists.
+    :param str phase_name: Configured or historical phase name whose studies are opened.
+    :return list[optuna.Study]: The phase's studies, oldest first; empty when none exists.
     :raises StudyStorageUnavailableError: The handle's format scan did not
         complete, or persistent storage exists but could not be read, so
-        whether the study exists cannot be determined.
+        whether a study exists cannot be determined.
     """
     _require_scanned(ledger)
     if ledger.backend == "memory":
-        return None
+        return []
     assert ledger.storage_url is not None
-    return _open_existing_journal_study(
-        ledger.storage_url, _phase_study_name(ledger.experiment, phase)
+    snapshot = _journal_snapshot_storage(ledger.storage_url, f"the studies of phase {phase_name!r}")
+    if snapshot is None:
+        return []
+    opened = (
+        _open_existing_journal_study(ledger.storage_url, name)
+        for name in _phase_study_names(snapshot, ledger.experiment_name, phase_name)
     )
+    return [study for study in opened if study is not None]
 
 
 def repair_incomplete_journal_record(ledger: ValidatedLedger) -> None:
@@ -891,17 +967,22 @@ def repair_incomplete_journal_record(ledger: ValidatedLedger) -> None:
 
 
 def read_trial_stats(
-    ledger: ValidatedLedger, published_trials: Mapping[str, _TrialRef | None]
+    ledger: ValidatedLedger,
+    published_trials: Mapping[str, _TrialRef | None],
+    study_names: Mapping[str, str],
 ) -> dict[str, _PhaseTrialStats]:
     """Read all phase counts and RUNNING identities from one ledger snapshot.
 
     An unreadable or unverified ledger reports ``available=False`` for each phase.
     Study schemas are checked in the captured replay. Capture follows publication
     pointer resolution, so published trial references can be checked against it.
+    A phase with no addressed study reads as not started.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :param Mapping[str, _TrialRef | None] published_trials: Published local trial to
         verify in the same snapshot, by phase name.
+    :param Mapping[str, str] study_names: The study each phase addresses, by phase name
+        (:func:`phasesweep.engine.fingerprints.addressed_study_names`).
     :return dict[str, _PhaseTrialStats]: One permissive result per configured
         phase, by phase name, with explicit availability.
     :raises StudySchemaMismatchError: A phase's own study is populated under an
@@ -924,14 +1005,21 @@ def read_trial_stats(
         return {phase.name: _unavailable_phase_trial_stats(ledger, phase, exc) for phase in phases}
     stats: dict[str, _PhaseTrialStats] = {}
     for phase in phases:
+        study_name = study_names.get(phase.name)
         if snapshot is None:
             stats[phase.name] = _PhaseTrialStats({}, True, {}, [])
             continue
         try:
-            stats[phase.name] = _phase_trial_stats(
-                snapshot,
-                _phase_study_name(ledger.experiment, phase),
-                published_trials.get(phase.name),
+            addressed = None if study_name is None else _load_snapshot_study(snapshot, study_name)
+            stats[phase.name] = replace(
+                _phase_trial_stats(addressed),
+                published_trial_available=_published_history_retained(
+                    snapshot,
+                    ledger.experiment_name,
+                    phase.name,
+                    published_trials.get(phase.name),
+                    addressed,
+                ),
             )
         except StudySchemaMismatchError:
             raise
@@ -955,86 +1043,118 @@ class PhaseTrials:
     cleanup_recovered: frozenset[int]
 
 
-def _read_phase_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.Study | None:
-    """Read one phase study as a read-only snapshot without creating storage.
+def _snapshot_storage(
+    ledger: ValidatedLedger,
+) -> JournalStorage | optuna.storages.InMemoryStorage | None:
+    """Capture the storage a read-only snapshot read replays, without creating any.
 
-    The snapshot supports trial and attribute reads but rejects journal writes.
     In-memory trials are available only through the invocation's :class:`ClaimedLedger`.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger` or :func:`claim_ledger`.
-    :param Phase | str phase: Phase or historical phase name whose study is read.
-    :return optuna.Study | None: The snapshot study, or ``None`` when no such
-        study exists or this handle cannot reach it.
+    :return JournalStorage | optuna.storages.InMemoryStorage | None: A captured journal, the
+        invocation's own in-memory storage, or ``None`` when nothing is reachable.
     :raises StudyStorageUnavailableError: The handle's format scan did not
         complete, or the journal could not be completely read.
-    :raises StudySchemaMismatchError: The study is populated under an unsupported schema.
     """
     _require_scanned(ledger)
-    study_name = _phase_study_name(ledger.experiment, phase)
     if ledger.backend == "memory":
-        if not isinstance(ledger, ClaimedLedger) or ledger.memory_storage is None:
+        if not isinstance(ledger, ClaimedLedger):
             return None
-        return _load_snapshot_study(ledger.memory_storage, study_name)
+        return ledger.memory_storage
     assert ledger.storage_url is not None
-    return _load_journal_study_snapshot(ledger.storage_url, study_name)
+    return _journal_snapshot_storage(
+        ledger.storage_url, f"experiment {ledger.experiment_name!r} trial data"
+    )
 
 
-def read_phase_studies(ledger: ValidatedLedger) -> dict[str, optuna.Study | None]:
-    """Read every configured phase study from one journal capture, without writes.
+def read_phase_studies(
+    ledger: ValidatedLedger, study_names: Mapping[str, str]
+) -> dict[str, optuna.Study | None]:
+    """Read the study each phase addresses from one journal capture, without writes.
 
     All studies describe the same replay, including empty studies whose accepted
     trial targets still bind a launch.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger` or :func:`claim_ledger`.
+    :param Mapping[str, str] study_names: The study each phase addresses, by phase name
+        (:func:`phasesweep.engine.fingerprints.addressed_study_names`).
     :return dict[str, optuna.Study | None]: One entry per configured phase, by
-        phase name; ``None`` for a phase with no such study, or one this
-        handle cannot reach.
+        phase name; ``None`` for a phase with no such study, one with no addressed study, or
+        one this handle cannot reach.
     :raises StudyStorageUnavailableError: The handle's format scan did not
         complete, or the journal could not be completely read or replayed.
     :raises StudySchemaMismatchError: A study is populated under an unsupported schema.
     """
-    _require_scanned(ledger)
-    phases = ledger.experiment.phases
-    if ledger.backend == "memory":
-        return {phase.name: _read_phase_study(ledger, phase) for phase in phases}
-    assert ledger.storage_url is not None
-    snapshot = _journal_snapshot_storage(
-        ledger.storage_url, f"experiment {ledger.experiment_name!r} trial data"
-    )
+    snapshot = _snapshot_storage(ledger)
     studies: dict[str, optuna.Study | None] = {}
-    for phase in phases:
-        study_name = _phase_study_name(ledger.experiment, phase)
-        if snapshot is None:
-            studies[phase.name] = None
-            continue
-        studies[phase.name] = _load_snapshot_study(snapshot, study_name)
+    for phase in ledger.experiment.phases:
+        study_name = study_names.get(phase.name)
+        studies[phase.name] = (
+            None
+            if snapshot is None or study_name is None
+            else _load_snapshot_study(snapshot, study_name)
+        )
     return studies
 
 
-def read_phase_trials(ledger: ValidatedLedger, phase: Phase | str) -> PhaseTrials | None:
-    """Read one phase's trials from a validated ledger, writing nothing.
+def phase_trials(study: optuna.Study) -> PhaseTrials:
+    """Read a snapshot study's trials beside its confirmed cleanup recoveries.
 
-    The study comes from :func:`_read_phase_study`, so the trials and the
-    study's cleanup recovery ledger come from the same snapshot and describe
-    the same moment.
+    :param optuna.Study study: A read-only snapshot study.
+    :return PhaseTrials: Its trials and cleanup recoveries, from that one snapshot.
+    """
+    from phasesweep.engine.attempts import _cleanup_recovered_trial_numbers
+
+    return PhaseTrials(
+        trials=study.get_trials(deepcopy=False),
+        cleanup_recovered=frozenset(_cleanup_recovered_trial_numbers(study)),
+    )
+
+
+def read_phase_trials(ledger: ValidatedLedger, study_name: str) -> PhaseTrials | None:
+    """Read one phase study's trials from a validated ledger, writing nothing.
+
+    The trials and the study's cleanup recovery ledger come from the same snapshot and
+    describe the same moment.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger` or :func:`claim_ledger`.
-    :param Phase | str phase: Phase or historical phase name whose study is read.
+    :param str study_name: The study, as :func:`phasesweep.engine.fingerprints.phase_study_name`
+        names it.
     :return PhaseTrials | None: The study's trials and confirmed cleanup
         recoveries, or ``None`` when no such study exists or this handle cannot reach it.
     :raises StudyStorageUnavailableError: The handle's format scan did not
         complete, or the journal could not be completely read.
     :raises StudySchemaMismatchError: The study is populated under an unsupported schema.
     """
-    from phasesweep.engine.attempts import _cleanup_recovered_trial_numbers
+    snapshot = _snapshot_storage(ledger)
+    study = None if snapshot is None else _load_snapshot_study(snapshot, study_name)
+    return None if study is None else phase_trials(study)
 
-    study = _read_phase_study(ledger, phase)
-    if study is None:
-        return None
-    return PhaseTrials(
-        trials=study.get_trials(deepcopy=False),
-        cleanup_recovered=frozenset(_cleanup_recovered_trial_numbers(study)),
-    )
+
+def read_every_phase_study(
+    ledger: ValidatedLedger, phase_names: Iterable[str]
+) -> dict[str, list[optuna.Study]]:
+    """Read every study of each named phase from one capture, writing nothing.
+
+    :param ValidatedLedger ledger: Handle from :func:`validate_ledger` or :func:`claim_ledger`.
+    :param Iterable[str] phase_names: Phases, configured or historical.
+    :return dict[str, list[optuna.Study]]: Each phase's snapshot studies, oldest first, whatever
+        values each was addressed by; empty for a phase with none or a handle that reaches none.
+    :raises StudyStorageUnavailableError: The handle's format scan did not
+        complete, or the journal could not be completely read.
+    :raises StudySchemaMismatchError: A study is populated under an unsupported schema.
+    """
+    snapshot = _snapshot_storage(ledger)
+    studies: dict[str, list[optuna.Study]] = {}
+    for phase_name in phase_names:
+        names = (
+            []
+            if snapshot is None
+            else _phase_study_names(snapshot, ledger.experiment_name, phase_name)
+        )
+        loaded = (None if snapshot is None else _load_snapshot_study(snapshot, n) for n in names)
+        studies[phase_name] = [study for study in loaded if study is not None]
+    return studies
 
 
 # Creating a directory fails with these when the configured path itself is
@@ -1102,21 +1222,24 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
         ledger = replace(ledger, format_scan_failure=None)
     repair_incomplete_journal_record(ledger)
     experiment = ledger.experiment
-    loaded: dict[str, optuna.Study] = {}
+    loaded: dict[str, tuple[optuna.Study, ...]] = {}
     for phase in experiment.phases:
         try:
-            study = open_existing_study(ledger, phase)
+            studies = open_existing_studies(ledger, phase.name)
         except Exception as exc:
             unavailable = StudyStorageUnavailableError.rewrap(
                 exc, f"Could not inspect persistent study storage for phase {phase.name!r}."
             )
             raise unavailable from exc
-        if study is not None:
-            loaded[phase.name] = study
+        if studies:
+            loaded[phase.name] = tuple(studies)
     _check_published_phase_studies(experiment, loaded, from_phase=from_phase)
     # An in-memory ledger loads no studies, so only persistent studies are claimed.
     claimable = [
-        study for study in loaded.values() if _artifact_root_claim_needed(study, experiment)
+        study
+        for studies in loaded.values()
+        for study in studies
+        if _artifact_root_claim_needed(study, experiment)
     ]
     offered = _artifact_root_identity(experiment)
     binding_state = _check_artifact_root_binding(experiment)
@@ -1151,7 +1274,7 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     )
 
 
-def open_phase_study(ledger: ClaimedLedger, phase: Phase) -> optuna.Study:
+def open_phase_study(ledger: ClaimedLedger, phase: Phase, study_name: str) -> optuna.Study:
     """Open or create a phase's live study for writing on a claimed ledger.
 
     The handle must be a :class:`ClaimedLedger` at runtime as well as in its type.
@@ -1159,7 +1282,9 @@ def open_phase_study(ledger: ClaimedLedger, phase: Phase) -> optuna.Study:
     reconfirm an existing study's root.
 
     :param ClaimedLedger ledger: Handle from :func:`claim_ledger`.
-    :param Phase phase: Phase whose sampler, search space, and study name are used.
+    :param Phase phase: Phase whose sampler and search space are used.
+    :param str study_name: The study the phase addresses under its parents' winners
+        (:func:`phasesweep.engine.fingerprints.phase_study_name`).
     :return optuna.Study: The phase's live study, bound to the claimed artifact root.
     :raises TypeError: ``ledger`` is not a :class:`ClaimedLedger`.
     :raises ArtifactRootConflictError: The study is already bound to a different
@@ -1177,7 +1302,7 @@ def open_phase_study(ledger: ClaimedLedger, phase: Phase) -> optuna.Study:
     else:
         assert ledger.storage_url is not None
         storage = _resolve_storage(ledger.storage_url)
-    study = _build_phase_study(experiment, phase, storage)
+    study = _build_phase_study(experiment, phase, storage, study_name)
     _bind_study_artifact_root(study, experiment)
     return study
 
@@ -1185,11 +1310,16 @@ def open_phase_study(ledger: ClaimedLedger, phase: Phase) -> optuna.Study:
 def open_preview_study(experiment: Experiment, phase: Phase) -> optuna.Study:
     """Create a fresh in-memory study for a dry run without resolving configured storage.
 
+    Its draws depend on the phase's namespace alone, so it samples what any study of the
+    phase would.
+
     :param Experiment experiment: Parsed experiment supplying direction and study name.
     :param Phase phase: Phase whose sampler and search space the preview uses.
     :return optuna.Study: Fresh in-memory study for the phase.
     """
-    return _build_phase_study(experiment, phase, None)
+    return _build_phase_study(
+        experiment, phase, None, _phase_namespace(experiment.experiment, phase.name)
+    )
 
 
 def _require_replay_matches_snapshot(

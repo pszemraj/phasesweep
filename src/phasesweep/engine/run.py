@@ -41,7 +41,7 @@ from phasesweep.engine.optuna import _finished_trial_count, _trial_count_state
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.preview import (
     PhasePreview,
-    RecordedPhase,
+    RecordedStudies,
     _dry_run_total_line,
     _preview_ledger,
     _preview_phase,
@@ -386,8 +386,11 @@ def _run_experiment_outcome(
             if cleanup.unreadable_evidence:
                 # New trials would bury finished training the tracker has yet to report.
                 raise attempt_ops._pending_evidence_refusal(cleanup.unreadable_evidence)
-            # Validate candidate evidence after recovery and before launching new work.
-            evidence_ops._validate_selection_evidence(experiment, existing_studies)
+            # Validate candidate evidence after recovery and before launching new work; a phase
+            # that inherits validates the study it addresses once the run reaches it.
+            evidence_ops._validate_selection_evidence(
+                experiment, guard_ops.known_studies(experiment, existing_studies)
+            )
             resume_ops._reject_fixed_targets_without_study(
                 experiment,
                 from_phase=from_phase,
@@ -622,7 +625,11 @@ def _mirror_publication(
 
 
 def _phase_counts(
-    ledger: ledger_ops.ValidatedLedger, phase: Phase, generation_id: str, winner: Winner
+    ledger: ledger_ops.ValidatedLedger,
+    phase: Phase,
+    study_name: str,
+    generation_id: str,
+    winner: Winner,
 ) -> PhaseCounts | None:
     """Count a finished phase's trials by recorded state, and the counted ones an earlier run recorded.
 
@@ -633,12 +640,13 @@ def _phase_counts(
 
     :param ledger_ops.ValidatedLedger ledger: The run's ledger, memory-backed or journal-backed.
     :param Phase phase: The phase that just ended.
+    :param str study_name: The study the phase ran in.
     :param str generation_id: This run's generation, which its own trials carry.
     :param Winner winner: The phase's winner, whose trials' directories the counts carry.
     :return PhaseCounts | None: The counts, or ``None`` when the phase's trials cannot be read.
     """
     try:
-        read = ledger_ops.read_phase_trials(ledger, phase)
+        read = ledger_ops.read_phase_trials(ledger, study_name)
     except (PhaseSweepError, OSError) as exc:
         log.warning("Could not count phase %r's trials for the run summary: %s", phase.name, exc)
         return None
@@ -700,7 +708,7 @@ def _run_experiment_inner(
     dry_run = ledger is None
     skip_until = from_phase is not None
     winners: dict[str, Winner] = {}
-    recorded: dict[str, RecordedPhase | None] = {}
+    recorded: RecordedStudies | None = None
     previews: list[PhasePreview] = []
     preview_context = ""
     if run_deadline is None and not dry_run and experiment.timeout_seconds_per_run is not None:
@@ -762,7 +770,14 @@ def _run_experiment_inner(
         skip_until = False
 
         if ledger is None:
-            previews.append(_preview_phase(experiment, phase, inherited, recorded.get(phase.name)))
+            previews.append(
+                _preview_phase(
+                    experiment,
+                    phase,
+                    inherited,
+                    None if recorded is None else recorded[phase.name],
+                )
+            )
             winner = previews[-1].winner
         else:
             assert generation is not None
@@ -775,7 +790,10 @@ def _run_experiment_inner(
                 run_deadline=run_deadline,
                 tracking=tracking,
             )
-            counts = _phase_counts(ledger, phase, generation.generation_id, winner)
+            study_name = fingerprint_ops.phase_study_name(
+                experiment, phase, fingerprint_ops._inherited_override_payload(phase, inherited)
+            )
+            counts = _phase_counts(ledger, phase, study_name, generation.generation_id, winner)
             if counts is not None:
                 generation.phase_counts[phase.name] = counts
         if generation is not None:

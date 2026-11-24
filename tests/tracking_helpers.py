@@ -281,7 +281,7 @@ def leave_cleanup_uncertain_attempt(experiment, monkeypatch, **run_kwargs):
         patch.setattr(cleanup_module, "_resolve_attempt", unproven)
         with pytest.raises(UnsafeProcessCleanupError):
             run_experiment(experiment, **run_kwargs)
-    read = read_phase_trials(validate_ledger(experiment), "depth")
+    read = read_phase_trials(validate_ledger(experiment), f"{experiment.experiment}::depth")
     [trial] = read.trials
     assert trial.state == TrialState.FAIL
     assert trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
@@ -486,7 +486,9 @@ def killed_sweep(
         bindings = session.attempt_tracking_records(experiment, session.BINDING_FILE, generation_id)
         assert len(bindings) == n_jobs
         return experiment, uploads, [session.read_binding(b.parent)["attempt_id"] for b in bindings]
-    trials = read_phase_trials(validate_ledger(experiment), "depth").trials
+    trials = read_phase_trials(
+        validate_ledger(experiment), f"{experiment.experiment}::depth"
+    ).trials
     state = TrialState.RUNNING if in_flight else TrialState.COMPLETE
     assert [trial.state for trial in trials] == [state] * n_jobs
     return experiment, uploads, [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials]
