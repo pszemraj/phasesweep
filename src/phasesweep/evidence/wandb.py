@@ -24,9 +24,6 @@ _HistoryRead = Literal["settled", "lagging", "retry"]
 transient failure worth another read."""
 
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
-# How long history may lag the summary of a run whose capture was accepted. Complete
-# history reads may use the remaining deadline.
-_FINISH_SETTLE_SECONDS = 30.0
 _HISTORY_RETRY_SECONDS = 2.0
 # Server row cap for unsampled history requests and scan pages.
 _HISTORY_SAMPLES = 10_000
@@ -422,7 +419,7 @@ def _history_position(
     neighbors or a malformed final row disqualify this fallback. Recognized
     aggregate suffixes use the underlying series' final position.
 
-    History is lagging until its index reaches the summary step and all counted
+    History is lagging until its index exists, reaches the summary step and all counted
     series rows are read. The axis must be logged alongside the metric. Transient
     read failures and deadline expiry request retry; other failures settle with
     no position. The captured objective is never changed.
@@ -446,10 +443,10 @@ def _history_position(
     position: int | float | None = None
     try:
         run.load(force=True)
-        index = run.history_keys
-        if index["lastStep"] < last_step:
+        indexed = _last_history_step(run)
+        if indexed is None or indexed < last_step:
             return "lagging", None
-        logged_keys = index["keys"]
+        logged_keys = run.history_keys["keys"]
         if metric_key in logged_keys:
             series = metric_key
         elif dot and aggregation in {"min", "max", "mean", "last", "first"} and head in logged_keys:
@@ -646,33 +643,38 @@ def _poll_wandb_summary(
 
 
 def _last_history_step(run: object) -> int | float | None:
-    """Return the last history step from the same answer as the run's state and summary.
+    """Return the last step of the history index in the same answer as the run's summary.
 
     ``Api.run`` fetches the run's ``historyKeys`` index with its state and summary, so the
-    two describe one moment, unlike a separate ``lastHistoryStep`` query.
+    two describe one moment, unlike a separate ``lastHistoryStep`` query. W&B serves the
+    index after the summary, as ``null``, a ``lastStep`` of -1 or no keys, so any of
+    those reads as no indexed history.
 
     :param object run: Public-API run.
-    :return int | float | None: The step, or ``None`` when the run has no history row or
-        the answer carried no index.
+    :return int | float | None: The step, or ``None`` when no history is indexed.
     """
     index = getattr(run, "history_keys", None)
-    return finite_nonnegative(index.get("lastStep")) if isinstance(index, Mapping) else None
+    if not isinstance(index, Mapping):
+        return None
+    keys = index.get("keys")
+    if not isinstance(keys, Mapping) or not keys:
+        return None
+    return finite_nonnegative(index.get("lastStep"))
 
 
 def _summary_matches_history(run: object, summary: Mapping[str, object]) -> bool:
-    """Say whether a finished run's summary is as far as its history.
+    """Say whether a finished run's summary and history index are both fully served.
 
     The summary's ``_step`` is the step of the last logged row, so a summary behind the
-    history, or empty while history exists, is still being ingested. An answer without
-    a history index leaves nothing to compare, so its summary is taken as it is.
+    index, a summary with a ``_step`` before the index exists, or an empty summary while
+    the index exists is still being ingested. Only a run that never logged a row has
+    neither.
 
     :param object run: Public-API run.
     :param Mapping[str, object] summary: Its decoded summary.
-    :return bool: Whether the summary's ``_step`` equals the history's last step, both
-        absent counting as equal, or the answer carried no index.
+    :return bool: Whether the summary's ``_step`` equals the index's last step, both
+        absent counting as equal.
     """
-    if not isinstance(getattr(run, "history_keys", None), Mapping):
-        return True
     return finite_nonnegative(summary.get("_step")) == _last_history_step(run)
 
 
@@ -704,8 +706,9 @@ def _locate_wandb_position(
 ) -> int | float | None:
     """Read a finished run's objective position within the parent's deadline.
 
-    History has _FINISH_SETTLE_SECONDS to catch up; reads and transient retries
-    may use the rest of the deadline. Other failures return no position.
+    Lagging history and transient failures are read again until the deadline; other
+    failures return no position. The summary capture already waited for the history
+    index, so lagging reads are rare; a read short of the index's row count is one.
 
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
@@ -722,7 +725,6 @@ def _locate_wandb_position(
     """
     from wandb.apis.public import Api
 
-    settle_by = min(deadline, time.monotonic() + _FINISH_SETTLE_SECONDS)
     interval = min(poll_seconds, _HISTORY_RETRY_SECONDS)
     run: Any = None
     while True:
@@ -748,8 +750,7 @@ def _locate_wandb_position(
             )
             if read == "settled":
                 return position
-        retry_by = settle_by if read == "lagging" else deadline
-        if time.monotonic() + interval >= retry_by:
+        if time.monotonic() + interval >= deadline:
             return None
         time.sleep(interval)
 

@@ -265,7 +265,8 @@ class _HistoryRun:
     """A finished run whose history, and the index describing it, a test controls.
 
     ``indexed_steps`` are the index's last steps on successive loads before it
-    reaches the last row; ``visible`` slices the rows successive reads return
+    reaches the last row, ``None`` for a null index and -1 for one without keys, as W&B
+    serves before indexing; ``visible`` slices the rows successive reads return
     before all of them are visible, as reads just after a run finishes do.
     """
 
@@ -284,14 +285,19 @@ class _HistoryRun:
         for row in self.rows:
             for key in row.keys() - {"_step"}:
                 counts[key] = counts.get(key, 0) + 1
-        last_step = max((row["_step"] for row in self.rows), default=-1)
-        self.history_keys = {
-            "lastStep": next(self.indexed_steps, last_step),
-            "keys": {
-                key: {"typeCounts": [{"type": "number", "count": count}]}
-                for key, count in counts.items()
-            },
-        }
+        indexed = next(self.indexed_steps, max((row["_step"] for row in self.rows), default=-1))
+        self.history_keys = (
+            None
+            if indexed is None
+            else {
+                "lastStep": indexed,
+                "keys": {
+                    key: {"typeCounts": [{"type": "number", "count": count}]}
+                    for key, count in counts.items()
+                    if indexed >= 0
+                },
+            }
+        )
 
     def _logged(self, keys):
         # Like the server, only rows that logged every requested key.
@@ -456,7 +462,7 @@ def test_wandb_read_short_of_the_indexed_row_count_is_retried(
 
 
 def test_wandb_slow_summary_polling_still_retries_history(monkeypatch):
-    """A summary poll interval past the settle window must not leave one history read."""
+    """A summary poll interval as long as the budget must not leave one history read."""
     monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_RETRY_SECONDS", 0.001)
     run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, visible=[slice(-2, None)])
     position = _history_position(
@@ -489,23 +495,24 @@ def test_wandb_dotted_history_series_is_read_before_its_head(monkeypatch):
     assert run.reads == [("history", ["eval/loss.ema", "eval/step"])]
 
 
-def test_wandb_waits_for_history_to_reach_the_summary_step(monkeypatch):
-    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=[3, 4])
+@pytest.mark.parametrize("indexed_steps", [[3, 4], [None, -1, -1]], ids=["behind", "unindexed"])
+def test_wandb_waits_for_history_to_reach_the_summary_step(monkeypatch, indexed_steps):
+    """An index behind the summary, or not yet served at all, is waited for before any read."""
+    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=indexed_steps)
     assert _history_position(monkeypatch, run, axis="eval/step") == 400
     assert len(run.reads) == 1
 
 
-def test_wandb_history_that_never_settles_stops_at_the_settle_window(monkeypatch):
-    monkeypatch.setattr("phasesweep.evidence.wandb._FINISH_SETTLE_SECONDS", 0.05)
+def test_wandb_history_that_never_settles_stops_at_the_deadline(monkeypatch):
     run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=[3] * 10**6)
     start = time.monotonic()
-    assert _history_position(monkeypatch, run, timeout_seconds=60) is None
-    assert time.monotonic() - start < 30
+    assert _history_position(monkeypatch, run, timeout_seconds=0.2) is None
+    assert 0.1 < time.monotonic() - start < 30
     assert run.reads == []
 
 
-def test_wandb_transient_history_failure_retries_past_the_settle_window(monkeypatch):
-    """Only waiting for history to catch up is bounded by the settle window."""
+def test_wandb_transient_history_failure_retries_until_the_deadline(monkeypatch):
+    """A history read that fails in transport after a long wait is read again within the deadline."""
     clock = _fake_wandb_clock(monkeypatch)
 
     class FlakyRun(_HistoryRun):
@@ -523,10 +530,8 @@ def test_wandb_transient_history_failure_retries_past_the_settle_window(monkeypa
 
 
 @pytest.mark.parametrize(("timeout", "expected"), [(120, 400), (70, None)])
-def test_wandb_history_read_may_outlast_the_settle_window_but_not_the_deadline(
-    monkeypatch, timeout, expected
-):
-    """A history read may outlast the settle window, bounded by the deadline."""
+def test_wandb_history_read_is_bounded_by_the_deadline(monkeypatch, timeout, expected):
+    """A slow history read is used when it ends before the deadline."""
     clock = ManualClock()
     monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", clock.monotonic)
     monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SAMPLES", 1)

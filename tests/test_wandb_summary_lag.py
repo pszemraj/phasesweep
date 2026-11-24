@@ -22,8 +22,23 @@ from tests.tracking_helpers import ManualClock
 _LAUNCHED_AT = 1_000.0
 _KEY = "eval/loss.min"
 
-Answer = tuple[str, dict[str, object], int]
-"""A run's state, its summary, and the last history step in the same answer (-1 for none)."""
+Answer = tuple[str, dict[str, object], int | None]
+"""A run's state, its summary, and its history index's last step in the same answer.
+
+-1 is an index with no keys and ``None`` a null index, as W&B serves before indexing.
+"""
+
+
+def _history_index(last_step: int | None) -> dict[str, object] | None:
+    """Build the ``historyKeys`` index W&B serves for a last step.
+
+    :param int | None last_step: The index's last step, -1 unindexed, ``None`` null.
+    :return dict[str, object] | None: The index.
+    """
+    if last_step is None:
+        return None
+    keys = {} if last_step < 0 else {"eval/loss": {"typeCounts": [{"count": last_step + 1}]}}
+    return {"lastStep": last_step, "keys": keys}
 
 
 def _poll(
@@ -78,7 +93,7 @@ def _serve(
             paths.append(path)
             state, summary, last_step = answers(len(paths) - 1)
             return SimpleNamespace(
-                state=state, summary_metrics=summary, history_keys={"lastStep": last_step}
+                state=state, summary_metrics=summary, history_keys=_history_index(last_step)
             )
 
     monkeypatch.setattr(public, "Api", Api)
@@ -101,6 +116,29 @@ def test_a_finished_runs_summary_served_a_minute_late_is_read_once_served(
     assert _poll()["values"] == {_KEY: 0.1}
     assert len(paths) == 13
     assert clock.now == 60
+
+
+@pytest.mark.parametrize("unindexed", [-1, None], ids=["no-keys", "null"])
+def test_a_summary_served_before_the_history_index_is_not_read(
+    monkeypatch: pytest.MonkeyPatch, unindexed: int | None
+) -> None:
+    """A summary that arrives while the history index is still unserved waits for the index, as on the live service."""
+    served = {"_step": 3, _KEY: 0.1, "_timestamp": 50.0}
+
+    def answer(read: int) -> Answer:
+        # Polls at 0 and 5 s: running, then finished, both before the summary arrives.
+        if read == 0:
+            return "running", {}, unindexed
+        if read < 12:
+            return "finished", {}, unindexed
+        if read == 12:
+            return "finished", served, unindexed
+        return "finished", served, 3
+
+    clock, paths = _serve(monkeypatch, answer)
+    assert _poll()["values"] == {_KEY: 0.1}
+    assert len(paths) == 14
+    assert clock.now == 65
 
 
 def test_a_gate_only_read_waits_for_the_summary_to_reach_the_history(
@@ -217,11 +255,11 @@ def test_the_real_client_reads_the_history_index_with_the_summary(tmp_path, monk
     clients: list[object] = []
     responses = iter(
         [
-            {"state": "finished", "summaryMetrics": "{}", "historyKeys": {"lastStep": 3}},
+            {"state": "finished", "summaryMetrics": "{}", "historyKeys": _history_index(3)},
             {
                 "state": "finished",
                 "summaryMetrics": json.dumps({"_step": 3, _KEY: 0.1}),
-                "historyKeys": {"lastStep": 3},
+                "historyKeys": _history_index(3),
             },
         ]
     )
