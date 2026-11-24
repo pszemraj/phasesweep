@@ -74,8 +74,7 @@ from phasesweep.engine.publication import (
 from phasesweep.engine.read import (
     _read_generation_selection,
     _represented_winners,
-    experiment_status,
-    phase_refusals,
+    inspect_status,
     read_trial_tables,
     require_study,
     unpublished_winner_step,
@@ -1429,7 +1428,8 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
         )
         return
     ledger = validate_ledger(config)
-    payload = experiment_status(config, ledger=ledger)
+    inspection = inspect_status(config, ledger)
+    payload = inspection.payload
     phases = payload.get("phases")
     phase_payloads = (
         [phase for phase in phases if isinstance(phase, dict)] if isinstance(phases, list) else []
@@ -1449,7 +1449,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     if running and suggest_resume:
         click.echo(unsettled_running_comment(running))
     # A recorded refusal needs no idle probe: it holds whether or not a run is active.
-    refusals = phase_refusals(config, ledger)
+    refusals = inspection.refusals
     for refusal in refusals.values():
         for line in _operational_error_text(refusal).splitlines():
             click.echo(f"# {line}")

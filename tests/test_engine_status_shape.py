@@ -18,6 +18,7 @@ from phasesweep import experiment_status, run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Sampler
+from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_dir,
@@ -153,6 +154,60 @@ def test_inspection_uses_one_current_pointer_capture(
     pinned = experiment_status(experiment, generation_id=generation)
     assert pinned["current_generation_id"] == "next-generation"
     assert pinned["represented_generation_id"] == generation
+
+
+def test_status_judges_a_refused_dependent_inside_its_one_pointer_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Status reads the pointer once and judges a child refused after its parent's top-up with the winners from that read, even when a generation is claimed right after it."""
+
+    def plan(choices: list[int]) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            phases=[
+                Phase(
+                    name="parent",
+                    n_trials=len(choices),
+                    gpu_policy="none",
+                    sampler=Sampler(type="grid"),
+                    search_space={"x": CategoricalParam(type="categorical", choices=choices)},
+                ),
+                Phase(
+                    name="child",
+                    n_trials=1,
+                    gpu_policy="none",
+                    inherits=["parent"],
+                    sampler=Sampler(type="random", seed=0),
+                    search_space={"y": IntParam(type="int", low=0, high=3)},
+                ),
+            ],
+        )
+
+    run_experiment(plan([3, 5]))
+    grown = plan([3, 5, 1])
+    with pytest.raises(StudyFingerprintMismatchError):
+        run_experiment(grown)
+    config = write_experiment_config(tmp_path / "grown.yaml", grown)
+    pointer = _generation_path(grown)
+    _generation_dir(_experiment_dir(grown), "next-generation").mkdir()
+    original_read = engine_read.read_yaml_or_none
+    reads: list[None] = []
+
+    def claim_after_read(path: Path) -> JsonValue:
+        payload = original_read(path)
+        if path == pointer:
+            reads.append(None)
+            pointer.write_text(yaml.safe_dump({"generation_id": "next-generation"}))
+        return payload
+
+    with monkeypatch.context() as capture:
+        capture.setattr(engine_read, "read_yaml_or_none", claim_after_read)
+        result = CliRunner().invoke(cli, ["status", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert len(reads) == 1
+    assert "# Study 't::child' was created with a different config." in result.output
+    assert "inherited_effective_overrides.x: 3 -> 1" in result.output
 
 
 def test_experiment_status_shape_is_pinned(tmp_path: Path) -> None:

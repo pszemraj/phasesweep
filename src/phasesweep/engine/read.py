@@ -812,7 +812,7 @@ def read_status(
     :return EngineStatus: Identities, integrity, result semantics, progress and artifact
         presence. Path-free ``publication_error`` appears only for failed or denied validation.
     """
-    status, _publication = _read_status(
+    status, _publication, _latest = _read_status(
         experiment,
         generation_id=generation_id,
         trial_generation_id=trial_generation_id,
@@ -856,7 +856,7 @@ def read_result(
         else [_validate_safe_name("phase", name) for name in phase_names]
     )
     ledger = validate_ledger(experiment) if ledger is None else ledger
-    status, publication = _read_status(
+    status, publication, _latest = _read_status(
         experiment,
         generation_id=generation_id,
         trial_generation_id=None,
@@ -882,7 +882,7 @@ def _read_status(
     comparison_experiment: Experiment | None,
     latest: bool = False,
     ledger: ValidatedLedger | None = None,
-) -> tuple[EngineStatus, PublicationPointer]:
+) -> tuple[EngineStatus, PublicationPointer, dict[str, PhaseWinnerView]]:
     """Build the :func:`read_status` payload and return the resolution behind it.
 
     :param Experiment experiment: Parsed experiment config whose phases are inspected.
@@ -898,8 +898,10 @@ def _read_status(
         is bound to a different storage ledger or experiment.
     :raises ValueError: If ``generation_id`` or ``trial_generation_id`` is not a safe
         generation name.
-    :return tuple[EngineStatus, PublicationPointer]: The status payload and
-        the single pointer resolution every fact in it came from.
+    :return tuple[EngineStatus, PublicationPointer, dict[str, PhaseWinnerView]]: The status
+        payload, the single pointer resolution every fact in it came from, and, for a ``latest``
+        read of a usable publication, each phase's latest usable winner from that same
+        resolution (empty otherwise).
     """
     ledger = validate_ledger(experiment) if ledger is None else ledger
     current_generation_id, represented_generation_id, publication = _read_generation_selection(
@@ -1047,7 +1049,7 @@ def _read_status(
             phase_payload["winner_config_matches_current"] = (
                 None if view is None else view.config_matches_current
             )
-    return status, publication
+    return status, publication, {} if latest_winners is None else latest_winners
 
 
 @dataclass(frozen=True)
@@ -1192,42 +1194,14 @@ def _status_phase_refusal(phase: Phase, study: optuna.Study) -> PhaseAbortRefuse
     return _phase_refusal(phase, study, policy)
 
 
-def _latest_winners(experiment: Experiment, ledger: ValidatedLedger) -> dict[str, Winner]:
-    """Read the winner each phase hands its dependents on the next run: its latest usable one.
-
-    :param Experiment experiment: Current config whose phases are read.
-    :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
-    :return dict[str, Winner]: The latest winner by phase name, without the phases that have
-        none or when the publication cannot be read.
-    """
-    _current, represented, publication = _read_generation_selection(experiment, latest=True)
-    if publication.state not in {"ok", "absent"}:
-        return {}
-    views = _represented_winners(
-        experiment,
-        publication,
-        represented,
-        [phase.name for phase in experiment.phases],
-        ledger=ledger,
-        fallback_published=True,
-    )
-    return {
-        view.phase: Winner(
-            trial_number=view.trial_number,
-            params=dict(view.params),
-            effective_overrides=dict(view.effective_overrides),
-            metric=view.metric,
-        )
-        for view in views
-    }
-
-
 PhaseRefusal: TypeAlias = (
     PhaseAbortRefusedError | StudySchemaMismatchError | StudyFingerprintMismatchError
 )
 
 
-def phase_refusals(experiment: Experiment, ledger: ValidatedLedger) -> dict[str, PhaseRefusal]:
+def _phase_refusals(
+    experiment: Experiment, ledger: ValidatedLedger, latest: Mapping[str, PhaseWinnerView]
+) -> dict[str, PhaseRefusal]:
     """Give the refusal a run would meet at each phase.
 
     A phase's recorded failure policy is judged first, as a run's preflight does. Otherwise a
@@ -1240,6 +1214,8 @@ def phase_refusals(experiment: Experiment, ledger: ValidatedLedger) -> dict[str,
     :param Experiment experiment: Current config, which decides whether a recorded abort is
         retired.
     :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
+    :param Mapping[str, PhaseWinnerView] latest: Each phase's latest usable winner, from the
+        status read's own pointer capture, so one command resolves the pointers once.
     :return dict[str, PhaseRefusal]: Refusals or invalid policy diagnostics by phase name; empty
         without a readable ledger.
     """
@@ -1249,7 +1225,15 @@ def phase_refusals(experiment: Experiment, ledger: ValidatedLedger) -> dict[str,
         studies = read_phase_studies(ledger)
     except StudyStorageUnavailableError:
         return {}
-    winners: dict[str, Winner] | None = None
+    winners = {
+        name: Winner(
+            trial_number=view.trial_number,
+            params=dict(view.params),
+            effective_overrides=dict(view.effective_overrides),
+            metric=view.metric,
+        )
+        for name, view in latest.items()
+    }
     refusals: dict[str, PhaseRefusal] = {}
     for phase in experiment.phases:
         study = studies[phase.name]
@@ -1265,8 +1249,6 @@ def phase_refusals(experiment: Experiment, ledger: ValidatedLedger) -> dict[str,
             continue
         if not study.get_trials(deepcopy=False):
             continue
-        if winners is None:
-            winners = _latest_winners(experiment, ledger)
         if not all(parent in winners for parent in phase.inherits):
             continue
         try:
@@ -1289,7 +1271,7 @@ def unpublished_winner_step(
     """Give one publication remedy from a phase without a feasible winner, for an idle experiment.
 
     A recorded abort or failure streak, or a study its inherited values no longer match, is
-    :func:`phase_refusals`' to report.
+    :func:`inspect_status`' refusals to report.
 
     :param Experiment experiment: Current config used to inspect durable phase policy.
     :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
@@ -1348,8 +1330,49 @@ def experiment_status(
     :raises WinnerIntegrityError: An unpublished winner's producing snapshot is unavailable or invalid.
     :return JsonObject: Paths, pointer identities, integrity, phase counts and labeled winners.
     """
+    payload, _latest = _experiment_status(experiment, generation_id=generation_id, ledger=ledger)
+    return payload
+
+
+@dataclass(frozen=True)
+class StatusInspection:
+    """What ``status`` prints, all from one pointer capture: the payload and each phase's refusal."""
+
+    payload: JsonObject
+    refusals: dict[str, PhaseRefusal]
+
+
+def inspect_status(experiment: Experiment, ledger: ValidatedLedger) -> StatusInspection:
+    """Read :func:`experiment_status` and the refusal a run would meet at each phase, at once.
+
+    The refusals judge dependents with the latest winners the payload shows, from the same
+    pointer resolution, so a generation claimed during the command cannot split the two.
+
+    :param Experiment experiment: Parsed experiment config to inspect.
+    :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
+    :raises StudyStorageUnavailableError: No study has started at the configured root.
+    :raises ArtifactRootConflictError: The root belongs to another ledger or experiment.
+    :raises StudySchemaMismatchError: The stored study format is unsupported.
+    :raises WinnerIntegrityError: An unpublished winner's producing snapshot is unavailable or invalid.
+    :return StatusInspection: The status payload and the refusals by phase name.
+    """
+    payload, latest = _experiment_status(experiment, generation_id=None, ledger=ledger)
+    return StatusInspection(payload, _phase_refusals(experiment, ledger, latest))
+
+
+def _experiment_status(
+    experiment: Experiment, *, generation_id: str | None, ledger: ValidatedLedger | None
+) -> tuple[JsonObject, dict[str, PhaseWinnerView]]:
+    """Build the :func:`experiment_status` payload and keep the winners it labels.
+
+    :param Experiment experiment: Parsed experiment config to inspect.
+    :param str | None generation_id: Optional generation pin, disabling published fallback.
+    :param ValidatedLedger | None ledger: Handle the caller already validated, or ``None``.
+    :return tuple[JsonObject, dict[str, PhaseWinnerView]]: The payload and each phase's latest
+        usable winner from the same pointer resolution, empty for a pinned or unusable read.
+    """
     require_study(experiment)
-    status, _ = _read_status(
+    status, _, latest = _read_status(
         experiment,
         generation_id=generation_id,
         trial_generation_id=None,
@@ -1385,7 +1408,7 @@ def experiment_status(
         from phasesweep.tracking.publication import delivery_status
 
         payload["tracking_delivery"] = delivery_status(experiment)
-    return json_object(payload)
+    return json_object(payload), latest
 
 
 def _recorded_count(value: object) -> int | None:
