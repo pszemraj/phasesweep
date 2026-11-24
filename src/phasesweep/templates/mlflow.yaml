@@ -16,6 +16,8 @@ execution:
 # To close and reopen it, save mlflow.active_run().info.run_id and resume by that ID; MLflow consumes the environment ID.
 # Do not call mlflow.set_experiment() with another name. phasesweep explain mlflow.run_mode gives the contract.
 trial_command: "phasesweep-mlflow-train --config {config_path}"
+# For a trainer that saves checkpoints, put its output setting under {trial_dir}, e.g. run_dir: "{trial_dir}/trainer".
+# Each trial keeps its checkpoints there. Pointing every trial at a fixed directory lets later trials overwrite the winner.
 trainer_config:
   model: {depth: 1}
   optimizer: {rate: 0}
