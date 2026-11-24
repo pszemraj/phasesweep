@@ -389,8 +389,8 @@ def test_wandb_aggregate_key_listed_in_the_index_is_read_from_its_series(monkeyp
     assert "eval/loss.min" in run.history_keys["keys"]
     assert _history_position(monkeypatch, run, "eval/loss.min", "eval/step") == 400
     assert run.reads == [
-        ("history", ["eval/loss.min", "eval/step"]),
-        ("scan", ["eval/loss.min", "eval/step"]),
+        ("history", ["eval/loss.min", "_step"]),
+        ("scan", ["eval/loss.min", "_step"]),
         ("history", ["eval/loss", "eval/step"]),
     ]
 
@@ -529,7 +529,21 @@ def test_wandb_dotted_history_series_is_read_before_its_head(monkeypatch, suffix
     ]
     run = _HistoryRun({key: 0.2, "_step": 2}, rows)
     assert _history_position(monkeypatch, run, key, "eval/step") == 20
-    assert run.reads == [("history", [key, "eval/step"])]
+    reads = [("history", [key, "eval/step"])]
+    if suffix == "min":
+        reads.insert(0, ("history", [key, "_step"]))
+    assert run.reads == reads
+
+
+def test_wandb_dotted_history_series_without_its_axis_has_no_position(monkeypatch):
+    """A literal metric without the axis cannot acquire its head's unrelated position."""
+    key = "eval/loss.min"
+    rows = [
+        {"_step": 0, key: 0.2},
+        {"_step": 1, "eval/loss": 0.9, "eval/step": 20},
+    ]
+    run = _HistoryRun({key: 0.2, "_step": 1}, rows)
+    assert _history_position(monkeypatch, run, key, "eval/step") is None
 
 
 @pytest.mark.parametrize("indexed_steps", [[3, 4], [None, -1, -1]], ids=["behind", "unindexed"])

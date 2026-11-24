@@ -18,7 +18,12 @@ from typing import TYPE_CHECKING, Any
 
 from phasesweep.config.common import TRACKER_READ_CONTROLS
 from phasesweep.errors import UnsafeProcessCleanupError
-from phasesweep.evidence.baseline import EVIDENCE_BASELINE_FILE, EvidenceBaseline, FileStamp
+from phasesweep.evidence.baseline import (
+    EVIDENCE_BASELINE_FILE,
+    EvidenceBaseline,
+    FileStamp,
+    read_evidence_baseline,
+)
 from phasesweep.evidence.models import (
     ArtifactSizeGate,
     Gate,
@@ -840,6 +845,23 @@ def _capture_wandb(
     target = f"{source.base_url}/{source.entity}/{source.project}/{run_id}"
     try:
         try:
+            logged_after = None if ctx.baseline is None else ctx.baseline.launched_at
+            resume_metric: tuple[str, str] | None = None
+            earlier_launches: list[float] = []
+            if (
+                logged_after is not None
+                and isinstance(source, WandbExtractor)
+                and source.evaluation_axis != "_step"
+                and source.metric_key.endswith((".min", ".max"))
+            ):
+                resume_metric = (source.metric_key, source.evaluation_axis)
+                for _, attempt_id in ctx.earlier_attempts:
+                    directory = ctx.attempt_dir.with_name(attempt_id)
+                    if attempt_id == run_id or not (directory / EVIDENCE_BASELINE_FILE).is_file():
+                        continue
+                    launched_at = read_evidence_baseline(directory).launched_at
+                    if launched_at is not None:
+                        earlier_launches.append(launched_at)
             capture = poll_wandb_summary(
                 base_url=source.base_url,
                 entity=source.entity,
@@ -851,7 +873,9 @@ def _capture_wandb(
                 timeout_seconds=source.timeout_seconds,
                 required_keys=query.numeric_keys,
                 presence_keys=query.presence_keys,
-                logged_after=None if ctx.baseline is None else ctx.baseline.launched_at,
+                logged_after=logged_after,
+                earlier_launches=tuple(earlier_launches),
+                resume_metric=resume_metric,
                 environment=ctx.wandb_environment,
                 deadline=poll_deadline,
             )

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from types import SimpleNamespace
 
 import pytest
@@ -67,7 +67,11 @@ def _poll(
 
 
 def _serve(
-    monkeypatch: pytest.MonkeyPatch, answers: Callable[[int], Answer]
+    monkeypatch: pytest.MonkeyPatch,
+    answers: Callable[[int], Answer],
+    *,
+    rows: tuple[Mapping[str, object], ...] = (),
+    on_scan: Callable[[list[str]], None] | None = None,
 ) -> tuple[ManualClock, list[str]]:
     """Answer each zero-based run lookup with ``answers(read)`` on a manual clock.
 
@@ -75,6 +79,8 @@ def _serve(
 
     :param pytest.MonkeyPatch monkeypatch: Fixture that replaces the SDK client and clock.
     :param Callable[[int], Answer] answers: State, summary and last history step per read.
+    :param tuple[Mapping[str, object], ...] rows: Rows available in unsampled history.
+    :param Callable[[list[str]], None] | None on_scan: Callback for each history read.
     :return tuple[ManualClock, list[str]]: The clock and the paths looked up.
     """
     public = pytest.importorskip("wandb.apis.public")
@@ -82,6 +88,14 @@ def _serve(
     monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", clock.monotonic)
     monkeypatch.setattr("phasesweep.evidence.wandb.time.sleep", clock.sleep)
     paths: list[str] = []
+
+    def scan_history(
+        *, keys: list[str], page_size: int, use_cache: bool
+    ) -> list[Mapping[str, object]]:
+        assert page_size > 0 and not use_cache
+        if on_scan is not None:
+            on_scan(keys)
+        return [row for row in rows if all(key in row for key in keys)]
 
     class Api:
         def __init__(self, **kwargs: object) -> None:
@@ -93,7 +107,10 @@ def _serve(
             paths.append(path)
             state, summary, last_step = answers(len(paths) - 1)
             return SimpleNamespace(
-                state=state, summary_metrics=summary, history_keys=_history_index(last_step)
+                state=state,
+                summary_metrics=summary,
+                history_keys=_history_index(last_step),
+                scan_history=scan_history,
             )
 
     monkeypatch.setattr(public, "Api", Api)
@@ -245,6 +262,92 @@ def test_a_reruns_own_crash_fails_the_read(monkeypatch: pytest.MonkeyPatch) -> N
     _serve(monkeypatch, lambda read: ("crashed", logged, 11))
     with pytest.raises(WandbRunTerminalError):
         _poll(logged_after=_LAUNCHED_AT)
+
+
+@pytest.mark.parametrize(
+    ("axis", "mode", "expected"),
+    [
+        ("eval/step", "native", (0.02, 0.9)),
+        ("_step", "native", (0.01, 0.99)),
+        ("eval/step", "literal", (0.01, 0.99)),
+        ("eval/step", "summary-only", (0.11, 0.88)),
+        ("eval/step", "missing-axis", (0.01, 0.99)),
+        ("eval/step", "history-outage", (0.02, 0.9)),
+    ],
+)
+def test_a_rerun_replaces_the_observed_training_suffix_for_native_extrema(
+    monkeypatch: pytest.MonkeyPatch, axis: str, mode: str, expected: tuple[float, float]
+) -> None:
+    """Native min and max exclude overwritten points while preserving earlier valid history."""
+    series = [
+        (975.0, 10, 0.4),
+        (985.0, 20, 0.2),
+        (990.0, 30, 0.01),
+        (995.0, 30, 0.99),
+        (1005.0, 30, 0.3),
+        (1010.0, 40, 0.9),
+        (1015.0, 40, 0.02),
+        (1025.0, 50, 0.4),
+        (1030.0, 60, 0.35),
+    ]
+    rows: list[dict[str, object]] = [
+        {"_step": index, "_timestamp": stamp, "eval/step": step, "eval/loss": loss}
+        for index, (stamp, step, loss) in enumerate(series)
+    ]
+    if mode == "literal":
+        rows.append({"_step": len(rows), "_timestamp": 1031.0, _KEY: 0.01, "eval/loss.max": 0.99})
+    if mode == "missing-axis":
+        rows[0].pop("eval/step")
+    native = (0.11, 0.88) if mode == "summary-only" else (0.01, 0.99)
+    last_step = len(rows) - 1
+    summary = {
+        "_step": last_step,
+        "_timestamp": 1031.0,
+        _KEY: native[0],
+        "eval/loss.max": native[1],
+        "eval/loss": 0.35,
+    }
+    readings: list[list[str]] = []
+
+    def on_scan(keys: list[str]) -> None:
+        readings.append(keys)
+        if mode == "history-outage" and len(readings) == 1:
+            raise ConnectionError("history temporarily unavailable")
+
+    clock, _ = _serve(
+        monkeypatch, lambda _: ("finished", summary, last_step), rows=tuple(rows), on_scan=on_scan
+    )
+    keys = (_KEY, "eval/loss.max")
+    for index, selected in enumerate(keys):
+        values = {**dict(zip(keys, native, strict=True)), "eval/loss": 0.35}
+        values[selected] = expected[index]
+        assert (
+            _poll(
+                logged_after=1020.0,
+                earlier_launches=(1000.0,),
+                resume_metric=(selected, axis),
+                required=(*keys, "eval/loss"),
+            )["values"]
+            == values
+        )
+    if axis == "_step":
+        assert not readings
+    if mode == "history-outage":
+        assert clock.now == 5
+
+
+def test_a_rerun_that_discards_every_objective_observation_fails_the_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rerun that re-logs progress alone cannot win with a discarded metric."""
+    rows = (
+        {"_step": 0, "_timestamp": 990.0, "eval/step": 10, "eval/loss": 0.1},
+        {"_step": 1, "_timestamp": 1010.0, "eval/step": 5},
+    )
+    summary = {"_step": 1, "_timestamp": 1010.0, _KEY: 0.1}
+    _serve(monkeypatch, lambda _: ("finished", summary, 1), rows=rows)
+    with pytest.raises(ValueError, match="no finite observation in the retained history"):
+        _poll(logged_after=_LAUNCHED_AT, resume_metric=(_KEY, "eval/step"))
 
 
 def test_the_real_client_reads_the_history_index_with_the_summary(tmp_path, monkeypatch) -> None:
