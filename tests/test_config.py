@@ -120,11 +120,17 @@ def test_evaluation_axis_defaults_and_misplacements_are_rejected():
     for axis in ("eval/loss.min", "eval/loss"):
         with pytest.raises(ValueError, match="names the metric's own series"):
             wandb.model_validate({**wandb.model_dump(), "evaluation_axis": axis})
-    for extractor in (
-        envelope.model_copy(update={"evaluation_axis": "tokens"}),
-        wandb.model_copy(update={"evaluation_axis": "eval/step"}),
+    for extractor, message in (
+        (
+            envelope.model_copy(update={"evaluation_axis": "tokens"}),
+            "only the metric extractor's evaluation_point",
+        ),
+        (
+            wandb.model_copy(update={"evaluation_axis": "eval/step"}),
+            "Configure the trainer progress axis on the W&B objective",
+        ),
     ):
-        with pytest.raises(ValueError, match="only the metric extractor's evaluation_point"):
+        with pytest.raises(ValueError, match=message):
             Constraint.model_validate(
                 {"name": "memory", "extractor": extractor.model_dump(), "max": 5}
             )

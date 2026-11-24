@@ -604,44 +604,88 @@ def _contains_series(
     return None if rows is None else any(row.get(key) is not None for row in rows)
 
 
-def _resumed_extremum(
+def _resumed_extrema(
     run: _HistoryReader,
-    key: str,
-    value: float,
+    values: Mapping[str, float],
     *,
     axis: str,
     launches: tuple[float, ...],
     last_step: int | float,
     deadline: float,
-) -> float:
-    """Reduce a native min/max over the retained rows when a rerun re-logs progress.
+) -> dict[str, float]:
+    """Reduce required native aggregates, sharing the reads of their underlying series.
 
-    Each rerun replaces the earlier suffix starting at its first measurement of this series.
-    Positions between a checkpoint and the first re-logged measurement are unknown.
     A literal dotted metric, an incomplete axis, and a separately supplied summary scalar keep
     their summary value.
 
     :param _HistoryReader run: Finished public-API run.
-    :param str key: Exact summary key.
-    :param float value: Finite scalar captured from the summary.
+    :param Mapping[str, float] values: Finite scalar values from the summary.
     :param str axis: Trainer's progress key, shared by the history rows being reduced.
     :param tuple[float, ...] launches: Chronological launch times of all reruns.
     :param int | float last_step: The summary's last W&B history step.
     :param float deadline: Monotonic deadline for history queries.
-    :return float: The corrected extremum, or the original summary scalar.
+    :return dict[str, float]: Corrected extrema keyed by their exact summary names.
     :raises TimeoutError: History could not be read before the deadline.
     :raises _NoRetainedMetricError: The native aggregate has no retained finite row.
     """
+    operations: dict[str, list[str]] = {}
+    for key in values:
+        series, _, operation = key.rpartition(".")
+        if not series or operation not in {"min", "max"}:
+            continue
+        literal = _contains_series(run, key, last_step=last_step, deadline=deadline, scan=True)
+        if literal is None:
+            raise TimeoutError("W&B history read expired.")
+        if not literal:
+            operations.setdefault(series, []).append(operation)
+
+    corrected: dict[str, float] = {}
+    for series, kinds in operations.items():
+        history = _retained_series(
+            run, series, axis=axis, launches=launches, last_step=last_step, deadline=deadline
+        )
+        if history is None:
+            continue
+        all_values, kept_values = history
+        for operation in kinds:
+            key = f"{series}.{operation}"
+            reduce = min if operation == "min" else max
+            if reduce(all_values) != values[key]:
+                continue
+            if not kept_values:
+                raise _NoRetainedMetricError(
+                    f"W&B metric {key!r} has no finite observation in the retained history "
+                    "after checkpoint rollback."
+                )
+            corrected[key] = reduce(kept_values)
+    return corrected
+
+
+def _retained_series(
+    run: _HistoryReader,
+    series: str,
+    *,
+    axis: str,
+    launches: tuple[float, ...],
+    last_step: int | float,
+    deadline: float,
+) -> tuple[list[float], list[float]] | None:
+    """Read a series whose rerun replaced part of its history.
+
+    Each rerun replaces the earlier suffix starting at its first measurement of the series.
+
+    :param _HistoryReader run: Finished public-API run.
+    :param str series: History key underlying one or both summary extrema.
+    :param str axis: Trainer's progress key logged on the same rows.
+    :param tuple[float, ...] launches: Chronological launch times of all reruns.
+    :param int | float last_step: The summary's last W&B history step.
+    :param float deadline: Monotonic deadline for history queries.
+    :return tuple[list[float], list[float]] | None: All and retained finite measurements,
+        or ``None`` when no replacement is established.
+    :raises TimeoutError: History could not be read before the deadline.
+    """
     from phasesweep.evidence.evaluation import json_float
 
-    series, _, operation = key.rpartition(".")
-    if not series or operation not in {"min", "max"}:
-        return value
-    literal = _contains_series(run, key, last_step=last_step, deadline=deadline, scan=True)
-    if literal is None:
-        raise TimeoutError("W&B history read expired.")
-    if literal:
-        return value
     axis_keys = list(dict.fromkeys((series, axis, "_step", "_timestamp")))
     rows = _read_series(run, axis_keys, last_step=last_step, deadline=deadline, scan=True)
     if rows is None:
@@ -653,22 +697,22 @@ def _resumed_extremum(
         timestamp = finite_nonnegative(row.get("_timestamp"))
         progress = finite_nonnegative(row.get(axis))
         if step is None or timestamp is None or progress is None:
-            return value
+            return None
         try:
             metric = json_float(row[series], label=series)
         except ValueError:
-            return value
+            return None
         points.append((step, bisect_left(launches, timestamp), progress, metric))
 
     histories: list[list[tuple[int | float, float]]] = [[] for _ in range(len(launches) + 1)]
     for _, segment, progress, metric in sorted(points):
         history = histories[segment]
         if history and progress < history[-1][0]:
-            return value
+            return None
         history.append((progress, metric))
     retained = merge_attempt_histories(histories)
     if len(retained) == len(points):
-        return value
+        return None
 
     full_series = _read_series(
         run, [series, "_step"], last_step=last_step, deadline=deadline, scan=True
@@ -678,18 +722,11 @@ def _resumed_extremum(
     if {finite_nonnegative(row.get("_step")) for row in full_series} != {
         step for step, _, _, _ in points
     }:
-        return value
+        return None
     all_values = [metric for _, _, _, metric in points if math.isfinite(metric)]
-    reduce = min if operation == "min" else max
-    if not all_values or reduce(all_values) != value:
-        return value
-    kept_values = [metric for metric in retained if math.isfinite(metric)]
-    if not kept_values:
-        raise _NoRetainedMetricError(
-            f"W&B metric {key!r} has no finite observation in the retained history "
-            "after checkpoint rollback."
-        )
-    return reduce(kept_values)
+    if not all_values:
+        return None
+    return all_values, [metric for metric in retained if math.isfinite(metric)]
 
 
 def _poll_wandb_summary(
@@ -840,16 +877,16 @@ def _poll_wandb_summary(
                         last_step = _last_history_step(run)
                         try:
                             if launches and resume_axis != "_step" and last_step is not None:
-                                for key in values:
-                                    values[key] = _resumed_extremum(
+                                values.update(
+                                    _resumed_extrema(
                                         run,
-                                        key,
-                                        values[key],
+                                        values,
                                         axis=resume_axis,
                                         launches=launches,
                                         last_step=last_step,
                                         deadline=deadline,
                                     )
+                                )
                         except Exception as exc:
                             if not _is_retryable_setup_error(exc):
                                 raise

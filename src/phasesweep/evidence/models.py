@@ -227,8 +227,9 @@ class WandbExtractor(_WandbSummarySource):
         description=(
             "History key logged alongside metric_key that marks where it was "
             "measured, e.g. 'eval/step' under define_metric('eval/*', "
-            "step_metric='eval/step'); selection's evaluation_point check compares "
-            "ranked objectives on it. '_step' is W&B's own history step."
+            "step_metric='eval/step'). The W&B objective's axis marks its evaluation "
+            "position and the progress used to retain min/max history on reruns. "
+            "'_step' is W&B's own history step."
         ),
     )
 

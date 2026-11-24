@@ -457,10 +457,10 @@ class _NamedExtractor(_Frozen):
 
     @model_validator(mode="after")
     def _validate_evaluation_axis_unused(self) -> Self:
-        """Reject a non-default ``evaluation_axis`` that nothing would read.
+        """Reject a non-default ``evaluation_axis`` on a named extractor.
 
-        Only the metric extractor's axis feeds selection's ``evaluation_point``
-        check, so a named extractor that sets one is a misplaced setting.
+        The objective declares the axis for its evaluation position. For W&B, that
+        axis also applies to native min/max constraints on a rerun.
 
         :raises ValueError: The extractor sets ``evaluation_axis``.
         :return Self: Self, unchanged.
@@ -469,6 +469,11 @@ class _NamedExtractor(_Frozen):
         if not isinstance(extractor, JsonEnvelopeExtractor | WandbExtractor):
             return self
         if extractor.evaluation_axis != type(extractor).model_fields["evaluation_axis"].default:
+            if isinstance(extractor, WandbExtractor):
+                raise ValueError(
+                    f"{self._label} {self.name!r} sets evaluation_axis. Configure the trainer "
+                    "progress axis on the W&B objective."
+                )
             raise ValueError(
                 f"{self._label} {self.name!r} sets evaluation_axis, which only the metric "
                 "extractor's evaluation_point check reads; remove it."

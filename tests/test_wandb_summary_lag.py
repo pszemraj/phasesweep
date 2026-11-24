@@ -395,16 +395,32 @@ def test_a_rerun_replaces_only_the_history_of_the_metric_it_logs(
     rows = (
         {"_step": 0, "_timestamp": 990.0, "eval/step": 200, "eval/loss": 0.1, "eval/acc": 0.6},
         {"_step": 1, "_timestamp": 995.0, "eval/step": 250, "eval/acc": 0.99},
-        {"_step": 2, "_timestamp": 1010.0, "eval/step": 200, "train_runtime": 1.0},
-        {"_step": 3, "_timestamp": 1015.0, "eval/step": 220, "eval/acc": 0.7},
-        {"_step": 4, "_timestamp": 1020.0, "eval/step": 300, "eval/loss": 0.35},
+        {"_step": 2, "_timestamp": 996.0, "eval/step": 260, "eval/acc": 0.2},
+        {"_step": 3, "_timestamp": 1010.0, "eval/step": 200, "train_runtime": 1.0},
+        {"_step": 4, "_timestamp": 1015.0, "eval/step": 220, "eval/acc": 0.7},
+        {"_step": 5, "_timestamp": 1020.0, "eval/step": 300, "eval/loss": 0.35},
     )
-    accuracy = "eval/acc.max"
-    summary = {"_step": 4, "_timestamp": 1020.0, _KEY: 0.1, accuracy: 0.99}
-    _serve(monkeypatch, lambda _: ("finished", summary, 4), rows=rows)
-    assert _poll(logged_after=_LAUNCHED_AT, resume_axis="eval/step", required=(_KEY, accuracy))[
-        "values"
-    ] == {_KEY: 0.1, accuracy: 0.7}
+    summary = {
+        "_step": 5,
+        "_timestamp": 1020.0,
+        _KEY: 0.1,
+        "eval/acc.min": 0.2,
+        "eval/acc.max": 0.99,
+    }
+    readings: list[list[str]] = []
+
+    def on_scan(keys: list[str]) -> None:
+        readings.append(keys)
+        clock.sleep(0.7)
+
+    clock, _ = _serve(monkeypatch, lambda _: ("finished", summary, 5), rows=rows, on_scan=on_scan)
+    assert _poll(
+        logged_after=_LAUNCHED_AT,
+        resume_axis="eval/step",
+        required=(_KEY, "eval/acc.min", "eval/acc.max"),
+        deadline=5.0,
+    )["values"] == {_KEY: 0.1, "eval/acc.min": 0.6, "eval/acc.max": 0.7}
+    assert len(readings) == 6
 
 
 def test_a_rerun_that_only_logs_teardown_keeps_the_final_loss(
