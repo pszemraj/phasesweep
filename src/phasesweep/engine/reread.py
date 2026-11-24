@@ -618,8 +618,8 @@ def _pending_notice(source: FillSource, phase: str) -> PendingRereadNotice:
     notice = PendingRereadNotice(
         f"{opening} ({describe_changes(source.changes)}).",
         remediation=(
-            f"Run `phasesweep run CONFIG`: it re-reads {trials} from kept evidence and retrains "
-            "nothing."
+            f"Run the same configuration to re-read {trials} from kept evidence without "
+            "retraining those trials."
         ),
     )
     settings = ", ".join(path for path, _old, _new in source.changes) or "reading settings"

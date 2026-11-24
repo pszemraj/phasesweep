@@ -124,7 +124,6 @@ from phasesweep.errors import (
     PERSISTENT_STUDY_KEEPS_TRIALS,
     START_AGAIN_STEP,
     OperatorAction,
-    operator_step,
 )
 from phasesweep.evidence.models import EXTRACTOR_KINDS
 from phasesweep.runtime.json import JsonObject, JsonValue, float_or_none, json_object
@@ -1186,9 +1185,8 @@ class TrialTable:
     finished: int
     uncounted: tuple[tuple[str, int], ...]
     groups: tuple[RepeatGroupView, ...] = ()
-    #: The diagnosis and step a run of the same config would be refused with, from the phase's
-    #: recorded abort or failure streak (:func:`phasesweep.engine.selection._phase_refusal`).
-    refusal: tuple[str, str] | None = None
+    #: Why the phase refuses a run or waits to re-read its kept evidence.
+    refusal: PhaseRefusal | None = None
     #: Each search-space growth the study recorded: the draw position it took effect at and the
     #: values it added (:func:`phasesweep.engine.growth.recorded_growth`).
     growth: tuple[tuple[int, str], ...] = ()
@@ -1583,7 +1581,7 @@ def _trial_table(
     winner: PhaseWinnerView | None,
     *,
     available: bool = True,
-    refusal: tuple[str, str] | None = None,
+    refusal: PhaseRefusal | None = None,
     growth: tuple[tuple[int, str], ...] = (),
 ) -> TrialTable:
     """Build one phase's table from its trials and the winner the publication holds for it.
@@ -1596,8 +1594,8 @@ def _trial_table(
     :param Sequence[optuna.trial.FrozenTrial] trials: The phase study's trials.
     :param PhaseWinnerView | None winner: The published winner for the phase, if any.
     :param bool available: ``False`` when the trials could not be read, so ``trials`` is empty.
-    :param tuple[str, str] | None refusal: The diagnosis and step a run would be refused with,
-        defaults to none.
+    :param PhaseRefusal | None refusal: Why the phase refuses a run or waits to re-read its
+        kept evidence, defaults to none.
     :param tuple[tuple[int, str], ...] growth: The search-space growths the study recorded,
         defaults to none.
     :return TrialTable: The rows and the columns they carry.
@@ -1797,7 +1795,7 @@ def read_trial_tables(
                     phase,
                     [],
                     winners.get(phase.name),
-                    refusal=None if notice is None else (str(notice), operator_step(notice)),
+                    refusal=notice,
                 )
             )
             continue
@@ -1814,7 +1812,7 @@ def read_trial_tables(
                 phase,
                 study.get_trials(deepcopy=False),
                 winners.get(phase.name),
-                refusal=(str(refusal), operator_step(refusal)) if refusal is not None else None,
+                refusal=refusal,
                 growth=() if identity is None else recorded_growth(identity),
             )
         )

@@ -10,7 +10,14 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Repeats, Sampler
-from phasesweep.engine.read import RepeatGroupView, TrialTable, TrialTables, read_trial_tables
+from phasesweep.engine.read import (
+    PhaseRefusal,
+    RepeatGroupView,
+    TrialTable,
+    TrialTables,
+    read_trial_tables,
+)
+from phasesweep.engine.selection import PhaseAbortRefusedError
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.trial_table import render_trial_tables, unsettled_running_comment
@@ -78,7 +85,7 @@ def _table(
     available: bool = True,
     finished: int | None = None,
     uncounted: tuple[tuple[str, int], ...] = (),
-    refusal: tuple[str, str] | None = None,
+    refusal: PhaseRefusal | None = None,
     growth: tuple[tuple[int, str], ...] = (),
 ) -> TrialTable:
     """Build a table whose columns are the core ones plus every optional key any row carries.
@@ -239,10 +246,10 @@ def test_a_phase_without_trials_says_so() -> None:
 def test_a_recorded_refusal_and_its_fix_print_under_the_heading() -> None:
     """A phase a run would refuse says why and what to do under its heading, wrapped to the width."""
     phase = _phase("search", n_trials=8, x=IntParam(type="int", low=0, high=9))
-    refusal = (
+    refusal = PhaseAbortRefusedError(
         "Phase 'search' previously aborted at its accepted n_trials=8: 3 consecutive "
         "failed/infeasible trials reached max_consecutive_failures=3.",
-        "Fix the cause, then raise phases[search].n_trials above 8 and rerun.",
+        remediation="Fix the cause, then raise phases[search].n_trials above 8 and rerun.",
     )
     rows = [_row(index, None, {"x": index}, state="FAIL", duration=0.1) for index in range(3)]
     tables = _tables(
@@ -263,7 +270,10 @@ def test_a_recorded_refusal_and_its_fix_print_under_the_heading() -> None:
 def test_each_search_space_growth_prints_under_the_heading_after_the_refusal() -> None:
     """A grown phase names each growth's first draw position and added values, after any refusal and its fix."""
     phase = _phase("search", n_trials=16, lr=CategoricalParam(type="categorical", choices=[0.001]))
-    refusal = ("Phase 'search' previously aborted.", "Raise phases[search].n_trials and rerun.")
+    refusal = PhaseAbortRefusedError(
+        "Phase 'search' previously aborted.",
+        remediation="Raise phases[search].n_trials and rerun.",
+    )
     rows = [_row(index, 0.5, {"lr": 0.001}) for index in range(2)]
     growth = ((12, "lr +0.003, +0.01"), (14, "lr +0.03"))
     tables = _tables(

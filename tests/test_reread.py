@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -524,10 +525,13 @@ def test_a_changed_trainer_beside_a_changed_reader_is_refused_not_retrained(
     assert _launches(launches) == 3
 
 
-def test_status_names_the_run_that_fills_a_phase_before_it_runs(tmp_path: Path) -> None:
+def test_status_names_the_run_that_fills_a_phase_before_it_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     """Before the fill, status says the phase has not started under the current settings."""
     trainer, _launches_path = _counting_trainer(tmp_path)
-    run_experiment(_experiment(tmp_path, trainer, _metric("loss")))
+    original = _experiment(tmp_path, trainer, _metric("loss"))
+    run_experiment(original)
     changed = _experiment(tmp_path, trainer, _metric("acc"))
 
     refusals = inspect_status(changed, validate_ledger(changed)).refusals
@@ -538,9 +542,17 @@ def test_status_names_the_run_that_fills_a_phase_before_it_runs(tmp_path: Path) 
         '(metric.extractor.key: "loss" -> "acc").'
     )
     assert notice.remediation == (
-        "Run `phasesweep run CONFIG`: it re-reads 3 finished trials from kept evidence and "
-        "retrains nothing."
+        "Run the same configuration to re-read 3 finished trials from kept evidence without "
+        "retraining those trials."
     )
+    config = write_experiment_config(tmp_path / "sweep config.yaml", original)
+    overrides = ["--set", 'metric.extractor.key="acc"']
+    for options in ([], ["--trials"]):
+        assert invoke_cli_boundary(["status", str(config), *overrides, *options], monkeypatch) == 0
+        status = capsys.readouterr().out
+        (command,) = [line.lstrip("# ") for line in status.splitlines() if "phasesweep run" in line]
+        assert "fix: Run the same configuration to re-read" in status
+        assert shlex.split(command) == ["phasesweep", "run", str(config), *overrides]
 
 
 def test_a_dry_run_says_it_would_re_read_and_writes_nothing(

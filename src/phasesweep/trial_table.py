@@ -22,7 +22,9 @@ from phasesweep.engine.read import (
     TrialTable,
     TrialTables,
 )
+from phasesweep.engine.reread import PendingRereadNotice
 from phasesweep.engine.state import OBSERVED_PREFIX
+from phasesweep.errors import operator_step
 from phasesweep.runtime.json import JsonObject, JsonValue, json_integer
 from phasesweep.runtime.terminal import (
     GAP,
@@ -425,6 +427,7 @@ def _phase_lines(
     csv_root: Path | None,
     width: int,
     color: bool,
+    rerun_command: str | None,
 ) -> list[str]:
     """Render one phase: its heading, any notes under it, its trials and its repeat groups.
 
@@ -441,6 +444,7 @@ def _phase_lines(
     :param Path | None csv_root: Artifact directory of an experiment that keeps no ledger.
     :param int width: Terminal width the prose wraps to.
     :param bool color: Whether to style the winner rows.
+    :param str | None rerun_command: Shell-quoted run command for a phase waiting to re-read.
     :return list[str]: The phase's lines, without a leading blank line.
     """
     notes: list[str] = []
@@ -465,9 +469,10 @@ def _phase_lines(
         subsequent_indent=INDENT,
     )
     if table.refusal is not None:
-        diagnosis, step = table.refusal
-        lines.extend(wrap(diagnosis, width, indent=INDENT, subsequent_indent=INDENT))
-        lines.extend(wrap_labeled("fix:", step, width, indent=INDENT))
+        lines.extend(wrap(str(table.refusal), width, indent=INDENT, subsequent_indent=INDENT))
+        lines.extend(wrap_labeled("fix:", operator_step(table.refusal), width, indent=INDENT))
+        if isinstance(table.refusal, PendingRereadNotice) and rerun_command is not None:
+            lines.append(f"{INDENT}{rerun_command}")
     for position, gains in table.growth:
         lines.extend(
             wrap(
@@ -501,6 +506,7 @@ def render_trial_tables(
     csv_root: Path | None,
     width: int,
     color: bool,
+    rerun_command: str | None = None,
 ) -> str:
     """Render every phase's trial table under a header that names where the winner marks come from.
 
@@ -512,6 +518,7 @@ def render_trial_tables(
         ledger holds them.
     :param int width: Terminal width that prose wraps to; tables keep their natural width.
     :param bool color: Whether to style the winner rows, from ``use_color`` on the output stream.
+    :param str | None rerun_command: Shell-quoted run command for a phase waiting to re-read.
     :return str: The experiment name, the generation line, then each phase's heading and table.
     """
     phases = {phase.name: phase for phase in experiment.phases}
@@ -527,6 +534,7 @@ def render_trial_tables(
                 csv_root=csv_root,
                 width=width,
                 color=color,
+                rerun_command=rerun_command,
             )
         )
     return "\n".join(lines)

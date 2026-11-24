@@ -79,6 +79,7 @@ from phasesweep.engine.read import (
     require_study,
     unpublished_winner_step,
 )
+from phasesweep.engine.reread import PendingRereadNotice
 from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.engine.study_policy import _require_launch_target
 from phasesweep.errors import (
@@ -1405,6 +1406,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     """
     config = _command_config(config_path, settings=settings)
     require_study(config)
+    rerun_command = _rerun_command(config_path, settings, None)
     if show_trials:
         tables = read_trial_tables(config, latest=True)
         width = terminal_width(sys.stdout)
@@ -1418,6 +1420,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
                 csv_root=None if config.persistent else _experiment_dir(config),
                 width=width,
                 color=use_color(sys.stdout),
+                rerun_command=rerun_command,
             )
         )
         raise_for_unusable_publication(
@@ -1453,6 +1456,8 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     for refusal in refusals.values():
         for line in _operational_error_text(refusal).splitlines():
             click.echo(f"# {line}")
+        if isinstance(refusal, PendingRereadNotice):
+            _render_phase_comment(rerun_command, prefix="# ")
     if retained and suggest_resume and not refusals:
         step = unpublished_winner_step(config, ledger, inspection.study_names)
         if step is not None:
