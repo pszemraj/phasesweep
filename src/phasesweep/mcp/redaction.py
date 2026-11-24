@@ -289,6 +289,14 @@ def status_payload(
                 "winner_present": phase.winner_present,
                 "trial_data_available": available,
                 "published_study_unavailable": phase.published_study_unavailable,
+                "reread_pending": (
+                    None
+                    if phase.reread_pending is None
+                    else {
+                        "statement": phase.reread_pending.statement,
+                        "finished_trials": phase.reread_pending.finished_trials,
+                    }
+                ),
             }
         )
     run_id = run["run_id"]

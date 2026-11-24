@@ -47,7 +47,7 @@ NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 McpPublicationState = PublicationState | Literal["unknown"]
 """Engine publication verdict plus the MCP snapshot-unavailable state."""
 
-RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[6] = 6
+RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[7] = 7
 
 
 class _SnapshotModel(BaseModel):
@@ -85,6 +85,15 @@ class RunningAttemptSnapshot(_SnapshotModel):
     """Captured recovery prediction; successful trainer evidence stays pending until extraction."""
 
 
+class RereadPendingSnapshot(_SnapshotModel):
+    """A phase whose study waits to be filled from the kept evidence of earlier reading settings."""
+
+    statement: str
+    """:attr:`phasesweep.engine.reread.PendingRereadNotice.statement`, free of config values."""
+    finished_trials: NonNegativeInt
+    """Finished trials the next run re-reads without launching a trainer."""
+
+
 class PhaseStatusSnapshot(_SnapshotModel):
     """One phase's trial counts by state at capture, and winner presence."""
 
@@ -101,6 +110,8 @@ class PhaseStatusSnapshot(_SnapshotModel):
 
     Known counts carry a list, empty when no row is RUNNING or the study is absent.
     """
+    reread_pending: RereadPendingSnapshot | None = None
+    """Set while the phase's counts are empty because its fill from kept evidence is pending."""
 
 
 class StatusSnapshot(_SnapshotModel):
@@ -489,7 +500,7 @@ def winner_snapshot(view: PhaseWinnerView) -> WinnerSnapshot:
 class RunResultSnapshot(_SnapshotModel):
     """Terminal status and winners frozen for one MCP run id."""
 
-    schema_version: Literal[6]
+    schema_version: Literal[7]
     status: StatusSnapshot
     winners: list[WinnerSnapshot]
     represented_config_fingerprint: str | None = None

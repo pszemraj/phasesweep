@@ -432,6 +432,13 @@ class GetLatestRunResult(_ToolPayload):
     run: RunPayload | None
 
 
+class RereadPendingPayload(_ToolPayload):
+    """Finished trials the next run re-reads from kept evidence instead of retraining."""
+
+    statement: str = Field(description="Which settings changed and what the next run re-reads.")
+    finished_trials: int = Field(ge=0, description="Finished trials the next run re-reads.")
+
+
 class PhaseStatusPayload(_ToolPayload):
     """Per-phase status without filesystem paths."""
 
@@ -496,6 +503,14 @@ class PhaseStatusPayload(_ToolPayload):
             "persistent observation is available; trial counts and derived progress "
             "fields are then null."
         )
+    )
+    reread_pending: RereadPendingPayload | None = Field(
+        default=None,
+        description=(
+            "Set when a reading setting (metric extractor or goal, constraints, gates) changed "
+            "since this phase's trials were measured: its counts are empty until the next run "
+            "re-reads them from kept evidence, which launches no trainer. Null otherwise."
+        ),
     )
 
 

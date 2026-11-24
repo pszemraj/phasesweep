@@ -101,13 +101,16 @@ READ_STATUS_ONLY_PHASE_KEYS = {
     "phase",
     "winner_present",
     "running_attempts",
+    "reread_pending",
 }
 """Phase keys that exist only in the path-free read_status view.
 
 ``running_attempts`` is the identity of each RUNNING row in the same storage
 snapshot the counts came from. The MCP terminal snapshot consumes it so it
 never has to reread a study to reconcile RUNNING trials; the CLI phase payload
-keeps exactly ``PHASE_STATUS_KEYS`` and republishes none of it.
+keeps exactly ``PHASE_STATUS_KEYS`` and republishes none of it. ``reread_pending``
+is MCP's account of a fill from kept evidence, which the CLI prints as the phase's
+refusal instead.
 """
 
 

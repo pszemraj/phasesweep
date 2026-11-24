@@ -376,11 +376,43 @@ def describe_changes(changes: Sequence[tuple[str, object, object]]) -> str:
 class PendingRereadNotice(PhaseSweepError):
     """A phase not started under the current reading settings, which a run re-reads, not retrains.
 
-    Read surfaces (``status``, ``status --trials``) report it where they report a phase's
-    refusal, with the command that fills the study.
+    ``status`` and ``status --trials`` print it where they report a phase's refusal, with the
+    changed values and the command that fills the study. The status payload, which MCP serves,
+    carries :attr:`statement` instead: the same sentence naming only the changed settings,
+    since their values are config-authored text such as file names and patterns.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RETRY
+    #: The value-free sentence the status payload carries (:func:`_pending_notice`).
+    statement: str = ""
+    #: Finished trials the fill re-reads (:attr:`FillSource.rereads`).
+    finished_trials: int = 0
+
+
+def _pending_notice(source: FillSource, phase: str) -> PendingRereadNotice:
+    """Build both texts of a :class:`PendingRereadNotice` from one description of the fill.
+
+    :param FillSource source: The study the fill would read from.
+    :param str phase: The phase's name.
+    :return PendingRereadNotice: The notice, with its message and step for the CLI and its
+        :attr:`PendingRereadNotice.statement` for the status payload.
+    """
+    opening = f"Phase {phase!r} has not started under the current reading settings"
+    trials = plural(source.rereads, "finished trial")
+    notice = PendingRereadNotice(
+        f"{opening} ({describe_changes(source.changes)}).",
+        remediation=(
+            f"Run `phasesweep run CONFIG`: it re-reads {trials} from kept evidence and retrains "
+            "nothing."
+        ),
+    )
+    settings = ", ".join(path for path, _old, _new in source.changes) or "reading settings"
+    notice.statement = (
+        f"{opening} ({settings} changed); the next run re-reads {trials} from kept evidence and "
+        "retrains nothing."
+    )
+    notice.finished_trials = source.rereads
+    return notice
 
 
 def pending_reread(
@@ -416,14 +448,7 @@ def pending_reread(
     source = fill_source(experiment, phase, inherited, others)
     if source is None:
         return None
-    return PendingRereadNotice(
-        f"Phase {phase.name!r} has not started under the current reading settings "
-        f"({describe_changes(source.changes)}).",
-        remediation=(
-            f"Run `phasesweep run CONFIG`: it re-reads {plural(source.rereads, 'finished trial')} "
-            "from kept evidence and retrains nothing."
-        ),
-    )
+    return _pending_notice(source, phase.name)
 
 
 def fill_note(source: FillSource, result: FillResult) -> str:

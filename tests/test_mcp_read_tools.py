@@ -279,6 +279,30 @@ def test_decataloged_live_run_leaves_config_drift_unknown(tmp_path: Path) -> Non
     assert results.published_config_matches_current is None
 
 
+def test_run_status_says_a_phase_with_no_trials_waits_to_re_read_its_kept_evidence(
+    tmp_path: Path,
+) -> None:
+    """After a goal flip the phase counts nothing yet, and status says the next run re-reads it."""
+    trainer = write_constant_trainer(tmp_path)
+    measured = drift_experiment(tmp_path, trainer)
+    run_experiment(measured)
+    config = tmp_path / "srv.yaml"
+    write_experiment_config(config, drift_experiment(tmp_path, trainer, goal="maximize"))
+    app, _registry, store = make_mcp_app(write_srv_catalog(tmp_path, config))
+    stage_live_run(store, "srv-after-goal-flip", config, "srv")
+
+    phase = GetRunStatusResult.model_validate(app.status(run_id="srv-after-goal-flip")).phases[0]
+
+    assert measured.phases[0].n_trials == 1
+    assert phase.finished_trials_total == 0
+    assert phase.reread_pending is not None
+    assert phase.reread_pending.finished_trials == 1
+    assert phase.reread_pending.statement == (
+        "Phase 'p' has not started under the current reading settings (metric.goal changed); "
+        "the next run re-reads 1 finished trial from kept evidence and retrains nothing."
+    )
+
+
 @pytest.mark.parametrize("method_name", ["status", "winners", "await_run"])
 def test_run_tools_reject_config_snapshot_hash_mismatch(
     tmp_path: Path,

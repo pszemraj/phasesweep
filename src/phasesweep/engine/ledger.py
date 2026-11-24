@@ -66,6 +66,7 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    _recorded_identity,
     _recovered_trial_state,
     _study_schema_supported,
     _unique_trial_outcomes,
@@ -967,12 +968,44 @@ def repair_incomplete_journal_record(ledger: ValidatedLedger) -> None:
     _repair_incomplete_journal_record(ledger.storage_url)
 
 
+def _fill_candidates(
+    snapshot: JournalStorage | optuna.storages.InMemoryStorage,
+    experiment_name: str,
+    phase_name: str,
+    addressed: optuna.Study | None,
+) -> tuple[optuna.Study, ...]:
+    """Give a status read the studies that tell whether a phase waits for a fill.
+
+    A study that records its identity is filled or bound, so only an addressed study without
+    one needs the phase's other studies (:func:`phasesweep.engine.reread.pending_reread`).
+
+    :param JournalStorage | optuna.storages.InMemoryStorage snapshot: The read's one capture.
+    :param str experiment_name: The experiment.
+    :param str phase_name: The phase.
+    :param optuna.Study | None addressed: The phase's addressed study, already loaded.
+    :return tuple[optuna.Study, ...]: The addressed study alone when it records an identity,
+        otherwise every study of the phase, oldest first, the addressed one not reloaded.
+    """
+    if addressed is not None and _recorded_identity(addressed) is not None:
+        return (addressed,)
+    studies: list[optuna.Study] = []
+    for name in _phase_study_names(snapshot, experiment_name, phase_name):
+        study = (
+            addressed
+            if addressed is not None and name == addressed.study_name
+            else _load_snapshot_study(snapshot, name)
+        )
+        if study is not None:
+            studies.append(study)
+    return tuple(studies)
+
+
 def read_trial_stats(
     ledger: ValidatedLedger,
     published_trials: Mapping[str, _TrialRef | None],
     study_names: Mapping[str, str],
 ) -> dict[str, _PhaseTrialStats]:
-    """Read all phase counts and RUNNING identities from one ledger snapshot.
+    """Read all phase counts, RUNNING identities and studies from one ledger snapshot.
 
     An unreadable or unverified ledger reports ``available=False`` for each phase.
     Study schemas are checked in the captured replay. Capture follows publication
@@ -1021,6 +1054,7 @@ def read_trial_stats(
                     published_trials.get(phase.name),
                     addressed,
                 ),
+                studies=_fill_candidates(snapshot, ledger.experiment_name, phase.name, addressed),
             )
         except StudySchemaMismatchError:
             raise

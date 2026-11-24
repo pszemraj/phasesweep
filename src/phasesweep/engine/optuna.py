@@ -91,6 +91,9 @@ class _PhaseTrialStats:
     ``published_trial_available`` says whether the same snapshot holds the requested published
     trial identity, in whichever of the phase's studies it was selected from, with that study's
     recorded count boundary met; false also covers unreadable or absent storage.
+    ``studies`` holds every study of the phase in that snapshot, oldest first, so a status
+    read can tell from the same capture whether the addressed one waits to be filled from
+    another (:func:`phasesweep.engine.reread.pending_reread`).
     """
 
     counts: dict[str, int]
@@ -98,6 +101,7 @@ class _PhaseTrialStats:
     generation_counts: dict[str, dict[str, int]]
     running_attempts: list[_TrialRef] | None
     published_trial_available: bool = False
+    studies: tuple[optuna.Study, ...] = ()
 
 
 def _trial_run_state(trial: optuna.trial.FrozenTrial) -> TrialStateName:
