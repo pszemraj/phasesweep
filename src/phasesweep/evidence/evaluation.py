@@ -216,7 +216,7 @@ def _require_fresh(
     relative: str,
     target: Path,
     *,
-    evidence_before: float | None = None,
+    evidence_before: float | str | None = None,
 ) -> None:
     """Refuse a value file this attempt did not write.
 
@@ -234,15 +234,19 @@ def _require_fresh(
     :param Path attempt_dir: The attempt's directory, holding the baseline record.
     :param str relative: Configured trial-relative path.
     :param Path target: Current location of evidence after containment checks.
-    :param float | None evidence_before: Unix time the shared value file must predate,
-        defaults to None.
+    :param float | str | None evidence_before: Unix time the shared value file must predate,
+        or the reason it cannot be attributed to the attempt, defaults to None.
     :raises StaleEvidenceError: The file was not written by this attempt, or its state at
         launch could not be inspected.
     :raises OSError: The current file or the baseline record could not be inspected.
     """
     if is_captured_stream(relative):
         return
-    if evidence_before is not None and resolved_file_change_ns(trial_dir, target) > round(
+    if isinstance(evidence_before, str):
+        raise StaleEvidenceError(
+            f"`{target}` cannot be attributed to this attempt: {evidence_before}."
+        )
+    if evidence_before is not None and resolved_file_change_ns(trial_dir, target) >= round(
         evidence_before * 1e9
     ):
         raise StaleEvidenceError(
@@ -288,7 +292,7 @@ def load_json_value(
     *,
     digest: dict[str, Any] | None = None,
     baseline: EvidenceBaseline | None = None,
-    evidence_before: float | None = None,
+    evidence_before: float | str | None = None,
 ) -> tuple[Path, Any]:
     """Load a dotted JSON value from a configured trial path, as :func:`trial_file` locates it.
 
@@ -300,8 +304,8 @@ def load_json_value(
         ``sha256``/``size_bytes`` of the exact bytes parsed, for evidence
         provenance.
     :param EvidenceBaseline | None baseline: Value paths and file stamps recorded at launch.
-    :param float | None evidence_before: Unix time the shared JSON file must predate,
-        defaults to None.
+    :param float | str | None evidence_before: Unix time the shared JSON file must predate,
+        or the reason it cannot be attributed to the attempt, defaults to None.
     :raises TrialPathError: If the path contains a broken link or resolves outside its directory.
     :raises StaleEvidenceError: If the file was not written by this attempt.
     :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular file.
@@ -514,7 +518,7 @@ class TrialContext:
     # Value paths and file stamps recorded before the attempt ran.
     baseline: EvidenceBaseline | None = field(default=None, compare=False)
     # End of the attributable period for mutable evidence in a directory another attempt reused.
-    evidence_before: float | None = None
+    evidence_before: float | str | None = None
     # (generation ID, attempt ID) of the earlier attempts that trained in trial_dir, oldest
     # first, whose tracker histories are the start of this trial's.
     earlier_attempts: tuple[tuple[str, str], ...] = ()
@@ -872,7 +876,12 @@ def _capture_wandb(
     if deadline is not None:
         poll_deadline = min(poll_deadline, deadline)
     target = f"{source.base_url}/{source.entity}/{source.project}/{run_id}"
+    evidence_before = ctx.evidence_before
     try:
+        if isinstance(evidence_before, str):
+            raise ExtractorError(
+                f"W&B run {target} cannot be attributed to this attempt: {evidence_before}."
+            )
         try:
             logged_after = None if ctx.baseline is None else ctx.baseline.launched_at
             resume_axis = source.evaluation_axis if isinstance(source, WandbExtractor) else "_step"
@@ -901,7 +910,7 @@ def _capture_wandb(
                 required_keys=query.numeric_keys,
                 presence_keys=query.presence_keys,
                 logged_after=logged_after,
-                logged_before=ctx.evidence_before,
+                logged_before=evidence_before,
                 earlier_launches=tuple(earlier_launches),
                 resume_axis=resume_axis,
                 environment=ctx.wandb_environment,

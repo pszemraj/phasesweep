@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,6 +34,7 @@ from phasesweep.engine.state import (
     RERUN_OF_ATTR,
     TRIAL_DIR_ATTR,
 )
+from phasesweep.evidence.baseline import EVIDENCE_BASELINE_FILE
 from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
 from tests.conftest import (
     invoke_cli_boundary,
@@ -285,6 +287,92 @@ def test_reread_refuses_an_older_file_reached_through_a_retargeted_link(tmp_path
     older, retry = phase_study_of(corrected).get_trials()
     assert "changed after this attempt finished" in older.user_attrs[FAILURE_REASON_ATTR]
     assert "last changed before this attempt started" in retry.user_attrs[FAILURE_REASON_ATTR]
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="the host cannot change process time zones")
+def test_reread_uses_the_next_launch_instead_of_local_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The middle of three attempts owns the shared file it rewrote, across time zones.
+
+    :param Path tmp_path: Scratch directory for the experiment and trainer.
+    :param pytest.MonkeyPatch monkeypatch: Controller's local time zone for each run.
+    """
+    launches = tmp_path / "launches.txt"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse, json
+        from pathlib import Path
+        args = argparse.ArgumentParser()
+        args.add_argument("--out", type=Path, required=True)
+        out = args.parse_known_args()[0].out
+        launches = Path({str(launches)!r})
+        with launches.open("a") as handle:
+            handle.write("launch\\n")
+        count = len(launches.read_text().splitlines())
+        if count < 3:
+            out.write_text(json.dumps({{"loss": count}}))
+        """,
+    )
+    phase = Phase(name="p", n_trials=1, gpu_policy="none")
+    env = {"TZ": "UTC0"}
+    try:
+        with monkeypatch.context() as controller:
+            for target, zone in enumerate(("UTC-10", "UTC0", "UTC+10"), 1):
+                controller.setenv("TZ", zone)
+                time.tzset()
+                phase = phase.model_copy(update={"n_trials": target})
+                with pytest.raises(NoFeasibleTrialError):
+                    run_experiment(
+                        _experiment(tmp_path, trainer, _metric("typo"), phases=[phase], env=env)
+                    )
+
+            corrected = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase], env=env)
+            assert run_experiment(corrected)["p"].metric == 2
+    finally:
+        time.tzset()
+
+    first, middle, last = phase_study_of(corrected).get_trials()
+    assert len({trial.user_attrs[TRIAL_DIR_ATTR] for trial in (first, middle, last)}) == 1
+    assert [trial.value for trial in (first, middle, last)] == [None, 2, None]
+    assert "changed after this attempt finished" in first.user_attrs[FAILURE_REASON_ATTR]
+    assert "no fresh write since launch" in last.user_attrs[FAILURE_REASON_ATTR]
+    assert _launches(launches) == 3
+
+
+@pytest.mark.integration
+def test_reread_refuses_undated_reuse_only_for_shared_evidence(tmp_path: Path) -> None:
+    """A retry's missing baseline prevents dating its shared JSON but leaves private logs usable.
+
+    :param Path tmp_path: Scratch directory for the experiment and trainer.
+    """
+    trainer, launches = _counting_trainer(tmp_path)
+    phase = Phase(name="p", n_trials=1, gpu_policy="none")
+    retried = phase.model_copy(update={"n_trials": 2})
+    original = _experiment(tmp_path, trainer, _metric("typo"), phases=[retried])
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(_experiment(tmp_path, trainer, _metric("typo"), phases=[phase]))
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(original)
+    _, retry = phase_study_of(original).get_trials()
+    records = Path(retry.user_attrs[TRIAL_DIR_ATTR]).parent / "attempts"
+    (records / retry.user_attrs[ATTEMPT_ID_ATTR] / EVIDENCE_BASELINE_FILE).unlink()
+
+    shared = _experiment(tmp_path, trainer, _metric("loss"), phases=[retried])
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(shared)
+    opener, _ = phase_study_of(shared).get_trials()
+    reason = opener.user_attrs[FAILURE_REASON_ATTR]
+    assert "cannot be attributed to this attempt" in reason
+    assert f"launch time of attempt {retry.user_attrs[ATTEMPT_ID_ATTR]!r}" in reason
+
+    log = Metric(extractor=LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[0-9.]+)"))
+    private = _experiment(tmp_path, trainer, log, phases=[retried])
+    assert run_experiment(private)["p"].metric == 4
+    assert [trial.value for trial in phase_study_of(private).get_trials()] == [4, None]
+    assert _launches(launches) == 2
 
 
 def test_an_added_constraint_is_measured_for_every_finished_trial(tmp_path: Path) -> None:

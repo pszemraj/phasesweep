@@ -20,7 +20,6 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from typing import ClassVar
 
 import optuna
@@ -36,6 +35,7 @@ from phasesweep.engine.errors import (
     StudySchemaMismatchError,
     WinnerIntegrityError,
 )
+from phasesweep.engine.evidence import _earlier_attempts
 from phasesweep.engine.fingerprints import (
     _MAX_REPORTED_CHANGES,
     READING_KEY,
@@ -52,7 +52,7 @@ from phasesweep.engine.fingerprints import (
     reading_settings,
 )
 from phasesweep.engine.optuna import _measured_trial_count
-from phasesweep.engine.paths import _experiment_dir
+from phasesweep.engine.paths import _attempt_dir, _experiment_dir, _trial_dir_opener
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
@@ -309,40 +309,86 @@ def fill_source(
     return max(reversed(found), key=lambda source: source.rereads)
 
 
-def _directory_starts(trials: Iterable[optuna.trial.FrozenTrial]) -> dict[str, datetime]:
-    """Find the last attempt that could write each directory, across reading studies.
+def _directory_reuses(
+    trials: Iterable[optuna.trial.FrozenTrial],
+) -> dict[str, dict[str, float | None]]:
+    """Collect the launch epochs of attempts that could write a reused directory.
 
-    A continued directory keeps its basename even if the artifact tree moves. A rerun
-    that opens a fresh directory has its own name. Copied trials keep their launch date.
+    A continued directory keeps its basename even if the artifact tree moves. Copies in
+    another reading study keep the same attempt ID. The opener needs no launch epoch.
 
     :param Iterable[optuna.trial.FrozenTrial] trials: Attempts visible in the phase's studies.
-    :return dict[str, datetime]: Latest attempt start for each trainer directory name.
+    :return dict[str, dict[str, float | None]]: Launch epochs by directory name and attempt ID.
+        A missing epoch marks a possible writer whose launch time cannot be established.
     """
-    starts: dict[str, datetime] = {}
+    reuses: dict[str, dict[str, float | None]] = {}
     for trial in trials:
         try:
             directory = _recorded_trial_dir(trial)
+            opener = None if directory is None else _trial_dir_opener(directory)
         except ValueError:
             continue
-        started = trial.datetime_start
+        attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
         if (
             directory is None
-            or started is None
-            or started <= starts.get(directory.name, datetime.min)
+            or not isinstance(attempt_id, str)
+            or not attempt_id
+            or attempt_id == opener
         ):
             continue
-        if type(trial.user_attrs.get(RETURN_CODE_ATTR)) is int:
-            starts[directory.name] = started
+        launches = reuses.setdefault(directory.name, {})
+        if attempt_id in launches:
             continue
+        if type(trial.user_attrs.get(RETURN_CODE_ATTR)) is not int:
+            try:
+                lifecycle = _trial_lifecycle(trial)
+            except ValueError:
+                lifecycle = None
+            if lifecycle is not None and (
+                lifecycle.state == "allocated" or lifecycle.ended_by == "not_started"
+            ):
+                continue
         try:
-            lifecycle = _trial_lifecycle(trial)
+            launches[attempt_id] = read_evidence_baseline(
+                _attempt_dir(directory.parent, attempt_id)
+            ).launched_at
         except ValueError:
-            lifecycle = None
-        if lifecycle is None or (
-            lifecycle.state != "allocated" and lifecycle.ended_by != "not_started"
-        ):
-            starts[directory.name] = started
-    return starts
+            launches[attempt_id] = None
+    return reuses
+
+
+def _shared_evidence_cutoff(
+    launches: Mapping[str, float | None],
+    trials: Mapping[int, optuna.trial.FrozenTrial],
+    trial: optuna.trial.FrozenTrial,
+    attempt_id: str,
+    launched_at: float | None,
+) -> float | str | None:
+    """Find the next reuse of the directory, after which its evidence belongs elsewhere.
+
+    :param Mapping[str, float | None] launches: Launch epochs of attempts that reused the directory.
+    :param Mapping[int, optuna.trial.FrozenTrial] trials: Source study's trials by number.
+    :param optuna.trial.FrozenTrial trial: The trial being re-read.
+    :param str attempt_id: The trial's attempt ID.
+    :param float | None launched_at: The attempt's launch epoch, absent for the opener.
+    :return float | str | None: The next launch epoch, a reason shared evidence cannot be attributed,
+        or None when there was no later reuse.
+    """
+    other_launches = {other: start for other, start in launches.items() if other != attempt_id}
+    undated = {other for other, start in other_launches.items() if start is None}
+    if undated:
+        earlier = {earlier_id for _, earlier_id in _earlier_attempts(trials, trial)}
+        unknown = min(undated - earlier, default=None)
+        if unknown is not None:
+            return f"the launch time of attempt {unknown!r} in its shared directory is unavailable"
+    return min(
+        (
+            start
+            for start in other_launches.values()
+            if start is not None and (launched_at is None or start >= launched_at)
+        ),
+        default=None,
+    )
 
 
 def _reread_trial(
@@ -351,7 +397,7 @@ def _reread_trial(
     trial: optuna.trial.FrozenTrial,
     trials: Mapping[int, optuna.trial.FrozenTrial],
     producing: dict[str, Experiment | WinnerIntegrityError],
-    directory_starts: Mapping[str, datetime],
+    directory_reuses: Mapping[str, Mapping[str, float | None]],
 ) -> optuna.trial.FrozenTrial | None:
     """Read one finished trial again under the current settings, as the trial a fill writes.
 
@@ -364,7 +410,8 @@ def _reread_trial(
     :param Mapping[int, optuna.trial.FrozenTrial] trials: The source study's trials by number.
     :param dict[str, Experiment | WinnerIntegrityError] producing: Producing configurations by
         generation, filled as they are loaded.
-    :param Mapping[str, datetime] directory_starts: Last attempt to use each trainer directory.
+    :param Mapping[str, Mapping[str, float | None]] directory_reuses: Attempts that reused each
+        trainer directory and their launch epochs.
     :raises TrackingTargetUnavailableError: The tracker gave no answer, so the verdict waits for
         a later run; the trials already copied stay and the fill resumes.
     :return optuna.trial.FrozenTrial | None: The trial to write, or ``None`` when the trial is
@@ -395,8 +442,6 @@ def _reread_trial(
         launched = producing[record.generation_id]
         if isinstance(launched, WinnerIntegrityError):
             raise ValueError(str(launched))
-        started = directory_starts.get(directory.name)
-        finished = trial.datetime_complete
         result, _ = read_finished_attempt(
             trials,
             trial,
@@ -406,10 +451,12 @@ def _reread_trial(
             current=experiment,
             trainer_duration=seconds,
             baseline=baseline,
-            evidence_before=(
-                finished.timestamp()
-                if finished is not None and started is not None and started > finished
-                else None
+            evidence_before=_shared_evidence_cutoff(
+                directory_reuses.get(directory.name, {}),
+                trials,
+                trial,
+                record.attempt_id,
+                baseline.launched_at,
             ),
         )
     except ValueError as exc:
@@ -502,13 +549,13 @@ def fill_study(
         if key != PHASE_DECISION_ATTR and stored.get(key) != value:
             target.set_user_attr(key, value)
     by_number = {trial.number: trial for trial in trials}
-    directory_starts = _directory_starts(
+    directory_reuses = _directory_reuses(
         trial for study in other_studies for trial in study.get_trials(deepcopy=False)
     )
     producing: dict[str, Experiment | WinnerIntegrityError] = {}
     rereads = changed = 0
     for trial in trials[len(present) :]:
-        reread = _reread_trial(experiment, phase, trial, by_number, producing, directory_starts)
+        reread = _reread_trial(experiment, phase, trial, by_number, producing, directory_reuses)
         if reread is not None:
             rereads += 1
             changed += (reread.state, reread.value) != (trial.state, trial.value)
