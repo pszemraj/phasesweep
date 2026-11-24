@@ -14,7 +14,7 @@ import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from phasesweep.runtime.json import finite_nonnegative, json_text, json_text_list
 from phasesweep.runtime.remote_worker import report_reserve, run_worker
@@ -425,10 +425,16 @@ def _history_position(
     neighbors or a malformed final row disqualify this fallback. Recognized
     aggregate suffixes use the underlying series' final position.
 
-    History is lagging until its index exists, reaches the summary step and all counted
-    series rows are read. The axis must be logged alongside the metric. Transient
-    read failures and deadline expiry request retry; other failures settle with
-    no position. The captured objective is never changed.
+    The rows decide, not the index: W&B's index lists an aggregate summary key such as
+    ``eval/loss.min`` that no row carries, and its per-key counts are not row counts. So
+    rows are read for ``metric_key`` first, which keeps a series really logged under a
+    dotted name, and only when none carry it for the head of a recognized aggregate.
+    Only rows logging the axis with the series are read. History is lagging only while
+    its index is behind the summary's ``_step``, which the summary capture has normally
+    already waited out; an axis the index does not list, or a series no row carries,
+    settles with no position at once. Transient read failures and deadline expiry
+    request retry; other failures settle with no position. The captured objective is
+    never changed.
 
     :param Any run: Finished public-API run.
     :param Mapping[str, Any] summary: Its decoded summary.
@@ -453,30 +459,29 @@ def _history_position(
         if indexed is None or indexed < last_step:
             return "lagging", None
         logged_keys = run.history_keys["keys"]
-        if metric_key in logged_keys:
-            series = metric_key
-        elif dot and aggregation in {"min", "max", "mean", "last", "first"} and head in logged_keys:
-            series = head
-        else:
+        if axis not in logged_keys:
             return "settled", None
-        count = sum(entry["count"] for entry in logged_keys[series]["typeCounts"])
-        # Below-cap requests return the complete series; longer series require scan pages.
-        keys = [series, axis]
-        if count < _HISTORY_SAMPLES:
-            rows = run.history(keys=keys, samples=_HISTORY_SAMPLES, pandas=False)
-        else:
-            rows = run.scan_history(keys=keys, page_size=_HISTORY_SAMPLES, use_cache=False)
-        read = 0
+        candidates = [metric_key]
+        if dot and aggregation in {"min", "max", "mean", "last", "first"}:
+            candidates.append(head)
+        series = ""
+        rows: list[Mapping[str, object]] = []
+        for candidate in candidates:
+            if candidate not in logged_keys:
+                continue
+            read = _read_series(run, candidate, axis, last_step=last_step, deadline=deadline)
+            if read is None:
+                return "retry", None
+            if read:
+                series, rows = candidate, read
+                break
+        if not rows:
+            return "settled", None
         exact_match = False
         neighbors: set[float] = set()
         final_value: float | None = None
         final_position: int | float | None = None
         for row in rows:
-            if time.monotonic() >= deadline:
-                return "retry", None
-            if series not in row:
-                continue
-            read += 1
             if series != metric_key:
                 position = finite_nonnegative(row.get(axis))
                 continue
@@ -494,13 +499,62 @@ def _history_position(
                 position = final_position
             elif math.nextafter(value, logged) == logged:
                 neighbors.add(logged)
-        if read < count:
-            return "lagging", None
         if not exact_match and len(neighbors) == 1 and final_value in neighbors:
             position = final_position
     except Exception as exc:
         return ("retry" if _is_retryable_setup_error(exc) else "settled"), None
     return "settled", position
+
+
+class _HistoryReader(Protocol):
+    """The public-API run's two history reads."""
+
+    def history(
+        self, *, keys: list[str], samples: int, pandas: bool
+    ) -> Iterable[Mapping[str, object]]:
+        """Return a sample of rows logging every key in ``keys``."""
+        ...
+
+    def scan_history(
+        self, *, keys: list[str], page_size: int, use_cache: bool
+    ) -> Iterable[Mapping[str, object]]:
+        """Return every row logging every key in ``keys``, in pages."""
+        ...
+
+
+def _read_series(
+    run: _HistoryReader, series: str, axis: str, *, last_step: int | float, deadline: float
+) -> list[Mapping[str, object]] | None:
+    """Read every history row that logs ``series`` together with ``axis``.
+
+    A run has at most ``last_step + 1`` rows, so below the server's sample cap the
+    sampled call returns them all and longer histories are scanned in pages. W&B has
+    served scanned rows before sampled ones, so an empty sampled read is scanned once.
+
+    :param _HistoryReader run: Finished public-API run.
+    :param str series: History key to read.
+    :param str axis: History key marking where ``series`` was measured.
+    :param int | float last_step: The summary's ``_step``, the last row's step.
+    :param float deadline: ``time.monotonic()`` time at which the read gives up.
+    :return list[Mapping[str, object]] | None: The rows carrying ``series``, or ``None``
+        when the deadline passed mid-read.
+    """
+    keys = [series, axis]
+    rows: list[Mapping[str, object]] = []
+    if last_step + 1 < _HISTORY_SAMPLES:
+        for row in run.history(keys=keys, samples=_HISTORY_SAMPLES, pandas=False):
+            if time.monotonic() >= deadline:
+                return None
+            if series in row:
+                rows.append(row)
+        if rows:
+            return rows
+    for row in run.scan_history(keys=keys, page_size=_HISTORY_SAMPLES, use_cache=False):
+        if time.monotonic() >= deadline:
+            return None
+        if series in row:
+            rows.append(row)
+    return rows
 
 
 def _poll_wandb_summary(
@@ -714,7 +768,7 @@ def _locate_wandb_position(
 
     Lagging history and transient failures are read again until the deadline; other
     failures return no position. The summary capture already waited for the history
-    index, so lagging reads are rare; a read short of the index's row count is one.
+    index, so history normally settles on the first read.
 
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.

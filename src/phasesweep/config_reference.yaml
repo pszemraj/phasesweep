@@ -661,6 +661,6 @@ WandbTarget:
   # W&B can report a run finished minutes before it serves the run's summary, longest for a resumed run, so a key missing from a finished summary fails the read only when this runs out.
   # Warning: a metric_key or gate key the trainer never logs therefore costs this much every trial.
   # After the objective is accepted, locating its history position gets a fresh budget of this length, capped by the same deadlines.
-  # History rows W&B has not served yet are read again until it runs out.
+  # Only a history index behind the summary is waited for; rows that carry no position settle at once with none.
   # A capture that runs out fails the read. A position lookup that runs out only leaves the position unrecorded.
   timeout_seconds: float = 600.0

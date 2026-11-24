@@ -264,10 +264,13 @@ def test_wandb_errors_unwind_through_context_managers(name, arguments):
 class _HistoryRun:
     """A finished run whose history, and the index describing it, a test controls.
 
-    ``indexed_steps`` are the index's last steps on successive loads before it
-    reaches the last row, ``None`` for a null index and -1 for one without keys, as W&B
-    serves before indexing; ``visible`` slices the rows successive reads return
-    before all of them are visible, as reads just after a run finishes do.
+    The index looks like the live service's: it lists every logged key and every
+    summary key, aggregates such as ``eval/loss.min`` included although no row carries
+    them, each with a count of 2 whatever the row count. ``indexed_steps`` are the
+    index's last steps on successive loads before it reaches the last row, ``None`` for
+    a null index and -1 for one without keys, as W&B serves before indexing; ``visible``
+    slices the rows successive sampled reads return, as W&B has served scanned rows
+    before sampled ones.
     """
 
     def __init__(self, summary, rows, indexed_steps=(), visible=()):
@@ -281,10 +284,7 @@ class _HistoryRun:
 
     def load(self, force=False):
         assert force is True
-        counts: dict[str, int] = {}
-        for row in self.rows:
-            for key in row.keys() - {"_step"}:
-                counts[key] = counts.get(key, 0) + 1
+        listed = {key for row in self.rows for key in row} | set(self.summary_metrics)
         indexed = next(self.indexed_steps, max((row["_step"] for row in self.rows), default=-1))
         self.history_keys = (
             None
@@ -292,8 +292,8 @@ class _HistoryRun:
             else {
                 "lastStep": indexed,
                 "keys": {
-                    key: {"typeCounts": [{"type": "number", "count": count}]}
-                    for key, count in counts.items()
+                    key: {"typeCounts": [{"type": "number", "count": 2}]}
+                    for key in listed | {"_runtime", "_timestamp"}
                     if indexed >= 0
                 },
             }
@@ -301,13 +301,12 @@ class _HistoryRun:
 
     def _logged(self, keys):
         # Like the server, only rows that logged every requested key.
-        rows = [row for row in self.rows if all(key in row for key in keys)]
-        return rows[next(self.visible, slice(None))]
+        return [row for row in self.rows if all(key in row for key in keys)]
 
     def history(self, keys, samples=500, pandas=True):
         assert pandas is False
         self.reads.append(("history", keys))
-        rows = self._logged(keys)
+        rows = self._logged(keys)[next(self.visible, slice(None))]
         # The server returns a series of at least ``samples`` rows as a sample.
         return rows if len(rows) < samples else rows[::2][:samples]
 
@@ -381,7 +380,53 @@ def test_wandb_locates_where_the_objective_summary_was_logged(
 ):
     run = _HistoryRun(summary, _EVAL_ROWS)
     assert _history_position(monkeypatch, run, metric_key, axis) == expected
-    assert {kind for kind, _ in run.reads} <= {"history"}
+
+
+def test_wandb_aggregate_key_listed_in_the_index_is_read_from_its_series(monkeypatch):
+    """An aggregate key the index lists but no row carries is read from its head series, after one scan confirms it is empty."""
+    run = _HistoryRun({"eval/loss.min": 0.2, "_step": 5}, _EVAL_ROWS)
+    run.load(force=True)
+    assert "eval/loss.min" in run.history_keys["keys"]
+    assert _history_position(monkeypatch, run, "eval/loss.min", "eval/step") == 400
+    assert run.reads == [
+        ("history", ["eval/loss.min", "eval/step"]),
+        ("scan", ["eval/loss.min", "eval/step"]),
+        ("history", ["eval/loss", "eval/step"]),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("evaluations", "expected"),
+    [([5, 10, 15, 20], 20), (list(range(1, 13)), 12)],
+    ids=["sweep-trainer", "resumed-trainer"],
+)
+def test_wandb_live_trainer_histories_are_positioned_at_their_last_evaluation(
+    monkeypatch, evaluations, expected
+):
+    """The live trainers' runs, one eval row per ``_step`` and an ``eval/loss.min`` summary, are positioned at their last ``eval/step``."""
+    rows = [
+        {"_step": step, "eval/loss": 1.0 / evaluation, "eval/step": evaluation}
+        for step, evaluation in enumerate(evaluations)
+    ]
+    summary = {"eval/loss.min": min(row["eval/loss"] for row in rows), "_step": len(rows) - 1}
+    run = _HistoryRun(summary, rows)
+    assert _history_position(monkeypatch, run, "eval/loss.min", "eval/step") == expected
+
+
+def test_wandb_axis_never_logged_settles_without_a_read(monkeypatch):
+    """An axis the index does not list leaves no position to find, so nothing is read or waited for."""
+    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS)
+    start = time.monotonic()
+    assert _history_position(monkeypatch, run, axis="tokens", timeout_seconds=60) is None
+    assert time.monotonic() - start < 5
+    assert run.reads == []
+
+
+def test_wandb_empty_sampled_read_is_scanned_once(monkeypatch):
+    """Rows the sampled call does not serve yet are read by one scan instead of a wait."""
+    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, visible=[slice(0, 0)])
+    assert _history_position(monkeypatch, run, axis="eval/step") == 400
+    assert [kind for kind, _ in run.reads] == ["history", "scan"]
 
 
 @pytest.mark.parametrize("direction", [-math.inf, math.inf])
@@ -439,37 +484,21 @@ def test_wandb_series_at_the_sample_cap_is_scanned_in_pages_never_sampled(monkey
     monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SAMPLES", 2)
     run = _HistoryRun({"eval/loss.min": 0.2, "_step": 5}, _EVAL_ROWS)
     assert _history_position(monkeypatch, run, "eval/loss.min", "eval/step") == 400
-    assert [kind for kind, _ in run.reads] == ["scan"]
+    # Six rows exceed the cap of two, so the aggregate key and then its head are scanned.
+    assert [kind for kind, _ in run.reads] == ["scan", "scan"]
     # A page of as many steps as the cap holds at most that many rows.
     assert run.page_size == 2
-
-
-@pytest.mark.parametrize(
-    ("visible", "metric_key", "expected"),
-    [
-        # Just after a run finishes, reads can return only the newest rows ...
-        pytest.param(slice(-2, None), "eval/loss", 400, id="newest-only"),
-        # ... or miss the newest ones, which would end the series early.
-        pytest.param(slice(0, 2), "eval/loss.min", 400, id="oldest-only"),
-    ],
-)
-def test_wandb_read_short_of_the_indexed_row_count_is_retried(
-    monkeypatch, visible, metric_key, expected
-):
-    run = _HistoryRun({metric_key: 0.2, "_step": 5}, _EVAL_ROWS, visible=[visible])
-    assert _history_position(monkeypatch, run, metric_key, "eval/step") == expected
-    assert [kind for kind, _ in run.reads] == ["history", "history"]
 
 
 def test_wandb_slow_summary_polling_still_retries_history(monkeypatch):
     """A summary poll interval as long as the budget must not leave one history read."""
     monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_RETRY_SECONDS", 0.001)
-    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, visible=[slice(-2, None)])
+    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=[3])
     position = _history_position(
         monkeypatch, run, "eval/loss", "eval/step", poll_seconds=60, timeout_seconds=60
     )
     assert position == 400
-    assert len(run.reads) == 2
+    assert len(run.reads) == 1
 
 
 @pytest.mark.parametrize(
@@ -477,22 +506,30 @@ def test_wandb_slow_summary_polling_still_retries_history(monkeypatch):
     [("best/loss", 0.1), ("eval/loss.selected", 0.123456), ("eval/loss.selected", 0.4)],
     ids=["absent-series", "custom-suffix-unlogged-value", "custom-suffix-matching-value"],
 )
-def test_wandb_summary_key_absent_from_history_settles_without_a_read(
+def test_wandb_summary_key_absent_from_history_settles_with_no_position(
     monkeypatch, metric_key, value
 ):
+    """A summary key no row carries settles after one sampled read and one scan, without waiting."""
     run = _HistoryRun({metric_key: value, "_step": 5}, _EVAL_ROWS)
-    assert _history_position(monkeypatch, run, metric_key, "eval/step") is None
-    assert run.reads == []
-
-
-def test_wandb_dotted_history_series_is_read_before_its_head(monkeypatch):
-    rows = [
-        {"_step": 0, "eval/loss": 0.2, "eval/loss.ema": 0.3, "eval/step": 10},
-        {"_step": 1, "eval/loss": 0.3, "eval/loss.ema": 0.2, "eval/step": 20},
+    assert _history_position(monkeypatch, run, metric_key, "eval/step", timeout_seconds=60) is None
+    assert run.reads == [
+        ("history", [metric_key, "eval/step"]),
+        ("scan", [metric_key, "eval/step"]),
     ]
-    run = _HistoryRun({"eval/loss.ema": 0.2, "_step": 1}, rows)
-    assert _history_position(monkeypatch, run, "eval/loss.ema", "eval/step") == 20
-    assert run.reads == [("history", ["eval/loss.ema", "eval/step"])]
+
+
+@pytest.mark.parametrize("suffix", ["ema", "min"])
+def test_wandb_dotted_history_series_is_read_before_its_head(monkeypatch, suffix):
+    """A series really logged under a dotted name, even an aggregate-looking one, is positioned by its own rows."""
+    key = f"eval/loss.{suffix}"
+    rows = [
+        {"_step": 0, "eval/loss": 0.2, key: 0.3, "eval/step": 10},
+        {"_step": 1, "eval/loss": 0.3, key: 0.2, "eval/step": 20},
+        {"_step": 2, "eval/loss": 0.4, key: 0.25, "eval/step": 30},
+    ]
+    run = _HistoryRun({key: 0.2, "_step": 2}, rows)
+    assert _history_position(monkeypatch, run, key, "eval/step") == 20
+    assert run.reads == [("history", [key, "eval/step"])]
 
 
 @pytest.mark.parametrize("indexed_steps", [[3, 4], [None, -1, -1]], ids=["behind", "unindexed"])
@@ -984,7 +1021,8 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
         class Run:
             state = "finished"
             summary_metrics = {"loss": 0.25, "_step": 7, "done": object(), "unrelated": object()}
-            history_keys = {"lastStep": 7, "keys": {"loss": {"typeCounts": [{"count": 1}]}}}
+            history_keys = {"lastStep": 7, "keys": {"loss": {"typeCounts": [{"count": 2}]},
+                                                    "_step": {"typeCounts": [{"count": 2}]}}}
             def load(self, force=False):
                 pass
             def history(self, keys, samples=500, pandas=True):
@@ -1232,7 +1270,8 @@ def test_wandb_position_worker_stopped_at_its_deadline_records_no_position(
         class Run:
             state = "finished"
             summary_metrics = {"loss": 0.25, "_step": 7}
-            history_keys = {"lastStep": 7, "keys": {"loss": {"typeCounts": [{"count": 1}]}}}
+            history_keys = {"lastStep": 7, "keys": {"loss": {"typeCounts": [{"count": 2}]},
+                                                    "_step": {"typeCounts": [{"count": 2}]}}}
             def load(self, force=False):
                 pass
             def history(self, keys, samples=500, pandas=True):

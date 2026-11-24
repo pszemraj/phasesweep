@@ -790,7 +790,10 @@ def test_slow_wandb_position_read_never_costs_an_accepted_trial(
     class Run:
         state = "finished"
         summary_metrics = {"eval/loss": 0.2, "_step": 1}
-        history_keys = {"lastStep": 1, "keys": {"eval/loss": {"typeCounts": [{"count": 1}]}}}
+        history_keys = {
+            "lastStep": 1,
+            "keys": {key: {"typeCounts": [{"count": 2}]} for key in ("eval/loss", "eval/step")},
+        }
 
         def load(self, force: bool = False) -> None:
             pass
