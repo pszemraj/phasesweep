@@ -85,7 +85,7 @@ from phasesweep.engine.study_policy import (
 )
 from phasesweep.engine.trial_dirs import _rerun_directory_sources
 from phasesweep.errors import (
-    FRESH_STUDY,
+    REJUDGE_BOUNDS_STEP,
     STORAGE_NULL_KEEPS_NOTHING,
     OperatorAction,
     PhaseSweepError,
@@ -191,7 +191,7 @@ def _no_feasible_remedy(
         return f"{evidence} Fix the failure, or the metric bounds or constraints, then rerun."
     infeasible = any(_trial_count_state(trial, experiment) == "INFEASIBLE" for trial in trials)
     if infeasible:
-        return f"{evidence} To change metric.min, metric.max or constraints, {FRESH_STUDY}."
+        return f"{evidence} {REJUDGE_BOUNDS_STEP}"
     fix = "Fix the failure"
     step: str | None = "raise the phase's n_trials and rerun."
     if phase_name is not None:

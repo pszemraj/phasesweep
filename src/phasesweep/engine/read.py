@@ -25,6 +25,7 @@ from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import Experiment, Phase, _metric_semantics_payload
 from phasesweep.engine.artifact_roots import _artifact_path_mode
 from phasesweep.engine.artifacts import read_yaml_or_none
+from phasesweep.engine.bounds import infeasible_reason
 from phasesweep.engine.confound import (
     _confound_summary,
     _validate_confound_block,
@@ -1256,7 +1257,7 @@ def _status_phase_refusal(
     :param optuna.Study study: Read-only phase study containing the recorded decisions.
     :return PhaseAbortRefusedError | None: Failure-policy refusal to report, if any.
     """
-    policy = _load_phase_policy_state(study)
+    policy = _load_phase_policy_state(study, experiment)
     if _at_accepted_partial_target(_load_accepted_partial_decision(study), phase):
         return None
     return _phase_refusal(experiment, phase, study, policy)
@@ -1469,17 +1470,20 @@ def _recorded_count(value: object) -> int | None:
     return value if type(value) is int and value >= 0 else None
 
 
-def _trial_reason(trial: optuna.trial.FrozenTrial) -> str | None:
-    """Read the recorded execution failure or outcome cause for a trial.
+def _trial_reason(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> str | None:
+    """Read the recorded execution failure or outcome cause for a trial, or judge its bounds.
 
     :param optuna.trial.FrozenTrial trial: Trial whose diagnostic is displayed.
-    :return str | None: Recorded cause, or None when no diagnostic was recorded.
+    :param Experiment experiment: Config whose bounds judge a measured trial.
+    :return str | None: Recorded cause, else the bounds a measured trial violates, else None.
     """
     failure = trial.user_attrs.get(FAILURE_REASON_ATTR)
     if isinstance(failure, str) and failure:
         return failure
     outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
-    return None if outcome is None else outcome.cause
+    if outcome is not None and outcome.cause is not None:
+        return outcome.cause
+    return infeasible_reason(trial, experiment)
 
 
 def _trial_dir_text(trial: optuna.trial.FrozenTrial) -> str | None:
@@ -1543,7 +1547,7 @@ def _trial_table(
         {name for t in trials for name in t.user_attrs if name.startswith(OBSERVED_PREFIX)}
     )
     reruns = any(RERUN_OF_ATTR in t.user_attrs for t in trials)
-    reasons = {trial.number: _trial_reason(trial) for trial in trials}
+    reasons = {trial.number: _trial_reason(trial, experiment) for trial in trials}
     has_reason = any(reasons.values())
     columns = (
         *(header for header, _ in _CORE_TRIAL_COLUMNS),

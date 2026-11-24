@@ -13,6 +13,7 @@ from collections.abc import Hashable, Mapping, Sequence
 import optuna
 
 from phasesweep.config.models import Experiment, Phase
+from phasesweep.engine.bounds import infeasible_reason
 from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.state import (
@@ -183,7 +184,7 @@ def _report_trial(
             params=params,
             repeat=repeat,
             rerun_of=trial.user_attrs.get(RERUN_OF_ATTR),
-            reason=_first_cause_line(trial),
+            reason=_first_cause_line(trial, experiment),
             recovered=recovered,
         )
     )
@@ -219,14 +220,17 @@ def _log_trial_start(
     )
 
 
-def _first_cause_line(trial: optuna.trial.FrozenTrial) -> str | None:
-    """Return the first line of a trial's recorded outcome cause.
+def _first_cause_line(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> str | None:
+    """Return the first line of a trial's recorded outcome cause, or of its bound violations.
 
     :param optuna.trial.FrozenTrial trial: Trial whose outcome record is read.
-    :return str | None: The cause's first nonblank line, or None when it recorded none.
+    :param Experiment experiment: Config whose bounds judge a measured trial.
+    :return str | None: The cause's first nonblank line, else the bounds a measured trial
+        violates, else None.
     """
     parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
-    lines = parsed.cause.strip().splitlines() if parsed and parsed.cause else []
+    cause = parsed.cause if parsed and parsed.cause else infeasible_reason(trial, experiment)
+    lines = cause.strip().splitlines() if cause else []
     return lines[0] if lines else None
 
 
@@ -254,6 +258,6 @@ def _log_reruns(
                 phase,
                 number=rerun,
                 source=source,
-                reason=_first_cause_line(trials[source]),
+                reason=_first_cause_line(trials[source], experiment),
             )
         )

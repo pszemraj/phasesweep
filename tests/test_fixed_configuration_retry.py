@@ -33,6 +33,7 @@ from phasesweep.engine.selection import (
 )
 from phasesweep.engine.state import TRIAL_TARGET_ATTR
 from phasesweep.engine.study_policy import _validate_trial_target
+from phasesweep.errors import REJUDGE_BOUNDS_STEP
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.runtime.process import write_attempt_lifecycle
@@ -234,7 +235,7 @@ def test_measured_infeasible_fixed_configuration_says_nothing_can_continue(tmp_p
     for message in (_operational_error_text(aborted.value), _operational_error_text(refused.value)):
         assert "Its configuration was measured and is not feasible" in message
         assert "phases[p]" not in message
-        assert "new `experiment` name" in message
+        assert REJUDGE_BOUNDS_STEP in message
     assert _call_count(calls) == 1
 
 

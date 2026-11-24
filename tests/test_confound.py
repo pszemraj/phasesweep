@@ -43,7 +43,6 @@ from phasesweep.engine.selection import (
 )
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
-    FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     RERUN_OF_ATTR,
@@ -1389,7 +1388,6 @@ def test_confound_block_never_moves_a_downstream_fingerprint() -> None:
 def _candidate_attrs(number: int, provenance: dict[str, Any]) -> dict[str, Any]:
     """Return the user attrs a selection candidate carries."""
     return {
-        FEASIBLE_ATTR: True,
         GENERATION_ID_ATTR: "generation-test",
         ATTEMPT_ID_ATTR: f"attempt-{number}",
         TRIAL_DIR_ATTR: f"/runs/p/trial_{number:05d}__attempt-{number}",

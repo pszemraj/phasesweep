@@ -19,8 +19,8 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.optuna import (
-    _completed_trial_count,
     _finished_trial_count,
+    _measured_trial_count,
     _meets_published_trial_history_boundary,
     _published_phase_trial_refs,
     _published_trial_matches,
@@ -57,7 +57,7 @@ log = logging.getLogger(__name__)
 BindingState = Literal["bound", "unbound"]
 
 
-ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 24
+ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 25
 
 
 def _artifact_root_storage_key(experiment: Experiment) -> str | None:
@@ -414,19 +414,19 @@ def _check_published_phase_studies(
                 trials = holding[0] if holding else [trial for t in every for trial in t]
                 if matched and expected is not None:
                     finished = _finished_trial_count(trials)
-                    completed = _completed_trial_count(trials, experiment)
-                    if _meets_published_trial_history_boundary(finished, completed, expected):
+                    measured = _measured_trial_count(trials)
+                    if _meets_published_trial_history_boundary(finished, measured, expected):
                         continue
                     boundary = ", ".join(
                         f"{count} {label}"
                         for count, label in (
                             (expected.finished_trials, "finished"),
-                            (expected.completed_trials, "completed"),
+                            (expected.measured_trials, "measured"),
                         )
                         if count is not None
                     )
                     missing = (
-                        f"has only {finished} finished and {completed} completed trials, "
+                        f"has only {finished} finished and {measured} measured trials, "
                         f"below the published completion boundary ({boundary})"
                     )
             except Exception as exc:

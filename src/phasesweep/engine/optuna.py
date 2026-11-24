@@ -67,7 +67,7 @@ class _TrialRef:
     which trial it is, and which generation/attempt claimed it.
     Values are ``None`` for an allocation interrupted before its identity
     attributes were written. Published references additionally
-    carry their finished and completed count boundary, and a RUNNING row the
+    carry their finished and measured count boundary, and a RUNNING row the
     state stale recovery will record for it. Those fields are not part of a
     trial-row identity comparison.
     """
@@ -76,7 +76,7 @@ class _TrialRef:
     generation_id: str | None
     attempt_id: str | None
     finished_trials: int | None = field(default=None, compare=False)
-    completed_trials: int | None = field(default=None, compare=False)
+    measured_trials: int | None = field(default=None, compare=False)
     recovers_as: RecoveredTrialState | None = field(default=None, compare=False)
 
 
@@ -150,20 +150,11 @@ def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
     return sum(1 for trial in trials if _trial_run_state(trial) in FINISHED_TRIAL_STATES)
 
 
-def _completed_trial_count(
-    trials: Iterable[optuna.trial.FrozenTrial], experiment: Experiment
-) -> int:
-    """Return the number of trials that finished inside every metric bound and constraint.
-
-    :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
-    :param Experiment experiment: Config supplying the current bounds.
-    :return int: Number of trials :func:`_trial_count_state` counts as ``COMPLETE``.
-    """
-    return sum(1 for trial in trials if _trial_count_state(trial, experiment) == "COMPLETE")
-
-
 def _measured_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
     """Return the Optuna COMPLETE trial count of ``trials``, infeasible ones included.
+
+    No bound changes it, so a publication and an accepted partial decision record it as
+    ``measured_trials`` and later reads compare a recount with that record.
 
     :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
     :return int: Number of trials in :attr:`optuna.trial.TrialState.COMPLETE`.
@@ -211,7 +202,7 @@ def _published_phase_trial_refs(
 
     :param Mapping[str, Any] | None summary: Already-resolved publication summary.
     :return dict[str, _TrialRef | None]: Local trial identities by phase, with
-        their known finished and completed count boundary; None when a published
+        their known finished and measured count boundary; None when a published
         phase does not record a complete identity.
     """
     refs: dict[str, _TrialRef | None] = {}
@@ -230,15 +221,15 @@ def _published_phase_trial_refs(
             and completion["finished_trials"] >= 0
             else None
         )
-        completed_trials = (
-            completion.get("completed_trials")
+        measured_trials = (
+            completion.get("measured_trials")
             if isinstance(completion, Mapping)
-            and type(completion.get("completed_trials")) is int
-            and completion["completed_trials"] >= 0
+            and type(completion.get("measured_trials")) is int
+            and completion["measured_trials"] >= 0
             else None
         )
         refs[name] = (
-            _TrialRef(number, generation, attempt, finished_trials, completed_trials)
+            _TrialRef(number, generation, attempt, finished_trials, measured_trials)
             if isinstance(number, int)
             and not isinstance(number, bool)
             and isinstance(generation, str)
@@ -251,19 +242,19 @@ def _published_phase_trial_refs(
 
 
 def _meets_published_trial_history_boundary(
-    finished: int, completed: int, expected: _TrialRef
+    finished: int, measured: int, expected: _TrialRef
 ) -> bool:
     """Return whether a study still holds the history a publication recorded.
 
     :param int finished: Finished trials the study holds now.
-    :param int completed: Completed trials the study holds now, those inside every metric
-        bound and constraint.
+    :param int measured: Trials the study holds now that measured their values
+        (:func:`_measured_trial_count`).
     :param _TrialRef expected: Published trial whose recorded counts, when
         present, are the minimum.
     :return bool: ``True`` when both counts meet the recorded boundary.
     """
     return (expected.finished_trials is None or finished >= expected.finished_trials) and (
-        expected.completed_trials is None or completed >= expected.completed_trials
+        expected.measured_trials is None or measured >= expected.measured_trials
     )
 
 

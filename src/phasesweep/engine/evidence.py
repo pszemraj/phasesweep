@@ -19,7 +19,6 @@ from phasesweep.engine.paths import _attempt_dir, _phase_dir
 from phasesweep.engine.repeats import evidence_members
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
-    FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_INPUT_ATTR,
@@ -73,10 +72,10 @@ if TYPE_CHECKING:
 # before the trainer starts, so their absence is proof the directory is no
 # longer the one that attempt produced.
 def _selection_candidate_identity(trial: optuna.trial.FrozenTrial) -> tuple[str, str] | None:
-    """Return execution identity for COMPLETE, finite, feasible trials with nonempty ids.
+    """Return execution identity for COMPLETE, finite trials with nonempty ids.
 
-    Selection additionally applies current constraint bounds. Evidence preflight
-    excludes that mutable filter, preserving evidence for trials that may become
+    Selection additionally applies the current metric and constraint bounds. Evidence
+    preflight excludes that mutable filter, preserving evidence for trials that may become
     eligible after a bounds edit. Ineligible trials cannot affect winner selection.
 
     :param optuna.trial.FrozenTrial trial: Persisted trial to classify.
@@ -86,8 +85,6 @@ def _selection_candidate_identity(trial: optuna.trial.FrozenTrial) -> tuple[str,
     if trial.state != optuna.trial.TrialState.COMPLETE:
         return None
     if trial.value is None or not math.isfinite(trial.value):
-        return None
-    if not trial.user_attrs.get(FEASIBLE_ATTR, False):
         return None
     generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
     attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)

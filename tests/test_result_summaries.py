@@ -8,16 +8,17 @@ from pathlib import Path
 import optuna
 import pytest
 
-from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.models import Constraint, Experiment, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.read import read_trial_tables
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
-    FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     RERUN_OF_ATTR,
     TRIAL_OUTCOME_ATTR,
+    constraint_attr,
 )
+from phasesweep.evidence.models import JsonExtractor
 from phasesweep.runtime.json import JsonObject
 from phasesweep.trial_table import render_trial_tables
 from tests.conftest import make_experiment, trial_outcome
@@ -25,9 +26,20 @@ from tests.recovery_helpers import new_phase_study
 
 
 def _experiment(tmp_path: Path, *, repeats: Repeats, n_trials: int) -> Experiment:
-    """Build a persistent random phase whose configuration slots can repeat."""
+    """Build a persistent random phase whose configuration slots can repeat.
+
+    Its ``memory`` constraint allows at most 1.0, so a member :func:`_add_trial` records as
+    infeasible measures 2.0 there.
+    """
     return make_experiment(
         persistent=tmp_path,
+        constraints=[
+            Constraint(
+                name="memory",
+                extractor=JsonExtractor(type="json", path="r.json", key="memory"),
+                max=1.0,
+            )
+        ],
         phases=[
             Phase(
                 name="p",
@@ -65,7 +77,7 @@ def _add_trial(
                 else optuna.trial.TrialState.FAIL
             ),
             user_attrs={
-                FEASIBLE_ATTR: feasible,
+                constraint_attr("memory"): 0.5 if feasible else 2.0,
                 GENERATION_ID_ATTR: "generation-a",
                 ATTEMPT_ID_ATTR: f"attempt-{number}",
                 TRIAL_OUTCOME_ATTR: trial_outcome(

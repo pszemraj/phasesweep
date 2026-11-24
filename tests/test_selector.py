@@ -15,7 +15,6 @@ from phasesweep.engine.repeats import RepeatAxis
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
-    FEASIBLE_ATTR,
     GATES_ATTR,
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
@@ -58,7 +57,6 @@ def _add_trial(
     study,
     value,
     *,
-    feasible=True,
     constraint_vals=None,
     params=None,
     extra_user_attrs=None,
@@ -69,7 +67,6 @@ def _add_trial(
         distributions[k] = optuna.distributions.IntDistribution(low=int(v), high=int(v))
         pvals[k] = int(v)
     user_attrs = {
-        FEASIBLE_ATTR: feasible,
         GENERATION_ID_ATTR: "generation-test",
         ATTEMPT_ID_ATTR: f"attempt-{len(study.trials)}",
         TRIAL_DIR_ATTR: f"/runs/p/trial-{len(study.trials)}",
@@ -113,9 +110,9 @@ def test_excludes_infeasible():
     )
     study = _make_study()
     # Best metric but violates constraint
-    _add_trial(study, 0.05, feasible=False, constraint_vals={"bytes": 200}, params={"x": 1})
-    _add_trial(study, 0.20, feasible=True, constraint_vals={"bytes": 50}, params={"x": 2})
-    _add_trial(study, 0.30, feasible=True, constraint_vals={"bytes": 75}, params={"x": 3})
+    _add_trial(study, 0.05, constraint_vals={"bytes": 200}, params={"x": 1})
+    _add_trial(study, 0.20, constraint_vals={"bytes": 50}, params={"x": 2})
+    _add_trial(study, 0.30, constraint_vals={"bytes": 75}, params={"x": 3})
 
     w = select_winner(study, exp)
     assert w.metric == pytest.approx(0.20)
@@ -123,9 +120,9 @@ def test_excludes_infeasible():
 
 
 def test_no_feasible_raises():
-    exp = _make_exp()
+    exp = _with_bounds(_make_exp(), max=0.05)
     study = _make_study()
-    _add_trial(study, 0.1, feasible=False, params={"x": 1})
+    _add_trial(study, 0.1, params={"x": 1})
     with pytest.raises(NoFeasibleTrialError):
         select_winner(study, exp)
 
@@ -254,10 +251,9 @@ def _with_bounds(exp, **bounds: float):
 
 
 def test_metric_bounds_are_rechecked_at_selection() -> None:
-    """A stored value outside today's bounds cannot win, whatever its feasible attr says."""
+    """A stored value outside today's bounds cannot win, as if the bounds were set or tightened later."""
     exp = _with_bounds(_make_exp(), min=0.2, max=2.0)
     study = _make_study()
-    # Every trial carries feasible=True, as if the bounds were set or tightened later.
     _add_trial(study, 0.1, params={"x": 1})
     _add_trial(study, 3.0, params={"x": 2})
     _add_trial(study, 0.5, params={"x": 3})
@@ -275,7 +271,7 @@ def test_metric_bounds_no_feasible_message_names_bound_and_best_value() -> None:
     """When the bounds leave nothing, the error names them and the best value seen."""
     study = _make_study()
     _add_trial(study, 5.0, params={"x": 1})
-    _add_trial(study, 3.5, params={"x": 2}, feasible=False)
+    _add_trial(study, 3.5, params={"x": 2})
     _add_trial(study, 7.0, params={"x": 3})
     study.add_trial(
         optuna.trial.create_trial(state=optuna.trial.TrialState.FAIL, user_attrs={"x": 1})
@@ -292,9 +288,19 @@ def test_metric_bounds_no_feasible_message_names_bound_and_best_value() -> None:
         select_winner(study, _with_bounds(_make_exp(goal="maximize"), min=6.0, max=6.5))
 
     unbounded_study = _make_study()
-    _add_trial(unbounded_study, 0.1, feasible=False, params={"x": 1})
+    # Only a constraint rules this trial out, so the metric has no bounds to name.
+    _add_trial(unbounded_study, 0.1, constraint_vals={"bytes": 200}, params={"x": 1})
+    constrained = _make_exp(
+        [
+            Constraint(
+                name="bytes",
+                max=100,
+                extractor=JsonExtractor(type="json", path="r.json", key="bytes"),
+            )
+        ]
+    )
     with pytest.raises(NoFeasibleTrialError) as unbounded:
-        select_winner(unbounded_study, _make_exp())
+        select_winner(unbounded_study, constrained)
     assert "Metric bounds" not in str(unbounded.value)
 
 
@@ -360,10 +366,11 @@ def test_repeats_group_with_failed_or_infeasible_member_cannot_rank(member: str)
     if member == "failed":
         _add_failed(study, 1, 2)
     elif member == "infeasible":
-        _add_trial(study, 0.01, feasible=False, params={"x": 1, "seed": 2})
+        # Outside the metric.max below.
+        _add_trial(study, 9.0, params={"x": 1, "seed": 2})
     _add_group(study, 2, [0.5, 0.5, 0.5])
 
-    winner = select_winner(study, _make_exp(), repeats=_axis())
+    winner = select_winner(study, _with_bounds(_make_exp(), max=5.0), repeats=_axis())
 
     assert winner.params == {"x": 2}
     assert winner.metric == pytest.approx(0.5)
@@ -637,15 +644,11 @@ def test_other_failures_are_not_read_as_a_per_trial_timeout(tmp_path: Path, reas
 @pytest.mark.parametrize(
     ("feasible", "required", "excluded"),
     [
-        pytest.param(
-            True, "raise phases[p].n_trials above 3", "To change metric.min", id="crashed-member"
-        ),
-        pytest.param(
-            False, "To change metric.min", "raise phases[p].n_trials", id="infeasible-members"
-        ),
+        pytest.param(True, "raise phases[p].n_trials above 3", "re-judges", id="crashed-member"),
+        pytest.param(False, "re-judges", "raise phases[p].n_trials", id="infeasible-members"),
     ],
 )
-def test_incomplete_repeats_remedy_uses_recorded_feasibility(
+def test_incomplete_repeats_remedy_uses_judged_feasibility(
     tmp_path: Path, feasible: bool, required: str, excluded: str
 ) -> None:
     """Successful repeat members do not turn a crashed group into an infeasible one."""

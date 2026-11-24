@@ -25,6 +25,7 @@ from phasesweep.engine.selection import (
 )
 from phasesweep.engine.state import PHASE_RECOVERY_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
+from phasesweep.errors import REJUDGE_BOUNDS_STEP
 from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import (
     assert_advises_target,
@@ -199,15 +200,16 @@ def _assert_advises_limit(message: str, above: int, left: int) -> None:
     assert f"run the {left} trials still left" in message
 
 
-def _assert_fresh_study_remedy(message: str) -> None:
-    """Assert the message offers a fresh study under a new experiment name."""
-    assert "new `experiment` name" in message
+def _assert_rejudge_remedy(message: str) -> None:
+    """Assert the message says a corrected bound re-judges the recorded trials, and never sends an infeasible streak to a fresh study."""
+    assert REJUDGE_BOUNDS_STEP in message
+    assert "new `experiment` name" not in message
 
 
 def _assert_no_recovery(message: str) -> None:
     """Assert the message offers no setting of phase ``p`` that continues the study."""
     assert "phases[p]" not in message
-    _assert_fresh_study_remedy(message)
+    _assert_rejudge_remedy(message)
 
 
 @pytest.mark.parametrize("repeats", [False, True], ids=["grid", "repeat-grid"])
@@ -414,7 +416,7 @@ def test_raised_failure_limit_runs_only_the_cells_an_infeasible_streak_left_unru
     _assert_advises_limit(aborted, 2, 2)
     # The target retries nothing: both measured cells are closed.
     assert "n_trials from" not in aborted
-    _assert_fresh_study_remedy(aborted)
+    _assert_rejudge_remedy(aborted)
     measured = ran()
     assert sorted(measured) == ["3", "4"]
 
@@ -445,7 +447,7 @@ def test_raised_failure_limit_runs_only_the_cells_an_infeasible_streak_left_unru
     assert [trial.state.name for trial in trials] == ["COMPLETE"] * 4
     assert sorted(trial.params["x"] for trial in trials[2:]) == [1, 2]
     study = phase_study(experiment)
-    assert _load_phase_policy_state(study).abort is None
+    assert _load_phase_policy_state(study, experiment).abort is None
     assert study.user_attrs[PHASE_RECOVERY_ATTR]["trial_target"] == 4
 
     # The recovery spent no further work, and a later lower limit never reinterprets its outcomes.
@@ -483,10 +485,10 @@ def _out_of_bounds_metric() -> Metric:
     )
 
 
-def test_infeasible_streak_advice_sends_a_bounds_change_to_a_new_experiment(
+def test_infeasible_streak_advice_says_a_bounds_change_rejudges_the_trials(
     tmp_path: Path,
 ) -> None:
-    """Every refusal of an infeasible streak says a bounds change needs a fresh study, then gives the step that keeps them."""
+    """Every refusal of an infeasible streak says a corrected bound re-judges the recorded trials, then gives the step that keeps the bounds."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
     original = _grid(tmp_path, trainer, 4, cells=4, metric=_out_of_bounds_metric())
     with pytest.raises(NoFeasibleTrialError) as aborted:
@@ -502,12 +504,12 @@ def test_infeasible_streak_advice_sends_a_bounds_change_to_a_new_experiment(
 
     for message in map(_operational_error_text, (aborted.value, refused.value, at_limit)):
         _assert_advises_limit(message, 2, 2)
-        assert message.index("metric bounds or constraints; to change those") < message.index(
-            "new `experiment` name"
+        assert message.index("outside the metric bounds or constraints.") < message.index(
+            REJUDGE_BOUNDS_STEP
         )
         assert "Fix the cause" not in message
-        assert message.index("new `experiment` name") < message.index(
-            "To keep them, raise phases[p].max_consecutive_failures"
+        assert message.index(REJUDGE_BOUNDS_STEP) < message.index(
+            "Otherwise, raise phases[p].max_consecutive_failures"
         )
     headline = str(aborted.value)
     assert "stderr" not in headline
@@ -555,7 +557,7 @@ def test_sampling_phase_asks_for_a_higher_target_without_a_retry_rule(tmp_path: 
 def test_infeasible_sampling_streak_offers_the_raised_target_under_unchanged_limits(
     tmp_path: Path,
 ) -> None:
-    """An infeasible streak leads with the new-study step for a bounds change, then the target raise that keeps them."""
+    """An infeasible streak leads with the re-judge step for a bounds change, then the target raise that keeps the bounds."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
     phase = Phase(
         name="p",
@@ -570,9 +572,9 @@ def test_infeasible_sampling_streak_offers_the_raised_target_under_unchanged_lim
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(experiment)
     message = _operational_error_text(aborted.value)
-    assert "To keep them, raise phases[p].n_trials above 2" in message
+    assert "Otherwise, raise phases[p].n_trials above 2" in message
     assert "Fix the cause" not in message
-    assert message.index("new `experiment` name") < message.index("To keep them")
+    assert message.index(REJUDGE_BOUNDS_STEP) < message.index("Otherwise, raise")
 
 
 def _survivorship_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:

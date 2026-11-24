@@ -333,20 +333,22 @@ def _save_intent(
     return path
 
 
-def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Projection:
+def _accepted_projection(
+    trial: FrozenTrial, inherits: Mapping[str, str], experiment: Experiment
+) -> Projection:
     """Freeze an accepted trial projection from its persisted values and attributes.
+
+    ``phasesweep.feasible`` is the bounds' verdict when the projection is written; PhaseSweep
+    never reads it back, and every PhaseSweep read judges the recorded values afresh.
 
     :param FrozenTrial trial: COMPLETE trial.
     :param Mapping[str, str] inherits: Native run of each parent winner the attempt inherited.
+    :param Experiment experiment: Config whose bounds give ``phasesweep.feasible``.
     :return Projection: The attempt's accepted projection.
     """
+    from phasesweep.engine.bounds import trial_bound_violations
     from phasesweep.engine.selection import _observed_values
-    from phasesweep.engine.state import (
-        CONSTRAINT_PREFIX,
-        DURATION_ATTR,
-        FEASIBLE_ATTR,
-        OVERRIDES_ATTR,
-    )
+    from phasesweep.engine.state import CONSTRAINT_PREFIX, DURATION_ATTR, OVERRIDES_ATTR
 
     overrides = json_object(json.loads(trial.user_attrs[OVERRIDES_ATTR]))
     assert trial.value is not None
@@ -359,7 +361,7 @@ def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Pro
     return _projection(
         metrics={
             "phasesweep.objective": float(trial.value),
-            "phasesweep.feasible": float(trial.user_attrs[FEASIBLE_ATTR]),
+            "phasesweep.feasible": float(not trial_bound_violations(trial, experiment)),
             "phasesweep.duration_seconds": json_number(trial.user_attrs, DURATION_ATTR),
             **{f"phasesweep.constraint.{k}": v for k, v in constraints.items()},
             **{f"phasesweep.observed.{k}": v for k, v in observed.items()},
@@ -564,7 +566,7 @@ def _save_attempt_intents(
             continue
         trial = found.trial
         if trial.state == TrialState.COMPLETE:
-            projection = _accepted_projection(trial, read_inherits(directory))
+            projection = _accepted_projection(trial, read_inherits(directory), experiment)
             paths.append(_save_intent(experiment, generation_id, name, binding, projection))
             continue
         if binding["run_mode"] != "managed":

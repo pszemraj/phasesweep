@@ -101,6 +101,11 @@ FRESH_STUDY = "set a new `experiment` name to start a fresh study"
 
 NEW_STUDY_STEP = f"{FRESH_STUDY[0].upper()}{FRESH_STUDY[1:]}."
 
+REJUDGE_BOUNDS_STEP = (
+    "A corrected metric.min, metric.max or constraint bound re-judges the recorded trials on "
+    "the next run without retraining them."
+)
+
 
 def restore_or_new_study(recorded: str) -> str:
     """Offer restoring what a refusal found changed, or starting a fresh study.

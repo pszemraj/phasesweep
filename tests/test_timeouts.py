@@ -201,8 +201,8 @@ def test_incomplete_timeout_winner_is_accepted_only_under_current_opt_in(tmp_pat
 
     completion = winners["p"].completion
     assert completion["requested_trials"] == 10
-    assert 1 <= completion["completed_trials"] < completion["requested_trials"]
-    assert completion["completed_trials"] <= completion["finished_trials"]
+    assert 1 <= completion["measured_trials"] < completion["requested_trials"]
+    assert completion["measured_trials"] <= completion["finished_trials"]
     assert completion["finished_trials"] <= completion["requested_trials"]
     assert completion["incomplete"] is True
     assert completion["reason"] == "timeout"
@@ -289,7 +289,7 @@ def test_timeout_that_interrupts_the_last_trial_leaves_the_phase_incomplete(
         return
     completion = run_experiment(exp)["p"].completion
     assert completion["requested_trials"] == 2
-    assert completion["completed_trials"] == 1
+    assert completion["measured_trials"] == 1
     assert completion["finished_trials"] == 1
     assert completion["incomplete"] is True
 
@@ -334,9 +334,9 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
     assert winners["p"].trial_number == 0
     completion = winners["p"].completion
     assert completion["requested_trials"] == 3
-    assert 1 <= completion["completed_trials"] < completion["requested_trials"]
+    assert 1 <= completion["measured_trials"] < completion["requested_trials"]
     assert (
-        completion["completed_trials"]
+        completion["measured_trials"]
         <= completion["finished_trials"]
         < completion["requested_trials"]
     )
@@ -353,8 +353,8 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
         if trial.user_attrs.get(TRIAL_OUTCOME_ATTR, {}).get("outcome") == "interrupted"
     ]
     assert len(deadline_trials) == 1
-    assert _load_phase_policy_state(study).abort is None
-    assert _load_phase_policy_state(study).consecutive_failures == 0
+    assert _load_phase_policy_state(study, exp).abort is None
+    assert _load_phase_policy_state(study, exp).consecutive_failures == 0
 
 
 @pytest.mark.parametrize("clock_elapses", [True, False])
@@ -468,7 +468,7 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     completion = winners["p"].completion
     assert completion["requested_trials"] == 3
     assert completion["finished_trials"] == 2
-    assert completion["completed_trials"] == 1
+    assert completion["measured_trials"] == 1
     assert completion["incomplete"] is True
     assert completion["reason"] == "timeout"
     assert completion["timeout_scope"] == "phase"
@@ -614,8 +614,8 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
         study_name="refused_partial_timeout_abort::p",
         storage=_resolve_storage(exp.storage),
     )
-    assert _load_phase_policy_state(study).abort is None
-    assert _load_phase_policy_state(study).consecutive_failures == 0
+    assert _load_phase_policy_state(study, exp).abort is None
+    assert _load_phase_policy_state(study, exp).consecutive_failures == 0
 
     # With a fresh, larger budget the remaining attempt runs; no failure abort
     # is recorded to block it at phase startup.
@@ -666,13 +666,13 @@ def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
     assert exc_info.value.published_result_committed is False
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
-    assert _load_phase_policy_state(study).abort is None
+    assert _load_phase_policy_state(study, exp).abort is None
     assert study.trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "interrupted"
 
     winners = run_experiment(exp)
     assert winners["p"].metric == pytest.approx(0.5)
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
-    assert _load_phase_policy_state(study).abort is None
+    assert _load_phase_policy_state(study, exp).abort is None
 
 
 @pytest.mark.parametrize("lease_timeout", [True, False])
@@ -762,7 +762,6 @@ def test_extraction_past_deadline_fails_the_trial(tmp_path: Path) -> None:
     )
 
     assert result.metric is None
-    assert result.feasible is False
     assert result.failure_reason is not None
     assert "wallclock deadline exceeded" in result.failure_reason
     assert result.deadline_exhausted is True
@@ -934,7 +933,7 @@ def test_unrelated_launch_timeout_is_not_relabelled_as_phase_deadline(
         run_experiment(experiment)
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
-    abort = _load_phase_policy_state(study).abort
+    abort = _load_phase_policy_state(study, experiment).abort
     assert abort is not None
     assert abort["policy"] == "unexpected_objective_exception"
 

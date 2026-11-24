@@ -74,7 +74,6 @@ def test_retry_replaces_optional_trial_results(tmp_path: Path) -> None:
         constraints={"old": 2.0},
         return_code=0,
         duration_seconds=1.0,
-        feasible=True,
         gate_results=[GateResult("required_file", True, "present")],
         objective_provenance=log_regex_provenance(),
         observed={"old": 3.0, "kept": 4.0},
@@ -100,7 +99,7 @@ def test_retry_replaces_optional_trial_results(tmp_path: Path) -> None:
     table = _trial_table(experiment, experiment.phases[0], [completed], None)
     assert table.rows[0][observed_attr("old")] is None
     assert table.rows[0][observed_attr("kept")] == 5.0
-    projection = _accepted_projection(completed, {})
+    projection = _accepted_projection(completed, {}, experiment)
     assert projection["summary"]["observed"] == {"kept": 5.0}
     assert projection["summary"]["constraints"] == {}
     assert "phasesweep.observed.old" not in projection["metrics"]
@@ -112,7 +111,6 @@ def test_retry_replaces_optional_trial_results(tmp_path: Path) -> None:
         constraints={},
         return_code=0,
         duration_seconds=1.0,
-        feasible=False,
         failure_reason="missing evidence",
     )
     record_trial_result(failed, original, overrides_json="{}")

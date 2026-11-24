@@ -65,7 +65,6 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     DURATION_ATTR,
     FAILURE_REASON_ATTR,
-    FEASIBLE_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
@@ -138,15 +137,14 @@ def test_outcome_parser_requires_a_finite_numeric_success_metric(metric: JsonVal
     assert _parsed_trial_outcome(payload) is None
 
 
-def test_outcome_parser_distinguishes_measured_and_unmeasured_failure() -> None:
-    """Zero is a valid measurement; failures, fatal errors, and interruptions can lack one."""
-    assert _parsed_trial_outcome(trial_outcome(1, "success", metric=0.0)) is not None
-    measured = _parsed_trial_outcome(trial_outcome(2, "failure", metric=0.0))
+def test_outcome_parser_accepts_a_measurement_only_on_a_success() -> None:
+    """A success records its measurement, zero included, whatever the bounds say; every other outcome records none."""
+    measured = _parsed_trial_outcome(trial_outcome(1, "success", metric=0.0))
     assert measured is not None and measured.metric == 0.0
+    assert _parsed_trial_outcome({**trial_outcome(1, "success"), "metric": None}) is None
     for outcome in ("failure", "fatal", "interrupted"):
         parsed = _parsed_trial_outcome(trial_outcome(3, outcome))
         assert parsed is not None and parsed.metric is None
-    for outcome in ("fatal", "interrupted"):
         assert _parsed_trial_outcome(trial_outcome(3, outcome, metric=1.0)) is None
 
 
@@ -222,7 +220,7 @@ def test_stale_recovery_records_interrupted_unless_the_objective_recorded_a_fail
     assert recovered.state == optuna.trial.TrialState.FAIL
     assert recovered.user_attrs[TRIAL_OUTCOME_ATTR] == expected
     assert _trial_interrupted(recovered) is interrupted
-    policy = _load_phase_policy_state(study)
+    policy = _load_phase_policy_state(study, make_experiment())
     assert policy.consecutive_failures == (2 if interrupted else 3)
     assert policy.abort == expected.get(TRIAL_OUTCOME_ABORT_KEY)
 
@@ -237,16 +235,16 @@ def test_an_interruption_between_two_failures_leaves_the_streak_at_two() -> None
     _finished(study, 3, "failure")
 
     assert _trial_interrupted(study.trials[stale.number])
-    assert _load_phase_policy_state(study).consecutive_failures == 2
+    assert _load_phase_policy_state(study, make_experiment()).consecutive_failures == 2
 
 
 @pytest.mark.parametrize("holder", ["peer", "itself"])
 def test_recovery_refuses_duplicate_sequences_without_erasing_outcomes(holder: str) -> None:
     """Disputed completion order leaves both saved measurements and aborts intact."""
-    phase = make_experiment(max_consecutive_failures=2).phases[0]
+    experiment = make_experiment(max_consecutive_failures=2)
     study = optuna.create_study(study_name="example::p")
     _finished(study, 1, "failure")
-    failed = _running_trial(study, trial_outcome(2, "failure", metric=3.0, abort=_abort(2)))
+    failed = _running_trial(study, trial_outcome(2, "failure", cause="exit 1", abort=_abort(2)))
     succeeded = _running_trial(study, trial_outcome(2, "success", metric=4.0))
     pending = _running_trial(study, None) if holder == "peer" else failed
     before = [trial.user_attrs for trial in study.get_trials()]
@@ -254,7 +252,13 @@ def test_recovery_refuses_duplicate_sequences_without_erasing_outcomes(holder: s
         StudySchemaMismatchError,
         match="study 'example::p', trials 1 and 2 both use completion sequence 2",
     ):
-        _record_stale_trial_outcome(study, pending, "failure", cause="crashed", policy_phase=phase)
+        _record_stale_trial_outcome(
+            study,
+            pending,
+            "failure",
+            cause="crashed",
+            policy=(experiment.phases[0], experiment),
+        )
     assert [trial.user_attrs for trial in study.get_trials()] == before
     assert all(trial.state == optuna.trial.TrialState.RUNNING for trial in (failed, succeeded))
 
@@ -419,7 +423,7 @@ def test_a_trainer_that_fails_while_a_shutdown_is_serviced_keeps_its_own_failure
     assert launched.exists()
     assert _trial_run_state(trial) == "FAIL"
     assert _cause(trial) == "non-zero exit code 1; stderr: CUDA error: out of memory"
-    assert _load_phase_policy_state(study).consecutive_failures == 1
+    assert _load_phase_policy_state(study, make_experiment()).consecutive_failures == 1
     assert _record_reruns(study) == []
 
 
@@ -1256,16 +1260,13 @@ else:
             if return_code == 0 and not terminated:
                 assert recovered.value == 1.0
                 assert recovered.user_attrs[TRIAL_OUTCOME_ATTR] == saved_outcome
-                assert recovered.user_attrs[FEASIBLE_ATTR] is feasible
+                assert (_trial_count_state(recovered, experiment) == "COMPLETE") is feasible
                 if feasible:
                     assert _cause(recovered) is None
                     assert run_experiment(experiment)["p"].metric == 1.0
                     assert run_experiment(experiment)["p"].metric == 1.0
                 else:
-                    assert (
-                        _cause(recovered)
-                        == "recovered evidence violates metric or constraint bounds"
-                    )
+                    assert _cause(recovered) is None
                     with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
                         run_experiment(experiment)
                 assert len(phase_trials(experiment)) == 1
@@ -1600,7 +1601,8 @@ def test_a_recovered_verdict_trips_the_failure_limit_as_a_live_one_does(
     first, second = phase_trials(experiment)
     assert second.state.name == ("FAIL" if verdict == "failure" else "COMPLETE")
     outcome = second.user_attrs[TRIAL_OUTCOME_ATTR]
-    assert outcome["outcome"] == "failure"
+    # A measurement records a success; the streak counts it as a failure under the bound.
+    assert outcome["outcome"] == ("failure" if verdict == "failure" else "success")
     assert outcome.get("metric") == (second.value if verdict == "infeasible" else None)
     assert outcome[TRIAL_OUTCOME_ABORT_KEY] == {
         "schema_version": 1,

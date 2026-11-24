@@ -51,8 +51,8 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.optuna import (
     _belongs_to_phase,
     _build_sampler,
-    _completed_trial_count,
     _finished_trial_count,
+    _measured_trial_count,
     _meets_published_trial_history_boundary,
     _phase_namespace,
     _PhaseTrialStats,
@@ -733,7 +733,7 @@ def _unavailable_phase_trial_stats(
 
 def _published_history_retained(
     snapshot: JournalStorage,
-    experiment: Experiment,
+    experiment_name: str,
     phase_name: str,
     expected: _TrialRef | None,
     addressed: optuna.Study | None,
@@ -746,7 +746,7 @@ def _published_history_retained(
     already loaded by the caller, is searched first, so the usual read loads no study twice.
 
     :param JournalStorage snapshot: Captured journal replay to read.
-    :param Experiment experiment: The experiment, which names the phase's studies.
+    :param str experiment_name: The experiment's name.
     :param str phase_name: The published phase.
     :param _TrialRef | None expected: The published trial and its count boundary.
     :param optuna.Study | None addressed: The study the phase addresses now, if it exists.
@@ -760,7 +760,7 @@ def _published_history_retained(
     def candidates() -> Iterator[optuna.Study | None]:
         if addressed is not None:
             yield addressed
-        for name in _phase_study_names(snapshot, experiment.experiment, phase_name):
+        for name in _phase_study_names(snapshot, experiment_name, phase_name):
             if addressed is None or name != addressed.study_name:
                 yield _load_snapshot_study(snapshot, name)
 
@@ -768,7 +768,7 @@ def _published_history_retained(
         trials = [] if study is None else study.get_trials(deepcopy=False)
         if any(_published_trial_matches(trial, expected) for trial in trials):
             return _meets_published_trial_history_boundary(
-                _finished_trial_count(trials), _completed_trial_count(trials, experiment), expected
+                _finished_trial_count(trials), _measured_trial_count(trials), expected
             )
     return False
 
@@ -1016,7 +1016,7 @@ def read_trial_stats(
                 _phase_trial_stats(addressed, ledger.experiment),
                 published_trial_available=_published_history_retained(
                     snapshot,
-                    ledger.experiment,
+                    ledger.experiment_name,
                     phase.name,
                     published_trials.get(phase.name),
                     addressed,

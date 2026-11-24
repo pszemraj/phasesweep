@@ -217,9 +217,10 @@ TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # outcome that trips a phase abort carries that abort record under
 # ``TRIAL_OUTCOME_ABORT_KEY``, so the decision is as durable as the outcome and
 # a restarted orchestrator cannot reinterpret the same terminal trials as a
-# completed phase.
+# completed phase. A trial whose values were measured records ``success`` with its metric,
+# whatever the bounds say: the failure policy judges the values when it replays the outcomes.
 TRIAL_OUTCOME_ATTR = "phasesweep_trial_outcome"
-TRIAL_OUTCOME_SCHEMA_VERSION = 3
+TRIAL_OUTCOME_SCHEMA_VERSION = 4
 TRIAL_OUTCOME_ABORT_KEY = "abort"
 # ``interrupted`` is the one label for a trial whose orchestrator stopped it before it
 # could finish: a signal, a phase or run deadline, or recovery after the orchestrator died.
@@ -235,8 +236,7 @@ PHASE_RECOVERY_ATTR = "phasesweep_phase_recovery"
 PHASE_RECOVERY_SCHEMA_VERSION = 1
 # Accepted partial-timeout decision; replay selects without allocating the remaining trials.
 PHASE_DECISION_ATTR = "phasesweep_phase_decision"
-PHASE_DECISION_SCHEMA_VERSION = 2
-FEASIBLE_ATTR = "phasesweep_feasible"
+PHASE_DECISION_SCHEMA_VERSION = 3
 GATES_ATTR = "phasesweep_gates"
 # JSON-encoded frozen objective evidence provenance; written when metric
 # extraction succeeds.
@@ -461,7 +461,7 @@ def _trial_outcome_payload(
 
     :param int sequence: Completion sequence assigned under the outcome lock.
     :param str outcome: Terminal outcome category.
-    :param float | None metric: Accepted scalar to tell Optuna, including measured infeasibility.
+    :param float | None metric: Measured scalar to tell Optuna, set exactly on a ``success``.
     :param str | None cause: Failure explanation when present.
     :param str | None policy: Fatal policy when present.
     :param JsonObject | None abort: Phase abort tripped by this outcome.
@@ -489,8 +489,8 @@ def _parsed_trial_outcome(value: object) -> _ParsedTrialOutcome | None:
     :param object value: Raw ``TRIAL_OUTCOME_ATTR`` user-attr value to validate.
     :return _ParsedTrialOutcome | None: Validated outcome, including the fatal
         policy needed to distinguish cleanup uncertainty from ordinary errors
-        and the abort record a failure or fatal outcome tripped; ``None`` when
-        the payload is malformed.
+        and the abort record a failure, fatal or out-of-bounds success outcome tripped;
+        ``None`` when the payload is malformed.
     """
     if not isinstance(value, dict):
         return None
@@ -507,18 +507,14 @@ def _parsed_trial_outcome(value: object) -> _ParsedTrialOutcome | None:
         or sequence < 1
         or not isinstance(outcome, str)
         or outcome not in _TRIAL_OUTCOMES
-        or (outcome == "success" and metric is None)
-        or (metric is not None and outcome not in {"success", "failure"})
+        or (outcome == "success") != (metric is not None)
         or (cause is not None and not isinstance(cause, str))
         or (
             policy is not None and (outcome != "fatal" or not isinstance(policy, str) or not policy)
         )
         or (
             abort is not None
-            and (
-                outcome not in {"failure", "fatal"}
-                or not _valid_abort_record(abort, sequence=sequence)
-            )
+            and (outcome == "interrupted" or not _valid_abort_record(abort, sequence=sequence))
         )
     ):
         return None
@@ -765,7 +761,7 @@ def _required_trial_dir(trial: FrozenTrial | Trial) -> Path:
     return Path(stored)
 
 
-GENERATION_SUMMARY_SCHEMA_VERSION = 7
+GENERATION_SUMMARY_SCHEMA_VERSION = 8
 PUBLICATION_POINTER_SCHEMA_VERSION = 2
 # Configuration and reproducibility files frozen into every generation namespace at claim time.
 GENERATION_CONFIG_SNAPSHOT_FILENAME = "config.snapshot.yaml"

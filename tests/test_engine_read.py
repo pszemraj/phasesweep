@@ -35,7 +35,6 @@ from tests.conftest import (
     make_experiment,
     mark_current_format,
     phase_trials,
-    tell_feasible,
     trial_outcome,
     write_constant_trainer,
     write_trainer,
@@ -87,7 +86,7 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(tmp_path
         study_name="read_t::p",
         storage=engine_ledger._resolve_storage(exp.storage) or exp.storage,
     )
-    tell_feasible(study, study.ask(), 1.0)
+    study.tell(study.ask(), 1.0)
     running = study.ask()
     running.set_user_attr("phasesweep_generation_id", "gen-1")
     running.set_user_attr("phasesweep_attempt_id", "attempt-1")
@@ -301,7 +300,7 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "generation")
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
-    tell_feasible(study, trial)
+    study.tell(trial, 0.5)
     complete = ledger.read_bytes()
     expected = engine_optuna._TrialRef(0, "generation", "attempt")
     # The handle's format scan also captures the journal. Take it on the whole
@@ -379,7 +378,7 @@ def test_phase_reads_capture_trial_data_once_whatever_the_phase_count(
     ]
     mark_current_format(experiment, *studies)
     for study in studies:
-        tell_feasible(study, study.ask())
+        study.tell(study.ask(), 0.5)
     real_capture = engine_ledger._capture_journal
     captures: list[Path] = []
 
@@ -421,7 +420,7 @@ def test_read_status_captures_trial_data_after_resolving_the_publication_pointer
 
     def finish_then_resolve(target: Experiment):
         # A publication tells its winning trial before it moves the pointer.
-        tell_feasible(study, trial)
+        study.tell(trial, 0.5)
         return real_resolve(target)
 
     monkeypatch.setattr(engine_read, "_resolve_publication_pointer", finish_then_resolve)
@@ -574,8 +573,8 @@ def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> No
     with pytest.raises(PublishedStudyMissingError) as refused:
         run_experiment(experiment)
     assert (
-        "has only 1 finished and 1 completed trials, below the published "
-        "completion boundary (3 finished, 3 completed)"
+        "has only 1 finished and 1 measured trials, below the published "
+        "completion boundary (3 finished, 3 measured)"
     ) in str(refused.value)
 
     assert [trial.number for trial in phase_trials(experiment)] == [0]
@@ -598,7 +597,7 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
     trial.set_user_attr("phasesweep_generation_id", "generation")
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
     if mismatch != "state":
-        tell_feasible(study, trial)
+        study.tell(trial, 0.5)
     mark_current_format(experiment, study)
     expected = engine_optuna._TrialRef(
         1 if mismatch == "number" else 0,

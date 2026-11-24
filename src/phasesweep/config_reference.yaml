@@ -53,6 +53,7 @@ metric: object (required)
   # Viability ceiling in the metric's units: a larger value makes the attempt infeasible. It keeps its real value for the sampler but cannot win.
   # Use a bound to refuse a degenerate score, such as a loss of exactly 0 from a leaked evaluation set. It never ranks or steers the search.
   # Warning: an infeasible attempt counts toward phases[].max_consecutive_failures, so a bound inside the ordinary spread can abort the phase.
+  # Bounds judge recorded measurements: correcting metric.min, metric.max or a constraint bound on a study with trials re-judges them on the next run, without retraining.
   max: float | null = null
 
   # Viability floor in the metric's units: a smaller value makes the attempt infeasible, with the same consequences as metric.max.

@@ -25,14 +25,12 @@ import optuna
 from optuna.trial import FrozenTrial
 
 from phasesweep.config.models import TRIAL_BOUND_ENV, Experiment, Observation, _wandb_query
-from phasesweep.engine.bounds import bound_violations
 from phasesweep.engine.errors import LaunchEnvironmentError
 from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.state import (
     CONSTRAINT_PREFIX,
     DURATION_ATTR,
     FAILURE_REASON_ATTR,
-    FEASIBLE_ATTR,
     GATES_ATTR,
     METRIC_EXTRACTOR_LABEL,
     OBJECTIVE_PROVENANCE_ATTR,
@@ -128,7 +126,6 @@ class TrialResult:
     constraints: dict[str, float]
     return_code: int
     duration_seconds: float
-    feasible: bool
     failure_reason: str | None = None
     gate_results: list[GateResult] | None = None
     # Evidence captured at metric extraction; absent when extraction failed.
@@ -153,7 +150,6 @@ def record_trial_result(trial: optuna.Trial, result: TrialResult, *, overrides_j
     :param str overrides_json: Fully composed trainer overrides serialized as JSON.
     """
     previous = trial.user_attrs
-    trial.set_user_attr(FEASIBLE_ATTR, result.feasible)
     trial.set_user_attr(RETURN_CODE_ATTR, result.return_code)
     trial.set_user_attr(DURATION_ATTR, result.duration_seconds)
     trial.set_user_attr(OVERRIDES_ATTR, overrides_json)
@@ -646,14 +642,13 @@ def _failed_trial(
     :param bool evidence_unreadable: Whether every failure is a tracker that gave no answer.
     :param dict[str, object] | None objective_provenance: Frozen evidence already captured
         before a later gate failed.
-    :return TrialResult: A result with ``metric=None`` and ``feasible=False``.
+    :return TrialResult: A result with ``metric=None``.
     """
     return TrialResult(
         metric=None,
         constraints=constraints if constraints is not None else {},
         return_code=rc,
         duration_seconds=duration,
-        feasible=False,
         failure_reason=failure_reason,
         gate_results=gate_results,
         deadline_exhausted=deadline_exhausted,
@@ -918,11 +913,12 @@ def extract_trial_result(
     """Extract a trial's metric and constraints after releasing the GPU lease.
 
     Process failures, extraction errors, nonfinite values, gate failures, and expired
-    deadlines return a failed TrialResult. Finite bound violations remain COMPLETE
-    and infeasible. Observations run after acceptance; unreadable observations warn
-    and are omitted without changing the result.
+    deadlines return a failed TrialResult. Finite values are measurements whatever the
+    bounds say: :mod:`phasesweep.engine.bounds` judges them wherever they are read.
+    Observations run after acceptance; unreadable observations warn and are omitted without
+    changing the result.
 
-    :param Experiment experiment: Experiment defining extractors and bounds.
+    :param Experiment experiment: Experiment defining extractors.
     :param ExecutedTrial executed: Trial context and supervised process result.
     :param list[Gate] | None gates: Evidence gates required for acceptance.
     :param float | None deadline: Absolute monotonic phase/run deadline, checked at stage
@@ -1075,7 +1071,6 @@ def extract_trial_result(
         if isinstance(v, TrialResult):
             return v
         constraint_values[c.name] = v
-    feasible = not bound_violations(metric_value, constraint_values, experiment)
 
     gate_results = evaluate_gates(executed.ctx, gates or [], deadline=deadline)
     if executed.ctx.mlflow_capture:
@@ -1124,7 +1119,6 @@ def extract_trial_result(
         constraints=constraint_values,
         return_code=rc,
         duration_seconds=duration,
-        feasible=feasible,
         failure_reason=None,
         gate_results=gate_results,
         objective_provenance=objective_provenance or None,

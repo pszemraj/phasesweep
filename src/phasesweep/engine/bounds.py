@@ -98,10 +98,17 @@ def trial_bound_violations(trial: optuna.trial.FrozenTrial, experiment: Experime
     return bound_violations(trial.value, recorded_constraints(trial, experiment), experiment)
 
 
-def bounds_reason(violations: list[str]) -> str:
-    """State why measured values are infeasible, as a trial's reason line shows it.
+def infeasible_reason(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> str | None:
+    """State why a measured trial is infeasible under the current bounds, for its reason line.
 
-    :param list[str] violations: Non-empty result of :func:`bound_violations`.
-    :return str: The reason text.
+    :param optuna.trial.FrozenTrial trial: Trial to describe.
+    :param Experiment experiment: Config supplying the current bounds.
+    :return str | None: The violations, or ``None`` for a trial that is not ``COMPLETE`` or
+        satisfies every bound.
     """
+    if trial.state != optuna.trial.TrialState.COMPLETE:
+        return None
+    violations = trial_bound_violations(trial, experiment)
+    if not violations:
+        return None
     return f"outside the metric bounds or constraints: {'; '.join(violations)}"

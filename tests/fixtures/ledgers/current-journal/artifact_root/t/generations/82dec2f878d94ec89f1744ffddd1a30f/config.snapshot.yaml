@@ -1,6 +1,6 @@
 experiment: t
-storage: journal:////home/pszemraj/workspace/projects/productivity/phasesweep/.claude/worktrees/agent-ac53a3f723c41adae/tests/fixtures/ledgers/current-journal/ledger/study.journal
-workdir: /home/pszemraj/workspace/projects/productivity/phasesweep/.claude/worktrees/agent-ac53a3f723c41adae/tests/fixtures/ledgers/current-journal/artifact_root
+storage: journal:////home/pszemraj/workspace/projects/productivity/phasesweep/.claude/worktrees/agent-a1b102656daf2df38/tests/fixtures/ledgers/current-journal/ledger/study.journal
+workdir: /home/pszemraj/workspace/projects/productivity/phasesweep/.claude/worktrees/agent-a1b102656daf2df38/tests/fixtures/ledgers/current-journal/artifact_root
 trial_command: printf 'PSWOBJ=0.5\n' {overrides}
 trainer_config: {}
 provenance:

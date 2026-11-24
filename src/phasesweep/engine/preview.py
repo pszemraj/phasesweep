@@ -480,7 +480,7 @@ def _preview_phase(
             phase,
             inherited_winners,
             study,
-            policy_state=_load_phase_policy_state(study),
+            policy_state=_load_phase_policy_state(study, experiment),
             phase_fingerprint=phase_fingerprint,
             verify_evidence=False,
         )
@@ -628,7 +628,7 @@ def _placeholder_winner(
         completion=_winner_completion(
             requested_trials=phase.n_trials,
             finished_trials=0,
-            completed_trials=0,
+            measured_trials=0,
             incomplete=True,
             reason="dry_run",
             timeout_scope=None,

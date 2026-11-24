@@ -50,9 +50,10 @@ from phasesweep.engine.fingerprints import (
 from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.ledger import ClaimedLedger, open_phase_study
 from phasesweep.engine.optuna import (
-    _completed_trial_count,
     _finished_trial_count,
+    _measured_trial_count,
     _suggest_all,
+    _trial_count_state,
 )
 from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trials_csv_path
 from phasesweep.engine.progress import (
@@ -164,7 +165,7 @@ def _winner_completion(
     *,
     requested_trials: int,
     finished_trials: int,
-    completed_trials: int,
+    measured_trials: int,
     incomplete: bool,
     reason: str | None,
     timeout_scope: str | None,
@@ -173,8 +174,8 @@ def _winner_completion(
 
     :param int requested_trials: Trial target the phase was configured to reach.
     :param int finished_trials: Finished trial count backing this completion.
-    :param int completed_trials: Completed trial count backing this completion, the
-        finished trials inside every metric bound and constraint.
+    :param int measured_trials: Finished trials that measured their values, feasible or not,
+        so that no bound edit changes the count a later read compares with a recount.
     :param bool incomplete: Whether the phase stopped short of its trial target.
     :param str | None reason: Why the phase is incomplete, or ``None`` when complete.
     :param str | None timeout_scope: Timeout guard that stopped the phase, or ``None``
@@ -184,7 +185,7 @@ def _winner_completion(
     return {
         "requested_trials": requested_trials,
         "finished_trials": finished_trials,
-        "completed_trials": completed_trials,
+        "measured_trials": measured_trials,
         "incomplete": incomplete,
         "reason": reason,
         "timeout_scope": timeout_scope,
@@ -192,7 +193,6 @@ def _winner_completion(
 
 
 def _partial_completion_for_replay(
-    experiment: Experiment,
     study: optuna.Study,
     decision: _AcceptedPartialDecision,
     *,
@@ -200,8 +200,7 @@ def _partial_completion_for_replay(
 ) -> dict[str, Any]:
     """Re-prove and return the frozen completion metadata for a decision replay.
 
-    :param Experiment experiment: Config whose bounds judge the recorded trials.
-    :param optuna.Study study: Study whose current finished and completed counts are verified.
+    :param optuna.Study study: Study whose current finished and measured counts are verified.
     :param _AcceptedPartialDecision decision: Persisted accepted-partial decision.
     :param int outcome_sequence: Current durable outcome sequence for the study.
     :raises StudySchemaMismatchError: Trial counts or the outcome sequence changed
@@ -212,7 +211,7 @@ def _partial_completion_for_replay(
     if (
         outcome_sequence != decision.outcome_sequence
         or _finished_trial_count(trials) != decision.finished_trials
-        or _completed_trial_count(trials, experiment) != decision.completed_trials
+        or _measured_trial_count(trials) != decision.measured_trials
     ):
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} changed after its accepted partial-timeout "
@@ -221,7 +220,7 @@ def _partial_completion_for_replay(
     return _winner_completion(
         requested_trials=decision.trial_target,
         finished_trials=decision.finished_trials,
-        completed_trials=decision.completed_trials,
+        measured_trials=decision.measured_trials,
         incomplete=True,
         reason="timeout",
         timeout_scope=decision.timeout_scope,
@@ -462,7 +461,7 @@ def _resume_phase(
     _validate_study_direction(study, experiment.metric.goal)
     _initialize_study_schema(study)
     _reap_stale_trials(study, experiment, phase.name, confirm=True)
-    policy_state = _load_phase_policy_state(study)
+    policy_state = _load_phase_policy_state(study, experiment)
     phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
     return _judge_recorded_phase(
         experiment,
@@ -549,7 +548,6 @@ def _judge_recorded_phase(
                 remediation=ACCEPT_INCOMPLETE_STEP,
             )
         completion = _partial_completion_for_replay(
-            experiment,
             study,
             partial_decision,
             outcome_sequence=policy_state.max_sequence,
@@ -847,6 +845,7 @@ def _record_outcome(
     metric: float | None = None,
     cause: str | None = None,
     fatal_policy: str | None = None,
+    within_bounds: bool = True,
 ) -> None:
     """Persist an outcome and its abort decision before the trial becomes terminal.
 
@@ -858,14 +857,18 @@ def _record_outcome(
     :param _PhaseExecution run: Phase execution whose counters advance after the durable write.
     :param optuna.Trial trial: Trial receiving the outcome record.
     :param str outcome: ``success``, ``failure``, ``interrupted``, or ``fatal``.
-    :param float | None metric: Accepted objective, also recorded when it violates bounds.
+    :param float | None metric: Measured objective of a ``success``, also when it violates bounds.
     :param str | None cause: Optional explanation stored in the outcome.
     :param str | None fatal_policy: Optional policy stored in the outcome and fatal abort.
+    :param bool within_bounds: Whether a ``success`` measured values inside the current bounds;
+        the failure streak counts one outside them as a failure
+        (:func:`~phasesweep.engine.study_policy._counted_outcome`), defaults to True.
     :raises _TrialLeftRunning: Retries exhausted or an outcome remains unconfirmed; leave
         the trial RUNNING and stop launches for stale-attempt recovery.
     """
     write_error: Exception | None = None
     abort_record: JsonObject | None = None
+    counted = outcome if within_bounds else "failure"
     for attempt_index in range(_OUTCOME_WRITE_ATTEMPTS):
         if attempt_index:
             time.sleep(_OUTCOME_WRITE_RETRY_DELAYS[attempt_index - 1])
@@ -875,7 +878,7 @@ def _record_outcome(
             if run.unconfirmed_outcome is not None:
                 raise _TrialLeftRunning(run.unconfirmed_outcome)
             abort_record = run.abort_decision(
-                trial.number, outcome, cause=cause, fatal_policy=fatal_policy
+                trial.number, counted, cause=cause, fatal_policy=fatal_policy
             )
             payload = _trial_outcome_payload(
                 run.completion_sequence + 1,
@@ -915,7 +918,7 @@ def _record_outcome(
                     raise unconfirmed from exc
 
             write_error = None
-            run.advance(trial.number, outcome)
+            run.advance(trial.number, counted)
             if abort_record is None:
                 return
             run.abort_recorded = True
@@ -1254,17 +1257,14 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         raise TrialExecutionError(result.failure_reason)
 
     assert result.metric is not None  # guaranteed when failure_reason is None
-    violations = bound_violations(result.metric, result.constraints, experiment)
+    # A measurement is a success whatever the bounds say; only the failure streak counts it
+    # as a failure while it is outside them.
     _record_outcome(
         run,
         trial,
-        "success" if result.feasible else "failure",
+        "success",
         metric=result.metric,
-        cause=(
-            None
-            if result.feasible
-            else f"metric or evidence constraints were infeasible: {'; '.join(violations)}"
-        ),
+        within_bounds=not bound_violations(result.metric, result.constraints, experiment),
     )
 
     return result.metric
@@ -1467,7 +1467,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
     study = run.study
     trials_after = study.get_trials(deepcopy=False)
     finished_after = _finished_trial_count(trials_after)
-    completed_after = _completed_trial_count(trials_after, experiment)
+    measured_after = _measured_trial_count(trials_after)
     # An expired budget with unfinished slots takes precedence over a failure-streak abort.
     scheduler_deadline_exhausted = (
         run.optimize_deadline is not None
@@ -1482,7 +1482,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         phase.allow_incomplete_on_timeout and timeout_observed and finished_after < phase.n_trials
     )
     if run.aborted and not timed_out_incomplete:
-        aborted_state = _load_phase_policy_state(study)
+        aborted_state = _load_phase_policy_state(study, experiment)
         abort = aborted_state.abort
         assert abort is not None  # an aborted run recorded its abort with the tripping outcome
         # Without storage there is no study to continue, so the whole run starts again.
@@ -1530,7 +1530,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
             "finished trials without an accepted timeout; refusing to publish "
             "an incomplete winner."
         )
-    current_policy_state = _load_phase_policy_state(study)
+    current_policy_state = _load_phase_policy_state(study, experiment)
     recorded_abort = current_policy_state.abort
     if accepted_partial_timeout:
         recovered_abort_sequence = (
@@ -1545,7 +1545,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
                 "trial_target": phase.n_trials,
                 "outcome_sequence": current_policy_state.max_sequence,
                 "finished_trials": finished_after,
-                "completed_trials": completed_after,
+                "measured_trials": measured_after,
                 "timeout_scope": run.timeout_source,
                 "recovered_abort_sequence": recovered_abort_sequence,
             },
@@ -1554,6 +1554,9 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         # Consume the abort before timeout handling so a larger timeout can resume refused work.
         _record_recovery_boundary(study, phase, recorded_abort["completion_sequence"])
     if timed_out_incomplete and not phase.allow_incomplete_on_timeout:
+        completed_after = sum(
+            _trial_count_state(trial, experiment) == "COMPLETE" for trial in trials_after
+        )
         raise phase_timeout(
             f"Phase {phase.name!r} timed out via {run.timeout_source or 'wallclock'} guard "
             f"after {finished_after}/{phase.n_trials} finished trials "
@@ -1571,7 +1574,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
             completion=_winner_completion(
                 requested_trials=phase.n_trials,
                 finished_trials=finished_after,
-                completed_trials=completed_after,
+                measured_trials=measured_after,
                 incomplete=accepted_partial_timeout,
                 reason="timeout" if accepted_partial_timeout else None,
                 timeout_scope=run.timeout_source if accepted_partial_timeout else None,
@@ -1742,7 +1745,7 @@ def _run_phase(
     if resume.recovery_abort is not None:
         # Atomically accept the recovery target and retire the abort before updating the target attr.
         _record_recovery_boundary(study, phase, resume.recovery_abort["completion_sequence"])
-        run.resume_from(_load_phase_policy_state(study))
+        run.resume_from(_load_phase_policy_state(study, experiment))
     _record_trial_target(study, phase)
     if (
         resume.partial_decision is not None
@@ -1871,7 +1874,7 @@ def _replay_met_target(
             completion=_winner_completion(
                 requested_trials=phase.n_trials,
                 finished_trials=_finished_trial_count(trials),
-                completed_trials=_completed_trial_count(trials, experiment),
+                measured_trials=_measured_trial_count(trials),
                 incomplete=False,
                 reason=None,
                 timeout_scope=None,

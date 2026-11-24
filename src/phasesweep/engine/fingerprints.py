@@ -60,8 +60,12 @@ _RUN_CONTROL_KEYS = frozenset(
 #: Where W&B read controls sit inside a dumped phase: a summary-presence gate carries them.
 _PHASE_READ_CONTROLS = {"gates": {"__all__": set(TRACKER_READ_CONTROLS)}}
 # Increment the schema versions when their fingerprint payloads change.
-FINGERPRINT_SCHEMA_VERSION = 9
-EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 7
+FINGERPRINT_SCHEMA_VERSION = 10
+EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 8
+#: The viability bounds of the metric and each constraint. They judge what a trial measured,
+#: so a phase study's identity excludes them; a published result was selected under them, so
+#: the experiment fingerprint it records includes them.
+_BOUND_KEYS = frozenset({"min", "max"})
 
 
 def _execution_identity(experiment: Experiment) -> dict[str, Any]:
@@ -95,13 +99,16 @@ def _semantic_core(experiment: Experiment) -> dict[str, Any]:
     """Return the experiment-level fields both semantic fingerprints hash.
 
     The metric's name only labels output, since every extractor reads by its own key, and a
-    tracker's read controls only bound the read, so neither is part of either identity.
+    tracker's read controls only bound the read, so neither is part of either identity. The
+    bounds (:data:`_BOUND_KEYS`) are left out too: :func:`_experiment_semantic_fingerprint`
+    adds them back for a published result.
 
     :param Experiment experiment: Experiment whose command, trainer input,
         environment, execution, provenance, metric, and constraints are read.
     :return dict[str, Any]: JSON-serializable payload fragment.
     """
     extractor_exclude = {"extractor": set(TRACKER_READ_CONTROLS)}
+    bound_exclude = dict.fromkeys(_BOUND_KEYS, True)
     return {
         "trial_command": experiment.trial_command,
         "trainer_config": experiment.trainer_config,
@@ -110,10 +117,11 @@ def _semantic_core(experiment: Experiment) -> dict[str, Any]:
         "execution": _execution_identity(experiment),
         "provenance": dict(sorted(experiment.provenance.items())),
         "metric": experiment.metric.model_dump(
-            mode="json", exclude={"name": True, **extractor_exclude}
+            mode="json", exclude={"name": True, **bound_exclude, **extractor_exclude}
         ),
         "constraints": [
-            c.model_dump(mode="json", exclude=extractor_exclude) for c in experiment.constraints
+            c.model_dump(mode="json", exclude={**bound_exclude, **extractor_exclude})
+            for c in experiment.constraints
         ],
         **(
             {"mlflow": experiment.mlflow.evidence_identity()}
@@ -128,8 +136,10 @@ def _experiment_semantic_fingerprint(
 ) -> str:
     """Hash the experiment semantics recorded with each published result.
 
-    Include metric/extractor, constraints, command, environment, provenance, and
-    ordered phase semantics. Exclude run-control targets, throughput, and comments.
+    Include metric/extractor, constraints and their bounds, command, environment, provenance,
+    and ordered phase semantics. Exclude run-control targets, throughput, and comments. The
+    bounds selected the published winner, so a result published under other bounds no longer
+    matches the config.
 
     :param Experiment experiment: Parsed experiment config to fingerprint.
     :param int | None phase_count: Producing phase-prefix length, or None for the full plan.
@@ -139,6 +149,13 @@ def _experiment_semantic_fingerprint(
         "fingerprint_schema_version": EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
         "experiment": experiment.experiment,
         **_semantic_core(experiment),
+        "bounds": {
+            "metric": experiment.metric.model_dump(mode="json", include=set(_BOUND_KEYS)),
+            "constraints": {
+                c.name: c.model_dump(mode="json", include=set(_BOUND_KEYS))
+                for c in experiment.constraints
+            },
+        },
         "phases": [
             {"name": phase.name, "inherits": list(phase.inherits), **_semantic_phase_dump(phase)}
             for phase in experiment.phases[:phase_count]

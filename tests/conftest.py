@@ -54,7 +54,6 @@ from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     FAILURE_REASON_ATTR,
-    FEASIBLE_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
@@ -64,7 +63,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
 )
-from phasesweep.engine.study_policy import _load_phase_policy_state
+from phasesweep.engine.study_policy import _recorded_outcome_sequence
 from phasesweep.engine.trial import EnvironmentIdentity
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION, TrialContext
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
@@ -344,20 +343,6 @@ def mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
         _write_artifact_root_binding(experiment)
 
 
-def tell_feasible(study: optuna.Study, trial: optuna.Trial, value: float = 0.5) -> None:
-    """Complete a hand-built trial as a run completes one inside every bound.
-
-    A run records the feasibility attr before a trial completes, and a COMPLETE trial
-    without it reads ``INFEASIBLE`` in counts and tables.
-
-    :param optuna.Study study: Study that owns ``trial``.
-    :param optuna.Trial trial: Asked trial to complete.
-    :param float value: Objective value to tell.
-    """
-    trial.set_user_attr(FEASIBLE_ATTR, True)
-    study.tell(trial, value)
-
-
 def stamped_environment_attrs(
     identity: EnvironmentIdentity, *, mapping: bool = True
 ) -> dict[str, object]:
@@ -476,9 +461,9 @@ def record_accepted_partial_timeout(study: optuna.Study, target: int) -> None:
             "schema_version": PHASE_DECISION_SCHEMA_VERSION,
             "decision": "accepted_partial_timeout",
             "trial_target": target,
-            "outcome_sequence": _load_phase_policy_state(study).max_sequence,
+            "outcome_sequence": _recorded_outcome_sequence(study),
             "finished_trials": _finished_trial_count(trials),
-            "completed_trials": _measured_trial_count(trials),
+            "measured_trials": _measured_trial_count(trials),
             "timeout_scope": "phase",
             "recovered_abort_sequence": None,
         },

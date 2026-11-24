@@ -1940,12 +1940,12 @@ def test_accepted_projection_reports_observed_values() -> None:
 
     from phasesweep.engine.state import (
         DURATION_ATTR,
-        FEASIBLE_ATTR,
         OVERRIDES_ATTR,
         constraint_attr,
         observed_attr,
     )
     from phasesweep.tracking.publication import _accepted_projection
+    from tests.conftest import make_experiment
 
     def projection(**observed: float):
         return _accepted_projection(
@@ -1954,13 +1954,13 @@ def test_accepted_projection_reports_observed_values() -> None:
                 state=optuna.trial.TrialState.COMPLETE,
                 user_attrs={
                     OVERRIDES_ATTR: json.dumps({"lr": 0.1}),
-                    FEASIBLE_ATTR: True,
                     DURATION_ATTR: 1.5,
                     constraint_attr("memory"): 4.0,
                     **{observed_attr(name): value for name, value in observed.items()},
                 },
             ),
             {},
+            make_experiment(),
         )
 
     reported = projection(peak=7.5, steps=3)

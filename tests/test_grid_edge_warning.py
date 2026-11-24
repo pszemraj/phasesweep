@@ -36,7 +36,6 @@ from phasesweep.engine.selection import (
 )
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
-    FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
@@ -49,6 +48,7 @@ from phasesweep.mcp.snapshots import RESULT_SNAPSHOT_SCHEMA_VERSION, capture_res
 from phasesweep.runtime.json import JsonValue
 from phasesweep.runtime.terminal import significant
 from tests.conftest import (
+    bounded_metric,
     log_regex_provenance,
     make_experiment,
     phase_study,
@@ -91,7 +91,10 @@ def _edge_warnings(
         repeats=repeats,
         allow_partial_grid=sampler_type == "grid" and repeats is None,
     )
-    experiment = make_experiment(phases=[phase], storage="auto" if persistent else None)
+    # An "infeasible" row measures 9.0, outside this bound.
+    experiment = make_experiment(
+        phases=[phase], storage="auto" if persistent else None, metric=bounded_metric(max=8.0)
+    )
     study = optuna.create_study(direction="minimize")
     for number, (params, outcome) in enumerate(rows):
         distributions = {
@@ -99,7 +102,6 @@ def _edge_warnings(
             for name, value in params.items()
         }
         attrs: dict[str, JsonValue] = {
-            FEASIBLE_ATTR: outcome != "infeasible",
             GENERATION_ID_ATTR: "generation-a",
             ATTEMPT_ID_ATTR: f"attempt-{number}",
             TRIAL_DIR_ATTR: f"/runs/p/trial_{number:05d}__attempt-{number}",

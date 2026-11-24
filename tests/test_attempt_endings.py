@@ -188,7 +188,7 @@ def test_a_crash_keeps_its_failure_when_a_ctrl_c_lands_in_the_helper_settle(
         assert runner.wait(timeout=30) == 128 + signal.SIGINT
     (trial,) = phase_trials(experiment)
     assert _outcome(trial) == ("FAIL", "non-zero exit code 1; stderr: loss went NaN at step 7")
-    assert _load_phase_policy_state(phase_study(experiment)).consecutive_failures == 1
+    assert _load_phase_policy_state(phase_study(experiment), experiment).consecutive_failures == 1
     assert _record_reruns(phase_study(experiment)) == []
     # The failure's trial line prints once, whichever run settles it, and the rerun has
     # nothing left to settle or run.

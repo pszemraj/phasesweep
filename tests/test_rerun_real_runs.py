@@ -80,7 +80,7 @@ def _assert_matches_control(experiment: Experiment, control: Experiment) -> list
     assert _finished_trial_count(trials) == phase.n_trials
     storage = _resolve_storage(experiment.resolved_storage)
     study = optuna.load_study(study_name="t::p", storage=storage)
-    assert _load_phase_policy_state(study).consecutive_failures == 0
+    assert _load_phase_policy_state(study, experiment).consecutive_failures == 0
     _, (winner,) = read_result(experiment, phase_names=["p"])
     _, (expected,) = read_result(control, phase_names=["p"])
     assert winner is not None and expected is not None

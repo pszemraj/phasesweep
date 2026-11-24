@@ -1177,7 +1177,7 @@ def test_summary_semantics_are_pointer_anchored_and_cross_checked(
         semantic_error = "config fingerprint"
     else:
         summary["phases"][0]["completion"]["finished_trials"] = 0
-        summary["phases"][0]["completion"]["completed_trials"] = 0
+        summary["phases"][0]["completion"]["measured_trials"] = 0
         semantic_error = "completion"
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
 

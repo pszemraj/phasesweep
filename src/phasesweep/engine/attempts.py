@@ -675,45 +675,51 @@ def _record_stale_trial_outcome(
     *,
     metric: float | None = None,
     cause: str | None = None,
-    policy_phase: Phase | None = None,
+    policy: tuple[Phase, Experiment] | None = None,
 ) -> None:
     """Commit a newly recovered verdict in completion order, preserving any existing decision.
 
     :param optuna.Study study: Owning study.
     :param optuna.trial.FrozenTrial trial: Trial being settled.
     :param str outcome: Success, failure, or an interruption when no measurement exists.
-    :param float | None metric: Accepted objective, including measured infeasibility.
+    :param float | None metric: Measured objective of a success, also outside the bounds.
     :param str | None cause: Reason for a failure or interruption.
-    :param Phase | None policy_phase: Producing phase whose failure limit applies to a new verdict.
+    :param tuple[Phase, Experiment] | None policy: Producing phase, whose failure limit applies to
+        a new verdict, and its configuration, whose bounds judge a success for the streak.
     :raises StudySchemaMismatchError: The durable completion order is invalid.
     :raises StudyStorageUnavailableError: Recovery could not read or commit the decision.
     """
     from phasesweep.engine.phase import _abort_decision
-    from phasesweep.engine.study_policy import _load_phase_policy_state
+    from phasesweep.engine.study_policy import (
+        _counted_outcome,
+        _load_phase_policy_state,
+        _recorded_outcome_sequence,
+    )
 
     try:
-        state = _load_phase_policy_state(study)
-        if (
-            _parsed_trial_outcome(
-                study._storage.get_trial(trial._trial_id).user_attrs.get(TRIAL_OUTCOME_ATTR)
-            )
-            is not None
-        ):
+        # Validating the completion order first refuses a duplicate sequence even when this
+        # trial already holds its verdict.
+        max_sequence = _recorded_outcome_sequence(study)
+        # The stored trial holds the constraint values the caller recorded after ``trial``.
+        stored = study._storage.get_trial(trial._trial_id)
+        if _parsed_trial_outcome(stored.user_attrs.get(TRIAL_OUTCOME_ATTR)) is not None:
             return
         abort = None
-        if policy_phase is not None:
+        if policy is not None:
+            policy_phase, producing = policy
+            state = _load_phase_policy_state(study, producing)
             abort = _abort_decision(
                 policy_phase,
                 trial.number,
-                outcome,
-                completion_sequence=state.max_sequence,
+                _counted_outcome(outcome, metric, stored, producing),
+                completion_sequence=max_sequence,
                 consecutive_failures=state.consecutive_failures,
                 abort_recorded=state.abort is not None,
             )
         if outcome == "interrupted" and cause is None:
             cause = "stale RUNNING trial recovered after its orchestrator stopped"
         payload = _trial_outcome_payload(
-            state.max_sequence + 1, outcome, metric=metric, cause=cause, abort=abort
+            max_sequence + 1, outcome, metric=metric, cause=cause, abort=abort
         )
         optuna.Trial(study, trial._trial_id).set_user_attr(TRIAL_OUTCOME_ATTR, payload)
     except StudySchemaMismatchError:
@@ -1343,16 +1349,14 @@ def _recover_completed_trial(
         assert result.metric is not None
     try:
         record_trial_result(active_trial, result, overrides_json=overrides_json)
-        cause = result.failure_reason
-        if cause is None and not result.feasible:
-            cause = "recovered evidence violates metric or constraint bounds"
         _record_stale_trial_outcome(
             study,
             trial,
-            "success" if result.feasible else "failure",
-            metric=result.metric,
-            cause=cause,
-            policy_phase=phase,
+            "failure" if result.failure_reason is not None else "success",
+            # Only a success carries its measurement, as a live trial's outcome does.
+            metric=result.metric if result.failure_reason is None else None,
+            cause=result.failure_reason,
+            policy=(phase, experiment),
         )
         if result.failure_reason is not None:
             active_trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
@@ -1569,8 +1573,7 @@ def _record_unfinished_trial_outcome(
     # The failure counts under its producing phase's policy, known only with its generation.
     known = record.generation_id is not None
     crashed = _producing_phase(record, experiment) if known else None
-    policy_phase = None if crashed is None else crashed[0]
-    _record_stale_trial_outcome(study, trial, "failure", cause=reason, policy_phase=policy_phase)
+    _record_stale_trial_outcome(study, trial, "failure", cause=reason, policy=crashed)
     _save_failed_trainer_duration(study, trial, lifecycle)
     if FAILURE_REASON_ATTR not in trial.user_attrs:
         try:

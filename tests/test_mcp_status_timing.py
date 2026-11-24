@@ -26,7 +26,7 @@ from phasesweep.mcp.tools import (
 )
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.time import utc_now_iso
-from tests.conftest import mark_current_format, phase_study, single_trial_confound, tell_feasible
+from tests.conftest import mark_current_format, phase_study, single_trial_confound
 from tests.mcp_helpers import (
     make_dead_run_handle,
     make_mcp_app,
@@ -45,7 +45,7 @@ def _complete_trials(experiment, *, n: int) -> None:
     )
     mark_current_format(experiment, study)
     for i in range(n):
-        tell_feasible(study, study.ask(), float(i))
+        study.tell(study.ask(), float(i))
 
 
 def test_elapsed_seconds_running_counts_from_launch(tmp_path: Path) -> None:

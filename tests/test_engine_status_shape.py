@@ -302,8 +302,8 @@ def test_status_counts_follow_the_trial_table_state_names(tmp_path: Path) -> Non
     assert sorted(str(row["state"]) for row in table.rows) == sorted(expected)
 
 
-def test_published_completion_counts_the_trials_status_calls_complete(tmp_path: Path) -> None:
-    """``completed_trials`` leaves out the INFEASIBLE trial, and a rerun replays that record."""
+def test_published_completion_counts_every_measured_trial(tmp_path: Path) -> None:
+    """``measured_trials`` counts the INFEASIBLE trial with the COMPLETE one, and a rerun replays that record."""
     experiment = _mixed_outcome_experiment(tmp_path)
     run_experiment(experiment)
     generation_id = published_generation_id(experiment)
@@ -314,7 +314,8 @@ def test_published_completion_counts_the_trials_status_calls_complete(tmp_path: 
     (phase_status,) = read_status(experiment)["phases"]
 
     assert completion["finished_trials"] == 3
-    assert completion["completed_trials"] == phase_status["trials"]["COMPLETE"] == 1
+    assert phase_status["trials"]["COMPLETE"] == phase_status["trials"]["INFEASIBLE"] == 1
+    assert completion["measured_trials"] == 2
 
     replayed = run_experiment(experiment)["p"]
 

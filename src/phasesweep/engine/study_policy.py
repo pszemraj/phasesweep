@@ -25,6 +25,7 @@ from phasesweep.engine.attempts import (
     _cleanup_recovered_trial_numbers,
     _trial_requires_cleanup_recovery,
 )
+from phasesweep.engine.bounds import bound_violations, recorded_constraints
 from phasesweep.engine.errors import (
     LaunchEnvironmentError,
     StudyFingerprintMismatchError,
@@ -63,6 +64,7 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
+    _ParsedTrialOutcome,
     _recorded_identity,
     _study_schema_supported,
     _unique_trial_outcomes,
@@ -72,6 +74,7 @@ from phasesweep.engine.trial import EnvironmentIdentity, _environment_identity, 
 from phasesweep.errors import (
     FRESH_STUDY,
     OTHER_FORMAT_STEP,
+    REJUDGE_BOUNDS_STEP,
     RERUN_CLEANUP_RECOVERY,
     OperatorAction,
     format_mismatch,
@@ -94,8 +97,9 @@ class _PhasePolicyState:
     max_sequence: int
     consecutive_failures: int
     abort: dict[str, Any] | None
-    """The first abort recorded after the recovery boundary, if any. A later
-    outcome resets the streak but never this recorded decision."""
+    """The first standing abort recorded after the recovery boundary, if any. A later
+    outcome resets the streak but never this recorded decision; a streak abort stands while
+    its streak, judged under the current bounds, still reaches the count it recorded."""
     abort_streak: tuple[int, ...] = ()
     """The trial numbers of the failed or fatal outcomes in a row that ended at ``abort``'s
     outcome, in completion order; empty while ``abort`` is ``None``."""
@@ -120,8 +124,8 @@ def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
 def _consecutive_failure_threshold_tripped(consecutive_failures: int, phase: Phase) -> bool:
     """Check the live or resumed failure count against the configured threshold.
 
-    A resumed phase applies today's threshold only when no abort is recorded. A recorded
-    abort is judged by :func:`_config_retires_abort`, never by recounting against it.
+    A resumed phase applies today's threshold only when no abort stands. A standing abort is
+    judged by :func:`_config_retires_abort`, never by recounting against today's threshold.
 
     :param int consecutive_failures: Current consecutive-failure count.
     :param Phase phase: Phase config supplying ``max_consecutive_failures``.
@@ -225,7 +229,8 @@ class _AcceptedPartialDecision:
     trial_target: int
     outcome_sequence: int
     finished_trials: int
-    completed_trials: int
+    measured_trials: int
+    """Finished trials that measured their values, a count no bound changes."""
     timeout_scope: str
 
 
@@ -270,7 +275,7 @@ def _load_accepted_partial_decision(
     trial_target = raw.get("trial_target")
     outcome_sequence = raw.get("outcome_sequence")
     finished_trials = raw.get("finished_trials")
-    completed_trials = raw.get("completed_trials")
+    measured_trials = raw.get("measured_trials")
     timeout_scope = raw.get("timeout_scope")
     recovered_abort_sequence = raw.get("recovered_abort_sequence")
     if (
@@ -283,9 +288,9 @@ def _load_accepted_partial_decision(
         or type(finished_trials) is not int
         or finished_trials < 0
         or finished_trials >= trial_target
-        or type(completed_trials) is not int
-        or completed_trials < 0
-        or completed_trials > finished_trials
+        or type(measured_trials) is not int
+        or measured_trials < 0
+        or measured_trials > finished_trials
         or timeout_scope not in {"phase", "run"}
         or (
             recovered_abort_sequence is not None
@@ -303,7 +308,7 @@ def _load_accepted_partial_decision(
         trial_target=trial_target,
         outcome_sequence=outcome_sequence,
         finished_trials=finished_trials,
-        completed_trials=completed_trials,
+        measured_trials=measured_trials,
         timeout_scope=timeout_scope,
     )
 
@@ -363,19 +368,39 @@ def _load_recovery_record(study: optuna.Study) -> _RecoveryRecord | None:
     return _RecoveryRecord(start_after_sequence, trial_target)
 
 
-def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
-    """Validate and reconstruct the durable consecutive-failure state.
+def _counted_outcome(
+    outcome: str, metric: float | None, trial: optuna.trial.FrozenTrial, experiment: Experiment
+) -> str:
+    """Return the outcome the failure streak counts for a recorded one.
 
-    :param optuna.Study study: Study whose ``PHASE_RECOVERY_ATTR`` and
-        per-trial outcome attrs are read and validated.
-    :return _PhasePolicyState: Reconstructed state: the highest recorded
-        outcome sequence, the consecutive-failure count since the last
-        recovery boundary, and the first abort recorded after it (if any)
-        with the trials of the failure streak that ended there.
-    :raises StudySchemaMismatchError: ``PHASE_RECOVERY_ATTR`` or a terminal
-        trial's outcome attr is malformed, two trials share a completion
-        sequence, or the recovery boundary exceeds the largest recorded
-        sequence.
+    A ``success`` records a measurement; the streak counts it as a failure while its
+    measured values violate a current bound, so correcting a bound re-judges the streak.
+
+    :param str outcome: The recorded outcome.
+    :param float | None metric: The metric a ``success`` recorded.
+    :param optuna.trial.FrozenTrial trial: The trial, whose constraint values are read.
+    :param Experiment experiment: Config supplying the current bounds.
+    :return str: ``"failure"`` for a success outside the bounds, otherwise ``outcome``.
+    """
+    if outcome != "success" or metric is None:
+        return outcome
+    violations = bound_violations(metric, recorded_constraints(trial, experiment), experiment)
+    return "failure" if violations else "success"
+
+
+def _recorded_outcome_events(
+    study: optuna.Study,
+) -> tuple[list[tuple[_ParsedTrialOutcome, optuna.trial.FrozenTrial]], int]:
+    """Validate a study's durable outcomes and return them in completion order.
+
+    :param optuna.Study study: Study whose ``PHASE_RECOVERY_ATTR`` and per-trial outcome
+        attrs are read and validated.
+    :return tuple[list[tuple[_ParsedTrialOutcome, optuna.trial.FrozenTrial]], int]: Each
+        outcome with its trial, by sequence, and the recovery boundary's sequence (0 without
+        one).
+    :raises StudySchemaMismatchError: ``PHASE_RECOVERY_ATTR`` or a terminal trial's outcome
+        attr is malformed, two trials share a completion sequence, or the recovery boundary
+        exceeds the largest recorded sequence.
     """
     recovery = _load_recovery_record(study)
     recovery_boundary = 0 if recovery is None else recovery.start_after_sequence
@@ -390,33 +415,78 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
                 f"terminal trial {trial.number} has missing or malformed "
                 f"{TRIAL_OUTCOME_ATTR!r}: {raw!r}",
             )
-    events = [
-        (parsed.sequence, parsed.outcome, parsed.abort, number)
-        for number, parsed in outcomes.items()
-    ]
-    events.sort(key=lambda event: event[0])
-    max_sequence = events[-1][0] if events else 0
+    by_number = {trial.number: trial for trial in trials}
+    events = sorted(
+        ((parsed, by_number[number]) for number, parsed in outcomes.items()),
+        key=lambda event: event[0].sequence,
+    )
+    max_sequence = events[-1][0].sequence if events else 0
     if recovery_boundary > max_sequence:
         raise _phase_policy_schema_error(
             study,
             f"{PHASE_RECOVERY_ATTR!r} starts after sequence {recovery_boundary}, "
             f"but the largest recorded sequence is {max_sequence}",
         )
+    return events, recovery_boundary
+
+
+def _recorded_outcome_sequence(study: optuna.Study) -> int:
+    """Return the highest completion sequence a study's validated outcomes record.
+
+    :param optuna.Study study: Study whose outcomes are read.
+    :return int: The highest sequence, 0 without outcomes.
+    :raises StudySchemaMismatchError: The durable outcomes are malformed
+        (:func:`_recorded_outcome_events`).
+    """
+    events, _ = _recorded_outcome_events(study)
+    return events[-1][0].sequence if events else 0
+
+
+def _load_phase_policy_state(study: optuna.Study, experiment: Experiment) -> _PhasePolicyState:
+    """Validate and reconstruct the durable consecutive-failure state under the current bounds.
+
+    Each outcome counts as :func:`_counted_outcome` says. A recorded streak abort stands
+    only while the streak that ended at its outcome, so re-judged, still reaches the count it
+    recorded: loosening a bound that turns the streak's trials feasible clears it, and a run
+    then judges the replayed streak against the current limit instead.
+
+    :param optuna.Study study: Study whose ``PHASE_RECOVERY_ATTR`` and
+        per-trial outcome attrs are read and validated.
+    :param Experiment experiment: Config supplying the current bounds.
+    :return _PhasePolicyState: Reconstructed state: the highest recorded
+        outcome sequence, the consecutive-failure count since the last
+        recovery boundary, and the first standing abort recorded after it (if any)
+        with the trials of the failure streak that ended there.
+    :raises StudySchemaMismatchError: ``PHASE_RECOVERY_ATTR`` or a terminal
+        trial's outcome attr is malformed, two trials share a completion
+        sequence, or the recovery boundary exceeds the largest recorded
+        sequence.
+    """
+    events, recovery_boundary = _recorded_outcome_events(study)
+    max_sequence = events[-1][0].sequence if events else 0
 
     consecutive_failures = 0
     streak: list[int] = []
     abort: dict[str, Any] | None = None
     abort_streak: tuple[int, ...] = ()
-    for sequence, outcome, recorded_abort, trial_number in events:
-        if sequence <= recovery_boundary:
+    for parsed, trial in events:
+        if parsed.sequence <= recovery_boundary:
             continue
         previous = consecutive_failures
-        consecutive_failures = _next_consecutive_failures(previous, outcome)
+        consecutive_failures = _next_consecutive_failures(
+            previous, _counted_outcome(parsed.outcome, parsed.metric, trial, experiment)
+        )
         if consecutive_failures > previous:
-            streak.append(trial_number)
+            streak.append(trial.number)
         elif consecutive_failures == 0:
             streak.clear()
-        if abort is None and recorded_abort is not None:
+        recorded_abort = parsed.abort
+        tripped = None if recorded_abort is None else _tripped_streak(recorded_abort)
+        if (
+            abort is None
+            and recorded_abort is not None
+            and (tripped is None or consecutive_failures >= tripped)
+        ):
             abort = recorded_abort
             abort_streak = tuple(streak)
 
@@ -445,13 +515,13 @@ def _record_recovery_boundary(
     :raises StudySchemaMismatchError: The study's durable failure-policy state
         is malformed.
     """
-    current = _load_phase_policy_state(study)
+    max_sequence = _recorded_outcome_sequence(study)
     study.set_user_attr(
         PHASE_RECOVERY_ATTR,
         {
             "schema_version": PHASE_RECOVERY_SCHEMA_VERSION,
             "recovered_abort_sequence": recovered_abort_sequence,
-            "start_after_sequence": current.max_sequence,
+            "start_after_sequence": max_sequence,
             "trial_target": phase.n_trials,
         },
     )
@@ -469,7 +539,7 @@ def _validate_study_schema(study: optuna.Study) -> None:
     version = study.user_attrs.get(STUDY_SCHEMA_ATTR)
     if _study_schema_supported(version, bool(trials)):
         if version is not None:
-            _load_phase_policy_state(study)
+            _recorded_outcome_events(study)
         return
 
     trial_numbers = [trial.number for trial in trials]
@@ -950,9 +1020,10 @@ def _recovery_advice(
     """Say how to continue a phase whose study recorded ``abort``, or that nothing can.
 
     Recovery messages take their advice from here, and :func:`_recovery_action` routes it.
-    Recovery retains recorded results. Bounds and constraints are part of the study's identity,
-    so changing them for trials that tripped on them takes a fresh study; a fix that changes
-    any other part of it meets its own refusal, which gives its own step.
+    Recovery retains recorded results. Bounds are not part of the study's identity: every read
+    judges the recorded values under the current ones, so correcting a bound the tripping
+    trials violated re-judges them. A fix that changes the study's identity meets its own
+    refusal, which gives its own step.
 
     :param Experiment experiment: Config whose bounds judge the recorded trials.
     :param Phase phase: Phase that aborted.
@@ -960,13 +1031,13 @@ def _recovery_advice(
     :param Mapping[str, object] abort: The recorded abort.
     :return str | None: The advice, or ``None`` when no remedy or explanation applies.
     """
-    if _streak_trials_all_infeasible(study, _load_phase_policy_state(study)):
-        remedies = _recovery_remedies(experiment, phase, study, abort, lead_in="To keep them, ")
+    if _streak_trials_all_infeasible(study, _load_phase_policy_state(study, experiment)):
+        remedies = _recovery_remedies(experiment, phase, study, abort, lead_in="Otherwise, ")
         if remedies is None:
             return None
         return (
-            "The tripping trials were outside the metric bounds or constraints; to change "
-            f"those, {FRESH_STUDY}. {remedies}"
+            "The tripping trials were outside the metric bounds or constraints. "
+            f"{REJUDGE_BOUNDS_STEP} {remedies}"
         )
     trials = study.get_trials(deepcopy=False)
     objective_lead = (

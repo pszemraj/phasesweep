@@ -1,8 +1,8 @@
-schema_version: 7
+schema_version: 8
 experiment: t
-generation_id: fd1646db45374950ba332214468f0413
+generation_id: 82dec2f878d94ec89f1744ffddd1a30f
 phasesweep_version: 0.3.15
-config_fingerprint: d766c1c44c2964d2af7fdc9599adce0e764fae06dafc68828c6d5c40801b4fc4
+config_fingerprint: 0b56220fbce1bafa2ddf4af88d1ddcbc1676ab08af0e6022557296bccca181b3
 metric:
   name: objective
   goal: minimize
@@ -24,19 +24,19 @@ phases:
   completion:
     requested_trials: 2
     finished_trials: 2
-    completed_trials: 2
+    measured_trials: 2
     incomplete: false
     reason: null
     timeout_scope: null
-  generation_id: fd1646db45374950ba332214468f0413
-  attempt_id: 8c691ed8ec8c4d0f9853e9e113bb0a80
-  trial_dir: trial_00000__8c691ed8ec8c4d0f9853e9e113bb0a80
+  generation_id: 82dec2f878d94ec89f1744ffddd1a30f
+  attempt_id: ada433e245ed49fb98def935cb35ef08
+  trial_dir: trial_00000__ada433e245ed49fb98def935cb35ef08
   winner_source:
     kind: phase_trial
     phase: p
     trial_number: 0
-    generation_id: fd1646db45374950ba332214468f0413
-    attempt_id: 8c691ed8ec8c4d0f9853e9e113bb0a80
+    generation_id: 82dec2f878d94ec89f1744ffddd1a30f
+    attempt_id: ada433e245ed49fb98def935cb35ef08
   trainer_input:
     schema_version: 1
     format: argparse
@@ -73,7 +73,7 @@ phases:
         verdict: ok
         detail:
           generations:
-          - generation_id: fd1646db45374950ba332214468f0413
+          - generation_id: 82dec2f878d94ec89f1744ffddd1a30f
             record: unknown
             commit: null
             dirty: null
@@ -85,11 +85,11 @@ phases:
 artifacts:
 - kind: config_snapshot
   path: config.snapshot.yaml
-  sha256: 584ef0f83850e002f0999e97d2c4cf7ca98608cde481be35894519ff3d3329e7
+  sha256: bd05443e81bfa5475e4372fe9145931fb8b53a9942d22b84c91f62b51ff3aacf
 - kind: reproducibility
   path: reproducibility.json
-  sha256: 4b3addafc5177e179878ce89450ccc01b89c5a8c3db417f3659cff3ce4c8ec7d
+  sha256: bf99ebdb2a5fa7b2cce1072c0d0cffd022e86106f85c7ea7704a8fa24c00b208
 - kind: winner
   phase: p
-  sha256: 6fa7519bd59334efcfcd62754c91fd59386952c614622542d2a27ee841d87398
+  sha256: 32a15fd07e0c5d18dfa9369fe61ac1c4486e1598318548dd5ec652421434c11a
 trainer_config: {}

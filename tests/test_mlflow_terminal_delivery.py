@@ -11,7 +11,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
-import optuna
 import pytest
 import yaml
 from optuna.trial import TrialState, create_trial
@@ -41,7 +40,6 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     DURATION_ATTR,
-    FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     OVERRIDES_ATTR,
     RERUN_OF_ATTR,
@@ -381,7 +379,6 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
                 value=0.5 if state == TrialState.COMPLETE else None,
                 user_attrs={
                     OVERRIDES_ATTR: json.dumps({"model.depth": 2}),
-                    FEASIBLE_ATTR: True,
                     DURATION_ATTR: 3.0,
                     constraint_attr("cost"): 1.0,
                 },
@@ -469,7 +466,6 @@ def test_failed_invocation_leaves_a_pending_trials_managed_run_open_only_when_pe
     assert not (delivery / f"attempt-{attempt}.json").exists()
     # Recovery later accepts the completed training.
     (pending,) = study.get_trials()
-    optuna.Trial(study, pending._trial_id).set_user_attr(FEASIBLE_ATTR, True)
     study.tell(pending.number, 0.5)
     publication._rebuild_attempt_intents(experiment, validate_ledger(experiment), [generation])
     record = read_record(delivery / f"attempt-{attempt}.json")

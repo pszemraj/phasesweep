@@ -119,7 +119,7 @@ def test_parallel_outcome_write_with_lost_acknowledgment(
                     worker.result(timeout=10)
 
     replay = optuna.load_study(study_name=study.study_name, storage=_resolve_storage(storage_url))
-    state = _load_phase_policy_state(replay)
+    state = _load_phase_policy_state(replay, experiment)
     assert state.abort is not None
     assert state.abort["completion_sequence"] == 1
     assert state.abort_streak == (first.number,)
@@ -240,7 +240,7 @@ def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) 
         run_experiment(exp)
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-    record = _load_phase_policy_state(study).abort
+    record = _load_phase_policy_state(study, make_experiment()).abort
     assert record is not None
     assert record["policy"] == "max_consecutive_failures"
     assert record["consecutive_failures"] == 2
@@ -324,7 +324,7 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(
             study = optuna.load_study(
                 study_name="t::p", storage=_resolve_storage(f"journal:///{db}")
             )
-            assert _load_phase_policy_state(study).abort is None
+            assert _load_phase_policy_state(study, make_experiment()).abort is None
             raise RuntimeError("simulated crash during winner selection")
 
         with monkeypatch.context() as patch:
@@ -335,13 +335,13 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(
                 run_experiment(_exp(6))
             assert type(caught.value) is RuntimeError
         study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-        assert _load_phase_policy_state(study).abort is None
+        assert _load_phase_policy_state(study, make_experiment()).abort is None
 
     winners = run_experiment(_exp(6))
 
     assert winners["p"].metric == pytest.approx(0.5)
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-    assert _load_phase_policy_state(study).abort is None
+    assert _load_phase_policy_state(study, make_experiment()).abort is None
 
 
 @pytest.mark.integration
@@ -384,7 +384,7 @@ def test_supported_topup_preserves_consecutive_failure_streak(tmp_path: Path) ->
         3,
         4,
     ]
-    abort = _load_phase_policy_state(study).abort
+    abort = _load_phase_policy_state(study, make_experiment()).abort
     assert abort is not None
     assert abort["consecutive_failures"] == 3
     assert _last_successful_generation_path(_exp(4)).read_text() == published_before
@@ -413,7 +413,9 @@ def test_retry_that_fails_again_aborts_after_a_fresh_failure_count(tmp_path: Pat
 
     def policy_state() -> tuple[list[str], _PhasePolicyState]:
         study = phase_study(grid(2))
-        return [trial.state.name for trial in study.trials], _load_phase_policy_state(study)
+        return [trial.state.name for trial in study.trials], _load_phase_policy_state(
+            study, make_experiment()
+        )
 
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(grid(2))
@@ -458,8 +460,8 @@ def test_changing_the_failure_limit_never_reinterprets_recorded_outcomes(tmp_pat
     first = run_experiment(original)
     assert run_experiment(lowered)["p"].attempt_id == first["p"].attempt_id
     study = phase_study(original)
-    assert _load_phase_policy_state(study).consecutive_failures == 1
-    assert _load_phase_policy_state(study).abort is None
+    assert _load_phase_policy_state(study, make_experiment()).consecutive_failures == 1
+    assert _load_phase_policy_state(study, make_experiment()).abort is None
     assert run_experiment(original)["p"].attempt_id == first["p"].attempt_id
 
 
@@ -501,7 +503,7 @@ def test_raised_failure_limit_retires_a_streak_abort_while_trials_remain(tmp_pat
     assert run_experiment(raised)["p"].metric == pytest.approx(0.5)
     study = phase_study(initial)
     assert [trial.state.name for trial in study.trials] == ["FAIL", "FAIL", "COMPLETE", "COMPLETE"]
-    state = _load_phase_policy_state(study)
+    state = _load_phase_policy_state(study, make_experiment())
     assert (state.abort, state.consecutive_failures) == (None, 0)
     # The recovery keeps the accepted target and spends it: nothing else was raised.
     assert study.user_attrs[PHASE_RECOVERY_ATTR]["trial_target"] == 4
@@ -617,7 +619,7 @@ def _abort_fatally(
         patch.setattr(phase_module, "prepare_trainer_input", explode)
         with pytest.raises(RuntimeError, match="simulated objective defect"):
             run_experiment(experiment)
-    abort = _load_phase_policy_state(phase_study(experiment)).abort
+    abort = _load_phase_policy_state(phase_study(experiment), experiment).abort
     assert abort is not None
     assert abort["policy"] == "unexpected_objective_exception"
     return experiment, calls

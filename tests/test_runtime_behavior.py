@@ -30,7 +30,12 @@ from phasesweep.engine.ledger import (
     open_phase_study,
     validate_ledger,
 )
-from phasesweep.engine.optuna import _build_sampler, _suggest, _trial_run_state
+from phasesweep.engine.optuna import (
+    _build_sampler,
+    _suggest,
+    _trial_count_state,
+    _trial_run_state,
+)
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
@@ -51,7 +56,6 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     DURATION_ATTR,
-    FEASIBLE_ATTR,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
     STUDY_SCHEMA_ATTR,
@@ -141,7 +145,6 @@ def test_json_primary_invalid_evidence_fails_trial(tmp_path, payload):
     try:
         result = extract_trial_result(experiment=experiment, executed=executed)
         assert result.metric is None
-        assert not result.feasible
         assert result.failure_reason.startswith("metric extractor")
     finally:
         if source.exists():
@@ -787,7 +790,6 @@ def test_non_finite_extracted_value_returns_failed_result(
     result = extract_trial_result(experiment=experiment, executed=executed)
 
     assert result.metric is None
-    assert result.feasible is False
     assert result.failure_reason == failure_reason
 
 
@@ -1200,12 +1202,12 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     trials = study.get_trials(deepcopy=False)
     if recovered_complete:
         assert [trial.state for trial in trials] == [optuna.trial.TrialState.COMPLETE] * 2
-        assert trials[0].user_attrs[FEASIBLE_ATTR] is (constraints is None)
-        assert trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == (
-            "success" if constraints is None else "failure"
+        assert _trial_count_state(trials[0], exp) == (
+            "COMPLETE" if constraints is None else "INFEASIBLE"
         )
+        assert trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "success"
         assert not any(RERUN_OF_ATTR in trial.user_attrs for trial in trials)
-        assert _load_phase_policy_state(study).max_sequence == 2
+        assert _load_phase_policy_state(study, exp).max_sequence == 2
         assert launches.read_text().splitlines() == ["0", "1"]
         assert trials[0].user_attrs[DURATION_ATTR] == trainer_durations[0]
         assert len(trainer_durations) == 1
@@ -1221,7 +1223,7 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
             "cause": "non-zero exit code 1",
         }
         assert not any(RERUN_OF_ATTR in trial.user_attrs for trial in trials)
-        assert _load_phase_policy_state(study).max_sequence == 2
+        assert _load_phase_policy_state(study, exp).max_sequence == 2
         assert launches.read_text().splitlines() == ["0", "1"]
 
 
@@ -1333,7 +1335,7 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         run_experiment(_exp(2))
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-    record = _load_phase_policy_state(study).abort
+    record = _load_phase_policy_state(study, _exp(2)).abort
     assert record is not None
     assert record["policy"] == "unsafe_process_cleanup"
     assert "cleanup could not be confirmed" in record["cause"]
@@ -1487,7 +1489,7 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
     record = outcomes[1][TRIAL_OUTCOME_ABORT_KEY]
     assert record["completion_sequence"] == 2
     assert record["consecutive_failures"] == 2
-    replayed = _load_phase_policy_state(study)
+    replayed = _load_phase_policy_state(study, exp)
     assert replayed.consecutive_failures == 0
     assert replayed.abort == record
 
@@ -1545,7 +1547,7 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
             run.abort_recorded = True
             first_abort = abort
             abort_streak = tuple(streak)
-        replayed = _load_phase_policy_state(study)
+        replayed = _load_phase_policy_state(study, experiment)
         assert run.completion_sequence == replayed.max_sequence
         assert run.consecutive_failures == replayed.consecutive_failures
         assert replayed.abort_streak == abort_streak
@@ -1553,7 +1555,7 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
     assert first_abort is not None
 
     _record_recovery_boundary(study, phase, run.completion_sequence)
-    replayed = _load_phase_policy_state(study)
+    replayed = _load_phase_policy_state(study, experiment)
     run.resume_from(replayed)
     assert run.completion_sequence == len(outcomes)
     assert run.consecutive_failures == 0
@@ -1862,12 +1864,10 @@ def test_metric_outside_bounds_is_complete_and_infeasible(tmp_path: Path) -> Non
     trials = phase_trials(exp)
     assert [t.state for t in trials] == [optuna.trial.TrialState.COMPLETE] * 3
     assert [t.value for t in trials] == [0.5, 20.0, 5.0]
-    assert [t.user_attrs[FEASIBLE_ATTR] for t in trials] == [False, False, True]
-    assert [t.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] for t in trials] == [
-        "failure",
-        "failure",
-        "success",
-    ]
+    assert [_trial_count_state(t, exp) for t in trials] == ["INFEASIBLE", "INFEASIBLE", "COMPLETE"]
+    # The outcomes record measurements; the failure streak judges them under the bounds.
+    assert [t.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] for t in trials] == ["success"] * 3
+    assert _load_phase_policy_state(phase_study(exp), exp).consecutive_failures == 0
 
     always_out = make_experiment(
         experiment="aborts",
@@ -1915,7 +1915,7 @@ def test_required_constraint_failure_preserves_prior_values(
     result = extract_trial_result(experiment=experiment, executed=executed)
 
     assert result.metric is None
-    assert result.feasible is False
+    assert result.failure_reason is not None
     assert result.constraints == {"first": 2.0}
     assert result.deadline_exhausted is (failure == "deadline")
     assert provenance_calls == [True, False, False]

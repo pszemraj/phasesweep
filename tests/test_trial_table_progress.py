@@ -15,7 +15,6 @@ from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.read import TrialTables, _trial_table
 from phasesweep.engine.state import (
     DURATION_ATTR,
-    FEASIBLE_ATTR,
     RERUN_OF_ATTR,
     TRIAL_OUTCOME_ATTR,
 )
@@ -51,7 +50,7 @@ def _complete(
     x: int, value: float, *, seed: int | None = None, **attrs: JsonValue
 ) -> optuna.trial.FrozenTrial:
     """Build a COMPLETE trial inside every bound, which is what counts toward the target."""
-    return _trial(_STATE.COMPLETE, x, value, seed=seed, **{FEASIBLE_ATTR: True}, **attrs)
+    return _trial(_STATE.COMPLETE, x, value, seed=seed, **attrs)
 
 
 def _interrupted(x: int) -> optuna.trial.FrozenTrial:
