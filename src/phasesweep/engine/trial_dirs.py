@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from stat import S_ISDIR, S_ISLNK
+from stat import S_ISLNK
 from typing import NamedTuple
 
 from optuna.trial import FrozenTrial
@@ -201,15 +201,9 @@ def _prepare_interrupted_trial_dir(trial_dir: Path, attempt_id: str) -> str | No
         return f"The original trial directory {trial_dir} is missing"
     if not S_ISLNK(mode):
         return None
-    try:
-        if S_ISDIR(trial_dir.stat().st_mode):
-            return None
-    except OSError:
-        broken = broken_symlink_detail(trial_dir.parent, trial_dir.name)
-        if broken is None:
-            raise
-    else:
-        broken = f"symlink {trial_dir} -> {trial_dir.readlink()} does not point to a directory"
+    broken = broken_symlink_detail(trial_dir.parent, trial_dir.name, require_directory=True)
+    if broken is None:
+        return None
     preserved = trial_dir.with_name(f".{trial_dir.name}.broken-symlink-{attempt_id}")
     trial_dir.rename(preserved)
     return f"Cannot reuse the original trial directory because {broken}. Preserved the symlink at {preserved}"

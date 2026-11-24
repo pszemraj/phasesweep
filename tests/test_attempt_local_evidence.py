@@ -252,19 +252,26 @@ def test_an_evidence_link_that_loops_fails_the_trial(
         run_extractor(make_trial_context(trial_dir), cfg)
 
 
-def test_missing_checkpoint_link_names_the_target_in_evidence_failures(tmp_path: Path) -> None:
-    """A missing checkpoint directory names the broken link for the score and the artifact gate."""
+@pytest.mark.parametrize("target_is_file", [False, True], ids=["missing-target", "file-target"])
+def test_unusable_checkpoint_link_names_the_target_in_evidence_failures(
+    tmp_path: Path, target_is_file: bool
+) -> None:
+    """An unusable checkpoint directory names the link and target for the score and artifact gate."""
     link = tmp_path / "latest"
-    link.symlink_to("checkpoint-500")
+    checkpoint = tmp_path / "checkpoint-500"
+    if target_is_file:
+        checkpoint.touch()
+    link.symlink_to(checkpoint.name)
     ctx = make_trial_context(tmp_path)
     relative = "latest/result.json"
-    detail = f"symlink {link} -> checkpoint-500 has a missing target"
+    cause = "does not point to a directory" if target_is_file else "has a missing target"
+    detail = f"symlink {link} -> checkpoint-500 {cause}"
     with pytest.raises(ExtractorError) as refused:
         run_extractor(ctx, JsonExtractor(type="json", path=relative, key="score"))
     assert detail in str(refused.value)
     (gate,) = evaluate_gates(ctx, [RequiredFileGate(type="required_file", path=relative)])
     assert not gate.passed and detail in gate.detail
-    assert link.is_symlink() and not (tmp_path / "checkpoint-500").exists()
+    assert link.is_symlink() and checkpoint.is_file() == target_is_file
 
 
 @pytest.mark.parametrize(

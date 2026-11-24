@@ -83,14 +83,18 @@ def file_sha256(path: Path, *, limit_bytes: int | None = None) -> str:
     return hasher.hexdigest()
 
 
-def broken_symlink_detail(directory: Path, relative: str | Path) -> str | None:
+def broken_symlink_detail(
+    directory: Path, relative: str | Path, *, require_directory: bool = False
+) -> str | None:
     """Identify a symlink that prevents access to a named path.
 
     :param Path directory: Directory from which to inspect the path.
     :param str | Path relative: Relative path whose components may include a link.
+    :param bool require_directory: The final component must also be a directory.
     :return str | None: The broken link, its target and the cause, when established.
     """
     component = directory
+    path = directory / relative
     for part in Path(relative).parts:
         component /= part
         try:
@@ -98,7 +102,7 @@ def broken_symlink_detail(directory: Path, relative: str | Path) -> str | None:
         except OSError:
             continue
         try:
-            component.stat()
+            info = component.stat()
         except OSError as exc:
             link = f"symlink {component} -> {target}"
             if exc.errno == errno.ENOENT:
@@ -107,6 +111,9 @@ def broken_symlink_detail(directory: Path, relative: str | Path) -> str | None:
                 return f"{link} has a non-directory component in its target path"
             if exc.errno == errno.ELOOP:
                 return f"{link} could not be followed (too many symbolic links)"
+        else:
+            if (component != path or require_directory) and not stat.S_ISDIR(info.st_mode):
+                return f"symlink {component} -> {target} does not point to a directory"
     return None
 
 

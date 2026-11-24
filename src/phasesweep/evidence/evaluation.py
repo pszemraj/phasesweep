@@ -1462,7 +1462,12 @@ def evaluate_gates(
             and gate.source != "json"
         ):
             directory = ctx.attempt_dir if is_captured_stream(gate.path) else ctx.trial_dir
-            if detail := broken_symlink_detail(directory, gate.path):
+            detail = broken_symlink_detail(
+                directory,
+                gate.path,
+                require_directory=isinstance(gate, ArtifactSizeGate) and gate.source == "directory",
+            )
+            if detail:
                 result = GateResult(
                     gate.type, False, f"Could not inspect `{gate.path}` because {detail}."
                 )
