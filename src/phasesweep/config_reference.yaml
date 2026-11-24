@@ -14,6 +14,7 @@
 # Values passed to the trainer unchanged (trainer_config, fixed_overrides, choices, repeats.values) keep their YAML type, so quote what must stay a string.
 # Every key is in the study fingerprint, which a study with trials refuses to change, except storage, workdir, observe and timeout_seconds_per_run.
 # Also outside it: execution.record_env, metric.name, the poll_seconds and timeout_seconds of mlflow and of every W&B extractor and gate, and the run-control keys listed under Phases.
+# The reading settings, metric.goal, metric.extractor, constraints and every phase's gates, address the study instead: a change re-reads the finished trials' kept evidence into a study of its own and retrains nothing: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#correct-a-reading-setting.
 # Notation: a `| null = null` key may be omitted, which turns its feature off unless an Unset: line says otherwise. TitleCase types are shared blocks.
 # Environment variables PhaseSweep reads: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#environment-variables. The MCP catalog is a separate file: https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md#the-catalog.
 
@@ -43,7 +44,7 @@ metric: object (required)
   # Requires: distinct from every constraints[].name and observe[].name, which are distinct from each other too.
   name: string = "objective"
 
-  # Direction in which trials rank and the sampler optimizes: minimize prefers the smallest value. A persistent study stored with the other direction is refused.
+  # Direction in which trials rank and the sampler optimizes: minimize prefers the smallest value. A changed goal re-reads the finished trials into a study of the other direction.
   # It never changes select on a log_regex or mlflow extractor, which chooses within one trial.
   goal: "minimize" | "maximize" = "minimize"
 
@@ -98,7 +99,7 @@ phases: list[object] (required)
     # Earlier phases whose winners' effective overrides, their inherited, fixed and sampled keys, become fixed inputs here. Nothing is inherited unless listed.
     # Only phases declared before this one can be listed. trainer_config is not inherited, and an inherited value keeps the phase that produced it as its origin.
     # Warning: only override values are inherited, never weights or checkpoints. Load a checkpoint explicitly through trainer_config or fixed_overrides.
-    # Warning: the values this phase inherits are part of its study fingerprint, so a changed inherited value stops a populated study of this phase from being reused; the parents' names are not.
+    # The values this phase inherits address its study, so a changed inherited value starts another study and a returning one reuses the study recorded under it; the parents' names are not part of it.
     inherits: list[string] = []
 
     # Fixed trainer-defined values for every trial of the phase, keyed by dotted paths of nonempty A-Z a-z 0-9 _ - segments, for example optimizer.lr.
@@ -591,7 +592,7 @@ LogRegexExtractor:
 
   # Python regular expression whose required group (?P<value>...) captures the whole metric token. Use loss=(?P<value>\S+) for whitespace delimiters or loss=(?P<value>[^\s,]+) when a comma can follow.
   # Lines split at \n, \r\n and bare \r and are searched one at a time, so a match cannot span lines. Inline flags such as (?i) work.
-  # Each numeric match is an observation. The reader skips captures that float() cannot parse and accepts nan, inf and 1_0. On a persistent study a changed pattern needs a new experiment name, because the pattern is part of the study identity.
+  # Each numeric match is an observation. The reader skips captures that float() cannot parse and accepts nan, inf and 1_0. On a persistent study a changed pattern re-reads the finished trials' logs, as any changed reading setting does.
   pattern: string (required)
 
   # Which observation is used: last or first by position in the file, min or max by value, the first of equal extremes. first decodes no line after its match.

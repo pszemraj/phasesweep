@@ -385,7 +385,7 @@ With the `wandb` reader, keep that reader and set `metric.extractor.evaluation_a
 
 With [MLflow's history selector](mlflow.md#select-metrics-and-require-evidence), the evaluation axis is the selected observation's integer `step`. Log the objective under a separate metric key, such as `objective_schedule_fraction`, at `step=int(10000 * actual_steps / planned_steps)`, and set `metric.extractor` to `{type: mlflow, metric_key: objective_schedule_fraction, select: last}`. Keep native-step history under its original metric key so a native step above 10000 cannot displace the relative-completion observation. Retain lower positions for early stops.
 
-`evaluation_axis` and `metric_key` are part of the study's identity, so set them before the first trial; on a study that has trials, a change needs a new `experiment` name.
+`evaluation_axis` and `metric_key` are reading settings: on a study that has trials, a change [re-reads](runtime.md#correct-a-reading-setting) the finished trials from their kept evidence, here the runs they logged to, and retrains nothing.
 
 ### W&B evidence
 

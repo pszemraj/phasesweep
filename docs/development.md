@@ -252,6 +252,7 @@ The principal test groups and what each covers:
 - TODO(runtime): Withhold edge advice when a restored journal cannot be matched to the population that selected the published winner.
 - TODO(runtime): Reuse the phase trial reads behind `status` when computing winner advisories.
 - TODO(runtime): Let `_phase_counts` use the trials from the completed phase instead of reopening the journal for the closing summary.
+- TODO(runtime): When a config returns to earlier reading settings, merge into their study the trials a later reading-settings study gained; today the earlier study is addressed as it was.
 - TODO(tracking): Share the phase trial reads used to match MLflow attempts across generations within a delivery pass.
 - TODO(cli): Preserve argument boundaries when a dry-run command contains an argument with a newline.
 - TODO(cli): Include W&B in the run banner when the only W&B reader is an evidence gate.
@@ -276,7 +277,7 @@ These have been requested and declined. Check this list before proposing one aga
 - **Reading or migrating trees and ledgers written in an older format.** PhaseSweep is still unstable and does not support backward compatibility until it stabilizes. Ledger and artifact format changes bump their record schemas and the respective study or artifact-root stamp; frozen MCP snapshot changes bump the MCP state-format marker. Older data is refused as an unsupported format with a fix line, and the checkout that produced it can still inspect it.
 - **Advice for removed config keys** such as `allow_seed_search`. A removed key fails as an unknown key, like any other; configs that use one stay on the revision that accepted it.
 - **An `await_run` limit above 600 seconds, or a streaming watch tool.** MCP tool calls are request and response, and clients bound how long one may block. An agent repeats `await_run` with the same `run_id`; [MCP](mcp.md) gives the loop.
-- **Importing trials from another experiment or a changed study.** A changed study fingerprint means the recorded trials answered a different question. Derive the new configuration with `run --set` under a new `experiment` name and run it.
+- **Importing trials from another experiment or a changed study.** A changed study fingerprint means the recorded trials trained something else; only a changed reading setting [re-reads](runtime.md#correct-a-reading-setting) them. Derive the new configuration with `run --set` under a new `experiment` name and run it.
 - **An audit-only mode for seed or repeat phases that publishes no winner.** `repeats` already publishes each group's spread with the winner, and a phase that publishes nothing would be a second phase kind for the same need.
 - **A launch queue that chains sweeps.** A scheduler is outside a single-node sweep tool. An agent waits on the blocking run with `await_run` and launches the next one.
 - **Per-item paired bootstrap.** This needs per-example evaluation data that PhaseSweep never collects. The tie warning reports each group's gap against a threshold from the sd pooled over every ranked group, and `show-winners` lists the groups' params; a phase's `cost_key` can advise a cheaper configuration within one pooled standard error from repeat-level objectives.
