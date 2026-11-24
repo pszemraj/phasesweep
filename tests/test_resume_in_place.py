@@ -422,12 +422,12 @@ def test_each_attempt_in_a_directory_delivers_its_own_mlflow_run(
 
 
 def test_a_resumed_trials_mlflow_objective_reads_its_attempts_merged_history() -> None:
-    """Every selector reads the stopped attempt's run merged under the rerun's, the rerun winning at a step both logged, and the capture names the earlier run."""
+    """Each selector keeps the previous attempt's prefix and discards its superseded steps, including steps past the retry's final one."""
     current = mlflow_binding()
     earlier = {**current, "run_id": "stopped", "attempt_id": "d" * 32}
     loss = {step: 1.0 + 0.1 * (step - 5) ** 2 for step in range(1, 11)}
     logged = {
-        "stopped": [(step, loss[step]) for step in range(1, 8)],
+        "stopped": [*((step, loss[step]) for step in range(1, 8)), (12, 0.1)],
         "native-id": [(7, 9.0), *((step, loss[step]) for step in range(8, 11))],
     }
     client = SimpleNamespace(

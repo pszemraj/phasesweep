@@ -93,21 +93,30 @@ def merge_histories(
 ) -> list[Mapping[str, object]]:
     """Merge one metric's histories from a trial's attempts into the trial's history.
 
-    A resumed trial logs its remaining steps into its own run, so the trial's history is
-    every attempt's, and an attempt that logged a step replaces what earlier attempts logged
-    there. A trainer that starts over from step 0 therefore overwrites each step it logs.
+    The first step logged by a newer attempt replaces the earlier history from that step
+    onward, including steps the resumed trainer never reaches again.
 
     :param Sequence[Sequence[Mapping[str, object]]] histories: Each attempt's records,
         oldest attempt first.
+    :raises ValueError: A history record has no valid step.
     :return list[Mapping[str, object]]: The merged records, for :func:`select_observation`.
     """
-    by_step: dict[object, list[Mapping[str, object]]] = {}
-    for history in histories:
-        logged: dict[object, list[Mapping[str, object]]] = {}
+    records = []
+    cutoff: int | None = None
+    for history in reversed(histories):
+        next_cutoff = cutoff
         for record in history:
-            logged.setdefault(record.get("step"), []).append(record)
-        by_step.update(logged)
-    return [record for records in by_step.values() for record in records]
+            step = record.get("step")
+            if type(step) is not int or step < 0:
+                raise ValueError(
+                    "MLflow history requires nonnegative integer steps and timestamps."
+                )
+            if cutoff is None or step < cutoff:
+                records.append(record)
+                if next_cutoff is None or step < next_cutoff:
+                    next_cutoff = step
+        cutoff = next_cutoff
+    return records
 
 
 def select_observation(
