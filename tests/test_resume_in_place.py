@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import optuna
 import pytest
@@ -32,9 +33,15 @@ from phasesweep.engine.trial_dirs import (
     _trial_dir_for_attempt,
 )
 from phasesweep.errors import ProcessCleanupUncertainError
-from phasesweep.evidence.baseline import read_evidence_baseline, write_evidence_baseline
+from phasesweep.evidence.baseline import (
+    EVIDENCE_PINS_DIR,
+    read_evidence_baseline,
+    release_evidence_pins,
+    write_evidence_baseline,
+)
 from phasesweep.evidence.evaluation import ExtractorError, run_extractor
 from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
+from phasesweep.runtime.files import atomic_write_text
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
 from phasesweep.tracking import publication, session
@@ -64,8 +71,10 @@ def test_a_value_file_left_before_launch_fails_as_not_written_by_this_attempt(
     attempt_dir.mkdir()
     (trial_dir / "r.json").write_text('{"loss": 0.1}', encoding="utf-8")
 
-    baseline = write_evidence_baseline(experiment, experiment.phases[0], trial_dir, attempt_dir)
-    assert read_evidence_baseline(attempt_dir) == baseline and set(baseline) == {"r.json"}
+    baseline = write_evidence_baseline(
+        experiment, experiment.phases[0], trial_dir, attempt_dir, reused=True
+    )
+    assert read_evidence_baseline(attempt_dir) == baseline and set(baseline.files) == {"r.json"}
     ctx = dataclasses.replace(
         make_trial_context(tmp_path),
         trial_dir=trial_dir,
@@ -80,9 +89,8 @@ def test_a_value_file_left_before_launch_fails_as_not_written_by_this_attempt(
     (trial_dir / "r.json").write_text('{"loss": 0.25}', encoding="utf-8")
     assert run_extractor(ctx, _JSON_METRIC.extractor) == 0.25
 
-    replacement = trial_dir / "replacement.json"
-    replacement.write_text('{"loss": 0.1}', encoding="utf-8")
-    replacement.replace(trial_dir / "r.json")
+    atomic_write_text(trial_dir / "r.json", '{"loss": 0.5}')
+    atomic_write_text(trial_dir / "r.json", '{"loss": 0.1}')
     assert run_extractor(ctx, _JSON_METRIC.extractor) == 0.1
 
 
@@ -109,7 +117,7 @@ def test_resumed_log_selects_fresh_lines_and_digests_the_complete_file(
     attempt_dir.mkdir()
     log_file = trial_dir / "train.log"
     log_file.write_bytes(prior)
-    write_evidence_baseline(experiment, experiment.phases[0], trial_dir, attempt_dir)
+    write_evidence_baseline(experiment, experiment.phases[0], trial_dir, attempt_dir, reused=True)
     ctx = dataclasses.replace(
         make_trial_context(tmp_path),
         trial_dir=trial_dir,
@@ -127,6 +135,142 @@ def test_resumed_log_selects_fresh_lines_and_digests_the_complete_file(
         "matched_line": expected_line,
         "match_count": 1,
     }
+
+
+def test_resumed_replacement_does_not_skip_the_old_prefix(tmp_path: Path) -> None:
+    """A replaced log can score its first line, even if it repeats the prior log's contents."""
+    extractor = LogRegexExtractor(
+        type="log_regex", file="train.log", pattern=r"x=(?P<value>[0-9.]+)", select="first"
+    )
+    experiment = make_experiment(persistent=tmp_path, metric=Metric(extractor=extractor))
+    trial_dir, attempt_dir = tmp_path / "trial", tmp_path / "attempt"
+    trial_dir.mkdir()
+    attempt_dir.mkdir()
+    log = trial_dir / "train.log"
+    log.write_text("x=0.1\n", encoding="utf-8")
+    original = log.stat()
+    write_evidence_baseline(experiment, experiment.phases[0], trial_dir, attempt_dir, reused=True)
+    (pin,) = (attempt_dir / EVIDENCE_PINS_DIR).iterdir()
+    atomic_write_text(log, "x=0.25\n")
+    atomic_write_text(log, "x=0.1\nx=0.8\n")
+
+    assert pin.stat().st_ino == original.st_ino != log.stat().st_ino
+    ctx = dataclasses.replace(
+        make_trial_context(tmp_path),
+        trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
+        baseline=read_evidence_baseline(attempt_dir),
+    )
+    assert run_extractor(ctx, extractor) == 0.1
+
+
+def test_resumed_append_without_links_uses_separate_filesystem_creation_ticks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An earlier creation tick establishes continuity when hard links are unavailable."""
+    extractor = LogRegexExtractor(
+        type="log_regex", file="train.log", pattern=r"x=(?P<value>[0-9.]+)", select="first"
+    )
+    experiment = make_experiment(persistent=tmp_path, metric=Metric(extractor=extractor))
+    trial_dir, attempt_dir = tmp_path / "trial", tmp_path / "attempt"
+    trial_dir.mkdir()
+    attempt_dir.mkdir()
+    log = trial_dir / "train.log"
+    log.write_text("x=0.1\n", encoding="utf-8")
+    births = {"train.log": 10, "evidence_baseline.json": 11}
+    monkeypatch.setattr(Path, "hardlink_to", Mock(side_effect=OSError("no hard links")))
+    monkeypatch.setattr(
+        "phasesweep.evidence.baseline.file_birth_ns", lambda path, _: births[path.name]
+    )
+    monkeypatch.setattr(
+        "phasesweep.evidence.evaluation.file_birth_ns", lambda path, _: births[path.name]
+    )
+    write_evidence_baseline(experiment, experiment.phases[0], trial_dir, attempt_dir, reused=True)
+    ctx = dataclasses.replace(
+        make_trial_context(tmp_path),
+        trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
+        baseline=read_evidence_baseline(attempt_dir),
+    )
+    with log.open("a", encoding="utf-8") as stream:
+        stream.write("x=0.8\n")
+    assert run_extractor(ctx, extractor) == 0.8
+    births["evidence_baseline.json"] = 10
+    with pytest.raises(ExtractorError, match="could not establish the prior file's identity"):
+        run_extractor(ctx, extractor)
+    births["train.log"] = 12
+    assert run_extractor(ctx, extractor) == 0.1
+
+
+def test_releasing_evidence_pins_keeps_unrelated_paths(tmp_path: Path) -> None:
+    """Retirement removes only pins and tolerates missing or symlinked pin directories."""
+    attempt = tmp_path / "attempt"
+    pins = attempt / EVIDENCE_PINS_DIR
+    pins.mkdir(parents=True)
+    evidence = tmp_path / "evidence"
+    evidence.touch()
+    (pins / "0").hardlink_to(evidence)
+    (pins / "1").mkdir()
+    (pins / "notes").write_text("keep", encoding="utf-8")
+    release_evidence_pins(attempt)
+    assert {path.name for path in pins.iterdir()} == {"1", "notes"}
+    assert evidence.is_file()
+
+    other = tmp_path / "unrelated"
+    other.mkdir()
+    (other / "0").touch()
+    missing = tmp_path / "missing"
+    release_evidence_pins(missing)
+    missing.mkdir()
+    (missing / EVIDENCE_PINS_DIR).symlink_to(other, target_is_directory=True)
+    release_evidence_pins(missing)
+    assert (other / "0").is_file()
+
+
+@pytest.mark.parametrize("reused", [False, True], ids=["first-attempt", "resumed"])
+def test_local_result_retarget_uses_the_final_files_creation_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reused: bool
+) -> None:
+    """Only a new result can supply evidence at an unfamiliar target in a reused directory."""
+    extractor = JsonExtractor(type="json", path="latest/r.json", key="loss")
+    experiment = make_experiment(persistent=tmp_path, metric=Metric(extractor=extractor))
+    trial_dir, attempt_dir = tmp_path / "trial", tmp_path / "attempt"
+    attempt_dir.mkdir()
+    for checkpoint in ("checkpoint-400", "checkpoint-500"):
+        parent = trial_dir / checkpoint
+        parent.mkdir(parents=True)
+        (parent / "r.json").write_text('{"loss": 0.25}', encoding="utf-8")
+    latest = trial_dir / "latest"
+    if reused:
+        latest.symlink_to("checkpoint-500")
+
+    baseline = write_evidence_baseline(
+        experiment, experiment.phases[0], trial_dir, attempt_dir, reused=reused
+    )
+    ctx = dataclasses.replace(
+        make_trial_context(tmp_path),
+        trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
+        baseline=read_evidence_baseline(attempt_dir),
+    )
+    latest.unlink(missing_ok=True)
+    latest.symlink_to("checkpoint-400")
+    result = latest / "r.json"
+    if not reused:
+        result.unlink()
+        result.write_text('{"loss": 0.75}', encoding="utf-8")
+    result.touch()
+    monkeypatch.setattr("phasesweep.evidence.evaluation.file_birth_ns", lambda *_: None)
+    if not reused:
+        assert run_extractor(ctx, extractor) == 0.75
+        return
+    with pytest.raises(ExtractorError, match="creation during this attempt cannot be established"):
+        run_extractor(ctx, extractor)
+    atomic_write_text(result, '{"loss": 0.75}')
+    monkeypatch.setattr(
+        "phasesweep.evidence.evaluation.file_birth_ns", lambda *_: baseline.captured_at_ns + 1
+    )
+    assert run_extractor(ctx, extractor) == 0.75
 
 
 def _interrupt_first_attempt(

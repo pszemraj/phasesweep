@@ -853,7 +853,9 @@ def launch_trial(
     )
     _record_trainer_environment(experiment, environment_identity, env, attempt_dir)
     # Before the trainer starts: what an earlier attempt left in this directory is refused.
-    baseline = write_evidence_baseline(experiment, phase, workdir, attempt_dir)
+    baseline = write_evidence_baseline(
+        experiment, phase, workdir, attempt_dir, reused=opener_attempt != attempt_id
+    )
 
     log.info("[%s/trial_%d] %s", phase_name, trial_id, cmd)
 
