@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import json
+import logging
 import os
 import stat
 import sys
@@ -31,7 +32,12 @@ from phasesweep.evidence.models import (
     WandbSummaryRequiredGate,
     is_captured_stream,
 )
-from phasesweep.runtime.files import atomic_write_text, file_sha256, fsync_directory
+from phasesweep.runtime.files import (
+    atomic_write_text,
+    broken_symlink_detail,
+    file_sha256,
+    fsync_directory,
+)
 from phasesweep.runtime.json import strict_json_loads
 
 if TYPE_CHECKING:
@@ -274,13 +280,22 @@ def write_evidence_baseline(
                 )
                 snapshots[identity] = before
                 files[relative] = before
-        except (FileNotFoundError, NotADirectoryError, RuntimeError):
-            # A missing target or a symlink loop names no file. Python 3.11 and 3.12
-            # raise RuntimeError for symlink loops, while newer versions use ELOOP.
-            continue
-        except OSError as exc:
-            if exc.errno != errno.ELOOP:
+        except (OSError, RuntimeError) as exc:
+            # Python 3.11 and 3.12 raise RuntimeError when resolving a link loop.
+            if isinstance(exc, OSError) and exc.errno not in {
+                errno.ENOENT,
+                errno.ENOTDIR,
+                errno.ELOOP,
+            }:
                 files[relative] = None
+            elif reused and (detail := broken_symlink_detail(root, relative)):
+                logging.getLogger(__name__).warning(
+                    "Rerunning in %s. Could not read %s before launch because %s. "
+                    "The trainer can still use other checkpoints in this directory.",
+                    root,
+                    relative,
+                    detail,
+                )
     if pins_dir.is_dir():
         fsync_directory(pins_dir)
     baseline = EvidenceBaseline(time.time_ns(), reused, files)

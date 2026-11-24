@@ -53,7 +53,7 @@ from phasesweep.evidence.wandb import (
     locate_wandb_position,
     poll_wandb_summary,
 )
-from phasesweep.runtime.files import file_sha256
+from phasesweep.runtime.files import broken_symlink_detail, file_sha256
 from phasesweep.runtime.json import (
     NonFiniteJsonConstantError,
     finite_nonnegative,
@@ -96,8 +96,8 @@ def _file_digest(raw: bytes) -> dict[str, Any]:
     return {"sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}
 
 
-class OutsideAttemptError(OSError):
-    """A trial-relative evidence path resolves outside its owning directory."""
+class TrialPathError(OSError):
+    """The configured evidence path cannot supply a file from its owning directory."""
 
 
 class StaleEvidenceError(OSError):
@@ -112,27 +112,30 @@ def attempt_file(trial_dir: Path, relative: str | Path) -> Path:
     absolute and ``..`` paths, so a link is the only way out, and several trials whose
     links name one shared file would all be scored from whichever trainer wrote it last.
     A link that stays inside the trial, such as ``latest -> checkpoint-500``, reads as
-    usual. A missing file resolves inside and keeps the caller's own not-found handling.
+    usual. A broken link names its target in the diagnostic. An ordinary missing file
+    keeps the caller's own not-found handling.
 
     :param Path trial_dir: The trial directory the file must resolve inside.
     :param str | Path relative: Configured trial-relative path.
-    :raises OutsideAttemptError: The path resolves outside ``trial_dir``.
+    :raises TrialPathError: A link is broken or the path resolves outside ``trial_dir``.
     :return Path: ``trial_dir / relative``, unchanged, for the caller to read.
     """
     path = trial_dir / relative
     try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        if detail := broken_symlink_detail(trial_dir, relative):
+            raise TrialPathError(f"Could not read `{relative}` because {detail}.") from None
+        if isinstance(exc, RuntimeError):
+            raise TrialPathError(f"Could not resolve {path}: {exc}") from exc
         resolved = path.resolve()
-    except RuntimeError:
-        # A symlink loop, which raises here before Python 3.13. It names no file, so the
-        # caller's own not-found handling reports it, as on later versions.
-        return path
     if not resolved.is_relative_to(trial_dir.resolve()):
         if is_captured_stream(relative):
-            raise OutsideAttemptError(
+            raise TrialPathError(
                 f"Captured stream `{relative}` resolves to {resolved}, outside its attempt "
                 f"directory {trial_dir}. Restore the attempt's captured stream."
             )
-        raise OutsideAttemptError(
+        raise TrialPathError(
             f"`{relative}` in trial directory {trial_dir} resolves to {resolved}, outside the "
             "trial. Have the trainer write it under PHASESWEEP_TRIAL_DIR."
         )
@@ -159,7 +162,7 @@ def trial_file(
     :param bool checked: Check the path against the directory that owns it. ``False``
         only locates it: for a gate that tests an artifact wherever its links lead, or to
         name the file in a diagnostic.
-    :raises OutsideAttemptError: A checked path resolves outside its owning directory.
+    :raises TrialPathError: A checked path contains a broken link or resolves outside its directory.
     :return Path: The path to read.
     """
     if is_captured_stream(relative):
@@ -207,14 +210,17 @@ def _prior_value_file(
         return prior
 
     old_path = before.path if isinstance(before, FileBaseline) else before
-    if not baseline.reused or target.resolve() == trial_dir.resolve() / old_path:
+    if not baseline.reused:
+        return None
+    resolved = target.resolve()
+    if resolved == trial_dir.resolve() / old_path:
         return None
     birth_ns = file_birth_ns(target, info)
     if birth_ns is not None and birth_ns > baseline.captured_at_ns:
         return None
     raise StaleEvidenceError(
-        f"`{target}` now names a different file whose creation during this attempt "
-        "cannot be established. Keep a stable evidence path or use an attempt's captured stream."
+        f"`{target}` now resolves to `{resolved}`. The file exists, but its creation during "
+        "this attempt cannot be established. Keep a stable evidence path or use an attempt's captured stream."
     )
 
 
@@ -280,7 +286,7 @@ def load_json_value(
         ``sha256``/``size_bytes`` of the exact bytes parsed, for evidence
         provenance.
     :param EvidenceBaseline | None baseline: Value files and their contents at launch.
-    :raises OutsideAttemptError: If a trainer ``relative_path`` resolves outside ``trial_dir``.
+    :raises TrialPathError: If the path contains a broken link or resolves outside its directory.
     :raises StaleEvidenceError: If the current contents cannot be attributed to the attempt.
     :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular file.
     :raises JsonKeyMissingError: If a segment of the dotted ``key`` path is missing, with the
@@ -444,7 +450,7 @@ def _trial_json_read_errors(target: Path, *, noun: str, trainer_step: str) -> It
     """
     try:
         yield
-    except (OutsideAttemptError, StaleEvidenceError) as exc:
+    except (TrialPathError, StaleEvidenceError) as exc:
         raise ExtractorError(str(exc)) from exc
     except FileNotFoundError as exc:
         missing = (
@@ -707,7 +713,7 @@ def _extract_log_regex(
                 f"Log file not found: {target} (the trainer must write `{cfg.file}` under "
                 "PHASESWEEP_TRIAL_DIR; `stdout.log` and `stderr.log` are written automatically)"
             )
-    except OutsideAttemptError as exc:
+    except TrialPathError as exc:
         raise ExtractorError(str(exc)) from exc
     except OSError as exc:
         raise ExtractorError(f"Could not inspect log file {cfg.file!r}: {exc}") from exc
@@ -1450,5 +1456,15 @@ def evaluate_gates(
             result = _wandb_summary_required(ctx, gate, deadline=deadline)
         else:
             result = _mlflow_required(ctx, gate, deadline=deadline)
+        if not result.passed and (
+            isinstance(gate, RequiredFileGate)
+            or isinstance(gate, ArtifactSizeGate)
+            and gate.source != "json"
+        ):
+            directory = ctx.attempt_dir if is_captured_stream(gate.path) else ctx.trial_dir
+            if detail := broken_symlink_detail(directory, gate.path):
+                result = GateResult(
+                    gate.type, False, f"Could not inspect `{gate.path}` because {detail}."
+                )
         results.append(result)
     return results

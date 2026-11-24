@@ -30,6 +30,7 @@ from phasesweep.evidence.models import (
     JsonScalarBoundGate,
     LogRegexExtractor,
     ObjectiveExtractor,
+    RequiredFileGate,
     Sha256Gate,
 )
 from tests.conftest import (
@@ -247,8 +248,23 @@ def test_an_evidence_link_that_loops_fails_the_trial(
     trial_dir.mkdir()
     (trial_dir / relative).symlink_to(relative)
 
-    with pytest.raises(ExtractorError):
+    with pytest.raises(ExtractorError, match="too many symbolic links"):
         run_extractor(make_trial_context(trial_dir), cfg)
+
+
+def test_missing_checkpoint_link_names_the_target_in_evidence_failures(tmp_path: Path) -> None:
+    """A missing checkpoint directory names the broken link for the score and the artifact gate."""
+    link = tmp_path / "latest"
+    link.symlink_to("checkpoint-500")
+    ctx = make_trial_context(tmp_path)
+    relative = "latest/result.json"
+    detail = f"symlink {link} -> checkpoint-500 has a missing target"
+    with pytest.raises(ExtractorError) as refused:
+        run_extractor(ctx, JsonExtractor(type="json", path=relative, key="score"))
+    assert detail in str(refused.value)
+    (gate,) = evaluate_gates(ctx, [RequiredFileGate(type="required_file", path=relative)])
+    assert not gate.passed and detail in gate.detail
+    assert link.is_symlink() and not (tmp_path / "checkpoint-500").exists()
 
 
 @pytest.mark.parametrize(

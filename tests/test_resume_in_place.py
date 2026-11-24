@@ -351,8 +351,10 @@ def test_a_rerun_that_rewrites_no_result_fails_as_not_written_by_this_attempt(
 
 
 @pytest.mark.integration
-def test_rerun_can_replace_an_unresolvable_observation(tmp_path: Path) -> None:
-    """An old observation symlink loop lets the resumed trainer repair the file."""
+def test_rerun_can_replace_an_unresolvable_observation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unresolved observation is reported before the trainer repairs it on the scheduled rerun."""
     body = _trainer(
         tmp_path,
         '    (trial / "observe.json").symlink_to("observe.json")',
@@ -375,6 +377,8 @@ def test_rerun_can_replace_an_unresolvable_observation(tmp_path: Path) -> None:
     winner = run_experiment(experiment)["p"]
     assert winner.metric == 1.0
     assert winner.observed == {"extra": 8.0}
+    assert "Could not read observe.json before launch because symlink" in caplog.text
+    assert "observe.json -> observe.json could not be followed" in caplog.text
 
 
 @pytest.mark.integration

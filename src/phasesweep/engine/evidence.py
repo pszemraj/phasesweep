@@ -39,7 +39,7 @@ from phasesweep.errors import (
 )
 from phasesweep.evidence.evaluation import (
     EVIDENCE_PROVENANCE_SCHEMA_VERSION,
-    OutsideAttemptError,
+    TrialPathError,
     attempt_file,
     extractor_config_fingerprint,
     json_float,
@@ -315,7 +315,7 @@ def _verify_objective_source_evidence(
     raw_path = str(source["path"])
     try:
         source_path = trial_file(trial_dir, attempt_dir, raw_path)
-    except OutsideAttemptError as exc:
+    except TrialPathError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r}, but {exc}"
         ) from exc
@@ -402,7 +402,7 @@ def _verify_trainer_input_evidence(
 
     try:
         input_path = attempt_file(trial_dir, filename)
-    except OutsideAttemptError as exc:
+    except TrialPathError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} recorded trainer input {filename!r}, but {exc}"
         ) from exc
