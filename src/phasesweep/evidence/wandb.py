@@ -67,10 +67,11 @@ class WandbRunTerminalError(RuntimeError):
 
 @dataclass(eq=False)
 class WandbRunStaleError(RuntimeError):
-    """A rerun's run still showed no history row logged after the rerun launched at the deadline."""
+    """The run's last logged row cannot be attributed to the attempt being read."""
 
     run_id: str
     waited_seconds: float
+    superseded: bool = False
 
 
 @dataclass(eq=False)
@@ -223,6 +224,7 @@ def poll_wandb_summary(
     required_keys: Iterable[str] = (),
     presence_keys: Iterable[str] = (),
     logged_after: float | None = None,
+    logged_before: float | None = None,
     earlier_launches: tuple[float, ...] = (),
     resume_metric: tuple[str, str] | None = None,
     environment: Mapping[str, str] | None = None,
@@ -243,6 +245,8 @@ def poll_wandb_summary(
     :param float | None logged_after: Unix time a rerun launched at, which the summary's
         ``_timestamp`` must pass before the run counts as this attempt's; ``None`` for an
         attempt whose run is its own, defaults to None.
+    :param float | None logged_before: Unix time the summary must predate when a later
+        attempt reused the run, defaults to None.
     :param tuple[float, ...] earlier_launches: Launch times of earlier reruns in this run.
     :param tuple[str, str] | None resume_metric: Objective key and its trainer progress axis
         for detecting repeated training in a native min/max aggregate.
@@ -253,7 +257,7 @@ def poll_wandb_summary(
         reached only when the worker reports that its last poll got an answer about the run.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
     :raises WandbRunStaleError: By the deadline the rerun's run never showed a row logged
-        after it launched.
+        after it launched, or a newer attempt replaced the retained summary.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
     :raises WandbMissingKeysError: At the deadline the finished run's summary still lacked
@@ -278,6 +282,7 @@ def poll_wandb_summary(
             "required_keys": list(required_keys),
             "presence_keys": list(presence_keys),
             "logged_after": logged_after,
+            "logged_before": logged_before,
             "earlier_launches": earlier_launches,
             "resume_metric": resume_metric,
             "deadline": deadline,
@@ -315,7 +320,7 @@ def poll_wandb_summary(
             raise RuntimeError(
                 f"W&B evidence worker returned a malformed stale-run report for attempt {attempt_id!r}."
             )
-        raise WandbRunStaleError(run_id, float(waited))
+        raise WandbRunStaleError(run_id, float(waited), response.get("superseded") is True)
     if response.get("status") == "missing_keys":
         missing = json_text_list(response.get("missing"))
         available = json_text_list(response.get("available"))
@@ -709,6 +714,7 @@ def _poll_wandb_summary(
     required_keys: Iterable[str] = (),
     presence_keys: Iterable[str] = (),
     logged_after: float | None = None,
+    logged_before: float | None = None,
     earlier_launches: tuple[float, ...] = (),
     resume_metric: tuple[str, str] | None = None,
     deadline: float | None = None,
@@ -742,6 +748,8 @@ def _poll_wandb_summary(
     :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
     :param float | None logged_after: Unix time a rerun launched at; ``None`` for an
         attempt whose run is its own, defaults to None.
+    :param float | None logged_before: Unix time the summary must predate when a later
+        attempt reused the run, defaults to None.
     :param tuple[float, ...] earlier_launches: Launch times of earlier reruns in this run.
     :param tuple[str, str] | None resume_metric: Objective key and its trainer progress axis
         for detecting repeated training in a native min/max aggregate.
@@ -751,7 +759,7 @@ def _poll_wandb_summary(
         reached when the last poll got an answer about the run.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
     :raises WandbRunStaleError: At the deadline the run still showed no row logged after
-        ``logged_after``.
+        ``logged_after``, or a newer attempt replaced the retained summary.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
     :raises WandbMissingKeysError: At the deadline the finished run's summary still lacked
@@ -825,6 +833,12 @@ def _poll_wandb_summary(
                         f"history's last step {_last_history_step(run)!r}."
                     )
                 elif run.state == "finished":
+                    if logged_before is not None:
+                        stamp = finite_nonnegative(summary.get("_timestamp"))
+                        if stamp is None or stamp >= logged_before:
+                            raise WandbRunStaleError(
+                                run_id, time.monotonic() - started, superseded=True
+                            )
                     if all(key in summary for key in required):
                         values = {}
                         for key in required:
@@ -1030,7 +1044,11 @@ def main(argv: list[str] | None = None) -> int:
     except WandbRunMissingError:
         response = {"status": "run_missing"}
     except WandbRunStaleError as exc:
-        response = {"status": "stale", "waited_seconds": exc.waited_seconds}
+        response = {
+            "status": "stale",
+            "waited_seconds": exc.waited_seconds,
+            "superseded": exc.superseded,
+        }
     except WandbPollTimeout as exc:
         response = {
             "status": "timeout",

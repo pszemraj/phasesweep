@@ -11,7 +11,7 @@ import hashlib
 import json
 import threading
 import warnings
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, assert_never
 
@@ -164,6 +164,25 @@ def _measured_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
     :return int: Number of trials in :attr:`optuna.trial.TrialState.COMPLETE`.
     """
     return sum(1 for trial in trials if trial.state == optuna.trial.TrialState.COMPLETE)
+
+
+def _measured_draw_count(
+    trials: Sequence[optuna.trial.FrozenTrial], *, excluded: Collection[int] = ()
+) -> int:
+    """Count draws already measured, even if a reread recovered several attempts per draw.
+
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
+    :param Collection[int] excluded: Trial numbers still awaiting a measurement verdict.
+    :return int: Distinct draw positions that have a COMPLETE trial, feasible or not.
+    """
+    positions = _draw_positions(trials)
+    return len(
+        {
+            positions[trial.number]
+            for trial in trials
+            if trial.state == optuna.trial.TrialState.COMPLETE and trial.number not in excluded
+        }
+    )
 
 
 def _any_trial_timed_out(trials: Iterable[optuna.trial.FrozenTrial]) -> bool:

@@ -215,6 +215,8 @@ def _require_fresh(
     attempt_dir: Path,
     relative: str,
     target: Path,
+    *,
+    evidence_before: float | None = None,
 ) -> None:
     """Refuse a value file this attempt did not write.
 
@@ -232,11 +234,20 @@ def _require_fresh(
     :param Path attempt_dir: The attempt's directory, holding the baseline record.
     :param str relative: Configured trial-relative path.
     :param Path target: Current location of evidence after containment checks.
+    :param float | None evidence_before: Unix time the shared value file must predate,
+        defaults to None.
     :raises StaleEvidenceError: The file was not written by this attempt, or its state at
         launch could not be inspected.
     :raises OSError: The current file or the baseline record could not be inspected.
     """
-    if baseline is None or not baseline.reused or is_captured_stream(relative):
+    if is_captured_stream(relative):
+        return
+    if evidence_before is not None and target.stat().st_ctime_ns > round(evidence_before * 1e9):
+        raise StaleEvidenceError(
+            f"`{target}` changed after this attempt finished and another attempt reused its "
+            "directory. The earlier value cannot be recovered from this file."
+        )
+    if baseline is None or not baseline.reused:
         return
     before = baseline.files.get(relative, relative)
     if before is None:
@@ -275,6 +286,7 @@ def load_json_value(
     *,
     digest: dict[str, Any] | None = None,
     baseline: EvidenceBaseline | None = None,
+    evidence_before: float | None = None,
 ) -> tuple[Path, Any]:
     """Load a dotted JSON value from a configured trial path, as :func:`trial_file` locates it.
 
@@ -286,6 +298,8 @@ def load_json_value(
         ``sha256``/``size_bytes`` of the exact bytes parsed, for evidence
         provenance.
     :param EvidenceBaseline | None baseline: Value paths and file stamps recorded at launch.
+    :param float | None evidence_before: Unix time the shared JSON file must predate,
+        defaults to None.
     :raises TrialPathError: If the path contains a broken link or resolves outside its directory.
     :raises StaleEvidenceError: If the file was not written by this attempt.
     :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular file.
@@ -300,7 +314,9 @@ def load_json_value(
     target = trial_file(trial_dir, attempt_dir, relative_path)
     if not target.is_file():
         raise FileNotFoundError(target)
-    _require_fresh(baseline, trial_dir, attempt_dir, relative_path, target)
+    _require_fresh(
+        baseline, trial_dir, attempt_dir, relative_path, target, evidence_before=evidence_before
+    )
     raw = target.read_bytes()
     if digest is not None:
         digest.update(_file_digest(raw))
@@ -495,6 +511,8 @@ class TrialContext:
     mlflow_capture: JsonObject = field(default_factory=dict, compare=False)
     # Value paths and file stamps recorded before the attempt ran.
     baseline: EvidenceBaseline | None = field(default=None, compare=False)
+    # End of the attributable period for mutable evidence in a directory another attempt reused.
+    evidence_before: float | None = None
     # (generation ID, attempt ID) of the earlier attempts that trained in trial_dir, oldest
     # first, whose tracker histories are the start of this trial's.
     earlier_attempts: tuple[tuple[str, str], ...] = ()
@@ -533,6 +551,7 @@ def _extract_json(
                 cfg.key,
                 digest=digest,
                 baseline=ctx.baseline,
+                evidence_before=ctx.evidence_before,
             )
     except JsonKeyMissingError as exc:
         raise ExtractorError(
@@ -732,7 +751,14 @@ def _extract_log_regex(
     count = 0
     first_unparseable: str | None = None
     try:
-        _require_fresh(ctx.baseline, ctx.trial_dir, ctx.attempt_dir, cfg.file, target)
+        _require_fresh(
+            ctx.baseline,
+            ctx.trial_dir,
+            ctx.attempt_dir,
+            cfg.file,
+            target,
+            evidence_before=ctx.evidence_before,
+        )
         with target.open("r", encoding="utf-8", errors="surrogateescape", newline="") as fh:
             for line_no, raw_text in enumerate(fh, 1):
                 raw_line = raw_text.encode("utf-8", errors="surrogateescape")
@@ -874,6 +900,7 @@ def _capture_wandb(
                 required_keys=query.numeric_keys,
                 presence_keys=query.presence_keys,
                 logged_after=logged_after,
+                logged_before=ctx.evidence_before,
                 earlier_launches=tuple(earlier_launches),
                 resume_metric=resume_metric,
                 environment=ctx.wandb_environment,
@@ -919,6 +946,11 @@ def _capture_wandb(
         # Both are verdicts reached only at the deadline, so an execution deadline that was
         # the binding limit cut the wait short instead.
         except WandbRunStaleError as exc:
+            if exc.superseded:
+                raise ExtractorError(
+                    f"W&B run {target} was reused by another attempt and its current summary "
+                    "cannot be attributed to this attempt."
+                ) from exc
             raise (DeadlineExceededError if capped else ExtractorError)(
                 f"W&B run {target} was not written by this attempt: after "
                 f"{exc.waited_seconds:.0f} s its summary still records no wandb.log() call "
@@ -1272,7 +1304,12 @@ def _json_equals(ctx: TrialContext, gate: JsonEqualsGate) -> GateResult:
     """
     try:
         _, actual = load_json_value(
-            ctx.trial_dir, ctx.attempt_dir, gate.path, gate.key, baseline=ctx.baseline
+            ctx.trial_dir,
+            ctx.attempt_dir,
+            gate.path,
+            gate.key,
+            baseline=ctx.baseline,
+            evidence_before=ctx.evidence_before,
         )
     except Exception as exc:
         return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
@@ -1295,7 +1332,12 @@ def _json_scalar_bound(ctx: TrialContext, gate: JsonScalarBoundGate) -> GateResu
     """
     try:
         _, raw_value = load_json_value(
-            ctx.trial_dir, ctx.attempt_dir, gate.path, gate.key, baseline=ctx.baseline
+            ctx.trial_dir,
+            ctx.attempt_dir,
+            gate.path,
+            gate.key,
+            baseline=ctx.baseline,
+            evidence_before=ctx.evidence_before,
         )
         value = json_float(raw_value, label=gate.key)
     except Exception as exc:
@@ -1369,7 +1411,12 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
         assert gate.key is not None
         try:
             _, raw_size = load_json_value(
-                ctx.trial_dir, ctx.attempt_dir, gate.path, gate.key, baseline=ctx.baseline
+                ctx.trial_dir,
+                ctx.attempt_dir,
+                gate.path,
+                gate.key,
+                baseline=ctx.baseline,
+                evidence_before=ctx.evidence_before,
             )
         except Exception as exc:
             return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))

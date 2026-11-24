@@ -135,6 +135,22 @@ def test_a_finished_runs_summary_served_a_minute_late_is_read_once_served(
     assert clock.now == 60
 
 
+def test_reread_only_accepts_a_shared_summary_logged_during_the_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finished run can still supply an earlier attempt's summary if it predates the cutoff.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
+    """
+    from phasesweep.evidence.wandb import WandbRunStaleError
+
+    _serve(monkeypatch, lambda _: ("finished", {"_step": 3, _KEY: 0.1, "_timestamp": 50.0}, 3))
+    assert _poll(logged_before=51.0)["values"] == {_KEY: 0.1}
+    with pytest.raises(WandbRunStaleError) as failure:
+        _poll(logged_before=50.0)
+    assert failure.value.superseded
+
+
 @pytest.mark.parametrize("unindexed", [-1, None], ids=["no-keys", "null"])
 def test_a_summary_served_before_the_history_index_is_not_read(
     monkeypatch: pytest.MonkeyPatch, unindexed: int | None

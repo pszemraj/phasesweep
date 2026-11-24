@@ -18,8 +18,9 @@ source and trial cutoff even if another study grew while the fill was stopped.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import ClassVar
 
 import optuna
@@ -70,6 +71,7 @@ from phasesweep.engine.state import (
     _parsed_phase_identity,
     _parsed_trial_outcome,
     _recorded_identity,
+    _recorded_trial_dir,
     _required_trial_dir,
     _trial_lifecycle,
     _trial_outcome_payload,
@@ -321,12 +323,49 @@ def fill_source(
     return max(reversed(found), key=lambda source: source.rereads)
 
 
+def _directory_starts(trials: Iterable[optuna.trial.FrozenTrial]) -> dict[str, datetime]:
+    """Find the last attempt that could write each directory, across reading studies.
+
+    A continued directory keeps its basename even if the artifact tree moves. A rerun
+    that opens a fresh directory has its own name. Copied trials keep their launch date.
+
+    :param Iterable[optuna.trial.FrozenTrial] trials: Attempts visible in the phase's studies.
+    :return dict[str, datetime]: Latest attempt start for each trainer directory name.
+    """
+    starts: dict[str, datetime] = {}
+    for trial in trials:
+        try:
+            directory = _recorded_trial_dir(trial)
+        except ValueError:
+            continue
+        started = trial.datetime_start
+        if (
+            directory is None
+            or started is None
+            or started <= starts.get(directory.name, datetime.min)
+        ):
+            continue
+        if type(trial.user_attrs.get(RETURN_CODE_ATTR)) is int:
+            starts[directory.name] = started
+            continue
+        try:
+            lifecycle = _trial_lifecycle(trial)
+        except ValueError:
+            lifecycle = None
+        if lifecycle is None or (
+            lifecycle.state != "allocated" and lifecycle.ended_by != "not_started"
+        ):
+            starts[directory.name] = started
+    return starts
+
+
 def _reread_trial(
     experiment: Experiment,
     phase: Phase,
     trial: optuna.trial.FrozenTrial,
     trials: Mapping[int, optuna.trial.FrozenTrial],
     producing: dict[str, Experiment | WinnerIntegrityError],
+    directory_starts: Mapping[str, datetime],
 ) -> optuna.trial.FrozenTrial | None:
     """Read one finished trial again under the current settings, as the trial a fill writes.
 
@@ -339,6 +378,7 @@ def _reread_trial(
     :param Mapping[int, optuna.trial.FrozenTrial] trials: The source study's trials by number.
     :param dict[str, Experiment | WinnerIntegrityError] producing: Producing configurations by
         generation, filled as they are loaded.
+    :param Mapping[str, datetime] directory_starts: Last attempt to use each trainer directory.
     :raises TrackingTargetUnavailableError: The tracker gave no answer, so the verdict waits for
         a later run; the trials already copied stay and the fill resumes.
     :return optuna.trial.FrozenTrial | None: The trial to write, or ``None`` when the trial is
@@ -350,9 +390,10 @@ def _reread_trial(
     if seconds is None or outcome is None or not isinstance(overrides_json, str):
         return None
     try:
-        record = _trial_attempt_record(trial, phase.name, _required_trial_dir(trial))
+        directory = _required_trial_dir(trial)
+        record = _trial_attempt_record(trial, phase.name, directory)
     except ValueError:
-        record = None
+        return None
     if record is None or record.generation_id is None:
         return None
     result: TrialResult
@@ -368,6 +409,8 @@ def _reread_trial(
         launched = producing[record.generation_id]
         if isinstance(launched, WinnerIntegrityError):
             raise ValueError(str(launched))
+        started = directory_starts.get(directory.name)
+        finished = trial.datetime_complete
         result, _ = read_finished_attempt(
             trials,
             trial,
@@ -377,6 +420,11 @@ def _reread_trial(
             current=experiment,
             trainer_duration=seconds,
             baseline=baseline,
+            evidence_before=(
+                finished.timestamp()
+                if finished is not None and started is not None and started > finished
+                else None
+            ),
         )
     except ValueError as exc:
         result = _failed_trial(rc=0, duration=seconds, failure_reason=str(exc))
@@ -414,7 +462,12 @@ def _reread_trial(
 
 
 def fill_study(
-    experiment: Experiment, phase: Phase, target: optuna.Study, source: FillSource
+    experiment: Experiment,
+    phase: Phase,
+    target: optuna.Study,
+    source: FillSource,
+    *,
+    other_studies: Sequence[optuna.Study],
 ) -> FillResult:
     """Fill a phase's addressed study from its source, re-reading every finished trainer.
 
@@ -428,6 +481,7 @@ def fill_study(
     :param Phase phase: The phase.
     :param optuna.Study target: The addressed study, writable.
     :param FillSource source: The study to fill from (:func:`fill_source`).
+    :param Sequence[optuna.Study] other_studies: Every study of the phase except the target.
     :raises StudySchemaMismatchError: The target holds trials the source does not, or the
         source's accepted partial decision is malformed.
     :raises TrackingTargetUnavailableError: A tracker gave no answer for a finished trial.
@@ -462,10 +516,13 @@ def fill_study(
         if key != PHASE_DECISION_ATTR and stored.get(key) != value:
             target.set_user_attr(key, value)
     by_number = {trial.number: trial for trial in trials}
+    directory_starts = _directory_starts(
+        trial for study in other_studies for trial in study.get_trials(deepcopy=False)
+    )
     producing: dict[str, Experiment | WinnerIntegrityError] = {}
     rereads = changed = 0
     for trial in trials[len(present) :]:
-        reread = _reread_trial(experiment, phase, trial, by_number, producing)
+        reread = _reread_trial(experiment, phase, trial, by_number, producing, directory_starts)
         if reread is not None:
             rereads += 1
             changed += (reread.state, reread.value) != (trial.state, trial.value)

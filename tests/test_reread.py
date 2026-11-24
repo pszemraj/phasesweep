@@ -19,15 +19,18 @@ from phasesweep.config.search import CategoricalParam, IntParam, Sampler
 from phasesweep.engine.errors import (
     PhaseTimeoutError,
     StudyFingerprintMismatchError,
+    TrialTargetRefusedError,
     WinnerIntegrityError,
 )
 from phasesweep.engine.ledger import _resolve_storage, validate_ledger
+from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.read import inspect_status
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FAILURE_REASON_ATTR,
     PHASE_DECISION_ATTR,
+    RERUN_OF_ATTR,
     TRIAL_DIR_ATTR,
 )
 from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
@@ -154,6 +157,96 @@ def test_a_flipped_goal_re_reads_into_a_study_of_the_other_direction(tmp_path: P
     study = phase_study_of(maximize)
     assert study.direction == optuna.study.StudyDirection.MAXIMIZE
     assert {t.number: t.user_attrs[TRIAL_DIR_ATTR] for t in study.get_trials()} == before
+
+
+@pytest.mark.parametrize("fixed", [False, True], ids=["grid", "fixed"])
+@pytest.mark.parametrize("private", [False, True], ids=["shared-json", "private-stdout"])
+def test_reread_attributes_results_to_their_attempt_and_keeps_the_retry_budget(
+    tmp_path: Path, fixed: bool, private: bool
+) -> None:
+    """A directory retry preserves its own result and rereading never schedules a new one.
+
+    :param Path tmp_path: Scratch directory for the experiment and trainer.
+    :param bool fixed: Retry a fixed configuration instead of a grid cell.
+    :param bool private: Read the attempt's private captured stream instead of shared JSON.
+    """
+    trainer, launches = _counting_trainer(tmp_path)
+    phase = Phase(name="p", n_trials=1, gpu_policy="none") if fixed else _phases()[0]
+    target = phase.n_trials + 1
+    retried = phase.model_copy(update={"n_trials": target})
+    for planned in (phase, retried):
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(_experiment(tmp_path, trainer, _metric("typo"), phases=[planned]))
+
+    metric = (
+        Metric(extractor=LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[0-9.]+)"))
+        if private
+        else _metric("loss")
+    )
+    corrected = _experiment(tmp_path, trainer, metric, phases=[retried])
+    run_experiment(corrected)
+    trials = phase_study_of(corrected).get_trials()
+    first, last = trials[0], trials[-1]
+    assert last.user_attrs[RERUN_OF_ATTR] == first.number
+    assert last.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
+    assert last.state == optuna.trial.TrialState.COMPLETE
+    if private:
+        assert first.state == optuna.trial.TrialState.COMPLETE
+    else:
+        assert first.state == optuna.trial.TrialState.FAIL
+        assert "changed after this attempt finished" in first.user_attrs[FAILURE_REASON_ATTR]
+
+    validate_trial_targets(corrected)
+    run_experiment(corrected, dry_run=True)
+    run_experiment(corrected)
+    too_many = retried.model_copy(update={"n_trials": target + 1})
+    with pytest.raises(TrialTargetRefusedError):
+        validate_trial_targets(_experiment(tmp_path, trainer, metric, phases=[too_many]))
+    assert _launches(launches) == target
+
+
+def test_reread_does_not_score_a_file_overwritten_from_another_reading_study(
+    tmp_path: Path,
+) -> None:
+    """A later retry's shared file is unavailable to a reread from a sibling study.
+
+    :param Path tmp_path: Scratch directory for the experiment and trainer.
+    """
+    launches = tmp_path / "launches.txt"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse, json
+        from pathlib import Path
+        args = argparse.ArgumentParser()
+        args.add_argument("--out", type=Path, required=True)
+        out = args.parse_known_args()[0].out
+        launches = Path({str(launches)!r})
+        with launches.open("a") as handle:
+            handle.write("launch\\n")
+        count = len(launches.read_text().splitlines())
+        out.write_text(json.dumps({{"loss": count}}))
+        if count == 4:
+            raise SystemExit(3)
+        """,
+    )
+    phase = _phases()[0]
+    older = _experiment(tmp_path, trainer, _metric("typo"))
+    sibling = _experiment(tmp_path, trainer, _metric("another-typo"))
+    retried = _experiment(
+        tmp_path, trainer, _metric("typo"), phases=[phase.model_copy(update={"n_trials": 4})]
+    )
+    for planned in (older, sibling, retried):
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(planned)
+
+    corrected = _experiment(tmp_path, trainer, _metric("loss"))
+    assert run_experiment(corrected)["p"].metric == 2
+    trials = phase_study_of(corrected).get_trials()
+    assert len(trials) == len(phase_study_of(sibling).get_trials()) == 3
+    assert trials[0].state == optuna.trial.TrialState.FAIL
+    assert "changed after this attempt finished" in trials[0].user_attrs[FAILURE_REASON_ATTR]
+    assert _launches(launches) == 4
 
 
 def test_an_added_constraint_is_measured_for_every_finished_trial(tmp_path: Path) -> None:

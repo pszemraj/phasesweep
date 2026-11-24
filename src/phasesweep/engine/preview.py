@@ -39,7 +39,7 @@ from phasesweep.engine.guards import _raise_collected_errors, known_studies
 from phasesweep.engine.ledger import open_preview_study, read_every_phase_study, validate_ledger
 from phasesweep.engine.optuna import (
     _finished_trial_count,
-    _measured_trial_count,
+    _measured_draw_count,
     _phase_namespace,
     _suggest_all,
 )
@@ -103,7 +103,7 @@ class RecordedPhase:
     #: plus each RUNNING one whose objective recorded a failure, which a launch recovers
     #: as failed first. Any other RUNNING attempt recovers as interrupted and reruns.
     finished: int
-    #: How many of those are COMPLETE, feasible or not.
+    #: Draws with a COMPLETE attempt, feasible or not.
     measured: int
     #: How many attempts are RUNNING, which a launch recovers before it checks anything.
     running: int
@@ -203,7 +203,7 @@ def _recorded_phase(
     recovered_as_failed = recovered.count("FAIL")
     return RecordedPhase(
         finished=_finished_trial_count(trials) + recovered_as_failed,
-        measured=_measured_trial_count(trials),
+        measured=_measured_draw_count(trials),
         running=len(recovered),
         recovery_reruns=(
             _pending_rerun_count(study) + len(recovered) - recovered_as_failed if recovered else 0
@@ -356,7 +356,7 @@ def validate_trial_targets(experiment: Experiment) -> None:
             continue
         study = known.get(phase.name)
         trials = [] if study is None else study.get_trials(deepcopy=False)
-        measured = _measured_trial_count(trials)
+        unread: set[int] = set()
         if study is None or _recorded_identity(study) is None:
             source = fill_source(
                 experiment,
@@ -368,9 +368,7 @@ def validate_trial_targets(experiment: Experiment) -> None:
             if source is not None:
                 study = source.study
                 missing = source.trials[len(trials) :]
-                measured += _measured_trial_count(
-                    trial for trial in missing if _trainer_seconds(trial) is None
-                )
+                unread = {trial.number for trial in missing if _trainer_seconds(trial) is not None}
                 trials = [*trials, *missing]
         recovered = [] if study is None else _recovered_running_states(study.study_name, trials)
         _validate_fixed_configuration_target(
@@ -378,7 +376,7 @@ def validate_trial_targets(experiment: Experiment) -> None:
             finished=_finished_trial_count(trials)
             + recovered.count("FAIL")
             + recovered.count("EVIDENCE_PENDING"),
-            measured=measured,
+            measured=_measured_draw_count(trials, excluded=unread),
         )
 
 

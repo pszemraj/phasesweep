@@ -1197,6 +1197,7 @@ def read_finished_attempt(
     current: Experiment,
     trainer_duration: float,
     baseline: EvidenceBaseline,
+    evidence_before: float | None = None,
 ) -> tuple[TrialResult, str]:
     """Read a finished attempt's kept evidence after the fact, through the live extraction path.
 
@@ -1216,6 +1217,8 @@ def read_finished_attempt(
     :param Experiment current: The invocation's configuration, for its MLflow polling controls.
     :param float trainer_duration: The trainer's recorded wall-clock seconds.
     :param EvidenceBaseline baseline: The attempt's evidence baseline.
+    :param float | None evidence_before: Unix time shared evidence must predate for a
+        re-read of a trial whose directory was reused, defaults to None.
     :raises ProcessCleanupUncertainError: The attempt records an unusable trial directory, so
         the run its trial logs to cannot be named.
     :raises StudyStorageUnavailableError: The trial lacks its recorded trainer input or overrides.
@@ -1278,6 +1281,7 @@ def read_finished_attempt(
         wandb_environment=environment,
         mlflow_environment=environment,
         baseline=baseline,
+        evidence_before=evidence_before,
         earlier_attempts=_earlier_attempts(trials, trial),
     )
     result = extract_trial_result(

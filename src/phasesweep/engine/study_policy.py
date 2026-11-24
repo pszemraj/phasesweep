@@ -45,7 +45,7 @@ from phasesweep.engine.optuna import (
     _any_trial_timed_out,
     _draw_positions,
     _finished_trial_count,
-    _measured_trial_count,
+    _measured_draw_count,
     _trial_count_state,
     _trial_run_state,
 )
@@ -656,7 +656,7 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
         )
     trials = study.get_trials(deepcopy=False)
     _validate_fixed_configuration_target(
-        phase, finished=_finished_trial_count(trials), measured=_measured_trial_count(trials)
+        phase, finished=_finished_trial_count(trials), measured=_measured_draw_count(trials)
     )
     _validate_grown_grid_target(study, phase, trials)
 
@@ -674,7 +674,7 @@ def _validate_fixed_configuration_target(phase: Phase, *, finished: int, measure
 
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
     :param int finished: Finished attempts the phase's study holds.
-    :param int measured: How many of those are COMPLETE, feasible or not.
+    :param int measured: How many draws have a COMPLETE attempt, feasible or not.
     :raises TrialTargetRefusedError: The fixed configuration asks for more
         attempts than it may retry; the message names the largest allowed target.
     """
@@ -887,7 +887,7 @@ def _pending_rerun_count(study: optuna.Study, phase: Phase | None = None) -> int
 def _failed_grid_cells(
     trials: Sequence[optuna.trial.FrozenTrial],
 ) -> list[optuna.trial.FrozenTrial]:
-    """Return each grid cell whose latest attempt FAILED, in trial-number order.
+    """Return the latest failure of each grid cell still eligible for retry.
 
     A cell with a pending or running retry, a completed attempt or an interrupted
     one is not listed: the first two are already handled and the last reruns itself.
@@ -898,7 +898,9 @@ def _failed_grid_cells(
     latest: dict[int, optuna.trial.FrozenTrial] = {}
     for trial in trials:
         grid_id = trial.system_attrs.get("grid_id")
-        if grid_id is not None:
+        if grid_id is not None and (
+            grid_id not in latest or latest[grid_id].state != optuna.trial.TrialState.COMPLETE
+        ):
             latest[grid_id] = trial
     return sorted(
         (trial for trial in latest.values() if _trial_run_state(trial) == "FAIL"),
@@ -1015,7 +1017,7 @@ def _raised_target_step(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]
     """
     name, target = phase.name, phase.n_trials
     finished = _finished_trial_count(trials)
-    ceiling = retry_target_ceiling(phase, finished=finished, measured=_measured_trial_count(trials))
+    ceiling = retry_target_ceiling(phase, finished=finished, measured=_measured_draw_count(trials))
     if ceiling is None:
         return f"raise phases[{name}].n_trials above {target} and rerun."
     if ceiling <= target:
@@ -1110,7 +1112,7 @@ def _recovery_remedies(
         return f"First confirm the cleanup: {RERUN_CLEANUP_RECOVERY}. {then}"
     trials = study.get_trials(deepcopy=False)
     finished = _finished_trial_count(trials)
-    ceiling = retry_target_ceiling(phase, finished=finished, measured=_measured_trial_count(trials))
+    ceiling = retry_target_ceiling(phase, finished=finished, measured=_measured_draw_count(trials))
     streak = _tripped_streak(abort)
     step = _raised_target_step(phase, trials)
     if step is None and streak is not None and finished < target:
