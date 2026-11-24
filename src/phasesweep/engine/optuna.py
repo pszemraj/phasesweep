@@ -875,10 +875,10 @@ def _suggest_all(trial: optuna.Trial, phase: Phase) -> dict[str, object]:
 def _phase_namespace(experiment_name: str, phase_name: str) -> str:
     """Return the name every study of one phase starts with.
 
-    A phase that inherits nothing has one study, named exactly this; each study of a phase that
-    inherits appends ``::`` and a digest of the values it inherits
-    (:func:`phasesweep.engine.fingerprints.phase_study_name`). Experiment and phase names are
-    safe names, so they hold no ``:``.
+    Each study of the phase appends ``::`` and a digest of the values it inherits and of its
+    reading settings (:func:`phasesweep.engine.fingerprints.phase_study_name`); the namespace
+    alone seeds the phase's draws, so every study of a phase draws alike. Experiment and phase
+    names are safe names, so they hold no ``:``.
 
     :param str experiment_name: The experiment's name.
     :param str phase_name: The phase's name, configured or historical.
@@ -888,7 +888,7 @@ def _phase_namespace(experiment_name: str, phase_name: str) -> str:
 
 
 def _study_namespace(study_name: str) -> str:
-    """Return the phase namespace a study name starts with, without any inherited-value digest.
+    """Return the phase namespace a study name starts with, without its address digest.
 
     :param str study_name: A phase study's name.
     :return str: Its ``<experiment>::<phase>`` part.
@@ -897,12 +897,11 @@ def _study_namespace(study_name: str) -> str:
 
 
 def _belongs_to_phase(study_name: str, experiment_name: str, phase_name: str) -> bool:
-    """Say whether a study holds trials of one phase, under any inherited values.
+    """Say whether a study holds trials of one phase, under any inherited values and reading.
 
     :param str study_name: Study name read from storage.
     :param str experiment_name: The experiment's name.
     :param str phase_name: The phase's name.
-    :return bool: Whether the name is the phase's namespace, alone or with a digest.
+    :return bool: Whether the name is the phase's namespace with an address digest.
     """
-    namespace = _phase_namespace(experiment_name, phase_name)
-    return study_name == namespace or study_name.startswith(f"{namespace}::")
+    return study_name.startswith(f"{_phase_namespace(experiment_name, phase_name)}::")

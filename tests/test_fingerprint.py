@@ -84,6 +84,7 @@ from tests.conftest import (
     mark_current_format,
     patch_published_trial_read_failure,
     phase_study,
+    study_name,
     write_constant_trainer,
     write_trainer,
 )
@@ -499,7 +500,9 @@ def test_changed_semantic_inherited_value_rejects_topup_before_allocation(
     with pytest.raises(StudyFingerprintMismatchError, match="different trainer environment"):
         run_experiment(_with_trial_target(experiment, 2))
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
+    study = optuna.load_study(
+        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
+    )
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
 
 
@@ -587,7 +590,9 @@ def test_identical_semantic_environment_resumes_persistent_study(
     monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", "/tmp/outer-objective-b.json")
     run_experiment(_with_trial_target(experiment, 2))
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
+    study = optuna.load_study(
+        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
+    )
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
     base = _environment_identity(experiment, "p")
     assert not {
@@ -613,7 +618,9 @@ def test_passthrough_token_rotation_resumes_persistent_study(
     monkeypatch.setenv("WANDB_API_KEY", "rotated-secret")
     run_experiment(_with_trial_target(experiment, 2))
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
+    study = optuna.load_study(
+        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
+    )
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
 
 
@@ -637,7 +644,9 @@ def test_populated_study_without_environment_identity_fails_closed(
     ):
         run_experiment(_with_trial_target(experiment, 2))
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
+    study = optuna.load_study(
+        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
+    )
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
 
 
@@ -697,7 +706,9 @@ def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:
     # Bump n_trials and re-run; this must not error on fingerprint.
     run_experiment(_with_trial_target(experiment, 4))
 
-    study = optuna.load_study(study_name="topup::a", storage=_resolve_storage(f"journal:///{db}"))
+    study = optuna.load_study(
+        study_name=study_name(experiment, "a"), storage=_resolve_storage(f"journal:///{db}")
+    )
     finished = [t for t in study.get_trials() if t.state.is_finished()]
     assert len(finished) == 4, f"expected 4 trials after top-up, got {len(finished)}"
 
@@ -743,7 +754,9 @@ def test_tpe_recovers_an_aborted_phase_by_raising_its_target(tmp_path: Path) -> 
     )
     run_experiment(control)
 
-    trials = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage)).trials
+    trials = optuna.load_study(
+        study_name=study_name(control), storage=_resolve_storage(storage)
+    ).trials
     expected = phase_study(control).trials
     assert [t.state.name for t in trials] == ["FAIL", "COMPLETE", "COMPLETE", "COMPLETE"]
     assert [t.params for t in trials] == [t.params for t in expected]
@@ -760,7 +773,7 @@ def test_tpe_completed_target_reruns_as_noop(tmp_path: Path) -> None:
     first = run_experiment(experiment)
     rerun = run_experiment(experiment)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
+    study = optuna.load_study(study_name=study_name(experiment), storage=_resolve_storage(storage))
     assert len(study.trials) == 2
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 2
     assert rerun["p"].trial_number == first["p"].trial_number
@@ -784,7 +797,7 @@ def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
     with pytest.raises(TrialTargetRefusedError, match="accepted a target of 3"):
         run_experiment(lowered)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
+    study = optuna.load_study(study_name=study_name(experiment), storage=_resolve_storage(storage))
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 3
     assert len(study.trials) == 3
     assert winners["p"].completion["finished_trials"] == 3
@@ -830,7 +843,9 @@ def test_same_workdir_top_up_keeps_the_artifact_root_binding(tmp_path: Path) -> 
     topped_up = _with_trial_target(experiment, 2)
     run_experiment(topped_up)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
+    study = optuna.load_study(
+        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
+    )
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment))
     assert len([trial for trial in study.trials if trial.state.is_finished()]) == 2
 
@@ -1002,7 +1017,9 @@ def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path
         update={"metric": experiment.metric.model_copy(update={"goal": "maximize"})}
     )
     study = optuna.create_study(
-        study_name="t::p", storage=_resolve_storage(experiment.storage), direction="minimize"
+        study_name=study_name(experiment),
+        storage=_resolve_storage(experiment.storage),
+        direction="minimize",
     )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
 
@@ -1020,7 +1037,8 @@ def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     storage = experiment.storage
-    drop_artifact_root_binding(storage, "t::p")
+    name = study_name(experiment)
+    drop_artifact_root_binding(storage, name)
 
     with pytest.raises(ArtifactRootConflictError) as excinfo:
         run_experiment(experiment)
@@ -1030,7 +1048,7 @@ def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
     assert (
         ARTIFACT_ROOT_ATTR
-        not in optuna.load_study(study_name="t::p", storage=_resolve_storage(storage)).user_attrs
+        not in optuna.load_study(study_name=name, storage=_resolve_storage(storage)).user_attrs
     )
     # The refusal is not allowed to cost the tree its existing publication.
     assert published_generation_id(experiment) is not None
@@ -1056,13 +1074,15 @@ def _unbound_two_phase_studies(
     """
     resolved = _resolve_storage(storage)
     arch = optuna.create_study(
-        study_name=f"{experiment.experiment}::arch", storage=resolved, direction="minimize"
+        study_name=study_name(experiment, "arch"), storage=resolved, direction="minimize"
     )
     arch.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     for _ in range(arch_trials):
         arch.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
     lr = optuna.create_study(
-        study_name=f"{experiment.experiment}::lr", storage=resolved, direction="minimize"
+        study_name=study_name(experiment, "lr", {"depth": 1}),
+        storage=resolved,
+        direction="minimize",
     )
     lr.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     lr.set_user_attr(ARTIFACT_ROOT_ATTR, bound_root)
@@ -1087,9 +1107,8 @@ def test_refused_multi_phase_binding_claims_nothing(tmp_path: Path, arch_trials:
     with pytest.raises(ArtifactRootConflictError):
         run_experiment(offered)
 
-    resolved = _resolve_storage(storage)
-    arch = optuna.load_study(study_name="t::arch", storage=resolved)
-    lr = optuna.load_study(study_name="t::lr", storage=resolved)
+    arch = phase_study(bound, "arch")
+    lr = phase_study(bound, "lr")
     assert ARTIFACT_ROOT_ATTR not in arch.user_attrs
     assert lr.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(bound))
 
@@ -1110,7 +1129,9 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
     experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer, storage=storage)
     for phase in experiment.phases:
         study = optuna.create_study(
-            study_name=f"t::{phase.name}", storage=_resolve_storage(storage), direction="minimize"
+            study_name=study_name(experiment, phase.name, {"depth": 1} if phase.inherits else None),
+            storage=_resolve_storage(storage),
+            direction="minimize",
         )
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     real_loader = ledger.open_existing_studies
@@ -1128,7 +1149,7 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
     assert isinstance(excinfo.value.__cause__, StudyStorageUnavailableError)
 
     for phase in experiment.phases:
-        study = optuna.load_study(study_name=f"t::{phase.name}", storage=_resolve_storage(storage))
+        study = phase_study(experiment, phase.name)
         assert ARTIFACT_ROOT_ATTR not in study.user_attrs
 
 
@@ -1191,9 +1212,9 @@ def test_published_study_requirement_starts_at_from_phase(
         # The resume replays the published winners, so it publishes nothing new.
         assert run_experiment(experiment, from_phase="lr") == original
         if replacement == "absent":
-            assert "t::arch" not in optuna.get_all_study_names(storage=resolved)
+            assert missing not in optuna.get_all_study_names(storage=resolved)
         else:
-            assert not optuna.load_study(study_name="t::arch", storage=resolved).trials
+            assert not optuna.load_study(study_name=missing, storage=resolved).trials
         assert len(optuna.load_study(study_name=kept, storage=resolved).trials) == 1
     assert _generation_path(experiment).read_bytes() == generation_before
     assert published_generation_id(experiment) == published
@@ -1298,8 +1319,8 @@ def _fabricate_interrupted_attempt(
     :return tuple[str, int, Path]: Study name, stale trial number, registry entry path.
     """
     phase_name = experiment.phases[0].name
-    study_name = f"{experiment.experiment}::{phase_name}"
-    study = optuna.load_study(study_name=study_name, storage=_resolve_storage(storage))
+    stale_study = study_name(experiment, phase_name)
+    study = optuna.load_study(study_name=stale_study, storage=_resolve_storage(storage))
     trial = study.ask()
     trial_dir = _trial_dir_for(experiment, phase_name, trial.number, attempt_id=attempt_id)
     trial_dir.mkdir(parents=True, exist_ok=True)
@@ -1312,13 +1333,13 @@ def _fabricate_interrupted_attempt(
         experiment,
         attempt_id=attempt_id,
         phase_name=phase_name,
-        study_name=study_name,
+        study_name=stale_study,
         trial_number=trial.number,
         trial_dir=trial_dir,
         attempt_dir=attempt_dir,
         generation_id="g-stale",
     )
-    return study_name, trial.number, _attempts_dir(experiment) / f"{attempt_id}.json"
+    return stale_study, trial.number, _attempts_dir(experiment) / f"{attempt_id}.json"
 
 
 @pytest.mark.integration
@@ -1343,7 +1364,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     )
     run_experiment(experiment_a)
     root_a = str(_experiment_dir(experiment_a))
-    study_name, stale_number, entry_path = _fabricate_interrupted_attempt(
+    stale_study, stale_number, entry_path = _fabricate_interrupted_attempt(
         experiment_a, storage, attempt_id="stale-attempt-1"
     )
     assert entry_path.is_file()
@@ -1370,7 +1391,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     # producing a root conflict would mean discovery ran twice.
     assert not any(isinstance(error, ArtifactRootConflictError) for error in chain)
 
-    after_transient = optuna.load_study(study_name=study_name, storage=_resolve_storage(storage))
+    after_transient = optuna.load_study(study_name=stale_study, storage=_resolve_storage(storage))
     assert (
         after_transient.get_trials(deepcopy=False)[stale_number].state
         == optuna.trial.TrialState.RUNNING
@@ -1383,7 +1404,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     with pytest.raises(ArtifactRootConflictError):
         run_experiment(experiment_b)
 
-    after_conflict = optuna.load_study(study_name=study_name, storage=_resolve_storage(storage))
+    after_conflict = optuna.load_study(study_name=stale_study, storage=_resolve_storage(storage))
     assert (
         after_conflict.get_trials(deepcopy=False)[stale_number].state
         == optuna.trial.TrialState.RUNNING
@@ -1458,7 +1479,9 @@ def test_generation_id_reuse_is_rejected_without_overwriting_history(tmp_path: P
         run_experiment(experiment, generation_id=generation_id)
 
     assert {path: path.read_bytes() for path in protected} == before
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
+    study = optuna.load_study(
+        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
+    )
     assert len(study.trials) == 1
 
 
@@ -1581,7 +1604,9 @@ def test_from_phase_ignores_lower_trial_target_on_skipped_phase(tmp_path: Path) 
 
     assert winners2["arch"].trial_number == winners1["arch"].trial_number
     assert winners2["arch"].metric == winners1["arch"].metric
-    study = optuna.load_study(study_name="t::arch", storage=_resolve_storage(storage))
+    study = optuna.load_study(
+        study_name=study_name(exp_v2, "arch"), storage=_resolve_storage(storage)
+    )
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 3
     assert len(study.trials) == 3
 
@@ -1817,7 +1842,7 @@ def test_zero_trial_crash_after_target_record_does_not_poison_fingerprint(
             run_experiment(_exp("false {overrides}"))
 
     study = optuna.load_study(
-        study_name="fp_target_poison::p",
+        study_name=study_name(_exp("false {overrides}")),
         storage=_resolve_storage(f"journal:///{db}"),
     )
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 1

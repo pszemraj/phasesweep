@@ -22,7 +22,7 @@ from phasesweep.runtime.files import (
     file_url_path,
     storage_recovery_locator,
 )
-from tests.conftest import make_experiment
+from tests.conftest import make_experiment, study_name
 from tests.experiments import json_metric, phase_payload, write_experiment
 
 
@@ -100,7 +100,7 @@ def test_auto_storage_preserves_paths_across_run_resume_and_recovery(
     locator = storage_recovery_locator(exp.resolved_storage)
     monkeypatch.chdir(tmp_path)
     assert canonical_storage_identity(locator) == canonical_storage_identity(exp.resolved_storage)
-    stored = optuna.load_study(study_name="t::p", storage=_resolve_storage(locator))
+    stored = optuna.load_study(study_name=study_name(exp), storage=_resolve_storage(locator))
     assert len(stored.trials) == 2
     topup = exp.model_copy(update={"phases": [exp.phases[0].model_copy(update={"n_trials": 3})]})
     run_experiment(topup)

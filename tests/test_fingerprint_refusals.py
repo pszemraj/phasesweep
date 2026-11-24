@@ -127,7 +127,7 @@ def test_refusal_for_an_inherited_phase_names_only_that_phase_to_rename(tmp_path
     run_experiment(load_experiment(config))
     write_anchored_config(config, phases=[anchored_phase(3), child], **fields)
 
-    with pytest.raises(StudyFingerprintMismatchError, match="::p'") as caught:
+    with pytest.raises(StudyFingerprintMismatchError, match="::p::[0-9a-f]{16}'") as caught:
         run_experiment(load_experiment(config))
 
     assert caught.value.remediation == (

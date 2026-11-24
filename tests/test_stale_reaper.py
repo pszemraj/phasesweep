@@ -80,6 +80,7 @@ from tests.conftest import (
     mark_current_format,
     patch_rejected_trial_user_attr,
     reaped_pid,
+    study_name,
     write_constant_trainer,
     write_trainer,
 )
@@ -184,9 +185,17 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     """
     storage = f"journal:///{tmp_path / 'p.journal'}"
 
+    exp = make_experiment(
+        storage=storage,
+        workdir=tmp_path / "runs",
+        trainer=write_constant_trainer(tmp_path),
+        name="a",
+        n_trials=1,
+    )
+
     # Manually create a study and inject a RUNNING trial + fingerprint.
     study = optuna.create_study(
-        study_name="t::a",
+        study_name=study_name(exp, "a"),
         storage=engine_ledger._resolve_storage(storage),
         direction="minimize",
     )
@@ -224,14 +233,6 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
 
     monkeypatch.setattr(orch, "_reap_stale_trials", spy_reap)
     monkeypatch.setattr(orch, "_verify_fingerprint", spy_verify)
-
-    exp = make_experiment(
-        storage=storage,
-        workdir=tmp_path / "runs",
-        trainer=write_constant_trainer(tmp_path),
-        name="a",
-        n_trials=1,
-    )
 
     stamp_artifact_root(study, exp)
     _stamp_identity(
@@ -337,7 +338,7 @@ def test_current_schema_rejects_terminal_trial_without_policy_outcome(
         n_trials=1,
     )
     study = optuna.create_study(
-        study_name="missing_outcome::p",
+        study_name=study_name(experiment),
         storage=engine_ledger._resolve_storage(storage),
         direction="minimize",
     )
@@ -963,7 +964,7 @@ def test_allocation_context_recovers_repeated_optuna_allocation_interruptions(
 
     assert winners["p"].metric == pytest.approx(1.0)
     study = optuna.load_study(
-        study_name="t::p", storage=engine_ledger._resolve_storage(exp.storage)
+        study_name=study_name(exp), storage=engine_ledger._resolve_storage(exp.storage)
     )
     trials = study.get_trials(deepcopy=False)
     # Each interrupted allocation reruns: the second run popped the first's
@@ -1015,7 +1016,7 @@ def test_allocation_context_covers_first_environment_write_failure(
 
     assert winners["p"].metric == pytest.approx(1.0)
     study = optuna.load_study(
-        study_name="t::p", storage=engine_ledger._resolve_storage(exp.storage)
+        study_name=study_name(exp), storage=engine_ledger._resolve_storage(exp.storage)
     )
     trials = study.get_trials(deepcopy=False)
     assert [trial.state for trial in trials] == [
@@ -1377,7 +1378,7 @@ def test_registry_reads_its_attempt_after_repairing_a_partial_journal_record(
 
     def trial_states(experiment: Experiment) -> list[optuna.trial.TrialState]:
         storage = engine_ledger._resolve_storage(experiment.resolved_storage)
-        study = optuna.load_study(study_name="journal-attempt::p", storage=storage)
+        study = optuna.load_study(study_name=study_name(experiment), storage=storage)
         return [trial.state for trial in study.get_trials(deepcopy=False)]
 
     assert trial_states(experiment) == trial_states(healthy_experiment)
@@ -1413,7 +1414,7 @@ def test_registry_discards_attempt_for_a_confirmed_missing_journal_study(tmp_pat
         tmp_path, attempt_id="missing-journal-attempt"
     )
     storage = engine_ledger._resolve_storage(experiment.resolved_storage)
-    optuna.delete_study(study_name="journal-attempt::p", storage=storage)
+    optuna.delete_study(study_name=study_name(experiment), storage=storage)
 
     _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
@@ -1535,7 +1536,7 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
         experiment,
         attempt_id="old-attempt",
         phase_name="p",
-        study_name="terminal-identity::p",
+        study_name=study_name(experiment),
         trial_number=0,
         trial_dir=old_dir,
         attempt_dir=old_attempt_dir,
@@ -1544,7 +1545,7 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
     # A restored divergent ledger can reuse the number without preserving
     # the registry entry's attempt. Recovery must inspect that trial itself.
     storage = engine_ledger._resolve_storage(experiment.resolved_storage)
-    study = optuna.create_study(study_name="terminal-identity::p", storage=storage)
+    study = optuna.create_study(study_name=study_name(experiment), storage=storage)
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     trial = study.ask()
     new_dir = tmp_path / "ledger-attempt"
@@ -1683,7 +1684,7 @@ def test_relative_registry_storage_recovers_from_the_registration_cwd(
     # through its absolute path instead.
     registered_ledger = f"journal:///{registration_cwd / 'studies.journal'}"
     study = optuna.load_study(
-        study_name="relative-registry::p",
+        study_name=study_name(experiment),
         storage=engine_ledger._resolve_storage(registered_ledger),
     )
     assert study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
@@ -1969,7 +1970,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
 
     # The failure is a visible, valid terminal row - not an invisible RUNNING one.
     study = optuna.load_study(
-        study_name="unregistrable::p", storage=engine_ledger._resolve_storage(storage)
+        study_name=study_name(_exp(1)), storage=engine_ledger._resolve_storage(storage)
     )
     (trial,) = study.get_trials(deepcopy=False)
     assert trial.state == optuna.trial.TrialState.FAIL

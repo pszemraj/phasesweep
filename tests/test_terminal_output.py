@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from phasesweep import load_experiment
 from phasesweep.cli import cli as cli_main
 from phasesweep.config.models import Experiment
 from phasesweep.config.search import CategoricalParam, Sampler
@@ -22,6 +23,7 @@ from tests.conftest import (
     console_script,
     invoke_cli_boundary,
     make_experiment,
+    study_name,
     terminal_stream,
     write_constant_trainer,
     write_experiment_config,
@@ -77,8 +79,8 @@ _STARTER_DRY_RUN_AT_80 = [
     "HH:MM:SS  DRY RUN phase 'learning_rate': sampler=grid (resumable, reproducible)",
     "HH:MM:SS  DRY RUN grid order: configurations are shuffled by sampler.seed, not",
     f"{_PAD}listed choice order.",
-    "HH:MM:SS  phase=depth study=phasesweep_starter::depth finished=0 remaining=2",
-    f"{_PAD}reruns=0 n_jobs=1",
+    "HH:MM:SS  phase=depth study={depth}",
+    f"{_PAD}finished=0 remaining=2 reruns=0 n_jobs=1",
     "HH:MM:SS  GPU isolation disabled by gpu_policy='none'.",
     "HH:MM:SS  DRY RUN phase=depth would launch 2 trials",
     "HH:MM:SS  DRY RUN example command:",
@@ -188,7 +190,11 @@ def test_a_dry_run_wraps_its_lines_to_the_terminal_and_keeps_its_commands_whole(
         re.sub(r"^\d\d:\d\d:\d\d", "HH:MM:SS", line).replace(root, "TMP")
         for line in stderr.text.splitlines()
     ]
-    assert lines == _STARTER_DRY_RUN_AT_80
+    starter = load_experiment(config)
+    expected = [
+        line.replace("{depth}", study_name(starter, "depth")) for line in _STARTER_DRY_RUN_AT_80
+    ]
+    assert lines == expected
 
 
 def test_validate_wraps_its_contract_lines_under_their_prefix_without_dict_syntax(

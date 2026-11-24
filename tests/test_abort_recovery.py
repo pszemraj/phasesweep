@@ -44,6 +44,7 @@ from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
     phase_study,
+    study_name,
     trial_outcome,
     write_experiment_config,
     write_flag_gated_trainer,
@@ -239,7 +240,9 @@ def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) 
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(exp)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+    study = optuna.load_study(
+        study_name=study_name(exp), storage=_resolve_storage(f"journal:///{db}")
+    )
     record = _load_phase_policy_state(study, make_experiment()).abort
     assert record is not None
     assert record["policy"] == "max_consecutive_failures"
@@ -273,7 +276,9 @@ def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(experiment(3))
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
+    study = optuna.load_study(
+        study_name=study_name(experiment(3)), storage=_resolve_storage(storage)
+    )
     cohort_digest = study.trials[0].user_attrs[TRAINER_ENV_DIGEST_ATTR]
     for sequence in (3, 4):
         study.add_trial(
@@ -322,7 +327,7 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(
 
         def crash_in_selection(*args: object, **kwargs: object) -> None:
             study = optuna.load_study(
-                study_name="t::p", storage=_resolve_storage(f"journal:///{db}")
+                study_name=study_name(_exp(3)), storage=_resolve_storage(f"journal:///{db}")
             )
             assert _load_phase_policy_state(study, make_experiment()).abort is None
             raise RuntimeError("simulated crash during winner selection")
@@ -334,13 +339,17 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(
             ) as caught:
                 run_experiment(_exp(6))
             assert type(caught.value) is RuntimeError
-        study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+        study = optuna.load_study(
+            study_name=study_name(_exp(6)), storage=_resolve_storage(f"journal:///{db}")
+        )
         assert _load_phase_policy_state(study, make_experiment()).abort is None
 
     winners = run_experiment(_exp(6))
 
     assert winners["p"].metric == pytest.approx(0.5)
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+    study = optuna.load_study(
+        study_name=study_name(_exp(6)), storage=_resolve_storage(f"journal:///{db}")
+    )
     assert _load_phase_policy_state(study, make_experiment()).abort is None
 
 
@@ -376,7 +385,9 @@ def test_supported_topup_preserves_consecutive_failure_streak(tmp_path: Path) ->
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(_exp(4))
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+    study = optuna.load_study(
+        study_name=study_name(_exp(4)), storage=_resolve_storage(f"journal:///{db}")
+    )
     assert [trial.state.name for trial in study.trials] == ["COMPLETE", "FAIL", "FAIL", "FAIL"]
     assert [trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in study.trials] == [
         1,

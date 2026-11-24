@@ -429,9 +429,8 @@ def _phase_lines(
     """Render one phase: its heading, any notes under it, its trials and its repeat groups.
 
     The heading reads ``finished of target trials``, then in parentheses the rows that do not
-    count toward the target, by state, then the configured metric name and the direction of the
-    goal the study recorded, which its trials were ranked under. When the config's goal differs,
-    a note under the heading says so and that a run refuses the study. A phase a run would refuse prints that
+    count toward the target, by state, then the configured metric name and the direction of its
+    goal, which addresses the study the rows come from. A phase a run would refuse prints that
     refusal and its fix before any other note. Each search-space growth the study recorded then
     gets a note naming the draw position it took effect at and the values it added.
 
@@ -459,23 +458,12 @@ def _phase_lines(
         if table.uncounted:
             others = ", ".join(f"{rows} {state.lower()}" for state, rows in table.uncounted)
             count = f"{count} ({others})"
-    configured = experiment.metric.goal
-    goal = table.recorded_goal or configured
     lines = wrap(
-        f"{table.phase}: {count}, {experiment.metric.name} ({_direction(goal)} is better)",
+        f"{table.phase}: {count}, {experiment.metric.name} "
+        f"({_direction(experiment.metric.goal)} is better)",
         width,
         subsequent_indent=INDENT,
     )
-    if goal != configured:
-        lines.extend(
-            wrap(
-                f"the config's goal is {configured} ({_direction(configured)} is better); "
-                "a run refuses this study",
-                width,
-                indent=INDENT,
-                subsequent_indent=INDENT,
-            )
-        )
     if table.refusal is not None:
         diagnosis, step = table.refusal
         lines.extend(wrap(diagnosis, width, indent=INDENT, subsequent_indent=INDENT))

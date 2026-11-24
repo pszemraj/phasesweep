@@ -36,7 +36,7 @@ from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
-from tests.conftest import invoke_cli_boundary
+from tests.conftest import invoke_cli_boundary, study_name
 from tests.ledger_fixtures import (
     LEDGER_MODES,
     Materialized,
@@ -230,7 +230,7 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
         elif read_path == "ledger-read_phase_trials":
             ledger = validate_ledger(materialized.experiment)
             for phase in materialized.experiment.phases:
-                read_phase_trials(ledger, f"{materialized.experiment.experiment}::{phase.name}")
+                read_phase_trials(ledger, study_name(materialized.experiment, phase.name))
         elif read_path == "mcp-snapshot":
             capture_result_snapshot(materialized.experiment)
         elif read_path == "cli-status":

@@ -9,7 +9,7 @@ import platform
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import optuna
 
@@ -60,7 +60,9 @@ _RUN_CONTROL_KEYS = frozenset(
 #: Where W&B read controls sit inside a dumped phase: a summary-presence gate carries them.
 _PHASE_READ_CONTROLS = {"gates": {"__all__": set(TRACKER_READ_CONTROLS)}}
 # Increment the schema versions when their fingerprint payloads change.
-FINGERPRINT_SCHEMA_VERSION = 10
+FINGERPRINT_SCHEMA_VERSION = 11
+#: Where a phase identity payload keeps its reading settings (:func:`reading_settings`).
+READING_KEY = "reading"
 EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 8
 #: The viability bounds of the metric and each constraint. They judge what a trial measured,
 #: so a phase study's identity excludes them; a published result was selected under them, so
@@ -95,27 +97,44 @@ def _semantic_payload_digest(payload: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _semantic_core(experiment: Experiment) -> dict[str, Any]:
-    """Return the experiment-level fields both semantic fingerprints hash.
+def _trainer_core(experiment: Experiment) -> JsonObject:
+    """Return the experiment-level fields that say what a trainer ran and where it logged.
 
-    The metric's name only labels output, since every extractor reads by its own key, and a
-    tracker's read controls only bound the read, so neither is part of either identity. The
-    bounds (:data:`_BOUND_KEYS`) are left out too: :func:`_experiment_semantic_fingerprint`
-    adds them back for a published result.
-
-    :param Experiment experiment: Experiment whose command, trainer input,
-        environment, execution, provenance, metric, and constraints are read.
-    :return dict[str, Any]: JSON-serializable payload fragment.
+    :param Experiment experiment: Experiment whose command, trainer input, environment,
+        execution, provenance and MLflow source are read.
+    :return JsonObject: JSON-serializable payload fragment.
     """
-    extractor_exclude = {"extractor": set(TRACKER_READ_CONTROLS)}
-    bound_exclude = dict.fromkeys(_BOUND_KEYS, True)
-    return {
+    core = {
         "trial_command": experiment.trial_command,
         "trainer_config": experiment.trainer_config,
         "override_format": experiment.override_format,
         "env": dict(sorted(experiment.env.items())),
         "execution": _execution_identity(experiment),
         "provenance": dict(sorted(experiment.provenance.items())),
+        **(
+            {"mlflow": experiment.mlflow.evidence_identity()}
+            if experiment.mlflow is not None
+            else {}
+        ),
+    }
+    return json_object(json.loads(json.dumps(core, default=str)))
+
+
+def _experiment_reading(experiment: Experiment) -> JsonObject:
+    """Return the experiment-level settings that say how a finished trainer's output is read.
+
+    The metric's name only labels output, since every extractor reads by its own key, and a
+    tracker's read controls only bound the read, so neither is part of any identity. The
+    bounds (:data:`_BOUND_KEYS`) judge what was read (:mod:`phasesweep.engine.bounds`):
+    :func:`_experiment_semantic_fingerprint` adds them back for a published result.
+
+    :param Experiment experiment: Experiment whose metric and constraints are read.
+    :return JsonObject: The metric's goal and extractor and each constraint's name and
+        extractor.
+    """
+    extractor_exclude = {"extractor": set(TRACKER_READ_CONTROLS)}
+    bound_exclude = dict.fromkeys(_BOUND_KEYS, True)
+    reading = {
         "metric": experiment.metric.model_dump(
             mode="json", exclude={"name": True, **bound_exclude, **extractor_exclude}
         ),
@@ -123,12 +142,34 @@ def _semantic_core(experiment: Experiment) -> dict[str, Any]:
             c.model_dump(mode="json", exclude={**bound_exclude, **extractor_exclude})
             for c in experiment.constraints
         ],
-        **(
-            {"mlflow": experiment.mlflow.evidence_identity()}
-            if experiment.mlflow is not None
-            else {}
-        ),
     }
+    return json_object(json.loads(json.dumps(reading, default=str)))
+
+
+def _semantic_core(experiment: Experiment) -> JsonObject:
+    """Return the experiment-level fields a published result's fingerprint hashes.
+
+    :param Experiment experiment: Experiment whose trainer and reading settings are read.
+    :return JsonObject: :func:`_trainer_core` and :func:`_experiment_reading` together.
+    """
+    return {**_trainer_core(experiment), **_experiment_reading(experiment)}
+
+
+def reading_settings(experiment: Experiment, phase: Phase) -> JsonObject:
+    """Return every setting that says how a phase's finished trainer output becomes results.
+
+    The metric's extractor and goal, the constraint list with each extractor, and the phase's
+    gates: changing any of them changes what a finished trial's evidence reads as, never what
+    the trainer ran, so they address the study (:func:`phase_study_name`) instead of being
+    compared, and a study under other reading settings is re-read rather than retrained
+    (:mod:`phasesweep.engine.reread`).
+
+    :param Experiment experiment: Experiment supplying the metric and constraints.
+    :param Phase phase: Phase supplying the gates.
+    :return JsonObject: The settings, normalized to the JSON representation being hashed.
+    """
+    gates = phase.model_dump(mode="json", include={"gates"}, exclude=_PHASE_READ_CONTROLS)
+    return {**_experiment_reading(experiment), **json_object(gates)}
 
 
 def _experiment_semantic_fingerprint(
@@ -210,6 +251,18 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     return dump
 
 
+def _identity_phase_dump(phase: Phase) -> JsonObject:
+    """Return what a phase's study identity compares of the phase: its dump without its gates.
+
+    The gates are reading settings (:func:`reading_settings`), which address the study.
+
+    :param Phase phase: Phase whose payload is being built.
+    :return JsonObject: :func:`_semantic_phase_dump` without ``gates``.
+    """
+    dump = {key: value for key, value in _semantic_phase_dump(phase).items() if key != "gates"}
+    return json_object(json.loads(json.dumps(dump, default=str)))
+
+
 class CarriesOverrides(Protocol):
     """A winner as a child sees it: the composed overrides it passes on."""
 
@@ -271,32 +324,55 @@ def _local_keys(phase: Phase) -> set[str]:
     return local_keys
 
 
-#: Hex digits of the inherited-value digest in a study name; 64 bits keeps a collision
-#: between two winners of one parent out of reach.
+#: Hex digits of the address digest in a study name; 64 bits keeps a collision between two
+#: addresses of one phase out of reach.
 _ADDRESS_DIGEST_CHARS = 16
 
 
 def phase_study_name(experiment: Experiment, phase: Phase, inherited: Mapping[str, object]) -> str:
-    """Return the study that holds a phase's trials measured under the given inherited values.
+    """Return the study that holds a phase's trials as read under the current reading settings.
 
-    The one rule for finding a phase's study: a phase that inherits nothing has one study, its
-    namespace; a phase that inherits has one study per set of values its parents' winners pass
-    it, so a changed winner addresses another study and a winner that returns to earlier values
-    addresses the study measured under them again. Each study holds exactly the trials measured
-    under its values, so the inherited values never need comparing.
+    The one rule for finding a phase's study: its namespace, ``::``, and a digest of the values
+    its parents' winners pass it and of its reading settings (:func:`reading_settings`). A
+    changed winner or a changed reading setting addresses another study, and returning to
+    earlier values or settings addresses the study recorded under them again. Each study holds
+    exactly the trials measured under its values and read under its settings, so neither is
+    ever compared; Optuna keeps a finished trial's value fixed, which is why a reading change
+    needs a study of its own (filled by :mod:`phasesweep.engine.reread`, never by retraining).
 
-    :param Experiment experiment: Experiment supplying the namespace.
+    :param Experiment experiment: Experiment supplying the namespace and the reading settings.
     :param Phase phase: The phase.
     :param Mapping[str, object] inherited: The values the phase inherits, by key: from its
         parents' winners (:func:`_inherited_override_payload`), or from one of its own winners
-        (:func:`_winner_inherited_values`).
+        (:func:`_winner_inherited_values`); empty for a phase that inherits nothing.
     :return str: The study name.
     """
     namespace = _phase_namespace(experiment.experiment, phase.name)
-    if not phase.inherits:
-        return namespace
-    digest = _semantic_payload_digest(inherited)
+    digest = _semantic_payload_digest(
+        {"inherited": dict(inherited), "reading": reading_settings(experiment, phase)}
+    )
     return f"{namespace}::{digest[:_ADDRESS_DIGEST_CHARS]}"
+
+
+def _recorded_goal(study: optuna.Study) -> Literal["minimize", "maximize"] | None:
+    """Read the metric goal a study's identity records among its reading settings.
+
+    The goal addresses the study, so a study the current config does not address may record
+    another one; its own direction is checked against that.
+
+    :param optuna.Study study: A phase's study.
+    :return Literal["minimize", "maximize"] | None: The recorded goal, or ``None`` when the
+        study records no identity.
+    """
+    record = _recorded_identity(study)
+    reading = None if record is None else record["payload"].get(READING_KEY)
+    metric = reading.get("metric") if isinstance(reading, dict) else None
+    goal = metric.get("goal") if isinstance(metric, dict) else None
+    if goal == "minimize":
+        return "minimize"
+    if goal == "maximize":
+        return "maximize"
+    return None
 
 
 def _winner_inherited_values(phase: Phase, winner: CarriesOverrides) -> dict[str, object]:
@@ -359,6 +435,10 @@ def _phase_fingerprint_payload(
 def _identity_payload(experiment: Experiment, phase: Phase, inherited: object) -> JsonObject:
     """Return the fingerprint payload of a phase with the given inherited overrides.
 
+    The inherited values and the reading settings address the study (:func:`phase_study_name`),
+    so a study's record always agrees with the config on both; the record keeps them so the
+    study a reading change re-reads from can say what changed.
+
     :param Experiment experiment: Experiment supplying the experiment-level semantics.
     :param Phase phase: Phase whose semantic dump the payload holds.
     :param object inherited: Effective inherited values by key, the payload's
@@ -367,9 +447,10 @@ def _identity_payload(experiment: Experiment, phase: Phase, inherited: object) -
     """
     payload = {
         "fingerprint_schema_version": FINGERPRINT_SCHEMA_VERSION,
-        **_semantic_core(experiment),
-        "phase": _semantic_phase_dump(phase),
+        **_trainer_core(experiment),
+        "phase": _identity_phase_dump(phase),
         "inherited_effective_overrides": inherited,
+        READING_KEY: reading_settings(experiment, phase),
     }
     return json_object(json.loads(json.dumps(payload, default=str)))
 
@@ -705,15 +786,47 @@ def _judge_identity(
     :raises StudySchemaMismatchError: The recorded identity is malformed.
     :return _IdentityVerdict: The current fingerprint and the record to write, if any.
     """
+    return _judge_record(
+        _recorded_identity(study),
+        study.get_trials(deepcopy=False),
+        study.study_name,
+        experiment,
+        phase,
+        inherited,
+    )
+
+
+def _judge_record(
+    record: PhaseIdentityRecord | None,
+    trials: Sequence[optuna.trial.FrozenTrial],
+    study_name: str,
+    experiment: Experiment,
+    phase: Phase,
+    inherited: object,
+) -> _IdentityVerdict:
+    """Judge the current config against an identity record and the trials it holds.
+
+    :func:`_judge_identity` judges a study's own record; a study filled under changed reading
+    settings is judged on its source's record and trials before it is written
+    (:mod:`phasesweep.engine.reread`).
+
+    :param PhaseIdentityRecord | None record: The recorded identity, or ``None``.
+    :param Sequence[optuna.trial.FrozenTrial] trials: The trials the record covers.
+    :param str study_name: The study the refusal names.
+    :param Experiment experiment: Current experiment config.
+    :param Phase phase: Phase the record belongs to.
+    :param object inherited: Effective inherited values by key.
+    :raises StudyFingerprintMismatchError: Trials without a record, or a config change the
+        trials cannot continue under; the message names what changed.
+    :return _IdentityVerdict: The current fingerprint and the record to write, if any.
+    """
     fresh = _fresh_identity(experiment, phase, inherited)
     payload, fingerprint = fresh["payload"], fresh["fingerprint"]
     space = fresh["search_spaces"][0]["search_space"]
-    record = _recorded_identity(study)
-    trials = study.get_trials(deepcopy=False)
     if record is None:
         if trials:
             raise StudyFingerprintMismatchError(
-                f"Phase {phase.name!r} study {study.study_name!r} has no semantic fingerprint.",
+                f"Phase {phase.name!r} study {study_name!r} has no semantic fingerprint.",
                 remediation=NEW_STUDY_STEP,
             )
         return _IdentityVerdict(fingerprint, fresh)
@@ -739,7 +852,7 @@ def _judge_identity(
             gained={key: verdict.gained for key, verdict in growth.items() if verdict.gained},
         )
     raise _mismatch_refusal(
-        study,
+        study_name,
         experiment,
         phase,
         existing=record["fingerprint"],
@@ -845,7 +958,7 @@ def _growth_refusal(phase: Phase, growth: Mapping[str, _GrowthVerdict]) -> tuple
 
 
 def _mismatch_refusal(
-    study: optuna.Study,
+    study_name: str,
     experiment: Experiment,
     phase: Phase,
     *,
@@ -856,7 +969,7 @@ def _mismatch_refusal(
 ) -> StudyFingerprintMismatchError:
     """Build the refusal of a populated study whose recorded fingerprint differs from ``payload``.
 
-    :param optuna.Study study: The populated study.
+    :param str study_name: The populated study.
     :param Experiment experiment: Current experiment config.
     :param Phase phase: Phase the study belongs to.
     :param str existing: The fingerprint the study recorded.
@@ -889,7 +1002,7 @@ def _mismatch_refusal(
         else:
             way_forward = restore_or_new_study(_RECORDED_VALUES)
     return StudyFingerprintMismatchError(
-        f"Study {study.study_name!r} was created with a different config{found}",
+        f"Study {study_name!r} was created with a different config{found}",
         # Running from the original directory keeps the study; a new name does not.
         action=OperatorAction.FIX_CONFIG if cwd_unset else None,
         remediation=_CWD_FOLLOWS_INVOCATION if cwd_unset else way_forward,

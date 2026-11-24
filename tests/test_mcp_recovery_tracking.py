@@ -30,7 +30,7 @@ from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
 from phasesweep.tracking.mlflow import OperationRejectedError, OperationUnavailableError
 from phasesweep.tracking.session import read_record, tracking_root
-from tests.conftest import invoke_cli_boundary, write_experiment_config
+from tests.conftest import invoke_cli_boundary, study_name, write_experiment_config
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     make_mcp_app,
@@ -272,7 +272,7 @@ def test_recover_run_finishes_the_mlflow_run_of_each_trial_it_settles(
 
     assert requests == ["resolve"] + ["publish"] * sends
     assert (run.sent(), run.summaries()) == ([finish], [finish])
-    read = read_phase_trials(validate_ledger(run.experiment), f"{run.experiment.experiment}::depth")
+    read = read_phase_trials(validate_ledger(run.experiment), study_name(run.experiment, "depth"))
     [trial] = read.trials
     assert read.cleanup_recovered == {trial.number}
     if source != "running":

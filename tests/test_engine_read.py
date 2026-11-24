@@ -35,6 +35,7 @@ from tests.conftest import (
     make_experiment,
     mark_current_format,
     phase_trials,
+    study_name,
     trial_outcome,
     write_constant_trainer,
     write_trainer,
@@ -83,7 +84,7 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(tmp_path
     path = tmp_path / "phases.journal"
     exp = _experiment(tmp_path, storage=f"journal:///{path}")
     study = optuna.create_study(
-        study_name="read_t::p",
+        study_name=study_name(exp),
         storage=engine_ledger._resolve_storage(exp.storage) or exp.storage,
     )
     study.tell(study.ask(), 1.0)
@@ -124,7 +125,7 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     ledger = tmp_path / "corrupt.journal"
     exp = _experiment(tmp_path, storage=f"journal:///{ledger}")
     study = optuna.create_study(
-        study_name="read_t::p",
+        study_name=study_name(exp),
         storage=engine_ledger._resolve_storage(exp.resolved_storage),
     )
     mark_current_format(exp, study)
@@ -292,7 +293,8 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     ledger = tmp_path / "study.journal"
     experiment = _experiment(tmp_path, storage=f"journal:///{ledger}")
     study = optuna.create_study(
-        study_name="read_t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
+        study_name=study_name(experiment),
+        storage=engine_ledger._resolve_storage(experiment.resolved_storage),
     )
     # Stamped first, as the engine does, so the journal's last record is the
     # trial's completion: a partial copy of it reads as a RUNNING trial.
@@ -309,7 +311,7 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     # scanned over the partial record would report every read unavailable.
     handle = engine_ledger.validate_ledger(experiment)
     assert handle.format_verified
-    study_names = {"p": f"{experiment.experiment}::p"}
+    study_names = {"p": study_name(experiment)}
     if change == "finish-partial":
         ledger.write_bytes(complete[:-1])
     real_fstat = engine_ledger.os.fstat
@@ -373,7 +375,7 @@ def test_phase_reads_capture_trial_data_once_whatever_the_phase_count(
     )
     storage = engine_ledger._resolve_storage(experiment.resolved_storage)
     studies = [
-        optuna.create_study(study_name=f"capture_count::{phase.name}", storage=storage)
+        optuna.create_study(study_name=study_name(experiment, phase.name), storage=storage)
         for phase in phases
     ]
     mark_current_format(experiment, *studies)
@@ -393,7 +395,7 @@ def test_phase_reads_capture_trial_data_once_whatever_the_phase_count(
     else:
         snapshots = engine_ledger.read_phase_studies(
             engine_ledger.validate_ledger(experiment),
-            {phase.name: f"capture_count::{phase.name}" for phase in phases},
+            {phase.name: study_name(experiment, phase.name) for phase in phases},
         )
         counts = []
         for snapshot in snapshots.values():
@@ -412,7 +414,8 @@ def test_read_status_captures_trial_data_after_resolving_the_publication_pointer
     ledger = tmp_path / "study.journal"
     experiment = _experiment(tmp_path, storage=f"journal:///{ledger}")
     study = optuna.create_study(
-        study_name="read_t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
+        study_name=study_name(experiment),
+        storage=engine_ledger._resolve_storage(experiment.resolved_storage),
     )
     mark_current_format(experiment, study)
     trial = study.ask()
@@ -465,9 +468,10 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
         ledger.write_text("not a database or journal\nanother record\n", encoding="utf-8")
     else:
         storage = engine_ledger._resolve_storage(experiment.resolved_storage)
-        optuna.delete_study(study_name="t::p", storage=storage)
+        name = study_name(experiment)
+        optuna.delete_study(study_name=name, storage=storage)
         if damage == "empty-study":
-            mark_current_format(experiment, optuna.create_study(study_name="t::p", storage=storage))
+            mark_current_format(experiment, optuna.create_study(study_name=name, storage=storage))
     ledger_before = ledger.read_bytes() if ledger.exists() else None
     generation_before = _generation_path(experiment).read_bytes()
     generation_dirs_before = {
@@ -552,8 +556,9 @@ def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> No
     # CREATE_TRIAL == 4. Study ids are assigned by the order CREATE_STUDY
     # records replay, so this finds "t::p"'s id instead of assuming 0.
     created_studies = [record for record in records if record.get("op_code") == 0]
+    name = study_name(experiment)
     study_id = next(
-        index for index, record in enumerate(created_studies) if record.get("study_name") == "t::p"
+        index for index, record in enumerate(created_studies) if record.get("study_name") == name
     )
     create_trial_indices = [
         index
@@ -591,7 +596,8 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
 ) -> None:
     experiment = _experiment(tmp_path, storage=f"journal:///{tmp_path / 'ledger'}")
     study = optuna.create_study(
-        study_name="read_t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
+        study_name=study_name(experiment),
+        storage=engine_ledger._resolve_storage(experiment.resolved_storage),
     )
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "generation")
@@ -608,7 +614,7 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
     stats = engine_ledger.read_trial_stats(
         engine_ledger.validate_ledger(experiment),
         {"p": expected},
-        {"p": f"{experiment.experiment}::p"},
+        {"p": study_name(experiment)},
     )["p"]
 
     assert stats.available

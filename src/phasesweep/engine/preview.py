@@ -29,6 +29,7 @@ from phasesweep.engine.fingerprints import (
     _inherited_override_suppliers,
     _judge_identity,
     _phase_fingerprint,
+    _recorded_goal,
     new_study_note,
     phase_study_name,
 )
@@ -371,7 +372,7 @@ def _refuse_as_a_launch_would(
     for phase in experiment.phases:
         for study in studies.get(phase.name, ()):
             try:
-                _validate_study_direction(study, experiment.metric.goal)
+                _validate_study_direction(study, _recorded_goal(study) or experiment.metric.goal)
                 _validate_study_schema(study)
             except Exception as exc:
                 errors.append(exc)

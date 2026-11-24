@@ -89,6 +89,7 @@ from tests.conftest import (
     make_experiment,
     mark_current_format,
     requires_nonroot,
+    study_name,
     write_constant_trainer,
     write_experiment_config,
     write_trainer,
@@ -399,7 +400,8 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         run_experiment(experiment)
         if from_phase is not None:
             optuna.delete_study(
-                study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
+                study_name=study_name(experiment),
+                storage=_resolve_storage(experiment.resolved_storage),
             )
         # A later configured phase legitimately has no study to restore yet.
         experiment = experiment.model_copy(
@@ -729,7 +731,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     assert isinstance(experiment, Experiment)
     for phase in experiment.phases:
         study = optuna.create_study(
-            study_name=f"{experiment.experiment}::{phase.name}",
+            study_name=study_name(experiment, phase.name),
             storage=engine_ledger._resolve_storage(experiment.resolved_storage),
             direction="minimize",
         )
@@ -1165,7 +1167,7 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     assert isinstance(experiment, Experiment)
     phase = experiment.phases[0]
     study = optuna.create_study(
-        study_name=f"{experiment.experiment}::{phase.name}",
+        study_name=study_name(experiment, phase.name),
         storage=_resolve_storage(experiment.resolved_storage),
         direction="minimize",
     )

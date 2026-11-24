@@ -25,7 +25,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
     TrialTargetRefusedError,
 )
-from phasesweep.engine.fingerprints import phase_study_name
+from phasesweep.engine.fingerprints import _recorded_goal, phase_study_name
 from phasesweep.engine.ledger import ClaimedLedger, claim_ledger, validate_ledger
 from phasesweep.engine.study_policy import (
     ReachedStudy,
@@ -177,7 +177,7 @@ def _preflight_existing_studies(
         finally:
             _refresh_recovered_trials_csv(study, experiment, phase)
         try:
-            _validate_study_direction(study, experiment.metric.goal)
+            _validate_study_direction(study, _recorded_goal(study) or experiment.metric.goal)
             _initialize_study_schema(study)
         except Exception as exc:
             errors.append(exc)

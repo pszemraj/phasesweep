@@ -71,6 +71,7 @@ from tests.conftest import (
     mark_current_format,
     phase_study,
     reaped_pid,
+    study_name,
 )
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
@@ -1277,7 +1278,7 @@ def test_registered_trial_recovery_counts_match_preflight_and_ledger(
         experiment,
         attempt_id=attempt_id,
         phase_name=phase.name,
-        study_name=f"{experiment.experiment}::{phase.name}",
+        study_name=study_name(experiment, phase.name),
         trial_number=trial_number,
         trial_dir=trial_dir,
         attempt_dir=attempt_dir,

@@ -16,7 +16,7 @@ from pathlib import Path
 import optuna
 import pytest
 
-from phasesweep import run_experiment
+from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import _console_logging, _rerun_command, _resume_hint
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Repeats, Sampler
@@ -52,6 +52,7 @@ from tests.conftest import (
     phase_study,
     run_log_text,
     stub_run_command,
+    study_name,
     trial_outcome,
     write_constant_trainer,
     write_experiment_config,
@@ -842,12 +843,14 @@ def test_a_dry_run_prints_its_lines_on_stderr_alone(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A dry run keeps its message text, prefixed only by the time, and prints nothing on stdout."""
+    monkeypatch.setenv("COLUMNS", "500")
     config = _run_config(tmp_path, "dry")
     assert invoke_cli_boundary(["run", str(config), "--dry-run"], monkeypatch) == 0
     captured = capsys.readouterr()
     assert captured.out == ""
     lines = [re.sub(r"^\d\d:\d\d:\d\d  ", "", line) for line in captured.err.splitlines()]
-    assert "phase=p study=t::p finished=0 remaining=2 reruns=0 n_jobs=1" in lines
+    study = study_name(load_experiment(config))
+    assert f"phase=p study={study} finished=0 remaining=2 reruns=0 n_jobs=1" in lines
     assert "DRY RUN phase=p would launch 2 trials" in lines
     assert lines[-1] == "DRY RUN complete. No trials launched, no summary written."
     assert not any(line.startswith(("phasesweep run", "Finished in", "log:")) for line in lines)
@@ -865,6 +868,7 @@ def test_a_dry_run_prints_every_info_line_of_the_starter(
     capsys.readouterr()
 
     assert invoke_cli_boundary(["run", str(config), "--dry-run"], monkeypatch) == 0
+    starter = load_experiment(config)
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -885,7 +889,8 @@ def test_a_dry_run_prints_every_info_line_of_the_starter(
         "DRY RUN grid order: configurations are shuffled by sampler.seed, not listed choice order.",
         "DRY RUN phase 'learning_rate': sampler=grid (resumable, reproducible)",
         "DRY RUN grid order: configurations are shuffled by sampler.seed, not listed choice order.",
-        "phase=depth study=phasesweep_starter::depth finished=0 remaining=2 reruns=0 n_jobs=1",
+        f"phase=depth study={study_name(starter, 'depth')} finished=0 remaining=2 reruns=0 "
+        "n_jobs=1",
         "GPU isolation disabled by gpu_policy='none'.",
         "DRY RUN phase=depth would launch 2 trials",
         "DRY RUN example command:",
@@ -1547,7 +1552,12 @@ def test_phase_counts_keep_an_interrupted_trial_out_of_the_counted_and_earlier_t
     )
 
     counts = _phase_counts(
-        validate_ledger(experiment), experiment, experiment.phases[0], "t::p", "this-run", winner
+        validate_ledger(experiment),
+        experiment,
+        experiment.phases[0],
+        study_name(experiment),
+        "this-run",
+        winner,
     )
 
     assert counts is not None

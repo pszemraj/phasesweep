@@ -209,7 +209,7 @@ def _refresh_recovered_trials_csv(
         recorded = _recorded_identity(study)
         if recorded is not None and recorded["payload"].get(
             "phase"
-        ) == fingerprint_ops._semantic_phase_dump(phase):
+        ) == fingerprint_ops._identity_phase_dump(phase):
             _write_trials_csv(
                 study,
                 path_ops._trials_csv_path(experiment, phase.name),

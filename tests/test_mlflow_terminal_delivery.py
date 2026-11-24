@@ -69,7 +69,12 @@ from phasesweep.tracking.session import (
     tracking_root,
     write_record,
 )
-from tests.conftest import lose_record_writes, patch_path_method_failure, trial_outcome
+from tests.conftest import (
+    lose_record_writes,
+    patch_path_method_failure,
+    study_name,
+    trial_outcome,
+)
 from tests.tracking_helpers import (
     FakeWorkerProcess,
     RunnerKilled,
@@ -174,7 +179,7 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
         with pytest.raises(RunnerKilled if outcome == "completed" else UnsafeProcessCleanupError):
             run_experiment(experiment)
     (original,) = read_phase_trials(
-        validate_ledger(experiment), f"{experiment.experiment}::depth"
+        validate_ledger(experiment), study_name(experiment, "depth")
     ).trials
     assert original.state == TrialState.RUNNING
     attempt_dir = _trial_attempt_dir(original)
@@ -188,7 +193,7 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
     reports = []
     run_experiment(experiment, terminal_callback=reports.append)
     original, retried = read_phase_trials(
-        validate_ledger(experiment), f"{experiment.experiment}::depth"
+        validate_ledger(experiment), study_name(experiment, "depth")
     ).trials
     assert _trial_interrupted(original)
     assert retried.state == TrialState.COMPLETE
@@ -355,7 +360,7 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
     )
     ledger = claim_ledger(validate_ledger(experiment))
     study = open_phase_study(
-        ledger, experiment.phases[0], f"{experiment.experiment}::{experiment.phases[0].name}"
+        ledger, experiment.phases[0], study_name(experiment, experiment.phases[0].name)
     )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     attempts = {
@@ -431,7 +436,7 @@ def test_failed_invocation_leaves_a_pending_trials_managed_run_open_only_when_pe
         {**mlflow_binding(), "phase": "generation", "attempt_id": generation},
     )
     ledger = claim_ledger(validate_ledger(experiment))
-    study = open_phase_study(ledger, phase, f"{experiment.experiment}::{phase.name}")
+    study = open_phase_study(ledger, phase, study_name(experiment, phase.name))
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     attempt = "1" * 32
     directory = _add_bound_attempt(
@@ -485,7 +490,7 @@ def test_recovered_cleanup_settles_only_the_attempt_of_its_own_study(tmp_path, m
         study = open_phase_study(
             ledger,
             next(p for p in experiment.phases if p.name == phase),
-            f"{experiment.experiment}::{phase}",
+            study_name(experiment, phase),
         )
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
         if recovered:
@@ -514,7 +519,7 @@ def test_interrupted_attempt_finishes_its_managed_run_killed(tmp_path, monkeypat
     phase = experiment.phases[0]
     generation = "a" * 32
     study = open_phase_study(
-        claim_ledger(validate_ledger(experiment)), phase, f"{experiment.experiment}::{phase.name}"
+        claim_ledger(validate_ledger(experiment)), phase, study_name(experiment, phase.name)
     )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     for number, (digit, outcome) in enumerate((("1", "interrupted"), ("2", "failure"))):
@@ -620,7 +625,7 @@ def test_the_run_that_confirms_an_attempts_cleanup_finishes_its_managed_run(tmp_
     assert journal.read_bytes() == before
 
     run_experiment(experiment)
-    read = read_phase_trials(validate_ledger(experiment), f"{experiment.experiment}::depth")
+    read = read_phase_trials(validate_ledger(experiment), study_name(experiment, "depth"))
     failed = next(trial for trial in read.trials if trial.user_attrs[ATTEMPT_ID_ATTR] == attempt)
     assert failed.state == TrialState.FAIL
     assert failed.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
@@ -1339,7 +1344,7 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     with pytest.raises(TrackingTargetUnavailableError):
         run_experiment(experiment)
     (pending,) = read_phase_trials(
-        validate_ledger(experiment), f"{experiment.experiment}::depth"
+        validate_ledger(experiment), study_name(experiment, "depth")
     ).trials
     assert pending.state == TrialState.RUNNING
     attempt = pending.user_attrs[ATTEMPT_ID_ATTR]
@@ -1359,7 +1364,7 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
         with pytest.raises(NoFeasibleTrialError):
             run_experiment(experiment)
     (recovered,) = read_phase_trials(
-        validate_ledger(experiment), f"{experiment.experiment}::depth"
+        validate_ledger(experiment), study_name(experiment, "depth")
     ).trials
     assert recovered.state == (TrialState.COMPLETE if answer == "accepted" else TrialState.FAIL)
     record_path = delivery / f"attempt-{attempt}.json"
@@ -1681,9 +1686,7 @@ def test_recovery_sends_nothing_to_a_tracker_that_is_down(tmp_path, monkeypatch)
     with pytest.raises(TrackingTargetUnavailableError):
         run_experiment(experiment)
     assert requests == ["resolve"]
-    trials = read_phase_trials(
-        validate_ledger(experiment), f"{experiment.experiment}::depth"
-    ).trials
+    trials = read_phase_trials(validate_ledger(experiment), study_name(experiment, "depth")).trials
     assert all(_trial_interrupted(trial) for trial in trials)
     [generation] = {trial.user_attrs[GENERATION_ID_ATTR] for trial in trials}
     delivery = tracking_root(experiment) / generation / "delivery"
@@ -1756,7 +1759,7 @@ def test_an_upload_workers_unconfirmed_cleanup_is_not_charged_to_the_recovered_a
     [recovered] = [
         trial
         for trial in read_phase_trials(
-            validate_ledger(experiment), f"{experiment.experiment}::depth"
+            validate_ledger(experiment), study_name(experiment, "depth")
         ).trials
         if trial.user_attrs[ATTEMPT_ID_ATTR] == attempt
     ]
@@ -1790,7 +1793,7 @@ def test_a_run_killed_before_delivering_a_recovered_outcome_leaves_it_for_sync(
     [recovered] = [
         trial
         for trial in read_phase_trials(
-            validate_ledger(experiment), f"{experiment.experiment}::depth"
+            validate_ledger(experiment), study_name(experiment, "depth")
         ).trials
         if trial.user_attrs[ATTEMPT_ID_ATTR] == attempt
     ]

@@ -58,6 +58,7 @@ from tests.conftest import (
     mark_current_format,
     phase_study,
     single_trial_confound,
+    study_name,
     trial_outcome,
     write_constant_trainer,
     write_experiment_config,
@@ -348,7 +349,9 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
         phases=[Phase(name="p", n_trials=1, sampler=SEEDED_RANDOM, search_space={})],
     )
     journal = _resolve_storage(experiment.resolved_storage)
-    study = optuna.create_study(study_name="t::p", storage=journal, direction="minimize")
+    study = optuna.create_study(
+        study_name=study_name(experiment), storage=journal, direction="minimize"
+    )
     mark_current_format(experiment, study)
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "old-generation")
@@ -596,7 +599,9 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
         ],
     )
     journal = _resolve_storage(experiment.resolved_storage)
-    study = optuna.create_study(study_name="t::p", storage=journal, direction="minimize")
+    study = optuna.create_study(
+        study_name=study_name(experiment), storage=journal, direction="minimize"
+    )
     mark_current_format(experiment, study)
     identified = study.ask()
     identified.set_user_attr("phasesweep_generation_id", "current-generation")

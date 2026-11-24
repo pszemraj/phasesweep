@@ -47,6 +47,7 @@ from phasesweep.engine.artifact_roots import (
     _write_artifact_root_binding,
 )
 from phasesweep.engine.confound import CONFOUND_SCHEMA_VERSION
+from phasesweep.engine.fingerprints import phase_study_name
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _finished_trial_count, _measured_trial_count
 from phasesweep.engine.paths import _last_successful_generation_path, _run_log_path
@@ -383,6 +384,15 @@ def bounded_metric(**bounds: float) -> Metric:
         extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
         **bounds,
     )
+
+
+def study_name(
+    experiment: Experiment,
+    phase_name: str = "p",
+    inherited: Mapping[str, object] | None = None,
+) -> str:
+    """Return the name of the study that holds a phase's trials, given the values it inherits."""
+    return phase_study_name(experiment, experiment.phase(phase_name), inherited or {})
 
 
 def phase_study(experiment: Experiment, phase_name: str = "p") -> optuna.Study:

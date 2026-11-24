@@ -33,6 +33,7 @@ from tests.conftest import (
     make_experiment,
     phase_study,
     phase_trials,
+    study_name,
     write_experiment_config,
     write_flaky_trainer,
     write_trainer,
@@ -280,7 +281,10 @@ def test_phase_header_counts_the_failed_cells_a_raised_target_retries(
         run_experiment(_grid(tmp_path, trainer, 2))
     raised = _grid(tmp_path, trainer, target)
     retried = target - 2
-    header = f"phase=p study=t::p finished=2 remaining={retried} reruns={retried} n_jobs=1"
+    header = (
+        f"phase=p study={study_name(raised)} finished=2 remaining={retried} reruns={retried} "
+        "n_jobs=1"
+    )
     caplog.set_level(logging.INFO)
 
     run_experiment(raised, dry_run=True)
@@ -433,7 +437,8 @@ def test_raised_failure_limit_runs_only_the_cells_an_infeasible_streak_left_unru
     caplog.clear()
     assert invoke_cli_boundary(["run", str(config(3)), "--dry-run"], monkeypatch) == 0
     lines = [record.getMessage() for record in caplog.records]
-    assert "phase=p study=t::p finished=2 remaining=2 reruns=0 n_jobs=1" in lines
+    study = study_name(load_experiment(config(3)))
+    assert f"phase=p study={study} finished=2 remaining=2 reruns=0 n_jobs=1" in lines
     assert "DRY RUN phase=p would launch 2 trials" in lines
     assert ran() == measured
 

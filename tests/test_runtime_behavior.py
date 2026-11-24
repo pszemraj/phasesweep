@@ -112,6 +112,7 @@ from tests.conftest import (
     phase_study,
     phase_trials,
     requires_nonroot,
+    study_name,
     trial_outcome,
     write_constant_trainer,
     write_param_echo_trainer,
@@ -311,7 +312,7 @@ def test_stale_trial_holding_last_grid_point_recovers(tmp_path: Path) -> None:
     # engine does; the stale trial must also hold a grid point, so give it the
     # attrs GridSampler.before_trial would have written at ask time.
     study = optuna.load_study(
-        study_name="gridstale::p",
+        study_name=study_name(exp),
         storage=_resolve_storage(exp.resolved_storage),
         sampler=_build_sampler(Sampler(type="grid"), search_space),
     )
@@ -388,7 +389,7 @@ def test_persistent_execution_reattaches_configured_sampler_and_pruner(
         workdir=tmp_path / "runs",
         phases=[phase],
     )
-    study = open_phase_study(claim_ledger(validate_ledger(exp)), phase, f"{exp.experiment}::p")
+    study = open_phase_study(claim_ledger(validate_ledger(exp)), phase, study_name(exp))
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     observed: dict[str, object] = {}
 
@@ -1334,7 +1335,9 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     with pytest.raises(ProcessCleanupUncertainError, match="cleanup could not be confirmed"):
         run_experiment(_exp(2))
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+    study = optuna.load_study(
+        study_name=study_name(_exp(2)), storage=_resolve_storage(f"journal:///{db}")
+    )
     record = _load_phase_policy_state(study, _exp(2)).abort
     assert record is not None
     assert record["policy"] == "unsafe_process_cleanup"
@@ -1382,7 +1385,9 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     before = len(study.trials)
     with pytest.raises(ProcessCleanupUncertainError):
         run_experiment(_exp(3))
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+    study = optuna.load_study(
+        study_name=study_name(_exp(3)), storage=_resolve_storage(f"journal:///{db}")
+    )
     assert len(study.trials) == before
     assert list(_attempts_dir(_exp(3)).glob("*.json"))
     assert CLEANUP_RECOVERED_TRIALS_ATTR not in study.user_attrs
@@ -1399,7 +1404,9 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_exp(3))
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+    study = optuna.load_study(
+        study_name=study_name(_exp(3)), storage=_resolve_storage(f"journal:///{db}")
+    )
     assert len(study.trials) == before + 1
     assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [unsafe_trial.number]
     assert list(_attempts_dir(_exp(3)).glob("*.json")) == []
@@ -1477,7 +1484,9 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(exp)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+    study = optuna.load_study(
+        study_name=study_name(exp), storage=_resolve_storage(f"journal:///{db}")
+    )
     outcomes = sorted(
         (trial.user_attrs[TRIAL_OUTCOME_ATTR] for trial in study.trials),
         key=lambda outcome: outcome["sequence"],
@@ -1635,7 +1644,9 @@ def test_gpu_unavailability_preserves_accepted_target_and_old_config(
         phase = experiment.phases[0].model_copy(update={"n_trials": 2})
         with pytest.raises(RuntimeError, match="no GPUs detected"):
             run_experiment(experiment.model_copy(update={"phases": [phase]}))
-        study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
+        study = optuna.load_study(
+            study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
+        )
         assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
         assert len(study.trials) == 1
 
@@ -1643,7 +1654,9 @@ def test_gpu_unavailability_preserves_accepted_target_and_old_config(
     assert rerun["p"].trial_number == first["p"].trial_number
     assert rerun["p"].metric == first["p"].metric
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
+    study = optuna.load_study(
+        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
+    )
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
     assert len(study.trials) == 1
 

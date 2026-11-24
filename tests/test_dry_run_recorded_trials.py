@@ -60,6 +60,7 @@ from tests.conftest import (
     phase_trials,
     record_accepted_partial_timeout,
     requires_nonroot,
+    study_name,
     trial_outcome,
     write_experiment_config,
     write_flaky_trainer,
@@ -254,7 +255,7 @@ def test_finished_phase_previews_a_replay_and_hands_its_child_the_real_winner(
     )
 
     assert _preview(appended, tmp_path, caplog) == [
-        "phase=a study=t::a finished=3 remaining=0 reruns=0 n_jobs=1",
+        f"phase=a study={study_name(appended, 'a')} finished=3 remaining=0 reruns=0 n_jobs=1",
         "DRY RUN phase=a target met (3 of 3 trials recorded): would replay its existing "
         "result and launch no trials",
         f"phase=b study={addressed} finished=0 remaining=2 reruns=0 n_jobs=1",
@@ -278,7 +279,7 @@ def test_raised_target_previews_only_the_trials_it_adds(
     raised = _persistent(tmp_path, _phase("a", 4))
 
     assert _preview(raised, tmp_path, caplog) == [
-        "phase=a study=t::a finished=2 remaining=2 reruns=0 n_jobs=1",
+        f"phase=a study={study_name(raised, 'a')} finished=2 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 2 trials",
     ]
 
@@ -304,7 +305,7 @@ def test_aborted_phase_is_refused_at_its_target_and_previews_a_raised_one(
 
     raised = attempt(6)
     assert _preview(raised, tmp_path, caplog) == [
-        "phase=a study=t::a finished=2 remaining=4 reruns=0 n_jobs=1",
+        f"phase=a study={study_name(raised, 'a')} finished=2 remaining=4 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 4 trials",
     ]
     assert len(calls.read_text().splitlines()) == 2
@@ -428,7 +429,8 @@ def test_dry_run_counts_a_failed_attempt_as_spent(
     _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=target)
 
     assert _preview(experiment, tmp_path, caplog) == [
-        f"phase=a study=t::a finished=2 remaining={remaining} reruns=0 n_jobs=1",
+        f"phase=a study={study_name(experiment, 'a')} finished=2 remaining={remaining} reruns=0 "
+        "n_jobs=1",
         expected_launch,
     ]
 
@@ -441,7 +443,7 @@ def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
     _record(experiment, "a", _STATE.COMPLETE, _STATE.RUNNING, target=2, running_outcome="failure")
 
     assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a finished=2 remaining=0 reruns=0 n_jobs=1",
+        f"phase=a study={study_name(experiment, 'a')} finished=2 remaining=0 reruns=0 n_jobs=1",
         _RUNNING_WARNING.format(name="a"),
         "DRY RUN phase=a target met (2 of 2 trials recorded): would replay its existing "
         "result and launch no trials",
@@ -485,7 +487,7 @@ def test_dry_run_labels_the_warning_that_it_could_not_check_for_an_active_run(
             _STATE.RUNNING,
             2,
             [
-                "phase=a study=t::a finished=1 remaining=1 reruns=1 n_jobs=1",
+                "finished=1 remaining=1 reruns=1 n_jobs=1",
                 _RUNNING_WARNING.format(name="a"),
                 "DRY RUN phase=a would launch 1 trial, 1 of them a rerun",
             ],
@@ -495,7 +497,7 @@ def test_dry_run_labels_the_warning_that_it_could_not_check_for_an_active_run(
             _STATE.FAIL,
             3,
             [
-                "phase=a study=t::a finished=1 remaining=2 reruns=1 n_jobs=1",
+                "finished=1 remaining=2 reruns=1 n_jobs=1",
                 "DRY RUN phase=a would launch 2 trials, 1 of them a rerun",
             ],
             id="interrupted",
@@ -515,7 +517,9 @@ def test_interrupted_attempts_preview_as_reruns(
         experiment, "a", _STATE.COMPLETE, recorded_state, target=target, fail_outcome="interrupted"
     )
 
-    assert _preview(experiment, tmp_path, caplog) == expected_lines
+    counts, *rest = expected_lines
+    expected = [f"phase=a study={study_name(experiment, 'a')} {counts}", *rest]
+    assert _preview(experiment, tmp_path, caplog) == expected
 
 
 def test_total_line_sums_the_launches_the_phase_lines_print(
@@ -627,7 +631,7 @@ def test_fresh_experiment_previews_every_phase_as_before(
     )
 
     assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a finished=0 remaining=3 reruns=0 n_jobs=1",
+        f"phase=a study={study_name(experiment, 'a')} finished=0 remaining=3 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 3 trials",
         "phase=b study=t::b finished=0 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=b would launch 2 trials",
@@ -752,7 +756,8 @@ def test_a_top_up_under_another_environment_is_refused_for_the_environment_first
         experiment(3),
         tmp_path,
         StudyFingerprintMismatchError,
-        r"Study 't::a' ran its trials under a different trainer environment",
+        rf"Study '{study_name(experiment(3), 'a')}' ran its trials under a different trainer "
+        r"environment",
     )
 
 
@@ -788,18 +793,6 @@ def test_several_refused_studies_are_reported_together_as_a_run_reports_them(
         tmp_path,
         TrialTargetRefusedError,
         r"multiple unsafe studies: Phase 'a' .*; Phase 'b' ",
-    )
-
-
-def test_flipped_goal_is_refused_as_a_run_refuses(tmp_path: Path) -> None:
-    """A study that optimizes the other direction is refused, not replayed under the wrong goal."""
-    _record(_persistent(tmp_path, _phase("a", 2)), "a", _STATE.FAIL, _STATE.FAIL, target=2)
-
-    _refusals_match(
-        _persistent(tmp_path, _phase("a", 2), maximize=True),
-        tmp_path,
-        StudySchemaMismatchError,
-        "optimizes minimize, but the config requires maximize",
     )
 
 
@@ -888,13 +881,13 @@ def test_empty_unstamped_study_previews_as_a_fresh_phase(
     """A study a crash left empty and unstamped is one the launch would stamp; the preview just reads it."""
     experiment = _persistent(tmp_path, _phase("a", 2))
     optuna.create_study(
-        study_name="t::a",
+        study_name=study_name(experiment, "a"),
         storage=_resolve_storage(experiment.resolved_storage),
         direction="minimize",
     )
 
     assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a finished=0 remaining=2 reruns=0 n_jobs=1",
+        f"phase=a study={study_name(experiment, 'a')} finished=0 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 2 trials",
     ]
 

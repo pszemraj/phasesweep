@@ -50,6 +50,7 @@ from tests.conftest import (
     make_trial_context,
     phase_trials,
     reaped_pid,
+    study_name,
     trial_outcome,
     write_experiment_config,
     write_flaky_trainer,
@@ -392,7 +393,7 @@ def test_each_attempt_in_a_directory_delivers_its_own_mlflow_run(
     run_experiment(experiment)
 
     first, rerun = read_phase_trials(
-        validate_ledger(experiment), f"{experiment.experiment}::depth"
+        validate_ledger(experiment), study_name(experiment, "depth")
     ).trials
     assert rerun.user_attrs[RERUN_OF_ATTR] == first.number
     assert rerun.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]

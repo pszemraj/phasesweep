@@ -50,6 +50,7 @@ from tests.conftest import (
     make_experiment,
     mark_current_format,
     reaped_pid,
+    study_name,
     write_experiment_config,
     write_trainer,
 )
@@ -91,7 +92,7 @@ def write_trial_identity(
 def new_phase_study(experiment: Experiment, phase_name: str) -> optuna.Study:
     """Create one phase's minimizing study."""
     study = optuna.create_study(
-        study_name=f"{experiment.experiment}::{phase_name}",
+        study_name=study_name(experiment, phase_name),
         storage=_resolve_storage(experiment.resolved_storage),
         direction="minimize",
     )

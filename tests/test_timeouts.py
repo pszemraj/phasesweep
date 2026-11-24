@@ -37,6 +37,7 @@ from tests.conftest import (
     make_trial_context,
     phase_study,
     phase_trials,
+    study_name,
     write_constant_trainer,
     write_flaky_trainer,
     write_trainer,
@@ -344,7 +345,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
     assert completion["reason"] == "timeout"
     assert completion["timeout_scope"] == "phase"
     study = optuna.load_study(
-        study_name="phase_timeout_allowed_abort_counter::p",
+        study_name=study_name(exp),
         storage=_resolve_storage(exp.storage),
     )
     deadline_trials = [
@@ -450,7 +451,7 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
         run_experiment(exp)
 
     study = optuna.load_study(
-        study_name="phase_scheduler_deadline_with_abort::p",
+        study_name=study_name(exp),
         storage=_resolve_storage(exp.storage),
     )
     assert study.user_attrs[PHASE_DECISION_ATTR]["decision"] == "accepted_partial_timeout"
@@ -459,7 +460,7 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     winners = run_experiment(exp)
 
     study = optuna.load_study(
-        study_name="phase_scheduler_deadline_with_abort::p",
+        study_name=study_name(exp),
         storage=_resolve_storage(exp.storage),
     )
     assert len(study.trials) == trial_count
@@ -611,7 +612,7 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
         run_experiment(exp)
 
     study = optuna.load_study(
-        study_name="refused_partial_timeout_abort::p",
+        study_name=study_name(exp),
         storage=_resolve_storage(exp.storage),
     )
     assert _load_phase_policy_state(study, exp).abort is None
@@ -665,13 +666,13 @@ def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
 
     assert exc_info.value.published_result_committed is False
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
+    study = optuna.load_study(study_name=study_name(exp), storage=_resolve_storage(exp.storage))
     assert _load_phase_policy_state(study, exp).abort is None
     assert study.trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "interrupted"
 
     winners = run_experiment(exp)
     assert winners["p"].metric == pytest.approx(0.5)
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
+    study = optuna.load_study(study_name=study_name(exp), storage=_resolve_storage(exp.storage))
     assert _load_phase_policy_state(study, exp).abort is None
 
 
@@ -932,7 +933,7 @@ def test_unrelated_launch_timeout_is_not_relabelled_as_phase_deadline(
     with pytest.raises(TimeoutError, match="injected non-deadline launch timeout"):
         run_experiment(experiment)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
+    study = optuna.load_study(study_name=study_name(experiment), storage=_resolve_storage(storage))
     abort = _load_phase_policy_state(study, experiment).abort
     assert abort is not None
     assert abort["policy"] == "unexpected_objective_exception"

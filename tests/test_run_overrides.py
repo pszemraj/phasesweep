@@ -37,6 +37,7 @@ from tests.conftest import (
     make_experiment,
     phase_study,
     requires_nonroot,
+    study_name,
     write_experiment_config,
     write_trainer,
 )
@@ -649,7 +650,8 @@ def test_malformed_phase_policy_keeps_status_yaml_and_other_refusals(tmp_path: P
     shown = CliRunner().invoke(cli, ["status", str(config)])
 
     assert shown.exit_code == 0, shown.output
-    assert "# Study 't::p' has invalid durable failure-policy state:" in shown.stdout
+    study = study_name(experiment)
+    assert f"# Study '{study}' has invalid durable failure-policy state:" in shown.stdout
     assert f"'{PHASE_RECOVERY_ATTR}' has malformed fields" in shown.stdout
     assert "# Phase 'next' previously aborted at its accepted n_trials=1" in shown.stdout
     assert yaml.safe_load(shown.stdout) == expected
@@ -659,7 +661,7 @@ def test_malformed_phase_policy_keeps_status_yaml_and_other_refusals(tmp_path: P
 
     assert tables.exit_code == 0, tables.output
     assert "p: 1 of 1 trial, objective" in tables.stdout
-    assert "Study 't::p' has invalid durable failure-policy state:" in tables.stdout
+    assert f"Study '{study}' has invalid durable failure-policy state:" in tables.stdout
     assert "next: 1 of 1 trial, objective" in tables.stdout
     assert "Phase 'next' previously aborted at its accepted n_trials=1" in tables.stdout
     assert ledger.read_bytes() == original

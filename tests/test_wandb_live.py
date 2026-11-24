@@ -26,8 +26,6 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, Sampler
-from phasesweep.engine.fingerprints import addressed_study_names
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.read import read_result
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -127,13 +125,10 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
     )
     winners = run_experiment(experiment)
 
-    storage = _resolve_storage(experiment.resolved_storage)
-
     assert winners["learning_rate"].effective_overrides["learning_rate"] == 0.1
     attempts: dict[str, list[str]] = {}
-    study_names = addressed_study_names(experiment, winners)
     for phase in experiment.phases:
-        trials = optuna.load_study(study_name=study_names[phase.name], storage=storage).trials
+        trials = phase_trials(experiment, phase.name)
         assert [trial.state for trial in trials] == [optuna.trial.TrialState.COMPLETE] * 2
         assert all(trial.value is not None and math.isfinite(trial.value) for trial in trials)
         winner = winners[phase.name]
@@ -185,7 +180,7 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
         replayed = run_experiment(experiment)
     for phase in experiment.phases:
         assert replayed[phase.name].attempt_id == winners[phase.name].attempt_id
-        trials = optuna.load_study(study_name=study_names[phase.name], storage=storage).trials
+        trials = phase_trials(experiment, phase.name)
         assert [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials] == attempts[phase.name]
 
 

@@ -44,6 +44,7 @@ from tests.conftest import (
     log_regex_provenance,
     make_experiment,
     phase_trials,
+    study_name,
     write_experiment_config,
     write_trainer,
 )
@@ -161,7 +162,7 @@ def test_observe_failure_records_nothing_and_keeps_trial_complete(
 
     winners = run_experiment(experiment)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
+    study = optuna.load_study(study_name=study_name(experiment), storage=_resolve_storage(storage))
     trials = study.get_trials(deepcopy=False)
     assert [t.state for t in trials] == [optuna.trial.TrialState.COMPLETE] * 3
     assert [t.user_attrs.get(observed_attr("mem")) for t in trials] == [3.0, None, 5.0]
