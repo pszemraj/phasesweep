@@ -148,7 +148,7 @@ Versions already uploaded to PyPI cannot be replaced; duplicate uploads fail vis
 
 - `phasesweep.config`: Pydantic Experiment models, strict YAML loading, and shared config `--set` path edits (`run_overrides`).
 - `phasesweep.engine`: phase orchestration, fingerprints, local persistence, immutable generation publication, and read-only status.
-- `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates, and the baseline (`evidence/baseline.py`) of each value file's size and modification time before an attempt runs, which lets a rerun in its trial's directory be scored only from files its own attempt wrote.
+- `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates, and the baseline (`evidence/baseline.py`) of each value file's metadata before an attempt runs, which lets a rerun in its trial's directory check for fresh results.
 - `phasesweep.reporting`: trainer-side JSON-envelope objective writer.
 - `phasesweep.tracking`: MLflow run bindings, supervised controller operations, result delivery, and upload retries.
 - `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, override rendering, and the terminal primitives of human-readable output (`runtime/terminal.py`: the colour decision, terminal width, prose wrapping, display paths). Keep `runtime/supervisor.py` stdlib-only; see the [launch ordering](invariants.md#9-nothing-runs-before-its-process-identity-is-durable).
@@ -267,6 +267,8 @@ The principal test groups and what each covers:
 ## Declined requests
 
 These have been requested and declined. Check this list before proposing one again, and reopen an item only with a reason its entry does not already answer.
+
+- **Rejecting a touched result file on a retry.** A trainer can legitimately rewrite identical bytes in place. The freshness check accepts the timestamp change in both cases.
 
 - **Extending pooled noise calculations to objectives near `1e155`.** These values fall outside the numerical range targeted for sweep advice.
 - **Distinguishing integers past `2**53` in numeric edge advice.** Sweep reporting does not require that precision for integer hyperparameters.
