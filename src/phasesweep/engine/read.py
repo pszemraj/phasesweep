@@ -1104,9 +1104,10 @@ class TrialTable:
     #: The diagnosis and step a run of the same config would be refused with, from the phase's
     #: recorded abort or failure streak (:func:`phasesweep.engine.selection._phase_refusal`).
     refusal: tuple[str, str] | None = None
-    #: The metric name and goal the study recorded, which its trial values were measured under;
-    #: ``None`` when the phase has no study or the study kept no identity payload.
-    recorded_metric: tuple[str, str] | None = None
+    #: The metric goal the study recorded, which its trials were ranked under; ``None`` when the
+    #: phase has no study or the study kept no identity payload. The study records no metric
+    #: name, which only labels the values, so the heading takes the configured one.
+    recorded_goal: str | None = None
     #: Each search-space growth the study recorded: the draw position it took effect at and the
     #: values it added (:func:`phasesweep.engine.growth.recorded_growth`).
     growth: tuple[tuple[int, str], ...] = ()
@@ -1441,7 +1442,7 @@ def _trial_table(
     *,
     available: bool = True,
     refusal: tuple[str, str] | None = None,
-    recorded_metric: tuple[str, str] | None = None,
+    recorded_goal: str | None = None,
     growth: tuple[tuple[int, str], ...] = (),
 ) -> TrialTable:
     """Build one phase's table from its trials and the winner the publication holds for it.
@@ -1456,8 +1457,7 @@ def _trial_table(
     :param bool available: ``False`` when the trials could not be read, so ``trials`` is empty.
     :param tuple[str, str] | None refusal: The diagnosis and step a run would be refused with,
         defaults to none.
-    :param tuple[str, str] | None recorded_metric: The name and goal the study recorded,
-        defaults to none.
+    :param str | None recorded_goal: The metric goal the study recorded, defaults to none.
     :param tuple[tuple[int, str], ...] growth: The search-space growths the study recorded,
         defaults to none.
     :return TrialTable: The rows and the columns they carry.
@@ -1514,25 +1514,24 @@ def _trial_table(
         ),
         groups=_repeat_group_views(experiment, phase, trials, rows),
         refusal=refusal,
-        recorded_metric=recorded_metric,
+        recorded_goal=recorded_goal,
         growth=growth,
     )
 
 
-def _recorded_metric(study: optuna.Study) -> tuple[str, str] | None:
-    """Read the metric name and goal a study recorded in its identity payload.
+def _recorded_goal(study: optuna.Study) -> str | None:
+    """Read the metric goal a study recorded in its identity payload.
 
-    The recorded values are the ones its trials were measured and ranked under, so a table
-    labels them with these, whatever the config names now.
+    The recorded goal is the one its trials were ranked under, so a table states the direction
+    with it, whatever the config says now.
 
     :param optuna.Study study: The phase's study.
-    :return tuple[str, str] | None: ``(name, goal)``, or ``None`` when the study kept no identity.
+    :return str | None: The goal, or ``None`` when the study kept no identity.
     """
     record = _recorded_identity(study)
     metric = None if record is None else record["payload"].get("metric")
-    name = metric.get("name") if isinstance(metric, dict) else None
     goal = metric.get("goal") if isinstance(metric, dict) else None
-    return (name, goal) if isinstance(name, str) and isinstance(goal, str) else None
+    return goal if isinstance(goal, str) else None
 
 
 def _repeat_group_views(
@@ -1674,7 +1673,7 @@ def read_trial_tables(
                 study.get_trials(deepcopy=False),
                 winners.get(phase.name),
                 refusal=(str(refusal), operator_step(refusal)) if refusal is not None else None,
-                recorded_metric=_recorded_metric(study),
+                recorded_goal=_recorded_goal(study),
                 growth=() if identity is None else recorded_growth(identity),
             )
         )

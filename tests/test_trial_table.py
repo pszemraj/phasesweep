@@ -79,7 +79,7 @@ def _table(
     finished: int | None = None,
     uncounted: tuple[tuple[str, int], ...] = (),
     refusal: tuple[str, str] | None = None,
-    recorded_metric: tuple[str, str] | None = None,
+    recorded_goal: str | None = None,
     growth: tuple[tuple[int, str], ...] = (),
 ) -> TrialTable:
     """Build a table whose columns are the core ones plus every optional key any row carries.
@@ -101,7 +101,7 @@ def _table(
         uncounted=uncounted,
         groups=groups,
         refusal=refusal,
-        recorded_metric=recorded_metric,
+        recorded_goal=recorded_goal,
         growth=growth,
     )
 
@@ -304,12 +304,12 @@ def test_a_wrapped_growth_note_hangs_under_its_first_line() -> None:
     assert lines[start + 1].startswith("    ") and not lines[start + 1].startswith("     ")
 
 
-def test_the_table_is_headed_with_the_recorded_metric_and_names_a_changed_config_metric() -> None:
-    """Values print under the metric the study recorded; a config naming another says so under the heading."""
+def test_the_table_is_headed_with_the_recorded_goal_and_names_a_changed_config_goal() -> None:
+    """The heading names the configured metric with the direction the study ranked under; a config with another goal says so under the heading."""
     phase = _phase("search", n_trials=8, x=IntParam(type="int", low=0, high=9))
     rows = [_row(index, 0.5, {"x": index}) for index in range(6)]
     tables = _tables(
-        _table("search", rows, recorded_metric=("loss", "minimize")),
+        _table("search", rows, recorded_goal="minimize"),
         represented=None,
         published=None,
         winners={},
@@ -318,32 +318,36 @@ def test_the_table_is_headed_with_the_recorded_metric_and_names_a_changed_config
     lines = _render(tables, phase, goal="maximize").splitlines()
 
     assert lines[3:6] == [
-        "search: 6 of 8 trials, loss (lower is better)",
-        "  the config names eval_loss (higher is better); a run refuses this study",
-        "          trial  loss  x  state     time",
+        "search: 6 of 8 trials, eval_loss (lower is better)",
+        "  the config's goal is maximize (higher is better); a run refuses this study",
+        "          trial  eval_loss  x  state     time",
     ]
-    # An unchanged metric prints no note, so a clean listing is the one the config alone gives.
-    unchanged = _table("search", rows, recorded_metric=("eval_loss", "minimize"))
+    # An unchanged goal prints no note, so a clean listing is the one the config alone gives.
+    unchanged = _table("search", rows, recorded_goal="minimize")
     clean = _render(_tables(unchanged, represented=None, published=None, winners={}), phase)
-    assert "the config names" not in clean
+    assert "the config's goal" not in clean
 
 
-def test_the_recorded_metric_comes_from_the_study_the_trials_were_read_from(
+def test_the_heading_pairs_the_configured_name_with_the_studys_recorded_goal(
     tmp_path: Path,
 ) -> None:
-    """``read_trial_tables`` carries the study's recorded name and goal, not the edited config's."""
+    """After the config renames the metric and flips its goal, the table shows the new name and the goal the study recorded."""
     experiment = make_experiment(persistent=tmp_path, trainer=write_constant_trainer(tmp_path))
     run_experiment(experiment)
+    assert experiment.metric.goal == "minimize"
     edited = experiment.model_copy(
         update={
             "metric": experiment.metric.model_copy(update={"name": "renamed", "goal": "maximize"})
         }
     )
 
-    (table,) = read_trial_tables(edited).phases
+    tables = read_trial_tables(edited)
+    (table,) = tables.phases
+    heading = render_trial_tables(tables, edited, csv_root=None, width=200, color=False)
 
-    assert table.recorded_metric == (experiment.metric.name, experiment.metric.goal)
-    assert table.recorded_metric != (edited.metric.name, edited.metric.goal)
+    assert table.recorded_goal == "minimize"
+    assert "p: 2 of 2 trials, renamed (lower is better)" in heading
+    assert "the config's goal is maximize (higher is better); a run refuses this study" in heading
 
 
 def test_unreadable_trial_data_is_reported_without_a_table() -> None:
