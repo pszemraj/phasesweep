@@ -7,9 +7,7 @@ current W&B credentials may write to::
         pytest -m live tests/test_wandb_live.py
 
 ``PHASESWEEP_WANDB_BASE_URL`` selects another W&B server. The sweep test makes four
-sequential CPU trainer runs, each a few seconds, and polls W&B for at most two
-minutes per run. The resume test interrupts one trial after its first attempt's rows
-reach W&B and resumes it in a second run, a few minutes in all.
+sequential CPU trainer runs, each a few seconds, and waits about a minute per run for W&B to serve the finished run's summary. The resume test interrupts one trial after its first attempt's rows reach W&B and resumes it in a second run, a few minutes in all.
 """
 
 from __future__ import annotations
@@ -28,6 +26,7 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, Sampler
+from phasesweep.engine.fingerprints import addressed_study_names
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.read import read_result
 from phasesweep.engine.state import (
@@ -132,10 +131,9 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
 
     assert winners["learning_rate"].effective_overrides["learning_rate"] == 0.1
     attempts: dict[str, list[str]] = {}
+    study_names = addressed_study_names(experiment, winners)
     for phase in experiment.phases:
-        trials = optuna.load_study(
-            study_name=f"{experiment.experiment}::{phase.name}", storage=storage
-        ).trials
+        trials = optuna.load_study(study_name=study_names[phase.name], storage=storage).trials
         assert [trial.state for trial in trials] == [optuna.trial.TrialState.COMPLETE] * 2
         assert all(trial.value is not None and math.isfinite(trial.value) for trial in trials)
         winner = winners[phase.name]
@@ -187,9 +185,7 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
         replayed = run_experiment(experiment)
     for phase in experiment.phases:
         assert replayed[phase.name].attempt_id == winners[phase.name].attempt_id
-        trials = optuna.load_study(
-            study_name=f"{experiment.experiment}::{phase.name}", storage=storage
-        ).trials
+        trials = optuna.load_study(study_name=study_names[phase.name], storage=storage).trials
         assert [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials] == attempts[phase.name]
 
 
