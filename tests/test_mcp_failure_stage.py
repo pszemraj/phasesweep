@@ -10,6 +10,7 @@ import pytest
 
 from phasesweep.config.models import ExecutionContext, Phase
 from phasesweep.engine.errors import (
+    TRACKER_UNREADABLE_STEP,
     ArtifactRootConflictError,
     LaunchEnvironmentError,
     StudyFingerprintMismatchError,
@@ -145,4 +146,4 @@ def test_an_unreadable_tracker_stops_the_live_run_and_refuses_the_next_at_prefli
             run_claimed_runner(store, run_id, config_path, experiment_id="t", cwd=tmp_path)
         failure = json.loads(store.status_path(run_id).read_text())["failure"]
         assert (failure["code"], failure["stage"]) == ("tracking_unavailable", stage)
-        assert "the finished training is kept" in failure["remediation"]
+        assert failure["remediation"] == TRACKER_UNREADABLE_STEP
