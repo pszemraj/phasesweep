@@ -40,6 +40,9 @@ from phasesweep.runtime.terminal import (
 _WINNER_WORD = "winner"
 _REPEAT_GROUPS_HEADING = "Repeat groups (statistics include infeasible measured members):"
 _REPEAT_GROUPS_NOTE = "Group numbers can change as members arrive."
+#: How a winner's generation is labelled when its recorded config does not match the current one,
+#: in the words ``show-winners`` uses for the same publication.
+_HISTORICAL = "does not match the current config"
 
 #: How a value sorts within one parameter column: listed choices, then unlisted values, then
 #: missing ones; the second and third fields order values within the first kind.
@@ -366,6 +369,24 @@ def _group_lines(
     ]
 
 
+def _source_text(tables: TrialTables, generation: str, published: bool) -> str:
+    """Name a generation the winner marks come from, its publication state and config match.
+
+    A generation whose recorded config does not match the current one marks the winner that
+    config selected, which a row's current state (``INFEASIBLE`` after a bound edit) can
+    contradict; ``show-winners`` labels the same publication historical, so this says it too.
+
+    :param TrialTables tables: The tables, for which generations are historical.
+    :param str generation: The generation id.
+    :param bool published: Whether it is the validated publication.
+    :return str: Such as ``published generation g1 (does not match the current config)``.
+    """
+    text = f"{'published' if published else 'unpublished'} generation {generation}"
+    if generation in tables.historical_generations:
+        text = f"{text} ({_HISTORICAL})"
+    return text
+
+
 def _generation_line(tables: TrialTables) -> str:
     """Say which generation the winner marks come from, once for the whole listing.
 
@@ -376,7 +397,7 @@ def _generation_line(tables: TrialTables) -> str:
     sources = set(tables.winner_generations.values())
     if len(sources) == 1:
         generation, published = next(iter(sources))
-        return f"{'published' if published else 'unpublished'} generation {generation}"
+        return _source_text(tables, generation, published)
     if len(sources) > 1:
         return "winners come from different generations; each phase names its own"
     represented = tables.represented_generation_id or tables.published_generation_id
@@ -473,6 +494,8 @@ def _phase_lines(
     if len(sources) > 1 and source is not None:
         generation, published = source
         state = "published" if published else "unpublished"
+        if generation in tables.historical_generations:
+            state = f"{state}, {_HISTORICAL}"
         notes.append(f"winner from generation {generation} ({state})")
     for note in notes:
         lines.extend(wrap(note, width, indent=INDENT, subsequent_indent=INDENT))

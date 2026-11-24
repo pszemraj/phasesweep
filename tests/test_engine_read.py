@@ -1058,6 +1058,39 @@ def test_read_trial_tables_marks_winner_and_infeasible(tmp_path: Path) -> None:
     assert "non-zero exit code 1" in str(rows[2]["reason"])
 
 
+def test_trial_tables_say_a_bound_edit_made_the_published_generation_historical(
+    tmp_path: Path,
+) -> None:
+    """After a bound edit the published winner's row reads INFEASIBLE, and the line says why.
+
+    The mark still names the publication's winner, as ``show-winners`` does, so the generation
+    line carries the same "does not match the current config" judgement.
+    """
+    from phasesweep.trial_table import render_trial_tables
+
+    published = _published(tmp_path)
+    tightened = published.model_copy(
+        update={"metric": published.metric.model_copy(update={"max": 0.1})}
+    )
+    generation = published_generation_id(published)
+
+    tables = read_trial_tables(tightened)
+    text = render_trial_tables(tables, tightened, csv_root=None, width=200, color=False)
+
+    (table,) = tables.phases
+    assert [(row["state"], row["winner"]) for row in table.rows] == [
+        ("INFEASIBLE", "*"),
+        ("INFEASIBLE", ""),
+    ]
+    assert text.splitlines()[1] == (
+        f"published generation {generation} (does not match the current config)"
+    )
+    unchanged = render_trial_tables(
+        read_trial_tables(published), published, csv_root=None, width=200, color=False
+    )
+    assert unchanged.splitlines()[1] == f"published generation {generation}"
+
+
 @pytest.mark.integration
 def test_read_trial_tables_adds_one_column_per_observed_name(tmp_path: Path) -> None:
     """Every ``observed:<name>`` any trial recorded is a column, empty where a trial lacked it."""

@@ -1194,6 +1194,10 @@ class TrialTables:
     phases: tuple[TrialTable, ...]
     represented_generation_id: str | None = None
     winner_generations: dict[str, tuple[str, bool]] = field(default_factory=dict)
+    #: Generations among :attr:`winner_generations` whose recorded config does not match the
+    #: current one, as ``show-winners`` judges them (``config_matches_current``): their marks
+    #: stand on that config's reading of the trials, not on the rows' current states.
+    historical_generations: frozenset[str] = frozenset()
 
 
 def _cli_phase_payloads(
@@ -1773,4 +1777,9 @@ def read_trial_tables(
             for name, view in winners.items()
             if view.generation_id is not None
         },
+        historical_generations=frozenset(
+            view.generation_id
+            for view in winners.values()
+            if view.generation_id is not None and view.config_matches_current is False
+        ),
     )
