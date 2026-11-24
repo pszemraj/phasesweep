@@ -30,7 +30,7 @@ from phasesweep.engine.confound import (
     _noise_remedy,
     _validate_confound_block,
 )
-from phasesweep.engine.errors import StudyContextConflictError, TrialEvidenceMissingError
+from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _validate_objective_provenance
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.paths import _generation_winner_path
@@ -1218,9 +1218,10 @@ def test_summary_exposes_the_evaluation_axis_without_checkpoint_paths() -> None:
             2,
             True,
             ("child",),
-            "Raise the phase's n_trials and rerun to run its untried cells. Before rerunning, "
-            "if any phase that inherits this one already has trials, give `child` a new `name`, "
-            "which runs it again from scratch.",
+            "Raise the phase's n_trials and rerun to run its untried cells. "
+            "Dependent studies keep their trials if their inherited values still match. "
+            "If those values change, the run keeps the top-up and names the phase that "
+            "needs a new study.",
         ),
         (
             1,
@@ -1261,10 +1262,10 @@ def test_survivorship_remedy_follows_the_configurations_left_and_the_storage(
 
 
 @pytest.mark.integration
-def test_published_survivorship_remedy_names_the_phases_that_must_be_renamed(
+def test_published_survivorship_remedy_keeps_compatible_dependent_studies(
     tmp_path: Path,
 ) -> None:
-    """The CLI and MCP remedy explains how a top-up can keep the upstream trials."""
+    """Following the CLI and MCP remedy reuses every study whose inherited values still match."""
     ready = tmp_path / "ready"
     trainer = write_trainer(
         tmp_path,
@@ -1294,7 +1295,7 @@ def test_published_survivorship_remedy_names_the_phases_that_must_be_renamed(
     winners = run_experiment(experiment)
     assert list(winners) == ["parent", "child", "grandchild"]
     assert winners["parent"].params == {"x": 1}
-    remedy_part = "give `child` and `grandchild` new names and update the `inherits` that name them"
+    remedy_part = "Dependent studies keep their trials if their inherited values still match."
 
     config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
     shown = CliRunner().invoke(cli, ["show-winners", str(config)])
@@ -1310,17 +1311,9 @@ def test_published_survivorship_remedy_names_the_phases_that_must_be_renamed(
     ready.touch()
     enlarged = parent.model_copy(update={"n_trials": 3})
     topup = experiment.model_copy(update={"phases": [enlarged, child, grandchild]})
-    with pytest.raises(StudyContextConflictError, match="bound to its published winner"):
-        run_experiment(topup)
-
-    next_child = child.model_copy(update={"name": "child_retry"})
-    next_grandchild = grandchild.model_copy(
-        update={"name": "grandchild_retry", "inherits": ["child_retry"]}
-    )
-    result = run_experiment(
-        experiment.model_copy(update={"phases": [enlarged, next_child, next_grandchild]})
-    )
-    assert list(result) == ["parent", "child_retry", "grandchild_retry"]
+    result = run_experiment(topup)
+    assert result["child"].source == winners["child"].source
+    assert result["grandchild"].source == winners["grandchild"].source
     trials = phase_study(experiment, "parent").trials
     assert len(trials) == 3
     assert trials[-1].state == _COMPLETE

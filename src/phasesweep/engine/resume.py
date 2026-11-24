@@ -13,13 +13,10 @@ import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.engine.errors import PhaseTimeoutError, StudyContextConflictError, phase_timeout
-from phasesweep.engine.optuna import _finished_trial_count
+from phasesweep.engine.errors import PhaseTimeoutError, phase_timeout
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication_validation import ValidatedPublication
-from phasesweep.engine.state import Winner, _recorded_identity
-from phasesweep.errors import phase_names, rename_step
-from phasesweep.runtime.terminal import plural
+from phasesweep.engine.state import Winner
 
 
 def _run_deadline_refusal(experiment: Experiment, phase_name: str) -> PhaseTimeoutError:
@@ -155,69 +152,6 @@ def _accept_skipped_winner(
     winner = artifact_io._load_winner(experiment, phase, inherited, publication=publication)
     evidence_ops._verify_winner_evidence(experiment, phase, winner)
     return winner
-
-
-def _reject_bound_descendant_topups(
-    experiment: Experiment,
-    *,
-    from_phase: str | None,
-    existing_studies: dict[str, optuna.Study],
-) -> None:
-    """Reject upstream top-ups that could invalidate a bound descendant study.
-
-    Reachability follows explicit inheritance edges. A new winner from an
-    upstream top-up changes the inherited effective overrides that every
-    transitive descendant has already hashed into its bound study.
-
-    :param Experiment experiment: Parsed experiment whose phase chain is scanned
-        from ``from_phase`` (or the start) onward.
-    :param str | None from_phase: Optional resume point; phases before it are skipped.
-    :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
-        phase name, as returned by :func:`phasesweep.engine.guards._preflight_existing_studies`.
-    :raises StudyContextConflictError: An upstream phase still has unfinished
-        top-up trials remaining while an inheriting descendant's study is bound
-        to its published winner: it holds a stored fingerprint and at least
-        one trial.
-    """
-    for _, phase in experiment.phases_from(from_phase):
-        study = existing_studies.get(phase.name)
-        if study is None:
-            continue
-        finished = _finished_trial_count(study.get_trials(deepcopy=False))
-        if finished >= phase.n_trials:
-            continue
-        partial_decision = study_policy_ops._load_accepted_partial_decision(study)
-        if study_policy_ops._at_accepted_partial_target(partial_decision, phase):
-            # The phase has already committed a terminal accepted-timeout
-            # decision at this exact target. Identical replay performs only
-            # deterministic selection; its unused slots are not a top-up.
-            continue
-
-        # Only a populated descendant has consumed this winner. The fingerprint
-        # is stamped before resource preflight, so a child that failed
-        # preflight holds a fingerprint and no trials, and _verify_fingerprint
-        # rebinds such an empty study to the new inherited config.
-        bound = [
-            name
-            for name in sorted(experiment.phases_inheriting(phase.name))
-            if (dependent := existing_studies.get(name)) is not None
-            and _recorded_identity(dependent) is not None
-            and dependent.get_trials(deepcopy=False)
-        ]
-        if bound:
-            # The target is no part of a study's identity, so the enlarged phase keeps its
-            # trials; its dependents' studies hold trials bound to its old winner.
-            rename = rename_step(experiment.phases_inheriting(phase.name))
-            raise StudyContextConflictError(
-                f"Phase {phase.name!r} has {plural(phase.n_trials - finished, 'top-up trial')} "
-                f"remaining, but {plural(len(bound), 'dependent phase')} ({phase_names(bound)}) "
-                f"{'is' if len(bound) == 1 else 'are'} bound to its published winner.",
-                remediation=(
-                    f"{rename[0].upper()}{rename[1:]}; `{phase.name}` keeps its trials and runs "
-                    "the rest. Or run a config without its dependents first, then put them back: "
-                    "a dependent whose inherited values come out unchanged keeps its trials."
-                ),
-            )
 
 
 def _preflight_missing_reached_phase_environments(

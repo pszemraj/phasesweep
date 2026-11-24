@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import optuna
 
@@ -109,7 +109,7 @@ class PhasePreview:
     launches: int
     #: How many of those launches rerun an interrupted trial or retry a failed grid cell.
     reruns: int
-    #: Whether the phase would replay a recorded result and launch no trials.
+    #: Whether the phase would replay a recorded result if its inherited values match.
     replays: bool
 
 
@@ -254,15 +254,14 @@ def _refuse_as_a_launch_would(
     *,
     from_phase: str | None,
 ) -> None:
-    """Apply claim, preflight, and top-up refusals to snapshots in launch order.
+    """Apply claim and preflight refusals to snapshots in launch order.
 
     The reached studies get the checks a launch gives them after its recovery, from the same
     function (:func:`phasesweep.engine.study_policy._reached_study_refusals`): recorded
     identity, then target, then the launch preflight of a phase that needs new trials. A
     RUNNING study gets the fixed-target check on predicted recovery counts in place of its
-    accepted target, and stays out of the descendant check, which needs the recovered state.
-    Preview inspects each study's artifact-root claim without making it, and does not verify
-    evidence.
+    accepted target. Preview inspects each study's artifact-root claim without making it,
+    and does not verify evidence.
 
     :param Experiment experiment: Parsed experiment being previewed.
     :param Mapping[str, RecordedPhase] recorded: What the ledger holds for each phase.
@@ -281,8 +280,6 @@ def _refuse_as_a_launch_would(
     :raises TrialTargetRefusedError: A study already accepted a higher target
         than its phase requests, or a fixed configuration asks for more
         attempts than it may retry.
-    :raises StudyContextConflictError: An upstream top-up would invalidate a
-        descendant study already bound to its winner.
     """
     studies = {name: record.study for name, record in recorded.items() if record.study is not None}
     _check_published_phase_studies(experiment, studies, from_phase=from_phase)
@@ -319,10 +316,6 @@ def _refuse_as_a_launch_would(
     ]
     errors.extend(_reached_study_refusals(experiment, reached))
     _raise_collected_errors(errors)
-    settled = {name: study for name, study in studies.items() if not recorded[name].running}
-    resume_ops._reject_bound_descendant_topups(
-        experiment, from_phase=from_phase, existing_studies=settled
-    )
     resume_ops._reject_fixed_targets_without_study(
         experiment, from_phase=from_phase, existing_studies=studies
     )
@@ -409,7 +402,8 @@ def _preview_phase(
             # Its own config was compared before any phase previewed (_reached_study_refusals).
             warn_dry_run(
                 "phase=%s comparison of its inherited values awaits the parent "
-                "winner whose values are placeholders",
+                "winner whose values are placeholders. The preview assumes the inherited "
+                "values still match the study",
                 phase.name,
             )
     if recorded is not None and not recorded.running and recorded.study is not None:
@@ -434,7 +428,7 @@ def _preview_phase(
                 finished,
                 phase.n_trials,
             )
-            return PhasePreview(winner=resumed, launches=0, reruns=0, replays=True)
+            return _replayed_phase_preview(phase, inherited_winners, resumed)
         resume = resumed
     _log_phase_header(
         phase,
@@ -472,7 +466,7 @@ def _preview_phase(
             winner = _replay_met_target(
                 experiment, phase, inherited_winners, study, resume, verify_evidence=False
             )
-        return PhasePreview(winner=winner, launches=0, reruns=0, replays=True)
+        return _replayed_phase_preview(phase, inherited_winners, winner)
     if recorded is None:
         # A readable ledger had every reached phase's launch preflighted before any phase
         # previewed (_refuse_as_a_launch_would); one previewed fresh from an unreadable ledger
@@ -520,6 +514,25 @@ def _inherited_placeholder_keys(
         if keys:
             by_parent[parent] = keys
     return by_parent
+
+
+def _replayed_phase_preview(
+    phase: Phase, inherited_winners: dict[str, Winner], winner: Winner
+) -> PhasePreview:
+    """Carry unresolved inherited values through a replay to later phases.
+
+    :param Phase phase: Replayed phase.
+    :param dict[str, Winner] inherited_winners: Parent winners, including any stand-ins.
+    :param Winner winner: Replayed or placeholder winner with composed overrides.
+    :return PhasePreview: Conditional replay and the values it passes on.
+    """
+    carried = _inherited_placeholder_keys(
+        phase, inherited_winners, replaced=[*phase.fixed_overrides, *winner.params]
+    )
+    stand_ins = winner.placeholder_keys.union(*carried.values()) & winner.effective_overrides.keys()
+    return PhasePreview(
+        winner=replace(winner, placeholder_keys=stand_ins), launches=0, reruns=0, replays=True
+    )
 
 
 def _placeholder_winner(

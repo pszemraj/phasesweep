@@ -24,7 +24,8 @@ from phasesweep.config.search import (
     grid_search_space,
     sampler_warnings,
 )
-from phasesweep.engine.paths import _generation_winner_path
+from phasesweep.engine.errors import StudyFingerprintMismatchError
+from phasesweep.engine.paths import _generation_winner_path, _last_successful_generation_path
 from phasesweep.engine.read import read_result, read_trial_tables
 from phasesweep.engine.repeats import ranked_group, repeat_axis
 from phasesweep.engine.selection import (
@@ -246,6 +247,101 @@ def test_a_cmaes_range_at_its_bound_goes_to_a_phase_of_its_own(
         "[p] no trial ran above the winner's x=0.3 (tried 0.1..0.3, at the configured upper "
         f"bound); add a seeded random or TPE phase over the wider range, {_STANDALONE}"
     ]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("winner_changes", [False, True], ids=["replay", "changed-winner"])
+def test_grown_parent_keeps_trials_and_checks_the_winner_before_child_work(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, winner_changes: bool
+) -> None:
+    """A top-up replays matching dependents and preserves its work if a dependent must rerun."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--x", type=int, required=True)
+        args, _ = parser.parse_known_args()
+        print(f"x={{-args.x if args.x < 4 or {winner_changes!r} else 0}}")
+        """,
+    )
+    parent = Phase(
+        name="parent",
+        n_trials=3,
+        gpu_policy="none",
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"x": IntParam(type="int", low=1, high=3)},
+    )
+    child = Phase(name="child", inherits=["parent"], n_trials=1, gpu_policy="none")
+    grandchild = Phase(name="grandchild", inherits=["child"], n_trials=1, gpu_policy="none")
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=trainer, phases=[parent, child, grandchild]
+    )
+    first = run_experiment(experiment)
+    assert first["parent"].params == {"x": 3}
+    published = published_generation_id(experiment)
+    assert published is not None
+    pointer = _last_successful_generation_path(experiment)
+    before = pointer.read_bytes()
+    parent_trials = phase_trials(experiment, parent.name)
+    child_trials = phase_trials(experiment, child.name)
+    grandchild_trials = phase_trials(experiment, grandchild.name)
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    shown = CliRunner().invoke(cli, ["show-winners", str(config)])
+    assert shown.exit_code == 0, shown.output
+    assert "add values beyond the bound to search_space and raise n_trials" in " ".join(
+        shown.output.split()
+    )
+
+    grown = parent.model_copy(
+        update={"n_trials": 4, "search_space": {"x": IntParam(type="int", low=1, high=4)}}
+    )
+    edited = experiment.model_copy(update={"phases": [grown, child, grandchild]})
+    with caplog.at_level(logging.INFO, logger="phasesweep.report"):
+        run_experiment(edited, dry_run=True)
+    for phase in (child, grandchild):
+        assert any(
+            f"phase={phase.name} comparison of its inherited values awaits" in message
+            for message in caplog.messages
+        )
+    assert "DRY RUN total: would launch 1 trial across 1 phase (2 other phases replay)" in (
+        caplog.messages
+    )
+    assert pointer.read_bytes() == before
+    assert phase_trials(edited, parent.name) == parent_trials
+
+    if winner_changes:
+        with pytest.raises(
+            StudyFingerprintMismatchError, match=r"inherited_effective_overrides.parent.x: 3 -> 4"
+        ) as refused:
+            run_experiment(edited)
+        assert refused.value.remediation is not None
+        assert "give `child` and `grandchild` new names" in refused.value.remediation
+        assert pointer.read_bytes() == before
+        status, retained = read_result(experiment, generation_id=published)
+        assert status["publication_integrity"] == "ok"
+        assert [view.params for view in retained] == [{"x": 3}, {}, {}]
+    else:
+        current = run_experiment(edited)
+        assert current[child.name].source == first[child.name].source
+        assert current[grandchild.name].source == first[grandchild.name].source
+        assert published_generation_id(edited) != published
+
+    topped_up = phase_trials(edited, parent.name)
+    assert topped_up[:-1] == parent_trials
+    assert topped_up[-1].params == {"x": 4}
+    assert phase_trials(edited, child.name) == child_trials
+    assert phase_trials(edited, grandchild.name) == grandchild_trials
+    if winner_changes:
+        next_child = child.model_copy(update={"name": "child2"})
+        next_grandchild = grandchild.model_copy(
+            update={"name": "grandchild2", "inherits": [next_child.name]}
+        )
+        repaired = experiment.model_copy(update={"phases": [grown, next_child, next_grandchild]})
+        result = run_experiment(repaired)
+        assert result["grandchild2"].effective_overrides == {"x": 4}
+        assert phase_trials(repaired, parent.name) == topped_up
+        assert published_generation_id(repaired) != published
 
 
 @pytest.mark.parametrize("sampler_type", ["random", "tpe", "grid"])

@@ -28,7 +28,7 @@ from phasesweep.engine.repeats import (
     noise_band,
 )
 from phasesweep.engine.state import GENERATION_ID_ATTR, _unreplaced_attempts
-from phasesweep.errors import STORAGE_NULL_KEEPS_NOTHING, rename_step
+from phasesweep.errors import STORAGE_NULL_KEEPS_NOTHING
 from phasesweep.evidence.models import (
     POSITIONED_EXTRACTOR_KINDS,
     best_value_position_reason,
@@ -1170,8 +1170,8 @@ def _survivorship_remedy(
     The summary holds no phase config or trials, so it cannot name the exact target
     :func:`phasesweep.engine.study_policy._raised_target_step` names; a raised ``n_trials`` is
     the one step that is true for every sampler, and docs/runtime.md ("Retry fixed
-    configurations and grids") gives the ceiling. A dependent study with trials must get a new
-    name before an upstream top-up. Without storage a rerun tries every configuration again.
+    configurations and grids") gives the ceiling. Dependent studies can replay if their
+    inherited values still match. Without storage a rerun tries every configuration again.
 
     :param SurvivorshipDetail detail: Flagged survivorship evidence.
     :param bool persistent: Whether the display config keeps its trials between runs.
@@ -1189,8 +1189,9 @@ def _survivorship_remedy(
         step = "Raise the phase's n_trials and rerun to run its untried cells."
     if dependents:
         step += (
-            " Before rerunning, if any phase that inherits this one already has trials, "
-            f"{rename_step(dependents)}."
+            " Dependent studies keep their trials if their inherited values still match. "
+            "If those values change, the run keeps the top-up and names the phase that "
+            "needs a new study."
         )
     return step
 

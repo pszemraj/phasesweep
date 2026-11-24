@@ -27,7 +27,6 @@ from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     PublishedStudyMissingError,
     RunRequestError,
-    StudyContextConflictError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -53,12 +52,10 @@ from phasesweep.engine.paths import (
     _trial_dir_for,
 )
 from phasesweep.engine.read import read_result, read_status
-from phasesweep.engine.resume import _reject_bound_descendant_topups
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
-    PHASE_IDENTITY_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
@@ -176,29 +173,6 @@ def _two_phase_experiment(
         ),
     ]
     return make_experiment(workdir=workdir, storage=storage, trainer=trainer, phases=phases)
-
-
-def _fake_top_up_study(*, completed: int = 0, fingerprint: str | None = None) -> SimpleNamespace:
-    """Build a stand-in study exposing only what the top-up guard reads.
-
-    :param int completed: Number of Optuna COMPLETE trials the study reports.
-    :param str | None fingerprint: Bound phase fingerprint, or ``None`` for a
-        study that has not been bound to a published winner yet.
-    :return SimpleNamespace: Object with the ``user_attrs``/``get_trials``
-        surface :func:`_reject_bound_descendant_topups` uses.
-    """
-    trials = [SimpleNamespace(state=optuna.trial.TrialState.COMPLETE, user_attrs={})] * completed
-    entries = [{"search_space": {}, "first_position": 0}]
-    record = {
-        "schema_version": 1,
-        "fingerprint": fingerprint,
-        "payload": {},
-        "search_spaces": entries,
-    }
-    return SimpleNamespace(
-        user_attrs={} if fingerprint is None else {PHASE_IDENTITY_ATTR: record},
-        get_trials=lambda *, deepcopy: trials,
-    )
 
 
 @pytest.mark.integration
@@ -815,76 +789,6 @@ def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
     assert len(study.trials) == 3
     assert winners["p"].completion["finished_trials"] == 3
     assert winner_path.read_bytes() == winner_before
-
-
-@pytest.mark.integration
-def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path) -> None:
-    """A bound child makes an ancestor top-up a non-destructive preflight refusal."""
-    trainer = write_constant_trainer(tmp_path)
-    storage = f"journal:///{tmp_path / 'studies.journal'}"
-    experiment = _two_phase_experiment(
-        workdir=tmp_path / "runs",
-        trainer=trainer,
-        storage=storage,
-        arch_n_trials=1,
-    )
-    run_experiment(experiment)
-    generation_id = published_generation_id(experiment)
-    assert generation_id is not None
-    protected_paths = [
-        _generation_summary_path(experiment, generation_id),
-        _last_successful_generation_path(experiment),
-        *(
-            _generation_winner_path(experiment, generation_id, phase.name)
-            for phase in experiment.phases
-        ),
-    ]
-    before = {path: path.read_bytes() for path in protected_paths}
-    parent_before = optuna.load_study(
-        study_name="t::arch", storage=_resolve_storage(storage)
-    ).trials
-    topped_up_parent = experiment.phases[0].model_copy(update={"n_trials": 2})
-    topped_up = experiment.model_copy(update={"phases": [topped_up_parent, experiment.phases[1]]})
-
-    with pytest.raises(
-        StudyContextConflictError, match=r"1 dependent phase \(`lr`\) is bound"
-    ) as refused:
-        run_experiment(topped_up)
-
-    # The rename step names only the dependent, so the enlarged phase keeps its trials.
-    assert refused.value.remediation == (
-        "Give `lr` a new `name`, which runs it again from scratch; `arch` keeps its trials and "
-        "runs the rest. Or run a config without its dependents first, then put them back: a "
-        "dependent whose inherited values come out unchanged keeps its trials."
-    )
-
-    parent_after = optuna.load_study(study_name="t::arch", storage=_resolve_storage(storage)).trials
-    assert len(parent_after) == len(parent_before) == 1
-    assert {path: path.read_bytes() for path in protected_paths} == before
-
-
-def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
-    """A grandchild study binds its ancestor even when the middle study is absent."""
-    experiment = make_experiment(
-        phases=[
-            Phase(
-                name="arch",
-                n_trials=2,
-                search_space={"depth": IntParam(type="int", low=1, high=2)},
-            ),
-            Phase(name="schedule", inherits=["arch"], n_trials=1, search_space={}),
-            Phase(name="final", inherits=["schedule"], n_trials=1, search_space={}),
-        ]
-    )
-    parent_study = _fake_top_up_study(completed=1)
-    grandchild_study = _fake_top_up_study(completed=1, fingerprint="bound-grandchild")
-
-    with pytest.raises(RuntimeError, match=r"1 dependent phase \(`final`\) is bound"):
-        _reject_bound_descendant_topups(
-            experiment,
-            from_phase=None,
-            existing_studies={"arch": parent_study, "final": grandchild_study},
-        )
 
 
 @pytest.mark.integration

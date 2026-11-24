@@ -1570,9 +1570,8 @@ def _reached_study_refusals(
     (:func:`phasesweep.engine.preview._refuse_as_a_launch_would`) both call this, so they refuse
     in one order, and each step assumes the ones before it passed. A changed config comes first
     and alone, for the first study in phase order that recorded another, because restoring it or
-    renaming the phase decides every later check; so the bound-descendant top-up check that
-    follows (:func:`phasesweep.engine.resume._reject_bound_descendant_topups`) refuses only a
-    phase that keeps its trials. Target and launch refusals are collected per study.
+    renaming the phase decides every later check. Target and launch refusals are collected per
+    study. A phase's actual inherited values are checked once its parents have selected winners.
 
     :param Experiment experiment: Current experiment config.
     :param Sequence[ReachedStudy] reached: The reached phases' studies, in phase order, each

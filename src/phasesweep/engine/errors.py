@@ -28,12 +28,6 @@ class StudySchemaMismatchError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
 
 
-class StudyContextConflictError(PhaseSweepError):
-    """Raised when an upstream top-up would invalidate a bound descendant study."""
-
-    default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
-
-
 class ArtifactRootConflictError(PhaseSweepError):
     """Raised when a study or artifact tree names a different publication owner."""
 

@@ -23,7 +23,6 @@ from phasesweep.engine.errors import (
     PublicationIntegrityError,
     PublishedStudyMissingError,
     ResumeWinnerMissingError,
-    StudyContextConflictError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     TrialEvidenceMissingError,
@@ -687,42 +686,6 @@ def test_uninspectable_ledger_on_an_unbound_tree_previews_fresh_phases_and_says_
     assert not (tmp_path / "elsewhere").exists()
 
 
-def test_raised_upstream_target_over_a_bound_descendant_is_refused_as_a_run_refuses(
-    tmp_path: Path,
-) -> None:
-    """Raising a finished phase's target under studies bound to its winner is refused, not previewed."""
-    recorded = _persistent(
-        tmp_path,
-        _phase("a", 2),
-        _phase("b", 2, inherits=("a",)),
-        _phase("c", 2, inherits=("b",)),
-    )
-    for name in ("a", "b", "c"):
-        _record(recorded, name, _STATE.FAIL, _STATE.FAIL, target=2)
-    raised = _persistent(
-        tmp_path,
-        _phase("a", 3),
-        _phase("b", 2, inherits=("a",)),
-        _phase("c", 2, inherits=("b",)),
-    )
-
-    refusal = _refusals_match(
-        raised,
-        tmp_path,
-        StudyContextConflictError,
-        r"1 top-up trial remaining, but 2 dependent phases \(`b`, `c`\) are bound",
-    )
-
-    # The rename step names only the dependents, so the enlarged phase keeps its trials.
-    assert isinstance(refusal, StudyContextConflictError)
-    assert refusal.remediation == (
-        "Give `b` and `c` new names and update the `inherits` that name them, which runs them "
-        "again from scratch; `a` keeps its trials and runs the rest. Or run a config without its "
-        "dependents first, then put them back: a dependent whose inherited values come out "
-        "unchanged keeps its trials."
-    )
-
-
 @pytest.mark.integration
 @pytest.mark.parametrize("changed", ["a", "b"])
 def test_a_top_up_of_a_changed_phase_is_refused_as_a_changed_study_first(
@@ -730,27 +693,23 @@ def test_a_top_up_of_a_changed_phase_is_refused_as_a_changed_study_first(
 ) -> None:
     """A raised target on a phase whose search space also lost values is refused as a changed study.
 
-    The top-up refusal says the phase keeps its trials, which a changed study does not, so the
-    run and its dry run both refuse the change first, for the first phase or a later one. With
-    the search space restored, the top-up refusal is what remains, and it is then true.
+    The run and its dry run check each phase's own identity before starting any top-up.
     """
     chain = {"a": (), "b": ("a",), "c": ("b",)}
     run_experiment(
         _persistent(tmp_path, *(_phase(name, 2, inherits=up) for name, up in chain.items()))
     )
 
-    def edited(*, narrow: bool) -> Experiment:
-        phases = []
-        for name, up in chain.items():
-            phase = _phase(name, 3 if name == changed else 2, inherits=up)
-            if narrow and name == changed:
-                space = {f"{name}_x": IntParam(type="int", low=0, high=5)}
-                phase = phase.model_copy(update={"search_space": space})
-            phases.append(phase)
-        return _persistent(tmp_path, *phases)
+    phases = []
+    for name, up in chain.items():
+        phase = _phase(name, 3 if name == changed else 2, inherits=up)
+        if name == changed:
+            space = {f"{name}_x": IntParam(type="int", low=0, high=5)}
+            phase = phase.model_copy(update={"search_space": space})
+        phases.append(phase)
 
     refusal = _refusals_match(
-        edited(narrow=True),
+        _persistent(tmp_path, *phases),
         tmp_path,
         StudyFingerprintMismatchError,
         rf"Study 't::{changed}' was created with a different config\. Changed: "
@@ -760,19 +719,13 @@ def test_a_top_up_of_a_changed_phase_is_refused_as_a_changed_study_first(
     assert isinstance(refusal, StudyFingerprintMismatchError)
     assert refusal.remediation is not None
     assert refusal.remediation.startswith(f"Put back {changed}_x high 10, or give ")
-    _refusals_match(
-        edited(narrow=False),
-        tmp_path,
-        StudyContextConflictError,
-        rf"Phase '{changed}' has 1 top-up trial remaining",
-    )
 
 
 @pytest.mark.integration
 def test_a_top_up_under_another_environment_is_refused_for_the_environment_first(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The run and its dry run refuse a changed trainer environment before a bound top-up."""
+    """The run and its dry run refuse a changed trainer environment before starting a top-up."""
 
     def experiment(n_trials: int) -> Experiment:
         return make_experiment(
@@ -791,23 +744,6 @@ def test_a_top_up_under_another_environment_is_refused_for_the_environment_first
         tmp_path,
         StudyFingerprintMismatchError,
         r"Study 't::a' ran its trials under a different trainer environment",
-    )
-
-
-def test_the_bound_descendant_refusal_counts_in_the_singular_without_list_syntax(
-    tmp_path: Path,
-) -> None:
-    """One bound dependent and several top-up trials read as plain words, with the phase named as the rename step names it."""
-    recorded = _persistent(tmp_path, _phase("a", 2), _phase("b", 2, inherits=("a",)))
-    for name in ("a", "b"):
-        _record(recorded, name, _STATE.FAIL, _STATE.FAIL, target=2)
-    raised = _persistent(tmp_path, _phase("a", 5), _phase("b", 2, inherits=("a",)))
-
-    refusal = _refusals_match(raised, tmp_path, StudyContextConflictError, "top-up")
-
-    assert str(refusal) == (
-        "Phase 'a' has 3 top-up trials remaining, but 1 dependent phase (`b`) is bound to its "
-        "published winner."
     )
 
 

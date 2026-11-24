@@ -20,7 +20,6 @@ from phasesweep.engine.artifact_roots import (
 )
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
-    StudyContextConflictError,
     StudyFingerprintMismatchError,
 )
 from phasesweep.engine.fingerprints import (
@@ -41,7 +40,7 @@ from phasesweep.errors import (
     OperatorAction,
     rename_step,
 )
-from tests.conftest import make_experiment, phase_trials, write_constant_trainer
+from tests.conftest import make_experiment
 from tests.experiments import (
     anchored_phase,
     phase_payload,
@@ -429,50 +428,6 @@ def test_the_rename_step_is_worded_once_and_names_every_phase_it_is_given() -> N
         "give the phase, and each phase that inherits it, a new `name`, updating every "
         "`inherits` to match, to run it under another value."
     ) in " ".join(timeout.comments)
-
-
-@pytest.mark.integration
-def test_a_raised_target_is_run_by_renaming_only_the_phases_that_inherit_it(
-    tmp_path: Path,
-) -> None:
-    """Following the refusal's step as printed keeps the enlarged phase's finished trials and reruns its dependents."""
-    trainer = write_constant_trainer(tmp_path)
-
-    def chain(*, a_trials: int, suffix: str) -> Experiment:
-        def phase(name: str, trials: int, parent: str | None = None) -> Phase:
-            return Phase(
-                name=name,
-                n_trials=trials,
-                inherits=[] if parent is None else [parent],
-                sampler=Sampler(type="random", seed=0),
-                gpu_policy="none",
-                search_space={name[0]: IntParam(type="int", low=0, high=9)},
-            )
-
-        phases = [
-            phase("a", a_trials),
-            phase(f"b{suffix}", 2, "a"),
-            phase(f"c{suffix}", 2, f"b{suffix}"),
-        ]
-        return make_experiment(persistent=tmp_path, trainer=trainer, phases=phases)
-
-    run_experiment(chain(a_trials=2, suffix=""))
-    with pytest.raises(StudyContextConflictError) as refused:
-        run_experiment(chain(a_trials=3, suffix=""))
-    assert refused.value.remediation is not None
-    assert refused.value.remediation == (
-        "Give `b` and `c` new names and update the `inherits` that name them, which runs them "
-        "again from scratch; `a` keeps its trials and runs the rest. Or run a config without its "
-        "dependents first, then put them back: a dependent whose inherited values come out "
-        "unchanged keeps its trials."
-    )
-
-    renamed = chain(a_trials=3, suffix="2")
-    run_experiment(renamed)
-
-    assert [t.state.name for t in phase_trials(renamed, "a")] == ["COMPLETE"] * 3
-    assert [t.number for t in phase_trials(renamed, "a")][:2] == [0, 1]
-    assert len(phase_trials(renamed, "b2")) == len(phase_trials(renamed, "c2")) == 2
 
 
 def test_long_values_are_windowed_around_their_first_difference() -> None:

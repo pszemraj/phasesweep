@@ -388,11 +388,6 @@ def _run_experiment_outcome(
                 raise attempt_ops._pending_evidence_refusal(cleanup.unreadable_evidence)
             # Validate candidate evidence after recovery and before launching new work.
             evidence_ops._validate_selection_evidence(experiment, existing_studies)
-            resume_ops._reject_bound_descendant_topups(
-                experiment,
-                from_phase=from_phase,
-                existing_studies=existing_studies,
-            )
             resume_ops._reject_fixed_targets_without_study(
                 experiment,
                 from_phase=from_phase,

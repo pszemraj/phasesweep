@@ -30,7 +30,6 @@ from phasesweep.config.search import CategoricalParam, FloatParam, Repeats, Samp
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     ExperimentLockBusyError,
-    StudyContextConflictError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -1961,7 +1960,6 @@ def test_expected_operational_failures_share_one_base() -> None:
         UnsafeProcessCleanupError,
         ExperimentLockBusyError,
         GpuConfigurationError,
-        StudyContextConflictError,
         StudyFingerprintMismatchError,
         StudySchemaMismatchError,
         StudyStorageUnavailableError,
