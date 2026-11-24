@@ -313,18 +313,18 @@ def test_grown_parent_keeps_trials_and_checks_the_winner_before_child_work(
     edited = experiment.model_copy(update={"phases": [grown, child, grandchild]})
     with caplog.at_level(logging.INFO, logger="phasesweep.report"):
         run_experiment(edited, dry_run=True)
-    # A dependent whose inherited values wait on the parent's new winner is previewed as a
-    # new study, the most the run can launch for it.
+    # A dependent with recorded studies has no launch count until its inherited values are known.
     for phase in (child, grandchild):
         awaits = any(
-            f"phase={phase.name} inherits values that are placeholders" in message
+            f"phase={phase.name} study and launch count depend on the inherited values" in message
             for message in caplog.messages
         )
         assert awaits is not child_fixes_x
     assert (
         "DRY RUN total: would launch 1 trial across 1 phase (2 other phases replay)"
         if child_fixes_x
-        else "DRY RUN total: would launch 3 trials across 3 phases"
+        else "DRY RUN total: would launch 1 trial across 1 phase. "
+        "Launch counts depend on inherited values for 2 phases"
     ) in caplog.messages
     assert pointer.read_bytes() == before
     assert phase_trials(edited, parent.name) == parent_trials

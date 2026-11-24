@@ -416,7 +416,9 @@ def test_evidence_deleted_since_fails_only_its_trial_with_the_readers_reason(
     assert (by_x[1].value, by_x[4].value) == (1.0, 4.0)
 
 
-def test_a_child_follows_its_re_read_parent_from_its_own_study(tmp_path: Path) -> None:
+def test_a_child_follows_its_re_read_parent_from_its_own_study(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """With the parent's winner unchanged, the child re-reads its own trials: nothing launches."""
     trainer, launches = _counting_trainer(tmp_path)
     run_experiment(_experiment(tmp_path, trainer, _metric("loss"), phases=_phases(child=True)))
@@ -426,7 +428,35 @@ def test_a_child_follows_its_re_read_parent_from_its_own_study(tmp_path: Path) -
         extractor=LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[0-9.eE+-]+)"),
     )
 
-    winners = run_experiment(_experiment(tmp_path, trainer, regex, phases=_phases(child=True)))
+    changed = _experiment(tmp_path, trainer, regex, phases=_phases(child=True))
+    before = tree_snapshot(tmp_path)
+    caplog.set_level(logging.INFO)
+    run_experiment(changed, dry_run=True)
+    assert "phase=c study and launch count depend on the inherited values selected by 'p' (x)" in (
+        caplog.text
+    )
+    assert "phase=c would launch" not in caplog.text
+    assert "placeholders until 'p' publishes a winner: x" in caplog.text
+    assert (
+        "DRY RUN total: no launches for phases with known counts. "
+        "Launch counts depend on inherited values for 1 phase"
+    ) in caplog.text
+
+    caplog.clear()
+    # A child with no studies will need its full budget under every parent winner.
+    new_child = changed.phases[1].model_copy(update={"name": "new_child"})
+    run_experiment(
+        changed.model_copy(update={"phases": [*changed.phases, new_child]}), dry_run=True
+    )
+    assert "DRY RUN phase=new_child would launch 2 trials" in caplog.text
+    assert (
+        "DRY RUN total: would launch 2 trials across 1 phase. "
+        "Launch counts depend on inherited values for 1 phase"
+    ) in caplog.text
+    assert tree_changes(before, tree_snapshot(tmp_path)) == {}
+    assert _launches(launches) == 5
+
+    winners = run_experiment(changed)
 
     assert _launches(launches) == 5
     assert winners["p"].effective_overrides == {"x": 4}
@@ -531,6 +561,9 @@ def test_a_dry_run_says_it_would_re_read_and_writes_nothing(
         'DRY RUN phase=p reading settings changed (metric.extractor.key: "loss" -> "acc"): '
         "would re-read 3 finished trials from kept evidence; nothing would retrain"
     ) in [record.getMessage() for record in caplog.records]
+    assert "would select from the re-read evidence and launch no trials" in caplog.text
+    assert "DRY RUN total: would launch 0 trials across 0 phases" in caplog.text
+    assert "phase replays" not in caplog.text
 
 
 def test_validate_counts_kept_grid_trials_when_the_reading_settings_change(

@@ -54,7 +54,7 @@ from phasesweep.engine.phase import (
     _winner_overrides,
 )
 from phasesweep.engine.progress import _log_phase_header
-from phasesweep.engine.reread import _trainer_seconds, describe_changes, fill_source
+from phasesweep.engine.reread import FillSource, _trainer_seconds, describe_changes, fill_source
 from phasesweep.engine.state import (
     PHASE_DECISION_ATTR,
     RecoveredTrialState,
@@ -65,7 +65,6 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import (
     ReachedStudy,
-    _AcceptedPartialDecision,
     _at_accepted_partial_target,
     _launch_preflight,
     _load_phase_policy_state,
@@ -113,8 +112,8 @@ class RecordedPhase:
     recovery_reruns: int
     #: The phase's study as a read-only snapshot, or ``None`` when the ledger holds none.
     study: optuna.Study | None
-    #: A fill's source decision at the current target, which determines the launch count.
-    reread_partial: _AcceptedPartialDecision | None = None
+    #: The source of a pending fill, whose old scores cannot supply a winner.
+    fill: FillSource | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,31 +122,36 @@ class PhasePreview:
 
     #: The winner the phase hands its children: a replayed one, or a placeholder.
     winner: Winner
-    #: Trials a launch would run, the count the phase's "would launch" line prints.
-    launches: int
+    #: Trials a launch would run, or None if the phase's addressed study is unresolved.
+    launches: int | None
     #: How many of those launches rerun an interrupted trial or retry a failed grid cell.
     reruns: int
-    #: Whether the phase would replay a recorded result if its inherited values match.
-    replays: bool
+    #: Whether the phase would replay a result already read under the current settings.
+    replays: bool = False
 
 
 def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
-    """Total the trials a dry run would launch from the counts its phase lines print.
+    """Total the launch counts the phase lines establish and report how many remain open.
 
     :param Sequence[PhasePreview] previews: The previewed phases, in order. A phase that
         ``--from-phase`` skips is not previewed and so is not counted.
     :return str: The line, without the ``DRY RUN`` prefix.
     """
-    trials = sum(preview.launches for preview in previews)
+    trials = sum(preview.launches for preview in previews if preview.launches is not None)
     reruns = sum(preview.reruns for preview in previews)
     launching = sum(1 for preview in previews if preview.launches)
     replaying = sum(1 for preview in previews if preview.replays)
+    unknown = sum(1 for preview in previews if preview.launches is None)
     line = f"total: would launch {plural(trials, 'trial')} "
     if reruns:
         line += f"({plural(reruns, 'rerun')}) "
     line += f"across {plural(launching, 'phase')}"
+    if unknown and not launching:
+        line = "total: no launches for phases with known counts"
     if replaying:
         line += f" ({replaying} other {'phase replays' if replaying == 1 else 'phases replay'})"
+    if unknown:
+        line += f". Launch counts depend on inherited values for {plural(unknown, 'phase')}"
     return line
 
 
@@ -251,15 +255,16 @@ def _addressed_record(
     phase: Phase,
     inherited_winners: dict[str, Winner],
     recorded: Sequence[RecordedPhase],
-) -> tuple[str | None, RecordedPhase]:
+) -> tuple[str | None, RecordedPhase | None]:
     """Pick what the ledger holds for the study a phase addresses under its parents' winners.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being previewed.
     :param dict[str, Winner] inherited_winners: Winners, or stand-ins for them.
     :param Sequence[RecordedPhase] recorded: Every study the phase has.
-    :return tuple[str | None, RecordedPhase]: The study name, or ``None`` while a parent's
-        winner is a stand-in, and that study's record, empty for one the ledger lacks.
+    :return tuple[str | None, RecordedPhase | None]: The study name, or ``None`` while a parent's
+        winner is a stand-in, and its record. The record is ``None`` when a stand-in prevents
+        picking among recorded studies, or empty when the phase is known to have no study.
     """
     fresh = RecordedPhase(finished=0, measured=0, running=0, recovery_reruns=0, study=None)
     stand_ins = _inherited_placeholder_keys(phase, inherited_winners)
@@ -269,13 +274,12 @@ def _addressed_record(
     if stand_ins:
         groups = "; ".join(f"{parent!r} ({', '.join(keys)})" for parent, keys in stand_ins.items())
         warn_dry_run(
-            "phase=%s inherits values that are placeholders until %s selects a winner, so its "
-            "study is not known yet: it is previewed as a new study, and a winner equal to an "
-            "earlier one reuses the trials measured under it",
+            "phase=%s study and launch count depend on the inherited values selected by %s. "
+            "Earlier trials may be reused",
             phase.name,
             groups,
         )
-        return None, fresh
+        return None, None
     inherited = _inherited_override_payload(phase, inherited_winners)
     name = phase_study_name(experiment, phase, inherited)
     addressed = next(
@@ -300,14 +304,7 @@ def _addressed_record(
             plural(source.rereads, "finished trial"),
         )
         stand_in = _recorded_phase(phase, source.study, trials=source.trials)
-        partial = _parse_accepted_partial_decision(
-            source.attrs.get(PHASE_DECISION_ATTR), source.study.study_name
-        )
-        return name, replace(
-            stand_in,
-            study=None,
-            reread_partial=partial if _at_accepted_partial_target(partial, phase) else None,
-        )
+        return name, replace(stand_in, study=None, fill=source)
     note = new_study_note(
         phase,
         inherited,
@@ -487,7 +484,8 @@ def _preview_phase(
     replay supplies its recorded winner to children. Remaining work supplies a
     sampled placeholder. Unreadable studies and RUNNING studies needing recovery
     also use placeholders; the latter retain predicted counts without judging
-    unrecovered state.
+    unrecovered state. A phase with recorded studies that still needs its inherited
+    values shows an example command and leaves its launch count unresolved.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being previewed.
@@ -507,18 +505,27 @@ def _preview_phase(
         addressed, recorded = _addressed_record(
             experiment, phase, inherited_winners, recorded_studies
         )
+        if recorded is None:
+            winner = _preview_trial_command(experiment, phase, inherited_winners)
+            return PhasePreview(winner=winner, launches=None, reruns=0)
         study_name = study_name if addressed is None else addressed
-    if recorded is not None and (partial := recorded.reread_partial) is not None:
-        _require_partial_replay_allowed(phase, partial)
-        log.info(
-            "DRY RUN phase=%s accepted a partial result at %d of %d trials: would select from "
-            "the re-read evidence and launch no trials",
-            phase.name,
-            partial.finished_trials,
-            partial.trial_target,
+    fill = None if recorded is None else recorded.fill
+    if fill is not None:
+        partial = _parse_accepted_partial_decision(
+            fill.attrs.get(PHASE_DECISION_ATTR), fill.study.study_name
         )
-        winner = _placeholder_winner(experiment, phase, inherited_winners)
-        return _replayed_phase_preview(phase, inherited_winners, winner)
+        if _at_accepted_partial_target(partial, phase):
+            assert partial is not None
+            _require_partial_replay_allowed(phase, partial)
+            log.info(
+                "DRY RUN phase=%s accepted a partial result at %d of %d trials: would select "
+                "from the re-read evidence and launch no trials",
+                phase.name,
+                partial.finished_trials,
+                partial.trial_target,
+            )
+            winner = _placeholder_winner(experiment, phase, inherited_winners)
+            return PhasePreview(winner=winner, launches=0, reruns=0)
     finished = 0 if recorded is None else recorded.finished
     reruns = 0 if recorded is None else recorded.recovery_reruns
     remaining = max(0, phase.n_trials - finished)
@@ -592,12 +599,15 @@ def _preview_phase(
             plural(recorded.running, "RUNNING attempt"),
         )
     if remaining == 0:
+        selection = (
+            "replay its existing result" if fill is None else "select from the re-read evidence"
+        )
         log.info(
-            "DRY RUN phase=%s target met (%d of %d trials recorded): would replay its "
-            "existing result and launch no trials",
+            "DRY RUN phase=%s target met (%d of %d trials recorded): would %s and launch no trials",
             phase.name,
             finished,
             phase.n_trials,
+            selection,
         )
         if study is None or resume is None:
             winner = _placeholder_winner(experiment, phase, inherited_winners)
@@ -605,6 +615,8 @@ def _preview_phase(
             winner = _replay_met_target(
                 experiment, phase, inherited_winners, study, resume, verify_evidence=False
             )
+        if fill is not None:
+            return PhasePreview(winner=winner, launches=0, reruns=0)
         return _replayed_phase_preview(phase, inherited_winners, winner)
     if recorded is None or phase.inherits:
         # A readable ledger had the launch of every reached phase whose study is known before
@@ -613,15 +625,10 @@ def _preview_phase(
         # winners pick, gets it here, as a run's does when it reaches the phase.
         _launch_preflight(experiment, phase.name, None if recorded is None else recorded.study)
     GpuPool.for_phase(phase, cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"))
-    winner = _dry_run_phase(
-        experiment,
-        phase,
-        inherited_winners,
-        open_preview_study(experiment, phase),
-        remaining,
-        reruns=reruns,
-    )
-    return PhasePreview(winner=winner, launches=remaining, reruns=reruns, replays=False)
+    of_them = f", {rerun_clause(reruns)}" if reruns else ""
+    log.info("DRY RUN phase=%s would launch %s%s", phase.name, plural(remaining, "trial"), of_them)
+    winner = _preview_trial_command(experiment, phase, inherited_winners)
+    return PhasePreview(winner=winner, launches=remaining, reruns=reruns)
 
 
 def _inherited_placeholder_keys(
@@ -710,14 +717,10 @@ def _placeholder_winner(
     )
 
 
-def _dry_run_phase(
+def _preview_trial_command(
     experiment: Experiment,
     phase: Phase,
     inherited_winners: dict[str, Winner],
-    study: optuna.Study,
-    remaining: int,
-    *,
-    reruns: int,
 ) -> Winner:
     """Render and log one example trial command for the phase without launching anything.
 
@@ -727,16 +730,10 @@ def _dry_run_phase(
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being previewed.
     :param dict[str, Winner] inherited_winners: Winners loaded for phases earlier in the chain.
-    :param optuna.Study study: An in-memory Optuna study used to ``ask`` for one sample.
-    :param int remaining: Number of trials that *would* run; logged for the user.
-    :param int reruns: How many of them rerun an interrupted trial or retry a failed grid cell
-        before any new draw.
     :return Winner: A placeholder built from the previewed sample, with the repeat key
         omitted, so downstream dry-run previews see consistent inherited context.
     """
-    of_them = f", {rerun_clause(reruns)}" if reruns else ""
-    log.info("DRY RUN phase=%s would launch %s%s", phase.name, plural(remaining, "trial"), of_them)
-    sample_trial = study.ask()
+    sample_trial = open_preview_study(experiment, phase).ask()
     sampled = _suggest_all(sample_trial, phase)
     overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
     preview_dir = _phase_dir(experiment, phase.name) / "trial_dryrun"
