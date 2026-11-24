@@ -1,4 +1,4 @@
-"""Record each value file's size and modification time, and a rerun's launch time, before an attempt can change them."""
+"""Record value file metadata and a rerun's launch time before the trainer starts."""
 
 from __future__ import annotations
 
@@ -35,24 +35,31 @@ if TYPE_CHECKING:
 
     from phasesweep.config.models import Experiment, Phase
 
-EVIDENCE_BASELINE_SCHEMA_VERSION = 5
+EVIDENCE_BASELINE_SCHEMA_VERSION = 6
 EVIDENCE_BASELINE_FILE = "evidence_baseline.json"
 
 
 class FileStamp(NamedTuple):
-    """Where a value file resolved before launch, with its size and modification time."""
+    """Where a value file resolved before launch, with its freshness metadata."""
 
     path: str
     size: int
     mtime_ns: int
+    ctime_ns: int
+    nlink: int
 
     def unchanged(self, info: stat_result) -> bool:
         """Check whether a file still carries the stamp it had before launch.
 
         :param stat_result info: Current metadata of the file at :attr:`path`.
-        :return bool: Whether its size and modification time are both unchanged.
+        :return bool: Whether the metadata shows no fresh value file.
         """
-        return (info.st_size, info.st_mtime_ns) == (self.size, self.mtime_ns)
+        same_size_and_mtime = (info.st_size, info.st_mtime_ns) == (self.size, self.mtime_ns)
+        # A link-count change can advance ctime by itself, including when the trainer
+        # removes the result path and puts the old file back via a hard link.
+        return same_size_and_mtime and (
+            info.st_ctime_ns == self.ctime_ns or info.st_nlink != self.nlink
+        )
 
 
 class EvidenceBaseline(NamedTuple):
@@ -162,7 +169,9 @@ def write_evidence_baseline(
             files[relative] = resolved
             info = path.stat()
             if stat.S_ISREG(info.st_mode):
-                files[relative] = FileStamp(resolved, info.st_size, info.st_mtime_ns)
+                files[relative] = FileStamp(
+                    resolved, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink
+                )
         except (OSError, RuntimeError) as exc:
             # Python 3.11 and 3.12 raise RuntimeError when resolving a link loop. A missing
             # target or a loop names no prior file; the read after the trainer exits names
@@ -222,12 +231,16 @@ def read_evidence_baseline(attempt_dir: Path) -> EvidenceBaseline:
         if not isinstance(fields, dict) or set(fields) != set(FileStamp._fields):
             raise ValueError(f"Evidence baseline {path} records {relative!r} malformed.")
         resolved, size, mtime_ns = fields["path"], fields["size"], fields["mtime_ns"]
+        ctime_ns, nlink = fields["ctime_ns"], fields["nlink"]
         if (
             not isinstance(resolved, str)
             or type(size) is not int
             or size < 0
             or type(mtime_ns) is not int
+            or type(ctime_ns) is not int
+            or type(nlink) is not int
+            or nlink < 1
         ):
             raise ValueError(f"Evidence baseline {path} records {relative!r} malformed.")
-        baseline[relative] = FileStamp(resolved, size, mtime_ns)
+        baseline[relative] = FileStamp(resolved, size, mtime_ns, ctime_ns, nlink)
     return EvidenceBaseline(reused, baseline, launched_at)

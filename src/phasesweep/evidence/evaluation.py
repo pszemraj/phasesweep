@@ -213,12 +213,14 @@ def _require_fresh(
 ) -> None:
     """Refuse a value file this attempt did not write.
 
-    A file the baseline recorded is this attempt's once its size or modification time
-    differs from the record: that is the file's own earlier stamp, so no clock is compared.
+    A recorded file counts when its size or modification time changes, or when its change
+    time changes while its hard-link count stays the same. This compares the file to its
+    own earlier stamp and covers copies that preserve modification time.
     A file at a target that held none at launch was created during the attempt. A link
     retargeted to a file the baseline did not record may reach one that existed before; it
-    counts when modified at or after the baseline record itself was written, just before
-    launch. That one comparison assumes the trial and attempt directories share a clock.
+    counts when its modification time is after the baseline write, or its change time is
+    at or after that write. A write can share the baseline's clock tick. This comparison
+    assumes the trial and attempt directories share a clock.
 
     :param EvidenceBaseline | None baseline: Value paths and file stamps recorded at launch.
     :param Path trial_dir: Directory containing trainer files.
@@ -245,16 +247,17 @@ def _require_fresh(
     if prior is not None:
         if prior.unchanged(info):
             raise StaleEvidenceError(
-                f"`{target}` was not written by this attempt: its size and modification time "
-                "are unchanged since launch, so the trainer exited without writing it."
+                f"`{target}` was not written by this attempt: its metadata shows no fresh "
+                "write since launch."
             )
         return
     if current == before or current in recorded:
         return
-    if info.st_mtime_ns >= (attempt_dir / EVIDENCE_BASELINE_FILE).stat().st_mtime_ns:
+    launch_stamp = (attempt_dir / EVIDENCE_BASELINE_FILE).stat().st_mtime_ns
+    if info.st_mtime_ns > launch_stamp or info.st_ctime_ns >= launch_stamp:
         return
     raise StaleEvidenceError(
-        f"`{target}` now resolves to `{resolved}`, which was last modified before this "
+        f"`{target}` now resolves to `{resolved}`, which last changed before this "
         "attempt started, so the trainer exited without writing it."
     )
 

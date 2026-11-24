@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -37,7 +38,11 @@ from phasesweep.engine.trial_dirs import (
     _trial_dir_for_attempt,
 )
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
-from phasesweep.evidence.baseline import read_evidence_baseline, write_evidence_baseline
+from phasesweep.evidence.baseline import (
+    EVIDENCE_BASELINE_FILE,
+    read_evidence_baseline,
+    write_evidence_baseline,
+)
 from phasesweep.evidence.evaluation import ExtractorError, TrialContext, run_extractor
 from phasesweep.evidence.mlflow import observation_id
 from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor, MlflowExtractor
@@ -96,13 +101,20 @@ def _resumed_context(
     )
 
 
-def test_a_rewritten_value_file_is_fresh_and_an_untouched_one_is_stale(tmp_path: Path) -> None:
-    """A rerun that rewrites its result with identical bytes in place scores it; one that leaves it, or links the old file back, fails as not written by this attempt."""
+@pytest.mark.parametrize("touch_only", [False, True], ids=["rewrite", "touch"])
+def test_a_rewritten_value_file_is_fresh_and_an_untouched_one_is_stale(
+    tmp_path: Path, touch_only: bool
+) -> None:
+    """Score an identical rewrite or touch while refusing untouched and relinked results.
+
+    :param Path tmp_path: Scratch directory for the trial and attempt.
+    :param bool touch_only: Update the file timestamps without writing its bytes.
+    """
     (tmp_path / "trial").mkdir()
     result = tmp_path / "trial" / "r.json"
     result.write_text('{"loss": 0.1}', encoding="utf-8")
     trial_dir, ctx = _resumed_context(tmp_path, _JSON_METRIC.extractor)
-    stale = "was not written by this attempt: its size and modification time are unchanged"
+    stale = "was not written by this attempt: its metadata shows no fresh write"
     with pytest.raises(ExtractorError, match=stale):
         run_extractor(ctx, _JSON_METRIC.extractor)
 
@@ -112,8 +124,31 @@ def test_a_rewritten_value_file_is_fresh_and_an_untouched_one_is_stale(tmp_path:
     with pytest.raises(ExtractorError, match=stale):
         run_extractor(ctx, _JSON_METRIC.extractor)
 
-    result.write_text('{"loss": 0.1}', encoding="utf-8")
+    if touch_only:
+        result.touch()
+    else:
+        result.write_text('{"loss": 0.1}', encoding="utf-8")
     assert run_extractor(ctx, _JSON_METRIC.extractor) == 0.1
+
+
+def test_a_same_size_copy_preserving_mtime_is_fresh(tmp_path: Path) -> None:
+    """Score a copy that changes only the recorded file's change time.
+
+    :param Path tmp_path: Scratch directory for the trial and attempt.
+    """
+    result = tmp_path / "trial" / "r.json"
+    result.parent.mkdir()
+    result.write_text('{"loss": 0.1}', encoding="utf-8")
+    _, ctx = _resumed_context(tmp_path, _JSON_METRIC.extractor)
+    prior = result.stat()
+
+    source = tmp_path / "source.json"
+    source.write_text('{"loss": 0.2}', encoding="utf-8")
+    os.utime(source, ns=(prior.st_atime_ns, prior.st_mtime_ns))
+    shutil.copy2(source, result)
+    copied = result.stat()
+    assert (copied.st_size, copied.st_mtime_ns) == (prior.st_size, prior.st_mtime_ns)
+    assert run_extractor(ctx, _JSON_METRIC.extractor) == 0.2
 
 
 def test_a_resumed_log_is_scored_from_every_line(tmp_path: Path) -> None:
@@ -142,8 +177,13 @@ def test_a_resumed_log_is_scored_from_every_line(tmp_path: Path) -> None:
     }
 
 
-def test_a_retargeted_link_reads_a_file_modified_after_launch(tmp_path: Path) -> None:
-    """A checkpoint link moved to a directory that existed before launch scores its file only once this attempt rewrote it."""
+def test_a_retargeted_link_uses_change_time_when_modification_time_is_inconclusive(
+    tmp_path: Path,
+) -> None:
+    """An unfamiliar target can share the launch tick if its change time reaches that tick.
+
+    :param Path tmp_path: Scratch directory for the trial and attempt.
+    """
     extractor = JsonExtractor(type="json", path="latest/r.json", key="loss")
     for checkpoint in ("checkpoint-400", "checkpoint-500"):
         parent = tmp_path / "trial" / checkpoint
@@ -154,10 +194,24 @@ def test_a_retargeted_link_reads_a_file_modified_after_launch(tmp_path: Path) ->
     latest = trial_dir / "latest"
     latest.unlink()
     latest.symlink_to("checkpoint-400")
-    with pytest.raises(ExtractorError, match="last modified before this attempt started"):
+    result = latest / "r.json"
+    prior = result.stat()
+    baseline_path = ctx.attempt_dir / EVIDENCE_BASELINE_FILE
+    launch_stamp = time.time_ns() + 3_600_000_000_000
+    os.utime(baseline_path, ns=(launch_stamp, launch_stamp))
+    os.utime(result, ns=(launch_stamp, launch_stamp))
+    old_target = result.stat()
+    assert old_target.st_ctime_ns < old_target.st_mtime_ns == baseline_path.stat().st_mtime_ns
+    with pytest.raises(ExtractorError, match="last changed before this attempt started"):
         run_extractor(ctx, extractor)
 
-    (latest / "r.json").write_text('{"loss": 0.75}', encoding="utf-8")
+    source = tmp_path / "source.json"
+    source.write_text('{"loss": 0.75}', encoding="utf-8")
+    os.utime(source, ns=(prior.st_atime_ns, prior.st_mtime_ns))
+    shutil.copy2(source, result)
+    copied = result.stat()
+    os.utime(baseline_path, ns=(copied.st_ctime_ns, copied.st_ctime_ns))
+    assert copied.st_mtime_ns < baseline_path.stat().st_mtime_ns == copied.st_ctime_ns
     assert run_extractor(ctx, extractor) == 0.75
 
 
