@@ -18,13 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from phasesweep.config.common import TRACKER_READ_CONTROLS
 from phasesweep.errors import UnsafeProcessCleanupError
-from phasesweep.evidence.baseline import (
-    EVIDENCE_BASELINE_FILE,
-    EVIDENCE_PINS_DIR,
-    EvidenceBaseline,
-    FileBaseline,
-    file_birth_ns,
-)
+from phasesweep.evidence.baseline import EVIDENCE_BASELINE_FILE, EvidenceBaseline, FileStamp
 from phasesweep.evidence.models import (
     ArtifactSizeGate,
     Gate,
@@ -175,98 +169,58 @@ def trial_file(
     return attempt_file(trial_dir, relative)
 
 
-def _prior_value_file(
-    baseline: EvidenceBaseline | None, trial_dir: Path, relative: str, target: Path
-) -> FileBaseline | None:
-    """Find the evidence file's prior contents or establish it as a new source.
+def _require_fresh(
+    baseline: EvidenceBaseline | None,
+    trial_dir: Path,
+    attempt_dir: Path,
+    relative: str,
+    target: Path,
+) -> None:
+    """Refuse a value file this attempt did not write.
 
-    :param EvidenceBaseline | None baseline: Value files and their contents at launch.
+    A file the baseline recorded is this attempt's once its size or modification time
+    differs from the record: that is the file's own earlier stamp, so no clock is compared.
+    A file at a target that held none at launch was created during the attempt. A link
+    retargeted to a file the baseline did not record may reach one that existed before; it
+    counts when modified at or after the baseline record itself was written, just before
+    launch. That one comparison assumes the trial and attempt directories share a clock.
+
+    :param EvidenceBaseline | None baseline: Value paths and file stamps recorded at launch.
     :param Path trial_dir: Directory containing trainer files.
+    :param Path attempt_dir: The attempt's directory, holding the baseline record.
     :param str relative: Configured trial-relative path.
     :param Path target: Current location of evidence after containment checks.
-    :raises StaleEvidenceError: Its earlier contents or freshness cannot be established.
-    :raises OSError: The current file's identity could not be read.
-    :return FileBaseline | None: Prior contents to compare, if the same file existed.
+    :raises StaleEvidenceError: The file was not written by this attempt, or its state at
+        launch could not be inspected.
+    :raises OSError: The current file or the baseline record could not be inspected.
     """
-    if baseline is None or is_captured_stream(relative):
-        return None
+    if baseline is None or not baseline.reused or is_captured_stream(relative):
+        return
     before = baseline.files.get(relative, relative)
     if before is None:
         raise StaleEvidenceError(
             f"`{target}` could not be inspected before this attempt, so its value "
             "cannot be attributed to this attempt."
         )
-    if not baseline.reused and isinstance(before, str):
-        return None
     info = target.stat()
-    prior = next(
-        (
-            candidate
-            for candidate in baseline.files.values()
-            if isinstance(candidate, FileBaseline) and candidate.same_file(info)
-        ),
-        None,
-    )
-    if prior is not None and (
-        prior.birth_ns is None or file_birth_ns(target, info) in (None, prior.birth_ns)
-    ):
-        return prior
-
-    old_path = before.path if isinstance(before, FileBaseline) else before
-    if not baseline.reused:
-        return None
     resolved = target.resolve()
-    if resolved == trial_dir.resolve() / old_path:
-        return None
-    birth_ns = file_birth_ns(target, info)
-    if birth_ns is not None and birth_ns > baseline.captured_at_ns:
-        return None
+    current = resolved.relative_to(trial_dir.resolve()).as_posix()
+    recorded = baseline.files.values()
+    prior = next((s for s in recorded if isinstance(s, FileStamp) and s.path == current), None)
+    if prior is not None:
+        if prior.unchanged(info):
+            raise StaleEvidenceError(
+                f"`{target}` was not written by this attempt: its size and modification time "
+                "are unchanged since launch, so the trainer exited without writing it."
+            )
+        return
+    if current == before or current in recorded:
+        return
+    if info.st_mtime_ns >= (attempt_dir / EVIDENCE_BASELINE_FILE).stat().st_mtime_ns:
+        return
     raise StaleEvidenceError(
-        f"`{target}` now resolves to `{resolved}`. The file exists, but its creation during "
-        "this attempt cannot be established. Keep a stable evidence path or use an attempt's captured stream."
-    )
-
-
-def _same_log_lifetime(before: FileBaseline, attempt_dir: Path, target: Path) -> bool:
-    """Prove that the log still has its prelaunch file identity.
-
-    :param FileBaseline before: Contents and identity recorded before launch.
-    :param Path attempt_dir: Directory containing the baseline record and its pins.
-    :param Path target: Current log path.
-    :raises OSError: An existing file's metadata could not be read.
-    :return bool: Whether a hard link or filesystem creation timestamp proves continuity.
-    """
-    try:
-        if before.pin is not None:
-            info = (attempt_dir / EVIDENCE_PINS_DIR / str(before.pin)).lstat()
-            return stat.S_ISREG(info.st_mode) and before.same_file(info)
-        if before.birth_ns is None:
-            return False
-        marker = attempt_dir / EVIDENCE_BASELINE_FILE
-        marker_info = marker.stat()
-        if marker_info.st_dev != before.device:
-            return False
-        # The baseline record predates launch on the same filesystem clock as
-        # the log. Distinct ticks rule out a new file with the old timestamp.
-        marker_birth = file_birth_ns(marker, marker_info)
-        return (
-            marker_birth is not None
-            and before.birth_ns < marker_birth
-            and file_birth_ns(target, target.stat()) == before.birth_ns
-        )
-    except FileNotFoundError:
-        return False
-
-
-def _unchanged_value(target: Path) -> StaleEvidenceError:
-    """Explain why a surviving file with identical contents cannot supply fresh evidence.
-
-    :param Path target: File the attempt's value was to come from.
-    :return StaleEvidenceError: The read's diagnostic.
-    """
-    return StaleEvidenceError(
-        f"`{target}` was not written by this attempt: it still names the same file with "
-        "unchanged contents. Have the trainer replace it when reporting an identical result."
+        f"`{target}` now resolves to `{resolved}`, which was last modified before this "
+        "attempt started, so the trainer exited without writing it."
     )
 
 
@@ -288,9 +242,9 @@ def load_json_value(
     :param dict[str, Any] | None digest: Optional sink that receives the
         ``sha256``/``size_bytes`` of the exact bytes parsed, for evidence
         provenance.
-    :param EvidenceBaseline | None baseline: Value files and their contents at launch.
+    :param EvidenceBaseline | None baseline: Value paths and file stamps recorded at launch.
     :raises TrialPathError: If the path contains a broken link or resolves outside its directory.
-    :raises StaleEvidenceError: If the current contents cannot be attributed to the attempt.
+    :raises StaleEvidenceError: If the file was not written by this attempt.
     :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular file.
     :raises JsonKeyMissingError: If a segment of the dotted ``key`` path is missing, with the
         failing segment as the argument and what the file holds there.
@@ -303,14 +257,10 @@ def load_json_value(
     target = trial_file(trial_dir, attempt_dir, relative_path)
     if not target.is_file():
         raise FileNotFoundError(target)
-    before = _prior_value_file(baseline, trial_dir, relative_path, target)
+    _require_fresh(baseline, trial_dir, attempt_dir, relative_path, target)
     raw = target.read_bytes()
-    if before is not None or digest is not None:
-        file_digest = _file_digest(raw)
-        if before is not None and before.sha256 == file_digest["sha256"]:
-            raise _unchanged_value(target)
-        if digest is not None:
-            digest.update(file_digest)
+    if digest is not None:
+        digest.update(_file_digest(raw))
     cur = strict_json_loads(raw.decode("utf-8"))
     walked: list[str] = []
     for part in key.split("."):
@@ -497,7 +447,7 @@ class TrialContext:
     mlflow_query: MlflowQuery | None = None
     mlflow_environment: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
     mlflow_capture: JsonObject = field(default_factory=dict, compare=False)
-    # Value-file identities and contents recorded before the attempt ran.
+    # Value paths and file stamps recorded before the attempt ran.
     baseline: EvidenceBaseline | None = field(default=None, compare=False)
 
 
@@ -695,7 +645,8 @@ def _extract_log_regex(
 ) -> float:
     """Select a numeric regex match and digest the complete log file.
 
-    On an appended log, match only bytes added after the old contents. First selection
+    A trainer log kept across a trial's attempts is the trial's log, so every line counts
+    once this attempt has written to it. First selection
     stops matching after its first numeric hit but continues reading for the digest.
     Warn when a numeric result leaves unparseable captures behind.
     Provenance includes the selected 1-based line and numeric match count.
@@ -732,37 +683,17 @@ def _extract_log_regex(
     count = 0
     first_unparseable: str | None = None
     try:
-        before = _prior_value_file(ctx.baseline, ctx.trial_dir, cfg.file, target)
-        prefix_size = 0
-        if before is not None and file_sha256(target, limit_bytes=before.size) == before.sha256:
-            if (
-                before.size
-                and ctx.baseline is not None
-                and ctx.baseline.reused
-                and not _same_log_lifetime(before, ctx.attempt_dir, target)
-            ):
-                if target.stat().st_size == before.size:
-                    raise _unchanged_value(target)
-                raise StaleEvidenceError(
-                    f"`{target}` kept its old prefix, but its filesystem could not "
-                    "establish the prior file's identity. Use a fresh log or captured stream."
-                )
-            prefix_size = before.size
+        _require_fresh(ctx.baseline, ctx.trial_dir, ctx.attempt_dir, cfg.file, target)
         with target.open("r", encoding="utf-8", errors="surrogateescape", newline="") as fh:
             for line_no, raw_text in enumerate(fh, 1):
                 raw_line = raw_text.encode("utf-8", errors="surrogateescape")
-                line_start = size_bytes
                 hasher.update(raw_line)
                 size_bytes += len(raw_line)
-                if size_bytes <= prefix_size:
-                    continue
                 if cfg.select == "first" and result is not None:
                     # Value already selected; keep reading only to finish the
                     # whole-file digest.
                     continue
-                # An old line may have been interrupted midway. Match its new suffix
-                # without joining bytes from the two attempts into one value.
-                line = raw_line[max(prefix_size - line_start, 0) :].decode("utf-8")
+                line = raw_line.decode("utf-8")
                 if line.endswith("\r\n"):
                     line = line[:-2] + "\n"
                 elif line.endswith("\r"):
@@ -805,8 +736,6 @@ def _extract_log_regex(
         raise ExtractorError(f"Could not read log file at {target}: {exc}") from exc
 
     sha256 = hasher.hexdigest()
-    if before is not None and before.sha256 == sha256:
-        raise ExtractorError(str(_unchanged_value(target)))
     if first_unparseable is not None:
         if result is None:
             raise ExtractorError(

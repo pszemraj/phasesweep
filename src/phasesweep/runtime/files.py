@@ -61,25 +61,17 @@ def ensure_artifact_dir(path: Path) -> None:
             pass
 
 
-def file_sha256(path: Path, *, limit_bytes: int | None = None) -> str:
-    """Return a file or prefix's SHA-256 digest with bounded reads.
+def file_sha256(path: Path) -> str:
+    """Return a file's SHA-256 digest with bounded reads.
 
     :param Path path: File to hash.
-    :param int | None limit_bytes: Maximum bytes to hash, defaults to the whole file.
     :return str: 64-character hexadecimal digest.
     :raises OSError: The file cannot be read.
     """
     hasher = hashlib.sha256()
     with path.open("rb") as handle:
-        remaining = limit_bytes
-        while remaining is None or remaining > 0:
-            chunk_size = 1024 * 1024 if remaining is None else min(1024 * 1024, remaining)
-            chunk = handle.read(chunk_size)
-            if not chunk:
-                break
+        while chunk := handle.read(1024 * 1024):
             hasher.update(chunk)
-            if remaining is not None:
-                remaining -= len(chunk)
     return hasher.hexdigest()
 
 

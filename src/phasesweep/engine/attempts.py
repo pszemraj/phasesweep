@@ -54,7 +54,6 @@ from phasesweep.errors import (
     format_mismatch,
     operator_step,
 )
-from phasesweep.evidence.baseline import release_evidence_pins
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     canonical_storage_identity,
@@ -428,8 +427,8 @@ def _register_active_attempt(
 def _retire_active_attempt(experiment: Experiment, attempt_id: str) -> None:
     """Best-effort removal of a registry entry whose trial is durably terminal.
 
-    A failed release or deletion leaves the entry for the next preflight,
-    which resolves its terminal trial's ``exited`` lifecycle.
+    A failed deletion leaves the entry for the next preflight, which resolves
+    its terminal trial's ``exited`` lifecycle without changing the study.
 
     :param Experiment experiment: Experiment supplying the registry root.
     :param str attempt_id: Attempt whose trial reached a terminal state.
@@ -439,24 +438,7 @@ def _retire_active_attempt(experiment: Experiment, attempt_id: str) -> None:
         _open_attempt_registry(experiment) as (directory_fd, _entry_paths),
     ):
         if directory_fd is not None:
-            entry_path = _attempts_dir(experiment) / f"{attempt_id}.json"
-            entry = _load_attempt_entry(entry_path, directory_fd=directory_fd)
-            _unlink_attempt_entry(entry_path, entry, directory_fd=directory_fd)
-
-
-def _unlink_attempt_entry(
-    entry_path: Path, entry: Mapping[str, object], *, directory_fd: int
-) -> None:
-    """Release a settled attempt's temporary files before its registry entry.
-
-    :param Path entry_path: Registry entry being retired.
-    :param Mapping[str, object] entry: Validated entry payload.
-    :param int directory_fd: Descriptor for the registry directory.
-    :raises OSError: The release or deletion failed, leaving the entry for preflight.
-    """
-    if entry["kind"] == "trial":
-        release_evidence_pins(Path(json_text(entry, "attempt_dir")))
-    os.unlink(entry_path.name, dir_fd=directory_fd)
+            os.unlink(f"{attempt_id}.json", dir_fd=directory_fd)
 
 
 @contextlib.contextmanager
@@ -993,7 +975,7 @@ def _preflight_active_attempts(
                 and not (retain_recovery_evidence and outcome in {"reaped", "recovered"})
             ):
                 with contextlib.suppress(OSError):
-                    _unlink_attempt_entry(entry_path, entry, directory_fd=directory_fd)
+                    os.unlink(entry_path.name, dir_fd=directory_fd)
     return inspected
 
 
