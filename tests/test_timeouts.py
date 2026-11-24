@@ -1006,11 +1006,13 @@ def test_a_deadline_during_a_finished_trainers_evidence_read_keeps_its_training(
     ) -> float:
         if not slowed:
             slowed.append(None)
-            time.sleep(1.5)
+            assert deadline is not None
+            # Outlast the phase deadline from wherever the trainer's exit left it.
+            time.sleep(max(0.0, deadline - time.monotonic()) + 0.3)
         return real_extractor(ctx, cfg, deadline=deadline, provenance=provenance)
 
     monkeypatch.setattr("phasesweep.engine.trial.run_extractor", slow_once)
-    short = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase(0.5)])
+    short = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase(3.0)])
     with pytest.raises(TimeoutError, match="while reading the evidence of trial 0, which finished"):
         run_experiment(short)
     assert len(calls.read_text().splitlines()) == 1
