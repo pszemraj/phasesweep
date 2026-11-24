@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import optuna
 import pytest
 
 from phasesweep import run_experiment
 from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler
+from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import METRIC_EXTRACTOR_LABEL
 from phasesweep.evidence.evaluation import ExtractorError, run_extractor
@@ -19,7 +21,7 @@ from tests.conftest import (
     make_experiment,
     make_trial_context,
     no_winner_remedy,
-    phase_trials,
+    study_name,
     write_trainer,
 )
 
@@ -43,8 +45,8 @@ def test_an_unreadable_objective_says_which_fix_continues_the_study_and_which_st
         "Fix the failure, then raise phases[p].n_trials"
     )
     assert (
-        f"{_UNREADABLE}; if the `metric` settings are wrong, correct them under a new "
-        "`experiment` name."
+        f"{_UNREADABLE}; if the `metric` settings are wrong, correct them and rerun: the "
+        "finished trials are re-read from their kept evidence, not retrained."
     ) in remedy
     assert "lossz" not in remedy
 
@@ -125,15 +127,20 @@ def test_an_aborted_phase_with_an_unreadable_objective_gives_steps_that_work(
     assert message.index(_UNREADABLE) < message.index(
         "Fix the cause, then raise phases[p].n_trials"
     )
-    assert "correct them under a new `experiment` name" in message
+    assert "correct them and rerun" in message
 
-    renamed = experiment("t_fixed", "loss", 4)
-    run_experiment(renamed)
-    assert [trial.state.name for trial in phase_trials(renamed)] == ["COMPLETE"] * 4
+    def states_of(config: Experiment) -> list[str]:
+        storage = _resolve_storage(config.resolved_storage)
+        study = optuna.load_study(study_name=study_name(config), storage=storage)
+        return [trial.state.name for trial in study.get_trials(deepcopy=False)]
+
+    corrected = experiment("t", "loss", 4)
+    run_experiment(corrected)
+    assert states_of(corrected) == ["COMPLETE"] * 4
 
     _write_result_trainer(tmp_path, keys=["loss", "lossz"])
     run_experiment(experiment("t", "lossz", 6))
-    states = [trial.state.name for trial in phase_trials(wrong)]
+    states = states_of(wrong)
     assert states.count("FAIL") == 2
     assert states.count("COMPLETE") == 4
 

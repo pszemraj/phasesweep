@@ -9,7 +9,7 @@ import os
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import optuna
 
@@ -78,6 +78,10 @@ from phasesweep.runtime.reaper import (
     stale_trial_process_decision,
 )
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, servicing_shutdown_signal
+
+if TYPE_CHECKING:
+    from phasesweep.engine.trial import TrialResult
+    from phasesweep.evidence.baseline import EvidenceBaseline
 
 log = logging.getLogger(__name__)
 
@@ -1183,6 +1187,107 @@ def _resolve_attempt(
     return terminated
 
 
+def read_finished_attempt(
+    trials: Mapping[int, optuna.trial.FrozenTrial],
+    trial: optuna.trial.FrozenTrial,
+    record: _AttemptRecord,
+    *,
+    producing: Experiment,
+    reading: Experiment,
+    current: Experiment,
+    trainer_duration: float,
+    baseline: EvidenceBaseline,
+) -> tuple[TrialResult, str]:
+    """Read a finished attempt's kept evidence after the fact, through the live extraction path.
+
+    The one way PhaseSweep reads a trainer that finished while nothing was reading it: recovery
+    of a finished orphan reads it under its producing configuration, and a study filled under
+    changed reading settings (:mod:`phasesweep.engine.reread`) reads it under the current one.
+    What the trainer ran and where it logged (run name, tracker target, environment) always
+    come from ``producing``; the extractors, constraints and gates come from ``reading``; the
+    attempt's own evidence baseline says which value files are its own.
+
+    :param Mapping[int, optuna.trial.FrozenTrial] trials: The trial's study's trials by number,
+        for the earlier attempts a rerun's directory holds.
+    :param optuna.trial.FrozenTrial trial: The trial whose attempt finished.
+    :param _AttemptRecord record: Its attempt, with a trial directory and generation.
+    :param Experiment producing: The configuration that launched the attempt.
+    :param Experiment reading: The configuration whose reading settings apply.
+    :param Experiment current: The invocation's configuration, for its MLflow polling controls.
+    :param float trainer_duration: The trainer's recorded wall-clock seconds.
+    :param EvidenceBaseline baseline: The attempt's evidence baseline.
+    :raises ProcessCleanupUncertainError: The attempt records an unusable trial directory, so
+        the run its trial logs to cannot be named.
+    :raises StudyStorageUnavailableError: The trial lacks its recorded trainer input or overrides.
+    :return tuple[TrialResult, str]: The extraction result and the trial's recorded overrides.
+    """
+    from phasesweep.engine.evidence import _earlier_attempts
+    from phasesweep.engine.trial import (
+        ExecutedTrial,
+        _environment_identity,
+        extract_trial_result,
+        trial_run_name,
+    )
+    from phasesweep.evidence.evaluation import TrialContext
+    from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
+    from phasesweep.runtime.process import ProcessResult
+
+    if record.trial_dir is None or record.generation_id is None:
+        raise StudyStorageUnavailableError(
+            f"Attempt {record.attempt_id} records no trial directory or generation to read."
+        )
+    try:
+        wandb_run_id = _trial_dir_opener(record.trial_dir)
+    except ValueError as exc:
+        raise ProcessCleanupUncertainError(
+            f"Attempt {record.attempt_id} records an unusable trial directory, so the run its "
+            f"trial logs to cannot be named: {exc}.",
+            action=OperatorAction.RESTORE_LEDGER,
+        ) from exc
+    environment = _environment_identity(
+        producing, record.phase_name, require_wandb_online=False
+    ).values
+    trainer_input = trial.user_attrs.get(TRAINER_INPUT_ATTR)
+    overrides_json = trial.user_attrs.get(OVERRIDES_ATTR)
+    if (
+        not isinstance(trainer_input, dict)
+        or not isinstance(trainer_input.get("sha256"), str)
+        or not isinstance(overrides_json, str)
+    ):
+        raise StudyStorageUnavailableError(
+            f"Completed attempt {record.attempt_id} lacks its recorded trainer input or overrides."
+        )
+    gates = reading.phase(record.phase_name).gates
+    ctx = TrialContext(
+        experiment=producing.experiment,
+        phase=record.phase_name,
+        trial_id=trial.number,
+        generation_id=record.generation_id,
+        attempt_id=record.attempt_id,
+        overrides_sha256=trainer_input["sha256"],
+        trial_dir=record.trial_dir,
+        attempt_dir=record.attempt_dir,
+        run_name=trial_run_name(producing, record.phase_name, trial.number, record.attempt_id),
+        return_code=0,
+        duration_seconds=trainer_duration,
+        wandb_run_id=wandb_run_id,
+        mlflow_settings=(
+            None if producing.mlflow is None else producing.mlflow.target(polling=current.mlflow)
+        ),
+        mlflow_query=compile_mlflow_query(reading, gates),
+        wandb_environment=environment,
+        mlflow_environment=environment,
+        baseline=baseline,
+        earlier_attempts=_earlier_attempts(trials, trial),
+    )
+    result = extract_trial_result(
+        experiment=reading,
+        executed=ExecutedTrial(ctx, ProcessResult(0, False, -1, trainer_duration)),
+        gates=gates,
+    )
+    return result, overrides_json
+
+
 def _recover_completed_trial(
     study: optuna.Study,
     trial: optuna.trial.FrozenTrial,
@@ -1225,18 +1330,8 @@ def _recover_completed_trial(
         a malformed directory, so the trial's W&B run or the attempts whose histories it
         continues cannot be named.
     """
-    from phasesweep.engine.evidence import _earlier_attempts
-    from phasesweep.engine.trial import (
-        ExecutedTrial,
-        _environment_identity,
-        extract_trial_result,
-        record_trial_result,
-        trial_run_name,
-    )
+    from phasesweep.engine.trial import record_trial_result
     from phasesweep.evidence.baseline import read_evidence_baseline
-    from phasesweep.evidence.evaluation import TrialContext
-    from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
-    from phasesweep.runtime.process import ProcessResult
 
     lifecycle = read_attempt_lifecycle(record.attempt_dir, expected_attempt_id=record.attempt_id)
     trainer_duration = None if lifecycle is None else _completed_trainer_duration(trial, lifecycle)
@@ -1267,53 +1362,8 @@ def _recover_completed_trial(
         # to be this attempt's own, so the training is not accepted and the trial reruns.
         log.warning("Attempt %s cannot be recovered as finished: %s", record.attempt_id, exc)
         return False
-    try:
-        wandb_run_id = _trial_dir_opener(record.trial_dir)
-    except ValueError as exc:
-        raise ProcessCleanupUncertainError(
-            f"Attempt {record.attempt_id} records an unusable trial directory, so the run its "
-            f"trial logs to cannot be named: {exc}.",
-            action=OperatorAction.RESTORE_LEDGER,
-        ) from exc
     experiment = _load_generation_experiment(_experiment_dir(current), record.generation_id)
     phase = experiment.phase(record.phase_name)
-    environment = _environment_identity(
-        experiment, record.phase_name, require_wandb_online=False
-    ).values
-    trainer_input = trial.user_attrs.get(TRAINER_INPUT_ATTR)
-    overrides_json = trial.user_attrs.get(OVERRIDES_ATTR)
-    if (
-        not isinstance(trainer_input, dict)
-        or not isinstance(trainer_input.get("sha256"), str)
-        or not isinstance(overrides_json, str)
-    ):
-        raise StudyStorageUnavailableError(
-            f"Completed attempt {record.attempt_id} lacks its recorded trainer input or overrides; its trial remains RUNNING."
-        )
-    ctx = TrialContext(
-        experiment=experiment.experiment,
-        phase=record.phase_name,
-        trial_id=trial.number,
-        generation_id=record.generation_id,
-        attempt_id=record.attempt_id,
-        overrides_sha256=trainer_input["sha256"],
-        trial_dir=record.trial_dir,
-        attempt_dir=record.attempt_dir,
-        run_name=trial_run_name(experiment, record.phase_name, trial.number, record.attempt_id),
-        return_code=0,
-        duration_seconds=trainer_duration,
-        wandb_run_id=wandb_run_id,
-        mlflow_settings=(
-            None if experiment.mlflow is None else experiment.mlflow.target(polling=current.mlflow)
-        ),
-        mlflow_query=compile_mlflow_query(experiment, phase.gates),
-        wandb_environment=environment,
-        mlflow_environment=environment,
-        baseline=baseline,
-        earlier_attempts=_earlier_attempts(
-            {other.number: other for other in study.get_trials(deepcopy=False)}, trial
-        ),
-    )
     active_trial = optuna.Trial(study, trial._trial_id)
     try:
         active_trial.set_user_attr(DURATION_ATTR, trainer_duration)
@@ -1323,10 +1373,15 @@ def _recover_completed_trial(
             f"Completed attempt {record.attempt_id} trainer exit evidence could not be recorded; its trial remains RUNNING."
         ) from exc
     try:
-        result = extract_trial_result(
-            experiment=experiment,
-            executed=ExecutedTrial(ctx, ProcessResult(0, False, -1, trainer_duration)),
-            gates=phase.gates,
+        result, overrides_json = read_finished_attempt(
+            {other.number: other for other in study.get_trials(deepcopy=False)},
+            trial,
+            record,
+            producing=experiment,
+            reading=experiment,
+            current=current,
+            trainer_duration=trainer_duration,
+            baseline=baseline,
         )
     except PhaseSweepShutdown:
         _warn_deferred_extraction(

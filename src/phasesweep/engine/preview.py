@@ -52,9 +52,11 @@ from phasesweep.engine.phase import (
     _winner_overrides,
 )
 from phasesweep.engine.progress import _log_phase_header
+from phasesweep.engine.reread import describe_changes, fill_source
 from phasesweep.engine.state import (
     RecoveredTrialState,
     Winner,
+    _recorded_identity,
     _recovered_trial_state,
     _unique_trial_outcomes,
 )
@@ -260,9 +262,27 @@ def _addressed_record(
         return None, fresh
     inherited = _inherited_override_payload(phase, inherited_winners)
     name = phase_study_name(experiment, phase, inherited)
-    for record in recorded:
-        if record.study is not None and record.study.study_name == name:
-            return name, record
+    addressed = next(
+        (r for r in recorded if r.study is not None and r.study.study_name == name), None
+    )
+    if addressed is not None and (
+        addressed.study is None or _recorded_identity(addressed.study) is not None
+    ):
+        return name, addressed
+    others = [r.study for r in recorded if r.study is not None and r.study.study_name != name]
+    source = fill_source(experiment, phase, inherited, others)
+    if source is not None:
+        # A run fills the study from kept evidence before it launches anything; the re-read
+        # outcomes are known only once read, so the source's counts stand in for them.
+        log.info(
+            "DRY RUN phase=%s reading settings changed (%s): would re-read %s from kept "
+            "evidence; nothing would retrain",
+            phase.name,
+            describe_changes(source.changes),
+            plural(source.rereads, "finished trial"),
+        )
+        stand_in = next(r for r in recorded if r.study is source.study)
+        return name, replace(stand_in, study=None)
     note = new_study_note(
         phase, inherited, [record.study for record in recorded if record.study is not None]
     )

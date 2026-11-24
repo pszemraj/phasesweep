@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from stat import S_ISDIR
-from typing import Any
+from typing import Any, Protocol
 
 import optuna
 from optuna.trial import FrozenTrial
@@ -140,12 +140,34 @@ class TrialResult:
     observed: dict[str, float] = field(default_factory=dict)
 
 
-def record_trial_result(trial: optuna.Trial, result: TrialResult, *, overrides_json: str) -> None:
+class UserAttrSink(Protocol):
+    """Where a trial's extracted evidence is recorded: a live trial, or a trial being rebuilt."""
+
+    @property
+    def user_attrs(self) -> Mapping[str, object]:
+        """Return the attributes recorded so far.
+
+        :return Mapping[str, object]: Attribute value by name.
+        """
+        ...
+
+    def set_user_attr(self, key: str, value: object) -> None:
+        """Record one attribute.
+
+        :param str key: Attribute name.
+        :param object value: JSON-serializable value.
+        """
+        ...
+
+
+def record_trial_result(trial: UserAttrSink, result: TrialResult, *, overrides_json: str) -> None:
     """Persist extracted evidence before committing a trial's terminal outcome.
 
-    Replace optional attributes from an earlier extraction with this result's values.
+    Replace optional attributes from an earlier extraction with this result's values. A live
+    trial records them one storage write each; a study filled from kept evidence
+    (:mod:`phasesweep.engine.reread`) records them on the trial it then writes whole.
 
-    :param optuna.Trial trial: Active trial receiving extracted evidence.
+    :param UserAttrSink trial: Active trial, or trial being rebuilt, receiving the evidence.
     :param TrialResult result: Canonical extraction result.
     :param str overrides_json: Fully composed trainer overrides serialized as JSON.
     """

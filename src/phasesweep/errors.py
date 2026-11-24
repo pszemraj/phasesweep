@@ -172,13 +172,13 @@ def timeout_step(phase_name: str) -> str:
 def unreadable_objective_step(*, persistent: bool) -> str:
     """Say what to fix when a trainer ran but its objective could not be read.
 
-    The cause is the trainer's output or the config's ``metric`` settings. The settings are
-    part of a persistent study's identity, so correcting them is refused over the recorded
-    trials and starts a fresh study instead; a fixed trainer output retries in place, by the
-    retry step that follows this sentence in a persistent study.
+    The cause is the trainer's output or the config's ``metric`` settings. Corrected settings
+    in a persistent study re-read every finished trainer's kept evidence and retrain nothing
+    (:mod:`phasesweep.engine.reread`); a fixed trainer output retries in place, by the retry
+    step that follows this sentence in a persistent study.
 
-    :param bool persistent: Whether the study is recorded, which decides whether a corrected
-        ``metric`` can continue it.
+    :param bool persistent: Whether the study is recorded, which decides whether corrected
+        ``metric`` settings re-read its finished trials.
     :return str: One sentence that leads the retry step.
     """
     if not persistent:
@@ -188,7 +188,8 @@ def unreadable_objective_step(*, persistent: bool) -> str:
         )
     return (
         "A trainer ran but its objective could not be read; if the `metric` settings are wrong, "
-        "correct them under a new `experiment` name."
+        "correct them and rerun: the finished trials are re-read from their kept evidence, "
+        "not retrained."
     )
 
 

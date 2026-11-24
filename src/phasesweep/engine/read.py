@@ -47,6 +47,7 @@ from phasesweep.engine.growth import recorded_growth
 from phasesweep.engine.ledger import (
     ValidatedLedger,
     log_storage_read_failure,
+    read_every_phase_study,
     read_phase_studies,
     read_phase_trials,
     read_trial_stats,
@@ -84,6 +85,7 @@ from phasesweep.engine.repeats import (
     ranked_group,
     repeat_axis,
 )
+from phasesweep.engine.reread import PendingRereadNotice, pending_reread
 from phasesweep.engine.selection import (
     PhaseAbortRefusedError,
     TieGroupComparison,
@@ -1264,8 +1266,42 @@ def _status_phase_refusal(
 
 
 PhaseRefusal: TypeAlias = (
-    PhaseAbortRefusedError | StudySchemaMismatchError | StudyFingerprintMismatchError
+    PhaseAbortRefusedError
+    | StudySchemaMismatchError
+    | StudyFingerprintMismatchError
+    | PendingRereadNotice
 )
+
+
+def _pending_rereads(
+    experiment: Experiment, ledger: ValidatedLedger, study_names: Mapping[str, str]
+) -> dict[str, PhaseRefusal]:
+    """Name each phase whose addressed study waits to be filled from kept evidence.
+
+    :param Experiment experiment: Current config.
+    :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
+    :param Mapping[str, str] study_names: The study each phase addresses.
+    :return dict[str, PhaseRefusal]: The notice, or the refusal of a study with the same
+        inherited values and another training identity or a malformed one, by phase name;
+        empty without a readable ledger.
+    """
+    try:
+        every = read_every_phase_study(ledger, list(study_names))
+    except StudyStorageUnavailableError:
+        return {}
+    pending: dict[str, PhaseRefusal] = {}
+    for phase in experiment.phases:
+        name = study_names.get(phase.name)
+        if name is None:
+            continue
+        try:
+            notice = pending_reread(experiment, phase, name, every.get(phase.name, []))
+        except (StudyFingerprintMismatchError, StudySchemaMismatchError) as exc:
+            pending[phase.name] = exc
+            continue
+        if notice is not None:
+            pending[phase.name] = notice
+    return pending
 
 
 def _phase_refusals(
@@ -1273,11 +1309,13 @@ def _phase_refusals(
 ) -> dict[str, PhaseRefusal]:
     """Give the refusal a run would meet at each phase, in the study it would address.
 
-    A phase's recorded failure policy is judged first, as a run's preflight does. Otherwise a
-    populated study is judged against its recorded identity, whose inherited values are the
-    ones that address it, so only a change to the phase's own config refuses. Invalid policy
-    state is reported for its phase alongside other refusals. It does not prevent status from
-    reporting trial counts and publication facts.
+    A phase whose addressed study waits to be filled from kept evidence under changed reading
+    settings reports that, with the command that fills it (:mod:`phasesweep.engine.reread`).
+    Otherwise a phase's recorded failure policy is judged first, as a run's preflight does,
+    then a populated study is judged against its recorded identity, whose inherited values and
+    reading settings are the ones that address it, so only a change to what was trained
+    refuses. Invalid policy state is reported for its phase alongside other refusals. It does
+    not prevent status from reporting trial counts and publication facts.
 
     :param Experiment experiment: Current config, which decides whether a recorded abort is
         retired.
@@ -1294,9 +1332,10 @@ def _phase_refusals(
     except StudyStorageUnavailableError:
         return {}
     refusals: dict[str, PhaseRefusal] = {}
+    refusals.update(_pending_rereads(experiment, ledger, study_names))
     for phase in experiment.phases:
         study = studies[phase.name]
-        if study is None:
+        if study is None or phase.name in refusals:
             continue
         try:
             refusal = _status_phase_refusal(experiment, phase, study)
@@ -1711,10 +1750,11 @@ def read_trial_tables(
     tables: list[TrialTable] = []
     unreadable: StudyStorageUnavailableError | None = None
     studies: dict[str, optuna.Study | None] = {}
+    study_names = _latest_study_names(experiment, publication, current_generation_id)
+    pending: Mapping[str, PhaseRefusal] = {}
     try:
-        studies = read_phase_studies(
-            ledger, _latest_study_names(experiment, publication, current_generation_id)
-        )
+        studies = read_phase_studies(ledger, study_names)
+        pending = _pending_rereads(experiment, ledger, study_names)
     except StudyStorageUnavailableError as exc:
         unreadable = exc
     for phase in experiment.phases:
@@ -1723,14 +1763,24 @@ def read_trial_tables(
             tables.append(_trial_table(experiment, phase, [], None, available=False))
             continue
         study = studies[phase.name]
+        notice = pending.get(phase.name)
         if study is None:
-            tables.append(_trial_table(experiment, phase, [], winners.get(phase.name)))
+            tables.append(
+                _trial_table(
+                    experiment,
+                    phase,
+                    [],
+                    winners.get(phase.name),
+                    refusal=None if notice is None else (str(notice), operator_step(notice)),
+                )
+            )
             continue
-        refusal: PhaseAbortRefusedError | StudySchemaMismatchError | None
-        try:
-            refusal = _status_phase_refusal(experiment, phase, study)
-        except StudySchemaMismatchError as exc:
-            refusal = exc
+        refusal: PhaseRefusal | None = notice
+        if refusal is None:
+            try:
+                refusal = _status_phase_refusal(experiment, phase, study)
+            except StudySchemaMismatchError as exc:
+                refusal = exc
         identity = _recorded_identity(study)
         tables.append(
             _trial_table(

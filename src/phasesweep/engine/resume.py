@@ -17,7 +17,7 @@ from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import PhaseTimeoutError, phase_timeout
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication_validation import ValidatedPublication
-from phasesweep.engine.state import Winner
+from phasesweep.engine.state import Winner, _recorded_identity
 
 
 def _run_deadline_refusal(experiment: Experiment, phase_name: str) -> PhaseTimeoutError:
@@ -229,7 +229,9 @@ def _preflight_reached_fingerprint(
     :param dict[str, Winner] preloaded_winners: Validated skipped-phase winners,
         used to resolve the reached phase's inherited values and so its study.
     :param Mapping[str, Sequence[optuna.Study]] existing_studies: Every existing study of each
-        phase, keyed by phase name; a no-op if the reached phase addresses none yet.
+        phase, keyed by phase name; a no-op if the reached phase addresses none yet, or one that
+        records no identity, which the phase's run fills from kept evidence or binds
+        (:mod:`phasesweep.engine.reread`).
     :raises StudyFingerprintMismatchError: The reached study's stored
         fingerprint does not match the current config.
     """
@@ -244,6 +246,6 @@ def _preflight_reached_fingerprint(
             experiment, phase, fingerprint_ops._inherited_override_payload(phase, inherited)
         ),
     )
-    if study is None:
+    if study is None or _recorded_identity(study) is None:
         return
     fingerprint_ops._verify_fingerprint(study, experiment, phase, inherited)

@@ -63,6 +63,7 @@ from phasesweep.engine.progress import (
     _warn_deferred_extraction,
 )
 from phasesweep.engine.repeats import repeat_axis
+from phasesweep.engine.reread import fill_note, fill_source, fill_study
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
     PhaseTrialsFailedError,
@@ -91,6 +92,7 @@ from phasesweep.engine.state import (
     WinnerSource,
     _completed_trainer_duration,
     _parsed_trial_outcome,
+    _recorded_identity,
     _trial_attempt_dir,
     _trial_lifecycle,
     _trial_outcome_payload,
@@ -1600,8 +1602,11 @@ def _run_phase(
 ) -> Winner:
     """Execute one phase end-to-end (sampler, study.optimize, winner selection).
 
-    Opens the study the parents' winners address (:func:`phase_study_name`), saying so when
-    it starts a new one beside the phase's other studies, which stay as they are.
+    Opens the study the parents' winners and the reading settings address
+    (:func:`phase_study_name`). One that records no identity is first filled from the kept
+    evidence of the phase's study under earlier reading settings, when there is one
+    (:mod:`phasesweep.engine.reread`); otherwise the run says when it starts a new study beside
+    the phase's other studies, which stay as they are.
     Validates the phase's durable state (:func:`_resume_phase`), runs Optuna's
     optimize loop with every worker sharing one :class:`_PhaseExecution`, and
     turns how that loop ended into the phase's winner or refusal
@@ -1655,6 +1660,13 @@ def _run_phase(
     # The live opener also claims a newly created study's publication root,
     # before any inspection, reaping, or trial work below can run against it.
     study = open_phase_study(ledger, phase, study_name)
+    if _recorded_identity(study) is None:
+        # A changed reading setting addresses a study of its own; the trials another study of
+        # the phase measured under the same values are re-read into it, never retrained.
+        source = fill_source(experiment, phase, inherited, others)
+        if source is not None:
+            filled = fill_study(experiment, phase, study, source)
+            report.info("%s  %s", phase.name, fill_note(source, filled))
     if not study.get_trials(deepcopy=False):
         note = new_study_note(phase, inherited, others)
         if note is not None:
