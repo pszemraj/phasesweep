@@ -975,7 +975,7 @@ def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monk
 
     def lookup(path):
         calls.append(path)
-        return SimpleNamespace(state="finished", summary_metrics={})
+        return SimpleNamespace(state="finished", summary_metrics={"other_key": 1})
 
     monkeypatch.setattr(public, "Api", lambda **kwargs: SimpleNamespace(run=lookup))
     monkeypatch.setattr(
@@ -1781,7 +1781,6 @@ def test_wandb_missing_run_diagnostic_follows_the_last_observation(
     from wandb.errors import CommError
 
     from phasesweep.evidence.wandb import (
-        WandbMissingKeysError,
         WandbPollTimeout,
         WandbRunMissingError,
         WandbSetupError,
@@ -1817,8 +1816,6 @@ def test_wandb_missing_run_diagnostic_follows_the_last_observation(
         if last_observation == "missing"
         else WandbSetupError
         if last_observation == "permission"
-        else WandbMissingKeysError
-        if last_observation == "summary"
         else WandbPollTimeout
     )
     with pytest.raises(expected) as refused:
@@ -1827,8 +1824,8 @@ def test_wandb_missing_run_diagnostic_follows_the_last_observation(
     assert calls >= 2
     assert "private" not in str(refused.value)
     if isinstance(refused.value, WandbPollTimeout):
-        # Only a lookup that failed in transport leaves the run unanswered.
-        assert refused.value.reached is (last_observation != "network")
+        # A finished run with an empty summary gives no usable answer either.
+        assert refused.value.reached is (last_observation == "running")
         detail = str(refused.value.last_error)
         assert "private" not in detail
         assert "Could not find run" not in detail

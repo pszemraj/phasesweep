@@ -363,7 +363,7 @@ phases: list[object] (required)
         sha256: string (required)
 
       # Variant wandb_summary_required: require summary keys, of any value type, in the finished W&B capture the phase's other W&B readers share.
-      # Without a W&B objective or constraint, the capture takes the first finished summary, so a missing key fails the gate at once.
+      # Without a W&B objective or constraint, the capture takes the first populated finished summary that matches its history. A key missing from that capture fails the gate.
       # Such gate-only phases may use different W&B targets from one another.
       - type: "wandb_summary_required" (required)
         <<: WandbTarget
@@ -629,7 +629,7 @@ WandbExtractor:
 
   # Exact nonempty key in the finished summary, for example eval/loss, or eval/loss.min for a define_metric summary=min aggregate.
   # A bare key never stands in for its aggregate.
-  # Warning: a metric_key missing from the finished summary is polled until timeout_seconds runs out, then fails the read, so a misspelled key costs that every trial.
+  # Warning: a metric_key missing from a populated, history-consistent finished summary is polled until timeout_seconds runs out, then fails the read, so a misspelled key costs that every trial.
   metric_key: string (required)
 
   # Nonempty history key logged with metric_key that marks where it was measured, for example eval/step or tokens. _step is W&B's own step.
@@ -660,9 +660,9 @@ WandbTarget:
   poll_seconds: float = 2.0
 
   # Seconds one attempt may spend capturing the finished summary, at least 1, worker startup, SDK calls and polling included. Phase and run deadlines cap it too.
-  # W&B can report a run finished minutes before it serves the run's summary, longest for a resumed run, so a key missing from a finished summary fails the read only when this runs out.
-  # Warning: a metric_key or gate key the trainer never logs therefore costs this much every trial.
+  # If W&B still serves an empty summary or its step disagrees with the history index at the deadline, rerun the same persistent config to read the finished trial.
+  # Warning: a required numeric key missing from a populated, history-consistent summary costs the full polling budget.
   # After the objective is accepted, locating its history position gets a fresh budget of this length, capped by the same deadlines.
   # Only a history index behind the summary is waited for; rows that carry no position settle at once with none.
-  # A capture that runs out fails the read. A position lookup that runs out only leaves the position unrecorded.
+  # A position lookup that runs out only leaves the position unrecorded.
   timeout_seconds: float = 600.0

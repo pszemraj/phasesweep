@@ -190,8 +190,8 @@ class TrackingTargetUnavailableError(PhaseSweepError):
 
 
 TRACKER_UNREADABLE_STEP = (
-    "Restore access to the tracker or install its SDK, then run the same config again; the "
-    f"finished training is kept. If the tracker is gone for good, {FRESH_STUDY}."
+    "Run the same config again once the tracker serves the evidence. Finished training is kept. "
+    f"If access failed, check credentials and SDK installation. If the tracker is gone for good, {FRESH_STUDY}."
 )
 
 

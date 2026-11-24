@@ -849,7 +849,8 @@ def _capture_wandb(
     :param float | None deadline: Absolute monotonic deadline, also bounded by the source timeout.
     :raises DeadlineExceededError: The execution deadline prevents capture.
     :raises EvidenceUnreadableError: W&B gave no answer: authentication or setup failed, the
-        SDK is missing, the reader worker failed, or every poll failed in transport.
+        SDK is missing, the reader worker failed, or the last poll failed in transport or
+        found a finished summary still being ingested.
     :raises ExtractorError: The run is missing, ended unsuccessfully or never finished, shows
         nothing a rerun logged, the finished summary lacks required keys, or evidence is invalid.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.

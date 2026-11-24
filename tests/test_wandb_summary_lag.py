@@ -10,14 +10,18 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from phasesweep import run_experiment
+from phasesweep.engine.errors import TrackingTargetUnavailableError
+from phasesweep.engine.state import ATTEMPT_ID_ATTR
 from phasesweep.evidence.evaluation import DeadlineExceededError, ExtractorError, run_extractor
 from phasesweep.evidence.models import WandbExtractor
-from tests.conftest import make_trial_context
-from tests.tracking_helpers import ManualClock
+from tests.conftest import make_trial_context, phase_trials
+from tests.tracking_helpers import ManualClock, switchable_wandb, wandb_objective_experiment
 
 _LAUNCHED_AT = 1_000.0
 _KEY = "eval/loss.min"
@@ -174,16 +178,32 @@ def test_a_summary_served_before_the_history_index_is_not_read(
     assert clock.now == 65
 
 
+@pytest.mark.parametrize("initial_step", [None, 3], ids=["both-unpublished", "history-first"])
 def test_a_gate_only_read_waits_for_the_summary_to_reach_the_history(
     monkeypatch: pytest.MonkeyPatch,
+    initial_step: int | None,
 ) -> None:
-    """With no numeric key to wait for, an empty finished summary is still not read while history exists."""
+    """A gate-only read waits for a summary even when the history index is unpublished too."""
     clock, _ = _serve(
         monkeypatch,
-        lambda read: ("finished", {} if read < 2 else {"_step": 3, "complete": True}, 3),
+        lambda read: (
+            ("finished", {}, initial_step)
+            if read < 2
+            else ("finished", {"_step": 3, "complete": True}, 3)
+        ),
     )
     assert _poll(required=(), presence_keys=["complete"])["present_keys"] == ["complete"]
     assert clock.now == 10
+
+
+def test_a_finished_summary_behind_its_history_stays_unreadable_on_a_rerun(monkeypatch) -> None:
+    """A partially ingested summary at the deadline cannot establish which attempt logged."""
+    from phasesweep.evidence.wandb import WandbPollTimeout
+
+    _serve(monkeypatch, lambda _: ("finished", {"_step": 1, "_timestamp": 1.0, _KEY: 0.1}, 2))
+    with pytest.raises(WandbPollTimeout) as caught:
+        _poll(logged_after=_LAUNCHED_AT)
+    assert not caught.value.reached
 
 
 def test_a_finished_summary_missing_a_key_fails_only_at_the_deadline(
@@ -197,6 +217,28 @@ def test_a_finished_summary_missing_a_key_fails_only_at_the_deadline(
         _poll()
     assert (caught.value.missing, caught.value.available) == ([_KEY], ["_step", "eval/loss"])
     assert caught.value.waited_seconds == clock.now == 240
+
+
+@pytest.mark.integration
+def test_a_late_summary_scores_the_original_trial_on_resume(
+    tmp_path: Path, wandb_worker_sdk: Callable[[str], None]
+) -> None:
+    """A finished run whose summary is empty past the deadline costs one trainer launch."""
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    tracker.switch("empty")
+    experiment, launches = wandb_objective_experiment(tmp_path, n_trials=1, timeout_seconds=6)
+    with pytest.raises(TrackingTargetUnavailableError, match="summary"):
+        run_experiment(experiment)
+    (pending,) = phase_trials(experiment)
+    assert pending.state.name == "RUNNING"
+    assert tracker.lookups("empty") > 0
+
+    tracker.switch("up")
+    assert run_experiment(experiment)["p"].metric == 1.0
+    (recovered,) = phase_trials(experiment)
+    assert recovered.state.name == "COMPLETE"
+    assert recovered.user_attrs[ATTEMPT_ID_ATTR] == pending.user_attrs[ATTEMPT_ID_ATTR]
+    assert launches.read_text().splitlines() == ["launch"]
 
 
 @pytest.mark.parametrize("recovers", [False, True], ids=["outage", "recovers"])

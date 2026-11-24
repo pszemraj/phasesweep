@@ -510,7 +510,7 @@ class SwitchableWandb:
     def switch(self, mode: str) -> None:
         """Answer every later run lookup in ``mode``.
 
-        :param str mode: ``up``, ``crashed``, ``denied`` or ``hang``.
+        :param str mode: ``up``, ``empty`` (summary still unpublished), ``crashed``, ``denied`` or ``hang``.
         """
         self.mode.write_text(mode)
 
@@ -557,7 +557,8 @@ def switchable_wandb(install_sdk, tmp_path: Path) -> SwitchableWandb:
                 if mode == "denied":
                     raise _Denied("credentials rejected")
                 state = "crashed" if mode == "crashed" else "finished"
-                return type("Run", (), {{"state": state, "summary_metrics": {{"x": 1.0}}}})()
+                summary = {{}} if mode == "empty" else {{"x": 1.0}}
+                return type("Run", (), {{"state": state, "summary_metrics": summary}})()
     """)
     return tracker
 
@@ -570,6 +571,7 @@ def wandb_objective_experiment(
     switch_at_launch: tuple[SwitchableWandb, int, str] | None = None,
     max_consecutive_failures: int = 5,
     metric_max: float | None = None,
+    timeout_seconds: float = 30,
 ) -> tuple[Experiment, Path]:
     """Build a persistent sweep whose objective W&B reports once its trainer exits cleanly.
 
@@ -584,6 +586,7 @@ def wandb_objective_experiment(
         its own evidence and every later lookup see it.
     :param int max_consecutive_failures: The phase's failure limit.
     :param float | None metric_max: Upper bound above which the objective is infeasible.
+    :param float timeout_seconds: One W&B capture's polling budget, defaults to 30.
     :return tuple[Experiment, Path]: The experiment and its trainer launch log.
     """
     from phasesweep.config.models import Metric
@@ -619,7 +622,7 @@ def wandb_objective_experiment(
         project="p",
         metric_key="x",
         poll_seconds=0.01,
-        timeout_seconds=30,
+        timeout_seconds=timeout_seconds,
     )
     experiment = make_experiment(
         persistent=tmp_path,

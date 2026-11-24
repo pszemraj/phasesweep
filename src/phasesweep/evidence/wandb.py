@@ -39,9 +39,8 @@ _REPORT_SECONDS = 2.0
 class WandbPollTimeout(TimeoutError):
     """The complete worker exhausted its summary visibility budget.
 
-    ``reached`` says whether the last poll got an answer about the run: a run seen but
-    never finished, or finished without its keys, is a verdict on the trial, while polls
-    that all failed in transport or setup say nothing about it.
+    ``reached`` says whether the last poll got a usable answer about the run. A transport
+    failure or a finished run whose summary is still being ingested leaves the read pending.
     """
 
     run_id: str
@@ -254,7 +253,7 @@ def poll_wandb_summary(
     :param float | None deadline: Absolute deadline including worker startup.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
     :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget; it was
-        reached only when the worker reports that its last poll got an answer about the run.
+        reached only when the worker reports that its last poll got a usable answer.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
     :raises WandbRunStaleError: By the deadline the rerun's run never showed a row logged
         after it launched, or a newer attempt replaced the retained summary.
@@ -724,8 +723,8 @@ def _poll_wandb_summary(
     No lookup starts after the deadline, but the answer to one in flight is used. Every poll
     builds a new client, because a client keeps the run it first fetched.
 
-    The public API reports a run ``finished`` with its full history count as soon as
-    ``wandb.finish()`` returns, but may serve the summary minutes later: first empty, or
+    The public API can report a run ``finished`` before it serves the history index
+    or the summary. The summary may take minutes to arrive: first empty, or
     for a resumed run still the earlier attempt's. So nothing short of the deadline
     establishes that a finished summary lacks a key. A summary counts only once it is as
     far as the history the same answer reports (:func:`_summary_matches_history`), so a
@@ -756,7 +755,7 @@ def _poll_wandb_summary(
     :param float | None deadline: Absolute ``time.monotonic()`` deadline from the parent.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
     :raises WandbPollTimeout: The run did not finish with the required keys in time,
-        reached when the last poll got an answer about the run.
+        reached when the last poll got a usable answer about the run.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
     :raises WandbRunStaleError: At the deadline the run still showed no row logged after
         ``logged_after``, or a newer attempt replaced the retained summary.
@@ -775,7 +774,7 @@ def _poll_wandb_summary(
     started = time.monotonic()
     deadline = started + timeout_seconds if deadline is None else deadline
     last_error: Exception | None = None
-    # Whether the latest poll got an answer about the run rather than failing in transport.
+    # Whether the latest poll got an answer that can settle the trial at the deadline.
     reached = False
     # Whether the latest answered poll still showed only an earlier attempt's run.
     stale = False
@@ -821,17 +820,20 @@ def _poll_wandb_summary(
                 missing = []
                 summary = run.summary_metrics
                 stale = logged_after is not None and not _logged_since(summary, logged_after)
-                if stale:
+                if run.state == "finished" and not _summary_matches_history(run, summary):
+                    reached = False
+                    last_error = RuntimeError(
+                        "The finished run's summary is still empty."
+                        if not summary
+                        else f"The summary's _step {summary.get('_step')!r} does not match the "
+                        f"history's last step {_last_history_step(run)!r}."
+                    )
+                elif stale:
                     last_error = RuntimeError(
                         "The summary records no row logged since the attempt launched."
                     )
                 elif run.state in {"failed", "crashed", "killed", "preempted"}:
                     raise WandbRunTerminalError(run_id, run.state)
-                elif run.state == "finished" and not _summary_matches_history(run, summary):
-                    last_error = RuntimeError(
-                        f"The summary's _step {summary.get('_step')!r} does not match the "
-                        f"history's last step {_last_history_step(run)!r}."
-                    )
                 elif run.state == "finished":
                     if logged_before is not None:
                         stamp = finite_nonnegative(summary.get("_timestamp"))
@@ -910,17 +912,15 @@ def _last_history_step(run: object) -> int | float | None:
 def _summary_matches_history(run: object, summary: Mapping[str, object]) -> bool:
     """Say whether a finished run's summary and history index are both fully served.
 
-    The summary's ``_step`` is the step of the last logged row, so a summary behind the
-    index, a summary with a ``_step`` before the index exists, or an empty summary while
-    the index exists is still being ingested. Only a run that never logged a row has
-    neither.
+    W&B can serve an empty summary before either the summary or the index is visible.
+    A populated summary can also arrive before or after its matching history index.
 
     :param object run: Public-API run.
     :param Mapping[str, object] summary: Its decoded summary.
-    :return bool: Whether the summary's ``_step`` equals the index's last step, both
-        absent counting as equal.
+    :return bool: Whether the summary is populated and its step matches the index.
+        A summary written directly can have values without a history step.
     """
-    return finite_nonnegative(summary.get("_step")) == _last_history_step(run)
+    return bool(summary) and finite_nonnegative(summary.get("_step")) == _last_history_step(run)
 
 
 def _logged_since(summary: Mapping[str, object], logged_after: float) -> bool:
