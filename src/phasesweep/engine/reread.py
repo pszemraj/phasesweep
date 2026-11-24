@@ -74,7 +74,10 @@ from phasesweep.engine.state import (
     _trial_lifecycle,
     _trial_outcome_payload,
 )
-from phasesweep.engine.study_policy import _initialize_study_schema, _load_accepted_partial_decision
+from phasesweep.engine.study_policy import (
+    _initialize_study_schema,
+    _parse_accepted_partial_decision,
+)
 from phasesweep.engine.trial import TrialResult, _failed_trial, record_trial_result
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.evidence.baseline import read_evidence_baseline
@@ -432,6 +435,9 @@ def fill_study(
     """
     trials = source.trials
     present = target.get_trials(deepcopy=False)
+    partial = _parse_accepted_partial_decision(
+        source.attrs.get(PHASE_DECISION_ATTR), source.study.study_name
+    )
     if [(t.number, t.params, t.user_attrs.get(ATTEMPT_ID_ATTR)) for t in present] != [
         (t.number, t.params, t.user_attrs.get(ATTEMPT_ID_ATTR)) for t in trials[: len(present)]
     ]:
@@ -453,9 +459,8 @@ def fill_study(
             },
         )
     for key, value in source.attrs.items():
-        if stored.get(key) != value:
+        if key != PHASE_DECISION_ATTR and stored.get(key) != value:
             target.set_user_attr(key, value)
-    partial = _load_accepted_partial_decision(target)
     by_number = {trial.number: trial for trial in trials}
     producing: dict[str, Experiment | WinnerIntegrityError] = {}
     rereads = changed = 0

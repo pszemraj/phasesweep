@@ -16,7 +16,11 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.config.models import Constraint, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Sampler
-from phasesweep.engine.errors import PhaseTimeoutError, StudyFingerprintMismatchError
+from phasesweep.engine.errors import (
+    PhaseTimeoutError,
+    StudyFingerprintMismatchError,
+    WinnerIntegrityError,
+)
 from phasesweep.engine.ledger import _resolve_storage, validate_ledger
 from phasesweep.engine.read import inspect_status
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -212,7 +216,7 @@ def test_a_child_follows_its_re_read_parent_from_its_own_study(tmp_path: Path) -
 
 @pytest.mark.parametrize("measured", [0, 1])
 def test_reread_keeps_the_partial_timeout_boundary_with_the_new_measurement_count(
-    tmp_path: Path, measured: int
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, measured: int
 ) -> None:
     """A timed-out fill replays its boundary and selects only measurements the new reader has."""
     trainer, launches = _counting_trainer(tmp_path)
@@ -226,6 +230,20 @@ def test_reread_keeps_the_partial_timeout_boundary_with_the_new_measurement_coun
     decision = source.user_attrs[PHASE_DECISION_ATTR]
     accepting = short.model_copy(update={"n_trials": 3, "allow_incomplete_on_timeout": True})
     changed = _experiment(tmp_path, trainer, _metric("acc"), phases=[accepting])
+
+    caplog.set_level(logging.INFO)
+    before = tree_snapshot(tmp_path)
+    run_experiment(changed, dry_run=True)
+    assert (
+        "accepted a partial result at 2 of 3 trials: would select from the re-read evidence "
+        "and launch no trials"
+    ) in caplog.text
+    refusing = accepting.model_copy(update={"allow_incomplete_on_timeout": False})
+    with pytest.raises(WinnerIntegrityError, match="accepted an incomplete result at 2/3"):
+        run_experiment(
+            _experiment(tmp_path, trainer, _metric("acc"), phases=[refusing]), dry_run=True
+        )
+    assert tree_changes(before, tree_snapshot(tmp_path)) == {}
 
     for _ in range(2):
         if measured:

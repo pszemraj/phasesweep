@@ -193,6 +193,23 @@ def _winner_completion(
     }
 
 
+def _require_partial_replay_allowed(phase: Phase, decision: _AcceptedPartialDecision) -> None:
+    """Check that the current phase permits replay at the accepted timeout boundary.
+
+    :param Phase phase: Phase that would replay its accepted partial result.
+    :param _AcceptedPartialDecision decision: Its recorded timeout boundary.
+    :raises WinnerIntegrityError: The current config disallows partial results.
+    """
+    if not phase.allow_incomplete_on_timeout:
+        raise WinnerIntegrityError(
+            f"Phase {phase.name!r} accepted an incomplete result at "
+            f"{decision.finished_trials}/{decision.trial_target} finished "
+            f"trials when its {decision.timeout_scope} deadline expired.",
+            action=OperatorAction.FIX_CONFIG,
+            remediation=ACCEPT_INCOMPLETE_STEP,
+        )
+
+
 def _partial_completion_for_replay(
     study: optuna.Study,
     decision: _AcceptedPartialDecision,
@@ -535,15 +552,7 @@ def _judge_recorded_phase(
     _validate_trial_target(study, phase)
     partial_decision = _load_accepted_partial_decision(study)
     if _at_accepted_partial_target(partial_decision, phase):
-        # Replay the accepted timeout boundary only while incomplete results remain enabled.
-        if not phase.allow_incomplete_on_timeout:
-            raise WinnerIntegrityError(
-                f"Phase {phase.name!r} accepted an incomplete result at "
-                f"{partial_decision.finished_trials}/{partial_decision.trial_target} finished "
-                f"trials when its {partial_decision.timeout_scope} deadline expired.",
-                action=OperatorAction.FIX_CONFIG,
-                remediation=ACCEPT_INCOMPLETE_STEP,
-            )
+        _require_partial_replay_allowed(phase, partial_decision)
         completion = _partial_completion_for_replay(
             study,
             partial_decision,

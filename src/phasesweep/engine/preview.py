@@ -49,12 +49,14 @@ from phasesweep.engine.phase import (
     _judge_recorded_phase,
     _PhaseResume,
     _replay_met_target,
+    _require_partial_replay_allowed,
     _winner_completion,
     _winner_overrides,
 )
 from phasesweep.engine.progress import _log_phase_header
 from phasesweep.engine.reread import _trainer_seconds, describe_changes, fill_source
 from phasesweep.engine.state import (
+    PHASE_DECISION_ATTR,
     RecoveredTrialState,
     Winner,
     _recorded_identity,
@@ -63,8 +65,11 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import (
     ReachedStudy,
+    _AcceptedPartialDecision,
+    _at_accepted_partial_target,
     _launch_preflight,
     _load_phase_policy_state,
+    _parse_accepted_partial_decision,
     _pending_rerun_count,
     _reached_study_refusals,
     _validate_fixed_configuration_target,
@@ -108,6 +113,8 @@ class RecordedPhase:
     recovery_reruns: int
     #: The phase's study as a read-only snapshot, or ``None`` when the ledger holds none.
     study: optuna.Study | None
+    #: A fill's source decision at the current target, which determines the launch count.
+    reread_partial: _AcceptedPartialDecision | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,7 +300,14 @@ def _addressed_record(
             plural(source.rereads, "finished trial"),
         )
         stand_in = _recorded_phase(phase, source.study, trials=source.trials)
-        return name, replace(stand_in, study=None)
+        partial = _parse_accepted_partial_decision(
+            source.attrs.get(PHASE_DECISION_ATTR), source.study.study_name
+        )
+        return name, replace(
+            stand_in,
+            study=None,
+            reread_partial=partial if _at_accepted_partial_target(partial, phase) else None,
+        )
     note = new_study_note(
         experiment,
         phase,
@@ -497,6 +511,17 @@ def _preview_phase(
             experiment, phase, inherited_winners, recorded_studies
         )
         study_name = study_name if addressed is None else addressed
+    if recorded is not None and (partial := recorded.reread_partial) is not None:
+        _require_partial_replay_allowed(phase, partial)
+        log.info(
+            "DRY RUN phase=%s accepted a partial result at %d of %d trials: would select from "
+            "the re-read evidence and launch no trials",
+            phase.name,
+            partial.finished_trials,
+            partial.trial_target,
+        )
+        winner = _placeholder_winner(experiment, phase, inherited_winners)
+        return _replayed_phase_preview(phase, inherited_winners, winner)
     finished = 0 if recorded is None else recorded.finished
     reruns = 0 if recorded is None else recorded.recovery_reruns
     remaining = max(0, phase.n_trials - finished)

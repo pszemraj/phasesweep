@@ -265,12 +265,26 @@ def _load_accepted_partial_decision(
     :return _AcceptedPartialDecision | None: Validated decision, or ``None``
         when the study has no accepted-partial decision.
     """
-    raw = study.user_attrs.get(PHASE_DECISION_ATTR)
+    return _parse_accepted_partial_decision(
+        study.user_attrs.get(PHASE_DECISION_ATTR), study.study_name
+    )
+
+
+def _parse_accepted_partial_decision(
+    raw: object, study_name: str
+) -> _AcceptedPartialDecision | None:
+    """Decode the accepted timeout boundary of a study or the source pinned by a fill.
+
+    :param object raw: Stored decision, or None.
+    :param str study_name: Study named in a schema refusal.
+    :raises StudySchemaMismatchError: The decision is malformed.
+    :return _AcceptedPartialDecision | None: The decision, or None when absent.
+    """
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise StudySchemaMismatchError(
-            f"Study {study.study_name!r} has malformed {PHASE_DECISION_ATTR!r}={raw!r}."
+            f"Study {study_name!r} has malformed {PHASE_DECISION_ATTR!r}={raw!r}."
         )
     trial_target = raw.get("trial_target")
     outcome_sequence = raw.get("outcome_sequence")
@@ -302,7 +316,7 @@ def _load_accepted_partial_decision(
         )
     ):
         raise StudySchemaMismatchError(
-            f"Study {study.study_name!r} has malformed {PHASE_DECISION_ATTR!r} fields: {raw!r}."
+            f"Study {study_name!r} has malformed {PHASE_DECISION_ATTR!r} fields: {raw!r}."
         )
     return _AcceptedPartialDecision(
         trial_target=trial_target,
