@@ -8,18 +8,24 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from unittest.mock import patch
 
 import optuna
 import pytest
 
 from phasesweep import run_experiment
 from phasesweep.config.models import Constraint, Experiment, Metric, Phase
-from phasesweep.config.search import CategoricalParam, Sampler
+from phasesweep.config.search import CategoricalParam, IntParam, Sampler
 from phasesweep.engine.errors import PhaseTimeoutError, StudyFingerprintMismatchError
 from phasesweep.engine.ledger import _resolve_storage, validate_ledger
 from phasesweep.engine.read import inspect_status
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import FAILURE_REASON_ATTR, PHASE_DECISION_ATTR, TRIAL_DIR_ATTR
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    FAILURE_REASON_ATTR,
+    PHASE_DECISION_ATTR,
+    TRIAL_DIR_ATTR,
+)
 from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
 from tests.conftest import (
     invoke_cli_boundary,
@@ -366,3 +372,57 @@ def test_a_fill_killed_part_way_is_finished_by_the_next_run(tmp_path: Path) -> N
         (t.number, t.params, t.user_attrs[TRIAL_DIR_ATTR]) for t in source
     ]
     assert all(trial.state == optuna.trial.TrialState.COMPLETE for trial in filled)
+
+
+@pytest.mark.integration
+def test_an_interrupted_fill_keeps_its_source_trials_when_other_studies_grow(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Growth of the source and a competing study keeps the interrupted fill's original cutoff."""
+    trainer, launches = _counting_trainer(tmp_path)
+
+    def config(key: str, target: int) -> Experiment:
+        phase = Phase(
+            name="p",
+            n_trials=target,
+            gpu_policy="none",
+            sampler=Sampler(type="random", seed=0),
+            search_space={"x": IntParam(type="int", low=1, high=100_000)},
+        )
+        return _experiment(tmp_path, trainer, _metric(key), phases=[phase])
+
+    run_experiment(config("loss", 1))
+    run_experiment(config("acc", 2))
+    original = config("loss", 3)
+    run_experiment(original)
+    source_trials = phase_study_of(original).get_trials()
+    interrupted = config("mem", 3)
+    add_trial = optuna.Study.add_trial
+
+    def stop_after_two(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        add_trial(study, trial)
+        if len(study.get_trials(deepcopy=False)) == 2:
+            raise RuntimeError("stop after the second copied trial")
+
+    with (
+        patch.object(optuna.Study, "add_trial", stop_after_two),
+        pytest.raises(RuntimeError, match="stop after the second copied trial"),
+    ):
+        run_experiment(interrupted)
+    run_experiment(config("loss", 4))
+    run_experiment(config("acc", 5))
+    before = _launches(launches)
+
+    notice = inspect_status(interrupted, validate_ledger(interrupted)).refusals["p"]
+    assert "re-reads 1 finished trial" in notice.remediation
+    caplog.set_level(logging.INFO)
+    run_experiment(interrupted, dry_run=True)
+    assert "would re-read 1 finished trial from kept evidence" in caplog.text
+    assert "target met (3 of 3 trials recorded)" in caplog.text
+
+    run_experiment(interrupted)
+    assert _launches(launches) == before
+    filled = phase_study_of(interrupted).get_trials()
+    assert [t.user_attrs[ATTEMPT_ID_ATTR] for t in filled] == [
+        t.user_attrs[ATTEMPT_ID_ATTR] for t in source_trials
+    ]

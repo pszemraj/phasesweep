@@ -11,9 +11,9 @@ and each trial whose trainer finished is read again from its kept evidence under
 settings, through the one path recovery reads a finished attempt by
 (:func:`phasesweep.engine.attempts.read_finished_attempt`). No trainer launches.
 
-The fill is resumable. Each trial is appended in one storage write and the identity record is
-written last, so a study holding trials but no identity is a fill a killed runner left
-part-way; the next run appends the trials still missing, from the same source.
+The fill is resumable. The source boundary is written before copying, each trial is appended
+in one storage write, and the identity is written last. A killed fill resumes from the same
+source and trial cutoff even if another study grew while the fill was stopped.
 """
 
 from __future__ import annotations
@@ -57,6 +57,7 @@ from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
+    ATTEMPT_ID_ATTR,
     DURATION_ATTR,
     FAILURE_REASON_ATTR,
     OVERRIDES_ATTR,
@@ -66,6 +67,7 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     TRIAL_OUTCOME_ATTR,
     PhaseIdentityRecord,
+    _parsed_phase_identity,
     _parsed_trial_outcome,
     _recorded_identity,
     _required_trial_dir,
@@ -79,12 +81,11 @@ from phasesweep.evidence.baseline import read_evidence_baseline
 from phasesweep.runtime.json import JsonObject, finite_nonnegative, json_object
 from phasesweep.runtime.terminal import plural
 
-#: Study attributes a fill does not copy: the identity is rebuilt under the current reading
-#: settings and written last, the opener already bound the artifact root, and the schema stamp
-#: is the run's own. The partial decision's measured count is rebuilt from the re-read trials.
-_NOT_COPIED = frozenset(
-    {PHASE_DECISION_ATTR, PHASE_IDENTITY_ATTR, ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR}
-)
+_FILL_ATTR = "phasesweep_reread_fill"
+REREAD_FILL_SCHEMA_VERSION = 1
+_FILL_FIELDS = frozenset({"schema_version", "study_name", "trial_count", "identity", "attrs"})
+#: The source's identity, root, schema and any earlier fill belong to the source study.
+_NOT_COPIED = frozenset({_FILL_ATTR, PHASE_IDENTITY_ATTR, ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR})
 #: The recorded outcomes a re-read replaces; an interruption or a fatal outcome stands as it was.
 _REREAD_OUTCOMES = frozenset({"success", "failure"})
 
@@ -95,10 +96,59 @@ class FillSource:
 
     study: optuna.Study
     record: PhaseIdentityRecord
-    #: How many of its trials have a finished trainer, so are read again.
+    #: How many of its trials still have a finished trainer to read.
     rereads: int
     #: Each reading setting that changed, with its recorded and current value.
     changes: tuple[tuple[str, object, object], ...]
+    #: The trial prefix and study attributes at the boundary of the fill.
+    trials: list[optuna.trial.FrozenTrial]
+    attrs: JsonObject
+
+
+@dataclass(frozen=True)
+class _FillBoundary:
+    """The source, trial cutoff and mutable study metadata recorded before copying."""
+
+    study_name: str
+    trial_count: int
+    identity: PhaseIdentityRecord
+    attrs: JsonObject
+
+
+def _fill_boundary(target: optuna.Study | None) -> _FillBoundary | None:
+    """Read the source recorded before a fill began.
+
+    :param optuna.Study | None target: The addressed study, if it exists.
+    :raises StudySchemaMismatchError: The saved source boundary is malformed.
+    :return _FillBoundary | None: The saved boundary, or None for a fresh fill.
+    """
+    raw = None if target is None else target.user_attrs.get(_FILL_ATTR)
+    if raw is None:
+        return None
+    assert target is not None
+    try:
+        record = json_object(raw)
+        name = record["study_name"]
+        count = record["trial_count"]
+        identity = _parsed_phase_identity(record["identity"], target.study_name)
+        attrs = json_object(record["attrs"])
+        if (
+            record.keys() != _FILL_FIELDS
+            or type(record.get("schema_version")) is not int
+            or record["schema_version"] != REREAD_FILL_SCHEMA_VERSION
+            or not isinstance(name, str)
+            or not name
+            or type(count) is not int
+            or count < 1
+            or identity is None
+            or not _NOT_COPIED.isdisjoint(attrs)
+        ):
+            raise ValueError("invalid source, trial count, identity or study attributes")
+    except (KeyError, ValueError) as exc:
+        raise StudySchemaMismatchError(
+            f"Study {target.study_name!r} has a malformed {_FILL_ATTR!r} record: {exc}."
+        ) from exc
+    return _FillBoundary(name, count, identity, attrs)
 
 
 @dataclass(frozen=True)
@@ -178,34 +228,55 @@ def fill_source(
     phase: Phase,
     inherited: Mapping[str, object],
     others: Sequence[optuna.Study],
+    *,
+    target: optuna.Study | None = None,
 ) -> FillSource | None:
     """Pick the study a phase's new study is filled from, judging without writing anything.
 
     A candidate holds trials measured under the same inherited values and argument order and
     would continue under the current config once its reading settings are replaced. The
     candidate with the most trainer-finished trials wins, the most recently created on a tie.
+    An interrupted fill keeps the source, trial cutoff and metadata it already recorded.
 
     :param Experiment experiment: Current config.
     :param Phase phase: The phase whose addressed study records no identity.
     :param Mapping[str, object] inherited: The ordered parent layer the phase inherits now.
     :param Sequence[optuna.Study] others: The phase's other studies, oldest first.
+    :param optuna.Study | None target: The addressed study, when already created.
     :raises StudyFingerprintMismatchError: A study with these inherited values exists but its
         training identity differs from the current config; the refusal names what changed.
-    :raises StudySchemaMismatchError: A candidate's identity record is malformed.
+    :raises StudySchemaMismatchError: The saved source is unavailable or a record is malformed.
     :return FillSource | None: The source, or ``None`` when no study holds these values.
     """
     reading = reading_settings(experiment, phase)
     values = _inherited_values(phase, inherited)
     cli_order = _cli_override_order(experiment, _composed_override_keys(phase, inherited))
+    boundary = _fill_boundary(target)
+    copied = 0 if target is None else len(target.get_trials(deepcopy=False))
+    if boundary is not None:
+        others = [study for study in others if study.study_name == boundary.study_name]
+        if not others:
+            raise StudySchemaMismatchError(f"Saved fill source {boundary.study_name!r} is missing.")
     found: list[FillSource] = []
     refusal: StudyFingerprintMismatchError | None = None
     for study in others:
-        record = _recorded_identity(study)
+        record = _recorded_identity(study) if boundary is None else boundary.identity
         trials = study.get_trials(deepcopy=False)
+        if boundary is not None:
+            if len(trials) < boundary.trial_count:
+                raise StudySchemaMismatchError(
+                    f"Saved fill source {study.study_name!r} holds fewer than "
+                    f"{plural(boundary.trial_count, 'trial')}."
+                )
+            trials = trials[: boundary.trial_count]
         if record is None or not trials:
             continue
         payload = record["payload"]
         if not _same_value(payload.get("inherited_effective_overrides"), values):
+            if boundary is not None:
+                raise StudySchemaMismatchError(
+                    f"Saved fill source {study.study_name!r} records different inherited values."
+                )
             continue
         same_order = _same_value(payload.get("cli_override_order"), cli_order)
         # Recheck a candidate under its original parent order before attributing a different
@@ -224,11 +295,22 @@ def fill_source(
             refusal = exc
             continue
         if not same_order:
+            if boundary is not None:
+                raise StudySchemaMismatchError(
+                    f"Saved fill source {study.study_name!r} records a different CLI argument order."
+                )
             continue
         recorded = payload.get(READING_KEY)
         changes = _changed_payload_keys(recorded if isinstance(recorded, dict) else {}, reading)
-        rereads = sum(_trainer_seconds(trial) is not None for trial in trials)
-        found.append(FillSource(study, record, rereads, tuple(changes)))
+        rereads = sum(_trainer_seconds(trial) is not None for trial in trials[copied:])
+        attrs = (
+            json_object(
+                {key: value for key, value in study.user_attrs.items() if key not in _NOT_COPIED}
+            )
+            if boundary is None
+            else boundary.attrs
+        )
+        found.append(FillSource(study, record, rereads, tuple(changes), trials, attrs))
     if not found:
         if refusal is not None:
             raise refusal
@@ -348,21 +430,32 @@ def fill_study(
     :raises TrackingTargetUnavailableError: A tracker gave no answer for a finished trial.
     :return FillResult: What the fill wrote in this call.
     """
-    trials = source.study.get_trials(deepcopy=False)
+    trials = source.trials
     present = target.get_trials(deepcopy=False)
-    partial = _load_accepted_partial_decision(source.study)
-    if [(trial.number, trial.params) for trial in present] != [
-        (trial.number, trial.params) for trial in trials[: len(present)]
+    if [(t.number, t.params, t.user_attrs.get(ATTEMPT_ID_ATTR)) for t in present] != [
+        (t.number, t.params, t.user_attrs.get(ATTEMPT_ID_ATTR)) for t in trials[: len(present)]
     ]:
         raise StudySchemaMismatchError(
             f"Study {target.study_name!r} holds trials that study {source.study.study_name!r} "
             "does not, so it cannot be filled from it."
         )
     _initialize_study_schema(target)
-    if not present:
-        for key, value in source.study.user_attrs.items():
-            if key not in _NOT_COPIED:
-                target.set_user_attr(key, value)
+    stored = target.user_attrs
+    if _FILL_ATTR not in stored:
+        target.set_user_attr(
+            _FILL_ATTR,
+            {
+                "schema_version": REREAD_FILL_SCHEMA_VERSION,
+                "study_name": source.study.study_name,
+                "trial_count": len(trials),
+                "identity": source.record,
+                "attrs": source.attrs,
+            },
+        )
+    for key, value in source.attrs.items():
+        if stored.get(key) != value:
+            target.set_user_attr(key, value)
+    partial = _load_accepted_partial_decision(target)
     by_number = {trial.number: trial for trial in trials}
     producing: dict[str, Experiment | WinnerIntegrityError] = {}
     rereads = changed = 0
@@ -380,7 +473,7 @@ def fill_study(
             is not None
             and outcome.sequence <= partial.outcome_sequence
         )
-        decision = json_object(source.study.user_attrs[PHASE_DECISION_ATTR])
+        decision = json_object(source.attrs[PHASE_DECISION_ATTR])
         target.set_user_attr(PHASE_DECISION_ATTR, {**decision, "measured_trials": measured})
     _stamp_identity(target, _reread_record(source.record, reading_settings(experiment, phase)))
     return FillResult(copied=len(trials) - len(present), rereads=rereads, changed=changed)
@@ -464,18 +557,20 @@ def pending_reread(
     if addressed is not None and _recorded_identity(addressed) is not None:
         return None
     others = [study for study in studies if study.study_name != study_name]
-    inherited: dict[str, object] | None = None
-    for study in others:
-        record = _recorded_identity(study)
-        if record is None:
-            continue
-        recorded_inheritance = _recorded_inheritance(record)
-        if phase_study_name(experiment, phase, recorded_inheritance) == study_name:
-            inherited = recorded_inheritance
-            break
+    boundary = _fill_boundary(addressed)
+    inherited = None if boundary is None else _recorded_inheritance(boundary.identity)
+    if inherited is None:
+        for study in others:
+            record = _recorded_identity(study)
+            if record is None:
+                continue
+            recorded_inheritance = _recorded_inheritance(record)
+            if phase_study_name(experiment, phase, recorded_inheritance) == study_name:
+                inherited = recorded_inheritance
+                break
     if inherited is None:
         return None
-    source = fill_source(experiment, phase, inherited, others)
+    source = fill_source(experiment, phase, inherited, others, target=addressed)
     if source is None:
         return None
     return _pending_notice(source, phase.name)

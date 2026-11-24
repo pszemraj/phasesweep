@@ -1656,7 +1656,7 @@ def _run_phase(
     if _recorded_identity(study) is None:
         # A changed reading setting addresses a study of its own; the trials another study of
         # the phase measured under the same values are re-read into it, never retrained.
-        source = fill_source(experiment, phase, inherited, others)
+        source = fill_source(experiment, phase, inherited, others, target=study)
         if source is not None:
             filled = fill_study(experiment, phase, study, source)
             report.info("%s  %s", phase.name, fill_note(source, filled))

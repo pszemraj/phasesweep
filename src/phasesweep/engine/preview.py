@@ -161,19 +161,27 @@ def _recovered_running_states(
     ]
 
 
-def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
+def _recorded_phase(
+    phase: Phase,
+    study: optuna.Study | None,
+    *,
+    trials: Sequence[optuna.trial.FrozenTrial] | None = None,
+) -> RecordedPhase:
     """Count one phase's snapshot study the way a launch counts it.
 
     :param Phase phase: The configured phase the study belongs to.
     :param optuna.Study | None study: The phase's snapshot study, or ``None`` when
         the ledger holds no such study, which counts zero attempts.
+    :param Sequence[optuna.trial.FrozenTrial] | None trials: The trial prefix of a pending fill,
+        or None to count the full study.
     :raises PhaseSweepError: A RUNNING attempt's completed trainer evidence awaits recovery,
         whose extraction decides the counts.
     :return RecordedPhase: The counts and the study.
     """
     if study is None:
         return RecordedPhase(finished=0, measured=0, running=0, recovery_reruns=0, study=None)
-    trials = study.get_trials(deepcopy=False)
+    if trials is None:
+        trials = study.get_trials(deepcopy=False)
     recovered = _recovered_running_states(study.study_name, trials)
     if "EVIDENCE_PENDING" in recovered:
         raise PhaseSweepError(
@@ -271,7 +279,9 @@ def _addressed_record(
     ):
         return name, addressed
     others = [r.study for r in recorded if r.study is not None and r.study.study_name != name]
-    source = fill_source(experiment, phase, inherited, others)
+    source = fill_source(
+        experiment, phase, inherited, others, target=None if addressed is None else addressed.study
+    )
     if source is not None:
         # A run fills the study from kept evidence before it launches anything; the re-read
         # outcomes are known only once read, so the source's counts stand in for them.
@@ -282,7 +292,7 @@ def _addressed_record(
             describe_changes(source.changes),
             plural(source.rereads, "finished trial"),
         )
-        stand_in = next(r for r in recorded if r.study is source.study)
+        stand_in = _recorded_phase(phase, source.study, trials=source.trials)
         return name, replace(stand_in, study=None)
     note = new_study_note(
         experiment,
@@ -335,11 +345,15 @@ def validate_trial_targets(experiment: Experiment) -> None:
         measured = _measured_trial_count(trials)
         if study is None or _recorded_identity(study) is None:
             source = fill_source(
-                experiment, phase, {}, [other for other in every[phase.name] if other is not study]
+                experiment,
+                phase,
+                {},
+                [other for other in every[phase.name] if other is not study],
+                target=study,
             )
             if source is not None:
                 study = source.study
-                missing = study.get_trials(deepcopy=False)[len(trials) :]
+                missing = source.trials[len(trials) :]
                 measured += _measured_trial_count(
                     trial for trial in missing if _trainer_seconds(trial) is None
                 )

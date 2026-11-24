@@ -212,7 +212,7 @@ ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
 PHASE_IDENTITY_ATTR = "phasesweep_phase_identity"
 PHASE_IDENTITY_SCHEMA_VERSION = 3
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 17
+STUDY_SCHEMA_VERSION = 18
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The
@@ -336,7 +336,17 @@ def _recorded_identity(study: Study) -> PhaseIdentityRecord | None:
     :raises StudySchemaMismatchError: The recorded identity is malformed.
     :return PhaseIdentityRecord | None: The record, or None when the study has none yet.
     """
-    value: object = study.user_attrs.get(PHASE_IDENTITY_ATTR)
+    return _parsed_phase_identity(study.user_attrs.get(PHASE_IDENTITY_ATTR), study.study_name)
+
+
+def _parsed_phase_identity(value: object, study_name: str) -> PhaseIdentityRecord | None:
+    """Parse a study's identity, including the source identity saved by an incomplete fill.
+
+    :param object value: Stored identity record, or None.
+    :param str study_name: Study named in a schema refusal.
+    :raises StudySchemaMismatchError: The identity is malformed.
+    :return PhaseIdentityRecord | None: The identity, or None when absent.
+    """
     if value is None:
         return None
     try:
@@ -369,7 +379,7 @@ def _recorded_identity(study: Study) -> PhaseIdentityRecord | None:
         }
     except (KeyError, ValueError) as exc:
         raise StudySchemaMismatchError(
-            f"Study {study.study_name!r} has a malformed {PHASE_IDENTITY_ATTR!r} record: {exc}."
+            f"Study {study_name!r} has a malformed {PHASE_IDENTITY_ATTR!r} record: {exc}."
         ) from exc
 
 
