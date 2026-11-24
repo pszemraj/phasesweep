@@ -72,10 +72,15 @@ class MlflowQuery(TypedDict):
 
 
 class MlflowCapture(TypedDict):
-    """Frozen native evidence captured from one finished run."""
+    """Frozen native evidence captured from one finished run and the trial's earlier runs.
+
+    ``earlier_bindings`` names, oldest first, the runs of the earlier attempts that ran in
+    the same trial directory, whose metric histories were merged under the bound run's.
+    """
 
     kind: Literal["mlflow"]
     binding: RunBinding
+    earlier_bindings: list[RunBinding]
     run_state: Literal["FINISHED"]
     query: MlflowQuery
     observations: dict[str, Observation]
@@ -170,11 +175,12 @@ class PendingCreation(TypedDict):
 
 
 class CaptureRequest(TypedDict):
-    """Worker request to fetch finished evidence for a bound run."""
+    """Worker request to fetch finished evidence for a bound run and the trial's earlier runs."""
 
     action: Literal["capture"]
     settings: MlflowTarget
     binding: RunBinding
+    earlier: list[RunBinding]
     query: MlflowQuery
     timeout_at: float
 

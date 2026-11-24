@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Protocol
 from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.json import (
     JsonObject,
+    JsonValue,
     json_integer,
     json_number,
     json_number_map,
@@ -627,21 +628,46 @@ def _finished_without(
     return f"MLflow run finished without {', '.join(lacking)}; available {'; '.join(available)}."
 
 
+def _metric_records(client: _SdkClient, run_id: str, key: str) -> list[Mapping[str, object]]:
+    """Read one run's complete history of a metric as plain records.
+
+    :param _SdkClient client: Public MLflow client in the supervised worker.
+    :param str run_id: Run whose history is read.
+    :param str key: Metric name.
+    :return list[Mapping[str, object]]: One record per logged point.
+    """
+    return [
+        {
+            "value": m.value,
+            "step": m.step,
+            "timestamp": m.timestamp,
+            "model_id": getattr(m, "model_id", None),
+            "dataset_name": getattr(m, "dataset_name", None),
+            "dataset_digest": getattr(m, "dataset_digest", None),
+        }
+        for m in client.get_metric_history(run_id, key)
+    ]
+
+
 def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     """Fetch finished evidence, sharing complete histories across selectors.
 
     FINISHED runs fail immediately when required evidence is missing. Unfinished
-    runs are polled until just before ``timeout_at``.
+    runs are polled until just before ``timeout_at``. Each metric's history is the bound
+    run's merged over the earlier runs of the trial's resumed attempts, whatever their
+    status, and the bound run must have logged the metric itself.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
-    :param CaptureRequest request: Trusted target, bound run, and shared query.
-    :raises ValueError: The run no longer matches its binding, ended FAILED or KILLED,
-        restarted during capture, or finished without a required metric, param or tag
-        (the message names it and the keys the run has) or without a metric's history.
+    :param CaptureRequest request: Trusted target, bound run, the trial's earlier runs
+        oldest first, and shared query.
+    :raises ValueError: The run or an earlier run no longer matches its binding, the run ended
+        FAILED or KILLED, restarted during capture, or finished without a required metric,
+        param or tag (the message names it and the keys the run has) or without a metric's
+        history.
     :raises TimeoutError: The run is still not finished when ``timeout_seconds`` runs out.
     :return MlflowCapture: Frozen shared native evidence.
     """
-    from phasesweep.evidence.mlflow import select_observation
+    from phasesweep.evidence.mlflow import merge_histories, select_observation
     from phasesweep.evidence.models import MlflowExtractor, MlflowRequiredGate
 
     binding, query = request["binding"], request["query"]
@@ -678,24 +704,19 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
                 ):
                     raise ManagedObjectiveMissingError(lacking)
                 raise ValueError(lacking)
+            earlier = request["earlier"]
+            for prior in earlier:
+                verify_remote(client.get_run(prior["run_id"]), prior)
             observations: dict[str, Observation] = {}
             for key in keys:
-                history = client.get_metric_history(binding["run_id"], key)
+                history = _metric_records(client, binding["run_id"], key)
                 if not history:
                     raise ValueError(
                         f"MLflow run finished with metric {key!r} but no history for it."
                     )
-                records: list[Mapping[str, object]] = [
-                    {
-                        "value": m.value,
-                        "step": m.step,
-                        "timestamp": m.timestamp,
-                        "model_id": getattr(m, "model_id", None),
-                        "dataset_name": getattr(m, "dataset_name", None),
-                        "dataset_digest": getattr(m, "dataset_digest", None),
-                    }
-                    for m in history
-                ]
+                records = merge_histories(
+                    [*(_metric_records(client, prior["run_id"], key) for prior in earlier), history]
+                )
                 for identity, spec in selections.items():
                     if spec.metric_key == key:
                         observations[identity] = select_observation(records, spec)
@@ -706,6 +727,7 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
             return {
                 "kind": "mlflow",
                 "binding": binding,
+                "earlier_bindings": earlier,
                 "run_state": "FINISHED",
                 "query": query,
                 "observations": observations,
@@ -781,6 +803,19 @@ def _projection(value: object) -> Projection:
     }
 
 
+def _earlier_bindings(request: JsonObject) -> list[JsonValue]:
+    """Return a capture request's list of earlier run bindings, before each is validated.
+
+    :param JsonObject request: Trusted capture request.
+    :raises ValueError: The request carries no list of earlier bindings.
+    :return list[JsonValue]: The undecoded bindings, oldest first.
+    """
+    earlier = request["earlier"]
+    if not isinstance(earlier, list):
+        raise ValueError("MLflow capture request lacks its earlier run bindings.")
+    return earlier
+
+
 def _dispatch(request: JsonObject) -> JsonObject:
     """Dispatch trusted controller requests using public MLflow APIs.
 
@@ -829,6 +864,7 @@ def _dispatch(request: JsonObject) -> JsonObject:
                 "action": "capture",
                 "settings": settings,
                 "binding": validate_binding(request["binding"]),
+                "earlier": [validate_binding(item) for item in _earlier_bindings(request)],
                 "query": parse_query(request["query"]),
                 "timeout_at": json_number(request, "timeout_at"),
             },

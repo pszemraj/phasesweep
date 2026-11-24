@@ -88,6 +88,28 @@ def compile_query(experiment: Experiment, gates: list[Gate]) -> MlflowQuery | No
     }
 
 
+def merge_histories(
+    histories: Sequence[Sequence[Mapping[str, object]]],
+) -> list[Mapping[str, object]]:
+    """Merge one metric's histories from a trial's attempts into the trial's history.
+
+    A resumed trial logs its remaining steps into its own run, so the trial's history is
+    every attempt's, and an attempt that logged a step replaces what earlier attempts logged
+    there. A trainer that starts over from step 0 therefore overwrites each step it logs.
+
+    :param Sequence[Sequence[Mapping[str, object]]] histories: Each attempt's records,
+        oldest attempt first.
+    :return list[Mapping[str, object]]: The merged records, for :func:`select_observation`.
+    """
+    by_step: dict[object, list[Mapping[str, object]]] = {}
+    for history in histories:
+        logged: dict[object, list[Mapping[str, object]]] = {}
+        for record in history:
+            logged.setdefault(record.get("step"), []).append(record)
+        by_step.update(logged)
+    return [record for records in by_step.values() for record in records]
+
+
 def select_observation(
     history: Sequence[Mapping[str, object]], spec: MlflowExtractor
 ) -> Observation:
@@ -176,6 +198,10 @@ def validate_capture(capture: Mapping[str, object]) -> MlflowCapture:
     if capture.get("kind") != "mlflow" or capture.get("run_state") != "FINISHED":
         raise ValueError("MLflow capture must name a finished run.")
     binding = validate_binding(capture.get("binding"))
+    raw_earlier = capture.get("earlier_bindings")
+    if not isinstance(raw_earlier, list):
+        raise ValueError("MLflow capture must name the earlier runs it merged.")
+    earlier = [validate_binding(item) for item in raw_earlier]
     query = parse_query(capture.get("query"))
     raw_observations = capture.get("observations")
     if not isinstance(raw_observations, dict):
@@ -206,6 +232,7 @@ def validate_capture(capture: Mapping[str, object]) -> MlflowCapture:
     return {
         "kind": "mlflow",
         "binding": binding,
+        "earlier_bindings": earlier,
         "run_state": "FINISHED",
         "query": query,
         "observations": observations,

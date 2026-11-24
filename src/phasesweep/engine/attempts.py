@@ -1215,7 +1215,10 @@ def _recover_completed_trial(
         committed.
     :raises TrackingTargetUnavailableError: The tracker gave no answer and no report
         collects the pending attempt for a refusal after the pass.
+    :raises ProcessCleanupUncertainError: A source the rerun continued records a malformed
+        directory, so the attempts whose histories it continues cannot be named.
     """
+    from phasesweep.engine.evidence import _earlier_attempts
     from phasesweep.engine.trial import (
         ExecutedTrial,
         _environment_identity,
@@ -1291,6 +1294,9 @@ def _recover_completed_trial(
         wandb_environment=environment,
         mlflow_environment=environment,
         baseline=baseline,
+        earlier_attempts=_earlier_attempts(
+            {other.number: other for other in study.get_trials(deepcopy=False)}, trial
+        ),
     )
     active_trial = optuna.Trial(study, trial._trial_id)
     try:

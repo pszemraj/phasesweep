@@ -58,7 +58,7 @@ from phasesweep.runtime.time import utc_now_iso
 
 if TYPE_CHECKING:
     from phasesweep.runtime.json import JsonObject
-    from phasesweep.tracking.records import MlflowCapture, MlflowQuery, MlflowTarget
+    from phasesweep.tracking.records import MlflowCapture, MlflowQuery, MlflowTarget, RunBinding
 
 log = logging.getLogger(__name__)
 
@@ -449,6 +449,9 @@ class TrialContext:
     mlflow_capture: JsonObject = field(default_factory=dict, compare=False)
     # Value paths and file stamps recorded before the attempt ran.
     baseline: EvidenceBaseline | None = field(default=None, compare=False)
+    # (generation ID, attempt ID) of the earlier attempts that trained in trial_dir, oldest
+    # first, whose tracker histories are the start of this trial's.
+    earlier_attempts: tuple[tuple[str, str], ...] = ()
 
 
 def _extract_json(
@@ -953,8 +956,44 @@ def locate_objective_position(
     )
 
 
+def _earlier_mlflow_bindings(ctx: TrialContext, binding: RunBinding) -> list[RunBinding]:
+    """Collect the bound runs of the earlier attempts that trained in the trial's directory.
+
+    An earlier attempt that never bound a run logged nothing to merge.
+
+    :param TrialContext ctx: Attempt naming its earlier attempts, oldest first.
+    :param RunBinding binding: This attempt's verified binding.
+    :raises ValueError: An earlier binding is unreadable or names another target or trial input.
+    :return list[RunBinding]: The earlier bindings, oldest first.
+    """
+    from phasesweep.tracking.session import BINDING_FILE, attempt_tracking_dir, read_binding
+
+    earlier: list[RunBinding] = []
+    for generation_id, attempt_id in ctx.earlier_attempts:
+        directory = attempt_tracking_dir(ctx.trial_dir.parent.parent, generation_id, attempt_id)
+        if not (directory / BINDING_FILE).is_file():
+            continue
+        prior = read_binding(directory)
+        if (
+            prior["attempt_id"] != attempt_id
+            or prior["tracking_uri"] != binding["tracking_uri"]
+            or prior["experiment_id"] != binding["experiment_id"]
+            or prior["experiment"] != binding["experiment"]
+            or prior["phase"] != binding["phase"]
+            or prior["overrides_sha256"] != binding["overrides_sha256"]
+        ):
+            raise ValueError(
+                f"MLflow binding of earlier attempt {attempt_id} names another target or trial."
+            )
+        earlier.append(prior)
+    return earlier
+
+
 def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCapture:
     """Read each native history once, after verifying the exact bound run.
+
+    A resumed trial's histories include its earlier attempts' runs, so every selector reads
+    the trial's whole history.
 
     :param TrialContext ctx: Attempt and configured capture contract.
     :param float | None deadline: Existing execution deadline.
@@ -999,12 +1038,14 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
             or binding["overrides_sha256"] != ctx.overrides_sha256
         ):
             raise ValueError("MLflow binding belongs to a different attempt or target.")
+        earlier = _earlier_mlflow_bindings(ctx, binding)
         stop = time.monotonic() + ctx.mlflow_settings["timeout_seconds"]
         retrieved = request_operation(
             {
                 "action": "capture",
                 "settings": ctx.mlflow_settings,
                 "binding": binding,
+                "earlier": earlier,
                 "query": ctx.mlflow_query,
                 "timeout_at": stop,
             },

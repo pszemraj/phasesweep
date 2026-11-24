@@ -34,7 +34,7 @@ from phasesweep.engine.errors import (
     phase_timeout,
     tracker_unreadable,
 )
-from phasesweep.engine.evidence import _verify_winner_evidence
+from phasesweep.engine.evidence import _earlier_attempts, _verify_winner_evidence
 from phasesweep.engine.fingerprints import _inherited_override_suppliers, _verify_fingerprint
 from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.ledger import ClaimedLedger, open_phase_study
@@ -990,6 +990,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             attempt_id=attempt_id,
             recovered=frozenset(_cleanup_recovered_trial_numbers(run.study)),
         )
+        earlier_attempts = _earlier_attempts(trials, trials[trial.number])
     except PhaseSweepError as exc:
         # Unconfirmed cleanup of the source, or a trial path the rerun cannot follow: the
         # operator acts before anything launches.
@@ -1103,6 +1104,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     trial_dir=trial_dir,
                     attempt_dir=attempt_dir,
                     opened_by=opened_by,
+                    earlier_attempts=earlier_attempts,
                     overrides=overrides,
                     timeout_seconds=phase.timeout_seconds_per_trial,
                     wallclock_deadline=run.optimize_deadline,

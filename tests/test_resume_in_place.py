@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import optuna
 import pytest
@@ -22,6 +25,7 @@ from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trial_dir_for
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    OBJECTIVE_PROVENANCE_ATTR,
     RERUN_OF_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
@@ -35,9 +39,11 @@ from phasesweep.engine.trial_dirs import (
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.evidence.baseline import read_evidence_baseline, write_evidence_baseline
 from phasesweep.evidence.evaluation import ExtractorError, TrialContext, run_extractor
-from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
+from phasesweep.evidence.mlflow import observation_id
+from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor, MlflowExtractor
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
+from phasesweep.tracking import mlflow as mlflow_worker
 from phasesweep.tracking import publication, session
 from tests.conftest import (
     make_experiment,
@@ -50,7 +56,7 @@ from tests.conftest import (
     write_trainer,
 )
 from tests.recovery_helpers import runner_once, write_trial_identity
-from tests.tracking_helpers import killed_sweep
+from tests.tracking_helpers import killed_sweep, mlflow_binding, mlflow_run
 
 _JSON_METRIC = Metric(extractor=JsonExtractor(type="json", path="r.json", key="loss"))
 
@@ -402,6 +408,9 @@ def test_each_attempt_in_a_directory_delivers_its_own_mlflow_run(
     # The rerun runs in a later generation than the attempt it replaces, under its own run.
     assert bindings[stopped]["generation_id"] != bindings[resumed]["generation_id"]
     assert bindings[stopped]["run_id"] != bindings[resumed]["run_id"]
+    # The rerun's objective was read over the stopped attempt's run as well.
+    capture = json.loads(rerun.user_attrs[OBJECTIVE_PROVENANCE_ATTR])["remote_capture"]
+    assert capture["earlier_bindings"] == [bindings[stopped]]
     # PhaseSweep finishes the stopped attempt's run; an accepted attempt's run is the
     # trainer's to end, so its record carries the result and no status.
     finishes = {
@@ -411,6 +420,53 @@ def test_each_attempt_in_a_directory_delivers_its_own_mlflow_run(
     }
     assert finishes == {stopped: "KILLED", resumed: None}
     assert publication.sync_tracking(experiment)["pending"] == 0
+
+
+def test_a_resumed_trials_mlflow_objective_reads_its_attempts_merged_history() -> None:
+    """Every selector reads the stopped attempt's run merged under the rerun's, the rerun winning at a step both logged, and the capture names the earlier run."""
+    current = mlflow_binding()
+    earlier = {**current, "run_id": "stopped", "attempt_id": "d" * 32}
+    loss = {step: 1.0 + 0.1 * (step - 5) ** 2 for step in range(1, 11)}
+    logged = {
+        "stopped": [(step, loss[step]) for step in range(1, 8)],
+        "native-id": [(7, 9.0), *((step, loss[step]) for step in range(8, 11))],
+    }
+    client = SimpleNamespace(
+        get_run=lambda run_id: mlflow_run(earlier if run_id == "stopped" else current),
+        get_metric_history=lambda run_id, _key: [
+            SimpleNamespace(value=value, step=step, timestamp=step)
+            for step, value in logged[run_id]
+        ],
+    )
+    selectors = {
+        "min": MlflowExtractor(type="mlflow", metric_key="loss", select="min"),
+        "last": MlflowExtractor(type="mlflow", metric_key="loss", select="last"),
+        "step": MlflowExtractor(type="mlflow", metric_key="loss", select="step", step=7),
+    }
+    query = {
+        "revision": 1,
+        "objective": selectors["min"].model_dump(),
+        "constraints": {},
+        "selections": {observation_id(s): s.model_dump() for s in selectors.values()},
+        "gates": [],
+    }
+    capture = mlflow_worker._capture(
+        client,
+        {
+            "binding": current,
+            "earlier": [earlier],
+            "query": query,
+            "settings": {"timeout_seconds": 1, "poll_seconds": 0.01},
+            "timeout_at": time.monotonic() + 1,
+        },
+    )
+    chosen = {
+        name: capture["observations"][observation_id(spec)] for name, spec in selectors.items()
+    }
+    assert (chosen["min"]["value"], chosen["min"]["step"]) == (1.0, 5)
+    assert (chosen["last"]["value"], chosen["last"]["step"]) == (loss[10], 10)
+    assert chosen["step"]["value"] == 9.0
+    assert capture["earlier_bindings"] == [earlier]
 
 
 def _interrupted(

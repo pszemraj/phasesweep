@@ -29,7 +29,10 @@ from phasesweep.engine.state import (
     _required_trial_dir,
     constraint_attr,
 )
-from phasesweep.engine.trial_dirs import _expected_trial_dir_name
+from phasesweep.engine.trial_dirs import (
+    _expected_trial_dir_name,
+    _rerun_directory_sources,
+)
 from phasesweep.errors import (
     NEW_STUDY_STEP,
     OTHER_FORMAT_STEP,
@@ -93,6 +96,26 @@ def _selection_candidate_identity(trial: optuna.trial.FrozenTrial) -> tuple[str,
     if not isinstance(attempt_id, str) or not attempt_id:
         return None
     return generation_id, attempt_id
+
+
+def _earlier_attempts(
+    trials: Mapping[int, optuna.trial.FrozenTrial], trial: optuna.trial.FrozenTrial
+) -> tuple[tuple[str, str], ...]:
+    """Name the earlier attempts that trained in the directory a rerun continues.
+
+    :param Mapping[int, optuna.trial.FrozenTrial] trials: The study's trials by number.
+    :param optuna.trial.FrozenTrial trial: The rerun, about to launch or already launched.
+    :raises ProcessCleanupUncertainError: A source's recorded directory is malformed.
+    :return tuple[tuple[str, str], ...]: ``(generation_id, attempt_id)`` per earlier attempt,
+        oldest first; empty for a trial in a directory of its own.
+    """
+    attempts: list[tuple[str, str]] = []
+    for source in _rerun_directory_sources(trials, trial):
+        generation_id = source.user_attrs.get(GENERATION_ID_ATTR)
+        attempt_id = source.user_attrs.get(ATTEMPT_ID_ATTR)
+        if isinstance(generation_id, str) and isinstance(attempt_id, str):
+            attempts.append((generation_id, attempt_id))
+    return tuple(reversed(attempts))
 
 
 def _trial_objective_provenance(trial: optuna.trial.FrozenTrial) -> dict[str, Any]:
@@ -624,6 +647,13 @@ def _verify_trial_evidence_dir(
                 )
             ):
                 raise ValueError("binding, target, or shared query differs")
+            # The merged history's earlier runs must still be the ones their attempts bound.
+            for prior in capture["earlier_bindings"]:
+                prior_dir = attempt_tracking_dir(
+                    trial_dir.parent.parent, prior["generation_id"], prior["attempt_id"]
+                )
+                if read_binding(prior_dir) != prior:
+                    raise ValueError(f"earlier attempt {prior['attempt_id']}'s binding differs")
             for name, specification in verification.mlflow_query["constraints"].items():
                 point = capture["observations"][
                     observation_id(MlflowExtractor.model_validate(specification))

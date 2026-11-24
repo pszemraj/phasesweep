@@ -311,7 +311,11 @@ def remote_mlflow_example(tmp_path, monkeypatch):
             run.data.params = {"depth": "1", "rate": "0"}
             run.data.tags["trainer"] = "none"
             point = SimpleNamespace(value=1.0, step=1, timestamp=1)
-            client = SimpleNamespace(get_run=lambda _: run, get_metric_history=lambda *_: [point])
+            earlier = {prior["run_id"]: mlflow_run(prior) for prior in request["earlier"]}
+            client = SimpleNamespace(
+                get_run=lambda run_id: earlier.get(run_id, run),
+                get_metric_history=lambda *_: [point],
+            )
             return _capture(client, request)
         uploads.append(request)
         return {}

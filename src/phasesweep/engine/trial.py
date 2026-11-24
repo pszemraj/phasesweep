@@ -736,6 +736,7 @@ def launch_trial(
     trial_dir: Path,
     attempt_dir: Path,
     opened_by: tuple[int, str] | None = None,
+    earlier_attempts: tuple[tuple[str, str], ...] = (),
     overrides: dict[str, Any],
     timeout_seconds: float | None,
     wallclock_deadline: float | None = None,
@@ -760,6 +761,9 @@ def launch_trial(
         ``trial_dir``, whose names ``{trial_id}``, ``{run_name}``, ``PHASESWEEP_TRIAL_ID`` and
         ``PHASESWEEP_RUN_NAME`` carry so a rerun continuing in it runs the same command;
         defaults to this trial and attempt.
+    :param tuple[tuple[str, str], ...] earlier_attempts: ``(generation_id, attempt_id)`` of
+        the earlier attempts that trained in ``trial_dir``, oldest first, whose tracker
+        histories the objective is read over; defaults to none.
     :param dict overrides: Inherited, fixed, and sampled overrides.
     :param float | None timeout_seconds: Optional per-trial wallclock budget.
     :param float | None wallclock_deadline: Absolute phase/run deadline including launch
@@ -898,6 +902,7 @@ def launch_trial(
         mlflow_query=compile_mlflow_query(experiment, phase.gates),
         mlflow_environment=env if experiment.mlflow is not None else None,
         baseline=baseline,
+        earlier_attempts=earlier_attempts,
     )
 
     return ExecutedTrial(ctx=ctx, process=proc_result)

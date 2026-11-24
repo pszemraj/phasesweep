@@ -177,6 +177,7 @@ def test_shared_history_once():
         client,
         {
             "binding": binding,
+            "earlier": [],
             "query": query,
             "settings": {"timeout_seconds": 1, "poll_seconds": 0.01},
             "timeout_at": time.monotonic() + 1,
@@ -1167,6 +1168,7 @@ def _capture_request(binding, *, gates=(), timeout_seconds=120, timeout_at=100.0
     """Build a capture of metric ``loss`` plus the given presence gates, on the fake clock."""
     return {
         "binding": binding,
+        "earlier": [],
         "query": {
             "objective": spec().model_dump(),
             "selections": {observation_id(spec()): spec().model_dump()},
