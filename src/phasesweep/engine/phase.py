@@ -118,7 +118,7 @@ from phasesweep.engine.trial import (
     record_trial_result,
     trial_run_name,
 )
-from phasesweep.engine.trial_dirs import _prepare_interrupted_trial_dir, _trial_dir_for_attempt
+from phasesweep.engine.trial_dirs import _trial_dir_for_attempt
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import (
     ABORT_START_AGAIN_STEP,
@@ -990,26 +990,27 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             attempt_id=attempt_id,
             recovered=frozenset(_cleanup_recovered_trial_numbers(run.study)),
         )
-    except ProcessCleanupUncertainError as exc:
+    except PhaseSweepError as exc:
+        # Unconfirmed cleanup of the source, or a trial path the rerun cannot follow: the
+        # operator acts before anything launches.
         run.record_fatal(exc)
         raise _TrialLeftRunning(exc) from exc
     trial_dir = directory.path
     opened_by = (directory.opener_number, directory.opener_attempt_id)
     attempt_dir = _attempt_dir(_phase_dir(experiment, phase.name), attempt_id)
+    # A broken link was refused above, so a rerun's path that does not exist is missing.
     reusing_directory = directory.opener_number != trial.number
+    directory_missing = reusing_directory and not trial_dir.exists()
     # Persist allocated before discovery and GPU waiting; no identity then means no launch.
     try:
-        directory_reset = (
-            _prepare_interrupted_trial_dir(trial_dir, attempt_id) if reusing_directory else None
-        )
-        if directory_reset is not None:
+        if directory_missing:
             log.warning(
-                "%s. Trial %d reruns trial %s with the same parameters in a new directory "
-                "at %s, without its previous local checkpoints.",
-                directory_reset,
+                "The original trial directory %s is missing. Trial %d reruns trial %s with the "
+                "same parameters in a new directory at that path, without its previous local "
+                "checkpoints.",
+                trial_dir,
                 trial.number,
                 trial.user_attrs.get(RERUN_OF_ATTR),
-                trial_dir,
             )
         trial_dir.mkdir(parents=True, exist_ok=True)
         attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -1090,7 +1091,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                 phase,
                 trial,
                 gpu=gpu_assignment.visible_devices,
-                in_place=reusing_directory and directory_reset is None,
+                in_place=reusing_directory and not directory_missing,
             )
             try:
                 executed = launch_trial(

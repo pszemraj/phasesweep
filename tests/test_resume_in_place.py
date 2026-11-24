@@ -32,7 +32,7 @@ from phasesweep.engine.trial_dirs import (
     _expected_trial_dir_name,
     _trial_dir_for_attempt,
 )
-from phasesweep.errors import ProcessCleanupUncertainError
+from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.evidence.baseline import (
     EVIDENCE_PINS_DIR,
     read_evidence_baseline,
@@ -670,13 +670,11 @@ def test_in_memory_runs_never_reuse_a_directory(tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize(
-    "directory_state", ["missing", "broken_link", "file_target", "working_link"]
-)
+@pytest.mark.parametrize("directory_state", ["missing", "working_link"])
 def test_rerun_keeps_the_original_directory_identity_when_its_contents_move(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, directory_state: str
 ) -> None:
-    """Unavailable checkpoints restart the same draw, and a working directory link still resumes."""
+    """A missing directory restarts the same draw at its path, and a working directory link still resumes."""
     experiment = _interrupt_first_attempt(
         tmp_path, _trainer(tmp_path, _CHECKPOINTING, _RESUMING), _JSON_METRIC
     )
@@ -684,13 +682,7 @@ def test_rerun_keeps_the_original_directory_identity_when_its_contents_move(
     directory = Path(first.user_attrs[TRIAL_DIR_ATTR])
     saved = directory.with_name("saved-directory")
     directory.rename(saved)
-    if directory_state == "broken_link":
-        directory.symlink_to("missing-target")
-    elif directory_state == "file_target":
-        target = directory.with_name("checkpoint-file")
-        target.write_text("keep")
-        directory.symlink_to(target.name)
-    elif directory_state == "working_link":
+    if directory_state == "working_link":
         directory.symlink_to(saved.name)
 
     winner = run_experiment(experiment)["p"]
@@ -719,16 +711,38 @@ def test_rerun_keeps_the_original_directory_identity_when_its_contents_move(
         assert (
             f"Trial {rerun.number} reruns trial {first.number} with the same parameters" in warning
         )
-        if directory_state in {"broken_link", "file_target"}:
-            (preserved,) = directory.parent.glob(f".{directory.name}.broken-symlink-*")
-            if directory_state == "broken_link":
-                assert preserved.readlink() == Path("missing-target")
-                assert not (directory.parent / "missing-target").exists()
-            else:
-                assert preserved.readlink() == Path("checkpoint-file")
-                assert preserved.read_text() == "keep"
-            assert str(preserved) in warning
-        else:
-            assert "is missing" in warning
+        assert "is missing" in warning
 
     assert run_experiment(experiment)["p"].metric == winner.metric
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("target", ["missing-target", "checkpoint-file"])
+def test_a_rerun_refuses_a_trial_directory_link_it_cannot_follow(
+    tmp_path: Path, target: str
+) -> None:
+    """A dangling or non-directory link at a rerun's trial path stops the run before launch, naming the link and its target, and leaves the link alone; deleting it reruns from step 0."""
+    experiment = _interrupt_first_attempt(
+        tmp_path, _trainer(tmp_path, _CHECKPOINTING, _RESUMING), _JSON_METRIC
+    )
+    (first,) = phase_trials(experiment)
+    directory = Path(first.user_attrs[TRIAL_DIR_ATTR])
+    directory.rename(directory.with_name("saved-directory"))
+    if target == "checkpoint-file":
+        directory.with_name(target).write_text("keep")
+    directory.symlink_to(target)
+
+    with pytest.raises(PhaseSweepError) as refused:
+        run_experiment(experiment)
+
+    assert f"symlink {directory} -> {target}" in str(refused.value)
+    assert refused.value.action is OperatorAction.RESTORE_TREE
+    assert refused.value.remediation == (
+        f"Restore the link's target, or delete the link {directory} to rerun this trial from "
+        "step 0."
+    )
+    assert directory.readlink() == Path(target)
+    assert not list(directory.parent.glob(f".{directory.name}*"))
+
+    directory.unlink()
+    assert run_experiment(experiment)["p"].metric == 0.0
