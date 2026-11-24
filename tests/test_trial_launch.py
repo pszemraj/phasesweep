@@ -400,8 +400,8 @@ def test_launch_trial_cli_input_without_trainer_config_is_the_overrides_alone(
     assert (tmp_path / "trial_0" / "overrides_resolved.json").read_text() == expected
     assert captured["PHASESWEEP_OVERRIDES_SHA256"] == hashlib.sha256(expected.encode()).hexdigest()
     assert shlex.split(captured["command"])[2:] == [
-        "--zeta.depth=8",
         "--alpha=1",
+        "--zeta.depth=8",
         "--zeta.width=2",
     ]
 
