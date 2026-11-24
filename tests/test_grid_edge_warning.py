@@ -324,7 +324,7 @@ def test_grown_parent_keeps_trials_and_checks_the_winner_before_child_work(
     changed_inherited_value = winner_changes and not child_fixes_x
     if changed_inherited_value:
         with pytest.raises(
-            StudyFingerprintMismatchError, match=r"inherited_effective_overrides.parent.x: 3 -> 4"
+            StudyFingerprintMismatchError, match=r"inherited_effective_overrides\.x: 3 -> 4"
         ) as refused:
             run_experiment(edited)
         assert refused.value.remediation is not None

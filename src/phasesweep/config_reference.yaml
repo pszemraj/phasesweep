@@ -97,7 +97,7 @@ phases: list[object] (required)
     # Earlier phases whose winners' effective overrides, their inherited, fixed and sampled keys, become fixed inputs here. Nothing is inherited unless listed.
     # Only phases declared before this one can be listed. trainer_config is not inherited, and an inherited value keeps the phase that produced it as its origin.
     # Warning: only override values are inherited, never weights or checkpoints. Load a checkpoint explicitly through trainer_config or fixed_overrides.
-    # Warning: the parents' winners are part of this phase's study fingerprint, so a changed parent winner stops a populated study of this phase from being reused.
+    # Warning: the values this phase inherits are part of its study fingerprint, so a changed inherited value stops a populated study of this phase from being reused; the parents' names are not.
     inherits: list[string] = []
 
     # Fixed trainer-defined values for every trial of the phase, keyed by dotted paths of nonempty A-Z a-z 0-9 _ - segments, for example optimizer.lr.

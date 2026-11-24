@@ -139,9 +139,9 @@ def phase_names(names: Sequence[str]) -> str:
 def rename_step(names: Sequence[str]) -> str:
     """Say how to start phases over under new names, which give them new studies.
 
-    A phase's study is named after the phase, so a new name is a new study for it, and a phase
-    that inherits a renamed one records that name in its own study identity, so the caller
-    passes every inheriting phase too. Only the ``inherits`` entries that name a renamed phase
+    A phase's study is named after the phase, so a new name is a new study for it. The caller
+    passes every inheriting phase too, since a renamed phase runs again and a different winner
+    would refuse an inheriting phase's study once the run reached it. Only the ``inherits`` entries that name a renamed phase
     change. A new study keeps none of the old one's trials, so the clause says the renamed
     phases run again.
 

@@ -159,6 +159,7 @@ def _phase_config_fingerprint(phase: Phase) -> str:
     payload = {
         "fingerprint_schema_version": fingerprint_ops.EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
         "name": phase.name,
+        "inherits": list(phase.inherits),
         **fingerprint_ops._semantic_phase_dump(phase),
     }
     return fingerprint_ops._semantic_payload_digest(payload)

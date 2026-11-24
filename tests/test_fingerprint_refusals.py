@@ -384,6 +384,39 @@ def test_a_study_bound_to_another_root_gets_a_step_that_fits(tmp_path: Path) -> 
     )
 
 
+def test_a_renamed_parent_that_supplies_the_same_values_keeps_the_childs_study() -> None:
+    """A child's identity holds the values its trainer inherits, not which parent supplied them, so a renamed or replaced parent with the same winner continues the child's study."""
+
+    def plan(parent_name: str) -> tuple[Experiment, Phase]:
+        parent = Phase(
+            name=parent_name,
+            n_trials=1,
+            gpu_policy="none",
+            search_space={"lr": IntParam(type="int", low=0, high=3)},
+            sampler=Sampler(type="random", seed=0),
+        )
+        child = Phase(
+            name="q",
+            n_trials=1,
+            gpu_policy="none",
+            inherits=[parent_name],
+            search_space={"wd": IntParam(type="int", low=0, high=3)},
+            sampler=Sampler(type="random", seed=0),
+        )
+        return make_experiment(phases=[parent, child]), child
+
+    def winner() -> Winner:
+        return Winner(trial_number=0, params={}, effective_overrides={"lr": 1}, metric=0.0)
+
+    original, child = plan("p")
+    study = optuna.create_study()
+    recorded = _verify_fingerprint(study, original, child, {"p": winner()})
+    study.optimize(lambda trial: 0.0, n_trials=1)
+
+    renamed, renamed_child = plan("p2")
+    assert _verify_fingerprint(study, renamed, renamed_child, {"p2": winner()}) == recorded
+
+
 def test_a_changed_inherited_winner_sends_the_dependent_to_a_new_name_not_a_new_experiment() -> (
     None
 ):
@@ -409,7 +442,7 @@ def test_a_changed_inherited_winner_sends_the_dependent_to_a_new_name_not_a_new_
     with pytest.raises(StudyFingerprintMismatchError) as caught:
         _verify_fingerprint(study, experiment, child, winners(2))
 
-    assert "inherited_effective_overrides.p.lr: 1 -> 2" in str(caught.value)
+    assert "inherited_effective_overrides.lr: 1 -> 2" in str(caught.value)
     assert caught.value.remediation == (
         f"A phase it inherits now has a different winner; {rename_step(['q', 'r'])}."
     )

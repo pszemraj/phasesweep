@@ -139,7 +139,7 @@ def _experiment_semantic_fingerprint(
         "experiment": experiment.experiment,
         **_semantic_core(experiment),
         "phases": [
-            {"name": phase.name, **_semantic_phase_dump(phase)}
+            {"name": phase.name, "inherits": list(phase.inherits), **_semantic_phase_dump(phase)}
             for phase in experiment.phases[:phase_count]
         ],
     }
@@ -164,10 +164,13 @@ def _recorded_config_matches(
 
 
 def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
-    """Return phase execution and output semantics, excluding run control.
+    """Return phase execution and output semantics, excluding run control and parent names.
 
     GPU identities are excluded. Under ``whole_node``, their count defines trainer
     world size and is included; equivalent index and UUID spellings retain identity.
+    ``inherits`` is excluded: a study holds the values its parents supply
+    (:func:`_inherited_override_payload`), not which parent supplied them, and the plan-level
+    fingerprints that record the graph add it themselves.
 
     :param Phase phase: Phase whose semantic payload is being built.
     :return dict[str, Any]: JSON-serializable semantic phase payload.
@@ -175,7 +178,7 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     dump = {
         k: v
         for k, v in phase.model_dump(mode="json", exclude=_PHASE_READ_CONTROLS).items()
-        if k not in _RUN_CONTROL_KEYS
+        if k not in _RUN_CONTROL_KEYS and k != "inherits"
     }
     if phase.gpu_policy == "whole_node":
         tokens = phase.gpu_ids if phase.gpu_ids is not None else phase.gpu_devices
@@ -207,26 +210,26 @@ def _inherited_override_suppliers(
 
 def _inherited_override_payload(
     phase: Phase, inherited_winners: Mapping[str, Winner]
-) -> dict[str, dict[str, object]]:
-    """Group inherited values the trainer actually receives by their supplying parent.
+) -> dict[str, object]:
+    """Return the inherited values the trainer actually receives, by key.
 
-    Fixed, sampled and repeat keys take their values from the current phase. The
-    parent grouping names which inherited values changed in a continuation refusal.
+    Fixed, sampled and repeat keys take their values from the current phase. Which parent
+    supplied a value is not recorded, so a parent renamed, reordered or replaced by one that
+    supplies the same values leaves a child's identity unchanged, and a refusal names each
+    changed key with both values.
 
     :param Phase phase: The phase whose local keys and inheritance precedence apply.
     :param Mapping[str, Winner] inherited_winners: Parent winners supplying overrides.
-    :return dict[str, dict[str, object]]: The effective inherited values by parent and key.
+    :return dict[str, object]: The effective inherited value of each key the phase does not set.
     """
     local_keys = set(phase.fixed_overrides) | phase.search_space.keys()
     if phase.repeats is not None:
         local_keys.add(phase.repeats.key)
-    inherited: dict[str, dict[str, object]] = {}
-    for key, parent in _inherited_override_suppliers(phase, inherited_winners).items():
-        if key not in local_keys:
-            inherited.setdefault(parent, {})[key] = inherited_winners[parent].effective_overrides[
-                key
-            ]
-    return inherited
+    return {
+        key: inherited_winners[parent].effective_overrides[key]
+        for key, parent in _inherited_override_suppliers(phase, inherited_winners).items()
+        if key not in local_keys
+    }
 
 
 def _phase_fingerprint_payload(
@@ -258,7 +261,7 @@ def _identity_payload(experiment: Experiment, phase: Phase, inherited: object) -
 
     :param Experiment experiment: Experiment supplying the experiment-level semantics.
     :param Phase phase: Phase whose semantic dump the payload holds.
-    :param object inherited: Effective inherited values by supplying parent, the payload's
+    :param object inherited: Effective inherited values by key, the payload's
         ``inherited_effective_overrides``.
     :return JsonObject: The payload, normalized to the JSON representation being hashed.
     """
@@ -410,8 +413,9 @@ def restore_or_rename_step(experiment: Experiment, phase: Phase, *, recorded: st
     """Offer the rename that reruns a phase whose own keys changed, beside restoring them.
 
     A phase's study is named after the phase, so a new name starts a new study and leaves
-    the other phases' studies valid. A phase that inherits the renamed one records that
-    name in its own study identity, so it needs a new name as well. A persistent study's
+    the other phases' studies valid. A phase that inherits the renamed one is named as well:
+    the renamed phase runs again, and a different winner would refuse the inheriting phase's
+    study once the run reached it. A persistent study's
     refusals share this step, whether the recorded identity is the study's or its winner's.
 
     :param Experiment experiment: Experiment whose phases may inherit ``phase``.
@@ -461,7 +465,7 @@ def _fresh_identity(experiment: Experiment, phase: Phase, inherited: object) -> 
 
     :param Experiment experiment: Current experiment config.
     :param Phase phase: Phase whose identity is built.
-    :param object inherited: Effective overrides by parent, the payload's
+    :param object inherited: Effective inherited values by key, the payload's
         ``inherited_effective_overrides``.
     :return PhaseIdentityRecord: The record.
     """
@@ -566,7 +570,7 @@ def _judge_identity(
     :param optuna.Study study: The phase's study, live or a read-only snapshot.
     :param Experiment experiment: Current experiment config.
     :param Phase phase: Phase the study belongs to.
-    :param object inherited: Effective overrides by parent, the payload's
+    :param object inherited: Effective inherited values by key, the payload's
         ``inherited_effective_overrides``.
     :raises StudyFingerprintMismatchError: The populated study has no recorded identity, or its
         config changed in a way it cannot continue under; the message names what changed.

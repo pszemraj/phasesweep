@@ -26,6 +26,7 @@ from phasesweep.engine.artifact_roots import (
 from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import (
     _inherited_override_payload,
+    _inherited_override_suppliers,
     _judge_identity,
     _phase_fingerprint,
 )
@@ -497,10 +498,17 @@ def _inherited_placeholder_keys(
         the parents that supply none.
     """
     inherited = _inherited_override_payload(phase, inherited_winners)
+    suppliers = _inherited_override_suppliers(phase, inherited_winners)
     return {
         parent: sorted(keys)
         for parent in phase.inherits
-        if (keys := inherited_winners[parent].placeholder_keys & inherited.get(parent, {}).keys())
+        if (
+            keys := {
+                key
+                for key in inherited_winners[parent].placeholder_keys & inherited.keys()
+                if suppliers[key] == parent
+            }
+        )
     }
 
 
