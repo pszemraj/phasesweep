@@ -43,6 +43,7 @@ from phasesweep.evidence.wandb import (
     WandbMissingKeysError,
     WandbPollTimeout,
     WandbRunMissingError,
+    WandbRunStaleError,
     WandbRunTerminalError,
     WandbSetupError,
     locate_wandb_position,
@@ -63,7 +64,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # Objective-evidence provenance schema version.
-EVIDENCE_PROVENANCE_SCHEMA_VERSION = 5
+EVIDENCE_PROVENANCE_SCHEMA_VERSION = 6
 # Log-regex evaluation revision included in the extractor contract.
 LOG_REGEX_EVALUATION_REVISION = 3
 
@@ -472,6 +473,9 @@ class TrialContext:
     run_name: str  # "{experiment}-{phase}-{trial_id}-{attempt_id}"
     return_code: int
     duration_seconds: float
+    # The trial's W&B run, which every attempt in trial_dir logs to: the attempt that opened
+    # the directory.
+    wandb_run_id: str
     wandb_environment: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
     wandb_query: WandbQuery | None = None
     wandb_capture: dict[str, Any] = field(default_factory=dict, compare=False)
@@ -810,8 +814,8 @@ def _capture_wandb(
     :raises DeadlineExceededError: The execution deadline prevents capture.
     :raises EvidenceUnreadableError: W&B gave no answer: authentication or setup failed, the
         SDK is missing, the reader worker failed, or every poll failed in transport.
-    :raises ExtractorError: The run is missing, ended unsuccessfully or never finished, the
-        finished summary lacks required keys, or evidence is invalid.
+    :raises ExtractorError: The run is missing, ended unsuccessfully or never finished, shows
+        nothing a rerun logged, the finished summary lacks required keys, or evidence is invalid.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     :return dict: Finished run identity, numeric values, present keys, and retrieval time.
     """
@@ -825,23 +829,26 @@ def _capture_wandb(
         tuple(cfg.keys) if isinstance(cfg, WandbSummaryRequiredGate) else (),
     )
     source = query.source
+    run_id = ctx.wandb_run_id
     poll_deadline = time.monotonic() + source.timeout_seconds
     capped = deadline is not None and deadline <= poll_deadline
     if deadline is not None:
         poll_deadline = min(poll_deadline, deadline)
-    target = f"{source.base_url}/{source.entity}/{source.project}/{ctx.attempt_id}"
+    target = f"{source.base_url}/{source.entity}/{source.project}/{run_id}"
     try:
         try:
             capture = poll_wandb_summary(
                 base_url=source.base_url,
                 entity=source.entity,
                 project=source.project,
-                run_id=ctx.attempt_id,
+                run_id=run_id,
+                attempt_id=ctx.attempt_id,
                 attempt_dir=ctx.attempt_dir,
                 poll_seconds=source.poll_seconds,
                 timeout_seconds=source.timeout_seconds,
                 required_keys=query.numeric_keys,
                 presence_keys=query.presence_keys,
+                logged_after=None if ctx.baseline is None else ctx.baseline.launched_at,
                 environment=ctx.wandb_environment,
                 deadline=poll_deadline,
             )
@@ -860,7 +867,7 @@ def _capture_wandb(
             )
             if isinstance(exc, WandbRunMissingError):
                 message = (
-                    f"No W&B run {ctx.attempt_id!r} was found in {source.entity}/{source.project} "
+                    f"No W&B run {run_id!r} was found in {source.entity}/{source.project} "
                     "at the evidence deadline. The trainer should call wandb.init() without "
                     "its own project, entity or id."
                 )
@@ -881,6 +888,11 @@ def _capture_wandb(
         except WandbRunTerminalError as exc:
             raise ExtractorError(
                 f"W&B run {target} ended in {exc.state!r}; only finished runs can provide evidence."
+            ) from exc
+        except WandbRunStaleError as exc:
+            raise ExtractorError(
+                f"W&B run {target} was not written by this attempt: its summary records no "
+                "wandb.log() call after the attempt launched."
             ) from exc
         except WandbMissingKeysError as exc:
             raise ExtractorError(
@@ -906,7 +918,7 @@ def _capture_wandb(
             "base_url": source.base_url,
             "entity": source.entity,
             "project": source.project,
-            "run_id": ctx.attempt_id,
+            "run_id": run_id,
             "run_state": "finished",
             "constraint_keys": dict(query.constraint_keys),
             "gate_keys": {identity: list(keys) for identity, keys in query.gate_keys},
@@ -978,7 +990,8 @@ def locate_objective_position(
         base_url=cfg.base_url,
         entity=cfg.entity,
         project=cfg.project,
-        run_id=ctx.attempt_id,
+        run_id=ctx.wandb_run_id,
+        attempt_id=ctx.attempt_id,
         attempt_dir=ctx.attempt_dir,
         poll_seconds=cfg.poll_seconds,
         timeout_seconds=cfg.timeout_seconds,

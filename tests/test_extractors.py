@@ -195,7 +195,7 @@ def test_wandb_real_sdk_error_causes_are_preserved(tmp_path, monkeypatch, status
         attempts.clear()
         monkeypatch.setattr(
             "phasesweep.evidence.evaluation.poll_wandb_summary",
-            lambda attempt_dir, environment, **kwargs: _wandb_poll(**kwargs),
+            lambda attempt_dir, attempt_id, environment, **kwargs: _wandb_poll(**kwargs),
         )
         extractor = WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss")
         with pytest.raises(EvidenceUnreadableError, match=str(status)):
@@ -923,7 +923,7 @@ def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monk
     monkeypatch.setattr(public, "Api", lambda **kwargs: SimpleNamespace(run=lookup))
     monkeypatch.setattr(
         "phasesweep.evidence.evaluation.poll_wandb_summary",
-        lambda attempt_dir, environment, **kwargs: _poll_wandb_summary(**kwargs),
+        lambda attempt_dir, attempt_id, environment, **kwargs: _poll_wandb_summary(**kwargs),
     )
     result = evaluate_gates(
         make_trial_context(tmp_path),
@@ -999,6 +999,7 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
         "entity": "entity",
         "project": "project",
         "run_id": "attempt",
+        "attempt_id": "attempt",
         "attempt_dir": tmp_path,
         "poll_seconds": 0.01,
         "timeout_seconds": 5,
@@ -1029,6 +1030,7 @@ def test_wandb_worker_crash_preserves_private_stderr(wandb_worker_sdk, tmp_path)
             entity="e",
             project="p",
             run_id="attempt",
+            attempt_id="attempt",
             attempt_dir=tmp_path,
             poll_seconds=0.01,
             timeout_seconds=5,
@@ -1317,6 +1319,7 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch,
         "entity": "e",
         "project": "p",
         "run_id": "attempt",
+        "attempt_id": "attempt",
         "attempt_dir": tmp_path,
         "poll_seconds": 0.01,
         "timeout_seconds": 5,
@@ -1364,6 +1367,7 @@ def test_wandb_supervision_bounds_blocked_sdk_and_descendants(wandb_worker_sdk, 
             entity="e",
             project="p",
             run_id="attempt",
+            attempt_id="attempt",
             attempt_dir=tmp_path,
             poll_seconds=0.01,
             timeout_seconds=2,
@@ -1403,6 +1407,7 @@ def test_wandb_position_worker_stopped_at_its_deadline_records_no_position(
         entity="e",
         project="p",
         run_id="attempt",
+        attempt_id="attempt",
         attempt_dir=tmp_path,
         poll_seconds=0.01,
         timeout_seconds=2,
@@ -1979,6 +1984,7 @@ def test_wandb_worker_reports_a_missing_run_before_the_supervisor_stops_it(
             entity="e",
             project="p",
             run_id="attempt",
+            attempt_id="attempt",
             attempt_dir=tmp_path,
             poll_seconds=0.01,
             timeout_seconds=_WORKER_POLL_BUDGET_SECONDS,

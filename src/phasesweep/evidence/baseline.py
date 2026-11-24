@@ -1,10 +1,11 @@
-"""Record each value file's size and modification time before an attempt can change them."""
+"""Record each value file's size and modification time, and a rerun's launch time, before an attempt can change them."""
 
 from __future__ import annotations
 
 import errno
 import json
 import stat
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, assert_never
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
 
     from phasesweep.config.models import Experiment, Phase
 
-EVIDENCE_BASELINE_SCHEMA_VERSION = 4
+EVIDENCE_BASELINE_SCHEMA_VERSION = 5
 EVIDENCE_BASELINE_FILE = "evidence_baseline.json"
 
 
@@ -55,12 +56,15 @@ class FileStamp(NamedTuple):
 
 
 class EvidenceBaseline(NamedTuple):
-    """The value paths of a trial directory before one attempt starts."""
+    """The value paths of a trial directory, and the time, before one attempt starts."""
 
     reused: bool
     # A path string records a resolved target with no regular file before launch. None
     # records a target whose prior state could not be inspected.
     files: Mapping[str, FileStamp | str | None]
+    # Unix time just before a rerun's trainer started, which the trial's W&B run must show
+    # a row logged after; None in a directory of the attempt's own, whose run is its own.
+    launched_at: float | None = None
 
 
 def _extractor_value_path(extractor: ObjectiveExtractor) -> str | None:
@@ -136,6 +140,8 @@ def write_evidence_baseline(
     Only a directory an earlier attempt used can hold a value file this attempt did not
     write, so a fresh directory records no paths. An I/O error that leaves a file's prior
     state uncertain is recorded for the individual reader to handle after the trainer runs.
+    A reused directory also records the current time, which the W&B run the attempt resumes
+    must log past.
 
     :param Experiment experiment: Metric, constraints and observations.
     :param Phase phase: Gates of the phase the attempt runs in.
@@ -167,6 +173,7 @@ def write_evidence_baseline(
                 errno.ELOOP,
             }:
                 files[relative] = None
+    launched_at = time.time() if reused else None
     payload = {
         "schema_version": EVIDENCE_BASELINE_SCHEMA_VERSION,
         "reused": reused,
@@ -174,9 +181,10 @@ def write_evidence_baseline(
             relative: before._asdict() if isinstance(before, FileStamp) else before
             for relative, before in files.items()
         },
+        "launched_at": launched_at,
     }
     atomic_write_text(attempt_dir / EVIDENCE_BASELINE_FILE, json.dumps(payload) + "\n")
-    return EvidenceBaseline(reused, files)
+    return EvidenceBaseline(reused, files, launched_at)
 
 
 def read_evidence_baseline(attempt_dir: Path) -> EvidenceBaseline:
@@ -198,7 +206,13 @@ def read_evidence_baseline(attempt_dir: Path) -> EvidenceBaseline:
     ):
         raise ValueError(f"Evidence baseline {path} is malformed or in another format.")
     reused, files = payload.get("reused"), payload.get("files")
-    if type(reused) is not bool or not isinstance(files, dict):
+    launched_at = payload.get("launched_at")
+    if (
+        type(reused) is not bool
+        or not isinstance(files, dict)
+        or (launched_at is None) == reused
+        or not (launched_at is None or (type(launched_at) is float and launched_at > 0))
+    ):
         raise ValueError(f"Evidence baseline {path} is malformed or in another format.")
     baseline: dict[str, FileStamp | str | None] = {}
     for relative, fields in files.items():
@@ -216,4 +230,4 @@ def read_evidence_baseline(attempt_dir: Path) -> EvidenceBaseline:
         ):
             raise ValueError(f"Evidence baseline {path} records {relative!r} malformed.")
         baseline[relative] = FileStamp(resolved, size, mtime_ns)
-    return EvidenceBaseline(reused, baseline)
+    return EvidenceBaseline(reused, baseline, launched_at)

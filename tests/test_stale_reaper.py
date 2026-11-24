@@ -1831,7 +1831,7 @@ def test_wandb_worker_parent_death_is_recovered_after_phase_removal(
 from pathlib import Path
 from phasesweep.evidence.wandb import poll_wandb_summary
 poll_wandb_summary(base_url="https://example.test", entity="e", project="p",
-    run_id="remote-attempt", attempt_dir=Path({str(attempt_dir)!r}),
+    run_id="remote-attempt", attempt_id="remote-attempt", attempt_dir=Path({str(attempt_dir)!r}),
     poll_seconds=0.01, timeout_seconds=120)
 """
     parent = subprocess.Popen([sys.executable, "-c", parent_code])

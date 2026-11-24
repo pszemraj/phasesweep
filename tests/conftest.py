@@ -1202,6 +1202,7 @@ def make_trial_context(
         run_name=run_name or f"{experiment}-{phase}-{trial_id}-attempt-test",
         return_code=0,
         duration_seconds=0.0,
+        wandb_run_id="attempt-test",
     )
 
 

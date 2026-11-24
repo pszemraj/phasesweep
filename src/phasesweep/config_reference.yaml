@@ -619,8 +619,8 @@ MlflowExtractor:
   step: int | null = null
 
 WandbExtractor:
-  # Variant wandb: read one finite number from the finished summary of the W&B run PhaseSweep manages for this attempt, <entity>/<project>/<attempt ID>.
-  # The trainer must log to that run under the managed WANDB_RUN_ID and finish it.
+  # Variant wandb: read one finite number from the finished summary of the W&B run PhaseSweep manages for this trial, <entity>/<project>/<attempt ID of the attempt that opened the trial directory>.
+  # The trainer must log to that run under the managed WANDB_RUN_ID and finish it. A rerun resumes the same run, so _step and summary aggregates span the whole trial; it counts only once it logs a row after its launch.
   # Seed ranking: phases[].repeats.
   # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#wb-evidence
   type: "wandb" (required)
@@ -639,10 +639,10 @@ WandbExtractor:
 
 # The W&B target and polling fields of the wandb reader and the wandb_summary_required gate. Within a phase, every W&B reader and gate agrees on all five.
 # For seed ranking, phases[].repeats creates one trial and tracked run per seed and ranks configuration groups.
-# A run that ends failed, crashed, killed or preempted fails the read at once, and one that has not finished is polled until timeout_seconds runs out.
-# Requires: the phasesweep[wandb] extra. The trainer's wandb.init() picks up the managed WANDB_* variables, including WANDB_RESUME never.
-# Pass no project, entity or id to wandb.init(); log into that one run, and call wandb.finish() only after the final log.
-# Requires: env.WANDB_BASE_URL, WANDB_ENTITY and WANDB_PROJECT, when set, match the target, env.WANDB_RESUME, when set, is never, and env has no WANDB_RUN_ID.
+# A run that ends failed, crashed, killed or preempted fails the read at once, and one that has not finished is polled until timeout_seconds runs out. For a rerun, a state or summary from before its first logged row is the earlier attempt's and is waited out; a run that still shows no such row 30 seconds after the first read, or when timeout_seconds runs out, fails the read as not written by this attempt.
+# Requires: the phasesweep[wandb] extra. The trainer's wandb.init() picks up the managed WANDB_* variables: WANDB_RUN_ID names the trial's run, with WANDB_RESUME never for the attempt that opens the trial directory and allow for a rerun in it.
+# Pass no project, entity, id or resume to wandb.init(); log into that one run, and call wandb.finish() only after the final log. A trainer that starts over instead of resuming logs after the earlier attempt's rows, so an aggregate key also covers them; use a plain key then.
+# Requires: env.WANDB_BASE_URL, WANDB_ENTITY and WANDB_PROJECT, when set, match the target, and env has no WANDB_RUN_ID or WANDB_RESUME.
 # Requires: no WANDB_MODE of offline, dryrun or disabled and no WANDB_DISABLED of 1, true, yes or on, in any case, in env or, at launch, inherited.
 WandbTarget:
   # W&B API endpoint: an http or https URL with a host. Scheme and host are lowercased and trailing slashes stripped. Credentials, a query or a fragment fail.

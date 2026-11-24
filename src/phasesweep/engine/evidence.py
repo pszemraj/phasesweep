@@ -15,7 +15,7 @@ from phasesweep.config.models import Experiment, Phase, _wandb_query
 from phasesweep.engine.errors import (
     TrialEvidenceMissingError,
 )
-from phasesweep.engine.paths import _attempt_dir, _phase_dir
+from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trial_dir_opener
 from phasesweep.engine.repeats import evidence_members
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -590,8 +590,15 @@ def _verify_trial_evidence_dir(
             remediation=NEW_STUDY_STEP,
         )
     capture = provenance.get("remote_capture")
-    if capture is not None and capture.get("kind") == "wandb" and capture["run_id"] != attempt_id:
-        raise TrialEvidenceMissingError(f"{subject} W&B capture belongs to another attempt.")
+    if capture is not None and capture.get("kind") == "wandb":
+        try:
+            trial_run = _trial_dir_opener(trial_dir)
+        except ValueError:
+            trial_run = None
+        if capture["run_id"] != trial_run:
+            raise TrialEvidenceMissingError(
+                f"{subject} W&B capture belongs to another trial's run."
+            )
     if verification.wandb_query is not None:
         if (
             capture is None

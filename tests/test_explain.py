@@ -164,7 +164,7 @@ def test_explain_wandb_gives_the_native_environment_contract() -> None:
     """W&B help names identity overrides and premature finish as contract violations."""
     code, out, err = _explain("metric.extractor")
     assert code == 0 and not err
-    assert "Pass no project, entity or id to wandb.init()" in out
+    assert "Pass no project, entity, id or resume to wandb.init()" in out
     assert "wandb.finish() only after the final log" in out
 
 

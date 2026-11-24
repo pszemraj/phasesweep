@@ -1365,6 +1365,7 @@ def test_failed_trainer_never_reads_remote_metrics(tmp_path, monkeypatch):
         run_name="test",
         return_code=1,
         duration_seconds=1,
+        wandb_run_id="b" * 32,
     )
 
     def remote(*args, **kwargs):

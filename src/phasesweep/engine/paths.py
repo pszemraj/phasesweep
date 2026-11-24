@@ -78,6 +78,17 @@ def _valid_trial_dir_name(value: object, *, label: str) -> str:
     return value
 
 
+def _trial_dir_opener(trial_dir: Path) -> str:
+    """Return the attempt that opened a trial directory, which also names the trial's W&B run.
+
+    :param Path trial_dir: A trial directory :func:`_trial_dir_for` built.
+    :raises ValueError: Its name is not one :func:`_trial_dir_name` builds.
+    :return str: The attempt ID after the name's ``__``.
+    """
+    name = _valid_trial_dir_name(trial_dir.name, label="trial directory")
+    return name.partition("__")[2]
+
+
 def _trial_dir_for(
     experiment: Experiment, phase_name: str, trial_number: int, *, attempt_id: str
 ) -> Path:

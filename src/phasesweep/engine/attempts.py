@@ -25,7 +25,7 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.ledger import open_registry_study
 from phasesweep.engine.optuna import _finished_trial_count
-from phasesweep.engine.paths import _attempt_dir, _attempts_dir, _experiment_dir
+from phasesweep.engine.paths import _attempt_dir, _attempts_dir, _experiment_dir, _trial_dir_opener
 from phasesweep.engine.progress import _log_recovered_trial, _warn_deferred_extraction
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.state import (
@@ -1221,8 +1221,9 @@ def _recover_completed_trial(
         committed.
     :raises TrackingTargetUnavailableError: The tracker gave no answer and no report
         collects the pending attempt for a refusal after the pass.
-    :raises ProcessCleanupUncertainError: A source the rerun continued records a malformed
-        directory, so the attempts whose histories it continues cannot be named.
+    :raises ProcessCleanupUncertainError: The attempt or a source the rerun continued records
+        a malformed directory, so the trial's W&B run or the attempts whose histories it
+        continues cannot be named.
     """
     from phasesweep.engine.evidence import _earlier_attempts
     from phasesweep.engine.trial import (
@@ -1266,6 +1267,14 @@ def _recover_completed_trial(
         # to be this attempt's own, so the training is not accepted and the trial reruns.
         log.warning("Attempt %s cannot be recovered as finished: %s", record.attempt_id, exc)
         return False
+    try:
+        wandb_run_id = _trial_dir_opener(record.trial_dir)
+    except ValueError as exc:
+        raise ProcessCleanupUncertainError(
+            f"Attempt {record.attempt_id} records an unusable trial directory, so the run its "
+            f"trial logs to cannot be named: {exc}.",
+            action=OperatorAction.RESTORE_LEDGER,
+        ) from exc
     experiment = _load_generation_experiment(_experiment_dir(current), record.generation_id)
     phase = experiment.phase(record.phase_name)
     environment = _environment_identity(
@@ -1293,6 +1302,7 @@ def _recover_completed_trial(
         run_name=trial_run_name(experiment, record.phase_name, trial.number, record.attempt_id),
         return_code=0,
         duration_seconds=trainer_duration,
+        wandb_run_id=wandb_run_id,
         mlflow_settings=(
             None if experiment.mlflow is None else experiment.mlflow.target(polling=current.mlflow)
         ),

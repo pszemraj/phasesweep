@@ -503,11 +503,14 @@ def compose_wandb_environment(
 ) -> dict[str, str]:
     """Bind remote evidence before environment identity, preserving other settings.
 
+    The run ID and resume policy are the attempt's, bound at launch: an attempt that opens
+    its trial directory starts the trial's run, and a rerun in that directory resumes it.
+
     :param WandbQuery query: Phase's agreed target and evidence requirements.
     :param Mapping[str, str] configured: Explicit experiment environment entries.
     :param Mapping[str, str] environment: Already composed trainer environment.
     :param bool require_online: Whether disabled/offline ambient logging is invalid for this use.
-    :return dict[str, str]: Bound base environment, before the generated attempt ID.
+    :return dict[str, str]: Bound base environment, before the attempt's run bindings.
     :raises ValueError: Explicit managed settings conflict, or remote logging is disabled.
     """
     source = query.source
@@ -515,7 +518,6 @@ def compose_wandb_environment(
         "WANDB_BASE_URL": source.base_url,
         "WANDB_ENTITY": source.entity,
         "WANDB_PROJECT": source.project,
-        "WANDB_RESUME": "never",
     }
     for key, expected in bindings.items():
         if key in configured:
@@ -527,7 +529,16 @@ def compose_wandb_environment(
                     f"env.{key} conflicts with managed W&B evidence; remove it or match the evidence target."
                 )
     if "WANDB_RUN_ID" in configured:
-        raise ValueError("env.WANDB_RUN_ID conflicts with the generated W&B attempt ID; remove it.")
+        raise ValueError(
+            "env.WANDB_RUN_ID conflicts with the W&B run PhaseSweep sets per trial; remove it."
+        )
+    # No one value matches both policies: never for the attempt that starts the trial's
+    # run, allow for a rerun that resumes it.
+    if "WANDB_RESUME" in configured:
+        raise ValueError(
+            "env.WANDB_RESUME conflicts with the resume policy PhaseSweep sets per attempt; "
+            "remove it."
+        )
     if require_online and (
         environment.get("WANDB_MODE", "online").lower() in {"offline", "dryrun", "disabled"}
         or environment.get("WANDB_DISABLED", "").lower() in {"1", "true", "yes", "on"}
@@ -538,6 +549,7 @@ def compose_wandb_environment(
     result = dict(environment)
     result.update(bindings)
     result.pop("WANDB_RUN_ID", None)
+    result.pop("WANDB_RESUME", None)
     return result
 
 

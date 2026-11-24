@@ -259,7 +259,7 @@ def _environment_identity(
     phase = experiment.phase(phase_name)
     query = _wandb_query(experiment, phase.gates)
     if query is not None:
-        cohort_names.update(("WANDB_BASE_URL", "WANDB_ENTITY", "WANDB_PROJECT", "WANDB_RESUME"))
+        cohort_names.update(("WANDB_BASE_URL", "WANDB_ENTITY", "WANDB_PROJECT"))
         try:
             env = compose_wandb_environment(
                 query,
@@ -800,9 +800,12 @@ def launch_trial(
     env = dict(environment_identity.values)
     phase = experiment.phase(phase_name)
     wandb_query = _wandb_query(experiment, phase.gates)
+    # Every attempt of the trial logs to one run, named by the attempt that opened its
+    # directory, so W&B keeps the history steps and summary aggregates of the whole trial.
     # Without a W&B query, the trainer keeps its own WANDB_RUN_ID.
     if wandb_query is not None:
-        env["WANDB_RUN_ID"] = attempt_id
+        env["WANDB_RUN_ID"] = opener_attempt
+        env["WANDB_RESUME"] = "never" if opener_attempt == attempt_id else "allow"
     if experiment.mlflow is not None:
         from phasesweep.runtime.json import json_text
         from phasesweep.tracking.session import (
@@ -892,6 +895,7 @@ def launch_trial(
         return_code=proc_result.return_code,
         duration_seconds=proc_result.duration_seconds,
         wandb_environment=env if wandb_query is not None else None,
+        wandb_run_id=opener_attempt,
         wandb_query=wandb_query,
         mlflow_settings=None if experiment.mlflow is None else experiment.mlflow.target(),
         mlflow_query=compile_mlflow_query(experiment, phase.gates),

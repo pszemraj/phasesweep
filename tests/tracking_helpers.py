@@ -136,6 +136,7 @@ def mlflow_trial_context(tmp_path: Path) -> TrialContext:
         run_name="test",
         return_code=0,
         duration_seconds=1,
+        wandb_run_id="b" * 32,
         mlflow_settings=experiment.mlflow.model_dump(),
         mlflow_query=compile_query(experiment, []),
     )

@@ -69,6 +69,13 @@ class WandbRunTerminalError(RuntimeError):
 
 
 @dataclass(eq=False)
+class WandbRunStaleError(RuntimeError):
+    """A rerun's run still showed no history row logged after the rerun launched."""
+
+    run_id: str
+
+
+@dataclass(eq=False)
 class WandbSetupError(RuntimeError):
     """W&B rejected authentication or client configuration permanently."""
 
@@ -200,11 +207,13 @@ def poll_wandb_summary(
     entity: str,
     project: str,
     run_id: str,
+    attempt_id: str,
     attempt_dir: Path,
     poll_seconds: float,
     timeout_seconds: float,
     required_keys: Iterable[str] = (),
     presence_keys: Iterable[str] = (),
+    logged_after: float | None = None,
     environment: Mapping[str, str] | None = None,
     deadline: float | None = None,
 ) -> dict[str, Any]:
@@ -213,18 +222,23 @@ def poll_wandb_summary(
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
     :param str project: W&B project containing the run.
-    :param str run_id: Immutable attempt ID, also used by process recovery.
+    :param str run_id: The trial's W&B run, which every attempt of the trial logs to.
+    :param str attempt_id: Attempt whose process slot runs the reader.
     :param Path attempt_dir: Existing attempt directory and durable process slot.
     :param float poll_seconds: Delay between summary polls.
     :param float timeout_seconds: Visibility budget for the whole capture.
     :param Iterable[str] required_keys: Numeric keys required before accepting a capture.
     :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
+    :param float | None logged_after: Unix time a rerun launched at, which the summary's
+        ``_timestamp`` must pass before the run counts as this attempt's; ``None`` for an
+        attempt whose run is its own, defaults to None.
     :param Mapping[str, str] | None environment: Actual composed trainer environment.
     :param float | None deadline: Absolute deadline including worker startup.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
     :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget; it was
         reached only when the worker reports that its last poll got an answer about the run.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
+    :raises WandbRunStaleError: The rerun's run never showed a row logged after it launched.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
     :raises WandbMissingKeysError: The finished run's summary still lacked
@@ -248,6 +262,7 @@ def poll_wandb_summary(
             "timeout_seconds": timeout_seconds,
             "required_keys": list(required_keys),
             "presence_keys": list(presence_keys),
+            "logged_after": logged_after,
             "deadline": deadline,
         },
         Path(__file__).resolve(),
@@ -262,9 +277,10 @@ def poll_wandb_summary(
                 "import_error",
                 "timeout",
                 "run_missing",
+                "stale",
             }
         ),
-        run_id=run_id,
+        run_id=attempt_id,
         attempt_dir=attempt_dir,
         environment=environment,
         deadline=deadline,
@@ -276,12 +292,14 @@ def poll_wandb_summary(
         raise WandbRunTerminalError(run_id, json_text(response, "state"))
     if response.get("status") == "run_missing":
         raise WandbRunMissingError(run_id)
+    if response.get("status") == "stale":
+        raise WandbRunStaleError(run_id)
     if response.get("status") == "missing_keys":
         missing = json_text_list(response.get("missing"))
         available = json_text_list(response.get("available"))
         if missing is None or available is None:
             raise RuntimeError(
-                f"W&B evidence worker returned a malformed missing-keys report for attempt {run_id!r}."
+                f"W&B evidence worker returned a malformed missing-keys report for attempt {attempt_id!r}."
             )
         raise WandbMissingKeysError(run_id, missing, available)
     if response.get("status") == "invalid_evidence":
@@ -301,13 +319,13 @@ def poll_wandb_summary(
             )
         diagnostic = f" Diagnostic preserved at {diagnostic_path}." if diagnostic_path else ""
         raise RuntimeError(
-            f"W&B evidence worker failed for attempt {run_id!r} (exit {result.return_code})."
+            f"W&B evidence worker failed for attempt {attempt_id!r} (exit {result.return_code})."
             f"{diagnostic}"
         )
     capture = response["capture"]
     if not isinstance(capture, dict):
         raise RuntimeError(
-            f"W&B evidence worker returned a malformed capture for attempt {run_id!r}."
+            f"W&B evidence worker returned a malformed capture for attempt {attempt_id!r}."
         )
     return capture
 
@@ -318,6 +336,7 @@ def locate_wandb_position(
     entity: str,
     project: str,
     run_id: str,
+    attempt_id: str,
     attempt_dir: Path,
     poll_seconds: float,
     timeout_seconds: float,
@@ -334,7 +353,8 @@ def locate_wandb_position(
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
     :param str project: W&B project containing the run.
-    :param str run_id: Immutable attempt ID, also used by process recovery.
+    :param str run_id: The trial's W&B run, which every attempt of the trial logs to.
+    :param str attempt_id: Attempt whose process slot runs the reader.
     :param Path attempt_dir: Existing attempt directory and durable process slot.
     :param float poll_seconds: Summary poll interval, the delay between
         history reads up to ``_HISTORY_RETRY_SECONDS``.
@@ -369,7 +389,7 @@ def locate_wandb_position(
         Path(__file__).resolve(),
         "wandb",
         statuses=frozenset({"position", "import_error"}),
-        run_id=run_id,
+        run_id=attempt_id,
         attempt_dir=attempt_dir,
         environment=environment,
         deadline=deadline,
@@ -483,6 +503,7 @@ def _poll_wandb_summary(
     timeout_seconds: float,
     required_keys: Iterable[str] = (),
     presence_keys: Iterable[str] = (),
+    logged_after: float | None = None,
     deadline: float | None = None,
 ) -> dict[str, Any]:
     """Poll an exact run using refreshed SDK clients within the parent's deadline.
@@ -494,6 +515,13 @@ def _poll_wandb_summary(
     lacked them. An unanswered poll at that boundary keeps polling until the
     tracker answers or the deadline arrives.
 
+    A rerun resumes the run an earlier attempt of its trial left, in whatever state that
+    attempt's end left it. Until the summary's ``_timestamp``, the time of the last logged
+    history row, passes ``logged_after``, the state and summary are the earlier attempt's,
+    so neither a terminal state nor a finished summary decides anything; a run that still
+    shows nothing newer once the settle window has passed, or at the deadline, was not
+    written by this attempt.
+
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
     :param str project: W&B project containing the run.
@@ -502,11 +530,14 @@ def _poll_wandb_summary(
     :param float timeout_seconds: Budget used when no ``deadline`` is given.
     :param Iterable[str] required_keys: Numeric keys required before accepting a capture.
     :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
+    :param float | None logged_after: Unix time a rerun launched at; ``None`` for an
+        attempt whose run is its own, defaults to None.
     :param float | None deadline: Absolute ``time.monotonic()`` deadline from the parent.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
     :raises WandbPollTimeout: The run did not finish with the required keys in time,
         reached when the last poll got an answer about the run.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
+    :raises WandbRunStaleError: The run showed no row logged after ``logged_after``.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
     :raises WandbMissingKeysError: The finished run's summary still lacked
@@ -523,6 +554,8 @@ def _poll_wandb_summary(
     last_error: Exception | None = None
     # Whether the latest poll got an answer about the run rather than failing in transport.
     reached = False
+    # Whether the latest answered poll still showed only an earlier attempt's run.
+    stale = False
     settle_by = math.inf
     required = tuple(required_keys)
     while time.monotonic() < deadline:
@@ -559,9 +592,17 @@ def _poll_wandb_summary(
                 # the reserve before the supervisor's deadline exists to report it.
                 last_error = None
                 reached = True
-                if run.state in {"failed", "crashed", "killed", "preempted"}:
+                stale = logged_after is not None and not _logged_since(
+                    run.summary_metrics, logged_after
+                )
+                if stale:
+                    observed_at = time.monotonic()
+                    settle_by = min(settle_by, observed_at + _FINISH_SETTLE_SECONDS)
+                    if settle_by <= observed_at:
+                        raise WandbRunStaleError(run_id)
+                elif run.state in {"failed", "crashed", "killed", "preempted"}:
                     raise WandbRunTerminalError(run_id, run.state)
-                if run.state == "finished":
+                elif run.state == "finished":
                     summary = run.summary_metrics
                     if all(key in summary for key in required):
                         values = {}
@@ -591,7 +632,23 @@ def _poll_wandb_summary(
         time.sleep(min(poll_seconds, max(0.0, wake_by - now)))
     if isinstance(last_error, WandbRunMissingError):
         raise last_error
+    if reached and stale:
+        raise WandbRunStaleError(run_id)
     raise WandbPollTimeout(run_id, timeout_seconds, reached=reached, last_error=last_error)
+
+
+def _logged_since(summary: Mapping[str, object], logged_after: float) -> bool:
+    """Say whether a run's summary records a history row logged after a rerun launched.
+
+    W&B stamps every logged row with the logging host's clock and keeps the last stamp as
+    the summary's ``_timestamp``; the trainer and PhaseSweep share that host's clock.
+
+    :param Mapping[str, object] summary: The run's decoded summary.
+    :param float logged_after: Unix time the rerun launched at.
+    :return bool: Whether ``_timestamp`` is a finite number later than ``logged_after``.
+    """
+    stamp = finite_nonnegative(summary.get("_timestamp"))
+    return stamp is not None and stamp > logged_after
 
 
 def _locate_wandb_position(
@@ -696,6 +753,8 @@ def main(argv: list[str] | None = None) -> int:
         response = {"status": "missing_keys", "missing": exc.missing, "available": exc.available}
     except WandbRunMissingError:
         response = {"status": "run_missing"}
+    except WandbRunStaleError:
+        response = {"status": "stale"}
     except WandbPollTimeout as exc:
         response = {
             "status": "timeout",
