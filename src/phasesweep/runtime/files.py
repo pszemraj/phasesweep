@@ -76,13 +76,18 @@ def file_sha256(path: Path) -> str:
 
 
 def broken_symlink_detail(
-    directory: Path, relative: str | Path, *, require_directory: bool = False
+    directory: Path,
+    relative: str | Path,
+    *,
+    require_directory: bool = False,
+    require_file: bool = False,
 ) -> str | None:
     """Identify a symlink that prevents access to a named path.
 
     :param Path directory: Directory from which to inspect the path.
     :param str | Path relative: Relative path whose components may include a link.
     :param bool require_directory: The final component must also be a directory.
+    :param bool require_file: The final component, if a link, must reach a regular file.
     :return str | None: The broken link, its target and the cause, when established.
     """
     component = directory
@@ -106,6 +111,8 @@ def broken_symlink_detail(
         else:
             if (component != path or require_directory) and not stat.S_ISDIR(info.st_mode):
                 return f"symlink {component} -> {target} does not point to a directory"
+            if component == path and require_file and not stat.S_ISREG(info.st_mode):
+                return f"symlink {component} -> {target} does not point to a regular file"
     return None
 
 

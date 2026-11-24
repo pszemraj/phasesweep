@@ -101,6 +101,20 @@ class StaleEvidenceError(OSError):
     """The evidence cannot be attributed to the current attempt."""
 
 
+def _link_refusal(owner: Path, relative: str | Path, *, directory: bool) -> str | None:
+    """Name a link in a configured path whose target is missing or not the kind required.
+
+    :param Path owner: The directory the configured path is relative to.
+    :param str | Path relative: Configured path.
+    :param bool directory: The path must reach a directory rather than a regular file.
+    :return str | None: The diagnostic naming the link and its target, or ``None``.
+    """
+    detail = broken_symlink_detail(
+        owner, relative, require_directory=directory, require_file=not directory
+    )
+    return None if detail is None else f"Could not read `{relative}` because {detail}."
+
+
 def attempt_file(trial_dir: Path, relative: str | Path) -> Path:
     """Return a trial-relative evidence path, refusing one the attempt may not be scored from.
 
@@ -109,20 +123,20 @@ def attempt_file(trial_dir: Path, relative: str | Path) -> Path:
     absolute and ``..`` paths, so a link is the only way out, and several trials whose
     links name one shared file would all be scored from whichever trainer wrote it last.
     A link that stays inside the trial, such as ``latest -> checkpoint-500``, reads as
-    usual. A broken link names its target in the diagnostic. An ordinary missing file
-    keeps the caller's own not-found handling.
+    usual. A link whose target is missing or is not the kind of file required names the
+    link and its target. An ordinary missing file keeps the caller's own not-found handling.
 
     :param Path trial_dir: The trial directory the file must resolve inside.
-    :param str | Path relative: Configured trial-relative path.
-    :raises TrialPathError: A link is broken or the path resolves outside ``trial_dir``.
+    :param str | Path relative: Configured trial-relative path of a regular file.
+    :raises TrialPathError: A link is unusable or the path resolves outside ``trial_dir``.
     :return Path: ``trial_dir / relative``, unchanged, for the caller to read.
     """
     path = trial_dir / relative
+    if refusal := _link_refusal(trial_dir, relative, directory=False):
+        raise TrialPathError(refusal)
     try:
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
-        if detail := broken_symlink_detail(trial_dir, relative):
-            raise TrialPathError(f"Could not read `{relative}` because {detail}.") from None
         if isinstance(exc, RuntimeError):
             raise TrialPathError(f"Could not resolve {path}: {exc}") from exc
         resolved = path.resolve()
@@ -159,7 +173,8 @@ def trial_file(
     :param bool checked: Check the path against the directory that owns it. ``False``
         only locates it: for a gate that tests an artifact wherever its links lead, or to
         name the file in a diagnostic.
-    :raises TrialPathError: A checked path contains a broken link or resolves outside its directory.
+    :raises TrialPathError: A checked path contains an unusable link or resolves outside its
+        directory.
     :return Path: The path to read.
     """
     if is_captured_stream(relative):
@@ -167,6 +182,25 @@ def trial_file(
     if not checked:
         return trial_dir / relative
     return attempt_file(trial_dir, relative)
+
+
+def unusable_link(
+    trial_dir: Path, attempt_dir: Path, relative: str | Path, *, directory: bool = False
+) -> str | None:
+    """Name an unusable link for a gate that locates its path unchecked.
+
+    The same rule :func:`attempt_file` refuses with, applied in the directory
+    :func:`trial_file` locates the path in.
+
+    :param Path trial_dir: The trial directory the trainer writes into.
+    :param Path attempt_dir: The attempt's directory, holding its captured streams.
+    :param str | Path relative: Configured trial-relative path.
+    :param bool directory: The path must reach a directory rather than a regular file,
+        defaults to False.
+    :return str | None: The diagnostic naming the link and its target, or ``None``.
+    """
+    owner = attempt_dir if is_captured_stream(relative) else trial_dir
+    return _link_refusal(owner, relative, directory=directory)
 
 
 def _require_fresh(
@@ -1182,7 +1216,8 @@ def _required_file(ctx: TrialContext, gate: RequiredFileGate) -> GateResult:
     path = trial_file(ctx.trial_dir, ctx.attempt_dir, gate.path, checked=False)
     if path.is_file():
         return GateResult(gate.type, True, f"{gate.path} exists")
-    return GateResult(gate.type, False, f"{gate.path} is missing")
+    refusal = unusable_link(ctx.trial_dir, ctx.attempt_dir, gate.path)
+    return GateResult(gate.type, False, refusal or f"{gate.path} is missing")
 
 
 def _json_equals(ctx: TrialContext, gate: JsonEqualsGate) -> GateResult:
@@ -1239,6 +1274,12 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
     :return GateResult: Pass/fail result and human-readable detail.
     """
     path = trial_file(ctx.trial_dir, ctx.attempt_dir, gate.path, checked=False)
+    if gate.source != "json" and (
+        refusal := unusable_link(
+            ctx.trial_dir, ctx.attempt_dir, gate.path, directory=gate.source == "directory"
+        )
+    ):
+        return GateResult(gate.type, False, refusal)
     if gate.source == "file":
         try:
             if not path.is_file():
@@ -1314,6 +1355,8 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
         if not path.is_file():
             return GateResult(gate.type, False, f"{gate.path} is missing")
         digest = file_sha256(path)
+    except TrialPathError as exc:
+        return GateResult(gate.type, False, str(exc))
     except OSError as exc:
         return GateResult(gate.type, False, f"could not read {gate.path}: {exc}")
     if digest == gate.sha256:
@@ -1429,20 +1472,5 @@ def evaluate_gates(
             result = _wandb_summary_required(ctx, gate, deadline=deadline)
         else:
             result = _mlflow_required(ctx, gate, deadline=deadline)
-        if not result.passed and (
-            isinstance(gate, RequiredFileGate)
-            or isinstance(gate, ArtifactSizeGate)
-            and gate.source != "json"
-        ):
-            directory = ctx.attempt_dir if is_captured_stream(gate.path) else ctx.trial_dir
-            detail = broken_symlink_detail(
-                directory,
-                gate.path,
-                require_directory=isinstance(gate, ArtifactSizeGate) and gate.source == "directory",
-            )
-            if detail:
-                result = GateResult(
-                    gate.type, False, f"Could not inspect `{gate.path}` because {detail}."
-                )
         results.append(result)
     return results

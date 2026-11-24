@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import errno
 import json
-import logging
 import stat
 from collections.abc import Mapping
 from pathlib import Path
@@ -27,7 +26,7 @@ from phasesweep.evidence.models import (
     WandbSummaryRequiredGate,
     is_captured_stream,
 )
-from phasesweep.runtime.files import atomic_write_text, broken_symlink_detail
+from phasesweep.runtime.files import atomic_write_text
 from phasesweep.runtime.json import strict_json_loads
 
 if TYPE_CHECKING:
@@ -159,21 +158,15 @@ def write_evidence_baseline(
             if stat.S_ISREG(info.st_mode):
                 files[relative] = FileStamp(resolved, info.st_size, info.st_mtime_ns)
         except (OSError, RuntimeError) as exc:
-            # Python 3.11 and 3.12 raise RuntimeError when resolving a link loop.
+            # Python 3.11 and 3.12 raise RuntimeError when resolving a link loop. A missing
+            # target or a loop names no prior file; the read after the trainer exits names
+            # any link that is still unusable.
             if isinstance(exc, OSError) and exc.errno not in {
                 errno.ENOENT,
                 errno.ENOTDIR,
                 errno.ELOOP,
             }:
                 files[relative] = None
-            elif detail := broken_symlink_detail(root, relative):
-                logging.getLogger(__name__).warning(
-                    "Rerunning in %s. Could not read %s before launch because %s. "
-                    "The trainer can still use other checkpoints in this directory.",
-                    root,
-                    relative,
-                    detail,
-                )
     payload = {
         "schema_version": EVIDENCE_BASELINE_SCHEMA_VERSION,
         "reused": reused,

@@ -252,26 +252,43 @@ def test_an_evidence_link_that_loops_fails_the_trial(
         run_extractor(make_trial_context(trial_dir), cfg)
 
 
-@pytest.mark.parametrize("target_is_file", [False, True], ids=["missing-target", "file-target"])
+@pytest.mark.parametrize(
+    ("target", "cause"),
+    [
+        (None, "has a missing target"),
+        ("file", "does not point to a directory"),
+        ("directory", "does not point to a regular file"),
+    ],
+    ids=["missing-target", "file-target", "directory-target"],
+)
 def test_unusable_checkpoint_link_names_the_target_in_evidence_failures(
-    tmp_path: Path, target_is_file: bool
+    tmp_path: Path, target: str | None, cause: str
 ) -> None:
-    """An unusable checkpoint directory names the link and target for the score and artifact gate."""
-    link = tmp_path / "latest"
+    """A link whose target is missing or not the kind of file a reader needs names the link and target for the score and for the presence, size and digest gates alike."""
     checkpoint = tmp_path / "checkpoint-500"
-    if target_is_file:
+    if target == "file":
         checkpoint.touch()
-    link.symlink_to(checkpoint.name)
+    link, relative = tmp_path / "latest", "latest/result.json"
+    if target == "directory":
+        (checkpoint / "result.json").mkdir(parents=True)
+        link, relative = tmp_path / "result.json", "result.json"
+        link.symlink_to("checkpoint-500/result.json")
+    else:
+        link.symlink_to(checkpoint.name)
     ctx = make_trial_context(tmp_path)
-    relative = "latest/result.json"
-    cause = "does not point to a directory" if target_is_file else "has a missing target"
-    detail = f"symlink {link} -> checkpoint-500 {cause}"
+    detail = f"symlink {link} -> {link.readlink()} {cause}"
     with pytest.raises(ExtractorError) as refused:
         run_extractor(ctx, JsonExtractor(type="json", path=relative, key="score"))
     assert detail in str(refused.value)
-    (gate,) = evaluate_gates(ctx, [RequiredFileGate(type="required_file", path=relative)])
-    assert not gate.passed and detail in gate.detail
-    assert link.is_symlink() and checkpoint.is_file() == target_is_file
+    gates = evaluate_gates(
+        ctx,
+        [
+            RequiredFileGate(type="required_file", path=relative),
+            ArtifactSizeGate(type="artifact_size", source="file", path=relative, max_bytes=9),
+            Sha256Gate(type="sha256", path=relative, sha256="0" * 64),
+        ],
+    )
+    assert [(gate.passed, detail in gate.detail) for gate in gates] == [(False, True)] * 3
 
 
 @pytest.mark.parametrize(
