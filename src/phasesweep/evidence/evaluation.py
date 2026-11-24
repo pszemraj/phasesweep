@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from phasesweep.config.common import TRACKER_READ_CONTROLS
+from phasesweep.config.common import TRACKER_READ_CONTROLS, is_sha256_hex
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence.baseline import (
     EVIDENCE_BASELINE_FILE,
@@ -69,7 +69,9 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # Objective-evidence provenance schema version.
-EVIDENCE_PROVENANCE_SCHEMA_VERSION = 6
+EVIDENCE_PROVENANCE_SCHEMA_VERSION = 7
+# Retained evidence is indexed by configured path and named by its recorded file digest.
+RETAINED_EVIDENCE_SCHEMA_VERSION = 1
 # Log-regex evaluation revision included in the extractor contract.
 LOG_REGEX_EVALUATION_REVISION = 3
 
@@ -188,6 +190,51 @@ def trial_file(
     if not checked:
         return trial_dir / relative
     return attempt_file(trial_dir, relative)
+
+
+def retained_evidence_dir(attempt_dir: Path, relative: str) -> Path:
+    """Locate this attempt's saved measurement bytes for a configured file path.
+
+    :param Path attempt_dir: Producing attempt's audit directory.
+    :param str relative: Configured path, relative to the trial directory.
+    :return Path: Directory whose filenames are the original file digests.
+    """
+    path_key = hashlib.sha256(Path(relative).as_posix().encode()).hexdigest()
+    return attempt_dir / f"retained-evidence-v{RETAINED_EVIDENCE_SCHEMA_VERSION}" / path_key
+
+
+def retained_evidence_file(
+    attempt_dir: Path, relative: str, *, digest: str | None = None
+) -> Path | None:
+    """Find the retained score file for this attempt and path, if a rerun saved it.
+
+    :param Path attempt_dir: Producing attempt's audit directory.
+    :param str relative: Configured path, relative to the trial directory.
+    :param str | None digest: Expected digest for a frozen objective, or None while re-reading.
+    :raises TrialPathError: The retained file has no unambiguous, readable original contents.
+    :return Path | None: The retained file, or None if this attempt has no capture of that path.
+    """
+    directory = retained_evidence_dir(attempt_dir, relative)
+    if digest is not None:
+        path = directory / digest
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return None
+    else:
+        try:
+            paths = [entry for entry in directory.iterdir() if is_sha256_hex(entry.name)]
+        except FileNotFoundError:
+            return None
+        if not paths:
+            return None
+        if len(paths) != 1:
+            raise TrialPathError(f"Several retained files claim {relative!r} in {attempt_dir}.")
+        path = paths[0]
+    retained = attempt_file(attempt_dir, path.relative_to(attempt_dir))
+    if digest is None and file_sha256(retained) != retained.name:
+        raise TrialPathError(f"Retained evidence at {retained} no longer has its original bytes.")
+    return retained
 
 
 def unusable_link(
@@ -317,12 +364,14 @@ def load_json_value(
         duplicate object keys, or a rejected JSON constant).
     :return tuple[Path, Any]: Resolved JSON file path and loaded value.
     """
-    target = trial_file(trial_dir, attempt_dir, relative_path)
+    retained = retained_evidence_file(attempt_dir, relative_path)
+    target = retained if retained is not None else trial_file(trial_dir, attempt_dir, relative_path)
     if not target.is_file():
         raise FileNotFoundError(target)
-    _require_fresh(
-        baseline, trial_dir, attempt_dir, relative_path, target, evidence_before=evidence_before
-    )
+    if retained is None:
+        _require_fresh(
+            baseline, trial_dir, attempt_dir, relative_path, target, evidence_before=evidence_before
+        )
     raw = target.read_bytes()
     if digest is not None:
         digest.update(_file_digest(raw))
@@ -610,7 +659,12 @@ def _extract_json_envelope(
             f"0 only; it writes `{cfg.path}` under PHASESWEEP_TRIAL_DIR"
         ),
     ):
-        raw = trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.path).read_bytes()
+        retained = retained_evidence_file(ctx.attempt_dir, cfg.path)
+        raw = (
+            retained
+            if retained is not None
+            else trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.path)
+        ).read_bytes()
         data = strict_json_loads(raw.decode("utf-8"))
 
     if not isinstance(data, dict):
@@ -735,7 +789,12 @@ def _extract_log_regex(
     :return float: Selected match value.
     """
     try:
-        target = trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.file)
+        retained = retained_evidence_file(ctx.attempt_dir, cfg.file)
+        target = (
+            retained
+            if retained is not None
+            else trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.file)
+        )
         if not target.is_file():
             raise ExtractorError(
                 f"Log file not found: {target} (the trainer must write `{cfg.file}` under "
@@ -757,14 +816,15 @@ def _extract_log_regex(
     count = 0
     first_unparseable: str | None = None
     try:
-        _require_fresh(
-            ctx.baseline,
-            ctx.trial_dir,
-            ctx.attempt_dir,
-            cfg.file,
-            target,
-            evidence_before=ctx.evidence_before,
-        )
+        if retained is None:
+            _require_fresh(
+                ctx.baseline,
+                ctx.trial_dir,
+                ctx.attempt_dir,
+                cfg.file,
+                target,
+                evidence_before=ctx.evidence_before,
+            )
         with target.open("r", encoding="utf-8", errors="surrogateescape", newline="") as fh:
             for line_no, raw_text in enumerate(fh, 1):
                 raw_line = raw_text.encode("utf-8", errors="surrogateescape")

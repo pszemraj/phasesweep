@@ -8,7 +8,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
 from uuid import uuid4
@@ -37,6 +37,9 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.evidence import (
     _earlier_attempts,
+    _preserve_shared_measurements,
+    _shared_measurements,
+    _SharedMeasurement,
     _validate_selection_evidence,
     _verify_winner_evidence,
 )
@@ -652,6 +655,8 @@ class _PhaseExecution:
     gpu_pool: GpuPool
     optimize_deadline: float | None
     timeout_source: str | None
+    other_studies: Sequence[optuna.Study] = ()
+    shared_measurements: dict[str, set[_SharedMeasurement]] | None = None
     completion_sequence: int = 0
     consecutive_failures: int = 0
     recorded_outcomes: dict[int, str] = field(default_factory=dict)
@@ -1062,6 +1067,13 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     # GPU lease covers only subprocess lifetime, not extraction.
     try:
         _refuse_launch_after_deadline(run)
+        if reusing_directory and run.other_studies:
+            with run.outcome_lock:
+                if run.shared_measurements is None:
+                    run.shared_measurements = _shared_measurements(run.other_studies)
+                measurements = run.shared_measurements.get(trial_dir.name)
+            if measurements:
+                _preserve_shared_measurements(trial_dir, measurements)
         prepared_input = prepare_trainer_input(
             experiment=experiment,
             phase_name=phase.name,
@@ -1753,6 +1765,7 @@ def _run_phase(
         gpu_pool=gpu_pool,
         optimize_deadline=budget.deadline,
         timeout_source=budget.source,
+        other_studies=others,
         finished_trials=finished,
     )
     run.resume_from(resume.policy_state)

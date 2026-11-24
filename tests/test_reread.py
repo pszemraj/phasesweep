@@ -18,6 +18,7 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.config.models import Constraint, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Sampler
+from phasesweep.engine import reread as reread_ops
 from phasesweep.engine.errors import (
     PhaseTimeoutError,
     StudyFingerprintMismatchError,
@@ -342,6 +343,91 @@ def test_reread_does_not_score_a_file_overwritten_from_another_reading_study(
     assert trials[0].state == optuna.trial.TrialState.FAIL
     assert "changed after this attempt finished" in trials[0].user_attrs[FAILURE_REASON_ATTR]
     assert _launches(launches) == 4
+
+
+@pytest.mark.parametrize("interrupt_fill", [False, True])
+def test_retry_keeps_the_measured_evidence_of_a_sibling_reading_study(
+    tmp_path: Path, interrupt_fill: bool
+) -> None:
+    """A retry can overwrite shared score files without erasing earlier measurements."""
+    launches = tmp_path / "launches.txt"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse, json
+        from pathlib import Path
+        args = argparse.ArgumentParser()
+        args.add_argument("--out", type=Path, required=True)
+        out = args.parse_args().out
+        launches = Path({str(launches)!r})
+        with launches.open("a") as handle:
+            handle.write("launch\\n")
+        count = len(launches.read_text().splitlines())
+        out.write_text(json.dumps({{"loss": count, "alternate": count}}))
+        out.with_name("resource.json").write_text(json.dumps({{"mem": 10 + count, "peak": 20 + count}}))
+        out.with_name("unmeasured.json").write_text(json.dumps({{"peaky": 30 + count}}))
+        """,
+    )
+    phase = Phase(name="p", n_trials=1, gpu_policy="none", sampler=Sampler(type="grid"))
+    retry = phase.model_copy(update={"n_trials": 2})
+
+    def config(
+        key: str,
+        phase: Phase,
+        *,
+        constraint_key: str = "mem",
+        constraint_path: str = "resource.json",
+    ) -> Experiment:
+        constraint = Constraint(
+            name="memory",
+            min=0,
+            extractor=JsonExtractor(type="json", path=constraint_path, key=constraint_key),
+        )
+        return _experiment(
+            tmp_path, trainer, _metric(key), phases=[phase], constraints=[constraint]
+        )
+
+    original = config("typo", phase)
+    corrected = config("loss", phase)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(original)
+    if interrupt_fill:
+        with (
+            patch.object(reread_ops, "_stamp_identity", side_effect=RuntimeError("stop fill")),
+            pytest.raises(RuntimeError, match="stop fill"),
+        ):
+            run_experiment(corrected)
+    else:
+        assert run_experiment(corrected)["p"].metric == 1
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(config("typo", retry))
+    first, last = phase_study_of(original).get_trials()
+    assert first.user_attrs[TRIAL_DIR_ATTR] == last.user_attrs[TRIAL_DIR_ATTR]
+    assert _launches(launches) == 2
+    assert (
+        Path(first.user_attrs[TRIAL_DIR_ATTR], "r.json").read_text()
+        == '{"loss": 2, "alternate": 2}'
+    )
+
+    # An unfinished fill can import the new attempt. A published study replays its own target.
+    corrected_phase = retry if interrupt_fill else phase
+    winner = run_experiment(config("loss", corrected_phase))["p"]
+    assert winner.metric == 1
+    assert winner.constraints == {"memory": 11}
+    unmeasured = config(
+        "alternate", retry, constraint_key="peaky", constraint_path="unmeasured.json"
+    )
+    assert run_experiment(unmeasured)["p"].metric == 2
+    assert [trial.value for trial in phase_study_of(unmeasured).get_trials()] == [None, 2]
+
+    alternate = config("alternate", retry, constraint_key="peak")
+    winner = run_experiment(alternate)["p"]
+    assert winner.metric == 1
+    assert winner.constraints == {"memory": 21}
+    assert [trial.value for trial in phase_study_of(alternate).get_trials()] == [1, 2]
+
+    assert _launches(launches) == 2
 
 
 def test_reread_refuses_an_older_file_reached_through_a_retargeted_link(tmp_path: Path) -> None:

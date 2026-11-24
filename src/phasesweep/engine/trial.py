@@ -59,6 +59,7 @@ from phasesweep.evidence.models import (
     JsonEnvelopeExtractor,
     ObjectiveExtractor,
     compose_wandb_environment,
+    is_captured_stream,
 )
 from phasesweep.runtime.commands import (
     TRAINER_INPUT_FILENAMES,
@@ -68,7 +69,7 @@ from phasesweep.runtime.commands import (
     trial_substitutions,
 )
 from phasesweep.runtime.files import atomic_write_text, private_atomic_write_text
-from phasesweep.runtime.json import JsonObject
+from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.runtime.process import (
     TIMEOUT_REASON_PREFIX,
     AttemptEnd,
@@ -1022,7 +1023,7 @@ def extract_trial_result(
         :param ObjectiveExtractor extractor: Configured scalar extractor.
         :param str label: Extractor label used in the persisted failure reason.
         :param str log_label: Metric or constraint label used in warning messages.
-        :param JsonObject | None provenance: Objective-only frozen evidence sink.
+        :param JsonObject | None provenance: Frozen evidence sink for the scalar.
         :return float | TrialResult: Finite scalar or the failed trial result.
         """
         try:
@@ -1067,7 +1068,7 @@ def extract_trial_result(
                 "[%s/trial_%d] %s returned non-finite value: %r",
                 executed.ctx.phase,
                 executed.ctx.trial_id,
-                label if provenance is not None else log_label,
+                label if label == METRIC_EXTRACTOR_LABEL else log_label,
                 value,
             )
             return _failed_trial(
@@ -1086,17 +1087,40 @@ def extract_trial_result(
     )
     if isinstance(metric_value, TrialResult):
         return metric_value
+    primary_source = objective_provenance.get("source")
+    constraint_files: list[JsonValue] = []
     for c in experiment.constraints:
         expired = _deadline_failure(f"constraint extractor {c.name!r}")
         if expired is not None:
             expired.constraints.update(constraint_values)
             return expired
+        provenance: JsonObject | None = (
+            {} if c.extractor.type in ("json", "json_envelope", "log_regex") else None
+        )
         v = extract_required(
-            c.extractor, label=f"constraint extractor {c.name!r}", log_label=f"constraint {c.name}"
+            c.extractor,
+            label=f"constraint extractor {c.name!r}",
+            log_label=f"constraint {c.name}",
+            provenance=provenance,
         )
         if isinstance(v, TrialResult):
             return v
         constraint_values[c.name] = v
+        if provenance is not None:
+            source = provenance["source"]
+            assert isinstance(source, dict) and isinstance(source["path"], str)
+            fields = ("path", "sha256", "size_bytes")
+            if is_captured_stream(source["path"]) or (
+                isinstance(primary_source, dict)
+                and all(primary_source.get(field) == source[field] for field in fields)
+            ):
+                continue
+            file = {field: source[field] for field in fields}
+            if file not in constraint_files:
+                constraint_files.append(file)
+
+    if constraint_files:
+        objective_provenance["local_constraint_files"] = constraint_files
 
     gate_results = evaluate_gates(executed.ctx, gates or [], deadline=deadline)
     if executed.ctx.mlflow_capture:

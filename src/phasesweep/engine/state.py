@@ -213,7 +213,7 @@ PHASE_IDENTITY_ATTR = "phasesweep_phase_identity"
 REREAD_FILL_ATTR = "phasesweep_reread_fill"
 PHASE_IDENTITY_SCHEMA_VERSION = 4
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 20
+STUDY_SCHEMA_VERSION = 21
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The

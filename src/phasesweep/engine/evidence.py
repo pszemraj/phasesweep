@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping
+import os
+import shutil
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import TYPE_CHECKING, Any, NoReturn, TypeGuard
 
 import optuna
@@ -45,6 +49,8 @@ from phasesweep.evidence.evaluation import (
     attempt_file,
     extractor_config_fingerprint,
     json_float,
+    retained_evidence_dir,
+    retained_evidence_file,
     trial_file,
 )
 from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
@@ -54,10 +60,12 @@ from phasesweep.evidence.models import (
     WandbExtractor,
     _validate_trial_file_path,
     _WandbSummarySource,
+    is_captured_stream,
 )
 from phasesweep.runtime.commands import TRAINER_INPUT_FILENAMES
 from phasesweep.runtime.files import (
     file_sha256,
+    fsync_directory,
 )
 from phasesweep.runtime.json import finite_nonnegative
 from phasesweep.runtime.process import (
@@ -147,6 +155,116 @@ def _trial_objective_provenance(trial: optuna.trial.FrozenTrial) -> dict[str, An
     return parsed
 
 
+def _file_evidence_fields(source: Mapping[str, object]) -> tuple[str, str, int]:
+    """Decode the provenance fields that identify exact scalar evidence bytes.
+
+    :param Mapping[str, object] source: Recorded local file evidence.
+    :raises ValueError: A path, digest or size is missing or invalid.
+    :return tuple[str, str, int]: Configured path, recorded digest and number of bytes.
+    """
+    path, digest, size = source.get("path"), source.get("sha256"), source.get("size_bytes")
+    if (
+        not isinstance(path, str)
+        or not path
+        or not is_sha256_hex(digest)
+        or type(size) is not int
+        or size < 0
+    ):
+        raise ValueError("missing file source path, size, or digest")
+    return _validate_trial_file_path(path), digest, size
+
+
+@dataclass(frozen=True)
+class _SharedMeasurement:
+    """A measured scalar that still refers to a reused trainer directory."""
+
+    attempt_id: str
+    path: str
+    digest: str
+    size: int
+
+
+def _shared_measurements(studies: Sequence[optuna.Study]) -> dict[str, set[_SharedMeasurement]]:
+    """Index scores in sibling reading studies whose files a retried trainer may replace.
+
+    :param Sequence[optuna.Study] studies: Other studies of the phase.
+    :return dict[str, set[_SharedMeasurement]]: Referenced score files by trainer directory name.
+    """
+    by_directory: dict[str, set[_SharedMeasurement]] = {}
+    for study in studies:
+        for trial in study.get_trials(deepcopy=False):
+            identity = _selection_candidate_identity(trial)
+            if identity is None:
+                continue
+            try:
+                directory = _required_trial_dir(trial).name
+                provenance = _trial_objective_provenance(trial)
+            except (TrialEvidenceMissingError, ValueError):
+                continue
+            sources = list(provenance.get("local_constraint_files", ()))
+            if provenance["source"]["kind"] == "file":
+                sources.append(provenance["source"])
+            for source in sources:
+                path, digest, size = _file_evidence_fields(source)
+                if not is_captured_stream(path):
+                    measurement = _SharedMeasurement(identity[1], path, digest, size)
+                    by_directory.setdefault(directory, set()).add(measurement)
+    return by_directory
+
+
+def _preserve_shared_measurements(
+    trial_dir: Path, measurements: Collection[_SharedMeasurement]
+) -> None:
+    """Retain exact measured files before a later trainer writes in their directory.
+
+    A successful rename publishes only complete, digest-matching bytes. A file already changed
+    in the trainer directory cannot be saved as this attempt's evidence.
+
+    :param Path trial_dir: Directory the trainer will reuse.
+    :param Collection[_SharedMeasurement] measurements: Measurements at risk from writes here.
+    :raises OSError: A source could not be inspected, or matching bytes could not be retained.
+    """
+    for measurement in measurements:
+        attempt_dir = _attempt_dir(trial_dir.parent, measurement.attempt_id)
+        if (
+            retained_evidence_file(attempt_dir, measurement.path, digest=measurement.digest)
+            is not None
+        ):
+            continue
+        try:
+            original = trial_file(trial_dir, attempt_dir, measurement.path)
+            if original.stat().st_size != measurement.size:
+                continue
+            source = original.open("rb")
+        except (FileNotFoundError, TrialPathError):
+            continue
+        staged = None
+        with source:
+            directory = retained_evidence_dir(attempt_dir, measurement.path)
+            destination = attempt_file(
+                attempt_dir, (directory / measurement.digest).relative_to(attempt_dir)
+            )
+            directory.mkdir(parents=True, exist_ok=True)
+            prefix = f".capture-{measurement.digest}-"
+            # Reruns of this directory are serialized. A killed run can leave its stage behind.
+            for abandoned in directory.glob(f"{prefix}*"):
+                abandoned.unlink()
+            try:
+                with NamedTemporaryFile(dir=directory, prefix=prefix, delete=False) as handle:
+                    staged = Path(handle.name)
+                    shutil.copyfileobj(source, handle)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if file_sha256(staged) == measurement.digest:
+                    staged.replace(destination)
+                    fsync_directory(directory)
+                    fsync_directory(directory.parent)
+                    fsync_directory(attempt_dir)
+            finally:
+                if staged is not None:
+                    staged.unlink(missing_ok=True)
+
+
 def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: str) -> None:
     """Require a present objective record to retain its source binding.
 
@@ -185,6 +303,16 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
     source = provenance.get("source")
     if not isinstance(source, Mapping):
         fail("missing source")
+    constraint_files = provenance.get("local_constraint_files", [])
+    if not isinstance(constraint_files, list):
+        fail("invalid local constraint files")
+    for file in constraint_files:
+        if not isinstance(file, Mapping):
+            fail("invalid local constraint file")
+        try:
+            _file_evidence_fields(file)
+        except ValueError as exc:
+            fail(f"invalid local constraint file: {exc}")
     capture = provenance.get("remote_capture")
     if isinstance(capture, Mapping) and capture.get("kind") == "mlflow":
         from phasesweep.evidence.mlflow import validate_capture
@@ -254,20 +382,12 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
         if not _valid_progress_record(progress, nullable=True):
             fail("W&B objective has no evaluation-axis record")
         return
-    if (
-        source.get("kind") != "file"
-        or not isinstance(source.get("path"), str)
-        or not source["path"]
-        or type(source.get("size_bytes")) is not int
-        or source["size_bytes"] < 0
-        or not is_sha256_hex(source.get("sha256"))
-    ):
-        fail("missing file source path, size, or digest")
-    else:
-        try:
-            _validate_trial_file_path(source["path"])
-        except ValueError:
-            fail("invalid file source path")
+    if source.get("kind") != "file":
+        fail("missing file source")
+    try:
+        _file_evidence_fields(source)
+    except ValueError as exc:
+        fail(str(exc))
     if kind == "json_envelope":
         evaluation = source.get("evaluation")
         if (
@@ -335,7 +455,10 @@ def _verify_objective_source_evidence(
     # _validate_objective_provenance refused any path but a trial-relative one.
     raw_path = str(source["path"])
     try:
-        source_path = trial_file(trial_dir, attempt_dir, raw_path)
+        retained = retained_evidence_file(attempt_dir, raw_path, digest=str(source["sha256"]))
+        source_path = (
+            retained if retained is not None else trial_file(trial_dir, attempt_dir, raw_path)
+        )
     except TrialPathError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r}, but {exc}"
