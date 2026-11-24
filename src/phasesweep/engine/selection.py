@@ -928,8 +928,8 @@ def _ranked_revision_sources(
 ) -> dict[int, list[str]]:
     """Find the earlier generations that may have trained in each ranked trial's directory.
 
-    Every ancestor in the trial's rerun chain that recorded the directory
-    (:func:`~phasesweep.engine.trial_dirs._rerun_directory_sources`) and a generation counts.
+    Every ancestor back to the attempt that opened the same directory
+    (:func:`~phasesweep.engine.trial_dirs._rerun_directory_sources`) and recorded a generation counts.
     One that never launched its trainer may add a revision that trained nothing, which the
     check's "may have trained" wording covers.
 

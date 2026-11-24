@@ -101,8 +101,9 @@ def _earlier_attempts(
     """Name the earlier attempts that trained in the directory a rerun continues.
 
     :param Mapping[int, optuna.trial.FrozenTrial] trials: The study's trials by number.
-    :param optuna.trial.FrozenTrial trial: The rerun, about to launch or already launched.
-    :raises ProcessCleanupUncertainError: A source's recorded directory is malformed.
+    :param optuna.trial.FrozenTrial trial: A trial continuing its source's directory, or
+        one that recorded its directory.
+    :raises ProcessCleanupUncertainError: A source is invalid or its recorded directory is malformed.
     :return tuple[tuple[str, str], ...]: ``(generation_id, attempt_id)`` per earlier attempt,
         oldest first; empty for a trial in a directory of its own.
     """
@@ -745,11 +746,7 @@ def _validate_selection_evidence(
                     f"{trial.user_attrs.get(TRIAL_DIR_ATTR)!r}, so its evidence cannot be "
                     "located."
                 ) from None
-            # Identity binding: the persisted directory name must be exactly the one
-            # _trial_dir_for builds for the trial and attempt that opened it, this trial's
-            # own or, for a rerun that continued an interrupted trial, that trial's. A name
-            # that disagrees means the study record and the directory are not describing
-            # the same execution.
+            # The directory must name its own opener, even after a fresh-directory rerun.
             expected_name = _expected_trial_dir_name(trials, trial)
             if expected_name is None or recorded != expected_name:
                 raise TrialEvidenceMissingError(

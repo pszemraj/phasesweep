@@ -19,6 +19,7 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     RERUN_OF_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     _parsed_trial_outcome,
     _trial_attempt_dir,
@@ -178,12 +179,17 @@ def test_a_rerun_that_logs_nothing_fails_as_not_written_by_this_attempt(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("directory_missing", [False, True])
 def test_recovery_after_a_runner_kill_reads_the_reruns_trial_run(
-    tmp_path: Path, wandb_worker_sdk: Callable[[str], None]
+    tmp_path: Path, wandb_worker_sdk: Callable[[str], None], directory_missing: bool
 ) -> None:
-    """A rerun whose runner died while reading W&B is recovered from the trial's run, not one named by its own attempt."""
+    """Recovery reads the run that the recorded directory's opener logged to."""
     tracker = _fake_wandb(wandb_worker_sdk, tmp_path)
     experiment = _interrupted_wandb_trial(tmp_path, timeout_seconds=30)
+    (first,) = phase_trials(experiment)
+    if directory_missing:
+        directory = Path(first.user_attrs[TRIAL_DIR_ATTR])
+        directory.rename(directory.with_name("saved-directory"))
     tracker.mode.write_text("hang")
     reader = None
     try:
@@ -200,9 +206,12 @@ def test_recovery_after_a_runner_kill_reads_the_reruns_trial_run(
 
         winner = run_experiment(experiment)["p"]
         first, rerun = phase_trials(experiment)
-        opener = first.user_attrs[ATTEMPT_ID_ATTR]
+        opener = (rerun if directory_missing else first).user_attrs[ATTEMPT_ID_ATTR]
         assert winner.trial_number == rerun.number and winner.metric == 1.0
-        assert len(_launch_envs(tmp_path)) == 2
+        assert _launch_envs(tmp_path) == [
+            [first.user_attrs[ATTEMPT_ID_ATTR], "never", first.user_attrs[ATTEMPT_ID_ATTR]],
+            [opener, "never" if directory_missing else "allow", rerun.user_attrs[ATTEMPT_ID_ATTR]],
+        ]
         assert set(tracker.lookups.read_text().splitlines()) == {f"e/p/{opener}"}
         capture = json.loads(rerun.user_attrs[OBJECTIVE_PROVENANCE_ATTR])["remote_capture"]
         assert capture["run_id"] == opener

@@ -998,7 +998,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     overrides = _composed_overrides(experiment, phase, sampled, run.inherited_winners)
 
     attempt_id = uuid4().hex
-    # A rerun of an interrupted or failed trial continues in its directory, under the opener's names.
+    # Continuing a directory keeps its opener's trainer and tracking identity.
     try:
         trials = {frozen.number: frozen for frozen in run.study.get_trials(deepcopy=False)}
         directory = _trial_dir_for_attempt(
@@ -1009,29 +1009,19 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             attempt_id=attempt_id,
             recovered=frozenset(_cleanup_recovered_trial_numbers(run.study)),
         )
-        earlier_attempts = _earlier_attempts(trials, trials[trial.number])
+        reusing_directory = directory.opener_number != trial.number
+        earlier_attempts = (
+            _earlier_attempts(trials, trials[trial.number]) if reusing_directory else ()
+        )
     except PhaseSweepError as exc:
-        # Unconfirmed cleanup of the source, or a trial path the rerun cannot follow: the
-        # operator acts before anything launches.
+        # Unconfirmed cleanup or a directory that cannot be inspected stops the launch.
         run.record_fatal(exc)
         raise _TrialLeftRunning(exc) from exc
     trial_dir = directory.path
     opened_by = (directory.opener_number, directory.opener_attempt_id)
     attempt_dir = _attempt_dir(_phase_dir(experiment, phase.name), attempt_id)
-    # A broken link was refused above, so a rerun's path that does not exist is missing.
-    reusing_directory = directory.opener_number != trial.number
-    directory_missing = reusing_directory and not trial_dir.exists()
     # Persist allocated before discovery and GPU waiting; no identity then means no launch.
     try:
-        if directory_missing:
-            log.warning(
-                "The original trial directory %s is missing. Trial %d reruns trial %s with the "
-                "same parameters in a new directory at that path, without its previous local "
-                "checkpoints.",
-                trial_dir,
-                trial.number,
-                trial.user_attrs.get(RERUN_OF_ATTR),
-            )
         trial_dir.mkdir(parents=True, exist_ok=True)
         attempt_dir.mkdir(parents=True, exist_ok=True)
         write_attempt_lifecycle(attempt_dir, attempt_id=attempt_id, state="allocated")
@@ -1056,6 +1046,14 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     trial.set_user_attr(GENERATION_ID_ATTR, run.generation_id)
     trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    if directory.restart_reason is not None:
+        log.warning(
+            "Trial %d reruns trial %s from step 0 with the same parameters in %s because %s.",
+            trial.number,
+            trial.user_attrs.get(RERUN_OF_ATTR),
+            trial_dir,
+            directory.restart_reason,
+        )
     trial.set_user_attr(OVERRIDES_ATTR, json.dumps(overrides, default=str, sort_keys=True))
     # GPU lease covers only subprocess lifetime, not extraction.
     try:
@@ -1111,7 +1109,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                 phase,
                 trial,
                 gpu=gpu_assignment.visible_devices,
-                in_place=reusing_directory and not directory_missing,
+                in_place=reusing_directory,
             )
             try:
                 executed = launch_trial(

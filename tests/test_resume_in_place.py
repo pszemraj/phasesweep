@@ -20,12 +20,13 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Metric, Observation
 from phasesweep.engine.errors import TrialEvidenceMissingError
-from phasesweep.engine.evidence import _verify_winner_evidence
+from phasesweep.engine.evidence import _earlier_attempts, _verify_winner_evidence
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
 from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trial_dir_for
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError, _ranked_revision_sources
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     RERUN_OF_ATTR,
     TRIAL_DIR_ATTR,
@@ -37,7 +38,7 @@ from phasesweep.engine.trial_dirs import (
     _expected_trial_dir_name,
     _trial_dir_for_attempt,
 )
-from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
+from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
 from phasesweep.evidence.baseline import (
     EVIDENCE_BASELINE_FILE,
     read_evidence_baseline,
@@ -380,15 +381,18 @@ def test_a_killed_runs_trial_resumes_its_checkpoint_in_the_next_run(tmp_path: Pa
 
 
 @pytest.mark.integration
-def test_an_interruption_before_a_reruns_launch_keeps_the_earlier_checkpoint(
-    tmp_path: Path,
+@pytest.mark.parametrize("directory_recorded", [False, True])
+def test_recovery_of_an_interrupted_directory_reset(
+    tmp_path: Path, directory_recorded: bool
 ) -> None:
-    """Recovery crosses a rerun interrupted before directory allocation to resume the original checkpoint."""
+    """Recovery uses a restored checkpoint until the reset's own directory reaches the ledger."""
     experiment = _interrupt_first_attempt(
         tmp_path, _trainer(tmp_path, _CHECKPOINTING, _RESUMING), _JSON_METRIC
     )
+    (first,) = phase_trials(experiment)
+    directory = Path(first.user_attrs[TRIAL_DIR_ATTR])
+    saved = directory.rename(directory.with_name("saved-directory"))
     config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
-    # Killing a separate controller leaves the claimed trial RUNNING without a directory.
     program = """
 import os, signal, sys
 from phasesweep import run_experiment
@@ -398,25 +402,39 @@ from phasesweep.engine import phase
 def interrupt_launch(*args, **kwargs):
     os.kill(os.getpid(), signal.SIGKILL)
 
-phase._trial_dir_for_attempt = interrupt_launch
+if sys.argv[2] == "True":
+    phase.prepare_trainer_input = interrupt_launch
+else:
+    register = phase._register_active_attempt
+    def interrupt_registration(*args, **kwargs):
+        register(*args, **kwargs)
+        interrupt_launch()
+    phase._register_active_attempt = interrupt_registration
 run_experiment(load_experiment(sys.argv[1]))
 """
     runner = subprocess.run(
-        [sys.executable, "-c", program, str(config)], capture_output=True, timeout=15, check=False
+        [sys.executable, "-c", program, str(config), str(directory_recorded)],
+        capture_output=True,
+        timeout=15,
+        check=False,
     )
     assert runner.returncode == -signal.SIGKILL, runner.stderr.decode()
     first, unlaunched = phase_trials(experiment)
     assert unlaunched.state == optuna.trial.TrialState.RUNNING
     assert unlaunched.user_attrs[RERUN_OF_ATTR] == first.number
-    assert TRIAL_DIR_ATTR not in unlaunched.user_attrs
+    assert (TRIAL_DIR_ATTR in unlaunched.user_attrs) is directory_recorded
+    saved.rename(directory)
 
     winner = run_experiment(experiment)["p"]
     _, settled, rerun = phase_trials(experiment)
     outcome = _parsed_trial_outcome(settled.user_attrs[TRIAL_OUTCOME_ATTR])
     assert outcome is not None and outcome.outcome == "interrupted"
     assert rerun.user_attrs[RERUN_OF_ATTR] == unlaunched.number
-    assert rerun.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
-    assert winner.metric == 5.0 and winner.trial_number == rerun.number
+    opener = settled if directory_recorded else first
+    assert rerun.user_attrs[TRIAL_DIR_ATTR] == opener.user_attrs[TRIAL_DIR_ATTR]
+    assert winner.metric == (0.0 if directory_recorded else 5.0)
+    assert winner.trial_number == rerun.number
+    assert (directory / "ckpt.txt").read_text() == ("5" if directory_recorded else "8")
     _verify_winner_evidence(experiment, experiment.phases[0], winner)
 
 
@@ -438,11 +456,16 @@ def test_a_reruns_winner_verifies_in_its_owners_directory(tmp_path: Path) -> Non
         _verify_winner_evidence(experiment, phase, winner)
 
 
-def test_each_attempt_in_a_directory_delivers_its_own_mlflow_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("directory_missing", [False, True])
+def test_each_attempt_delivers_its_own_mlflow_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, directory_missing: bool
 ) -> None:
-    """A killed run's attempt and the next run's in-place rerun each keep their own MLflow binding and run: the stopped one ends KILLED, the accepted rerun's is left to its trainer, and nothing stays pending."""
+    """Each attempt delivers its own run, and extraction includes only histories from the same directory."""
     experiment, uploads, [stopped] = killed_sweep(tmp_path, monkeypatch, n_jobs=1)
+    (first,) = phase_trials(experiment, "depth")
+    if directory_missing:
+        directory = Path(first.user_attrs[TRIAL_DIR_ATTR])
+        directory.rename(directory.with_name("saved-directory"))
 
     run_experiment(experiment)
 
@@ -450,7 +473,9 @@ def test_each_attempt_in_a_directory_delivers_its_own_mlflow_run(
         validate_ledger(experiment), study_name(experiment, "depth")
     ).trials
     assert rerun.user_attrs[RERUN_OF_ATTR] == first.number
-    assert rerun.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
+    assert (
+        rerun.user_attrs[TRIAL_DIR_ATTR] != first.user_attrs[TRIAL_DIR_ATTR]
+    ) is directory_missing
     resumed = rerun.user_attrs[ATTEMPT_ID_ATTR]
     bindings = {
         path.parent.name: session.read_binding(path.parent)
@@ -461,9 +486,8 @@ def test_each_attempt_in_a_directory_delivers_its_own_mlflow_run(
     # The rerun runs in a later generation than the attempt it replaces, under its own run.
     assert bindings[stopped]["generation_id"] != bindings[resumed]["generation_id"]
     assert bindings[stopped]["run_id"] != bindings[resumed]["run_id"]
-    # The rerun's objective was read over the stopped attempt's run as well.
     capture = json.loads(rerun.user_attrs[OBJECTIVE_PROVENANCE_ATTR])["remote_capture"]
-    assert capture["earlier_bindings"] == [bindings[stopped]]
+    assert capture["earlier_bindings"] == ([] if directory_missing else [bindings[stopped]])
     # PhaseSweep finishes the stopped attempt's run; an accepted attempt's run is the
     # trainer's to end, so its record carries the result and no status.
     finishes = {
@@ -583,6 +607,7 @@ def test_a_rerun_refuses_a_directory_whose_source_cleanup_is_unconfirmed(tmp_pat
         cleanup_confirmed=True,
         duration_seconds=1.0,
     )
+    source_dir.mkdir()
     assert _trial_dir_for_attempt(
         experiment, "p", trials, trials[1], attempt_id="a1"
     ) == TrialDirectory(source_dir, 0, "a0")
@@ -599,6 +624,8 @@ def test_parallel_reruns_each_use_their_own_sources_directory(tmp_path: Path) ->
         attempt_dir = _attempt_dir(dirs["a0"].parent, attempt_id)
         attempt_dir.mkdir(parents=True)
         write_attempt_lifecycle(attempt_dir, attempt_id=attempt_id, state="allocated")
+    for directory in dirs.values():
+        directory.mkdir()
     trials = _trials(
         _interrupted(0, dirs["a0"], "a0"),
         _interrupted(1, dirs["a1"], "a1"),
@@ -611,8 +638,30 @@ def test_parallel_reruns_each_use_their_own_sources_directory(tmp_path: Path) ->
     fourth = _trial_dir_for_attempt(experiment, "p", trials, trials[4], attempt_id="a4")
     assert third == TrialDirectory(dirs["a1"], 1, "a1")
     assert fourth == TrialDirectory(dirs["a0"], 0, "a0")
-    # Winner verification walks the whole chain to the trial that opened the directory.
     assert _expected_trial_dir_name(trials, trials[4]) == dirs["a0"].name
+
+
+def test_tracking_and_code_revision_ancestry_stop_at_the_directory_opener(tmp_path: Path) -> None:
+    """A fresh directory cuts off earlier attempts in live and recorded continuations."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    original = _trial_dir_for(experiment, "p", 0, attempt_id="a0")
+    fresh = _trial_dir_for(experiment, "p", 1, attempt_id="a1")
+    fresh.mkdir(parents=True)
+    trials = _trials(
+        _interrupted(0, original, "a0", **{GENERATION_ID_ATTR: "g0"}),
+        _interrupted(1, fresh, "a1", **{RERUN_OF_ATTR: 0, GENERATION_ID_ATTR: "g1"}),
+        _interrupted(2, fresh, "a2", **{RERUN_OF_ATTR: 1, GENERATION_ID_ATTR: "g2"}),
+        _waiting_rerun(2),
+        _waiting_rerun(3),
+    )
+
+    assert _earlier_attempts(trials, trials[1]) == ()
+    assert _earlier_attempts(trials, trials[2]) == (("g1", "a1"),)
+    assert _earlier_attempts(trials, trials[4]) == (("g1", "a1"), ("g2", "a2"))
+    assert _ranked_revision_sources(list(trials.values()), [trials[1], trials[2]]) == {2: ["g1"]}
+    assert _trial_dir_for_attempt(
+        experiment, "p", trials, trials[4], attempt_id="a4", recovered=frozenset({2})
+    ) == TrialDirectory(fresh, 1, "a1")
 
 
 _PRINTS_JSON = """
@@ -671,79 +720,57 @@ def test_in_memory_runs_never_reuse_a_directory(tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("directory_state", ["missing", "working_link"])
-def test_rerun_keeps_the_original_directory_identity_when_its_contents_move(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, directory_state: str
+@pytest.mark.parametrize(
+    "target", [None, "saved-directory", "missing-target", "checkpoint-file", "loop"]
+)
+def test_rerun_uses_the_previous_directory_when_it_is_available(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, target: str | None
 ) -> None:
-    """A missing directory restarts the same draw at its path, and a working directory link still resumes."""
+    """A usable directory link keeps its checkpoint, and a missing directory or unusable link starts a fresh attempt."""
     experiment = _interrupt_first_attempt(
         tmp_path, _trainer(tmp_path, _CHECKPOINTING, _RESUMING), _JSON_METRIC
     )
     (first,) = phase_trials(experiment)
     directory = Path(first.user_attrs[TRIAL_DIR_ATTR])
-    saved = directory.with_name("saved-directory")
-    directory.rename(saved)
-    if directory_state == "working_link":
-        directory.symlink_to(saved.name)
+    saved = directory.rename(directory.with_name("saved-directory"))
+    if target == "checkpoint-file":
+        directory.with_name(target).write_text("keep")
+    if target == "loop":
+        target = directory.name
+    if target is not None:
+        directory.symlink_to(target)
 
     winner = run_experiment(experiment)["p"]
     first, rerun = phase_trials(experiment)
     assert rerun.user_attrs[RERUN_OF_ATTR] == first.number
     assert rerun.params == first.params
     assert rerun.user_attrs[ATTEMPT_ID_ATTR] != first.user_attrs[ATTEMPT_ID_ATTR]
-    assert Path(rerun.user_attrs[TRIAL_DIR_ATTR]) == directory
-    assert winner.trial_dir == directory.name
+    rerun_dir = Path(rerun.user_attrs[TRIAL_DIR_ATTR])
+    assert winner.trial_dir == rerun_dir.name
     assert winner.trial_number == rerun.number
     warnings = [
-        record.getMessage()
-        for record in caplog.records
-        if "without its previous local checkpoints" in record.getMessage()
+        record.getMessage() for record in caplog.records if "from step 0" in record.getMessage()
     ]
-    if directory_state == "working_link":
+    if target == saved.name:
+        assert rerun_dir == directory
         assert winner.metric == 5.0
-        assert directory.readlink() == Path(saved.name)
         assert warnings == []
     else:
+        assert rerun_dir == _trial_dir_for(
+            experiment, "p", rerun.number, attempt_id=rerun.user_attrs[ATTEMPT_ID_ATTR]
+        )
         assert winner.metric == 0.0
-        assert directory.is_dir() and not directory.is_symlink()
         assert (saved / "ckpt.txt").read_text() == "5"
         (warning,) = warnings
-        assert str(directory) in warning
-        assert (
-            f"Trial {rerun.number} reruns trial {first.number} with the same parameters" in warning
-        )
-        assert "is missing" in warning
+        assert f"Trial {rerun.number} reruns trial {first.number} from step 0" in warning
+        if target is None:
+            assert f"{directory} is missing" in warning
+            assert not directory.exists()
+        else:
+            assert f"symlink {directory} -> {target}" in warning
+    if target is not None:
+        assert directory.readlink() == Path(target)
+    if target == "checkpoint-file":
+        assert directory.read_text() == "keep"
 
     assert run_experiment(experiment)["p"].metric == winner.metric
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("target", ["missing-target", "checkpoint-file"])
-def test_a_rerun_refuses_a_trial_directory_link_it_cannot_follow(
-    tmp_path: Path, target: str
-) -> None:
-    """A dangling or non-directory link at a rerun's trial path stops the run before launch, naming the link and its target, and leaves the link alone; deleting it reruns from step 0."""
-    experiment = _interrupt_first_attempt(
-        tmp_path, _trainer(tmp_path, _CHECKPOINTING, _RESUMING), _JSON_METRIC
-    )
-    (first,) = phase_trials(experiment)
-    directory = Path(first.user_attrs[TRIAL_DIR_ATTR])
-    directory.rename(directory.with_name("saved-directory"))
-    if target == "checkpoint-file":
-        directory.with_name(target).write_text("keep")
-    directory.symlink_to(target)
-
-    with pytest.raises(PhaseSweepError) as refused:
-        run_experiment(experiment)
-
-    assert f"symlink {directory} -> {target}" in str(refused.value)
-    assert refused.value.action is OperatorAction.RESTORE_TREE
-    assert refused.value.remediation == (
-        f"Restore the link's target, or delete the link {directory} to rerun this trial from "
-        "step 0."
-    )
-    assert directory.readlink() == Path(target)
-    assert not list(directory.parent.glob(f".{directory.name}*"))
-
-    directory.unlink()
-    assert run_experiment(experiment)["p"].metric == 0.0

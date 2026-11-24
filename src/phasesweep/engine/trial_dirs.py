@@ -1,12 +1,4 @@
-"""Which trial directory an attempt runs in: its own, or the one the trial it reruns opened.
-
-Every rerun of a recorded trial, interrupted or failed, runs the same command in the
-directory that trial's chain opened, so a trainer that resumes from the latest checkpoint in
-its output directory continues where it stopped. PhaseSweep hands the trainer no pointer and
-copies nothing. Whether a checkpoint a failure left is usable is the trainer's own resume
-logic to decide, as it is after a killed runner; the evidence baseline makes the rerun count
-only the files it writes itself.
-"""
+"""Choose an attempt's training directory and track which attempts trained there."""
 
 from __future__ import annotations
 
@@ -42,36 +34,50 @@ from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 def _rerun_directory_sources(
     trials: Mapping[int, FrozenTrial], trial: FrozenTrial
 ) -> Iterator[FrozenTrial]:
-    """Yield the ancestors in a trial's rerun chain that recorded their directory, newest first.
+    """Yield the earlier attempts that recorded the same directory, newest first.
 
-    The chain follows :data:`~phasesweep.engine.state.RERUN_OF_ATTR` whether each source was
-    interrupted or failed. A rerun can stop before recording its directory; the walk continues
-    through it to find the last attempt that could have used the directory, and its opener.
+    Walk through attempts that stopped before recording a directory. Stop at the attempt
+    whose recorded directory carries its own name, even when it was itself a rerun.
 
     :param Mapping[int, FrozenTrial] trials: The study's trials by number.
-    :param FrozenTrial trial: The trial about to launch, or one already launched.
+    :param FrozenTrial trial: A trial about to launch or one that recorded its directory.
     :raises ProcessCleanupUncertainError: A source is invalid or its recorded directory is malformed.
     :return Iterator[FrozenTrial]: Directory sources, from the most recent to the opener.
     """
     current = trial
     while True:
         source_number = current.user_attrs.get(RERUN_OF_ATTR)
-        if source_number is None:
-            return
         source = trials.get(source_number) if type(source_number) is int else None
-        if source is None or source.number >= current.number:
+        if source_number is not None and (source is None or source.number >= current.number):
             raise ProcessCleanupUncertainError(
                 f"Trial {current.number} names {source_number!r} under {RERUN_OF_ATTR!r}, "
                 "which is not an earlier trial of its study.",
                 action=OperatorAction.RESTORE_LEDGER,
             )
         try:
-            recorded = _recorded_trial_dir(source)
+            recorded = _recorded_trial_dir(current)
         except ValueError as exc:
-            raise _unusable_directory_error(source, exc) from exc
+            raise _unusable_directory_error(current, exc) from exc
         if recorded is not None:
-            yield source
+            if current is not trial:
+                yield current
+            if recorded.name == _own_directory_name(current):
+                return
+        if source is None:
+            return
         current = source
+
+
+def _own_directory_name(trial: FrozenTrial) -> str | None:
+    """Return the name a trial would record if it opened its own directory.
+
+    :param FrozenTrial trial: The trial whose name to derive.
+    :return str | None: The name for the trial's recorded attempt, if any.
+    """
+    attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+    if not isinstance(attempt_id, str) or not attempt_id:
+        return None
+    return _trial_dir_name(trial.number, attempt_id)
 
 
 def _unusable_directory_error(owner: FrozenTrial, exc: ValueError) -> ProcessCleanupUncertainError:
@@ -94,6 +100,7 @@ class TrialDirectory(NamedTuple):
     path: Path
     opener_number: int
     opener_attempt_id: str
+    restart_reason: str | None = None
 
 
 def _owner_directory(phase_dir: Path, owner: FrozenTrial) -> TrialDirectory:
@@ -124,10 +131,7 @@ def _expected_trial_dir_name(trials: Mapping[int, FrozenTrial], trial: FrozenTri
     """
     sources = list(_rerun_directory_sources(trials, trial))
     owner = sources[-1] if sources else trial
-    attempt_id = owner.user_attrs.get(ATTEMPT_ID_ATTR)
-    if not isinstance(attempt_id, str) or not attempt_id:
-        return None
-    return _trial_dir_name(owner.number, attempt_id)
+    return _own_directory_name(owner)
 
 
 def _trial_dir_for_attempt(
@@ -139,7 +143,7 @@ def _trial_dir_for_attempt(
     attempt_id: str,
     recovered: frozenset[int] = frozenset(),
 ) -> TrialDirectory:
-    """Return the trial directory a new attempt runs in, and the attempt that opened it.
+    """Reuse an available training directory after cleanup, or open a fresh one.
 
     A trial that continues another's directory may start only once that directory's last
     attempt is provably gone, so two live processes never write one directory: its
@@ -156,10 +160,9 @@ def _trial_dir_for_attempt(
         :func:`phasesweep.engine.attempts._cleanup_recovered_trial_numbers`.
     :raises ProcessCleanupUncertainError: The directory's last attempt may still be running,
         or the recorded directory is unusable.
-    :raises PhaseSweepError: The directory path is a link that does not lead to a directory.
+    :raises PhaseSweepError: The directory path could not be inspected.
     :return TrialDirectory: The directory, rebuilt under the current phase directory, with
-        the trial number and attempt that opened it: ``trial`` and ``attempt_id`` themselves
-        for a directory of its own.
+        the trial number and attempt that opened it and why it started fresh, if applicable.
     """
     sources = list(_rerun_directory_sources(trials, trial))
     if not sources:
@@ -192,42 +195,29 @@ def _trial_dir_for_attempt(
                 action=OperatorAction.INSPECT_LOGS,
             )
     directory = _owner_directory(phase_dir, sources[-1])
-    _refuse_unusable_link(trial, directory.path)
-    return directory
+    unavailable = _unavailable_trial_directory(directory.path)
+    if unavailable is None:
+        return directory
+    path = _trial_dir_for(experiment, phase_name, trial.number, attempt_id=attempt_id)
+    return TrialDirectory(path, trial.number, attempt_id, unavailable)
 
 
-def _refuse_unusable_link(trial: FrozenTrial, trial_dir: Path) -> None:
-    """Refuse a rerun whose trial directory path is a link PhaseSweep cannot follow to a directory.
+def _unavailable_trial_directory(trial_dir: Path) -> str | None:
+    """Describe why a missing directory or unusable link would require a fresh directory.
 
-    A dangling link most plausibly names a checkpoint volume that is not mounted, so running
-    the trial again from step 0 would orphan that checkpoint; the operator restores the target,
-    or deletes the link to rerun from scratch. A missing path is left to the caller, which
-    creates the directory.
-
-    :param FrozenTrial trial: The trial about to rerun.
-    :param Path trial_dir: The directory path it reruns in.
-    :raises PhaseSweepError: The path is a broken link, or cannot be inspected.
+    :param Path trial_dir: Directory to continue if available.
+    :raises PhaseSweepError: The directory path could not be inspected.
+    :return str | None: The missing directory or the unusable symlink and its target, if any.
     """
     try:
         is_link = S_ISLNK(trial_dir.lstat().st_mode)
     except FileNotFoundError:
-        return
+        return f"the previous trial directory {trial_dir} is missing"
     except OSError as exc:
         raise PhaseSweepError(
-            f"Trial {trial.number} reruns in {trial_dir}, which could not be inspected: {exc}.",
+            f"The previous trial directory {trial_dir} could not be inspected: {exc}.",
             action=OperatorAction.RESTORE_TREE,
         ) from exc
-    broken = (
-        broken_symlink_detail(trial_dir.parent, trial_dir.name, require_directory=True)
-        if is_link
-        else None
-    )
-    if broken is not None:
-        raise PhaseSweepError(
-            f"Trial {trial.number} reruns in its trial directory, but {broken}.",
-            action=OperatorAction.RESTORE_TREE,
-            remediation=(
-                f"Restore the link's target, or delete the link {trial_dir} to rerun this trial "
-                "from step 0."
-            ),
-        )
+    if is_link:
+        return broken_symlink_detail(trial_dir.parent, trial_dir.name, require_directory=True)
+    return None
