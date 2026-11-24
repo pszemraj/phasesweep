@@ -212,7 +212,7 @@ def _assess_population(
     *,
     provenance: Mapping[int, Mapping[str, object]],
     revisions: Mapping[str, RevisionRead],
-    revision_sources: Mapping[int, Sequence[str]] | None = None,
+    revision_sources: Mapping[int, Sequence[str]],
     axis: RepeatAxis | None = None,
     groups: Sequence[RankedGroup] | None = None,
     incomplete_group: Collection[int] = (),
@@ -234,8 +234,8 @@ def _assess_population(
     :param Mapping[str, RevisionRead] revisions: What selection read of the trainer revision each
         ranked generation recorded, keyed by generation id; a generation without an entry
         counts as unreadable.
-    :param Mapping[int, Sequence[str]] | None revision_sources: Possible contributing generations
-        per ranked trial, before the generation that finished it.
+    :param Mapping[int, Sequence[str]] revision_sources: Possible contributing generations per
+        ranked trial, before the generation that finished it.
     :param RepeatAxis | None axis: The phase's repeat axis, which keys configurations by
         repeat group, or ``None`` for a phase without repeats.
     :param Sequence[RankedGroup] | None groups: The complete repeat groups
@@ -562,7 +562,7 @@ def _code_revision_check(
     ranked: Sequence[optuna.trial.FrozenTrial],
     revisions: Mapping[str, RevisionRead],
     *,
-    sources: Mapping[int, Sequence[str]] | None,
+    sources: Mapping[int, Sequence[str]],
 ) -> CodeRevisionCheck:
     """Compare the trainer revisions of generations that may have trained ranked trials.
 
@@ -577,7 +577,7 @@ def _code_revision_check(
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials by number; each carries
         its generation id, which selection requires.
     :param Mapping[str, RevisionRead] revisions: The revision read for each generation.
-    :param Mapping[int, Sequence[str]] | None sources: Possible contributing generations per
+    :param Mapping[int, Sequence[str]] sources: Possible contributing generations per
         ranked trial, before the generation that finished it.
     :return CodeRevisionCheck: The check record.
     """
@@ -585,7 +585,7 @@ def _code_revision_check(
         return {"verdict": "n/a", "reason": "only one trial was ranked"}
     members: dict[str, list[int]] = {}
     for trial in ranked:
-        earlier = () if sources is None else sources.get(trial.number, ())
+        earlier = sources.get(trial.number, ())
         trial_generations = dict.fromkeys((*earlier, str(trial.user_attrs[GENERATION_ID_ATTR])))
         for generation in trial_generations:
             members.setdefault(generation, []).append(trial.number)

@@ -195,7 +195,9 @@ def _assess(
     """Assess ``ranked`` with the lowest value winning, as minimize selection does."""
     winner = min(ranked, key=lambda trial: (trial.value, trial.number))
     records = provenance or {trial.number: log_regex_provenance() for trial in ranked}
-    return _assess_population(trials, ranked, winner, provenance=records, revisions=revisions or {})
+    return _assess_population(
+        trials, ranked, winner, provenance=records, revisions=revisions or {}, revision_sources={}
+    )
 
 
 def _generation_trials(*generations: str) -> list[optuna.trial.FrozenTrial]:
@@ -583,6 +585,7 @@ def test_survivorship_warning_names_each_failed_configuration() -> None:
         trials[0],
         provenance={0: log_regex_provenance()},
         revisions={},
+        revision_sources={},
         untried_cells=[{"x": 99}],
     )
 
@@ -603,6 +606,7 @@ def test_survivorship_counts_a_grid_cell_no_trial_reached() -> None:
         trials[1],
         provenance={trial.number: log_regex_provenance() for trial in trials},
         revisions={},
+        revision_sources={},
         untried_cells=[{"x": 3}],
     )
     assert plain["checks"]["survivorship"] == {
@@ -702,6 +706,7 @@ def _assess_groups(
         by_number[best.representative],
         provenance={trial.number: log_regex_provenance() for trial in ranked},
         revisions={},
+        revision_sources={},
         axis=RepeatAxis(key="seed", values=(0, 1, 2), reduce=reduce, slot_size=None),
         groups=ranked_groups,
         incomplete_group=incomplete,

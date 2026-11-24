@@ -118,7 +118,9 @@ def test_training_length_recipe_preserves_evaluation_and_mcp_verdicts(
             )
         )
     trials = study.get_trials(deepcopy=False)
-    block = _assess_population(trials, trials, trials[1], provenance=provenance, revisions={})
+    block = _assess_population(
+        trials, trials, trials[1], provenance=provenance, revisions={}, revision_sources={}
+    )
 
     assert block["checks"]["evaluation_point"]["verdict"] == expected_verdict
     summary = _confound_summary(

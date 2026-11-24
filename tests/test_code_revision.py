@@ -19,7 +19,6 @@ from phasesweep import run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import ExecutionContext, Experiment
 from phasesweep.engine.paths import (
-    _attempt_dir,
     _experiment_dir,
     _generation_dir,
     _generation_reproducibility_path,
@@ -27,17 +26,11 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.provenance import _code_revision
 from phasesweep.engine.selection import _ranked_code_revisions, _ranked_revision_sources
 from phasesweep.engine.state import (
-    ATTEMPT_ID_ATTR,
-    FAILURE_REASON_ATTR,
     GENERATION_ID_ATTR,
     REPRODUCIBILITY_SCHEMA_VERSION,
     RERUN_OF_ATTR,
-    RETURN_CODE_ATTR,
     TRIAL_DIR_ATTR,
-    TRIAL_OUTCOME_ATTR,
-    _trial_outcome_payload,
 )
-from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
@@ -327,49 +320,39 @@ def test_a_ranked_generation_without_a_readable_record_reads_as_unreadable(
         )
     trials = study.get_trials(deepcopy=False)
 
-    assert _ranked_code_revisions(experiment, trials) == {
+    assert _ranked_code_revisions(experiment, trials, sources={}) == {
         "missing-0": "unreadable",
         "missing-1": "unreadable",
     }
-    assert _ranked_code_revisions(experiment, trials[:1]) == {}
+    assert _ranked_code_revisions(experiment, trials[:1], sources={}) == {}
 
 
-@pytest.mark.parametrize("worker_state", ["launching", "exited"])
-def test_ranked_rerun_keeps_trainer_revision_when_worker_never_started(
-    tmp_path: Path, worker_state: str
-) -> None:
-    """An evidence worker's unused process slot does not erase a successful trainer's revision."""
+def test_ranked_revision_sources_read_every_generation_in_the_rerun_chain(tmp_path: Path) -> None:
+    """Each ancestor in a ranked trial's rerun chain that recorded its directory and a generation adds that generation, oldest first; one that recorded no directory adds none."""
+    directory = str(tmp_path / "trial_00000__opener")
+    failed = optuna.trial.TrialState.FAIL
     study = optuna.create_study()
-    attempt_id = "source-attempt"
-    attempt_dir = _attempt_dir(tmp_path, attempt_id)
-    attempt_dir.mkdir(parents=True)
-    write_attempt_lifecycle(
-        attempt_dir,
-        attempt_id=attempt_id,
-        state=worker_state,
-        ended_by="not_started" if worker_state == "exited" else None,
-        cleanup_confirmed=True if worker_state == "exited" else None,
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=failed, user_attrs={GENERATION_ID_ATTR: "opener", TRIAL_DIR_ATTR: directory}
+        )
     )
     study.add_trial(
         optuna.trial.create_trial(
-            state=optuna.trial.TrialState.FAIL,
-            user_attrs={
-                ATTEMPT_ID_ATTR: attempt_id,
-                FAILURE_REASON_ATTR: "phase deadline expired before the evidence worker launched",
-                GENERATION_ID_ATTR: "source-generation",
-                RETURN_CODE_ATTR: 0,
-                TRIAL_DIR_ATTR: str(tmp_path / f"trial_00000__{attempt_id}"),
-                TRIAL_OUTCOME_ATTR: _trial_outcome_payload(1, "interrupted"),
-            },
+            state=failed, user_attrs={GENERATION_ID_ATTR: "no-directory", RERUN_OF_ATTR: 0}
         )
     )
-    study.add_trial(optuna.trial.create_trial(value=0.5, user_attrs={RERUN_OF_ATTR: 0}))
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=failed,
+            user_attrs={GENERATION_ID_ATTR: "rerun", RERUN_OF_ATTR: 1, TRIAL_DIR_ATTR: directory},
+        )
+    )
+    study.add_trial(optuna.trial.create_trial(value=0.5, user_attrs={RERUN_OF_ATTR: 2}))
     study.add_trial(optuna.trial.create_trial(value=0.6))
     trials = study.get_trials(deepcopy=False)
 
-    assert _ranked_revision_sources(trials, trials[1:], phase_dir=tmp_path) == {
-        1: ["source-generation"]
-    }
+    assert _ranked_revision_sources(trials, trials[3:]) == {3: ["opener", "rerun"]}
 
 
 @pytest.mark.integration
@@ -430,7 +413,7 @@ def test_a_top_up_under_another_commit_is_disclosed_on_the_winner(
 def test_ranked_rerun_discloses_prior_training_in_its_directory(
     tmp_path: Path, hermetic_git: None
 ) -> None:
-    """A saved checkpoint can contribute its source revision to a later ranking, but an allocated attempt cannot."""
+    """Every generation in a ranked rerun's chain is disclosed as one that may have trained in its directory, including an attempt stopped before launch."""
     repo = tmp_path / "repo"
     first_head = _committed_repo(repo)
     marker = tmp_path / "first-ready"
@@ -462,6 +445,7 @@ print("x=0.7" if checkpoint.is_file() else "x=0.9")
 
     (repo / "tracked.txt").write_text("v2\n")
     _git(repo, "commit", "-q", "-am", "allocate a rerun")
+    allocated_head = _git(repo, "rev-parse", "HEAD")
     # This runner persists the rerun's directory and allocated lifecycle, then stops at launch.
     program = """
 import os, signal, sys
@@ -496,6 +480,7 @@ run_experiment(load_experiment(sys.argv[1]))
         for entry in check["detail"]["generations"]
     ] == [
         (first.user_attrs[GENERATION_ID_ATTR], first_head, [rerun.number]),
+        (allocated.user_attrs[GENERATION_ID_ATTR], allocated_head, [rerun.number]),
         (generation_id, final_head, [rerun.number, peer.number]),
     ]
 
