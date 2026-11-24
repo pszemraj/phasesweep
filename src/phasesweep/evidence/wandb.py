@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from phasesweep.evidence.history import merge_attempt_histories
 from phasesweep.runtime.json import finite_nonnegative, json_text, json_text_list
 from phasesweep.runtime.remote_worker import report_reserve, run_worker
 
@@ -91,8 +92,8 @@ class WandbMissingKeysError(RuntimeError):
     waited_seconds: float
 
 
-class _NoRetainedObjectiveError(ValueError):
-    """An observed rollback discarded every finite objective observation."""
+class _NoRetainedMetricError(ValueError):
+    """An observed rollback discarded every finite metric observation."""
 
 
 WANDB_SDK_MISSING = 'W&B evidence requires the optional SDK: pip install "phasesweep[wandb]".'
@@ -225,7 +226,7 @@ def poll_wandb_summary(
     logged_after: float | None = None,
     logged_before: float | None = None,
     earlier_launches: tuple[float, ...] = (),
-    resume_metric: tuple[str, str] | None = None,
+    resume_axis: str = "_step",
     environment: Mapping[str, str] | None = None,
     deadline: float | None = None,
 ) -> dict[str, Any]:
@@ -247,8 +248,7 @@ def poll_wandb_summary(
     :param float | None logged_before: Unix time the summary must predate when a later
         attempt reused the run, defaults to None.
     :param tuple[float, ...] earlier_launches: Launch times of earlier reruns in this run.
-    :param tuple[str, str] | None resume_metric: Objective key and its trainer progress axis
-        for detecting repeated training in a native min/max aggregate.
+    :param str resume_axis: Trainer progress key shared by native min/max aggregates.
     :param Mapping[str, str] | None environment: Actual composed trainer environment.
     :param float | None deadline: Absolute deadline including worker startup.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
@@ -261,7 +261,7 @@ def poll_wandb_summary(
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
     :raises WandbMissingKeysError: At the deadline the finished run's summary still lacked
         required keys.
-    :raises ValueError: A requested scalar is invalid or the native objective has no retained row.
+    :raises ValueError: A requested scalar is invalid or a native aggregate has no retained row.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     """
     deadline = min(
@@ -283,7 +283,7 @@ def poll_wandb_summary(
             "logged_after": logged_after,
             "logged_before": logged_before,
             "earlier_launches": earlier_launches,
-            "resume_metric": resume_metric,
+            "resume_axis": resume_axis,
             "deadline": deadline,
         },
         Path(__file__).resolve(),
@@ -616,8 +616,8 @@ def _resumed_extremum(
 ) -> float:
     """Reduce a native min/max over the retained rows when a rerun re-logs progress.
 
-    The first progress reported by each rerun replaces the earlier suffix starting at that
-    progress. Positions between a checkpoint and the first re-logged evaluation are unknown.
+    Each rerun replaces the earlier suffix starting at its first measurement of this series.
+    Positions between a checkpoint and the first re-logged measurement are unknown.
     A literal dotted metric, an incomplete axis, and a separately supplied summary scalar keep
     their summary value.
 
@@ -630,7 +630,7 @@ def _resumed_extremum(
     :param float deadline: Monotonic deadline for history queries.
     :return float: The corrected extremum, or the original summary scalar.
     :raises TimeoutError: History could not be read before the deadline.
-    :raises _NoRetainedObjectiveError: The native objective has no retained finite row.
+    :raises _NoRetainedMetricError: The native aggregate has no retained finite row.
     """
     from phasesweep.evidence.evaluation import json_float
 
@@ -642,32 +642,32 @@ def _resumed_extremum(
         raise TimeoutError("W&B history read expired.")
     if literal:
         return value
-    axis_keys = list(dict.fromkeys((axis, "_step", "_timestamp")))
+    axis_keys = list(dict.fromkeys((series, axis, "_step", "_timestamp")))
     rows = _read_series(run, axis_keys, last_step=last_step, deadline=deadline, scan=True)
     if rows is None:
         raise TimeoutError("W&B history read expired.")
 
-    points: list[tuple[int | float, int, int | float]] = []
+    points: list[tuple[int | float, int, int | float, float]] = []
     for row in rows:
         step = finite_nonnegative(row.get("_step"))
         timestamp = finite_nonnegative(row.get("_timestamp"))
         progress = finite_nonnegative(row.get(axis))
         if step is None or timestamp is None or progress is None:
             return value
-        points.append((step, bisect_left(launches, timestamp), progress))
-
-    retained: list[tuple[int | float, float]] = []
-    attempt = 0
-    overlap = False
-    for step, segment, progress in sorted(points):
-        if retained and progress < retained[-1][1] and segment == attempt:
+        try:
+            metric = json_float(row[series], label=series)
+        except ValueError:
             return value
-        if retained and segment != attempt and progress <= retained[-1][1]:
-            retained = [(index, position) for index, position in retained if position < progress]
-            overlap = True
-        retained.append((step, progress))
-        attempt = segment
-    if not overlap:
+        points.append((step, bisect_left(launches, timestamp), progress, metric))
+
+    histories: list[list[tuple[int | float, float]]] = [[] for _ in range(len(launches) + 1)]
+    for _, segment, progress, metric in sorted(points):
+        history = histories[segment]
+        if history and progress < history[-1][0]:
+            return value
+        history.append((progress, metric))
+    retained = merge_attempt_histories(histories)
+    if len(retained) == len(points):
         return value
 
     full_series = _read_series(
@@ -675,28 +675,18 @@ def _resumed_extremum(
     )
     if full_series is None:
         raise TimeoutError("W&B history read expired.")
-    axis_steps = {step for step, _, _ in points}
-    retained_steps = {step for step, _ in retained}
-    all_values: list[float] = []
-    kept_values: list[float] = []
-    for row in full_series:
-        step = finite_nonnegative(row.get("_step"))
-        if step not in axis_steps:
-            return value
-        try:
-            metric = json_float(row[series], label=series)
-        except ValueError:
-            return value
-        if math.isfinite(metric):
-            all_values.append(metric)
-            if step in retained_steps:
-                kept_values.append(metric)
+    if {finite_nonnegative(row.get("_step")) for row in full_series} != {
+        step for step, _, _, _ in points
+    }:
+        return value
+    all_values = [metric for _, _, _, metric in points if math.isfinite(metric)]
     reduce = min if operation == "min" else max
     if not all_values or reduce(all_values) != value:
         return value
+    kept_values = [metric for metric in retained if math.isfinite(metric)]
     if not kept_values:
-        raise _NoRetainedObjectiveError(
-            f"W&B objective {key!r} has no finite observation in the retained history "
+        raise _NoRetainedMetricError(
+            f"W&B metric {key!r} has no finite observation in the retained history "
             "after checkpoint rollback."
         )
     return reduce(kept_values)
@@ -715,7 +705,7 @@ def _poll_wandb_summary(
     logged_after: float | None = None,
     logged_before: float | None = None,
     earlier_launches: tuple[float, ...] = (),
-    resume_metric: tuple[str, str] | None = None,
+    resume_axis: str = "_step",
     deadline: float | None = None,
 ) -> dict[str, Any]:
     """Poll an exact run using refreshed SDK clients within the parent's deadline.
@@ -750,8 +740,7 @@ def _poll_wandb_summary(
     :param float | None logged_before: Unix time the summary must predate when a later
         attempt reused the run, defaults to None.
     :param tuple[float, ...] earlier_launches: Launch times of earlier reruns in this run.
-    :param tuple[str, str] | None resume_metric: Objective key and its trainer progress axis
-        for detecting repeated training in a native min/max aggregate.
+    :param str resume_axis: Trainer progress key shared by native min/max aggregates.
     :param float | None deadline: Absolute ``time.monotonic()`` deadline from the parent.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
     :raises WandbPollTimeout: The run did not finish with the required keys in time,
@@ -763,7 +752,7 @@ def _poll_wandb_summary(
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
     :raises WandbMissingKeysError: At the deadline the finished run's summary still lacked
         required keys.
-    :raises ValueError: A requested scalar is invalid or the native objective has no retained row.
+    :raises ValueError: A requested scalar is invalid or a native aggregate has no retained row.
     """
     from wandb.apis.public import Api
     from wandb.errors import AuthenticationError, UsageError
@@ -850,14 +839,13 @@ def _poll_wandb_summary(
                             values[key] = value
                         last_step = _last_history_step(run)
                         try:
-                            if launches and resume_metric is not None and last_step is not None:
-                                key, axis = resume_metric
-                                if key in values and axis != "_step":
+                            if launches and resume_axis != "_step" and last_step is not None:
+                                for key in values:
                                     values[key] = _resumed_extremum(
                                         run,
                                         key,
                                         values[key],
-                                        axis=axis,
+                                        axis=resume_axis,
                                         launches=launches,
                                         last_step=last_step,
                                         deadline=deadline,
@@ -1055,7 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
             "cause": str(exc.last_error) if exc.last_error else None,
             "reached": exc.reached,
         }
-    except _NoRetainedObjectiveError as exc:
+    except _NoRetainedMetricError as exc:
         response = {"status": "invalid_evidence", "cause": str(exc)}
     except ValueError:
         response = {

@@ -376,36 +376,62 @@ def test_a_rerun_replaces_the_observed_training_suffix_for_native_extrema(
         monkeypatch, lambda _: ("finished", summary, last_step), rows=tuple(rows), on_scan=on_scan
     )
     keys = (_KEY, "eval/loss.max")
-    for index, selected in enumerate(keys):
-        values = {**dict(zip(keys, native, strict=True)), "eval/loss": 0.35}
-        values[selected] = expected[index]
-        assert (
-            _poll(
-                logged_after=1020.0,
-                earlier_launches=(1000.0,),
-                resume_metric=(selected, axis),
-                required=(*keys, "eval/loss"),
-            )["values"]
-            == values
-        )
+    assert _poll(
+        logged_after=1020.0,
+        earlier_launches=(1000.0,),
+        resume_axis=axis,
+        required=(*keys, "eval/loss"),
+    )["values"] == {**dict(zip(keys, expected, strict=True)), "eval/loss": 0.35}
     if axis == "_step":
         assert not readings
     if mode == "history-outage":
         assert clock.now == 5
 
 
-def test_a_rerun_that_discards_every_objective_observation_fails_the_read(
+def test_a_rerun_replaces_only_the_history_of_the_metric_it_logs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A rerun that re-logs progress alone cannot win with a discarded metric."""
+    """A checkpoint loss survives an unrelated row while accuracy is reduced on its own steps."""
+    rows = (
+        {"_step": 0, "_timestamp": 990.0, "eval/step": 200, "eval/loss": 0.1, "eval/acc": 0.6},
+        {"_step": 1, "_timestamp": 995.0, "eval/step": 250, "eval/acc": 0.99},
+        {"_step": 2, "_timestamp": 1010.0, "eval/step": 200, "train_runtime": 1.0},
+        {"_step": 3, "_timestamp": 1015.0, "eval/step": 220, "eval/acc": 0.7},
+        {"_step": 4, "_timestamp": 1020.0, "eval/step": 300, "eval/loss": 0.35},
+    )
+    accuracy = "eval/acc.max"
+    summary = {"_step": 4, "_timestamp": 1020.0, _KEY: 0.1, accuracy: 0.99}
+    _serve(monkeypatch, lambda _: ("finished", summary, 4), rows=rows)
+    assert _poll(logged_after=_LAUNCHED_AT, resume_axis="eval/step", required=(_KEY, accuracy))[
+        "values"
+    ] == {_KEY: 0.1, accuracy: 0.7}
+
+
+def test_a_rerun_that_only_logs_teardown_keeps_the_final_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ending a retry at the final checkpoint keeps the objective already measured there."""
     rows = (
         {"_step": 0, "_timestamp": 990.0, "eval/step": 10, "eval/loss": 0.1},
-        {"_step": 1, "_timestamp": 1010.0, "eval/step": 5},
+        {"_step": 1, "_timestamp": 1010.0, "eval/step": 10, "train_runtime": 1.0},
+    )
+    summary = {"_step": 1, "_timestamp": 1010.0, _KEY: 0.1}
+    _serve(monkeypatch, lambda _: ("finished", summary, 1), rows=rows)
+    assert _poll(logged_after=_LAUNCHED_AT, resume_axis="eval/step")["values"] == {_KEY: 0.1}
+
+
+def test_a_rerun_that_replaces_every_finite_observation_fails_the_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A nonfinite remeasurement cannot win with the finite observation it replaced."""
+    rows = (
+        {"_step": 0, "_timestamp": 990.0, "eval/step": 10, "eval/loss": 0.1},
+        {"_step": 1, "_timestamp": 1010.0, "eval/step": 5, "eval/loss": float("nan")},
     )
     summary = {"_step": 1, "_timestamp": 1010.0, _KEY: 0.1}
     _serve(monkeypatch, lambda _: ("finished", summary, 1), rows=rows)
     with pytest.raises(ValueError, match="no finite observation in the retained history"):
-        _poll(logged_after=_LAUNCHED_AT, resume_metric=(_KEY, "eval/step"))
+        _poll(logged_after=_LAUNCHED_AT, resume_axis="eval/step")
 
 
 def test_the_real_client_reads_the_history_index_with_the_summary(tmp_path, monkeypatch) -> None:

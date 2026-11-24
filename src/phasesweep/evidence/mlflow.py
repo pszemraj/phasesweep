@@ -7,6 +7,7 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
+from phasesweep.evidence.history import merge_attempt_histories
 from phasesweep.evidence.models import (
     Gate,
     MlflowExtractor,
@@ -101,22 +102,18 @@ def merge_histories(
     :raises ValueError: A history record has no valid step.
     :return list[Mapping[str, object]]: The merged records, for :func:`select_observation`.
     """
-    records = []
-    cutoff: int | None = None
-    for history in reversed(histories):
-        next_cutoff = cutoff
+    positioned = []
+    for history in histories:
+        points = []
         for record in history:
             step = record.get("step")
             if type(step) is not int or step < 0:
                 raise ValueError(
                     "MLflow history requires nonnegative integer steps and timestamps."
                 )
-            if cutoff is None or step < cutoff:
-                records.append(record)
-                if next_cutoff is None or step < next_cutoff:
-                    next_cutoff = step
-        cutoff = next_cutoff
-    return records
+            points.append((step, record))
+        positioned.append(points)
+    return merge_attempt_histories(positioned)
 
 
 def select_observation(

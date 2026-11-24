@@ -875,15 +875,13 @@ def _capture_wandb(
     try:
         try:
             logged_after = None if ctx.baseline is None else ctx.baseline.launched_at
-            resume_metric: tuple[str, str] | None = None
+            resume_axis = source.evaluation_axis if isinstance(source, WandbExtractor) else "_step"
             earlier_launches: list[float] = []
             if (
                 logged_after is not None
-                and isinstance(source, WandbExtractor)
-                and source.evaluation_axis != "_step"
-                and source.metric_key.endswith((".min", ".max"))
+                and resume_axis != "_step"
+                and any(key.endswith((".min", ".max")) for key in query.numeric_keys)
             ):
-                resume_metric = (source.metric_key, source.evaluation_axis)
                 for _, attempt_id in ctx.earlier_attempts:
                     directory = ctx.attempt_dir.with_name(attempt_id)
                     if attempt_id == run_id or not (directory / EVIDENCE_BASELINE_FILE).is_file():
@@ -905,7 +903,7 @@ def _capture_wandb(
                 logged_after=logged_after,
                 logged_before=ctx.evidence_before,
                 earlier_launches=tuple(earlier_launches),
-                resume_metric=resume_metric,
+                resume_axis=resume_axis,
                 environment=ctx.wandb_environment,
                 deadline=poll_deadline,
             )
