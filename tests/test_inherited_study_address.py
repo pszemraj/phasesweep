@@ -11,7 +11,6 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Sampler
-from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.fingerprints import phase_study_name
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.evidence.models import JsonExtractor
@@ -103,8 +102,8 @@ def _calls(calls: Path) -> list[str]:
 
 
 @pytest.mark.integration
-def test_inherited_cli_order_addresses_only_trials_that_ran_in_that_order(tmp_path: Path) -> None:
-    """Reordering inherited alias arguments changes the selected study, including on a reread."""
+def test_reordered_inherited_cli_keys_keep_the_study_and_its_reread(tmp_path: Path) -> None:
+    """Distinct inherited alias keys render in a fixed order and reuse the trainer's output."""
     calls = tmp_path / "cli_calls.log"
     trainer = write_trainer(
         tmp_path / "cli_trainer.py",
@@ -140,6 +139,9 @@ def test_inherited_cli_order_addresses_only_trials_that_ran_in_that_order(tmp_pa
     original = make_experiment(
         persistent=tmp_path, trainer=trainer, phases=[left, right, child], metric=metric
     )
+    changed_order = make_experiment(
+        persistent=tmp_path, trainer=trainer, phases=[left, right, reordered], metric=metric
+    )
     changed = make_experiment(
         persistent=tmp_path,
         trainer=trainer,
@@ -151,17 +153,13 @@ def test_inherited_cli_order_addresses_only_trials_that_ran_in_that_order(tmp_pa
         ),
     )
 
-    assert run_experiment(original)["child"].metric == 0.2
-    assert _calls(calls) == ["0.3", "0.2", "0.2"]
-    assert run_experiment(changed)["child"].metric == 0.9
-    assert _calls(calls) == ["0.3", "0.2", "0.2", "0.1"]
-    assert run_experiment(original)["child"].metric == 0.2
-
-    changed_order = make_experiment(
-        persistent=tmp_path, trainer=trainer, phases=[left, right, reordered], metric=metric
-    )
+    assert run_experiment(original)["child"].metric == 0.1
+    (original_study,) = _child_studies(original)
     assert run_experiment(changed_order, from_phase="child")["child"].metric == 0.1
-    assert _calls(calls) == ["0.3", "0.2", "0.2", "0.1"]
+    assert list(_child_studies(changed_order)) == [original_study]
+    assert run_experiment(changed)["child"].metric == 0.9
+    assert run_experiment(original)["child"].metric == 0.1
+    assert _calls(calls) == ["0.3", "0.2", "0.1"]
 
 
 @pytest.mark.parametrize(
@@ -169,14 +167,14 @@ def test_inherited_cli_order_addresses_only_trials_that_ran_in_that_order(tmp_pa
     [
         ("yaml_file", "train {config_path}", {}),
         ("json_file", "train {overrides_path}", {}),
-        ("argparse", "train {overrides}", {"trainer": {"lr": 0.0}, "learning-rate": 0.0}),
-        ("hydra", "train {overrides}", {"trainer": {"lr": 0.0}, "learning-rate": 0.0}),
+        ("argparse", "train {overrides}", {}),
+        ("hydra", "train {overrides}", {}),
     ],
 )
 def test_inheritance_order_reuses_studies_with_equivalent_trainer_inputs(
     fmt: str, command: str, base: dict[str, float | dict[str, float]]
 ) -> None:
-    """File input and existing CLI base positions make the two parent orders equivalent."""
+    """Each input format uses only the effective inherited values to address the study."""
     phase = Phase(name="p", n_trials=1, gpu_policy="none")
     experiment = make_experiment(
         phases=[phase], override_format=fmt, trial_command=command, trainer_config=base
@@ -189,16 +187,15 @@ def test_inheritance_order_reuses_studies_with_equivalent_trainer_inputs(
 
 
 @pytest.mark.integration
-def test_reordering_fixed_cli_arguments_refuses_existing_results(tmp_path: Path) -> None:
-    """A changed local order changes the trainer and requires a new phase or study."""
+def test_reordering_fixed_cli_arguments_replays_existing_results(tmp_path: Path) -> None:
+    """Reordering fixed arguments preserves the published winner without launching anything."""
     trainer, calls = _trainer(tmp_path)
     phase = Phase(name="p", n_trials=1, gpu_policy="none", fixed_overrides={"x": 1, "y": 2})
     original = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
-    run_experiment(original)
+    first = run_experiment(original)["p"]
     reordered = phase.model_copy(update={"fixed_overrides": {"y": 2, "x": 1}})
     changed = make_experiment(persistent=tmp_path, trainer=trainer, phases=[reordered])
-    with pytest.raises(StudyFingerprintMismatchError, match="cli_override_order"):
-        run_experiment(changed)
+    assert run_experiment(changed)["p"] == first
     assert _calls(calls) == ["1,2"]
 
 

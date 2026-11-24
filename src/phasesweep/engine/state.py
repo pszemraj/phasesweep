@@ -210,9 +210,9 @@ ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
 # space the study has run under with the draw position each took effect at. One attr, so a
 # crash cannot leave a fingerprint beside a payload or history it does not describe.
 PHASE_IDENTITY_ATTR = "phasesweep_phase_identity"
-PHASE_IDENTITY_SCHEMA_VERSION = 3
+PHASE_IDENTITY_SCHEMA_VERSION = 4
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 18
+STUDY_SCHEMA_VERSION = 19
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The
@@ -309,8 +309,6 @@ class PhaseIdentityRecord(TypedDict):
     payload: JsonObject
     #: Every search space the study ran under, oldest first; the last is ``payload``'s.
     search_spaces: list[SearchSpaceEntry]
-    #: Parent keys' insertion positions, including keys a CLI phase replaces locally.
-    inherited_cli_keys: list[str]
 
 
 def _parsed_search_space_entry(value: object, *, previous: int | None) -> SearchSpaceEntry:
@@ -361,11 +359,6 @@ def _parsed_phase_identity(value: object, study_name: str) -> PhaseIdentityRecor
         )
         if not isinstance(fingerprint, str) or not isinstance(entries, list) or not entries:
             raise ValueError("fingerprint or search_spaces is malformed")
-        inherited_cli_keys: object = value["inherited_cli_keys"]
-        if not isinstance(inherited_cli_keys, list) or not all(
-            isinstance(key, str) for key in inherited_cli_keys
-        ):
-            raise ValueError("inherited_cli_keys must be a list of strings")
         parsed: list[SearchSpaceEntry] = []
         for entry in entries:
             previous = parsed[-1]["first_position"] if parsed else None
@@ -375,7 +368,6 @@ def _parsed_phase_identity(value: object, study_name: str) -> PhaseIdentityRecor
             "fingerprint": fingerprint,
             "payload": json_object(payload),
             "search_spaces": parsed,
-            "inherited_cli_keys": inherited_cli_keys,
         }
     except (KeyError, ValueError) as exc:
         raise StudySchemaMismatchError(

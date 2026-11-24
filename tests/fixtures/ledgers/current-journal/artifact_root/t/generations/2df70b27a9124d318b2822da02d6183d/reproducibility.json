@@ -1,17 +1,17 @@
 {
   "code_revision": null,
-  "config_fingerprint": "a7dfef2cc795c7f28c01b00ae09be201b2b4df88b9d7e290add9bf7546672b10",
+  "config_fingerprint": "e23ce993bba9c21d99e9c623296e5b98c552d680b8d3c24e2160eb33209017b6",
   "config_snapshot": {
     "path": "config.snapshot.yaml",
     "sha256": "66ca9aa184e8b9780c9695fcc9db655dba75f6b5117ab47144878daca599fc69"
   },
   "experiment": "t",
-  "generation_id": "917765af890c43549ae288ab5a0fe705",
+  "generation_id": "2df70b27a9124d318b2822da02d6183d",
   "generation_id_source": "engine",
   "phase_config_fingerprints": [
     {
       "name": "p",
-      "sha256": "38bc9cb2b671d7b7f6d3e3b5341207d898843175cb178f67a3e24b90f0703a0e"
+      "sha256": "a0bb6fdc88aed137a58127c9f6ca6d6124b57b07b2232f3b7283d73a3e90270d"
     }
   ],
   "phasesweep_version": "0.3.15",
@@ -20,10 +20,10 @@
   },
   "schema_version": 4,
   "schema_versions": {
-    "experiment_fingerprint": 9,
+    "experiment_fingerprint": 10,
     "generation_summary": 9,
-    "phase_fingerprint": 12,
+    "phase_fingerprint": 13,
     "reproducibility": 4,
-    "study_storage": 18
+    "study_storage": 19
   }
 }

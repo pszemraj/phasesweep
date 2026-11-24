@@ -82,7 +82,7 @@ phases: list[object] (required)
     # An interrupted attempt reruns as a new attempt with the same command in the same trial directory, so the trainer's own checkpoint-resume logic continues it; the rerun must write its result files again.
     # When the target is reached with no eligible feasible attempt, the phase fails.
     # On persistent storage a raised target runs the remaining attempts in the same study, and a lowered one is refused.
-    # Raising it on a finished phase that others inherit keeps its trials, runs the rest and selects its winner first. A dependent whose inherited values come out unchanged keeps its trials; one whose values changed stops the run, keeping the completed top-up, and is given a new `name` (with every `inherits` updated) to run again.
+    # A parent top-up keeps its trials and selects its winner first. Each child reuses or starts the study for its inherited values.
     # Recommended: one trial per configuration, spending the budget on more distinct values, such as 7 to 8 log-spaced learning rates.
     # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation for retries, aborts and partial results.
     n_trials: int (required)
@@ -376,7 +376,7 @@ phases: list[object] (required)
 #   json_file  {overrides_path}  overrides.json, with dotted keys expanded into nested objects. Values must be strict JSON.
 #   argparse   {overrides}       flattened leaves as shell-quoted --key=value tokens: null as None, a boolean as true or false, a string as written.
 #   hydra      {overrides}       flattened leaves as shell-quoted key=value tokens, strings double-quoted. A string with ${ or a control character fails.
-# Under argparse and hydra a float renders with Python's str() and a list as [a,b], recursively.
+# Argparse and Hydra tokens are sorted by dotted key. A float renders with Python's str() and a list as [a,b], recursively.
 # trial_command may not carry another format's placeholder, and yaml_file always needs its own.
 # The other formats need theirs once a phase has an inherited, fixed, sampled or repeat key, or trainer_config is nonempty.
 # Under argparse and hydra every flattened leaf must render: no mapping inside a list, no empty mapping, no dotted literal key colliding with a nested mapping.

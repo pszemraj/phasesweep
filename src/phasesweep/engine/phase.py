@@ -1670,7 +1670,7 @@ def _run_phase(
             filled = fill_study(experiment, phase, study, source, other_studies=others)
             report.info("%s  %s", phase.name, fill_note(source, filled))
     if not study.get_trials(deepcopy=False):
-        note = new_study_note(experiment, phase, inherited, others)
+        note = new_study_note(phase, inherited, others)
         if note is not None:
             report.info("%s  %s", phase.name, note)
     resumed = _resume_phase(experiment, phase, inherited_winners, study)

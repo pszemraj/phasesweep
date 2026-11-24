@@ -40,8 +40,6 @@ from phasesweep.engine.fingerprints import (
     _MAX_REPORTED_CHANGES,
     READING_KEY,
     _changed_payload_keys,
-    _cli_override_order,
-    _composed_override_keys,
     _identity_record,
     _inherited_values,
     _judge_record,
@@ -87,7 +85,7 @@ from phasesweep.runtime.json import JsonObject, finite_nonnegative, json_object
 from phasesweep.runtime.terminal import plural
 
 _FILL_ATTR = "phasesweep_reread_fill"
-REREAD_FILL_SCHEMA_VERSION = 1
+REREAD_FILL_SCHEMA_VERSION = 2
 _FILL_FIELDS = frozenset({"schema_version", "study_name", "trial_count", "identity", "attrs"})
 #: The source's identity, root, schema and any earlier fill belong to the source study.
 _NOT_COPIED = frozenset({_FILL_ATTR, PHASE_IDENTITY_ATTR, ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR})
@@ -192,7 +190,6 @@ def _reread_record(record: PhaseIdentityRecord, reading: JsonObject) -> PhaseIde
         _semantic_payload_digest(payload),
         payload,
         list(record["search_spaces"]),
-        record["inherited_cli_keys"],
     )
 
 
@@ -238,14 +235,14 @@ def fill_source(
 ) -> FillSource | None:
     """Pick the study a phase's new study is filled from, judging without writing anything.
 
-    A candidate holds trials measured under the same inherited values and argument order and
-    would continue under the current config once its reading settings are replaced. The
+    A candidate holds trials measured under the same inherited values and would continue
+    under the current config once its reading settings are replaced. The
     candidate with the most trainer-finished trials wins, the most recently created on a tie.
     An interrupted fill keeps the source, trial cutoff and metadata it already recorded.
 
     :param Experiment experiment: Current config.
     :param Phase phase: The phase whose addressed study records no identity.
-    :param Mapping[str, object] inherited: The ordered parent layer the phase inherits now.
+    :param Mapping[str, object] inherited: The parent layer the phase inherits now.
     :param Sequence[optuna.Study] others: The phase's other studies, oldest first.
     :param optuna.Study | None target: The addressed study, when already created.
     :raises StudyFingerprintMismatchError: A study with these inherited values exists but its
@@ -255,7 +252,6 @@ def fill_source(
     """
     reading = reading_settings(experiment, phase)
     values = _inherited_values(phase, inherited)
-    cli_order = _cli_override_order(experiment, _composed_override_keys(phase, inherited))
     boundary = _fill_boundary(target)
     copied = 0 if target is None else len(target.get_trials(deepcopy=False))
     if boundary is not None:
@@ -283,10 +279,6 @@ def fill_source(
                     f"Saved fill source {study.study_name!r} records different inherited values."
                 )
             continue
-        same_order = _same_value(payload.get("cli_override_order"), cli_order)
-        # Recheck a candidate under its original parent order before attributing a different
-        # command to the parents. Own training changes still need the usual refusal.
-        inherited_for_check = inherited if same_order else _recorded_inheritance(record)
         try:
             _judge_record(
                 _reread_record(record, reading),
@@ -294,16 +286,10 @@ def fill_source(
                 study.study_name,
                 experiment,
                 phase,
-                inherited_for_check,
+                inherited,
             )
         except StudyFingerprintMismatchError as exc:
             refusal = exc
-            continue
-        if not same_order:
-            if boundary is not None:
-                raise StudySchemaMismatchError(
-                    f"Saved fill source {study.study_name!r} records a different CLI argument order."
-                )
             continue
         recorded = payload.get(READING_KEY)
         changes = _changed_payload_keys(recorded if isinstance(recorded, dict) else {}, reading)

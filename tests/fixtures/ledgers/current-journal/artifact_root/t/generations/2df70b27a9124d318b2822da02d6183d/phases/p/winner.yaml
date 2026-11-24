@@ -16,15 +16,15 @@ completion:
   incomplete: false
   reason: null
   timeout_scope: null
-generation_id: 917765af890c43549ae288ab5a0fe705
-attempt_id: 2297b16324634d2db93d92e46c898f12
-trial_dir: trial_00000__2297b16324634d2db93d92e46c898f12
+generation_id: 2df70b27a9124d318b2822da02d6183d
+attempt_id: 764372713bef443d8cc1173307ec5667
+trial_dir: trial_00000__764372713bef443d8cc1173307ec5667
 winner_source:
   kind: phase_trial
   phase: p
   trial_number: 0
-  generation_id: 917765af890c43549ae288ab5a0fe705
-  attempt_id: 2297b16324634d2db93d92e46c898f12
+  generation_id: 2df70b27a9124d318b2822da02d6183d
+  attempt_id: 764372713bef443d8cc1173307ec5667
 trainer_input:
   schema_version: 1
   format: argparse
@@ -61,7 +61,7 @@ confound:
       verdict: ok
       detail:
         generations:
-        - generation_id: 917765af890c43549ae288ab5a0fe705
+        - generation_id: 2df70b27a9124d318b2822da02d6183d
           record: unknown
           commit: null
           dirty: null
@@ -70,13 +70,13 @@ confound:
           - 1
 observed: {}
 repeats: null
-phase_fingerprint: da536c0c09241ed6ff365f2f97cad1509684f56159accb68a9eb70e12a99daa4
-study_name: t::p::b1b09c503c3d6d54
+phase_fingerprint: 542603c093517aa6d206fc23a9aa8997ed01e6b4dee572e1f3db3cebbdb65466
+study_name: t::p::7577ebe79cdcb473
 objective_provenance:
   extractor:
     config_sha256: 600d03da027bd207d565a7cd606ddc0dd3c5b90ab73870b828f9de4819308def
     kind: log_regex
-  recorded_at: '2026-11-24T16:57:58+00:00'
+  recorded_at: '2026-11-24T19:29:54+00:00'
   schema_version: 6
   source:
     kind: file

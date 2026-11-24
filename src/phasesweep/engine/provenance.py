@@ -270,7 +270,7 @@ def _write_generation_provenance(
         "config_fingerprint": fingerprint_ops._experiment_semantic_fingerprint(experiment),
         "phase_config_fingerprints": [
             {"name": phase["name"], "sha256": _phase_config_fingerprint(phase)}
-            for phase in fingerprint_ops._semantic_phase_plan(experiment, experiment.phases)
+            for phase in fingerprint_ops._semantic_phase_plan(experiment.phases)
         ],
         "provenance": dict(sorted(experiment.provenance.items())),
         "code_revision": _code_revision(Path(trainer_cwd)),

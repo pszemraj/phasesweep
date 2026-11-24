@@ -309,7 +309,6 @@ def _addressed_record(
             reread_partial=partial if _at_accepted_partial_target(partial, phase) else None,
         )
     note = new_study_note(
-        experiment,
         phase,
         inherited,
         [record.study for record in recorded if record.study is not None],
