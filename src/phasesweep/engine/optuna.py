@@ -167,12 +167,17 @@ def _measured_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
 
 
 def _measured_draw_count(
-    trials: Sequence[optuna.trial.FrozenTrial], *, excluded: Collection[int] = ()
+    trials: Sequence[optuna.trial.FrozenTrial],
+    *,
+    excluded: Collection[int] = (),
+    assumed_complete: Collection[int] = (),
 ) -> int:
     """Count draws already measured, even if a reread recovered several attempts per draw.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
     :param Collection[int] excluded: Trial numbers still awaiting a measurement verdict.
+    :param Collection[int] assumed_complete: Trial numbers counted as COMPLETE to bound the
+        capacity left after re-reading their evidence.
     :return int: Distinct draw positions that have a COMPLETE trial, feasible or not.
     """
     positions = _draw_positions(trials)
@@ -180,7 +185,10 @@ def _measured_draw_count(
         {
             positions[trial.number]
             for trial in trials
-            if trial.state == optuna.trial.TrialState.COMPLETE and trial.number not in excluded
+            if trial.number not in excluded
+            and (
+                trial.state == optuna.trial.TrialState.COMPLETE or trial.number in assumed_complete
+            )
         }
     )
 

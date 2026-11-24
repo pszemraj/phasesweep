@@ -324,7 +324,7 @@ def test_grown_parent_keeps_trials_and_checks_the_winner_before_child_work(
         "DRY RUN total: would launch 1 trial across 1 phase (2 other phases replay)"
         if child_fixes_x
         else "DRY RUN total: would launch 1 trial across 1 phase. "
-        "Launch counts depend on inherited values for 2 phases"
+        "Launch counts are unresolved for 2 phases"
     ) in caplog.messages
     assert pointer.read_bytes() == before
     assert phase_trials(edited, parent.name) == parent_trials

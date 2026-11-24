@@ -163,13 +163,25 @@ def test_reread_releases_retry_budget_for_cells_that_now_have_a_result(
     assert _launches(launches) == 5
 
     fixed = _experiment(tmp_path, trainer, _metric("loss"), phases=[retry])
+    phase = phase.model_copy(update={"n_trials": 5})
+    corrected = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
     caplog.set_level(logging.INFO)
+    before = tree_snapshot(tmp_path)
+    run_experiment(fixed, dry_run=True)
+    assert "Its launch count depends on how much retry capacity remains" in caplog.text
+    assert "DRY RUN phase=p would launch" not in caplog.text
+    assert "Launch counts are unresolved for 1 phase" in caplog.text
+    caplog.clear()
+    run_experiment(corrected, dry_run=True)
+    assert "would select from the re-read evidence and launch no trials" in caplog.text
+    assert "DRY RUN total: would launch 0 trials across 0 phases" in caplog.text
+    assert tree_changes(before, tree_snapshot(tmp_path)) == {}
+    assert _launches(launches) == 5
+
     with pytest.raises(TrialTargetRefusedError, match="allow at most 5"):
         run_experiment(fixed)
     assert "reduce the accepted trial target from 6 to 5" in caplog.text
 
-    phase = phase.model_copy(update={"n_trials": 5})
-    corrected = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
     assert run_experiment(corrected)["p"].metric == 1.0
     assert _launches(launches) == 5
     copied = phase_study_of(corrected).get_trials()
@@ -520,7 +532,7 @@ def test_a_child_follows_its_re_read_parent_from_its_own_study(
     assert "placeholders until 'p' publishes a winner: x" in caplog.text
     assert (
         "DRY RUN total: no launches for phases with known counts. "
-        "Launch counts depend on inherited values for 1 phase"
+        "Launch counts are unresolved for 1 phase"
     ) in caplog.text
 
     caplog.clear()
@@ -532,7 +544,7 @@ def test_a_child_follows_its_re_read_parent_from_its_own_study(
     assert "DRY RUN phase=new_child would launch 2 trials" in caplog.text
     assert (
         "DRY RUN total: would launch 2 trials across 1 phase. "
-        "Launch counts depend on inherited values for 1 phase"
+        "Launch counts are unresolved for 1 phase"
     ) in caplog.text
     assert tree_changes(before, tree_snapshot(tmp_path)) == {}
     assert _launches(launches) == 5

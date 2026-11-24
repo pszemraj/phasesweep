@@ -57,7 +57,7 @@ from phasesweep.engine.phase import (
     _winner_overrides,
 )
 from phasesweep.engine.progress import _log_phase_header
-from phasesweep.engine.reread import FillSource, _trainer_seconds, describe_changes, fill_source
+from phasesweep.engine.reread import FillSource, describe_changes, fill_source
 from phasesweep.engine.state import (
     PHASE_DECISION_ATTR,
     RecoveredTrialState,
@@ -117,6 +117,8 @@ class RecordedPhase:
     study: optuna.Study | None
     #: The source of a pending fill, whose old scores cannot supply a winner.
     fill: FillSource | None = None
+    #: Whether the next run can launch work only if the re-read leaves enough retry capacity.
+    fill_retry_uncertain: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +127,7 @@ class PhasePreview:
 
     #: The winner the phase hands its children: a replayed one, or a placeholder.
     winner: Winner
-    #: Trials a launch would run, or None if the phase's addressed study is unresolved.
+    #: Trials a launch would run, or None while an inheritance or re-read verdict is pending.
     launches: int | None
     #: How many of those launches rerun an interrupted trial or retry a failed grid cell.
     reruns: int
@@ -154,7 +156,7 @@ def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
     if replaying:
         line += f" ({replaying} other {'phase replays' if replaying == 1 else 'phases replay'})"
     if unknown:
-        line += f". Launch counts depend on inherited values for {plural(unknown, 'phase')}"
+        line += f". Launch counts are unresolved for {plural(unknown, 'phase')}"
     return line
 
 
@@ -299,8 +301,7 @@ def _addressed_record(
         experiment, phase, inherited, others, target=None if addressed is None else addressed.study
     )
     if source is not None:
-        # A run fills the study from kept evidence before it launches anything; the re-read
-        # outcomes are known only once read, so the source's counts stand in for them.
+        # A fill keeps the results already copied and the source's remaining trainer attempts.
         log.info(
             "DRY RUN phase=%s reading settings changed (%s): would re-read %s from kept "
             "evidence; nothing would retrain",
@@ -308,8 +309,29 @@ def _addressed_record(
             describe_changes(source.changes),
             plural(source.rereads, "finished trial"),
         )
-        stand_in = _recorded_phase(phase, source.study, trials=source.trials)
-        return name, replace(stand_in, study=None, fill=source)
+        copied = (
+            []
+            if addressed is None or addressed.study is None
+            else addressed.study.get_trials(deepcopy=False)
+        )
+        trials = [*copied, *source.trials[len(copied) :]]
+        stand_in = _recorded_phase(phase, source.study, trials=trials)
+        uncertain = False
+        if phase.n_trials > stand_in.finished:
+            # Each draw that might measure can remove one retry from the available budget.
+            ceiling = retry_target_ceiling(
+                phase,
+                finished=stand_in.finished,
+                measured=_measured_draw_count(trials, assumed_complete=source.reread_trials),
+            )
+            uncertain = ceiling is not None and phase.n_trials > ceiling
+        if uncertain:
+            _validate_fixed_configuration_target(
+                phase,
+                finished=stand_in.finished,
+                measured=_measured_draw_count(trials, excluded=source.reread_trials),
+            )
+        return name, replace(stand_in, study=None, fill=source, fill_retry_uncertain=uncertain)
     note = new_study_note(
         phase,
         inherited,
@@ -357,7 +379,7 @@ def validate_trial_targets(experiment: Experiment) -> None:
             continue
         study = known.get(phase.name)
         trials = [] if study is None else study.get_trials(deepcopy=False)
-        unread: set[int] = set()
+        unread: frozenset[int] = frozenset()
         if study is None or _recorded_identity(study) is None:
             source = fill_source(
                 experiment,
@@ -368,9 +390,8 @@ def validate_trial_targets(experiment: Experiment) -> None:
             )
             if source is not None:
                 study = source.study
-                missing = source.trials[len(trials) :]
-                unread = {trial.number for trial in missing if _trainer_seconds(trial) is not None}
-                trials = [*trials, *missing]
+                unread = source.reread_trials
+                trials = [*trials, *source.trials[len(trials) :]]
         recovered = [] if study is None else _recovered_running_states(study.study_name, trials)
         _validate_fixed_configuration_target(
             phase,
@@ -490,7 +511,8 @@ def _preview_phase(
     sampled placeholder. Unreadable studies and RUNNING studies needing recovery
     also use placeholders; the latter retain predicted counts without judging
     unrecovered state. A phase with recorded studies that still needs its inherited
-    values shows an example command and leaves its launch count unresolved.
+    values, or whose retry capacity depends on a reread, shows an example command
+    and leaves its launch count unresolved.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being previewed.
@@ -534,6 +556,16 @@ def _preview_phase(
     finished = 0 if recorded is None else recorded.finished
     reruns = 0 if recorded is None else recorded.recovery_reruns
     remaining = max(0, phase.n_trials - finished)
+    if recorded is not None and recorded.fill_retry_uncertain:
+        warn_dry_run(
+            "phase=%s has %d of %d trials recorded. Its launch count depends on how much retry "
+            "capacity remains after re-reading the evidence",
+            phase.name,
+            finished,
+            phase.n_trials,
+        )
+        winner = _preview_trial_command(experiment, phase, inherited_winners)
+        return PhasePreview(winner=winner, launches=None, reruns=0)
     study: optuna.Study | None = None
     resume: _PhaseResume | None = None
     phase_fingerprint = _phase_fingerprint(experiment, phase, inherited_winners)

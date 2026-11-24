@@ -109,13 +109,21 @@ class FillSource:
 
     study: optuna.Study
     record: PhaseIdentityRecord
-    #: How many of its trials still have a finished trainer to read.
-    rereads: int
+    #: Which trials still have a finished trainer to read.
+    reread_trials: frozenset[int]
     #: Each reading setting that changed, with its recorded and current value.
     changes: tuple[tuple[str, object, object], ...]
     #: The source's current trials and study attributes.
     trials: list[optuna.trial.FrozenTrial]
     attrs: JsonObject
+
+    @property
+    def rereads(self) -> int:
+        """Count the finished trials the fill still re-reads.
+
+        :return int: Number of trials with a finished trainer and no row in the target.
+        """
+        return len(self.reread_trials)
 
 
 def _fill_source_name(target: optuna.Study | None) -> str | None:
@@ -297,7 +305,9 @@ def fill_source(
             continue
         recorded = payload.get(READING_KEY)
         changes = _changed_payload_keys(recorded if isinstance(recorded, dict) else {}, reading)
-        rereads = sum(_trainer_seconds(trial) is not None for trial in trials[copied:])
+        rereads = frozenset(
+            trial.number for trial in trials[copied:] if _trainer_seconds(trial) is not None
+        )
         attrs = json_object(
             {key: value for key, value in study.user_attrs.items() if key not in _NOT_COPIED}
         )
