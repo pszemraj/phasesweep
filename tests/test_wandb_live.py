@@ -88,7 +88,8 @@ def _grid_phase(name: str, key: str, choices: list[float], **kwargs: object) -> 
         gpu_policy="none",
         sampler=Sampler(type="grid"),
         timeout_seconds_per_trial=120,
-        timeout_seconds_per_phase=600,
+        # Each of the two trials' reads may wait out W&B's summary lag.
+        timeout_seconds_per_phase=1800,
         search_space={key: CategoricalParam(type="categorical", choices=choices)},
         **kwargs,
     )
@@ -104,7 +105,7 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
         project=project,
         metric_key="eval/loss.min",
         evaluation_axis="eval/step",
-        timeout_seconds=120,
+        timeout_seconds=600,
         poll_seconds=2,
     )
     experiment = Experiment(
@@ -119,7 +120,7 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
         ),
         execution=ExecutionContext(inherit_env="none", passthrough_env=_PASSTHROUGH),
         metric=Metric(name="eval_loss", goal="minimize", extractor=extractor),
-        timeout_seconds_per_run=1200,
+        timeout_seconds_per_run=3600,
         phases=[
             _grid_phase("learning_rate", "learning_rate", [0.01, 0.1]),
             _grid_phase("regularization", "weight_decay", [0.0, 0.01], inherits=["learning_rate"]),
@@ -210,7 +211,8 @@ def test_a_resumed_trial_logs_every_attempt_to_its_one_wandb_run(tmp_path: Path)
         project=project,
         metric_key="eval/loss.min",
         evaluation_axis="eval/step",
-        timeout_seconds=120,
+        # A resumed run served the earlier attempt's summary for minutes after the rerun ended.
+        timeout_seconds=600,
         poll_seconds=2,
     )
     experiment = Experiment(
@@ -227,21 +229,22 @@ def test_a_resumed_trial_logs_every_attempt_to_its_one_wandb_run(tmp_path: Path)
             inherit_env="none", passthrough_env=_PASSTHROUGH, cwd=str(tmp_path)
         ),
         metric=Metric(name="eval_loss", goal="minimize", extractor=extractor),
-        timeout_seconds_per_run=1200,
+        timeout_seconds_per_run=3600,
         phases=[
             Phase(
                 name="resume",
                 n_trials=1,
                 gpu_policy="none",
                 sampler=Sampler(type="grid"),
-                timeout_seconds_per_trial=600,
-                timeout_seconds_per_phase=900,
+                # The first attempt waits up to 600 s for W&B to serve its rows.
+                timeout_seconds_per_trial=1200,
+                timeout_seconds_per_phase=2400,
                 search_space={"learning_rate": CategoricalParam(type="categorical", choices=[0.1])},
             )
         ],
     )
     config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
-    with runner_once(config, marker, timeout=300):
+    with runner_once(config, marker, timeout=900):
         pass
 
     winner = run_experiment(experiment)["resume"]

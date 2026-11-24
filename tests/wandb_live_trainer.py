@@ -49,13 +49,14 @@ def _wait_until_uploaded(run_path: str, step: int) -> None:
 
     :param str run_path: ``entity/project/run_id`` of the run.
     :param int step: One-based evaluation step just logged, W&B ``_step`` ``step - 1``.
-    :raises SystemExit: W&B did not serve the rows within two minutes.
+    :raises SystemExit: W&B did not serve the rows within ten minutes.
     """
     import wandb
 
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + 600
     while time.monotonic() < deadline:
         try:
+            # A new client per poll, because a client keeps the run it first fetched.
             served = wandb.Api(timeout=30).run(run_path)
             if (
                 served.lastHistoryStep >= step - 1
