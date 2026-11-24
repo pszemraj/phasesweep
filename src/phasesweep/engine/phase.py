@@ -15,7 +15,7 @@ from uuid import uuid4
 
 import optuna
 
-from phasesweep.config.models import Constraint, Experiment, Metric, Phase
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.artifacts import _warn_environment_drift, _write_trials_csv
 from phasesweep.engine.attempts import (
     _active_attempt_persistence_error,
@@ -24,6 +24,7 @@ from phasesweep.engine.attempts import (
     _retire_active_attempt,
     _trial_requires_cleanup_recovery,
 )
+from phasesweep.engine.bounds import bound_violations
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
@@ -191,6 +192,7 @@ def _winner_completion(
 
 
 def _partial_completion_for_replay(
+    experiment: Experiment,
     study: optuna.Study,
     decision: _AcceptedPartialDecision,
     *,
@@ -198,6 +200,7 @@ def _partial_completion_for_replay(
 ) -> dict[str, Any]:
     """Re-prove and return the frozen completion metadata for a decision replay.
 
+    :param Experiment experiment: Config whose bounds judge the recorded trials.
     :param optuna.Study study: Study whose current finished and completed counts are verified.
     :param _AcceptedPartialDecision decision: Persisted accepted-partial decision.
     :param int outcome_sequence: Current durable outcome sequence for the study.
@@ -209,7 +212,7 @@ def _partial_completion_for_replay(
     if (
         outcome_sequence != decision.outcome_sequence
         or _finished_trial_count(trials) != decision.finished_trials
-        or _completed_trial_count(trials) != decision.completed_trials
+        or _completed_trial_count(trials, experiment) != decision.completed_trials
     ):
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} changed after its accepted partial-timeout "
@@ -546,6 +549,7 @@ def _judge_recorded_phase(
                 remediation=ACCEPT_INCOMPLETE_STEP,
             )
         completion = _partial_completion_for_replay(
+            experiment,
             study,
             partial_decision,
             outcome_sequence=policy_state.max_sequence,
@@ -566,7 +570,7 @@ def _judge_recorded_phase(
             ) from exc
     # A later success or a lowered failure limit does not clear a recorded abort. A live run's
     # preflight confirms cleanup before this point; a dry run cannot.
-    refusal = _phase_refusal(phase, study, policy_state)
+    refusal = _phase_refusal(experiment, phase, study, policy_state)
     if refusal is not None:
         raise refusal
     active_abort = policy_state.abort
@@ -1250,20 +1254,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         raise TrialExecutionError(result.failure_reason)
 
     assert result.metric is not None  # guaranteed when failure_reason is None
-    violations: list[str] = []
-    if not result.feasible:
-        bound_checks: list[tuple[str, float, Metric | Constraint]] = [
-            (f"metric {experiment.metric.name!r}", result.metric, experiment.metric),
-            *(
-                (f"constraint {constraint.name!r}", result.constraints[constraint.name], constraint)
-                for constraint in experiment.constraints
-            ),
-        ]
-        for label, value, bounds in bound_checks:
-            if bounds.min is not None and value < bounds.min:
-                violations.append(f"{label}={value} < min={bounds.min}")
-            if bounds.max is not None and value > bounds.max:
-                violations.append(f"{label}={value} > max={bounds.max}")
+    violations = bound_violations(result.metric, result.constraints, experiment)
     _record_outcome(
         run,
         trial,
@@ -1445,6 +1436,7 @@ def _settle_finished_trial(
                 _write_trials_csv(
                     study,
                     _trials_csv_path(run.experiment, run.phase.name),
+                    run.experiment,
                     repeats=repeat_axis(run.phase),
                 )
                 run.csv_throttle.mark_written(finished, now)
@@ -1475,7 +1467,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
     study = run.study
     trials_after = study.get_trials(deepcopy=False)
     finished_after = _finished_trial_count(trials_after)
-    completed_after = _completed_trial_count(trials_after)
+    completed_after = _completed_trial_count(trials_after, experiment)
     # An expired budget with unfinished slots takes precedence over a failure-streak abort.
     scheduler_deadline_exhausted = (
         run.optimize_deadline is not None
@@ -1495,7 +1487,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         assert abort is not None  # an aborted run recorded its abort with the tripping outcome
         # Without storage there is no study to continue, so the whole run starts again.
         advice = (
-            _recovery_advice(phase, study, abort)
+            _recovery_advice(experiment, phase, study, abort)
             if experiment.persistent
             else ABORT_START_AGAIN_STEP
         )
@@ -1673,7 +1665,10 @@ def _run_phase(
         # a study this run does not address. Like every trials.csv snapshot it is best-effort.
         with contextlib.suppress(Exception):
             _write_trials_csv(
-                study, _trials_csv_path(experiment, phase.name), repeats=repeat_axis(phase)
+                study,
+                _trials_csv_path(experiment, phase.name),
+                experiment,
+                repeats=repeat_axis(phase),
             )
     if isinstance(resumed, Winner):
         return resumed
@@ -1818,6 +1813,7 @@ def _run_phase(
                 _write_trials_csv(
                     study,
                     _trials_csv_path(experiment, phase.name),
+                    experiment,
                     repeats=repeat_axis(phase),
                 )
 
@@ -1875,7 +1871,7 @@ def _replay_met_target(
             completion=_winner_completion(
                 requested_trials=phase.n_trials,
                 finished_trials=_finished_trial_count(trials),
-                completed_trials=_completed_trial_count(trials),
+                completed_trials=_completed_trial_count(trials, experiment),
                 incomplete=False,
                 reason=None,
                 timeout_scope=None,

@@ -414,7 +414,7 @@ def _check_published_phase_studies(
                 trials = holding[0] if holding else [trial for t in every for trial in t]
                 if matched and expected is not None:
                     finished = _finished_trial_count(trials)
-                    completed = _completed_trial_count(trials)
+                    completed = _completed_trial_count(trials, experiment)
                     if _meets_published_trial_history_boundary(finished, completed, expected):
                         continue
                     boundary = ", ".join(

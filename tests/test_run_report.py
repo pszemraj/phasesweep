@@ -1547,7 +1547,7 @@ def test_phase_counts_keep_an_interrupted_trial_out_of_the_counted_and_earlier_t
     )
 
     counts = _phase_counts(
-        validate_ledger(experiment), experiment.phases[0], "t::p", "this-run", winner
+        validate_ledger(experiment), experiment, experiment.phases[0], "t::p", "this-run", winner
     )
 
     assert counts is not None

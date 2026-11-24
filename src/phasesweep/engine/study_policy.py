@@ -46,6 +46,7 @@ from phasesweep.engine.optuna import (
     _finished_trial_count,
     _measured_trial_count,
     _trial_count_state,
+    _trial_run_state,
 )
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -811,7 +812,7 @@ def _failed_grid_cells(
         if grid_id is not None:
             latest[grid_id] = trial
     return sorted(
-        (trial for trial in latest.values() if _trial_count_state(trial) == "FAIL"),
+        (trial for trial in latest.values() if _trial_run_state(trial) == "FAIL"),
         key=lambda trial: trial.number,
     )
 
@@ -943,7 +944,9 @@ def _raised_target_step(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]
     return f"{raise_to} {' and '.join(actions)}."
 
 
-def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, object]) -> str | None:
+def _recovery_advice(
+    experiment: Experiment, phase: Phase, study: optuna.Study, abort: Mapping[str, object]
+) -> str | None:
     """Say how to continue a phase whose study recorded ``abort``, or that nothing can.
 
     Recovery messages take their advice from here, and :func:`_recovery_action` routes it.
@@ -951,13 +954,14 @@ def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, obje
     so changing them for trials that tripped on them takes a fresh study; a fix that changes
     any other part of it meets its own refusal, which gives its own step.
 
+    :param Experiment experiment: Config whose bounds judge the recorded trials.
     :param Phase phase: Phase that aborted.
     :param optuna.Study study: The phase's study.
     :param Mapping[str, object] abort: The recorded abort.
     :return str | None: The advice, or ``None`` when no remedy or explanation applies.
     """
     if _streak_trials_all_infeasible(study, _load_phase_policy_state(study)):
-        remedies = _recovery_remedies(phase, study, abort, lead_in="To keep them, ")
+        remedies = _recovery_remedies(experiment, phase, study, abort, lead_in="To keep them, ")
         if remedies is None:
             return None
         return (
@@ -975,14 +979,19 @@ def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, obje
         if _any_trial_timed_out(trials)
         else "Fix the cause, then "
     )
-    remedies = _recovery_remedies(phase, study, abort, lead_in=lead_in)
+    remedies = _recovery_remedies(experiment, phase, study, abort, lead_in=lead_in)
     if remedies is None:
         return None
     return f"{objective_lead}{remedies}"
 
 
 def _recovery_remedies(
-    phase: Phase, study: optuna.Study, abort: Mapping[str, object], *, lead_in: str
+    experiment: Experiment,
+    phase: Phase,
+    study: optuna.Study,
+    abort: Mapping[str, object],
+    *,
+    lead_in: str,
 ) -> str | None:
     """Name the step that continues a phase whose study recorded ``abort``, or say none does.
 
@@ -993,6 +1002,7 @@ def _recovery_remedies(
     recorded count instead. A grid or fixed configuration with every cell measured has no
     remedy, and says so.
 
+    :param Experiment experiment: Config whose bounds judge the recorded trials.
     :param Phase phase: Phase that aborted.
     :param optuna.Study study: The phase's study.
     :param Mapping[str, object] abort: The recorded abort.
@@ -1022,7 +1032,7 @@ def _recovery_remedies(
         return f"{lead_in}{step}"
     if ceiling is None or ceiling > finished:
         return None
-    if any(_trial_count_state(trial) == "COMPLETE" for trial in trials):
+    if any(_trial_count_state(trial, experiment) == "COMPLETE" for trial in trials):
         return "Nothing is left to run or retry."
     if phase_draws(phase):
         return "Every cell was measured and none is feasible, so change the search space or bounds."

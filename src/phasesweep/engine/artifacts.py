@@ -128,12 +128,16 @@ def _file_log_handler(path: Path) -> Iterator[None]:
 
 
 def _write_trials_csv(
-    study: optuna.Study, path: Path, *, repeats: RepeatAxis | None = None
+    study: optuna.Study,
+    path: Path,
+    experiment: Experiment,
+    *,
+    repeats: RepeatAxis | None = None,
 ) -> None:
     """Snapshot every trial in ``study`` to ``path`` as stdlib CSV.
 
     The ``state`` column is the label run logs and status tables use, so an
-    interrupted trial reads ``INTERRUPTED`` and an infeasible one ``INFEASIBLE``.
+    interrupted trial reads ``INTERRUPTED`` and one outside the current bounds ``INFEASIBLE``.
     A repeats phase gets a ``repeat_group`` column: the highest trial number
     in the trial's group so far, grouped by the same key selection uses. An
     incomplete group's label moves as more members are allocated.
@@ -146,6 +150,7 @@ def _write_trials_csv(
 
     :param optuna.Study study: Study whose trials are serialized.
     :param Path path: Destination CSV path.
+    :param Experiment experiment: Config whose bounds judge each measured trial.
     :param RepeatAxis | None repeats: The phase's repeat axis, or ``None`` without repeats.
     """
     trials = study.get_trials(deepcopy=False)
@@ -173,7 +178,7 @@ def _write_trials_csv(
         for t in trials:
             row: dict[str, Any] = {
                 "number": t.number,
-                "state": _trial_count_state(t),
+                "state": _trial_count_state(t, experiment),
                 "value": t.value,
                 "datetime_start": t.datetime_start,
                 "datetime_complete": t.datetime_complete,
@@ -208,6 +213,7 @@ def _refresh_recovered_trials_csv(
             _write_trials_csv(
                 study,
                 path_ops._trials_csv_path(experiment, phase.name),
+                experiment,
                 repeats=repeat_axis(phase),
             )
     except Exception as exc:

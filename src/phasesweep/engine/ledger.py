@@ -733,7 +733,7 @@ def _unavailable_phase_trial_stats(
 
 def _published_history_retained(
     snapshot: JournalStorage,
-    experiment_name: str,
+    experiment: Experiment,
     phase_name: str,
     expected: _TrialRef | None,
     addressed: optuna.Study | None,
@@ -746,7 +746,7 @@ def _published_history_retained(
     already loaded by the caller, is searched first, so the usual read loads no study twice.
 
     :param JournalStorage snapshot: Captured journal replay to read.
-    :param str experiment_name: The experiment's name.
+    :param Experiment experiment: The experiment, which names the phase's studies.
     :param str phase_name: The published phase.
     :param _TrialRef | None expected: The published trial and its count boundary.
     :param optuna.Study | None addressed: The study the phase addresses now, if it exists.
@@ -760,7 +760,7 @@ def _published_history_retained(
     def candidates() -> Iterator[optuna.Study | None]:
         if addressed is not None:
             yield addressed
-        for name in _phase_study_names(snapshot, experiment_name, phase_name):
+        for name in _phase_study_names(snapshot, experiment.experiment, phase_name):
             if addressed is None or name != addressed.study_name:
                 yield _load_snapshot_study(snapshot, name)
 
@@ -768,18 +768,19 @@ def _published_history_retained(
         trials = [] if study is None else study.get_trials(deepcopy=False)
         if any(_published_trial_matches(trial, expected) for trial in trials):
             return _meets_published_trial_history_boundary(
-                _finished_trial_count(trials), _completed_trial_count(trials), expected
+                _finished_trial_count(trials), _completed_trial_count(trials, experiment), expected
             )
     return False
 
 
-def _phase_trial_stats(study: optuna.Study | None) -> _PhaseTrialStats:
+def _phase_trial_stats(study: optuna.Study | None, experiment: Experiment) -> _PhaseTrialStats:
     """Read one captured study's counts and RUNNING identities.
 
     Counts and RUNNING identities come from one snapshot, so they describe the same moment.
     An absent study reports available zero counts.
 
     :param optuna.Study | None study: The phase's addressed study from the snapshot, if any.
+    :param Experiment experiment: Config whose bounds judge the measured trials.
     :return _PhaseTrialStats: The study's available counts and identities.
     """
     if study is None:
@@ -791,7 +792,7 @@ def _phase_trial_stats(study: optuna.Study | None) -> _PhaseTrialStats:
     running_attempts: list[_TrialRef] = []
     outcomes = _unique_trial_outcomes(study_name, trials)
     for trial in trials:
-        state = _trial_count_state(trial)
+        state = _trial_count_state(trial, experiment)
         counts[state] = counts.get(state, 0) + 1
         generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
         if isinstance(generation_id, str):
@@ -1012,10 +1013,10 @@ def read_trial_stats(
         try:
             addressed = None if study_name is None else _load_snapshot_study(snapshot, study_name)
             stats[phase.name] = replace(
-                _phase_trial_stats(addressed),
+                _phase_trial_stats(addressed, ledger.experiment),
                 published_trial_available=_published_history_retained(
                     snapshot,
-                    ledger.experiment_name,
+                    ledger.experiment,
                     phase.name,
                     published_trials.get(phase.name),
                     addressed,

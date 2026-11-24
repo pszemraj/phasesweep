@@ -16,7 +16,7 @@ from phasesweep import run_experiment
 from phasesweep.config.models import Experiment
 from phasesweep.engine import phase as phase_module
 from phasesweep.engine.cleanup import _reap_stale_trials
-from phasesweep.engine.optuna import _trial_count_state
+from phasesweep.engine.optuna import _trial_run_state
 from phasesweep.engine.paths import _run_log_path
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
@@ -52,7 +52,7 @@ def _outcome(trial: FrozenTrial) -> tuple[str, str | None]:
     :return tuple[str, str | None]: ``(state, cause)``.
     """
     parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
-    return _trial_count_state(trial), None if parsed is None else parsed.cause
+    return _trial_run_state(trial), None if parsed is None else parsed.cause
 
 
 def _exec_trainer(tmp_path: Path, body: str, **phase: object) -> Experiment:

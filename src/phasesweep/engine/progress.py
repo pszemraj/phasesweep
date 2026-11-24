@@ -176,7 +176,7 @@ def _report_trial(
             experiment,
             phase,
             number=trial.number,
-            state=_trial_count_state(trial),
+            state=_trial_count_state(trial, experiment),
             value=trial.value,
             seconds=seconds,
             finished=finished,

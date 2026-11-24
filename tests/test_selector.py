@@ -650,8 +650,10 @@ def test_incomplete_repeats_remedy_uses_recorded_feasibility(
 ) -> None:
     """Successful repeat members do not turn a crashed group into an infeasible one."""
     experiment = make_experiment(persistent=tmp_path, n_trials=3)
+    if not feasible:
+        experiment = _with_bounds(experiment, max=0.1)
     study = _make_study()
-    _add_group(study, 1, [0.5, 0.6], feasible=feasible)
+    _add_group(study, 1, [0.5, 0.6])
     _add_failed(study, 1, 2)
 
     with pytest.raises(NoFeasibleTrialError) as refused:

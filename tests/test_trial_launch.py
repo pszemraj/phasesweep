@@ -26,7 +26,7 @@ import yaml
 from phasesweep import run_experiment
 from phasesweep.config.models import ExecutionContext, Experiment, Metric
 from phasesweep.engine.artifacts import _warn_environment_drift
-from phasesweep.engine.optuna import _trial_count_state
+from phasesweep.engine.optuna import _trial_run_state
 from phasesweep.engine.paths import _attempt_dir
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
@@ -1527,7 +1527,7 @@ def test_guardian_sigkill_interrupts_its_trial_which_reruns_in_place(
                     real_terminate((identity.pgid,), grace_seconds=0.05)
 
     first, second, rerun = phase_study(experiment).trials
-    assert [_trial_count_state(t) for t in (first, second, rerun)] == [
+    assert [_trial_run_state(t) for t in (first, second, rerun)] == [
         "INTERRUPTED",
         "COMPLETE",
         "COMPLETE",

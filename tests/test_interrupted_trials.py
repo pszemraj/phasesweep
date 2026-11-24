@@ -47,6 +47,7 @@ from phasesweep.engine.optuna import (
     _draw_positions,
     _finished_trial_count,
     _trial_count_state,
+    _trial_run_state,
 )
 from phasesweep.engine.paths import (
     _attempts_dir,
@@ -291,7 +292,7 @@ def test_an_interrupted_trial_is_counted_apart_and_never_toward_the_target() -> 
     _record_reruns(study)
     trials = study.get_trials(deepcopy=False)
 
-    assert [_trial_count_state(t) for t in trials] == ["FAIL", "INTERRUPTED", "WAITING"]
+    assert [_trial_run_state(t) for t in trials] == ["FAIL", "INTERRUPTED", "WAITING"]
     assert _finished_trial_count(trials) == 1
     assert _draw_positions(trials) == {0: 0, 1: 1, 2: 1}
 
@@ -416,7 +417,7 @@ def test_a_trainer_that_fails_while_a_shutdown_is_serviced_keeps_its_own_failure
     (trial,) = phase_trials(exp)
     study = phase_study(exp)
     assert launched.exists()
-    assert _trial_count_state(trial) == "FAIL"
+    assert _trial_run_state(trial) == "FAIL"
     assert _cause(trial) == "non-zero exit code 1; stderr: CUDA error: out of memory"
     assert _load_phase_policy_state(study).consecutive_failures == 1
     assert _record_reruns(study) == []
@@ -450,7 +451,7 @@ def test_no_trainer_starts_while_a_shutdown_is_serviced(
 
     (trial,) = phase_trials(exp)
     assert not launched.exists()
-    assert _trial_count_state(trial) == "INTERRUPTED"
+    assert _trial_run_state(trial) == "INTERRUPTED"
     assert _cause(trial) == _SIGINT_CAUSE
 
 
@@ -518,7 +519,7 @@ def test_a_shutdown_waits_for_parallel_workers_to_record_their_own_trials(
     sender.join(timeout=5.0)
 
     trials = phase_trials(exp)
-    assert [_trial_count_state(trial) for trial in trials] == ["INTERRUPTED", "INTERRUPTED"]
+    assert [_trial_run_state(trial) for trial in trials] == ["INTERRUPTED", "INTERRUPTED"]
     assert [_cause(trial) for trial in trials] == [_SIGINT_CAUSE, _SIGINT_CAUSE]
     with (_phase_dir(exp, "p") / "trials.csv").open(newline="") as handle:
         assert [row[f"user_attr:{FAILURE_REASON_ATTR}"] for row in csv.DictReader(handle)] == [
@@ -1248,7 +1249,7 @@ else:
             (recovered,) = phase_trials(experiment)
             with (_phase_dir(experiment, "p") / "trials.csv").open(newline="") as handle:
                 (row,) = csv.DictReader(handle)
-            assert row["state"] == _trial_count_state(recovered)
+            assert row["state"] == _trial_count_state(recovered, experiment)
             assert recovered.state.name == (
                 "COMPLETE" if return_code == 0 and not terminated else "FAIL"
             )

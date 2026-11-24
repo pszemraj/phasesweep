@@ -936,7 +936,9 @@ def _recover_trial_evidence(
                     generation = trial.user_attrs.get(GENERATION_ID_ATTR)
                     if location != (phase_name, trial.number, generation):
                         continue
-                    evidence.reaped_attempt_states[trial_attempt_id] = _trial_count_state(trial)
+                    evidence.reaped_attempt_states[trial_attempt_id] = _trial_count_state(
+                        trial, config
+                    )
     _require_cleanup_evidence(needs, evidence, inspected_studies)
     return evidence
 

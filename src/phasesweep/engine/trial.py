@@ -24,8 +24,8 @@ from typing import Any
 import optuna
 from optuna.trial import FrozenTrial
 
-from phasesweep.config.common import check_bounds
 from phasesweep.config.models import TRIAL_BOUND_ENV, Experiment, Observation, _wandb_query
+from phasesweep.engine.bounds import bound_violations
 from phasesweep.engine.errors import LaunchEnvironmentError
 from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.state import (
@@ -1064,9 +1064,6 @@ def extract_trial_result(
     )
     if isinstance(metric_value, TrialResult):
         return metric_value
-    feasible = check_bounds(
-        metric_value, min_value=experiment.metric.min, max_value=experiment.metric.max
-    )
     for c in experiment.constraints:
         expired = _deadline_failure(f"constraint extractor {c.name!r}")
         if expired is not None:
@@ -1078,8 +1075,7 @@ def extract_trial_result(
         if isinstance(v, TrialResult):
             return v
         constraint_values[c.name] = v
-        if not check_bounds(v, min_value=c.min, max_value=c.max):
-            feasible = False
+    feasible = not bound_violations(metric_value, constraint_values, experiment)
 
     gate_results = evaluate_gates(executed.ctx, gates or [], deadline=deadline)
     if executed.ctx.mlflow_capture:

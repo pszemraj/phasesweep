@@ -58,6 +58,7 @@ from phasesweep.engine.optuna import (
     _published_phase_trial_refs,
     _published_trial_history_available,
     _trial_count_state,
+    _trial_run_state,
     _TrialRef,
 )
 from phasesweep.engine.paths import (
@@ -605,7 +606,7 @@ def winner_advisories(
         else None
     )
     finished = sorted(
-        (trial for trial in trials or () if _trial_count_state(trial) in FINISHED_TRIAL_STATES),
+        (trial for trial in trials or () if _trial_run_state(trial) in FINISHED_TRIAL_STATES),
         key=lambda trial: trial.number,
     )
     edge_status: EdgeAdvisoryStatus = "unavailable"
@@ -1245,9 +1246,12 @@ class UnpublishedWinnerStep:
     fix: str
 
 
-def _status_phase_refusal(phase: Phase, study: optuna.Study) -> PhaseAbortRefusedError | None:
+def _status_phase_refusal(
+    experiment: Experiment, phase: Phase, study: optuna.Study
+) -> PhaseAbortRefusedError | None:
     """Give status the failure-policy refusal when a partial decision does not take precedence.
 
+    :param Experiment experiment: Config whose bounds judge the recorded trials.
     :param Phase phase: Phase whose target and failure limit apply.
     :param optuna.Study study: Read-only phase study containing the recorded decisions.
     :return PhaseAbortRefusedError | None: Failure-policy refusal to report, if any.
@@ -1255,7 +1259,7 @@ def _status_phase_refusal(phase: Phase, study: optuna.Study) -> PhaseAbortRefuse
     policy = _load_phase_policy_state(study)
     if _at_accepted_partial_target(_load_accepted_partial_decision(study), phase):
         return None
-    return _phase_refusal(phase, study, policy)
+    return _phase_refusal(experiment, phase, study, policy)
 
 
 PhaseRefusal: TypeAlias = (
@@ -1294,7 +1298,7 @@ def _phase_refusals(
         if study is None:
             continue
         try:
-            refusal = _status_phase_refusal(phase, study)
+            refusal = _status_phase_refusal(experiment, phase, study)
             if refusal is None:
                 _verify_recorded_identity(study, experiment, phase)
         except (StudyFingerprintMismatchError, StudySchemaMismatchError) as exc:
@@ -1488,14 +1492,17 @@ def _trial_dir_text(trial: optuna.trial.FrozenTrial) -> str | None:
     return None if directory is None else str(directory)
 
 
-#: Columns every trial table starts with, as ``(header, getter)`` pairs.
-_CORE_TRIAL_COLUMNS: tuple[tuple[str, Callable[[optuna.trial.FrozenTrial], JsonValue]], ...] = (
-    ("trial", lambda trial: trial.number),
+#: Columns every trial table starts with, as ``(header, getter)`` pairs; a getter reads the
+#: trial and the config whose bounds judge it.
+_CORE_TRIAL_COLUMNS: tuple[
+    tuple[str, Callable[[optuna.trial.FrozenTrial, Experiment], JsonValue]], ...
+] = (
+    ("trial", lambda trial, _: trial.number),
     ("state", _trial_count_state),
-    ("value", lambda trial: trial.value),
-    ("params", lambda trial: dict(trial.params)),
-    ("duration_s", lambda trial: float_or_none(trial.user_attrs.get(DURATION_ATTR))),
-    ("trial_dir", _trial_dir_text),
+    ("value", lambda trial, _: trial.value),
+    ("params", lambda trial, _: dict(trial.params)),
+    ("duration_s", lambda trial, _: float_or_none(trial.user_attrs.get(DURATION_ATTR))),
+    ("trial_dir", lambda trial, _: _trial_dir_text(trial)),
 )
 _REPEAT_GROUP_COLUMN = "repeat_group"
 _RERUN_OF_COLUMN = "rerun_of"
@@ -1557,7 +1564,9 @@ def _trial_table(
     )
     rows: list[JsonObject] = []
     for trial in trials:
-        row: JsonObject = {header: getter(trial) for header, getter in _CORE_TRIAL_COLUMNS}
+        row: JsonObject = {
+            header: getter(trial, experiment) for header, getter in _CORE_TRIAL_COLUMNS
+        }
         if axis is not None:
             row[_REPEAT_GROUP_COLUMN] = groups.get(trial.number)
         if reruns:
@@ -1568,7 +1577,7 @@ def _trial_table(
             row["reason"] = reasons[trial.number]
         row[_WINNER_COLUMN] = "*" if _stands_under_winner(trial, standing) else ""
         rows.append(row)
-    states = [_trial_count_state(trial) for trial in trials]
+    states = [_trial_run_state(trial) for trial in trials]
     return TrialTable(
         phase=phase.name,
         available=available,
@@ -1733,7 +1742,7 @@ def read_trial_tables(
             continue
         refusal: PhaseAbortRefusedError | StudySchemaMismatchError | None
         try:
-            refusal = _status_phase_refusal(phase, study)
+            refusal = _status_phase_refusal(experiment, phase, study)
         except StudySchemaMismatchError as exc:
             refusal = exc
         identity = _recorded_identity(study)

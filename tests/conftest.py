@@ -48,7 +48,7 @@ from phasesweep.engine.artifact_roots import (
 )
 from phasesweep.engine.confound import CONFOUND_SCHEMA_VERSION
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
+from phasesweep.engine.optuna import _finished_trial_count, _measured_trial_count
 from phasesweep.engine.paths import _last_successful_generation_path, _run_log_path
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
@@ -478,7 +478,7 @@ def record_accepted_partial_timeout(study: optuna.Study, target: int) -> None:
             "trial_target": target,
             "outcome_sequence": _load_phase_policy_state(study).max_sequence,
             "finished_trials": _finished_trial_count(trials),
-            "completed_trials": _completed_trial_count(trials),
+            "completed_trials": _measured_trial_count(trials),
             "timeout_scope": "phase",
             "recovered_abort_sequence": None,
         },

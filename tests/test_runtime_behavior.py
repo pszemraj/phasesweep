@@ -30,7 +30,7 @@ from phasesweep.engine.ledger import (
     open_phase_study,
     validate_ledger,
 )
-from phasesweep.engine.optuna import _build_sampler, _suggest, _trial_count_state
+from phasesweep.engine.optuna import _build_sampler, _suggest, _trial_run_state
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
@@ -935,7 +935,7 @@ def test_parallel_abort_stamps_environment_before_stopping_a_queued_trial(tmp_pa
 
     study = phase_study(experiment)
     previous = study.trials
-    assert [_trial_count_state(trial) for trial in previous] == ["FAIL", "INTERRUPTED"]
+    assert [_trial_run_state(trial) for trial in previous] == ["FAIL", "INTERRUPTED"]
     stopped = _parsed_trial_outcome(previous[1].user_attrs[TRIAL_OUTCOME_ATTR])
     assert stopped is not None and "before this trial's trainer launched" in stopped.cause
     for trial in previous:

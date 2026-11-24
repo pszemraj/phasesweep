@@ -18,7 +18,7 @@ from typing import Literal, NotRequired, TypeAlias, TypedDict, get_args
 
 import optuna
 
-from phasesweep.engine.optuna import _trial_count_state
+from phasesweep.engine.optuna import _trial_run_state
 from phasesweep.engine.provenance import CodeRevision
 from phasesweep.engine.repeats import (
     RankedGroup,
@@ -195,7 +195,6 @@ SlotState: TypeAlias = Literal["measured", "infeasible", "pending", "untried"] |
 still waiting for an attempt, a grid cell no trial reached, or failed, as the number of its
 latest failed attempt."""
 
-_MEASURED_STATES = frozenset({"COMPLETE", "INFEASIBLE"})
 _PENDING_STATES = frozenset({"WAITING", "RUNNING"})
 # Evaluation positions within this fraction of the furthest one count as one
 # point: a fixed-token batch-size sweep stops each trial within a batch of its
@@ -463,8 +462,8 @@ def _slot_state(
     """
     if not attempts:
         return "untried"
-    states = {trial.number: _trial_count_state(trial) for trial in attempts}
-    measured = [number for number, state in states.items() if state in _MEASURED_STATES]
+    states = {trial.number: _trial_run_state(trial) for trial in attempts}
+    measured = [number for number, state in states.items() if state == "COMPLETE"]
     if measured:
         return "measured" if any(number in feasible for number in measured) else "infeasible"
     if any(state in _PENDING_STATES or number in waiting for number, state in states.items()):

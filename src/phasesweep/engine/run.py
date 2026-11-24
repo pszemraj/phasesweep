@@ -626,6 +626,7 @@ def _mirror_publication(
 
 def _phase_counts(
     ledger: ledger_ops.ValidatedLedger,
+    experiment: Experiment,
     phase: Phase,
     study_name: str,
     generation_id: str,
@@ -639,6 +640,7 @@ def _phase_counts(
     the phase and nothing else.
 
     :param ledger_ops.ValidatedLedger ledger: The run's ledger, memory-backed or journal-backed.
+    :param Experiment experiment: Config whose bounds judge the measured trials.
     :param Phase phase: The phase that just ended.
     :param str study_name: The study the phase ran in.
     :param str generation_id: This run's generation, which its own trials carry.
@@ -651,7 +653,7 @@ def _phase_counts(
         log.warning("Could not count phase %r's trials for the run summary: %s", phase.name, exc)
         return None
     trials = [] if read is None else read.trials
-    states = Counter(_trial_count_state(trial) for trial in trials)
+    states = Counter(_trial_count_state(trial, experiment) for trial in trials)
     standing = _winning_trials(winner.trial_number, winner.attempt_id, winner.repeats)
     standing_dirs = (
         _recorded_trial_dir(trial)
@@ -793,7 +795,9 @@ def _run_experiment_inner(
             study_name = fingerprint_ops.phase_study_name(
                 experiment, phase, fingerprint_ops._inherited_override_payload(phase, inherited)
             )
-            counts = _phase_counts(ledger, phase, study_name, generation.generation_id, winner)
+            counts = _phase_counts(
+                ledger, experiment, phase, study_name, generation.generation_id, winner
+            )
             if counts is not None:
                 generation.phase_counts[phase.name] = counts
         if generation is not None:

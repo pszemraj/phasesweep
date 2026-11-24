@@ -485,7 +485,7 @@ def test_trials_csv_carries_the_digest_but_not_the_mapping(tmp_path: Path) -> No
     study = study_with_stamped_environment(identity)
     destination = tmp_path / "trials.csv"
 
-    _write_trials_csv(study, destination)
+    _write_trials_csv(study, destination, make_experiment())
 
     header, row = destination.read_text(encoding="utf-8").splitlines()
     columns = header.split(",")

@@ -15,7 +15,6 @@ from typing import Any, ClassVar
 
 import optuna
 
-from phasesweep.config.common import check_bounds
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import (
     CategoricalParam,
@@ -25,6 +24,7 @@ from phasesweep.config.search import (
     sampler_search_space,
 )
 from phasesweep.engine.artifacts import _winner_common_payload
+from phasesweep.engine.bounds import trial_bound_violations
 from phasesweep.engine.confound import (
     ConfoundBlock,
     RevisionRead,
@@ -41,6 +41,7 @@ from phasesweep.engine.optuna import (
     _draw_positions,
     _finished_trial_count,
     _trial_count_state,
+    _trial_run_state,
 )
 from phasesweep.engine.paths import (
     TRIALS_CSV_FILENAME,
@@ -188,7 +189,7 @@ def _no_feasible_remedy(
         if unreadable:
             return f"{evidence} {unreadable_objective_step(persistent=False)}"
         return f"{evidence} Fix the failure, or the metric bounds or constraints, then rerun."
-    infeasible = any(_trial_count_state(trial) == "INFEASIBLE" for trial in trials)
+    infeasible = any(_trial_count_state(trial, experiment) == "INFEASIBLE" for trial in trials)
     if infeasible:
         return f"{evidence} To change metric.min, metric.max or constraints, {FRESH_STUDY}."
     fix = "Fix the failure"
@@ -280,7 +281,7 @@ def _no_feasible_error_type(
     :return type[NoFeasibleTrialError]: :class:`PhaseTrialsFailedError` when any trial
         counts as ``FAIL``, otherwise :class:`PhaseTrialsInfeasibleError`.
     """
-    if any(_trial_count_state(trial) == "FAIL" for trial in trials):
+    if any(_trial_run_state(trial) == "FAIL" for trial in trials):
         return PhaseTrialsFailedError
     return PhaseTrialsInfeasibleError
 
@@ -292,13 +293,14 @@ class PhaseAbortRefusedError(PhaseSweepError):
 
 
 def _prior_phase_abort_error(
-    phase: Phase, abort_record: JsonObject, study: optuna.Study
+    experiment: Experiment, phase: Phase, abort_record: JsonObject, study: optuna.Study
 ) -> PhaseAbortRefusedError:
     """Build the refusal of a phase whose recorded abort the current config does not retire.
 
     The advice comes from :func:`~phasesweep.engine.study_policy._recovery_advice` and
     the action from :func:`~phasesweep.engine.study_policy._recovery_action`.
 
+    :param Experiment experiment: Config whose bounds judge the recorded trials.
     :param Phase phase: Phase whose accepted trial target is quoted in the
         message.
     :param JsonObject abort_record: Recorded abort; supplies
@@ -306,7 +308,7 @@ def _prior_phase_abort_error(
     :param optuna.Study study: The phase's study.
     :return PhaseAbortRefusedError: The refusal, for the caller to raise or report.
     """
-    advice = _recovery_advice(phase, study, abort_record)
+    advice = _recovery_advice(experiment, phase, study, abort_record)
     return PhaseAbortRefusedError(
         f"Phase {phase.name!r} previously aborted at its accepted "
         f"n_trials={abort_record['trial_target']}: {as_sentence(abort_record['cause'])}",
@@ -316,10 +318,11 @@ def _prior_phase_abort_error(
 
 
 def _streak_at_limit_error(
-    phase: Phase, abort_record: JsonObject, study: optuna.Study
+    experiment: Experiment, phase: Phase, abort_record: JsonObject, study: optuna.Study
 ) -> PhaseAbortRefusedError:
     """Build the refusal of new work while the resumed failure streak meets the current limit.
 
+    :param Experiment experiment: Config whose bounds judge the recorded trials.
     :param Phase phase: Phase whose current ``max_consecutive_failures`` the
         streak meets.
     :param JsonObject abort_record: The abort the streak would record, from
@@ -328,7 +331,7 @@ def _streak_at_limit_error(
     :param optuna.Study study: The phase's study.
     :return PhaseAbortRefusedError: The refusal, for the caller to raise or report.
     """
-    advice = _recovery_advice(phase, study, abort_record)
+    advice = _recovery_advice(experiment, phase, study, abort_record)
     return PhaseAbortRefusedError(
         f"Phase {phase.name!r} has {abort_record['consecutive_failures']} consecutive "
         f"failed/infeasible trials, which meets "
@@ -339,6 +342,7 @@ def _streak_at_limit_error(
 
 
 def _phase_refusal(
+    experiment: Experiment,
     phase: Phase,
     study: optuna.Study,
     policy_state: _PhasePolicyState,
@@ -349,6 +353,7 @@ def _phase_refusal(
     and a replayed streak at the current limit refuses until ``n_trials`` exceeds the accepted
     target. ``run`` raises it and ``status`` prints it, so both give one diagnosis and step.
 
+    :param Experiment experiment: Config whose bounds judge the recorded trials.
     :param Phase phase: The phase being judged.
     :param optuna.Study study: The phase's study.
     :param _PhasePolicyState policy_state: The study's replayed failure-policy state.
@@ -359,10 +364,10 @@ def _phase_refusal(
         _awaits_cleanup_recovery(study, abort)
         or not _config_retires_abort(phase, study.get_trials(deepcopy=False), abort)
     ):
-        return _prior_phase_abort_error(phase, abort, study)
+        return _prior_phase_abort_error(experiment, phase, abort, study)
     streak = _replayed_streak_abort(phase, study, policy_state)
     if streak is not None and phase.n_trials <= _accepted_trial_target(study):
-        return _streak_at_limit_error(phase, streak, study)
+        return _streak_at_limit_error(experiment, phase, streak, study)
     return None
 
 
@@ -702,7 +707,7 @@ def _edge_advisory(
         winner sits on the configured end, then how to search past each configured end
         reached; ``None`` when no parameter qualifies.
     """
-    finished = [trial for trial in trials if _trial_count_state(trial) in FINISHED_TRIAL_STATES]
+    finished = [trial for trial in trials if _trial_run_state(trial) in FINISHED_TRIAL_STATES]
     clauses: list[str] = []
     remedies: dict[str, None] = {}
     for name, param in phase.search_space.items():
@@ -993,20 +998,7 @@ def _eligible(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> bool:
     """
     if _selection_candidate_identity(trial) is None:
         return False
-    metric = experiment.metric
-    if not check_bounds(_trial_value(trial), min_value=metric.min, max_value=metric.max):
-        return False
-    for constraint in experiment.constraints:
-        raw = trial.user_attrs.get(constraint_attr(constraint.name))
-        if raw is None:
-            return False
-        try:
-            value = float(raw)
-        except (TypeError, ValueError, OverflowError):
-            return False
-        if not check_bounds(value, min_value=constraint.min, max_value=constraint.max):
-            return False
-    return True
+    return not trial_bound_violations(trial, experiment)
 
 
 def _metric_bounds_note(trials: Sequence[optuna.trial.FrozenTrial], experiment: Experiment) -> str:

@@ -23,7 +23,7 @@ from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, Repeats, Sampler
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
-from phasesweep.engine.optuna import _draw_positions, _finished_trial_count, _trial_count_state
+from phasesweep.engine.optuna import _draw_positions, _finished_trial_count, _trial_run_state
 from phasesweep.engine.read import read_result
 from phasesweep.engine.state import (
     RERUN_OF_ATTR,
@@ -74,7 +74,7 @@ def _assert_matches_control(experiment: Experiment, control: Experiment) -> list
         if trial.number in interrupted:
             parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
             assert parsed is not None and parsed.outcome == "interrupted"
-            assert _trial_count_state(trial) == "INTERRUPTED"
+            assert _trial_run_state(trial) == "INTERRUPTED"
     assert "WAITING" not in {t.state.name for t in trials}
     phase = experiment.phases[0]
     assert _finished_trial_count(trials) == phase.n_trials
@@ -258,7 +258,7 @@ def test_phase_deadline_interrupts_a_trial_that_reruns_once_the_phase_continues(
     harness.release()
     # The same target replays the accepted partial and schedules nothing.
     run_experiment(accepted)
-    assert [_trial_count_state(t) for t in phase_trials(accepted)] == [
+    assert [_trial_run_state(t) for t in phase_trials(accepted)] == [
         "COMPLETE",
         "INTERRUPTED",
     ]

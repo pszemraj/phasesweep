@@ -19,7 +19,7 @@ import optuna
 from optuna.exceptions import ExperimentalWarning
 from optuna.samplers._lazy_random_state import LazyRandomState
 
-from phasesweep.config.models import Phase
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import (
     _OPTUNA_EXACT_INT_LIMIT,
     CategoricalParam,
@@ -31,6 +31,7 @@ from phasesweep.config.search import (
     grid_search_space,
     sampler_search_space,
 )
+from phasesweep.engine.bounds import trial_bound_violations
 from phasesweep.engine.grid_order import (
     GridCell,
     grid_axis_names,
@@ -40,7 +41,6 @@ from phasesweep.engine.grid_order import (
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FAILURE_REASON_ATTR,
-    FEASIBLE_ATTR,
     FINISHED_TRIAL_STATES,
     GENERATION_ID_ATTR,
     METRIC_EXTRACTOR_LABEL,
@@ -100,25 +100,19 @@ class _PhaseTrialStats:
     published_trial_available: bool = False
 
 
-def _trial_count_state(trial: optuna.trial.FrozenTrial) -> TrialStateName:
-    """Return the state a trial is counted and reported under.
+def _trial_run_state(trial: optuna.trial.FrozenTrial) -> TrialStateName:
+    """Return the state a run left a trial in, before any bound is applied.
 
-    The one classifier behind every state-keyed count, run log line and trial table, so
-    an interrupted trial (:func:`~phasesweep.engine.state._trial_interrupted`) is never
-    counted as finished anywhere, and a trial that completed out of bounds reads
-    ``INFEASIBLE`` wherever it is shown. A run records the feasibility attr before a
-    trial completes, so a COMPLETE trial without a truthy one never ranks either.
+    An interrupted trial (:func:`~phasesweep.engine.state._trial_interrupted`) reads
+    ``INTERRUPTED``, so it is never counted as finished anywhere. A trial that measured its
+    values reads ``COMPLETE`` whatever the bounds say; :func:`_trial_count_state` judges it.
 
     :param optuna.trial.FrozenTrial trial: Trial to classify.
-    :return TrialStateName: ``INTERRUPTED`` for an interrupted trial, ``INFEASIBLE`` for a
-        COMPLETE trial without a truthy feasibility attr, otherwise the Optuna state name.
+    :return TrialStateName: ``INTERRUPTED`` for an interrupted trial, otherwise the Optuna
+        state name; never ``INFEASIBLE``.
     """
     if _trial_interrupted(trial):
         return "INTERRUPTED"
-    if trial.state == optuna.trial.TrialState.COMPLETE and not trial.user_attrs.get(
-        FEASIBLE_ATTR, False
-    ):
-        return "INFEASIBLE"
     name = trial.state.name
     for state in TRIAL_STATE_NAMES:
         if state == name:
@@ -126,27 +120,46 @@ def _trial_count_state(trial: optuna.trial.FrozenTrial) -> TrialStateName:
     raise ValueError(f"Trial {trial.number} has an unknown Optuna state {name!r}.")
 
 
+def _trial_count_state(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> TrialStateName:
+    """Return the state a trial is counted and reported under.
+
+    The one classifier behind every state-keyed count, run log line and trial table. A
+    measured trial whose recorded values violate a current bound
+    (:func:`~phasesweep.engine.bounds.trial_bound_violations`) reads ``INFEASIBLE``.
+
+    :param optuna.trial.FrozenTrial trial: Trial to classify.
+    :param Experiment experiment: Config supplying the current metric and constraint bounds.
+    :return TrialStateName: ``INFEASIBLE`` for a measured trial outside the bounds,
+        otherwise :func:`_trial_run_state`.
+    """
+    state = _trial_run_state(trial)
+    if state == "COMPLETE" and trial_bound_violations(trial, experiment):
+        return "INFEASIBLE"
+    return state
+
+
 def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
     """Return the number of trials that count toward ``n_trials``.
 
     A trial counts once it is finished: an interrupted trial reruns instead, so it
-    never consumes the trial target.
+    never consumes the trial target. No bound changes the count.
 
     :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
     :return int: Number of trials in a state of :data:`~phasesweep.engine.state.FINISHED_TRIAL_STATES`.
     """
-    return sum(1 for trial in trials if _trial_count_state(trial) in FINISHED_TRIAL_STATES)
+    return sum(1 for trial in trials if _trial_run_state(trial) in FINISHED_TRIAL_STATES)
 
 
-def _completed_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
+def _completed_trial_count(
+    trials: Iterable[optuna.trial.FrozenTrial], experiment: Experiment
+) -> int:
     """Return the number of trials that finished inside every metric bound and constraint.
 
-    A publication and an accepted partial decision record this count as ``completed_trials``.
-
     :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
+    :param Experiment experiment: Config supplying the current bounds.
     :return int: Number of trials :func:`_trial_count_state` counts as ``COMPLETE``.
     """
-    return sum(1 for trial in trials if _trial_count_state(trial) == "COMPLETE")
+    return sum(1 for trial in trials if _trial_count_state(trial, experiment) == "COMPLETE")
 
 
 def _measured_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:

@@ -37,7 +37,6 @@ from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     CLEANUP_RECOVERED_TRIALS_ATTR,
-    FEASIBLE_ATTR,
     TRIAL_OUTCOME_ATTR,
     TrialStateName,
     Winner,
@@ -897,6 +896,11 @@ def test_pending_snapshot_uses_actual_recovered_state_without_changing_frozen_co
     """Recovered pending evidence updates only its frozen row, including a finalization retry."""
     run_id = "srv-pending-result"
     config = write_srv_config(tmp_path)
+    if terminal_state == "INFEASIBLE":
+        # The trial below measures 1.0, outside this bound.
+        fields = yaml.safe_load(config.read_text())
+        fields["metric"]["max"] = 0.5
+        config.write_text(yaml.safe_dump(fields))
     number = write_launched_stale_trial(config, cleanup_confirmed=False, generation_id=run_id)
     experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
@@ -927,7 +931,6 @@ def test_pending_snapshot_uses_actual_recovered_state_without_changing_frozen_co
     study = phase_study(experiment)
     pending = study.get_trials()[number]
     active = optuna.Trial(study, pending._trial_id)
-    active.set_user_attr(FEASIBLE_ATTR, terminal_state != "INFEASIBLE")
     active.set_user_attr(
         TRIAL_OUTCOME_ATTR,
         trial_outcome(

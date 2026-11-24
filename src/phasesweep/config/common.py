@@ -134,21 +134,6 @@ def _require_finite(label: str, value: float) -> None:
         raise ValueError(f"{label} must be finite; got {value!r}")
 
 
-def check_bounds(value: float, *, min_value: float | None, max_value: float | None) -> bool:
-    """Test finiteness and optional inclusive bounds.
-
-    :param float value: Number to compare against the bounds.
-    :param float | None min_value: Inclusive lower bound, or None to leave it unbounded.
-    :param float | None max_value: Inclusive upper bound, or None to leave it unbounded.
-    :return bool: Whether the value is finite and satisfies both supplied bounds.
-    """
-    if not math.isfinite(value):
-        return False
-    if min_value is not None and value < min_value:
-        return False
-    return not (max_value is not None and value > max_value)
-
-
 def _validate_optional_bounds(
     *,
     label: str,
