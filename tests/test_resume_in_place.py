@@ -663,3 +663,68 @@ def test_in_memory_runs_never_reuse_a_directory(tmp_path: Path) -> None:
     opened = sorted(_phase_dir(experiment, "p").glob("trial_*"))
     assert len(opened) == 2
     assert all(directory.name.startswith("trial_00000__") for directory in opened)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "directory_state", ["missing", "broken_link", "file_target", "working_link"]
+)
+def test_rerun_keeps_the_original_directory_identity_when_its_contents_move(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, directory_state: str
+) -> None:
+    """Unavailable checkpoints restart the same draw, and a working directory link still resumes."""
+    experiment = _interrupt_first_attempt(
+        tmp_path, _trainer(tmp_path, _CHECKPOINTING, _RESUMING), _JSON_METRIC
+    )
+    (first,) = phase_trials(experiment)
+    directory = Path(first.user_attrs[TRIAL_DIR_ATTR])
+    saved = directory.with_name("saved-directory")
+    directory.rename(saved)
+    if directory_state == "broken_link":
+        directory.symlink_to("missing-target")
+    elif directory_state == "file_target":
+        target = directory.with_name("checkpoint-file")
+        target.write_text("keep")
+        directory.symlink_to(target.name)
+    elif directory_state == "working_link":
+        directory.symlink_to(saved.name)
+
+    winner = run_experiment(experiment)["p"]
+    first, rerun = phase_trials(experiment)
+    assert rerun.user_attrs[RERUN_OF_ATTR] == first.number
+    assert rerun.params == first.params
+    assert rerun.user_attrs[ATTEMPT_ID_ATTR] != first.user_attrs[ATTEMPT_ID_ATTR]
+    assert Path(rerun.user_attrs[TRIAL_DIR_ATTR]) == directory
+    assert winner.trial_dir == directory.name
+    assert winner.trial_number == rerun.number
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "without its previous local checkpoints" in record.getMessage()
+    ]
+    if directory_state == "working_link":
+        assert winner.metric == 5.0
+        assert directory.readlink() == Path(saved.name)
+        assert warnings == []
+    else:
+        assert winner.metric == 0.0
+        assert directory.is_dir() and not directory.is_symlink()
+        assert (saved / "ckpt.txt").read_text() == "5"
+        (warning,) = warnings
+        assert str(directory) in warning
+        assert (
+            f"Trial {rerun.number} reruns trial {first.number} with the same parameters" in warning
+        )
+        if directory_state in {"broken_link", "file_target"}:
+            (preserved,) = directory.parent.glob(f".{directory.name}.broken-symlink-*")
+            if directory_state == "broken_link":
+                assert preserved.readlink() == Path("missing-target")
+                assert not (directory.parent / "missing-target").exists()
+            else:
+                assert preserved.readlink() == Path("checkpoint-file")
+                assert preserved.read_text() == "keep"
+            assert str(preserved) in warning
+        else:
+            assert "is missing" in warning
+
+    assert run_experiment(experiment)["p"].metric == winner.metric

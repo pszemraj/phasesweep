@@ -68,6 +68,7 @@ from phasesweep.engine.state import (
     OVERRIDES_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
+    RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
@@ -116,7 +117,7 @@ from phasesweep.engine.trial import (
     record_trial_result,
     trial_run_name,
 )
-from phasesweep.engine.trial_dirs import _trial_dir_for_attempt
+from phasesweep.engine.trial_dirs import _prepare_interrupted_trial_dir, _trial_dir_for_attempt
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import (
     ABORT_START_AGAIN_STEP,
@@ -994,8 +995,21 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     trial_dir = directory.path
     opened_by = (directory.opener_number, directory.opener_attempt_id)
     attempt_dir = _attempt_dir(_phase_dir(experiment, phase.name), attempt_id)
+    reusing_directory = directory.opener_number != trial.number
     # Persist allocated before discovery and GPU waiting; no identity then means no launch.
     try:
+        directory_reset = (
+            _prepare_interrupted_trial_dir(trial_dir, attempt_id) if reusing_directory else None
+        )
+        if directory_reset is not None:
+            log.warning(
+                "%s. Trial %d reruns trial %s with the same parameters in a new directory "
+                "at %s, without its previous local checkpoints.",
+                directory_reset,
+                trial.number,
+                trial.user_attrs.get(RERUN_OF_ATTR),
+                trial_dir,
+            )
         trial_dir.mkdir(parents=True, exist_ok=True)
         attempt_dir.mkdir(parents=True, exist_ok=True)
         write_attempt_lifecycle(attempt_dir, attempt_id=attempt_id, state="allocated")
@@ -1075,7 +1089,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                 phase,
                 trial,
                 gpu=gpu_assignment.visible_devices,
-                in_place=directory.opener_number != trial.number,
+                in_place=reusing_directory and directory_reset is None,
             )
             try:
                 executed = launch_trial(

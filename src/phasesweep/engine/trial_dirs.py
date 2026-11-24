@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from stat import S_ISDIR, S_ISLNK
 from typing import NamedTuple
 
 from optuna.trial import FrozenTrial
@@ -33,6 +34,7 @@ from phasesweep.engine.state import (
     _trial_interrupted,
 )
 from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
+from phasesweep.runtime.files import broken_symlink_detail
 from phasesweep.runtime.process import read_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 
@@ -93,15 +95,15 @@ def _owner_directory(phase_dir: Path, owner: FrozenTrial) -> TrialDirectory:
 
     :param Path phase_dir: The phase directory, which may have moved since.
     :param FrozenTrial owner: A trial that recorded its directory.
-    :raises ProcessCleanupUncertainError: The recorded directory is malformed or not a name
-        PhaseSweep builds.
+    :raises ProcessCleanupUncertainError: The recorded directory does not name its opener.
     :return TrialDirectory: The directory, its opener's number and attempt.
     """
     try:
-        # The name carries the opener's number and attempt, which the trainer sees.
         name = _valid_trial_dir_name(_required_trial_dir(owner).name, label="trial directory")
-        number, _, attempt_id = name.removeprefix("trial_").partition("__")
-        return TrialDirectory(phase_dir / name, int(number), attempt_id)
+        attempt_id = owner.user_attrs.get(ATTEMPT_ID_ATTR)
+        if not isinstance(attempt_id, str) or name != _trial_dir_name(owner.number, attempt_id):
+            raise ValueError(f"{name!r} does not name the trial and attempt that opened it")
+        return TrialDirectory(phase_dir / name, owner.number, attempt_id)
     except ValueError as exc:
         raise _unusable_directory_error(owner, exc) from exc
 
@@ -183,3 +185,31 @@ def _trial_dir_for_attempt(
                 action=OperatorAction.INSPECT_LOGS,
             )
     return _owner_directory(phase_dir, sources[-1])
+
+
+def _prepare_interrupted_trial_dir(trial_dir: Path, attempt_id: str) -> str | None:
+    """Leave the original path free for allocation if its interrupted trial lost the directory.
+
+    :param Path trial_dir: Verified opener directory whose last attempt is settled.
+    :param str attempt_id: New attempt ID that makes the preserved sibling name unique.
+    :raises OSError: Directory inspection or preservation failed.
+    :return str | None: Why the rerun will have an empty directory, if it cannot reuse the old one.
+    """
+    try:
+        mode = trial_dir.lstat().st_mode
+    except FileNotFoundError:
+        return f"The original trial directory {trial_dir} is missing"
+    if not S_ISLNK(mode):
+        return None
+    try:
+        if S_ISDIR(trial_dir.stat().st_mode):
+            return None
+    except OSError:
+        broken = broken_symlink_detail(trial_dir.parent, trial_dir.name)
+        if broken is None:
+            raise
+    else:
+        broken = f"symlink {trial_dir} -> {trial_dir.readlink()} does not point to a directory"
+    preserved = trial_dir.with_name(f".{trial_dir.name}.broken-symlink-{attempt_id}")
+    trial_dir.rename(preserved)
+    return f"Cannot reuse the original trial directory because {broken}. Preserved the symlink at {preserved}"

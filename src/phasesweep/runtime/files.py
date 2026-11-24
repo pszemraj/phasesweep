@@ -83,6 +83,33 @@ def file_sha256(path: Path, *, limit_bytes: int | None = None) -> str:
     return hasher.hexdigest()
 
 
+def broken_symlink_detail(directory: Path, relative: str | Path) -> str | None:
+    """Identify a symlink that prevents access to a named path.
+
+    :param Path directory: Directory from which to inspect the path.
+    :param str | Path relative: Relative path whose components may include a link.
+    :return str | None: The broken link, its target and the cause, when established.
+    """
+    component = directory
+    for part in Path(relative).parts:
+        component /= part
+        try:
+            target = component.readlink()
+        except OSError:
+            continue
+        try:
+            component.stat()
+        except OSError as exc:
+            link = f"symlink {component} -> {target}"
+            if exc.errno == errno.ENOENT:
+                return f"{link} has a missing target"
+            if exc.errno == errno.ENOTDIR:
+                return f"{link} has a non-directory component in its target path"
+            if exc.errno == errno.ELOOP:
+                return f"{link} could not be followed (too many symbolic links)"
+    return None
+
+
 class UnsafeLockPathError(PhaseSweepError):
     """Raised when a lock directory or file is inaccessible or unsafe to trust."""
 
