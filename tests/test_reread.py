@@ -21,13 +21,14 @@ from phasesweep.config.search import CategoricalParam, IntParam, Sampler
 from phasesweep.engine import reread as reread_ops
 from phasesweep.engine.errors import (
     PhaseTimeoutError,
+    PublishedStudyMissingError,
     StudyFingerprintMismatchError,
     TrialTargetRefusedError,
     WinnerIntegrityError,
 )
 from phasesweep.engine.ledger import _resolve_storage, validate_ledger
 from phasesweep.engine.preview import validate_trial_targets
-from phasesweep.engine.read import inspect_status
+from phasesweep.engine.read import inspect_status, read_status
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -253,6 +254,57 @@ def test_a_flipped_goal_re_reads_into_a_study_of_the_other_direction(tmp_path: P
     study = phase_study_of(maximize)
     assert study.direction == optuna.study.StudyDirection.MAXIMIZE
     assert {t.number: t.user_attrs[TRIAL_DIR_ATTR] for t in study.get_trials()} == before
+
+
+@pytest.mark.integration
+def test_published_reread_history_belongs_to_the_selecting_study(tmp_path: Path) -> None:
+    """An older sibling can neither block replay nor replace the missing publisher."""
+    launches = tmp_path / "launches.txt"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse
+        import json
+        from pathlib import Path
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", type=Path)
+        args, _ = parser.parse_known_args()
+        launches = Path({str(launches)!r})
+        with launches.open("a") as handle:
+            print("launch", file=handle)
+        count = len(launches.read_text().splitlines())
+        args.out.write_text(json.dumps({{"loss": count, "acc": count, "mem": count}}))
+        """,
+    )
+    phase = Phase(
+        name="p",
+        n_trials=1,
+        gpu_policy="none",
+        allow_partial_grid=True,
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
+    )
+    initial = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
+    topped_up = phase.model_copy(update={"n_trials": 2})
+    reread = _experiment(tmp_path, trainer, _metric("acc"), phases=[topped_up])
+    latest = _experiment(tmp_path, trainer, _metric("mem"), phases=[topped_up])
+
+    assert run_experiment(initial)["p"].trial_number == 0
+    assert run_experiment(reread)["p"].trial_number == 0
+    assert read_status(initial)["phases"][0]["published_study_unavailable"] is False
+    run_experiment(reread, dry_run=True)
+    assert run_experiment(reread)["p"].trial_number == 0
+    assert run_experiment(latest)["p"].trial_number == 0
+    assert _launches(launches) == 2
+
+    optuna.delete_study(
+        study_name=study_name(latest, "p"),
+        storage=_resolve_storage(latest.resolved_storage),
+    )
+    assert read_status(reread)["phases"][0]["published_study_unavailable"] is True
+    with pytest.raises(PublishedStudyMissingError, match="its persistent study is missing"):
+        run_experiment(reread)
 
 
 @pytest.mark.parametrize("fixed", [False, True], ids=["grid", "fixed"])

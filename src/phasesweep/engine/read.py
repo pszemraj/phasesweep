@@ -945,13 +945,12 @@ def _read_status(
     )
     # A published represented generation is exactly the validated one, so its
     # facts come from what validation read and nothing below rereads it.
-    validated = publication.validated if is_published else None
+    published = publication.validated
+    validated = published if is_published else None
 
     published_trials = (
-        _published_phase_trial_refs(
-            None if publication.validated is None else publication.validated.summary
-        )
-        if experiment.persistent
+        _published_phase_trial_refs(published.summary, winners=published.winners)
+        if experiment.persistent and published is not None
         else {}
     )
     study_names = _latest_study_names(experiment, publication, current_generation_id)

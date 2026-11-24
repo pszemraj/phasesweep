@@ -371,9 +371,8 @@ def _check_published_phase_studies(
     a publication that needs operator attention. Only persistent storage carries
     published trials to require; an in-memory ledger starts empty on every launch.
 
-    A published winner came from whichever study of its phase its parents' published winners
-    addressed, so every study of the phase is searched for it; attempt identities are unique
-    across them.
+    The winner records the study that selected it. A sibling study can contain the same
+    attempt identity after re-reading its results.
 
     :param Experiment experiment: Experiment whose current publication is checked.
     :param Mapping[str, Sequence[optuna.Study]] loaded: Already-inspected persistent studies,
@@ -389,30 +388,33 @@ def _check_published_phase_studies(
     raise_for_unusable_publication(
         experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
     )
-    if not experiment.persistent:
+    validated = publication.validated
+    if not experiment.persistent or validated is None:
         return
-    published_trials = _published_phase_trial_refs(
-        None if publication.validated is None else publication.validated.summary
-    )
+    published_trials = _published_phase_trial_refs(validated.summary, winners=validated.winners)
     for _index, phase in experiment.phases_from(from_phase):
         phase_name = phase.name
         if phase_name not in published_trials:
             continue
-        studies = loaded.get(phase_name, ())
         expected = published_trials[phase_name]
+        study = (
+            None
+            if expected is None
+            else next(
+                (
+                    study
+                    for study in loaded.get(phase_name, ())
+                    if study.study_name == expected.study_name
+                ),
+                None,
+            )
+        )
         missing = "is missing"
-        if studies:
+        if study is not None and expected is not None:
             try:
-                every = [study.get_trials(deepcopy=False) for study in studies]
-                holding = [
-                    trials
-                    for trials in every
-                    if expected is not None
-                    and any(_published_trial_matches(trial, expected) for trial in trials)
-                ]
-                matched = bool(holding)
-                trials = holding[0] if holding else [trial for t in every for trial in t]
-                if matched and expected is not None:
+                trials = study.get_trials(deepcopy=False)
+                matched = any(_published_trial_matches(trial, expected) for trial in trials)
+                if matched:
                     finished = _finished_trial_count(trials)
                     measured = _measured_trial_count(trials)
                     if _meets_published_trial_history_boundary(finished, measured, expected):
@@ -439,16 +441,11 @@ def _check_published_phase_studies(
                 if not trials:
                     missing = "contains no trials"
                 else:
-                    missing = "does not contain the published trial identity"
-                    if expected is not None:
-                        missing += (
-                            f" (trial {expected.trial_number}, generation {expected.generation_id!r}, "
-                            f"attempt {expected.attempt_id!r})"
-                        )
-                    else:
-                        missing += (
-                            " because the publication records no complete local trial identity"
-                        )
+                    missing = (
+                        "does not contain the published trial identity "
+                        f"(trial {expected.trial_number}, generation {expected.generation_id!r}, "
+                        f"attempt {expected.attempt_id!r})"
+                    )
         raise PublishedStudyMissingError(
             f"Published generation {publication.generation_id!r} records a selected trial for "
             f"phase {phase_name!r}, but its persistent study {missing}."

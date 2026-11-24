@@ -240,6 +240,8 @@ The pointer names the only namespace containing the summary and winners, `genera
 
 CLI inspection and MCP `experiment_status` use the same `require_study` boundary. A failed later generation cannot hide an earlier published winner. [Inspection commands](runtime.md#inspection-commands) describes overrides, fallback winners and per-phase historical labels.
 
+Published ledger history belongs to the selecting study named by the validated winner. `engine.artifact_roots._check_published_phase_studies` and `engine.ledger._published_history_retained` check that study's trial identity and completion counts. `tests/test_reread.py::test_published_reread_history_belongs_to_the_selecting_study` exercises replay across settings and refusal when a sibling retains copies of the published trials but the selecting study is missing.
+
 CLI, engine and frozen MCP views compare against the producing phase prefix. Unpublished winners and completed-trial recovery share a producing-snapshot loader which validates and parses the exact bytes covered by the SHA-256 in `reproducibility.json`. Absent, unreadable, invalid or mismatched snapshots require artifact repair.
 
 Trainer readiness is independent of catalog loading. The [catalog contract](mcp.md#the-catalog) describes when lost trainer directories cause entry failures and how reads and launches respond. Any failed entry forces reload on every call, including startup with a partial catalog, so a fix can take effect without a file edit. `inspect_experiment` returns a path-free error for a failed id while reads by run id and `get_latest_run` remain available. Failed-id cancellation requires launch-time permission and permission from every entry with that id, including a previously loaded duplicate's declared action.

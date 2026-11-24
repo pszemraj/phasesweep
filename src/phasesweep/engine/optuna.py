@@ -58,6 +58,8 @@ from phasesweep.runtime.process import TIMEOUT_REASON_PREFIX
 if TYPE_CHECKING:
     from optuna.samplers._cmaes import CmaClass
 
+    from phasesweep.engine.publication_validation import ValidatedWinner
+
 
 @dataclass(frozen=True)
 class _TrialRef:
@@ -67,7 +69,7 @@ class _TrialRef:
     which trial it is, and which generation/attempt claimed it.
     Values are ``None`` for an allocation interrupted before its identity
     attributes were written. Published references additionally
-    carry their finished and measured count boundary, and a RUNNING row the
+    carry their selecting study and finished and measured count boundary, and a RUNNING row the
     state stale recovery will record for it. Those fields are not part of a
     trial-row identity comparison.
     """
@@ -78,6 +80,7 @@ class _TrialRef:
     finished_trials: int | None = field(default=None, compare=False)
     measured_trials: int | None = field(default=None, compare=False)
     recovers_as: RecoveredTrialState | None = field(default=None, compare=False)
+    study_name: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -228,10 +231,14 @@ def _any_objective_unreadable(trials: Iterable[optuna.trial.FrozenTrial]) -> boo
 
 def _published_phase_trial_refs(
     summary: Mapping[str, Any] | None,
+    *,
+    winners: Mapping[str, ValidatedWinner] | None = None,
 ) -> dict[str, _TrialRef | None]:
     """Return each published phase's local winning-trial identity.
 
     :param Mapping[str, Any] | None summary: Already-resolved publication summary.
+    :param Mapping[str, ValidatedWinner] | None winners: Validated winner artifacts that
+        name their selecting studies, for callers checking the ledger.
     :return dict[str, _TrialRef | None]: Local trial identities by phase, with
         their known finished and measured count boundary; None when a published
         phase does not record a complete identity.
@@ -259,8 +266,16 @@ def _published_phase_trial_refs(
             and completion["measured_trials"] >= 0
             else None
         )
+        winner = None if winners is None else winners.get(name)
         refs[name] = (
-            _TrialRef(number, generation, attempt, finished_trials, measured_trials)
+            _TrialRef(
+                number,
+                generation,
+                attempt,
+                finished_trials,
+                measured_trials,
+                study_name=None if winner is None else winner.study_name,
+            )
             if isinstance(number, int)
             and not isinstance(number, bool)
             and isinstance(generation, str)

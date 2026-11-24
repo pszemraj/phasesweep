@@ -304,7 +304,7 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
     study.tell(trial, 0.5)
     complete = ledger.read_bytes()
-    expected = engine_optuna._TrialRef(0, "generation", "attempt")
+    expected = engine_optuna._TrialRef(0, "generation", "attempt", study_name=study.study_name)
     # The handle's format scan also captures the journal. Take it on the whole
     # journal, before the damage and the patch, so the handle is verified and
     # the one capture the file changes under is the phase snapshot's. A handle
@@ -609,6 +609,7 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
         1 if mismatch == "number" else 0,
         "different" if mismatch == "generation" else "generation",
         "different" if mismatch == "attempt" else "attempt",
+        study_name=study.study_name,
     )
 
     stats = engine_ledger.read_trial_stats(

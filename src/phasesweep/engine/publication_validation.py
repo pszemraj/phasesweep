@@ -69,6 +69,7 @@ class ValidatedWinner:
     """The exact bytes whose digest matched the manifest."""
     payload: Mapping[str, Any]
     """The mapping decoded from ``content``."""
+    study_name: str
     metric: float
     source: WinnerSource
     confound: ConfoundBlock
@@ -425,6 +426,7 @@ def _validate_generation_manifest(
         winners[name] = ValidatedWinner(
             content=content,
             payload=payload,
+            study_name=study_name,
             metric=metric_value,
             source=parsed_source,
             confound=confound,

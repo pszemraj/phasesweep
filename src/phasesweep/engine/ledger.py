@@ -19,7 +19,7 @@ import logging
 import os
 import stat
 import time
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -734,44 +734,36 @@ def _unavailable_phase_trial_stats(
 
 def _published_history_retained(
     snapshot: JournalStorage,
-    experiment_name: str,
-    phase_name: str,
     expected: _TrialRef | None,
     addressed: optuna.Study | None,
 ) -> bool:
     """Say whether a phase's published trial and its history survive in a captured snapshot.
 
-    The published winner came from whichever of the phase's studies its parents' published
-    winners addressed, which need not be the one the phase addresses now, so every study of
-    the phase is searched; attempt identities are unique across them. The addressed study,
-    already loaded by the caller, is searched first, so the usual read loads no study twice.
+    Read the selecting study recorded in the winner. Other reading settings can copy the same
+    attempt identity into a sibling study. Reuse the addressed study if it is the selecting one.
 
     :param JournalStorage snapshot: Captured journal replay to read.
-    :param str experiment_name: The experiment's name.
-    :param str phase_name: The published phase.
     :param _TrialRef | None expected: The published trial and its count boundary.
     :param optuna.Study | None addressed: The study the phase addresses now, if it exists.
-    :return bool: Whether a study of the phase holds the trial and meets the boundary.
-    :raises StudySchemaMismatchError: A study of the phase is populated under an unsupported
-        schema.
+    :return bool: Whether the selecting study holds the trial and meets the boundary.
+    :raises StudySchemaMismatchError: The selecting study is populated under an unsupported schema.
     """
-    if expected is None:
+    if expected is None or expected.study_name is None:
         return False
 
-    def candidates() -> Iterator[optuna.Study | None]:
-        if addressed is not None:
-            yield addressed
-        for name in _phase_study_names(snapshot, experiment_name, phase_name):
-            if addressed is None or name != addressed.study_name:
-                yield _load_snapshot_study(snapshot, name)
-
-    for study in candidates():
-        trials = [] if study is None else study.get_trials(deepcopy=False)
-        if any(_published_trial_matches(trial, expected) for trial in trials):
-            return _meets_published_trial_history_boundary(
-                _finished_trial_count(trials), _measured_trial_count(trials), expected
-            )
-    return False
+    study = (
+        addressed
+        if addressed is not None and addressed.study_name == expected.study_name
+        else _load_snapshot_study(snapshot, expected.study_name)
+    )
+    if study is None:
+        return False
+    trials = study.get_trials(deepcopy=False)
+    if not any(_published_trial_matches(trial, expected) for trial in trials):
+        return False
+    return _meets_published_trial_history_boundary(
+        _finished_trial_count(trials), _measured_trial_count(trials), expected
+    )
 
 
 def _phase_trial_stats(study: optuna.Study | None, experiment: Experiment) -> _PhaseTrialStats:
@@ -1049,8 +1041,6 @@ def read_trial_stats(
                 _phase_trial_stats(addressed, ledger.experiment),
                 published_trial_available=_published_history_retained(
                     snapshot,
-                    ledger.experiment_name,
-                    phase.name,
                     published_trials.get(phase.name),
                     addressed,
                 ),
