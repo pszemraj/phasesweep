@@ -249,7 +249,6 @@ The principal test groups and what each covers:
 - TODO(runtime): Recover draws whose bookkeeping failed before the trainer started. A fatal pre-launch write can currently spend the draw and require a top-up.
 - TODO(runtime): Account for repeated configuration–seed pairs so running the same seed twice does not inflate the pooled noise band's effective sample size.
 - TODO(runtime): Recheck process identity in `_signal_members` so PID reuse between enumeration and signalling cannot redirect a signal to another group.
-- TODO(runtime): Print the trial table from `status --trials` when a study's recorded failure-policy state cannot be replayed (duplicate completion sequences, a malformed recovery record); the table and its refusal lines now come from one strict read, which raises for such a study.
 - TODO(runtime): Withhold edge advice when a restored journal cannot be matched to the population that selected the published winner.
 - TODO(runtime): Reuse the phase trial reads behind `status` when computing winner advisories.
 - TODO(runtime): Let `_phase_counts` use the trials from the completed phase instead of reopening the journal for the closing summary.

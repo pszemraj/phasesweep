@@ -15,7 +15,7 @@ from phasesweep import run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.run_overrides import SET_SYNTAX, SetPathError, apply_set
-from phasesweep.config.search import IntParam, Sampler
+from phasesweep.config.search import CategoricalParam, IntParam, Sampler
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudyStorageUnavailableError
 from phasesweep.engine.ledger import ValidatedLedger
 from phasesweep.engine.locking import _experiment_lock
@@ -537,6 +537,48 @@ def test_show_winners_reads_unpublished_phase_results(
     assert not missing_locks.exists()
 
 
+def test_status_after_a_parent_top_up_changes_its_winner_prints_the_dependents_refusal(
+    tmp_path: Path,
+) -> None:
+    """Once a parent's top-up picks a new winner and its dependent is refused, status prints that refusal and its fix, not advice to rerun the same config into it."""
+
+    def plan(choices: list[int]) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            phases=[
+                Phase(
+                    name="p",
+                    n_trials=len(choices),
+                    gpu_policy="none",
+                    sampler=Sampler(type="grid"),
+                    search_space={"x": CategoricalParam(type="categorical", choices=choices)},
+                ),
+                Phase(
+                    name="q",
+                    n_trials=1,
+                    gpu_policy="none",
+                    inherits=["p"],
+                    sampler=Sampler(type="random", seed=0),
+                    search_space={"y": IntParam(type="int", low=0, high=3)},
+                ),
+            ],
+        )
+
+    run_experiment(plan([3, 5]))
+    grown = plan([3, 5, 1])
+    with pytest.raises(StudyFingerprintMismatchError) as refused:
+        run_experiment(grown)
+    config = write_experiment_config(tmp_path / "grown.yaml", grown)
+
+    shown = CliRunner().invoke(cli, ["status", str(config)])
+
+    assert shown.exit_code == 0, shown.output
+    assert "Changed: inherited_effective_overrides.x: 3 -> 1." in shown.output
+    assert f"\n# fix: {operator_step(refused.value)}\n" in shown.output
+    assert "Rerun the same config" not in shown.output
+    assert "Winner retained but not published" not in shown.output
+
+
 @pytest.mark.parametrize("streak_abort", [False, True], ids=["no-feasible", "streak-abort"])
 def test_unpublished_status_prints_the_recorded_failure_remedy_once(
     tmp_path: Path, streak_abort: bool
@@ -654,6 +696,14 @@ def test_malformed_phase_policy_keeps_status_yaml_and_other_refusals(tmp_path: P
     assert "# Phase 'next' previously aborted at its accepted n_trials=1" in shown.stdout
     assert yaml.safe_load(shown.stdout) == expected
     assert expected["publication_integrity"] == "ok"
+
+    tables = CliRunner().invoke(cli, ["status", str(config), "--trials"])
+
+    assert tables.exit_code == 0, tables.output
+    assert "p: 1 of 1 trial, objective" in tables.stdout
+    assert "Study 't::p' has invalid durable failure-policy state:" in tables.stdout
+    assert "next: 1 of 1 trial, objective" in tables.stdout
+    assert "Phase 'next' previously aborted at its accepted n_trials=1" in tables.stdout
     assert ledger.read_bytes() == original
 
 

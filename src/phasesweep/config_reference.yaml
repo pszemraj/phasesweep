@@ -80,7 +80,7 @@ phases: list[object] (required)
     # An interrupted attempt reruns as a new attempt with the same command in the same trial directory, so the trainer's own checkpoint-resume logic continues it; the rerun must write its result files again.
     # When the target is reached with no eligible feasible attempt, the phase fails.
     # On persistent storage a raised target runs the remaining attempts in the same study, and a lowered one is refused.
-    # While a phase that inherits from this one, even indirectly, has trials, a run that would add trials here is refused. Give each phase that inherits this one a new `name`, updating every `inherits` to match: this phase keeps its finished trials and runs the rest, and the renamed phases start new studies and run again. Or run a config without those phases first, then put them back: one whose inherited values come out unchanged keeps its trials. A new experiment name reruns every phase.
+    # Raising it on a finished phase that others inherit keeps its trials, runs the rest and selects its winner first. A dependent whose inherited values come out unchanged keeps its trials; one whose values changed stops the run, keeping the completed top-up, and is given a new `name` (with every `inherits` updated) to run again.
     # Recommended: one trial per configuration, spending the budget on more distinct values, such as 7 to 8 log-spaced learning rates.
     # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation for retries, aborts and partial results.
     n_trials: int (required)

@@ -29,9 +29,15 @@ from phasesweep.engine.confound import (
     _confound_summary,
     _validate_confound_block,
 )
-from phasesweep.engine.errors import StudySchemaMismatchError, StudyStorageUnavailableError
+from phasesweep.engine.errors import (
+    StudyFingerprintMismatchError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+)
 from phasesweep.engine.fingerprints import (
     _experiment_semantic_fingerprint,
+    _inherited_override_payload,
+    _judge_identity,
     _recorded_config_matches,
 )
 from phasesweep.engine.growth import recorded_growth
@@ -95,6 +101,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     TRIAL_STATE_NAMES,
     PublicationState,
+    Winner,
     WinnerSource,
     _parse_winner_source,
     _parsed_trial_outcome,
@@ -1184,19 +1191,56 @@ def _status_phase_refusal(phase: Phase, study: optuna.Study) -> PhaseAbortRefuse
     return _phase_refusal(phase, study, policy)
 
 
-def phase_refusals(
-    experiment: Experiment, ledger: ValidatedLedger
-) -> dict[str, PhaseAbortRefusedError | StudySchemaMismatchError]:
-    """Give the refusal each phase's recorded failure policy would meet on a run.
+def _latest_winners(experiment: Experiment, ledger: ValidatedLedger) -> dict[str, Winner]:
+    """Read the winner each phase hands its dependents on the next run: its latest usable one.
 
-    Invalid policy state is reported for its phase alongside other refusals. It does not
-    prevent status from reporting trial counts and publication facts.
+    :param Experiment experiment: Current config whose phases are read.
+    :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
+    :return dict[str, Winner]: The latest winner by phase name, without the phases that have
+        none or when the publication cannot be read.
+    """
+    _current, represented, publication = _read_generation_selection(experiment, latest=True)
+    if publication.state not in {"ok", "absent"}:
+        return {}
+    views = _represented_winners(
+        experiment,
+        publication,
+        represented,
+        [phase.name for phase in experiment.phases],
+        ledger=ledger,
+        fallback_published=True,
+    )
+    return {
+        view.phase: Winner(
+            trial_number=view.trial_number,
+            params=dict(view.params),
+            effective_overrides=dict(view.effective_overrides),
+            metric=view.metric,
+        )
+        for view in views
+    }
+
+
+PhaseRefusal: TypeAlias = (
+    PhaseAbortRefusedError | StudySchemaMismatchError | StudyFingerprintMismatchError
+)
+
+
+def phase_refusals(experiment: Experiment, ledger: ValidatedLedger) -> dict[str, PhaseRefusal]:
+    """Give the refusal a run would meet at each phase.
+
+    A phase's recorded failure policy is judged first, as a run's preflight does. Otherwise a
+    populated phase whose parents all have winners is judged against its recorded identity with
+    the values those latest winners pass it, so a parent whose top-up changed its winner shows
+    the dependent's refusal rather than advice to rerun into it. Invalid policy state is
+    reported for its phase alongside other refusals. It does not prevent status from reporting
+    trial counts and publication facts.
 
     :param Experiment experiment: Current config, which decides whether a recorded abort is
         retired.
     :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
-    :return dict[str, PhaseAbortRefusedError | StudySchemaMismatchError]: Refusals or invalid
-        policy diagnostics by phase name; empty without a readable ledger.
+    :return dict[str, PhaseRefusal]: Refusals or invalid policy diagnostics by phase name; empty
+        without a readable ledger.
     """
     if not experiment.persistent:
         return {}
@@ -1204,7 +1248,8 @@ def phase_refusals(
         studies = read_phase_studies(ledger)
     except StudyStorageUnavailableError:
         return {}
-    refusals: dict[str, PhaseAbortRefusedError | StudySchemaMismatchError] = {}
+    winners: dict[str, Winner] | None = None
+    refusals: dict[str, PhaseRefusal] = {}
     for phase in experiment.phases:
         study = studies[phase.name]
         if study is None:
@@ -1216,6 +1261,24 @@ def phase_refusals(
             continue
         if refusal is not None:
             refusals[phase.name] = refusal
+            continue
+        if not study.get_trials(deepcopy=False):
+            continue
+        if winners is None:
+            winners = _latest_winners(experiment, ledger)
+        if not all(parent in winners for parent in phase.inherits):
+            continue
+        try:
+            _judge_identity(
+                study,
+                experiment,
+                phase,
+                _inherited_override_payload(
+                    phase, {parent: winners[parent] for parent in phase.inherits}
+                ),
+            )
+        except (StudyFingerprintMismatchError, StudySchemaMismatchError) as exc:
+            refusals[phase.name] = exc
     return refusals
 
 
@@ -1224,7 +1287,8 @@ def unpublished_winner_step(
 ) -> UnpublishedWinnerStep | None:
     """Give one publication remedy from a phase without a feasible winner, for an idle experiment.
 
-    A recorded abort or failure streak is :func:`phase_refusals`' to report.
+    A recorded abort or failure streak, or a study its inherited values no longer match, is
+    :func:`phase_refusals`' to report.
 
     :param Experiment experiment: Current config used to inspect durable phase policy.
     :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
@@ -1553,7 +1617,8 @@ def read_trial_tables(
     requested generation, or that publication by default. Absent studies and in-memory ledgers
     have no rows. Unreadable phases are reported unavailable. A phase whose recorded abort or
     failure streak would refuse a run carries that refusal, read from the same study snapshot as
-    its trials.
+    its trials; one whose failure-policy state cannot be replayed keeps its rows and carries
+    that diagnostic instead.
 
     :param Experiment experiment: Parsed experiment config whose phases are read.
     :param str | None generation_id: Generation whose winners are marked, defaulting to publication.
@@ -1596,7 +1661,11 @@ def read_trial_tables(
         if study is None:
             tables.append(_trial_table(experiment, phase, [], winners.get(phase.name)))
             continue
-        refusal = _status_phase_refusal(phase, study)
+        refusal: PhaseAbortRefusedError | StudySchemaMismatchError | None
+        try:
+            refusal = _status_phase_refusal(phase, study)
+        except StudySchemaMismatchError as exc:
+            refusal = exc
         identity = _recorded_identity(study)
         tables.append(
             _trial_table(
