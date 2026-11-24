@@ -42,7 +42,6 @@ from phasesweep.engine.evidence import (
 )
 from phasesweep.engine.fingerprints import (
     _inherited_override_payload,
-    _inherited_override_suppliers,
     _verify_fingerprint,
     new_study_note,
     phase_study_name,
@@ -333,10 +332,7 @@ def _composed_overrides(
             f"Phase {phase.name!r} re-samples inherited winner key(s) {sorted(resampled)} "
             "that an ancestor sampled."
         )
-    out = {
-        key: inherited_winners[parent].effective_overrides[key]
-        for key, parent in _inherited_override_suppliers(phase, inherited_winners).items()
-    }
+    out = _inherited_override_payload(phase, inherited_winners)
     out.update(phase.fixed_overrides)
     out.update(sampled)
     return out
@@ -360,9 +356,8 @@ def _winner_overrides(
     :param dict[str, Winner] inherited_winners: Parent-phase winners.
     :return dict[str, object]: Composed overrides without the repeat key.
     """
-    effective: dict[str, object] = _composed_overrides(
-        experiment, phase, dict(params), inherited_winners
-    )
+    sampled = {key: params[key] for key in phase.search_space if key in params}
+    effective = _composed_overrides(experiment, phase, sampled, inherited_winners)
     if phase.repeats is not None:
         effective.pop(phase.repeats.key, None)
     return effective
@@ -1666,7 +1661,7 @@ def _run_phase(
             filled = fill_study(experiment, phase, study, source)
             report.info("%s  %s", phase.name, fill_note(source, filled))
     if not study.get_trials(deepcopy=False):
-        note = new_study_note(phase, inherited, others)
+        note = new_study_note(experiment, phase, inherited, others)
         if note is not None:
             report.info("%s  %s", phase.name, note)
     resumed = _resume_phase(experiment, phase, inherited_winners, study)
@@ -1953,6 +1948,7 @@ def _select_phase_winner(
         gates=selected.gates,
         completion=completion,
         phase_fingerprint=phase_fingerprint,
+        study_name=study.study_name,
         generation_id=selected.generation_id,
         attempt_id=selected.attempt_id,
         trial_dir=selected.trial_dir,

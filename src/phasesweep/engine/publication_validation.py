@@ -19,6 +19,7 @@ from phasesweep.config.models import Experiment, Metric, _metric_semantics_paylo
 from phasesweep.config.search import Repeats
 from phasesweep.engine.confound import ConfoundBlock, _validate_confound_block
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
+from phasesweep.engine.optuna import _belongs_to_phase
 from phasesweep.engine.provenance import CodeRevision, _parse_code_revision
 from phasesweep.engine.repeats import RepeatsRecord, _check_repeats_axis, _validate_repeats_block
 from phasesweep.engine.state import (
@@ -376,6 +377,11 @@ def _validate_generation_manifest(
         fingerprint = payload.get("phase_fingerprint")
         if not is_sha256_hex(fingerprint):
             raise _fail(f"winner for phase {name!r} has no valid phase_fingerprint")
+        study_name = payload.get("study_name")
+        if not isinstance(study_name, str) or not _belongs_to_phase(
+            study_name, summary["experiment"], name
+        ):
+            raise _fail(f"winner for phase {name!r} has no valid study_name")
         try:
             parsed_source = _parse_winner_source(payload.get("winner_source"), expected_phase=name)
         except ValueError as exc:

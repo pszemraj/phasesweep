@@ -1,29 +1,29 @@
 {
   "code_revision": null,
-  "config_fingerprint": "0b56220fbce1bafa2ddf4af88d1ddcbc1676ab08af0e6022557296bccca181b3",
+  "config_fingerprint": "a7dfef2cc795c7f28c01b00ae09be201b2b4df88b9d7e290add9bf7546672b10",
   "config_snapshot": {
     "path": "config.snapshot.yaml",
     "sha256": "66ca9aa184e8b9780c9695fcc9db655dba75f6b5117ab47144878daca599fc69"
   },
   "experiment": "t",
-  "generation_id": "1f4576f7081549cfbe4795a3a36abe67",
+  "generation_id": "f254d01d016d4d3ab1a977df38c37df3",
   "generation_id_source": "engine",
   "phase_config_fingerprints": [
     {
       "name": "p",
-      "sha256": "20218c582ab0edb576b04a4f0a0528a3ba081cb07a730e3cd8c24f6a34fc530d"
+      "sha256": "38bc9cb2b671d7b7f6d3e3b5341207d898843175cb178f67a3e24b90f0703a0e"
     }
   ],
   "phasesweep_version": "0.3.15",
   "provenance": {
     "revision": "golden-fixture-v1"
   },
-  "schema_version": 3,
+  "schema_version": 4,
   "schema_versions": {
-    "experiment_fingerprint": 8,
-    "generation_summary": 8,
-    "phase_fingerprint": 11,
-    "reproducibility": 3,
-    "study_storage": 16
+    "experiment_fingerprint": 9,
+    "generation_summary": 9,
+    "phase_fingerprint": 12,
+    "reproducibility": 4,
+    "study_storage": 17
   }
 }

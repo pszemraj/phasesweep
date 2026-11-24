@@ -28,6 +28,7 @@ from phasesweep.engine.fingerprints import (
     _inherited_override_payload,
     _inherited_override_suppliers,
     _judge_identity,
+    _local_keys,
     _phase_fingerprint,
     _recorded_goal,
     new_study_note,
@@ -284,7 +285,10 @@ def _addressed_record(
         stand_in = next(r for r in recorded if r.study is source.study)
         return name, replace(stand_in, study=None)
     note = new_study_note(
-        phase, inherited, [record.study for record in recorded if record.study is not None]
+        experiment,
+        phase,
+        inherited,
+        [record.study for record in recorded if record.study is not None],
     )
     if note is not None:
         log.info("DRY RUN phase=%s %s", phase.name, note)
@@ -595,15 +599,15 @@ def _inherited_placeholder_keys(
     :return dict[str, list[str]]: Sorted stand-in keys per parent, in inheritance order, without
         the parents that supply none.
     """
-    inherited = _inherited_override_payload(phase, inherited_winners)
     suppliers = _inherited_override_suppliers(phase, inherited_winners)
+    inherited = suppliers.keys() - _local_keys(phase)
     return {
         parent: sorted(keys)
         for parent in phase.inherits
         if (
             keys := {
                 key
-                for key in inherited_winners[parent].placeholder_keys & inherited.keys()
+                for key in inherited_winners[parent].placeholder_keys & inherited
                 if suppliers[key] == parent
             }
         )

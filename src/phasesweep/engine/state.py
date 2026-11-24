@@ -131,6 +131,8 @@ class Winner:
     gates: list[dict[str, Any]] = field(default_factory=list)
     completion: dict[str, Any] = field(default_factory=dict)
     phase_fingerprint: str | None = None
+    # Address of the study that selected this winner, including its reading settings.
+    study_name: str | None = None
     generation_id: str | None = None
     attempt_id: str | None = None
     # Name of the trial directory inside its phase that the source attempt ran in.
@@ -208,9 +210,9 @@ ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
 # space the study has run under with the draw position each took effect at. One attr, so a
 # crash cannot leave a fingerprint beside a payload or history it does not describe.
 PHASE_IDENTITY_ATTR = "phasesweep_phase_identity"
-PHASE_IDENTITY_SCHEMA_VERSION = 2
+PHASE_IDENTITY_SCHEMA_VERSION = 3
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 16
+STUDY_SCHEMA_VERSION = 17
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The
@@ -307,6 +309,8 @@ class PhaseIdentityRecord(TypedDict):
     payload: JsonObject
     #: Every search space the study ran under, oldest first; the last is ``payload``'s.
     search_spaces: list[SearchSpaceEntry]
+    #: Parent keys' insertion positions, including keys a CLI phase replaces locally.
+    inherited_cli_keys: list[str]
 
 
 def _parsed_search_space_entry(value: object, *, previous: int | None) -> SearchSpaceEntry:
@@ -347,6 +351,11 @@ def _recorded_identity(study: Study) -> PhaseIdentityRecord | None:
         )
         if not isinstance(fingerprint, str) or not isinstance(entries, list) or not entries:
             raise ValueError("fingerprint or search_spaces is malformed")
+        inherited_cli_keys: object = value["inherited_cli_keys"]
+        if not isinstance(inherited_cli_keys, list) or not all(
+            isinstance(key, str) for key in inherited_cli_keys
+        ):
+            raise ValueError("inherited_cli_keys must be a list of strings")
         parsed: list[SearchSpaceEntry] = []
         for entry in entries:
             previous = parsed[-1]["first_position"] if parsed else None
@@ -356,6 +365,7 @@ def _recorded_identity(study: Study) -> PhaseIdentityRecord | None:
             "fingerprint": fingerprint,
             "payload": json_object(payload),
             "search_spaces": parsed,
+            "inherited_cli_keys": inherited_cli_keys,
         }
     except (KeyError, ValueError) as exc:
         raise StudySchemaMismatchError(
@@ -761,13 +771,13 @@ def _required_trial_dir(trial: FrozenTrial | Trial) -> Path:
     return Path(stored)
 
 
-GENERATION_SUMMARY_SCHEMA_VERSION = 8
+GENERATION_SUMMARY_SCHEMA_VERSION = 9
 PUBLICATION_POINTER_SCHEMA_VERSION = 2
 # Configuration and reproducibility files frozen into every generation namespace at claim time.
 GENERATION_CONFIG_SNAPSHOT_FILENAME = "config.snapshot.yaml"
 GENERATION_REPRODUCIBILITY_FILENAME = "reproducibility.json"
 # generation_id_source records whether the caller supplied the generation ID or the engine minted it.
-REPRODUCIBILITY_SCHEMA_VERSION = 3
+REPRODUCIBILITY_SCHEMA_VERSION = 4
 
 WINNER_FILENAME = "winner.yaml"
 # Manifest kinds that name a file in the generation namespace root rather than

@@ -18,7 +18,6 @@ part-way; the next run appends the trials still missing, from the same source.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import ClassVar
@@ -40,8 +39,12 @@ from phasesweep.engine.fingerprints import (
     _MAX_REPORTED_CHANGES,
     READING_KEY,
     _changed_payload_keys,
+    _cli_override_order,
+    _composed_override_keys,
     _identity_record,
+    _inherited_values,
     _judge_record,
+    _recorded_inheritance,
     _render_changed_values,
     _same_value,
     _semantic_payload_digest,
@@ -131,7 +134,10 @@ def _reread_record(record: PhaseIdentityRecord, reading: JsonObject) -> PhaseIde
     """
     payload = {**record["payload"], READING_KEY: reading}
     return _identity_record(
-        _semantic_payload_digest(payload), payload, list(record["search_spaces"])
+        _semantic_payload_digest(payload),
+        payload,
+        list(record["search_spaces"]),
+        record["inherited_cli_keys"],
     )
 
 
@@ -175,15 +181,13 @@ def fill_source(
 ) -> FillSource | None:
     """Pick the study a phase's new study is filled from, judging without writing anything.
 
-    A candidate holds trials measured under the same inherited values and would continue under
-    the current config once its reading settings are replaced: the check is the one a study's
-    own identity gets (:func:`phasesweep.engine.fingerprints._judge_record`), so a changed
-    trainer, environment or phase is refused as it is in the study it changed. The candidate
-    with the most trainer-finished trials wins, the most recently created on a tie.
+    A candidate holds trials measured under the same inherited values and argument order and
+    would continue under the current config once its reading settings are replaced. The
+    candidate with the most trainer-finished trials wins, the most recently created on a tie.
 
     :param Experiment experiment: Current config.
     :param Phase phase: The phase whose addressed study records no identity.
-    :param Mapping[str, object] inherited: The values the phase inherits now.
+    :param Mapping[str, object] inherited: The ordered parent layer the phase inherits now.
     :param Sequence[optuna.Study] others: The phase's other studies, oldest first.
     :raises StudyFingerprintMismatchError: A study with these inherited values exists but its
         training identity differs from the current config; the refusal names what changed.
@@ -191,7 +195,8 @@ def fill_source(
     :return FillSource | None: The source, or ``None`` when no study holds these values.
     """
     reading = reading_settings(experiment, phase)
-    values = json_object(json.loads(json.dumps(dict(inherited), default=str)))
+    values = _inherited_values(phase, inherited)
+    cli_order = _cli_override_order(experiment, _composed_override_keys(phase, inherited))
     found: list[FillSource] = []
     refusal: StudyFingerprintMismatchError | None = None
     for study in others:
@@ -202,6 +207,10 @@ def fill_source(
         payload = record["payload"]
         if not _same_value(payload.get("inherited_effective_overrides"), values):
             continue
+        same_order = _same_value(payload.get("cli_override_order"), cli_order)
+        # Recheck a candidate under its original parent order before attributing a different
+        # command to the parents. Own training changes still need the usual refusal.
+        inherited_for_check = inherited if same_order else _recorded_inheritance(record)
         try:
             _judge_record(
                 _reread_record(record, reading),
@@ -209,10 +218,12 @@ def fill_source(
                 study.study_name,
                 experiment,
                 phase,
-                values,
+                inherited_for_check,
             )
         except StudyFingerprintMismatchError as exc:
             refusal = exc
+            continue
+        if not same_order:
             continue
         recorded = payload.get(READING_KEY)
         changes = _changed_payload_keys(recorded if isinstance(recorded, dict) else {}, reading)
@@ -456,9 +467,11 @@ def pending_reread(
     inherited: dict[str, object] | None = None
     for study in others:
         record = _recorded_identity(study)
-        values = None if record is None else record["payload"].get("inherited_effective_overrides")
-        if isinstance(values, dict) and phase_study_name(experiment, phase, values) == study_name:
-            inherited = dict(values)
+        if record is None:
+            continue
+        recorded_inheritance = _recorded_inheritance(record)
+        if phase_study_name(experiment, phase, recorded_inheritance) == study_name:
+            inherited = recorded_inheritance
             break
     if inherited is None:
         return None

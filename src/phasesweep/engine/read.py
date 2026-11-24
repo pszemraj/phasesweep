@@ -39,9 +39,7 @@ from phasesweep.engine.fingerprints import (
     _experiment_semantic_fingerprint,
     _recorded_config_matches,
     _verify_recorded_identity,
-    _winner_inherited_values,
     addressed_study_names,
-    phase_study_name,
 )
 from phasesweep.engine.growth import recorded_growth
 from phasesweep.engine.ledger import (
@@ -186,6 +184,7 @@ class PhaseWinnerView:
     gates_passed: bool | None  # None when the phase declared no gates
     incomplete: bool  # True when a wallclock timeout produced a partial winner
     source: WinnerSource | None = None
+    study_name: str | None = None
     # Path-free projection of the winner's confound block: verdicts, check
     # names, counts and evaluation guidance (:func:`phasesweep.engine.confound._confound_summary`).
     confound: dict[str, Any] | None = None
@@ -342,6 +341,7 @@ def _winner_view(
             repeats = validated.repeats
             observed = dict(validated.observed)
         provenance = data.get("objective_provenance")
+        study_name = data.get("study_name")
         extractor = provenance.get("extractor") if isinstance(provenance, Mapping) else None
         kind = extractor.get("kind") if isinstance(extractor, Mapping) else None
         confound = _confound_summary(
@@ -360,6 +360,7 @@ def _winner_view(
             gates_passed=(all(bool(g.get("passed")) for g in gates) if gates else None),
             incomplete=bool(completion.get("incomplete", False)),
             source=source,
+            study_name=study_name if isinstance(study_name, str) else None,
             confound=confound,
             confound_detail=confound_block,
             finished_trials=_recorded_count(completion.get("finished_trials")),
@@ -589,16 +590,7 @@ def winner_advisories(
     """
     phase = next((phase for phase in experiment.phases if phase.name == winner.phase), None)
     try:
-        # The winner's own overrides name the study it was selected from, whichever study
-        # its phase addresses now.
-        read = (
-            None
-            if phase is None
-            else read_phase_trials(
-                ledger,
-                phase_study_name(experiment, phase, _winner_inherited_values(phase, winner)),
-            )
-        )
+        read = None if winner.study_name is None else read_phase_trials(ledger, winner.study_name)
     except StudyStorageUnavailableError:
         read = None
     trials = None if read is None else read.trials

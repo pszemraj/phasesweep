@@ -6,7 +6,7 @@ import hashlib
 import json
 import logging
 import platform
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -33,6 +33,7 @@ from phasesweep.errors import (
     restore_or_new_study,
     short_digest,
 )
+from phasesweep.runtime.commands import compose_trainer_input
 from phasesweep.runtime.json import JsonObject, json_object
 from phasesweep.runtime.terminal import plural
 
@@ -60,10 +61,10 @@ _RUN_CONTROL_KEYS = frozenset(
 #: Where W&B read controls sit inside a dumped phase: a summary-presence gate carries them.
 _PHASE_READ_CONTROLS = {"gates": {"__all__": set(TRACKER_READ_CONTROLS)}}
 # Increment the schema versions when their fingerprint payloads change.
-FINGERPRINT_SCHEMA_VERSION = 11
+FINGERPRINT_SCHEMA_VERSION = 12
 #: Where a phase identity payload keeps its reading settings (:func:`reading_settings`).
 READING_KEY = "reading"
-EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 8
+EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 9
 #: The viability bounds of the metric and each constraint. They judge what a trial measured,
 #: so a phase study's identity excludes them; a published result was selected under them, so
 #: the experiment fingerprint it records includes them.
@@ -197,10 +198,7 @@ def _experiment_semantic_fingerprint(
                 for c in experiment.constraints
             },
         },
-        "phases": [
-            {"name": phase.name, "inherits": list(phase.inherits), **_semantic_phase_dump(phase)}
-            for phase in experiment.phases[:phase_count]
-        ],
+        "phases": _semantic_phase_plan(experiment, experiment.phases[:phase_count]),
     }
     return _semantic_payload_digest(payload)
 
@@ -220,6 +218,31 @@ def _recorded_config_matches(
     return stored_fingerprint == _experiment_semantic_fingerprint(
         experiment, phase_count=phase_count
     )
+
+
+def _semantic_phase_plan(experiment: Experiment, phases: Sequence[Phase]) -> list[JsonObject]:
+    """Describe the configured phases with each phase's composed CLI argument order.
+
+    :param Experiment experiment: Experiment supplying engine and trainer input settings.
+    :param Sequence[Phase] phases: The whole plan or a prefix in execution order.
+    :return list[JsonObject]: Fingerprint payloads in plan order, including inheritance.
+    """
+    payloads: list[JsonObject] = []
+    winner_keys: dict[str, list[str]] = {}
+    for phase in phases:
+        inherited = (key for parent in phase.inherits for key in winner_keys[parent])
+        keys = _composed_override_keys(phase, inherited)
+        repeat_key = None if phase.repeats is None else phase.repeats.key
+        winner_keys[phase.name] = [key for key in keys if key != repeat_key]
+        payloads.append(
+            {
+                "name": phase.name,
+                "inherits": list(phase.inherits),
+                **_semantic_phase_dump(phase),
+                "cli_override_order": [*_cli_override_order(experiment, keys)],
+            }
+        )
+    return payloads
 
 
 def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
@@ -294,22 +317,60 @@ def _inherited_override_suppliers(
 def _inherited_override_payload(
     phase: Phase, inherited_winners: Mapping[str, CarriesOverrides]
 ) -> dict[str, object]:
-    """Return the inherited values the trainer actually receives, by key.
-
-    Fixed, sampled and repeat keys take their values from the current phase. Which parent
-    supplied a value is not recorded, so a parent renamed, reordered or replaced by one that
-    supplies the same values leaves a child's study and identity unchanged.
+    """Return the ordered parent layer of a trial's composed overrides.
 
     :param Phase phase: The phase whose local keys and inheritance precedence apply.
     :param Mapping[str, CarriesOverrides] inherited_winners: Parent winners supplying overrides.
-    :return dict[str, object]: The effective inherited value of each key the phase does not set.
+    :return dict[str, object]: Parent values in their first insertion positions, including keys
+        whose values the phase replaces.
     """
-    local_keys = _local_keys(phase)
     return {
         key: inherited_winners[parent].effective_overrides[key]
         for key, parent in _inherited_override_suppliers(phase, inherited_winners).items()
-        if key not in local_keys
     }
+
+
+def _inherited_values(phase: Phase, inherited: Mapping[str, object]) -> JsonObject:
+    """Keep the inherited values the trainer receives after the local overrides.
+
+    :param Phase phase: The phase that can replace a parent's value.
+    :param Mapping[str, object] inherited: The parent layer before local overrides.
+    :return JsonObject: Effective inherited values by key, in JSON representation.
+    """
+    local_keys = _local_keys(phase)
+    values = {key: value for key, value in inherited.items() if key not in local_keys}
+    return json_object(json.loads(json.dumps(values, default=str)))
+
+
+def _composed_override_keys(phase: Phase, inherited: Iterable[str]) -> list[str]:
+    """Return the keys in trial override order, including keys replaced in place.
+
+    :param Phase phase: The phase that adds fixed, sampled, and repeat keys.
+    :param Iterable[str] inherited: Parent keys in insertion order.
+    :return list[str]: Keys in the order used by trial composition.
+    """
+    repeat = () if phase.repeats is None else (phase.repeats.key,)
+    return list(dict.fromkeys((*inherited, *phase.fixed_overrides, *phase.search_space, *repeat)))
+
+
+def _cli_override_order(experiment: Experiment, keys: Iterable[str]) -> list[str]:
+    """Return the CLI's argument key order after composing its trainer input.
+
+    CLI override values occupy one position each regardless of their value. The base
+    configuration can fix the positions of entire branches, so override insertion order
+    matters only where it changes the flattened command. File formats sort mapping keys.
+
+    :param Experiment experiment: Experiment supplying the input format and base config.
+    :param Iterable[str] keys: Composed override keys in insertion order.
+    :return list[str]: Flattened CLI key order, or an empty list for file formats.
+    """
+    if experiment.override_format not in {"argparse", "hydra"}:
+        return []
+    composed = compose_trainer_input(
+        experiment.trainer_config, dict.fromkeys(keys), experiment.override_format
+    )
+    assert isinstance(composed, dict)
+    return list(composed)
 
 
 def _local_keys(phase: Phase) -> set[str]:
@@ -333,23 +394,38 @@ def phase_study_name(experiment: Experiment, phase: Phase, inherited: Mapping[st
     """Return the study that holds a phase's trials as read under the current reading settings.
 
     The one rule for finding a phase's study: its namespace, ``::``, and a digest of the values
-    its parents' winners pass it and of its reading settings (:func:`reading_settings`). A
-    changed winner or a changed reading setting addresses another study, and returning to
-    earlier values or settings addresses the study recorded under them again. Each study holds
-    exactly the trials measured under its values and read under its settings, so neither is
-    ever compared; Optuna keeps a finished trial's value fixed, which is why a reading change
-    needs a study of its own (filled by :mod:`phasesweep.engine.reread`, never by retraining).
+    its parents' winners pass it, any CLI ordering they contribute, and its reading settings
+    (:func:`reading_settings`). Returning to earlier inputs and settings addresses the study
+    recorded under them again. Optuna keeps a finished trial's value fixed, so each reading
+    change needs a study of its own (:mod:`phasesweep.engine.reread`).
 
     :param Experiment experiment: Experiment supplying the namespace and the reading settings.
     :param Phase phase: The phase.
-    :param Mapping[str, object] inherited: The values the phase inherits, by key: from its
-        parents' winners (:func:`_inherited_override_payload`), or from one of its own winners
-        (:func:`_winner_inherited_values`); empty for a phase that inherits nothing.
+    :param Mapping[str, object] inherited: The ordered parent layer, from the parents' winners
+        (:func:`_inherited_override_payload`) or a study's record (:func:`_recorded_inheritance`).
     :return str: The study name.
     """
     namespace = _phase_namespace(experiment.experiment, phase.name)
+    values = _inherited_values(phase, inherited)
+    order = (
+        _cli_override_order(experiment, _composed_override_keys(phase, inherited))
+        if inherited
+        else []
+    )
+    # A parent layer that only replaces local slots without affecting their rendered order
+    # contributes nothing, just like an empty parent layer.
+    if (
+        order
+        and not values
+        and order == _cli_override_order(experiment, _composed_override_keys(phase, ()))
+    ):
+        order = []
     digest = _semantic_payload_digest(
-        {"inherited": dict(inherited), "reading": reading_settings(experiment, phase)}
+        {
+            "inherited": values,
+            "cli_override_order": order,
+            "reading": reading_settings(experiment, phase),
+        }
     )
     return f"{namespace}::{digest[:_ADDRESS_DIGEST_CHARS]}"
 
@@ -373,22 +449,6 @@ def _recorded_goal(study: optuna.Study) -> Literal["minimize", "maximize"] | Non
     if goal == "maximize":
         return "maximize"
     return None
-
-
-def _winner_inherited_values(phase: Phase, winner: CarriesOverrides) -> dict[str, object]:
-    """Return the inherited values a phase's own winner was measured under.
-
-    A winner's composed overrides hold every inherited value beside the phase's own keys, so
-    they name the study the winner was selected from without its parents' winners.
-
-    :param Phase phase: The winner's phase.
-    :param CarriesOverrides winner: One of the phase's winners.
-    :return dict[str, object]: Its inherited values, by key.
-    """
-    local_keys = _local_keys(phase)
-    return {
-        key: value for key, value in winner.effective_overrides.items() if key not in local_keys
-    }
 
 
 def addressed_study_names(
@@ -432,7 +492,9 @@ def _phase_fingerprint_payload(
     )
 
 
-def _identity_payload(experiment: Experiment, phase: Phase, inherited: object) -> JsonObject:
+def _identity_payload(
+    experiment: Experiment, phase: Phase, inherited: Mapping[str, object]
+) -> JsonObject:
     """Return the fingerprint payload of a phase with the given inherited overrides.
 
     The inherited values and the reading settings address the study (:func:`phase_study_name`),
@@ -441,15 +503,17 @@ def _identity_payload(experiment: Experiment, phase: Phase, inherited: object) -
 
     :param Experiment experiment: Experiment supplying the experiment-level semantics.
     :param Phase phase: Phase whose semantic dump the payload holds.
-    :param object inherited: Effective inherited values by key, the payload's
-        ``inherited_effective_overrides``.
+    :param Mapping[str, object] inherited: The parent layer of the phase's overrides.
     :return JsonObject: The payload, normalized to the JSON representation being hashed.
     """
     payload = {
         "fingerprint_schema_version": FINGERPRINT_SCHEMA_VERSION,
         **_trainer_core(experiment),
         "phase": _identity_phase_dump(phase),
-        "inherited_effective_overrides": inherited,
+        "inherited_effective_overrides": _inherited_values(phase, inherited),
+        "cli_override_order": _cli_override_order(
+            experiment, _composed_override_keys(phase, inherited)
+        ),
         READING_KEY: reading_settings(experiment, phase),
     }
     return json_object(json.loads(json.dumps(payload, default=str)))
@@ -604,12 +668,16 @@ def restore_or_rename_step(phase: Phase, *, recorded: str) -> str:
 
 
 def new_study_note(
-    phase: Phase, inherited: Mapping[str, object], others: Sequence[optuna.Study]
+    experiment: Experiment,
+    phase: Phase,
+    inherited: Mapping[str, object],
+    others: Sequence[optuna.Study],
 ) -> str | None:
     """Say why a phase starts a new study beside the ones it already has, and that they stay.
 
+    :param Experiment experiment: Config supplying the CLI input format.
     :param Phase phase: The phase whose addressed study holds no trials yet.
-    :param Mapping[str, object] inherited: The values it now inherits.
+    :param Mapping[str, object] inherited: The ordered parent layer it now inherits.
     :param Sequence[optuna.Study] others: The phase's other studies, oldest first.
     :raises StudySchemaMismatchError: The most recent populated study's identity is malformed.
     :return str | None: The sentence, or None when no other study holds a trial.
@@ -621,7 +689,7 @@ def new_study_note(
     latest, trials = populated[-1]
     record = _recorded_identity(latest)
     recorded = None if record is None else record["payload"].get("inherited_effective_overrides")
-    current = json_object(json.loads(json.dumps(dict(inherited), default=str)))
+    current = _inherited_values(phase, inherited)
     changes = _changed_payload_keys(recorded if isinstance(recorded, dict) else {}, current)
     shown = "; ".join(
         f"{path}: {' -> '.join(_render_changed_values(old, new))}"
@@ -630,14 +698,19 @@ def new_study_note(
     more = len(changes) - _MAX_REPORTED_CHANGES
     if more > 0:
         shown += f"; and {more} more"
-    return (
-        f"inherits {shown or 'different values'}, so it starts a new study; "
-        f"the earlier study keeps its {plural(len(trials), 'trial')}."
-    )
+    old_order = None if record is None else record["payload"].get("cli_override_order")
+    order = _cli_override_order(experiment, _composed_override_keys(phase, inherited))
+    if not shown and old_order is not None and not _same_value(old_order, order):
+        shown = "a different CLI argument order"
+    change = f"inherits {shown or 'different values'}"
+    return f"{change}, so it starts a new study; the earlier study keeps its {plural(len(trials), 'trial')}."
 
 
 def _identity_record(
-    fingerprint: str, payload: JsonObject, search_spaces: list[SearchSpaceEntry]
+    fingerprint: str,
+    payload: JsonObject,
+    search_spaces: list[SearchSpaceEntry],
+    inherited_cli_keys: list[str],
 ) -> PhaseIdentityRecord:
     """Build the identity record a study is bound to.
 
@@ -645,6 +718,7 @@ def _identity_record(
     :param JsonObject payload: Canonical payload the fingerprint covers.
     :param list[SearchSpaceEntry] search_spaces: The study's search-space history, ending with
         ``payload``'s own search space.
+    :param list[str] inherited_cli_keys: Original parent keys in CLI insertion order.
     :return PhaseIdentityRecord: The record.
     """
     return {
@@ -652,7 +726,19 @@ def _identity_record(
         "fingerprint": fingerprint,
         "payload": payload,
         "search_spaces": search_spaces,
+        "inherited_cli_keys": inherited_cli_keys,
     }
+
+
+def _recorded_inheritance(record: PhaseIdentityRecord) -> dict[str, object]:
+    """Recreate the parent layer that produced a recorded trainer invocation.
+
+    :param PhaseIdentityRecord record: The study's identity.
+    :return dict[str, object]: Effective parent values, with positions for keys the phase
+        replaced when composing the CLI command.
+    """
+    values = json_object(record["payload"]["inherited_effective_overrides"])
+    return {**dict.fromkeys(record["inherited_cli_keys"]), **values}
 
 
 def _payload_search_space(payload: JsonObject) -> JsonObject:
@@ -669,13 +755,14 @@ def _payload_search_space(payload: JsonObject) -> JsonObject:
     return space
 
 
-def _fresh_identity(experiment: Experiment, phase: Phase, inherited: object) -> PhaseIdentityRecord:
+def _fresh_identity(
+    experiment: Experiment, phase: Phase, inherited: Mapping[str, object]
+) -> PhaseIdentityRecord:
     """Build the identity a study with no trials is bound to: one search space, from position 0.
 
     :param Experiment experiment: Current experiment config.
     :param Phase phase: Phase whose identity is built.
-    :param object inherited: Effective inherited values by key, the payload's
-        ``inherited_effective_overrides``.
+    :param Mapping[str, object] inherited: The ordered parent layer.
     :return PhaseIdentityRecord: The record.
     """
     payload = _identity_payload(experiment, phase, inherited)
@@ -683,6 +770,7 @@ def _fresh_identity(experiment: Experiment, phase: Phase, inherited: object) -> 
         _semantic_payload_digest(payload),
         payload,
         [{"search_space": _payload_search_space(payload), "first_position": 0}],
+        list(inherited) if experiment.override_format in {"argparse", "hydra"} else [],
     )
 
 
@@ -765,7 +853,7 @@ def _next_draw_position(trials: Sequence[optuna.trial.FrozenTrial], phase: Phase
 
 
 def _judge_identity(
-    study: optuna.Study, experiment: Experiment, phase: Phase, inherited: object
+    study: optuna.Study, experiment: Experiment, phase: Phase, inherited: Mapping[str, object]
 ) -> _IdentityVerdict:
     """Judge the current config against a study's recorded identity, writing nothing.
 
@@ -779,8 +867,7 @@ def _judge_identity(
     :param optuna.Study study: The phase's study, live or a read-only snapshot.
     :param Experiment experiment: Current experiment config.
     :param Phase phase: Phase the study belongs to.
-    :param object inherited: Effective inherited values by key, the payload's
-        ``inherited_effective_overrides``.
+    :param Mapping[str, object] inherited: The ordered parent layer.
     :raises StudyFingerprintMismatchError: The populated study has no recorded identity, or its
         config changed in a way it cannot continue under; the message names what changed.
     :raises StudySchemaMismatchError: The recorded identity is malformed.
@@ -802,7 +889,7 @@ def _judge_record(
     study_name: str,
     experiment: Experiment,
     phase: Phase,
-    inherited: object,
+    inherited: Mapping[str, object],
 ) -> _IdentityVerdict:
     """Judge the current config against an identity record and the trials it holds.
 
@@ -815,7 +902,7 @@ def _judge_record(
     :param str study_name: The study the refusal names.
     :param Experiment experiment: Current experiment config.
     :param Phase phase: Phase the record belongs to.
-    :param object inherited: Effective inherited values by key.
+    :param Mapping[str, object] inherited: The ordered parent layer.
     :raises StudyFingerprintMismatchError: Trials without a record, or a config change the
         trials cannot continue under; the message names what changed.
     :return _IdentityVerdict: The current fingerprint and the record to write, if any.
@@ -841,14 +928,17 @@ def _judge_record(
     base = entries[:-1] if len(entries) > 1 and first <= entries[-1]["first_position"] else entries
     base_payload = _with_search_space(record["payload"], base[-1]["search_space"])
     if base is not entries and _same_value(base_payload, payload):
-        return _IdentityVerdict(fingerprint, _identity_record(fingerprint, payload, list(base)))
+        return _IdentityVerdict(
+            fingerprint,
+            _identity_record(fingerprint, payload, list(base), fresh["inherited_cli_keys"]),
+        )
     growth = _growth_verdicts(base_payload, payload, phase)
     if growth is not None and all(verdict.grows for verdict in growth.values()):
         entry: SearchSpaceEntry = {"search_space": space, "first_position": first}
         grown = [*base, entry]
         return _IdentityVerdict(
             fingerprint,
-            _identity_record(fingerprint, payload, grown),
+            _identity_record(fingerprint, payload, grown, fresh["inherited_cli_keys"]),
             gained={key: verdict.gained for key, verdict in growth.items() if verdict.gained},
         )
     raise _mismatch_refusal(
@@ -925,7 +1015,7 @@ def _verify_recorded_identity(study: optuna.Study, experiment: Experiment, phase
         or not study.get_trials(deepcopy=False)
     ):
         return
-    _judge_identity(study, experiment, phase, record["payload"]["inherited_effective_overrides"])
+    _judge_identity(study, experiment, phase, _recorded_inheritance(record))
 
 
 def _growth_refusal(phase: Phase, growth: Mapping[str, _GrowthVerdict]) -> tuple[str, str] | None:
