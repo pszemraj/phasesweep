@@ -69,7 +69,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # Objective-evidence provenance schema version.
-EVIDENCE_PROVENANCE_SCHEMA_VERSION = 7
+EVIDENCE_PROVENANCE_SCHEMA_VERSION = 8
 # Retained evidence is indexed by configured path and named by its recorded file digest.
 RETAINED_EVIDENCE_SCHEMA_VERSION = 1
 # Log-regex evaluation revision included in the extractor contract.

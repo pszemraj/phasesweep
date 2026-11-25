@@ -199,11 +199,15 @@ def validate_capture(capture: Mapping[str, object]) -> MlflowCapture:
     :raises ValueError: Capture structure or required evidence disagrees.
     :return MlflowCapture: The narrowed evidence.
     """
-    from phasesweep.tracking.records import validate_binding
+    from phasesweep.tracking.records import readable_run_state, validate_binding
 
-    if capture.get("kind") != "mlflow" or capture.get("run_state") != "FINISHED":
-        raise ValueError("MLflow capture must name a finished run.")
     binding = validate_binding(capture.get("binding"))
+    status = capture.get("run_state")
+    tags = json_text_map(capture.get("tags"))
+    if tags is None:
+        raise ValueError("Invalid MLflow metadata subset.")
+    if capture.get("kind") != "mlflow" or not readable_run_state(status, binding["run_mode"], tags):
+        raise ValueError("MLflow capture must name a finished run.")
     raw_earlier = capture.get("earlier_bindings")
     if not isinstance(raw_earlier, list):
         raise ValueError("MLflow capture must name the earlier runs it merged.")
@@ -227,8 +231,8 @@ def validate_capture(capture: Mapping[str, object]) -> MlflowCapture:
     retrieved_at = capture.get("retrieved_at")
     if not isinstance(retrieved_at, str) or not retrieved_at:
         raise ValueError("Missing MLflow retrieval timestamp.")
-    params, tags = json_text_map(capture.get("params")), json_text_map(capture.get("tags"))
-    if params is None or tags is None:
+    params = json_text_map(capture.get("params"))
+    if params is None:
         raise ValueError("Invalid MLflow metadata subset.")
     for gate in (MlflowRequiredGate.model_validate(g) for g in query["gates"]):
         if any(key not in params for key in gate.params) or any(
@@ -239,7 +243,7 @@ def validate_capture(capture: Mapping[str, object]) -> MlflowCapture:
         "kind": "mlflow",
         "binding": binding,
         "earlier_bindings": earlier,
-        "run_state": "FINISHED",
+        "run_state": status,
         "query": query,
         "observations": observations,
         "retrieved_at": retrieved_at,

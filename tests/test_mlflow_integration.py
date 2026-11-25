@@ -617,6 +617,38 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     assert max(map(len, lines)) <= 80
 
 
+def test_corrected_key_reads_the_managed_run_after_failed_delivery(local_server, tmp_path):
+    """A corrected key reads the original successful trainer while its delivered verdict stays FAILED."""
+    from phasesweep.engine.selection import NoFeasibleTrialError
+    from phasesweep.evidence.models import MlflowExtractor
+    from phasesweep.tracking.session import BINDING_FILE, attempt_tracking_records, read_binding
+
+    uri, client, experiment_id, _process = local_server
+    trainer = tmp_path / "trainer.py"
+    trainer.write_text(
+        "import mlflow\nwith mlflow.start_run():\n    mlflow.log_metric('loss', 0.25)\n",
+        encoding="utf-8",
+    )
+    corrected = _managed_loss_experiment(tmp_path, uri, experiment_id, trainer, n_trials=1)
+    typo = corrected.metric.model_copy(
+        update={"extractor": MlflowExtractor(type="mlflow", metric_key="typo", select="last")}
+    )
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(corrected.model_copy(update={"metric": typo}))
+    (record,) = attempt_tracking_records(corrected, BINDING_FILE, None)
+    binding = read_binding(record.parent)
+    assert client.get_run(binding["run_id"]).info.status == "FAILED"
+
+    winner = run_experiment(corrected)["p"]
+    assert (winner.metric, winner.attempt_id) == (0.25, binding["attempt_id"])
+    assert winner.objective_provenance is not None
+    capture = winner.objective_provenance["remote_capture"]
+    assert capture["run_state"] == "FAILED"
+    assert capture["tags"]["phasesweep.status_before_delivery"] == "FINISHED"
+    assert list(attempt_tracking_records(corrected, BINDING_FILE, None)) == [record]
+    assert client.get_run(binding["run_id"]).info.status == "FAILED"
+
+
 def test_managed_missing_objective_hint_is_logged_once_per_phase(
     local_server,
     tmp_path: Path,

@@ -207,7 +207,9 @@ def test_remote_identity_failures_name_their_cause(problem, message):
 @pytest.mark.parametrize("status", ["FAILED", "KILLED"])
 def test_unsuccessful_remote_cannot_be_finished(status):
     binding = mlflow_binding()
-    client = SimpleNamespace(get_run=lambda _: mlflow_run(binding, status=status))
+    run = mlflow_run(binding, status=status)
+    run.data.tags["phasesweep.outcome"] = status
+    client = SimpleNamespace(get_run=lambda _: run)
     with pytest.raises(ValueError, match="unsuccessfully"):
         _capture(
             client,

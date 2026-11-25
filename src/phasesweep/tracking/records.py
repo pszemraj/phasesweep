@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Annotated, Literal, NotRequired, TypeAlias
+from typing import Annotated, Literal, NotRequired, TypeAlias, TypeGuard
 
 from pydantic import Field, TypeAdapter, ValidationError
 from typing_extensions import TypedDict
@@ -14,6 +14,26 @@ from phasesweep.runtime.json import JsonObject
 RunMode: TypeAlias = Literal["managed", "trainer"]
 """Whether PhaseSweep creates the attempt's MLflow run or the trainer does."""
 IdentityText: TypeAlias = Annotated[str, Field(min_length=1)]
+CaptureRunState: TypeAlias = Literal["FINISHED", "FAILED", "KILLED"]
+STATUS_BEFORE_DELIVERY = "phasesweep.status_before_delivery"
+
+
+def readable_run_state(
+    status: object, mode: RunMode, tags: Mapping[str, str]
+) -> TypeGuard[CaptureRunState]:
+    """Recognize a finished trainer's native status or the outcome PhaseSweep applied to it.
+
+    :param object status: MLflow status at capture.
+    :param RunMode mode: Owner of the bound run.
+    :param Mapping[str, str] tags: Native tags at capture, or their retained subset.
+    :return bool: Whether MLflow permits reading evidence after successful local training.
+    """
+    return status == "FINISHED" or (
+        mode == "managed"
+        and status in ("FAILED", "KILLED")
+        and tags.get("phasesweep.outcome") == status
+        and tags.get(STATUS_BEFORE_DELIVERY) in ("RUNNING", "FINISHED")
+    )
 
 
 class SourceIdentity(TypedDict):
@@ -81,7 +101,7 @@ class MlflowCapture(TypedDict):
     kind: Literal["mlflow"]
     binding: RunBinding
     earlier_bindings: list[RunBinding]
-    run_state: Literal["FINISHED"]
+    run_state: CaptureRunState
     query: MlflowQuery
     observations: dict[str, Observation]
     retrieved_at: str

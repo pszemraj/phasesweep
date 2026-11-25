@@ -26,6 +26,7 @@ from phasesweep.runtime.json import (
 )
 from phasesweep.runtime.remote_worker import report_reserve, run_worker
 from phasesweep.runtime.time import utc_now_iso
+from phasesweep.tracking.records import STATUS_BEFORE_DELIVERY, readable_run_state
 
 if TYPE_CHECKING:
     from mlflow.entities import Metric, Param, RunTag
@@ -658,8 +659,9 @@ def _metric_records(client: _SdkClient, run_id: str, key: str) -> list[Mapping[s
 def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     """Fetch finished evidence, sharing complete histories across selectors.
 
-    FINISHED runs fail immediately when required evidence is missing. Unfinished
-    runs are polled until just before ``timeout_at``. Each metric's history is the bound
+    A managed run may carry the failed outcome PhaseSweep delivered after successful training.
+    Its history can still answer a corrected reader. Finished runs fail immediately when required evidence is missing.
+    Unfinished runs are polled until just before ``timeout_at``. Each metric's history is the bound
     run's merged over the earlier runs of the trial's resumed attempts, whatever their
     status. The bound run must log the objective and gate evidence itself. A constraint
     can use earlier history when the bound run omits its metric.
@@ -668,7 +670,7 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     :param CaptureRequest request: Trusted target, bound run, the trial's earlier runs
         oldest first, and shared query.
     :raises ValueError: The run or an earlier run no longer matches its binding, the run ended
-        FAILED or KILLED, restarted during capture, or finished without a required metric,
+        FAILED or KILLED independently of delivery, restarted during capture, or finished without a required metric,
         param or tag (the message names it and the keys the run has) or without a metric's
         history.
     :raises TimeoutError: The run is still not finished when ``timeout_seconds`` runs out.
@@ -685,12 +687,12 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     while True:
         run = client.get_run(binding["run_id"])
         verify_remote(run, binding)
-        if run.info.status in {"FAILED", "KILLED"}:
-            raise ValueError("MLflow run ended unsuccessfully; remote metrics cannot rescue it.")
         if run.info.status == "RUNNING" and binding["run_mode"] == "managed":
             client.set_terminated(binding["run_id"], status="FINISHED")
             run = client.get_run(binding["run_id"])
-        if run.info.status == "FINISHED":
+            verify_remote(run, binding)
+        status = run.info.status
+        if readable_run_state(status, binding["run_mode"], run.data.tags):
             selections = {
                 identity: MlflowExtractor.model_validate(specification)
                 for identity, specification in query["selections"].items()
@@ -735,19 +737,26 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
                         observations[identity] = select_observation(records, spec)
             final = client.get_run(binding["run_id"])
             verify_remote(final, binding)
-            if final.info.status != "FINISHED":
+            if final.info.status != status or not readable_run_state(
+                status, binding["run_mode"], final.data.tags
+            ):
                 raise ValueError("MLflow run restarted during evidence capture.")
+            tag_keys = {key for gate in gates for key in gate.tags}
+            if status != "FINISHED":
+                tag_keys.update((STATUS_BEFORE_DELIVERY, "phasesweep.outcome"))
             return {
                 "kind": "mlflow",
                 "binding": binding,
                 "earlier_bindings": earlier,
-                "run_state": "FINISHED",
+                "run_state": status,
                 "query": query,
                 "observations": observations,
                 "retrieved_at": utc_now_iso(),
                 "params": {key: final.data.params[key] for gate in gates for key in gate.params},
-                "tags": {key: final.data.tags[key] for gate in gates for key in gate.tags},
+                "tags": {key: final.data.tags[key] for key in sorted(tag_keys)},
             }
+        if status in {"FAILED", "KILLED"}:
+            raise ValueError("MLflow run ended unsuccessfully; remote metrics cannot rescue it.")
         if time.monotonic() >= stop:
             raise TimeoutError(
                 f"MLflow run was still {run.info.status} when timeout_seconds ran out."
@@ -774,13 +783,20 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
     finish = request.get("finish")
     if finish and binding["run_mode"] != "managed":
         raise ValueError("Only runs PhaseSweep created may be terminated.")
+    tags = dict(projection["tags"])
+    if (
+        request["name"].startswith("attempt-")
+        and finish in ("FAILED", "KILLED")
+        and run.info.status in ("RUNNING", "FINISHED")
+    ):
+        tags[STATUS_BEFORE_DELIVERY] = run.info.status
     client.log_batch(
         binding["run_id"],
         metrics=[
             Metric(k, v, projection["timestamp"], 0) for k, v in projection["metrics"].items()
         ],
         params=[Param(k, v) for k, v in projection["params"].items()],
-        tags=[RunTag(k, v) for k, v in projection["tags"].items()],
+        tags=[RunTag(k, v) for k, v in tags.items()],
         synchronous=True,
     )
     with TemporaryDirectory(prefix="phasesweep-mlflow-summary-") as directory:

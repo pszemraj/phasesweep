@@ -76,7 +76,7 @@ Lightning's `MLFlowLogger` needs the supplied run ID passed as its `run_id`; rea
 
 Transformers' MLflow callback ends its run at the end of training, so call `mlflow.start_run()` before constructing the Trainer to keep its final evaluation in the same active run.
 
-Each [rerun](runtime.md#interrupted-trials-rerun) gets a new managed run. It keeps the display name when it reuses the training directory. PhaseSweep finishes a managed run that a successful trainer left open. A bound run marked FAILED or KILLED fails evidence capture, but it can contribute earlier history to a later attempt. See [result delivery and recovery](#result-delivery-and-recovery) for how PhaseSweep closes unaccepted attempts.
+Each [rerun](runtime.md#interrupted-trials-rerun) gets a new managed run. It keeps the display name when it reuses the training directory. PhaseSweep finishes a managed run that a successful trainer left open. A trainer-reported FAILED or KILLED status fails capture for that attempt. If PhaseSweep closed a managed run after a reading failure, correcting the reader can recover its metrics while preserving the delivered status. Earlier attempts can contribute history to a later attempt in either case. See [result delivery and recovery](#result-delivery-and-recovery) for how PhaseSweep closes unaccepted attempts.
 
 In **trainer** mode, your existing logger creates and finishes the run. The trainer receives `MLFLOW_TRACKING_URI` and the resolved `MLFLOW_EXPERIMENT_ID`, so a plain `mlflow.start_run()` opens it in the configured experiment. Bind that exact run once it exists:
 
