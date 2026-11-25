@@ -679,8 +679,8 @@ def _run_experiment_inner(
 ) -> dict[str, Winner]:
     """Execute the phase sequence under the caller's locks and signal handlers.
 
-    A live run that launched no trial claims its generation and publishes only when its
-    winners differ from the validated publication, or nothing validates as published.
+    A live run that launched no trial claims its generation and publishes unless the validated
+    publication holds the same winners under a config that matches the current one.
 
     :param Experiment experiment: Parsed experiment config.
     :param str | None from_phase: Resume point whose earlier winners are loaded from disk.

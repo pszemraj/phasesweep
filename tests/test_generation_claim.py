@@ -1,4 +1,7 @@
-"""A generation exists only for an invocation that launches a trial or publishes changed winners."""
+"""A generation exists only for an invocation that launches a trial or publishes.
+
+A run publishes unless the publication holds its winners under the current config.
+"""
 
 from __future__ import annotations
 
@@ -26,7 +29,7 @@ from phasesweep.engine.paths import (
     _generations_dir,
     _last_successful_generation_path,
 )
-from phasesweep.engine.read import read_status
+from phasesweep.engine.read import experiment_status, read_status
 from phasesweep.engine.run import TerminalReport
 from phasesweep.mcp.redaction import status_payload
 from phasesweep.mcp.runs import RunStore
@@ -110,6 +113,86 @@ def test_a_replay_of_the_published_winners_writes_no_generation(tmp_path: Path) 
     changed = {**winners, "b": replace(winners["b"], metric=0.25)}
     assert generation_ops._publication_holds(experiment, changed) is None
     assert generation_ops._publication_holds(experiment, {"a": winners["a"]}) is None
+
+
+def _bounded(experiment: Experiment) -> Experiment:
+    """Return ``experiment`` with a metric bound every recorded trial satisfies.
+
+    :param Experiment experiment: Experiment from :func:`_two_phases`.
+    :return Experiment: The same experiment under ``metric.max: 100``.
+    """
+    return experiment.model_copy(
+        update={"metric": experiment.metric.model_copy(update={"max": 100.0})}
+    )
+
+
+def _launched_nothing(report: TerminalReport) -> bool:
+    """Report whether every trial a successful run counted was finished by an earlier run.
+
+    :param TerminalReport report: The run's terminal report.
+    :return bool: Whether the run's phases counted only earlier trials.
+    """
+    counts = report.phase_counts.values()
+    return bool(counts) and all(item.earlier == item.counted for item in counts)
+
+
+def test_an_edit_that_keeps_the_winners_publishes_them_under_the_current_config(
+    tmp_path: Path,
+) -> None:
+    """A bound that selects the same winners, and the original config after it, publish them.
+
+    Each run launches nothing and writes a generation recording its config, so status calls
+    the published winners current and the next run with the same config replays them.
+    """
+    experiment = _two_phases(tmp_path)
+    reports: list[TerminalReport] = []
+    winners = run_experiment(experiment, terminal_callback=reports.append)
+
+    for config in (_bounded(experiment), experiment):
+        assert generation_ops._publication_holds(config, winners) is None
+        assert run_experiment(config, terminal_callback=reports.append) == winners
+        republished = reports[-1]
+        assert republished.replayed_generation_id is None
+        assert _launched_nothing(republished)
+        assert published_generation_id(config) == republished.generation_id
+        assert read_status(config)["published_config_matches_current"] is True
+        phases = experiment_status(config)["phases"]
+        assert isinstance(phases, list)
+        assert [
+            isinstance(phase, dict) and phase["winner_config_matches_current"] for phase in phases
+        ] == [True, True]
+
+        run_experiment(config, terminal_callback=reports.append)
+        assert reports[-1].replayed_generation_id == republished.generation_id
+
+
+def test_an_interrupted_launch_free_publication_is_finished_by_the_next_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C between a launch-free run's claim and its publication keeps the old publication.
+
+    The next run under the same config launches nothing and publishes the winners.
+    """
+    experiment = _two_phases(tmp_path)
+    winners = run_experiment(experiment)
+    first = published_generation_id(experiment)
+    bounded = _bounded(experiment)
+    reports: list[TerminalReport] = []
+
+    def interrupt(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(generation_ops, "_publish_generation", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            run_experiment(bounded, terminal_callback=reports.append)
+    assert _generation_dir(_experiment_dir(experiment), reports[0].generation_id).is_dir()
+    assert published_generation_id(bounded) == first
+
+    assert run_experiment(bounded, terminal_callback=reports.append) == winners
+    assert _launched_nothing(reports[1])
+    assert published_generation_id(bounded) == reports[1].generation_id
+    assert read_status(bounded)["published_config_matches_current"] is True
 
 
 def test_a_replay_publishes_a_generation_when_nothing_is_published(

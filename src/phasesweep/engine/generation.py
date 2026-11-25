@@ -21,6 +21,7 @@ import phasesweep.engine.publication_validation as validation_ops
 from phasesweep._metadata import __version__
 from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import PublicationCommitError, RunRequestError
+from phasesweep.engine.fingerprints import _recorded_config_matches
 from phasesweep.engine.state import PUBLICATION_POINTER_SCHEMA_VERSION, PhaseCounts, Winner
 from phasesweep.runtime.files import atomic_create_text
 from phasesweep.runtime.shutdown import absorb_shutdown_signals, signal_name
@@ -74,9 +75,10 @@ class InvocationGeneration:
 
     :meth:`claim` creates the namespace and points the current-generation pointer at it.
     The engine calls it before the first trial allocation, or before publishing winners
-    that differ from the current publication. Winners saved before the claim stay in
-    memory and are written by it, so an invocation that launches nothing and publishes
-    nothing leaves no generation. A matching replay makes the published generation current.
+    the current publication does not already represent under the current config
+    (:func:`_publication_holds`). Winners saved before the claim stay in memory and are
+    written by it, so an invocation that launches nothing and publishes nothing leaves no
+    generation. A matching replay makes the published generation current.
     """
 
     def __init__(
@@ -171,15 +173,27 @@ class InvocationGeneration:
 
 
 def _publication_holds(experiment: Experiment, winners: Mapping[str, Winner]) -> str | None:
-    """Return the published generation whose winners equal ``winners``, if there is one.
+    """Return the published generation that already represents these winners under this config.
+
+    The config is judged by :func:`_recorded_config_matches`, the comparison every reader of
+    the publication makes, so a run replays exactly when ``status`` and ``show-winners`` would
+    call the publication current. Equal winners under an edit the experiment fingerprint
+    covers, such as a bound that selects the same trials, are published again instead.
 
     :param Experiment experiment: Experiment whose last-success pointer is resolved.
     :param Mapping[str, Winner] winners: Winners an invocation would publish.
-    :return str | None: The published generation id when its publication validates and
-        its winner files hold exactly these phases with these payloads, else ``None``.
+    :return str | None: The published generation id when its publication validates, its
+        recorded fingerprint matches ``experiment`` and its winner files hold exactly these
+        phases with these payloads, else ``None``.
     """
     validated = publication_ops._resolve_publication_pointer(experiment).validated
     if validated is None or set(validated.winners) != set(winners):
+        return None
+    if not _recorded_config_matches(
+        experiment,
+        validated.summary.get("config_fingerprint"),
+        phase_count=len(validated.phase_plan),
+    ):
         return None
     for phase_name, winner in winners.items():
         payload = artifact_io._winner_payload(experiment, phase_name, winner)
