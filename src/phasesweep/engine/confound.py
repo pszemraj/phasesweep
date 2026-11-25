@@ -1054,38 +1054,53 @@ def _describe_evaluation_point(detail: EvaluationDetail, *, winner_trial: int) -
 
 
 def _describe_code_revision(detail: CodeRevisionDetail) -> str:
-    """Say which trainer revisions the ranked trials ran under, generation by generation.
+    """Say which distinct trainer revisions the ranked trials ran under, and which trials ran under each.
+
+    Generations that recorded the same commit and dirty state read as one revision, so a
+    revision that differs is never hidden behind repeats of the one that does not.
 
     :param CodeRevisionDetail detail: Flagged code-revision evidence.
     :return str: The warning sentence.
     """
     generations = detail["generations"]
-    listed = ", ".join(_generation_text(entry) for entry in generations[:_LOGGED_VALUES])
-    if len(generations) > _LOGGED_VALUES:
-        listed += f" and {len(generations) - _LOGGED_VALUES} more"
+    members: dict[str, set[int]] = {}
+    for entry in generations:
+        members.setdefault(_revision_label(entry), set()).update(entry["trials"])
+    listed = ", ".join(
+        f"{label} ({_trial_ranges(sorted(numbers))})" for label, numbers in members.items()
+    )
     return (
-        f"code_revision: ranked trials span {plural(len(generations), 'generation')} whose "
-        f"trainer code may differ: {listed}"
+        f"code_revision: ranked trials span {plural(len(generations), 'generation')} with "
+        f"{plural(len(members), 'distinct trainer revision')} whose code may differ: {listed}"
     )
 
 
-def _generation_text(entry: GenerationRevision) -> str:
-    """Write one generation's revision and its ranked trials, as the warning lists it.
+def _revision_label(entry: GenerationRevision) -> str:
+    """Name the revision one generation recorded.
 
     :param GenerationRevision entry: The generation's evidence.
-    :return str: Such as ``1a2b3c4d5e6f dirty (trials 3, 4)``, with at most five trials named.
+    :return str: Such as ``1a2b3c4d5e6f dirty``, ``unknown`` or ``unreadable``.
     """
     commit = entry["commit"]
-    label: str
     if commit is None:
-        label = entry["record"]
-    else:
-        label = f"{commit[:12]}{' dirty' if entry['dirty'] else ''}"
-    trials = entry["trials"]
-    named = _numbered("trial", trials[:_LOGGED_VALUES])
-    if len(trials) > _LOGGED_VALUES:
-        named += f" and {len(trials) - _LOGGED_VALUES} more"
-    return f"{label} ({named})"
+        return entry["record"]
+    return f"{commit[:12]}{' dirty' if entry['dirty'] else ''}"
+
+
+def _trial_ranges(numbers: Sequence[int]) -> str:
+    """Name trials by number, three or more consecutive numbers as ``first-last``.
+
+    :param Sequence[int] numbers: Trial numbers in ascending order, at least one.
+    :return str: Such as ``trial 4``, ``trials 13, 14`` or ``trials 0-3, 5, 7-9``.
+    """
+    runs: list[list[int]] = []
+    for number in numbers:
+        if runs and number == runs[-1][-1] + 1:
+            runs[-1].append(number)
+        else:
+            runs.append([number])
+    named = [f"{run[0]}-{run[-1]}" if len(run) > 2 else ", ".join(map(str, run)) for run in runs]
+    return f"trial{'' if len(numbers) == 1 else 's'} {', '.join(named)}"
 
 
 def _describe_survivorship(

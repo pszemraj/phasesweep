@@ -477,8 +477,8 @@ def test_a_top_up_under_another_commit_is_disclosed_on_the_winner(
 
     err = capsys.readouterr().err
     assert (
-        "code_revision: ranked trials span 2 generations whose trainer code may differ: "
-        f"{first_head[:12]} (trial 0), {second_head[:12]} (trial 1)"
+        "code_revision: ranked trials span 2 generations with 2 distinct trainer revisions "
+        f"whose code may differ: {first_head[:12]} (trial 0), {second_head[:12]} (trial 1)"
     ) in err
     assert "flagged: code_revision\n" in err
     experiment = experiment.model_copy(

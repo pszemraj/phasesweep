@@ -262,9 +262,9 @@ def test_code_revision_flags_what_cannot_be_shown_equal_and_never_raises() -> No
     ]
     (line,) = _describe_flagged(block, winner_trial=4)
     assert line == (
-        "code_revision: ranked trials span 4 generations whose trainer code may differ: "
-        f"{_COMMIT_A[:12]} (trials 0, 1), {_COMMIT_A[:12]} dirty (trial 2), unknown (trial 3), "
-        "unreadable (trial 4)"
+        "code_revision: ranked trials span 4 generations with 4 distinct trainer revisions "
+        f"whose code may differ: {_COMMIT_A[:12]} (trials 0, 1), {_COMMIT_A[:12]} dirty "
+        "(trial 2), unknown (trial 3), unreadable (trial 4)"
     )
     assert _validate_confound_block(block, winner_trial=4) == block
     summary = _confound_summary(
@@ -286,6 +286,26 @@ def test_code_revision_flags_what_cannot_be_shown_equal_and_never_raises() -> No
     }
     assert _assess(commits, commits, revisions=split)["checks"]["code_revision"]["verdict"] == (
         "heterogeneous"
+    )
+
+
+def test_code_revision_warning_lists_each_distinct_revision_once_with_its_trials() -> None:
+    """Generations at one commit read as one revision with its trial ranges, so the commit that differs stays listed."""
+    trials = _generation_trials("g1", "g1", "g2", "g2", "g2", "g3", "g4", "g5")
+    clean_a = {"commit": _COMMIT_A, "dirty": False}
+    revisions = {
+        "g1": clean_a,
+        "g2": clean_a,
+        "g3": {"commit": _COMMIT_B, "dirty": False},
+        "g4": {"commit": _COMMIT_B, "dirty": False},
+        "g5": clean_a,
+    }
+    block = _assess(trials, trials, revisions=revisions)
+
+    (line,) = _describe_flagged(block, winner_trial=0)
+    assert line == (
+        "code_revision: ranked trials span 5 generations with 2 distinct trainer revisions "
+        f"whose code may differ: {_COMMIT_A[:12]} (trials 0-4, 7), {_COMMIT_B[:12]} (trials 5, 6)"
     )
 
 
