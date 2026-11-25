@@ -1806,7 +1806,7 @@ def _reached_study_refusals(
         already past its direction and schema checks.
     :return list[Exception]: The refusals in phase order; empty when every study passes.
     """
-    from phasesweep.engine.reread import pending_sibling_retries
+    from phasesweep.engine.reread import pending_sibling_trials
 
     for item in reached:
         try:
@@ -1836,10 +1836,13 @@ def _reached_study_refusals(
                 needs_new_trials = phase.n_trials > finished
             # Preflight a definite launch. A kept result may cover a budgeted retry, but
             # if its read cannot measure the trial, the reached phase preflights before launching.
-            if needs_new_trials and phase.n_trials > finished + len(
-                pending_sibling_retries(phase, study, item.siblings)
-            ):
-                _launch_preflight(experiment, phase.name, study)
+            if needs_new_trials:
+                kept = pending_sibling_trials(experiment, phase, study, item.siblings)
+                adaptive_read = phase.sampler.type in {"tpe", "cmaes"} and any(
+                    trial.new_draw for trial in kept
+                )
+                if phase.n_trials > finished + len(kept) and not adaptive_read:
+                    _launch_preflight(experiment, phase.name, study)
             _validate_selection_evidence(experiment, {phase.name: study})
         except Exception as exc:
             errors.append(exc)

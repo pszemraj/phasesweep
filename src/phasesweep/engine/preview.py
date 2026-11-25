@@ -62,7 +62,7 @@ from phasesweep.engine.reread import (
     FillSource,
     describe_changes,
     fill_source,
-    pending_sibling_retries,
+    pending_sibling_trials,
     preview_filled_study,
 )
 from phasesweep.engine.state import (
@@ -697,11 +697,11 @@ def _preview_phase(
             siblings = tuple(
                 record.study for record in recorded_studies or () if record.study is not None
             )
-            kept = pending_sibling_retries(phase, study, siblings)
+            kept = pending_sibling_trials(experiment, phase, study, siblings, after_gap=True)
             if kept:
                 assured = sum(not retry.requires_measurement for retry in kept)
                 log.info(
-                    "DRY RUN phase=%s would re-read %s from a sibling study to settle pending reruns",
+                    "DRY RUN phase=%s would re-read %s from a sibling study to reuse kept training",
                     phase.name,
                     plural(len(kept), "finished trial"),
                 )
@@ -709,7 +709,24 @@ def _preview_phase(
                     log.info("DRY RUN phase=%s would launch no trials", phase.name)
                     winner = _placeholder_winner(experiment, phase, inherited_winners)
                     return PhasePreview(winner=winner, launches=0, reruns=0)
-                if phase.inherits and len(kept) < remaining:
+                adaptive_read = phase.sampler.type in {"tpe", "cmaes"} and any(
+                    trial.new_draw for trial in kept
+                )
+                if all(trial.new_draw for trial in kept) and not adaptive_read:
+                    if phase.inherits:
+                        _launch_preflight(experiment, phase.name, study)
+                    GpuPool.for_phase(
+                        phase, cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES")
+                    )
+                    launches = remaining - assured
+                    log.info(
+                        "DRY RUN phase=%s would launch %s after re-reading kept training",
+                        phase.name,
+                        plural(launches, "trial"),
+                    )
+                    winner = _preview_trial_command(experiment, phase, inherited_winners)
+                    return PhasePreview(winner=winner, launches=launches, reruns=0)
+                if phase.inherits and len(kept) < remaining and not adaptive_read:
                     _launch_preflight(experiment, phase.name, study)
                 warn_dry_run(
                     "phase=%s may need up to %s depending on the re-read results",

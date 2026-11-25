@@ -64,7 +64,13 @@ from phasesweep.engine.progress import (
     _warn_deferred_extraction,
 )
 from phasesweep.engine.repeats import repeat_axis
-from phasesweep.engine.reread import fill_note, fill_source, fill_study, reread_sibling_retries
+from phasesweep.engine.reread import (
+    fill_note,
+    fill_source,
+    fill_study,
+    reread_sibling_trials,
+    sibling_launch_batch,
+)
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
     PhaseTrialsFailedError,
@@ -1636,7 +1642,7 @@ def _run_phase(
         if note is not None:
             report.info("%s  %s", phase.name, note)
     resumed = _resume_phase(experiment, phase, inherited_winners, study)
-    if not isinstance(resumed, Winner) and reread_sibling_retries(
+    if not isinstance(resumed, Winner) and reread_sibling_trials(
         experiment,
         phase,
         study,
@@ -1753,9 +1759,11 @@ def _run_phase(
                 while True:
                     _log_reruns(experiment, phase, study, recorded_reruns)
                     finished_before = _finished_trial_count(study.get_trials(deepcopy=False))
+                    batch = sibling_launch_batch(experiment, phase, study, others)
+                    bounded = batch < remaining
                     study.optimize(
                         functools.partial(_objective, run),
-                        n_trials=remaining,
+                        n_trials=batch,
                         n_jobs=phase.n_jobs,
                         timeout=timeout,
                         gc_after_trial=True,
@@ -1779,8 +1787,32 @@ def _run_phase(
                         timeout = budget.deadline - time.monotonic()
                         if timeout <= 0:
                             break
+                    if bounded:
+                        try:
+                            adopted = reread_sibling_trials(
+                                experiment, phase, study, others, budget.deadline, generation_id
+                            )
+                        except PhaseTimeoutError:
+                            run.stop_for_deadline()
+                            break
+                        if adopted:
+                            _validate_selection_evidence(experiment, {phase.name: study})
+                            state = _load_phase_policy_state(study, experiment)
+                            run.resume_from(state)
+                            run.finished_trials = _finished_trial_count(
+                                study.get_trials(deepcopy=False)
+                            )
+                            if state.abort is not None:
+                                run.abort_recorded = True
+                                run.stop_launches()
+                                break
+                            remaining = phase.n_trials - run.finished_trials
+                            if remaining <= 0:
+                                break
+                        if budget.deadline is not None:
+                            timeout = max(0.0, budget.deadline - time.monotonic())
                     recorded_reruns = _record_reruns(study)
-                    if not recorded_reruns:
+                    if not recorded_reruns and not bounded:
                         break
             except BaseException as exc:
                 # Drain workers before run reconciliation can reap their trials.
