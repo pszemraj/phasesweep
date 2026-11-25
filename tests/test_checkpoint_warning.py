@@ -111,6 +111,21 @@ def test_one_rerun_over_a_finished_model_names_its_directory(
     assert line.startswith(f"[p/trial_1] Reruns in {directory}, where a finished attempt's model")
 
 
+def test_a_sibling_reading_that_completed_the_attempt_makes_its_model_finished(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A retry by the study that read the attempt as failed warns when a sibling study read it as complete."""
+    trainer = _trainer(tmp_path)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(_config(tmp_path, trainer, cells=1, n_trials=1, gate=2))
+    run_experiment(_config(tmp_path, trainer, cells=1, n_trials=1, gate=1))
+    caplog.clear()
+    run_experiment(_config(tmp_path, trainer, cells=1, n_trials=2, gate=2))
+
+    (line,) = _warnings(caplog)
+    assert line.startswith("[p/trial_1] Reruns in ")
+
+
 def test_a_retried_failed_trial_has_no_finished_model_to_overwrite(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

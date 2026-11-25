@@ -269,10 +269,12 @@ def reruns_over_finished_results(
         rerun whose directory cannot be resolved is left to its launch, which refuses it.
     """
     attempts = producing_attempts(studies)
+    # A sibling reading study can complete an attempt that its launching study read as failed.
     finished = {
         attempt_id
-        for attempt_id, owner in attempts.items()
-        if owner.trial.state == TrialState.COMPLETE
+        for study in studies
+        for row in study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
+        if isinstance(attempt_id := row.user_attrs.get(ATTEMPT_ID_ATTR), str)
     }
     affected: list[tuple[int, str]] = []
     for number in reruns:
