@@ -12,10 +12,12 @@ import json
 import threading
 import warnings
 from collections.abc import Collection, Iterable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, assert_never
 
 import optuna
+from optuna._transform import _SearchSpaceTransform
 from optuna.exceptions import ExperimentalWarning
 from optuna.samplers._lazy_random_state import LazyRandomState
 
@@ -44,6 +46,7 @@ from phasesweep.engine.state import (
     FINISHED_TRIAL_STATES,
     GENERATION_ID_ATTR,
     METRIC_EXTRACTOR_LABEL,
+    REREAD_FILL_ATTR,
     RERUN_OF_ATTR,
     TRIAL_STATE_NAMES,
     RecoveredTrialState,
@@ -713,6 +716,10 @@ class _PositionCmaEsSampler(optuna.samplers.CmaEsSampler):
         :param int seed: Base seed supplied by the phase's sampler config.
         """
         self._thread_rng = _ThreadRandomState()
+        self._reread_draw: ContextVar[
+            tuple[dict[str, optuna.distributions.BaseDistribution], optuna.study.StudyDirection]
+            | None
+        ] = ContextVar("cmaes_reread_draw", default=None)
         super().__init__(seed=seed, independent_sampler=_PositionRandomSampler(seed=seed))
         self._base_seed = seed
 
@@ -741,7 +748,8 @@ class _PositionCmaEsSampler(optuna.samplers.CmaEsSampler):
         """Sample as CMA-ES does, with the ask seeded by the draw position instead of the trial number.
 
         The trial handed on is a copy numbered by position; its trial id is the
-        real one, so every storage write lands on the real trial.
+        real one, so every storage write lands on the real trial. A re-read study
+        supplies the current direction and search space when Optuna restores its optimizer.
 
         :param optuna.Study study: The active study; its name is part of the seed.
         :param optuna.trial.FrozenTrial trial: The trial being sampled for.
@@ -756,7 +764,12 @@ class _PositionCmaEsSampler(optuna.samplers.CmaEsSampler):
         )
         positioned = copy.copy(trial)
         positioned.number = position
-        return super().sample_relative(study, positioned, search_space)
+        replay = (search_space, study.direction) if REREAD_FILL_ATTR in study.user_attrs else None
+        token = self._reread_draw.set(replay)
+        try:
+            return super().sample_relative(study, positioned, search_space)
+        finally:
+            self._reread_draw.reset(token)
 
     def _restore_optimizer(
         self, completed_trials: list[optuna.trial.FrozenTrial]
@@ -769,25 +782,53 @@ class _PositionCmaEsSampler(optuna.samplers.CmaEsSampler):
         a generation told meanwhile; the newest generation wins, ties to the
         highest number.
 
+        A re-read can have several complete batches after that snapshot. Replay all
+        but the last consecutive complete batch, which Optuna tells and saves as
+        part of the ask. When an observation is missing, the first incomplete batch
+        receives new draws before any later batch can affect the optimizer.
+
         :param list[optuna.trial.FrozenTrial] completed_trials: The study's
             completed trials.
-        :return CmaClass | None: The restored optimizer, or None before any tell.
+        :return CmaClass | None: Optimizer immediately before Optuna's next ask, or
+            None when there is no snapshot to restore in an ordinary study.
         """
         carriers = [
             completed
             for completed in completed_trials
             if any(key.startswith(self._attr_key_optimizer) for key in completed.system_attrs)
         ]
-        if not carriers:
-            return None
-        newest = max(
-            carriers,
-            key=lambda carrier: (
-                carrier.system_attrs[self._attr_key_generation],
-                carrier.number,
-            ),
-        )
-        return super()._restore_optimizer([newest])
+        optimizer = None
+        if carriers:
+            newest = max(
+                carriers,
+                key=lambda carrier: (
+                    carrier.system_attrs[self._attr_key_generation],
+                    carrier.number,
+                ),
+            )
+            optimizer = super()._restore_optimizer([newest])
+        replay = self._reread_draw.get()
+        if replay is None:
+            return optimizer
+
+        search_space, direction = replay
+        transform = _SearchSpaceTransform(search_space, transform_step=True, transform_0_1=True)
+        if optimizer is None:
+            optimizer = self._init_optimizer(transform, direction)
+        population = optimizer.population_size
+        sign = 1 if direction == optuna.study.StudyDirection.MINIMIZE else -1
+        batch = self._get_solution_trials(completed_trials, optimizer.generation)
+        while len(batch) >= population:
+            following = self._get_solution_trials(completed_trials, optimizer.generation + 1)
+            if len(following) < population:
+                break
+            solutions = []
+            for trial in batch[:population]:
+                assert trial.value is not None
+                solutions.append((transform.transform(trial.params), sign * trial.value))
+            optimizer.tell(solutions)
+            batch = following
+        return optimizer
 
 
 def _sampling_trial_for_reread(

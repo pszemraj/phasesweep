@@ -26,10 +26,12 @@ from phasesweep.engine.optuna import (
     _draw_positions,
     _position_seed,
     _PositionCmaEsSampler,
+    _sampling_trial_for_reread,
     _suggest,
 )
-from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_OUTCOME_ATTR
+from phasesweep.engine.state import REREAD_FILL_ATTR, RERUN_OF_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.engine.study_policy import _record_reruns
+from phasesweep.engine.trial_dirs import REREAD_FILL_SCHEMA_VERSION
 from tests.conftest import trial_outcome
 
 _GRID_SPACE: dict[str, SearchParam] = {
@@ -460,6 +462,36 @@ def test_cmaes_restores_the_newest_generation_not_the_highest_numbered_snapshot(
 
     assert sampler._restore_optimizer([told_three, rerun_of_two, plain]) == "generation 3"
     assert sampler._restore_optimizer([plain]) is None
+
+
+def test_cmaes_reread_replays_later_batches_after_an_incomplete_one_fills() -> None:
+    """A re-read with a lost measurement fills its missing batch before reusing later ones."""
+    source = _study(_build_sampler(_CMAES, _CMA_SPACE))
+    _run(source, _CMA_SPACE, 19)
+    sampler = _PositionCmaEsSampler(seed=5)
+    reread = optuna.create_study(
+        study_name=f"{source.study_name}::reread", sampler=sampler, storage=source._storage
+    )
+    reread.set_user_attr(
+        REREAD_FILL_ATTR,
+        {"schema_version": REREAD_FILL_SCHEMA_VERSION, "study_name": source.study_name},
+    )
+    for trial in source.get_trials():
+        retained = _sampling_trial_for_reread(trial, sampler)
+        if trial.number == 8:
+            retained.state = optuna.trial.TrialState.FAIL
+            retained.value = None
+            retained.user_attrs[TRIAL_OUTCOME_ATTR] = trial_outcome(
+                trial.number + 1, "failure", cause="metric missing in kept evidence"
+            )
+        reread.add_trial(retained)
+
+    _run(reread, _CMA_SPACE, 1)
+    assert reread.trials[-1].system_attrs[sampler._attr_key_generation] == 1
+
+    resumed = _reopen(reread, _CMAES, _CMA_SPACE)
+    _run(resumed, _CMA_SPACE, 1)
+    assert resumed.trials[-1].system_attrs[sampler._attr_key_generation] == 3
 
 
 def test_the_optuna_internals_the_position_samplers_build_on_exist() -> None:

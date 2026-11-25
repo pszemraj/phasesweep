@@ -392,11 +392,11 @@ def test_a_flipped_goal_re_reads_into_a_study_of_the_other_direction(tmp_path: P
 
 @pytest.mark.integration
 def test_cmaes_topup_relearns_from_the_reread_values(tmp_path: Path) -> None:
-    """An objective direction change keeps draw batches and drops fitted CMA-ES state."""
+    """A direction change replays all retained CMA-ES batches before the next draw."""
     trainer, launches = _counting_trainer(tmp_path)
     phase = Phase(
         name="p",
-        n_trials=9,
+        n_trials=19,
         gpu_policy="none",
         sampler=Sampler(type="cmaes", seed=5),
         search_space={key: FloatParam(type="float", low=-1, high=1) for key in ("x", "y")},
@@ -407,19 +407,23 @@ def test_cmaes_topup_relearns_from_the_reread_values(tmp_path: Path) -> None:
     sampler = _PositionCmaEsSampler(seed=5)
     assert sampler._restore_optimizer(before) is not None
 
-    top_up = phase.model_copy(update={"n_trials": 10})
+    top_up = phase.model_copy(update={"n_trials": 20})
     changed = _experiment(tmp_path, trainer, _metric("loss", goal="maximize"), phases=[top_up])
     assert run_experiment(changed)["p"].metric >= max(
         t.value for t in before if t.value is not None
     )
     after = phase_study_of(changed).trials
-    assert _launches(launches) == len(after) == 10
-    assert [trial.params for trial in after[:9]] == [trial.params for trial in before]
-    assert [trial.system_attrs.get(sampler._attr_key_generation) for trial in after[:9]] == [
+    retained = after[:-1]
+    assert _launches(launches) == len(after) == 20
+    assert [trial.params for trial in retained] == [trial.params for trial in before]
+    assert [trial.system_attrs.get(sampler._attr_key_generation) for trial in retained] == [
         trial.system_attrs.get(sampler._attr_key_generation) for trial in before
     ]
-    assert sampler._restore_optimizer(after[:9]) is None
-    assert sampler._restore_optimizer(after) is not None
+    assert sampler._restore_optimizer(retained) is None
+    assert after[-1].system_attrs[sampler._attr_key_generation] == 3
+    optimizer = sampler._restore_optimizer(after)
+    assert optimizer is not None
+    assert optimizer.generation == 3
 
 
 def test_managed_envelope_path_change_reuses_the_producing_envelope(tmp_path: Path) -> None:
