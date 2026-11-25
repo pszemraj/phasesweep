@@ -1288,6 +1288,46 @@ def test_validate_counts_kept_grid_trials_when_the_reading_settings_change(
 
 
 @pytest.mark.integration
+def test_fill_source_keeps_a_failed_draw_missing_from_a_shorter_copy(tmp_path: Path) -> None:
+    """Changing the metric keeps a spent failure when two sources offer the same measurements."""
+    calls = tmp_path / "calls"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse
+        from pathlib import Path
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", type=Path)
+        args, _ = parser.parse_known_args()
+        calls = Path({str(calls)!r})
+        with calls.open("a") as receipt:
+            receipt.write("launch\\n")
+        if len(calls.read_text().splitlines()) == 2:
+            raise SystemExit(2)
+        args.out.write_text('{{"loss": 1, "acc": 2, "mem": 3}}')
+        """,
+    )
+
+    def config(key: str, n: int) -> Experiment:
+        phase = _phases()[0].model_copy(update={"allow_partial_grid": True, "n_trials": n})
+        return _experiment(tmp_path, trainer, _metric(key), phases=[phase])
+
+    run_experiment(config("loss", 1))
+    run_experiment(config("acc", 1))
+    original = config("loss", 2)
+    run_experiment(original)
+    failed = phase_study_of(original).trials[1]
+    assert failed.state == optuna.trial.TrialState.FAIL
+
+    changed = config("mem", 2)
+    run_experiment(changed)
+    copied = phase_study_of(changed).trials[1]
+    assert copied.state == failed.state
+    assert copied.user_attrs[ATTEMPT_ID_ATTR] == failed.user_attrs[ATTEMPT_ID_ATTR]
+    assert _launches(calls) == 2
+
+
+@pytest.mark.integration
 def test_a_fill_killed_part_way_is_finished_by_the_next_run(tmp_path: Path) -> None:
     """A runner killed after one copied trial leaves a fill the next run completes in place."""
     trainer, launches = _counting_trainer(tmp_path)

@@ -262,7 +262,9 @@ def fill_source(
 
     A candidate holds trials measured under the same inherited values and would continue
     under the current config once its reading settings are replaced. The
-    candidate with the most trainer-finished trials wins, the most recently created on a tie.
+    Prefer the most finished trainers to read, then the history with the most spent attempts
+    and retained rows, so a shorter copy cannot erase a failure or an interrupted checkpoint.
+    Equally complete histories use the most recently created study.
     An interrupted fill keeps its source and uses its latest trials and study metadata.
 
     :param Experiment experiment: Current config.
@@ -325,7 +327,14 @@ def fill_source(
         if refusal is not None:
             raise refusal
         return None
-    return max(reversed(found), key=lambda source: source.rereads)
+    return max(
+        reversed(found),
+        key=lambda source: (
+            source.rereads,
+            _finished_trial_count(source.trials),
+            len(source.copyable_trials),
+        ),
+    )
 
 
 def _reread_trial(
