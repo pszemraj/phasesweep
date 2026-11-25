@@ -100,7 +100,7 @@ _UNREADABLE_RUN = "run:"
 _UNREADABLE_HANDLE_FILE = "handle:"
 #: The operator's step for a state directory in another format, which nothing migrates.
 FRESH_STATE_DIR_STEP = "Point the catalog's `state_dir` at a new directory."
-MCP_STATE_FORMAT_VERSION = 14
+MCP_STATE_FORMAT_VERSION = 15
 CLEANUP_UNCERTAINTY_SCHEMA_VERSION = 1
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
 _STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}

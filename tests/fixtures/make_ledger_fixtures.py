@@ -66,7 +66,7 @@ FIXTURE_ENVIRONMENT: dict[str, str | None] = {
 TARGET_STUDY_SCHEMA_VERSION = 22
 #: Artifact-root binding schema this fixture set is asserted against. Mirrors
 #: ``phasesweep.engine.artifact_roots.ARTIFACT_ROOT_BINDING_SCHEMA_VERSION``.
-TARGET_BINDING_SCHEMA_VERSION = 30
+TARGET_BINDING_SCHEMA_VERSION = 31
 #: Study user attribute holding the PhaseSweep study schema version.
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
 #: Optuna journal op code for ``SET_STUDY_USER_ATTR``.

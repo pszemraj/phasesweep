@@ -64,7 +64,7 @@ _PHASE_READ_CONTROLS = {"gates": {"__all__": set(TRACKER_READ_CONTROLS)}}
 FINGERPRINT_SCHEMA_VERSION = 13
 #: Where a phase identity payload keeps its reading settings (:func:`reading_settings`).
 READING_KEY = "reading"
-EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 10
+EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 11
 #: The viability bounds of the metric and each constraint. They judge what a trial measured,
 #: so a phase study's identity excludes them; a published result was selected under them, so
 #: the experiment fingerprint it records includes them.
@@ -217,11 +217,17 @@ def _recorded_config_matches(
 def _semantic_phase_plan(phases: Sequence[Phase]) -> list[JsonObject]:
     """Describe the configured phases and their inheritance graph.
 
+    A phase's parents are recorded as a sorted set. Their order in ``inherits`` only decides
+    which parent supplies a key two parents export (:func:`_inherited_override_suppliers`),
+    and the phase graph's validation admits that only when both carry the key from one origin
+    or the phase replaces it (:meth:`Experiment._validate_phase_graph`), so the order never
+    changes a value a trainer receives.
+
     :param Sequence[Phase] phases: The whole plan or a prefix in execution order.
     :return list[JsonObject]: Fingerprint payloads in plan order, including inheritance.
     """
     return [
-        {"name": phase.name, "inherits": list(phase.inherits), **_semantic_phase_dump(phase)}
+        {"name": phase.name, "inherits": [*sorted(phase.inherits)], **_semantic_phase_dump(phase)}
         for phase in phases
     ]
 
@@ -283,6 +289,9 @@ def _inherited_override_suppliers(
     phase: Phase, inherited_winners: Mapping[str, CarriesOverrides]
 ) -> dict[str, str]:
     """Name the last parent supplying each key.
+
+    Validation lets two parents supply one key only when both carry it from one origin or the
+    phase replaces it, so which of them is named never changes a value the phase receives.
 
     :param Phase phase: The phase whose inheritance order determines precedence.
     :param Mapping[str, CarriesOverrides] inherited_winners: Parent winners supplying overrides.

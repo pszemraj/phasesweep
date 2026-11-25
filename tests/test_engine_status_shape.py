@@ -213,6 +213,57 @@ def test_status_counts_a_child_in_the_study_its_parents_latest_winner_addresses(
     assert child["trials"] == {"COMPLETE": 1}
 
 
+def test_reordered_parents_keep_the_published_result_matching_the_config(tmp_path: Path) -> None:
+    """Reordering a child's ``inherits`` changes no value it receives, so ``status``, ``status --trials`` and a rerun all treat the published generation as the current config's result, and nothing launches."""
+    calls = tmp_path / "calls.log"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import sys
+        from pathlib import Path
+        with Path({str(calls)!r}).open("a") as log:
+            log.write(" ".join(sys.argv[1:]) + "\\n")
+        print("x=1")
+        """,
+    )
+
+    def plan(parents: list[str]) -> Experiment:
+        def phase(name: str, key: str, inherits: list[str]) -> Phase:
+            return Phase(
+                name=name,
+                n_trials=2,
+                gpu_policy="none",
+                inherits=inherits,
+                sampler=Sampler(type="grid"),
+                search_space={key: CategoricalParam(type="categorical", choices=[1, 2])},
+            )
+
+        return make_experiment(
+            persistent=tmp_path,
+            trainer=trainer,
+            phases=[phase("lr", "a", []), phase("depth", "b", []), phase("final", "c", parents)],
+        )
+
+    run_experiment(plan(["lr", "depth"]))
+    published = published_generation_id(plan(["lr", "depth"]))
+    launched = calls.read_text()
+    reordered = plan(["depth", "lr"])
+    config = write_experiment_config(tmp_path / "reordered.yaml", reordered)
+
+    status = CliRunner().invoke(cli, ["status", str(config)])
+    trials = CliRunner().invoke(cli, ["status", str(config), "--trials"])
+    run_experiment(reordered)
+
+    assert status.exit_code == 0, status.output
+    phases = yaml.safe_load(status.output)["phases"]
+    assert [phase["winner_config_matches_current"] for phase in phases] == [True, True, True]
+    assert trials.exit_code == 0, trials.output
+    assert f"published generation {published}" in trials.output
+    assert "does not match the current config" not in trials.output
+    assert published_generation_id(reordered) == published
+    assert calls.read_text() == launched
+
+
 def test_experiment_status_shape_is_pinned(tmp_path: Path) -> None:
     """A standalone experiment payload carries generation identity plus phases."""
     materialized = materialize("current-journal", tmp_path, mode="tree")

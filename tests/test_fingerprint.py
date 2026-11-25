@@ -470,6 +470,25 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     )
 
 
+def test_experiment_fingerprint_records_a_phases_parents_as_a_set() -> None:
+    """Reordering ``inherits``, here around a key two parents carry from one origin, keeps the experiment fingerprint, and changing which phases a child inherits moves it."""
+    from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+
+    def plan(parents: list[str]) -> Experiment:
+        return make_experiment(
+            phases=[
+                Phase(name="root", n_trials=1, fixed_overrides={"lr": 0.1}),
+                Phase(name="left", n_trials=1, inherits=["root"], fixed_overrides={"a": 1}),
+                Phase(name="right", n_trials=1, inherits=["root"], fixed_overrides={"b": 2}),
+                Phase(name="child", n_trials=1, inherits=parents),
+            ]
+        )
+
+    forward = _experiment_semantic_fingerprint(plan(["left", "right"]))
+    assert _experiment_semantic_fingerprint(plan(["right", "left"])) == forward
+    assert _experiment_semantic_fingerprint(plan(["left"])) != forward
+
+
 def _with_trial_target(experiment: Experiment, n_trials: int) -> Experiment:
     phase = experiment.phases[0].model_copy(update={"n_trials": n_trials})
     return experiment.model_copy(update={"phases": [phase]})

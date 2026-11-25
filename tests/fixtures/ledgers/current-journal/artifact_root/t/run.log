@@ -1,14 +1,14 @@
-2026-11-24 22:38:48 I phasesweep.engine.run Run started: experiment t, pid 3269851
-2026-11-24 22:38:48 I phasesweep.engine.artifact_roots Bound study t::p::7577ebe79cdcb473 to artifact root /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root/t
-2026-11-24 22:38:48 I phasesweep.report p  2 trials to run, 1 at a time
-2026-11-24 22:38:48 I phasesweep.runtime.gpu CUDA_VISIBLE_DEVICES exposes no devices; phase will pin CUDA_VISIBLE_DEVICES='' in trial environments without GPU host locks.
-2026-11-24 22:38:49 I phasesweep.report p  trial 0  RUNNING  a=1
-2026-11-24 22:38:49 I phasesweep.engine.trial [p/trial_0] printf 'PSWOBJ=0.5\n' --a=1
-2026-11-24 22:38:49 I phasesweep.report p  trial 0  COMPLETE  objective 0.5  0.4s  1/2  a=1
-2026-11-24 22:38:49 I phasesweep.report p  trial 1  RUNNING  a=10
-2026-11-24 22:38:49 I phasesweep.engine.trial [p/trial_1] printf 'PSWOBJ=0.5\n' --a=10
-2026-11-24 22:38:49 I phasesweep.report p  trial 1  COMPLETE  objective 0.5  0.4s  2/2  a=10
-2026-11-24 22:38:49 W phasesweep.engine.selection [p] tie: trial 1 matched the winner's value exactly with different params
-2026-11-24 22:38:49 I phasesweep.report p  winner: trial 0  objective 0.5  a=1
-2026-11-24 22:38:49 I phasesweep.engine.run Wrote /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root/t/generations/7dd6b6e5702b4ec88c7052982ffb9fa6/summary.yaml
-2026-11-24 22:38:49 I phasesweep.engine.run Run finished: experiment t, pid 3269851, 1 phase, 2 trials, 0 from a previous run, 1.1s
+2026-11-24 23:58:38 I phasesweep.engine.run Run started: experiment t, pid 3345566
+2026-11-24 23:58:38 I phasesweep.engine.artifact_roots Bound study t::p::7577ebe79cdcb473 to artifact root /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root/t
+2026-11-24 23:58:38 I phasesweep.report p  2 trials to run, 1 at a time
+2026-11-24 23:58:38 I phasesweep.runtime.gpu CUDA_VISIBLE_DEVICES exposes no devices; phase will pin CUDA_VISIBLE_DEVICES='' in trial environments without GPU host locks.
+2026-11-24 23:58:38 I phasesweep.report p  trial 0  RUNNING  a=1
+2026-11-24 23:58:38 I phasesweep.engine.trial [p/trial_0] printf 'PSWOBJ=0.5\n' --a=1
+2026-11-24 23:58:39 I phasesweep.report p  trial 0  COMPLETE  objective 0.5  0.6s  1/2  a=1
+2026-11-24 23:58:39 I phasesweep.report p  trial 1  RUNNING  a=10
+2026-11-24 23:58:39 I phasesweep.engine.trial [p/trial_1] printf 'PSWOBJ=0.5\n' --a=10
+2026-11-24 23:58:39 I phasesweep.report p  trial 1  COMPLETE  objective 0.5  0.6s  2/2  a=10
+2026-11-24 23:58:39 W phasesweep.engine.selection [p] tie: trial 1 matched the winner's value exactly with different params
+2026-11-24 23:58:39 I phasesweep.report p  winner: trial 0  objective 0.5  a=1
+2026-11-24 23:58:39 I phasesweep.engine.run Wrote /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root/t/generations/6cf5941ee2ca4e22b46076ec0c6b0dc1/summary.yaml
+2026-11-24 23:58:39 I phasesweep.engine.run Run finished: experiment t, pid 3345566, 1 phase, 2 trials, 0 from a previous run, 1.5s
