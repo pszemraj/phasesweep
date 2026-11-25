@@ -933,7 +933,11 @@ def _validate_grown_grid_target(
 
 
 def _scheduled_reruns(
-    study: optuna.Study, trials: Sequence[optuna.trial.FrozenTrial], phase: Phase | None = None
+    study: optuna.Study,
+    trials: Sequence[optuna.trial.FrozenTrial],
+    phase: Phase | None = None,
+    *,
+    possible: bool = False,
 ) -> list[optuna.trial.FrozenTrial]:
     """Return the trials the next run reruns before any new draw and has not yet queued.
 
@@ -945,6 +949,7 @@ def _scheduled_reruns(
     :param optuna.Study study: Study holding the trials and grid history.
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
     :param Phase | None phase: Phase whose target may retry a failed fixed trial or grid cell.
+    :param bool possible: Include failures whose retry eligibility depends on pending reads.
     :return list[optuna.trial.FrozenTrial]: The trials to rerun, in scheduling order.
     """
     sources = _rerun_sources(trials)
@@ -952,7 +957,7 @@ def _scheduled_reruns(
         return sources
     if not phase_draws(phase):
         if (
-            not sources
+            (possible or not sources)
             and trials
             and _trial_run_state(trials[-1]) == "FAIL"
             and _finished_trial_count(trials) < phase.n_trials
@@ -964,7 +969,8 @@ def _scheduled_reruns(
         slots = max(
             0, phase.n_trials - _finished_trial_count(trials) - len(sources) - waiting - undrawn
         )
-        sources.extend(_failed_grid_cells(trials)[:slots])
+        failed = _failed_grid_cells(trials)
+        sources.extend(failed if possible else failed[:slots])
     return sources
 
 

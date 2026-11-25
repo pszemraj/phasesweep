@@ -6,7 +6,7 @@ import logging
 import shlex
 from pathlib import Path
 from typing import Literal
-from unittest.mock import patch
+from unittest.mock import DEFAULT, patch
 
 import optuna
 import pytest
@@ -298,6 +298,116 @@ def test_adaptive_donor_positions_bound_coverage_before_adoption(tmp_path: Path)
         study = _study(target)
         assert len(study.trials) == study.user_attrs[TRIAL_TARGET_ATTR] == 1
     assert _launches(launches) == 2
+
+
+@pytest.mark.parametrize("interrupted_fill", [False, True])
+def test_fill_preview_counts_donors_outside_its_source(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, interrupted_fill: bool
+) -> None:
+    """Bound new launches after a fresh or interrupted fill without writing its ledger."""
+    trainer, launches = _trainer(tmp_path)
+    phase = _phase("grid", 1)
+    run_experiment(_config(tmp_path, trainer, phase, "acc"))
+    run_experiment(_config(tmp_path, trainer, phase))
+    two = phase.model_copy(update={"n_trials": 2})
+    sibling = _config(tmp_path, trainer, two, "acc")
+    run_experiment(sibling)
+    grown = two.model_copy(
+        update={"search_space": {"x": CategoricalParam(type="categorical", choices=[1, 2, 3, 4])}}
+    )
+    run_experiment(_config(tmp_path, trainer, grown))
+    target = _config(
+        tmp_path, trainer, grown.model_copy(update={"n_trials": 3}), "loss", "maximize"
+    )
+    if interrupted_fill:
+        with patch.object(reread_ops, "_reread_trial", wraps=reread_ops._reread_trial) as read:
+            read.side_effect = [DEFAULT, reread_ops._fill_timeout(target, target.phases[0])]
+            with pytest.raises(PhaseTimeoutError):
+                run_experiment(target)
+        assert len(_study(target).trials) == 1
+    trainer.unlink()
+    journal = tmp_path / "studies.journal"
+    before = journal.read_bytes()
+    caplog.set_level(logging.INFO)
+
+    run_experiment(target, dry_run=True)
+
+    assert "may need to launch up to 1 trial depending on the re-read results" in caplog.text
+    sparse = _config(
+        tmp_path, trainer, grown.model_copy(update={"n_trials": 4}), "loss", "maximize"
+    )
+    with pytest.raises(LaunchEnvironmentError, match="not an executable file"):
+        run_experiment(sparse, dry_run=True)
+    assert journal.read_bytes() == before
+    run_experiment(target)
+    assert _launches(launches) == 3
+    rows = _study(target).trials
+    assert [row.params["x"] for row in rows] == [3, 4, 2]
+    assert (
+        rows[-1].user_attrs[ATTEMPT_ID_ATTR]
+        == _study(sibling).trials[-1].user_attrs[ATTEMPT_ID_ATTR]
+    )
+    assert read_status(target)["publication_integrity"] == "ok"
+
+
+def test_fill_preview_counts_the_rerun_that_sibling_draws_cannot_cover(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A partially filled study still forecasts an interrupted draw's definite rerun."""
+    stage = tmp_path / "stage"
+    launches = tmp_path / "launches"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import sys, time
+        from pathlib import Path
+        with Path({str(launches)!r}).open("a") as log:
+            print("launch", file=log)
+        stage = Path({str(stage)!r}).read_text()
+        if stage == "interrupt":
+            time.sleep(30)
+        if stage == "fail":
+            raise SystemExit(9)
+        Path(sys.argv[sys.argv.index("--out") + 1]).write_text('{{"loss": 1, "acc": 2}}')
+        """,
+    )
+    phase = _phase("random", 1).model_copy(update={"max_consecutive_failures": 10})
+    two = phase.model_copy(update={"n_trials": 2})
+    stage.write_text("measure")
+    run_experiment(_config(tmp_path, trainer, phase))
+    run_experiment(_config(tmp_path, trainer, phase, "acc"))
+    stage.write_text("interrupt")
+    timed = two.model_copy(update={"timeout_seconds_per_phase": 3})
+    with pytest.raises(PhaseTimeoutError, match="timed out via phase guard"):
+        run_experiment(_config(tmp_path, trainer, timed))
+    stage.write_text("measure")
+    run_experiment(_config(tmp_path, trainer, two, "acc"))
+    stage.write_text("fail")
+    sibling = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 5}), "acc")
+    run_experiment(sibling)
+    stage.write_text("measure")
+    target = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 4}), goal="maximize")
+    with (
+        patch.object(
+            reread_ops, "_stamp_identity", side_effect=RuntimeError("pause before sealing")
+        ),
+        pytest.raises(RuntimeError, match="pause before sealing"),
+    ):
+        run_experiment(target)
+    before = _launches(launches)
+    caplog.set_level(logging.INFO)
+
+    run_experiment(target, dry_run=True)
+    assert "DRY RUN total: would launch 1 trial (1 rerun) across 1 phase" in caplog.text
+    assert _launches(launches) == before
+    run_experiment(target)
+
+    rows = _study(target).trials
+    assert _launches(launches) == before + 1
+    assert rows[2].user_attrs[RERUN_OF_ATTR] == 1
+    assert [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows[3:]] == [
+        row.user_attrs[ATTEMPT_ID_ATTR] for row in _study(sibling).trials[2:4]
+    ]
 
 
 def test_mid_phase_adoption_deadline_preserves_new_training_on_restart(tmp_path: Path) -> None:

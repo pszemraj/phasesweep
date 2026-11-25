@@ -105,7 +105,9 @@ from phasesweep.engine.study_policy import (
     _record_recovery_boundary,
     _record_trial_target,
     _recorded_outcome_sequence,
+    _rerun_sources,
     _scheduled_reruns,
+    _undrawn_grown_grid_cells,
 )
 from phasesweep.engine.trial import TrialResult, _failed_trial, record_trial_result
 from phasesweep.engine.trial_dirs import (
@@ -570,6 +572,23 @@ def _finish_fill(
     return adjusted
 
 
+def _begin_fill(target: optuna.Study, source: FillSource) -> None:
+    """Record the fill's source before importing rows.
+
+    :param optuna.Study target: The study being filled.
+    :param FillSource source: The study whose history is imported.
+    """
+    _initialize_study_schema(target)
+    if REREAD_FILL_ATTR not in target.user_attrs:
+        target.set_user_attr(
+            REREAD_FILL_ATTR,
+            {
+                "schema_version": REREAD_FILL_SCHEMA_VERSION,
+                "study_name": source.study.study_name,
+            },
+        )
+
+
 def preview_filled_study(
     experiment: Experiment,
     phase: Phase,
@@ -577,20 +596,32 @@ def preview_filled_study(
     source: FillSource,
     trials: Sequence[optuna.trial.FrozenTrial],
 ) -> optuna.Study:
-    """Project already-known fill verdicts using the same policy as the live fill.
+    """Project fill history for launch planning.
+
+    Unread rows are possible failures for finding retry donors. They cannot supply
+    settled policy or an adaptive proposal until the actual measurements are read.
 
     :param Experiment experiment: Current reading settings.
     :param Phase phase: Phase whose run is being previewed.
     :param str study_name: Addressed study's name.
     :param FillSource source: Source study and its recorded phase policy.
-    :param Sequence[optuna.trial.FrozenTrial] trials: Already-known rows of the addressed study.
-    :return optuna.Study: An in-memory study ready for the ordinary recorded-phase checks.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Committed and forthcoming rows of the fill.
+    :return optuna.Study: An in-memory study with the projected history and identity.
     """
     from phasesweep.engine.ledger import open_preview_study
 
     study = open_preview_study(experiment, phase, study_name=study_name)
-    study.add_trials(trials)
-    _finish_fill(experiment, phase, study, source)
+    _begin_fill(study, source)
+    for trial in trials:
+        if trial.number in source.reread_trials:
+            trial = copy.copy(trial)
+            trial.state = optuna.trial.TrialState.FAIL
+            trial.values = None
+        study.add_trial(_sampling_trial_for_reread(trial, study.sampler))
+    if source.reread_trials:
+        _stamp_identity(study, _reread_record(source.record, reading_settings(experiment, phase)))
+    else:
+        _finish_fill(experiment, phase, study, source)
     return study
 
 
@@ -635,16 +666,7 @@ def fill_study(
             f"Study {target.study_name!r} holds trials that study {source.study.study_name!r} "
             "does not, so it cannot be filled from it."
         )
-    _initialize_study_schema(target)
-    stored = target.user_attrs
-    if REREAD_FILL_ATTR not in stored:
-        target.set_user_attr(
-            REREAD_FILL_ATTR,
-            {
-                "schema_version": REREAD_FILL_SCHEMA_VERSION,
-                "study_name": source.study.study_name,
-            },
-        )
+    _begin_fill(target, source)
     by_number = {trial.number: trial for trial in trials}
     attempts = producing_attempts(other_studies)
     launches = directory_launches(attempts)
@@ -706,7 +728,11 @@ class SiblingTrial(NamedTuple):
 
 
 def pending_sibling_retries(
-    phase: Phase, study: optuna.Study, others: Sequence[optuna.Study]
+    phase: Phase,
+    study: optuna.Study,
+    others: Sequence[optuna.Study],
+    *,
+    required_reruns: frozenset[int] | None = None,
 ) -> tuple[SiblingTrial, ...]:
     """Resolve outstanding reruns that already finished training in sibling studies.
 
@@ -717,6 +743,8 @@ def pending_sibling_retries(
     :param Phase phase: Config whose remaining target and rerun policy choose the slots.
     :param optuna.Study study: Target study whose reruns are examined.
     :param Sequence[optuna.Study] others: The phase's other reading studies.
+    :param frozenset[int] | None required_reruns: Reruns that unread verdicts cannot close,
+        or None for a settled target.
     :return tuple[SiblingTrial, ...]: Completed training matching each outstanding slot.
     """
     others = tuple(other for other in others if other.study_name != study.study_name)
@@ -731,7 +759,12 @@ def pending_sibling_retries(
         for trial in trials
         if trial.state == optuna.trial.TrialState.WAITING and RERUN_OF_ATTR in trial.user_attrs
     ]
-    pending = [*queued, *_scheduled_reruns(study, trials, phase)][:room]
+    pending = [
+        *queued,
+        *_scheduled_reruns(study, trials, phase, possible=required_reruns is not None),
+    ]
+    if required_reruns is None:
+        pending = pending[:room]
     if not pending:
         return ()
     by_number = {trial.number: trial for trial in trials}
@@ -788,7 +821,15 @@ def pending_sibling_retries(
                 )
                 retry.producers.append(owner)
                 break
-    return tuple(matches[trial.number] for trial in pending if trial.number in matches)
+    matched = tuple(matches[trial.number] for trial in pending if trial.number in matches)
+    if required_reruns is None:
+        return matched
+    # An optional retry must have a slot left after required reruns and reserved grid cells.
+    required = tuple(retry for retry in matched if retry.source.number in required_reruns)
+    optional = tuple(retry for retry in matched if retry.source.number not in required_reruns)
+    undrawn = _undrawn_grown_grid_cells(study, phase, trials)
+    optional_slots = max(0, room - len(required_reruns) - undrawn)
+    return required[:room] + optional[:optional_slots]
 
 
 def _sibling_draw_candidates(
@@ -859,7 +900,7 @@ def _sibling_draw_positions(
 
 
 class SiblingPlan(NamedTuple):
-    """Matched trials and the number of later adaptive slots a sibling might also supply."""
+    """Matched trials and adaptive slots with donors whose proposals are still unknown."""
 
     reads: tuple[SiblingTrial, ...] = ()
     possible_later: int = 0
@@ -878,6 +919,7 @@ def _planned_sibling_draws(
     *,
     after_gap: bool = False,
     pending_reruns: int = 0,
+    unread: bool = False,
 ) -> SiblingPlan:
     """Match this study's prospective draws, stopping when an adaptive result is unknown.
 
@@ -887,6 +929,7 @@ def _planned_sibling_draws(
     :param Sequence[ProducingAttempt] candidates: Compatible physical draws, newest first.
     :param bool after_gap: Include later deterministic draws after one needs a launch.
     :param int pending_reruns: Slots already owed to retries before any new draw.
+    :param bool unread: Whether earlier measurements can still change the next adaptive proposal.
     :return SiblingPlan: Matched draws and additional possible adaptive positions.
     """
     if not candidates:
@@ -937,7 +980,7 @@ def _planned_sibling_draws(
         if adaptive and after_gap:
             # A retry's unknown result can change even the first new proposal. Once a
             # proposal is known, only strictly later positions still depend on its score.
-            if pending_reruns:
+            if pending_reruns or unread:
                 return SiblingPlan(possible_later=len(by_position))
             possible_later = len(by_position) - int(position in by_position)
         room = min(room, max(by_position) - position + 1)
@@ -988,6 +1031,7 @@ def pending_sibling_trials(
     others: Sequence[optuna.Study],
     *,
     forecast: bool = False,
+    unread: frozenset[int] = frozenset(),
 ) -> SiblingPlan:
     """Find kept training for pending reruns or the next draws this study would make.
 
@@ -1000,13 +1044,26 @@ def pending_sibling_trials(
     :param optuna.Study study: Initialized target study.
     :param Sequence[optuna.Study] others: Other reading studies of the phase.
     :param bool forecast: Include slots after pending retries and possible launches.
+    :param frozenset[int] unread: Fill rows whose verdicts still depend on their measurements.
     :return SiblingPlan: Available reads and remaining adaptive positions with donors.
     """
-    retries = pending_sibling_retries(phase, study, others)
-    pending = _pending_rerun_count(study, phase)
-    if (pending and not forecast) or (
-        phase.n_trials <= _finished_trial_count(study.get_trials(deepcopy=False)) + pending
-    ):
+    trials = study.get_trials(deepcopy=False)
+    if unread:
+        required = frozenset(
+            trial.number for trial in _rerun_sources(trials, assumed_complete=unread)
+        ) | frozenset(
+            trial.number
+            for trial in trials
+            if trial.state == optuna.trial.TrialState.WAITING and RERUN_OF_ATTR in trial.user_attrs
+        )
+        retries = pending_sibling_retries(phase, study, others, required_reruns=required)
+        # An optional covered retry displaces at most one covered new draw, so forecast the
+        # most covered retries that can fit and leave their slots out of the new-draw window.
+        pending = len(required) + sum(retry.source.number not in required for retry in retries)
+    else:
+        retries = pending_sibling_retries(phase, study, others)
+        pending = _pending_rerun_count(study, phase)
+    if (pending and not forecast) or (phase.n_trials <= _finished_trial_count(trials) + pending):
         return SiblingPlan(retries)
     draws = _planned_sibling_draws(
         experiment,
@@ -1015,6 +1072,7 @@ def pending_sibling_trials(
         _sibling_draw_candidates(experiment, phase, study, others),
         after_gap=forecast,
         pending_reruns=pending,
+        unread=bool(unread),
     )
     return SiblingPlan(retries + draws.reads, draws.possible_later)
 
