@@ -8,6 +8,7 @@ the earlier attempt's summary for minutes after the rerun finished.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -424,6 +425,7 @@ def test_a_reruns_own_crash_fails_the_read(monkeypatch: pytest.MonkeyPatch) -> N
     ("axis", "mode", "expected"),
     [
         ("eval/step", "native", (0.02, 0.9)),
+        ("eval/step", "rounded-summary", (0.02, 0.9)),
         ("_step", "native", (0.01, 0.99)),
         ("eval/step", "literal", (0.01, 0.99)),
         ("eval/step", "summary-only", (0.11, 0.88)),
@@ -455,6 +457,8 @@ def test_a_rerun_replaces_the_observed_training_suffix_for_native_extrema(
     if mode == "missing-axis":
         rows[0].pop("eval/step")
     native = (0.11, 0.88) if mode == "summary-only" else (0.01, 0.99)
+    if mode == "rounded-summary":
+        native = (math.nextafter(native[0], 0), math.nextafter(native[1], 1))
     last_step = len(rows) - 1
     summary = {
         "_step": last_step,

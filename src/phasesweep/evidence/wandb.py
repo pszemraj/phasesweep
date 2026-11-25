@@ -651,7 +651,8 @@ def _resumed_extrema(
         for operation in kinds:
             key = f"{series}.{operation}"
             reduce = min if operation == "min" else max
-            if reduce(all_values) != values[key]:
+            # W&B can serialize the same value one binary64 step apart in summary and history.
+            if math.nextafter(reduce(all_values), values[key]) != values[key]:
                 continue
             if not kept_values:
                 raise _RetainedHistoryError(
