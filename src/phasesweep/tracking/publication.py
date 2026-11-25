@@ -307,9 +307,8 @@ def _records(experiment: Experiment, scope: str | None, *, skip: str | None = No
     """List the delivery records in scope in sending order, each summary run's last.
 
     A summary run ends last, so a summary run MLflow shows ended had the attempt outcomes and
-    winner references it summarizes sent before it. Generations are taken by ID, which says
-    nothing of when each ran, so no order among earlier runs is promised; nothing on this path
-    reads when a generation started.
+    winner references it summarizes sent before it. Generations are grouped by ID, which says
+    nothing of when each ran; :func:`_pending_records` orders them by their records' timestamps.
 
     :param Experiment experiment: Configured experiment.
     :param str | None scope: One generation, or ``None`` for every generation.
@@ -328,18 +327,29 @@ def _pending_records(
 ) -> list[Path]:
     """List the delivery records in scope that are still to be sent, in sending order.
 
+    Generations go oldest first by their oldest pending record's timestamp, so when two
+    readings of one run are both pending, the newest reading is sent last and the run's status,
+    tags and artifacts end as its metric does, on the newest point.
+
     :param Experiment experiment: Configured experiment.
     :param str | None scope: One generation, or ``None`` for every generation.
     :param str | None skip: Generation left out, a live invocation's own.
     :raises OSError: A record cannot be read.
     :raises ValueError: A record is malformed.
-    :return list[Path]: Undelivered records, as :func:`_records` orders them.
+    :return list[Path]: Undelivered records, each generation's as :func:`_records` orders them.
     """
-    return [
-        path
-        for path in _records(experiment, scope, skip=skip)
-        if not _read_delivery(path).delivered
-    ]
+    oldest: dict[str, int] = {}
+    pending: list[Path] = []
+    for path in _records(experiment, scope, skip=skip):
+        delivery = _read_delivery(path)
+        if not delivery.delivered:
+            generation_id = path.parent.parent.name
+            oldest[generation_id] = min(
+                oldest.get(generation_id, delivery.timestamp), delivery.timestamp
+            )
+            pending.append(path)
+    # A stable sort keeps each generation's records in the order _records gives them.
+    return sorted(pending, key=lambda path: oldest[path.parent.parent.name])
 
 
 def _save_intent(
@@ -427,21 +437,34 @@ def _shown_attempts(experiment: Experiment) -> dict[str, _Shown]:
 
 
 def _generation_timestamp(experiment: Experiment, generation_id: str) -> int | None:
-    """Return the newest timestamp a generation's saved records carry.
+    """Return the time a record rebuilt for an ended generation is stamped with.
 
-    A record rebuilt for an ended generation takes it, so it stays older than every later
-    generation's records and never displaces their reading.
+    That is the newest timestamp the generation's saved records carry or, when it saved none,
+    the time it wrote its lifecycle record, which is written once as the generation ends. The
+    record then stays older than every later generation's records and never displaces their
+    reading. Neither the summary nor the winners record when the generation ran: a winner's
+    capture time is that of the reading it adopted, which can predate a later generation.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Ended generation.
-    :raises OSError: A record cannot be read.
+    :raises OSError: A record or the lifecycle record cannot be read.
     :raises ValueError: A record is malformed.
-    :return int | None: Milliseconds, or ``None`` when the generation saved no record.
+    :return int | None: Milliseconds, or ``None``, stamping now, for a generation with neither:
+        the pointer target, whose lifecycle record follows the pointer commit, or one killed
+        outright, whose records the next run's first pass rebuilds before it saves its own.
     """
-    return max(
+    from phasesweep.engine.paths import _generation_record_path
+
+    saved = max(
         (_read_delivery(path).timestamp for path in _records(experiment, generation_id)),
         default=None,
     )
+    if saved is not None:
+        return saved
+    try:
+        return _generation_record_path(experiment, generation_id).stat().st_mtime_ns // 1_000_000
+    except FileNotFoundError:
+        return None
 
 
 def _accepted_projection(

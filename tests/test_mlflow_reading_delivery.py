@@ -48,6 +48,76 @@ def _reread_setup(
     return reread, uploads, winner.attempt_id
 
 
+def _run_shows(uploads: list[JsonObject], attempt: str) -> tuple[object, object, object]:
+    """Fold the uploads to one attempt's run as MLflow keeps them.
+
+    :return tuple[object, object, object]: The last status set, the objective point with the
+        newest timestamp, and the metric of the attempt artifact uploaded last.
+    """
+    sent = [upload for upload in uploads if upload["binding"]["attempt_id"] == attempt]
+    readings = [upload for upload in sent if upload["name"] == f"attempt-{attempt}"]
+    status = [upload["finish"] for upload in readings if upload["finish"]][-1]
+    newest = max(readings, key=lambda upload: upload["projection"]["timestamp"])
+    objective = newest["projection"]["metrics"]["phasesweep.objective"]
+    return status, objective, readings[-1]["projection"]["summary"]["metric"]
+
+
+def _silent_tracker(outage: pytest.MonkeyPatch) -> None:
+    """Make every MLflow request but a capture go unanswered."""
+    respond = session.request_operation
+
+    def silent(request: JsonObject, **kwargs: object) -> JsonObject:
+        if request["action"] == "capture":
+            return respond(request, **kwargs)
+        raise OperationUnavailableError("tracking server did not answer in time")
+
+    outage.setattr(session, "request_operation", silent)
+    outage.setattr(worker, "request_operation", silent)
+
+
+def test_a_run_ends_on_the_newest_of_two_pending_readings(tmp_path, monkeypatch):
+    """Two readings queued in one outage are sent oldest first, whatever their generation IDs."""
+    config, uploads, attempt = _reread_setup(tmp_path, monkeypatch)
+    original = deepcopy(config)
+    original["metric"]["extractor"]["metric_key"] = "eval/loss"
+    older, newer = "f" * 32, "0" * 32  # the newer generation's ID sorts first
+    with monkeypatch.context() as outage:
+        _silent_tracker(outage)
+        experiment = Experiment.model_validate(config)
+        assert run_experiment(experiment, generation_id=older)["depth"].metric == 3.0
+        newest = Experiment.model_validate(original)
+        assert run_experiment(newest, generation_id=newer)["depth"].metric == 1.0
+
+    assert publication.sync_tracking(newest)["pending"] == 0
+    assert _run_shows(uploads, attempt) == ("FINISHED", 1.0, 1.0)
+    winners = [upload for upload in uploads if upload["name"] == "winner-depth"]
+    assert f"phasesweep.winner_generation.{newer}" in winners[-1]["projection"]["tags"]
+
+
+def test_rebuilding_an_older_generations_records_keeps_the_newer_reading(tmp_path, monkeypatch):
+    """Records rebuilt for a generation that has none left take its lifecycle record's time."""
+    config, uploads, attempt = _reread_setup(tmp_path, monkeypatch)
+    reports: list[TerminalReport] = []
+    experiment = Experiment.model_validate(config)
+    assert run_experiment(experiment, terminal_callback=reports.append)["depth"].metric == 3.0
+    first = next(
+        path.parent.parent.name
+        for path in session.tracking_root(experiment).glob(f"*/delivery/attempt-{attempt}.json")
+        if path.parent.parent.name != reports[0].generation_id
+    )
+    for path in (session.tracking_root(experiment) / first / "delivery").iterdir():
+        path.unlink()
+    before = len(uploads)
+
+    assert publication.sync_tracking(experiment)["pending"] == 0
+    rebuilt = session.read_record(
+        session.tracking_root(experiment) / first / "delivery" / f"attempt-{attempt}.json"
+    )
+    assert rebuilt["state"] == "delivered"
+    assert {upload["name"] for upload in uploads[before:]} == {"winner-depth", "generation"}
+    assert _run_shows(uploads, attempt) == ("FINISHED", 3.0, 3.0)
+
+
 def test_a_generation_that_launched_nothing_delivers_its_reading(tmp_path, monkeypatch):
     """A reread sends its objective, its winner tag and its own summary run without a launch."""
     config, uploads, attempt = _reread_setup(tmp_path, monkeypatch)
