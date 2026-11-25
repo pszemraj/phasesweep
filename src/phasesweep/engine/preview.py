@@ -58,7 +58,13 @@ from phasesweep.engine.phase import (
     _winner_overrides,
 )
 from phasesweep.engine.progress import _log_phase_header
-from phasesweep.engine.reread import FillSource, describe_changes, fill_source, preview_filled_study
+from phasesweep.engine.reread import (
+    FillSource,
+    describe_changes,
+    fill_source,
+    pending_sibling_retries,
+    preview_filled_study,
+)
 from phasesweep.engine.state import (
     PHASE_DECISION_ATTR,
     RecoveredTrialState,
@@ -521,7 +527,9 @@ def _refuse_as_a_launch_would(
             continue
         record = records[known_study.study_name]
         predicted = (record.finished, record.measured) if record.running else None
-        reached.append(ReachedStudy(phase, known_study, predicted=predicted))
+        reached.append(
+            ReachedStudy(phase, known_study, predicted=predicted, siblings=studies[phase.name])
+        )
     errors.extend(_reached_study_refusals(experiment, reached))
     _raise_collected_errors(errors)
     resume_ops._reject_fixed_targets_without_study(
@@ -680,6 +688,30 @@ def _preview_phase(
             )
             return _replayed_phase_preview(phase, inherited_winners, resumed)
         resume = resumed
+        if fill is None and remaining:
+            siblings = tuple(
+                record.study for record in recorded_studies or () if record.study is not None
+            )
+            kept = min(remaining, len(pending_sibling_retries(phase, study, siblings)))
+            if kept:
+                log.info(
+                    "DRY RUN phase=%s would re-read %s from a sibling study to settle pending reruns",
+                    phase.name,
+                    plural(kept, "finished trial"),
+                )
+                if kept == remaining:
+                    log.info("DRY RUN phase=%s would launch no trials", phase.name)
+                    winner = _placeholder_winner(experiment, phase, inherited_winners)
+                    return PhasePreview(winner=winner, launches=0, reruns=0)
+                if phase.inherits:
+                    _launch_preflight(experiment, phase.name, study)
+                warn_dry_run(
+                    "phase=%s would need up to %s if the re-read evidence permits this target",
+                    phase.name,
+                    plural(remaining - kept, "trainer launch"),
+                )
+                winner = _preview_trial_command(experiment, phase, inherited_winners)
+                return PhasePreview(winner=winner, launches=None, reruns=0)
     _log_phase_header(
         phase,
         study_name,

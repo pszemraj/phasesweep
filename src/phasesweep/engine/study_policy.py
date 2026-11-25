@@ -142,6 +142,53 @@ def _consecutive_failure_threshold_tripped(consecutive_failures: int, phase: Pha
     return consecutive_failures >= phase.max_consecutive_failures
 
 
+def _abort_decision(
+    phase: Phase,
+    trial_number: int,
+    outcome: str,
+    *,
+    completion_sequence: int,
+    consecutive_failures: int,
+    abort_recorded: bool,
+    cause: str | None = None,
+    fatal_policy: str | None = None,
+) -> JsonObject | None:
+    """Return the abort record that recording ``outcome`` after the given state would trip.
+
+    Live trials, recovered outcomes and sibling re-reads apply the target study’s failure policy.
+
+    :param Phase phase: Phase whose ``max_consecutive_failures`` and ``n_trials`` apply.
+    :param int trial_number: Trial whose outcome is about to be recorded.
+    :param str outcome: The terminal outcome about to be recorded.
+    :param int completion_sequence: Completion sequence of the last recorded outcome.
+    :param int consecutive_failures: Failure streak before ``outcome``.
+    :param bool abort_recorded: Whether the phase already recorded an abort.
+    :param str | None cause: The outcome's recorded cause, if any.
+    :param str | None fatal_policy: The fatal policy of a ``"fatal"`` outcome.
+    :return JsonObject | None: The abort record at the next completion sequence, or ``None``
+        when the outcome trips nothing.
+    """
+    if abort_recorded:
+        return None
+    sequence = completion_sequence + 1
+    if outcome == "fatal":
+        return _abort_record(
+            policy=fatal_policy or "fatal_trial_exception",
+            completion_sequence=sequence,
+            trial_target=phase.n_trials,
+            cause=cause or f"trial {trial_number} hit a fatal objective error",
+        )
+    streak = _next_consecutive_failures(consecutive_failures, outcome)
+    if not _consecutive_failure_threshold_tripped(streak, phase):
+        return None
+    return _failure_policy_abort_record(
+        phase,
+        consecutive_failures=streak,
+        completion_sequence=sequence,
+        trial_target=phase.n_trials,
+    )
+
+
 def _abort_record(
     *,
     policy: str,
@@ -1737,6 +1784,7 @@ class ReachedStudy(NamedTuple):
     #: Finished and measured counts a launch's recovery would leave, for a dry run's study whose
     #: RUNNING attempts it has not recovered; ``None`` for a settled study, whose trials give them.
     predicted: tuple[int, int] | None = None
+    siblings: Sequence[optuna.Study] = ()
 
 
 def _reached_study_refusals(
@@ -1758,6 +1806,8 @@ def _reached_study_refusals(
         already past its direction and schema checks.
     :return list[Exception]: The refusals in phase order; empty when every study passes.
     """
+    from phasesweep.engine.reread import pending_sibling_retries
+
     for item in reached:
         try:
             _verify_recorded_identity(item.study, experiment, item.phase)
@@ -1784,7 +1834,9 @@ def _reached_study_refusals(
                 _validate_fixed_configuration_target(phase, finished=finished, measured=measured)
                 _validate_grown_grid_target(study, phase, study.get_trials(deepcopy=False))
                 needs_new_trials = phase.n_trials > finished
-            if needs_new_trials:
+            if needs_new_trials and phase.n_trials > finished + len(
+                pending_sibling_retries(phase, study, item.siblings)
+            ):
                 _launch_preflight(experiment, phase.name, study)
             _validate_selection_evidence(experiment, {phase.name: study})
         except Exception as exc:

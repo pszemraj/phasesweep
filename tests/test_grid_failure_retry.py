@@ -24,7 +24,7 @@ from phasesweep.engine.selection import (
     _streak_at_limit_error,
 )
 from phasesweep.engine.state import PHASE_RECOVERY_ATTR
-from phasesweep.engine.study_policy import _load_phase_policy_state
+from phasesweep.engine.study_policy import _failure_policy_abort_record, _load_phase_policy_state
 from phasesweep.errors import REJUDGE_BOUNDS_STEP
 from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import (
@@ -472,7 +472,7 @@ def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> N
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(original)
     phase = original.phases[0]
-    streak = phase_ops._failure_policy_abort_record(
+    streak = _failure_policy_abort_record(
         phase, consecutive_failures=2, completion_sequence=2, trial_target=4
     )
 
@@ -503,7 +503,7 @@ def test_infeasible_streak_advice_says_a_bounds_change_rejudges_the_trials(
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(original)
     phase = original.phases[0]
-    streak = phase_ops._failure_policy_abort_record(
+    streak = _failure_policy_abort_record(
         phase, consecutive_failures=2, completion_sequence=2, trial_target=4
     )
     at_limit = _streak_at_limit_error(original, phase, streak, phase_study(original))

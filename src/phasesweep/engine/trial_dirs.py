@@ -81,6 +81,8 @@ class ProducingAttempt(NamedTuple):
 
     study: Study
     trial: FrozenTrial
+    #: Numbered rows of the producing study, shared by all its attempts.
+    rows: Mapping[int, FrozenTrial]
 
 
 def producing_attempts(studies: Sequence[Study]) -> dict[str, ProducingAttempt]:
@@ -89,41 +91,80 @@ def producing_attempts(studies: Sequence[Study]) -> dict[str, ProducingAttempt]:
     Each fill pins its source, and never changes the attempt IDs it copies. A row whose
     direct source contains its ID is a copy, even if its source was itself filled.
     Later trials can have the same number in siblings, so numbers cannot identify copies.
-    If the source was lost, the generation that launched the trainer still proves its
-    address from its frozen config and the inherited values kept by both studies.
+    A study can also import a sibling's finished continuation. It does not copy that sibling's
+    allocation context. The context and, where needed, the frozen generation's study address
+    distinguish the physical launch from those later copies.
 
     :param Sequence[Study] studies: Studies of the phase from one ledger or live run.
     :raises StudySchemaMismatchError: A study's fill provenance is malformed.
     :return dict[str, ProducingAttempt]: Unambiguous producing rows by attempt ID.
     """
+    from phasesweep.engine.study_policy import _allocation_contexts
+
+    numbered = {
+        study.study_name: {trial.number: trial for trial in study.get_trials(deepcopy=False)}
+        for study in studies
+    }
     rows = {
         study.study_name: {
             attempt_id: trial
-            for trial in study.get_trials(deepcopy=False)
+            for trial in numbered[study.study_name].values()
             if isinstance(attempt_id := trial.user_attrs.get(ATTEMPT_ID_ATTR), str)
         }
         for study in studies
     }
     owners: dict[str, list[ProducingAttempt]] = defaultdict(list)
+    occurrences: dict[str, list[ProducingAttempt]] = defaultdict(list)
     snapshots: dict[tuple[Path, str], Experiment | None] = {}
+    generations = {
+        study.study_name: {record["generation_id"] for record in _allocation_contexts(study)}
+        for study in studies
+    }
+    have_allocations = any(generations.values())
     for study in studies:
         source_name = _fill_source_name(study)
         source = None if source_name is None else rows.get(source_name)
         for attempt_id, trial in rows[study.study_name].items():
+            item = ProducingAttempt(study, trial, numbered[study.study_name])
+            generation = trial.user_attrs.get(GENERATION_ID_ATTR)
+            if (
+                have_allocations
+                and isinstance(generation, str)
+                and generation not in generations[study.study_name]
+            ):
+                continue
+            occurrences[attempt_id].append(item)
             if (
                 source_name is None
-                or (source is not None and attempt_id not in source)
+                or (
+                    source is not None
+                    and (
+                        attempt_id not in source
+                        or (
+                            isinstance(generation, str)
+                            and generation in generations[study.study_name]
+                            and generation not in generations[source_name]
+                        )
+                    )
+                )
                 or source is None
                 and _generation_addresses(study, trial, snapshots)
             ):
-                owners[attempt_id].append(ProducingAttempt(study, trial))
+                owners[attempt_id].append(item)
+    for attempt_id, matches in occurrences.items():
+        if len(matches) > 1 and len(owners.get(attempt_id, ())) != 1:
+            launched = [
+                item for item in matches if _generation_addresses(item.study, item.trial, snapshots)
+            ]
+            if launched:
+                owners[attempt_id] = launched
     return {attempt_id: matches[0] for attempt_id, matches in owners.items() if len(matches) == 1}
 
 
 def _generation_addresses(
     study: Study, trial: FrozenTrial, snapshots: dict[tuple[Path, str], Experiment | None]
 ) -> bool:
-    """Check whether retained launch settings identify a row whose fill source is gone.
+    """Check whether retained launch settings identify a producing row.
 
     :param Study study: Possible launching study.
     :param FrozenTrial trial: Row with a physical attempt identity.
@@ -302,9 +343,11 @@ def earlier_directory_launches(
     """
     from phasesweep.engine.evidence import _earlier_attempts
 
-    launches = directory_launches(producing_attempts(studies), directory=directory)
+    attempts = producing_attempts(studies)
+    launches = directory_launches(attempts, directory=directory)
     return directory_history(
-        launches.get(directory.name, ()), ancestors=_earlier_attempts(trials, trial)
+        launches.get(directory.name, ()),
+        ancestors=_earlier_attempts(trials, trial, attempts=attempts),
     ).earlier
 
 
@@ -327,21 +370,34 @@ def standing_repeat_attempts(trials: Sequence[FrozenTrial]) -> list[FrozenTrial]
     return list(standing.values())
 
 
-def _rerun_directory_sources(
-    trials: Mapping[int, FrozenTrial], trial: FrozenTrial
+def _rerun_chain(
+    trials: Mapping[int, FrozenTrial],
+    trial: FrozenTrial,
+    *,
+    attempts: Mapping[str, ProducingAttempt] | None = None,
 ) -> Iterator[FrozenTrial]:
-    """Yield the earlier attempts that recorded the same directory, newest first.
-
-    Walk through attempts that stopped before recording a directory. Stop at the attempt
-    whose recorded directory carries its own name, even when it was itself a rerun.
+    """Walk a draw from its latest trial to its first, including directory restarts.
 
     :param Mapping[int, FrozenTrial] trials: The study's trials by number.
-    :param FrozenTrial trial: A trial about to launch or one that recorded its directory.
-    :raises ProcessCleanupUncertainError: A source is invalid or its recorded directory is malformed.
-    :return Iterator[FrozenTrial]: Directory sources, from the most recent to the opener.
+    :param FrozenTrial trial: The first trial to yield.
+    :param Mapping[str, ProducingAttempt] | None attempts: Producers to follow for aliases.
+    :raises ProcessCleanupUncertainError: A rerun link does not name an earlier draw ancestor.
+    :return Iterator[FrozenTrial]: Trials in newest-to-oldest order.
     """
     current = trial
+    seen: set[str] = set()
     while True:
+        identity = current.user_attrs.get(ATTEMPT_ID_ATTR)
+        if attempts is not None and isinstance(identity, str):
+            if identity in seen:
+                raise ProcessCleanupUncertainError(
+                    f"Trial {current.number} repeats attempt {identity!r} in its rerun lineage.",
+                    action=OperatorAction.RESTORE_LEDGER,
+                )
+            seen.add(identity)
+            owner = attempts.get(identity)
+            if owner is not None:
+                trials, current = owner.rows, owner.trial
         source_number = current.user_attrs.get(RERUN_OF_ATTR)
         source = trials.get(source_number) if type(source_number) is int else None
         if source_number is not None and (source is None or source.number >= current.number):
@@ -350,18 +406,36 @@ def _rerun_directory_sources(
                 "which is not an earlier trial of its study.",
                 action=OperatorAction.RESTORE_LEDGER,
             )
+        yield current
+        if source is None:
+            return
+        current = source
+
+
+def _rerun_directory_sources(
+    trials: Mapping[int, FrozenTrial],
+    trial: FrozenTrial,
+    *,
+    attempts: Mapping[str, ProducingAttempt] | None = None,
+) -> Iterator[FrozenTrial]:
+    """Yield earlier attempts in the same directory, through its physical opener.
+
+    :param Mapping[int, FrozenTrial] trials: The study's trials by number.
+    :param FrozenTrial trial: A trial about to launch or one that recorded its directory.
+    :param Mapping[str, ProducingAttempt] | None attempts: Producers to follow for aliases.
+    :raises ProcessCleanupUncertainError: A source is invalid or its recorded directory is malformed.
+    :return Iterator[FrozenTrial]: Directory sources, from the most recent to the opener.
+    """
+    for index, current in enumerate(_rerun_chain(trials, trial, attempts=attempts)):
         try:
             recorded = _recorded_trial_dir(current)
         except ValueError as exc:
             raise _unusable_directory_error(current, exc) from exc
         if recorded is not None:
-            if current is not trial:
+            if index:
                 yield current
             if recorded.name == _own_directory_name(current):
                 return
-        if source is None:
-            return
-        current = source
 
 
 def _own_directory_name(trial: FrozenTrial) -> str | None:
@@ -417,17 +491,26 @@ def _owner_directory(phase_dir: Path, owner: FrozenTrial) -> TrialDirectory:
         raise _unusable_directory_error(owner, exc) from exc
 
 
-def _expected_trial_dir_name(trials: Mapping[int, FrozenTrial], trial: FrozenTrial) -> str | None:
+def _expected_trial_dir_name(
+    trials: Mapping[int, FrozenTrial],
+    trial: FrozenTrial,
+    *,
+    attempts: Mapping[str, ProducingAttempt] | None = None,
+) -> str | None:
     """Return the directory name a launched trial must have recorded.
 
     :param Mapping[int, FrozenTrial] trials: The study's trials by number.
     :param FrozenTrial trial: A launched trial.
+    :param Mapping[str, ProducingAttempt] | None attempts: Producers for copied rows.
     :return str | None: The name :func:`_trial_dir_for` builds for the trial that opened its
         directory, or ``None`` when that trial records no attempt.
     """
-    sources = list(_rerun_directory_sources(trials, trial))
-    owner = sources[-1] if sources else trial
-    return _own_directory_name(owner)
+    sources = list(_rerun_directory_sources(trials, trial, attempts=attempts))
+    return (
+        _own_directory_name(sources[-1])
+        if sources
+        else _own_directory_name(next(_rerun_chain(trials, trial, attempts=attempts)))
+    )
 
 
 def _trial_dir_for_attempt(
@@ -438,6 +521,7 @@ def _trial_dir_for_attempt(
     *,
     attempt_id: str,
     recovered: frozenset[int] = frozenset(),
+    studies: Sequence[Study] = (),
 ) -> TrialDirectory:
     """Reuse an available training directory after cleanup, or open a fresh one.
 
@@ -454,6 +538,7 @@ def _trial_dir_for_attempt(
     :param str attempt_id: The new attempt, which names a directory it opens itself.
     :param frozenset[int] recovered: Trial numbers whose cleanup recovery recorded, from
         :func:`phasesweep.engine.attempts._cleanup_recovered_trial_numbers`.
+    :param Sequence[Study] studies: Studies that may supply a continuation's physical opener.
     :raises ProcessCleanupUncertainError: The directory's last attempt may still be running,
         or the recorded directory is unusable.
     :raises PhaseSweepError: The directory path could not be inspected.
@@ -490,7 +575,12 @@ def _trial_dir_for_attempt(
                 "first, so two processes never write one trial directory.",
                 action=OperatorAction.INSPECT_LOGS,
             )
-    directory = _owner_directory(phase_dir, sources[-1])
+    opener = sources[-1]
+    if studies and _required_trial_dir(source).name != _own_directory_name(opener):
+        opener = list(
+            _rerun_directory_sources(trials, trial, attempts=producing_attempts(studies))
+        )[-1]
+    directory = _owner_directory(phase_dir, opener)
     unavailable = _unavailable_trial_directory(directory.path)
     if unavailable is None:
         return directory

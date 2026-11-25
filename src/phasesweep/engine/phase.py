@@ -64,7 +64,7 @@ from phasesweep.engine.progress import (
     _warn_deferred_extraction,
 )
 from phasesweep.engine.repeats import repeat_axis
-from phasesweep.engine.reread import fill_note, fill_source, fill_study
+from phasesweep.engine.reread import fill_note, fill_source, fill_study, reread_sibling_retries
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
     PhaseTrialsFailedError,
@@ -99,11 +99,9 @@ from phasesweep.engine.state import (
     _trial_outcome_payload,
 )
 from phasesweep.engine.study_policy import (
-    _abort_record,
+    _abort_decision,
     _AcceptedPartialDecision,
     _at_accepted_partial_target,
-    _consecutive_failure_threshold_tripped,
-    _failure_policy_abort_record,
     _initialize_study_schema,
     _launch_preflight,
     _load_accepted_partial_decision,
@@ -381,54 +379,6 @@ def _winner_overrides(
     if phase.repeats is not None:
         effective.pop(phase.repeats.key, None)
     return effective
-
-
-def _abort_decision(
-    phase: Phase,
-    trial_number: int,
-    outcome: str,
-    *,
-    completion_sequence: int,
-    consecutive_failures: int,
-    abort_recorded: bool,
-    cause: str | None = None,
-    fatal_policy: str | None = None,
-) -> JsonObject | None:
-    """Return the abort record that recording ``outcome`` after the given state would trip.
-
-    A live phase execution and stale-trial recovery both decide here, so an outcome trips the
-    same abort whichever of them records it.
-
-    :param Phase phase: Phase whose ``max_consecutive_failures`` and ``n_trials`` apply.
-    :param int trial_number: Trial whose outcome is about to be recorded.
-    :param str outcome: The terminal outcome about to be recorded.
-    :param int completion_sequence: Completion sequence of the last recorded outcome.
-    :param int consecutive_failures: Failure streak before ``outcome``.
-    :param bool abort_recorded: Whether the phase already recorded an abort.
-    :param str | None cause: The outcome's recorded cause, if any.
-    :param str | None fatal_policy: The fatal policy of a ``"fatal"`` outcome.
-    :return JsonObject | None: The abort record at the next completion sequence, or ``None``
-        when the outcome trips nothing.
-    """
-    if abort_recorded:
-        return None
-    sequence = completion_sequence + 1
-    if outcome == "fatal":
-        return _abort_record(
-            policy=fatal_policy or "fatal_trial_exception",
-            completion_sequence=sequence,
-            trial_target=phase.n_trials,
-            cause=cause or f"trial {trial_number} hit a fatal objective error",
-        )
-    streak = _next_consecutive_failures(consecutive_failures, outcome)
-    if not _consecutive_failure_threshold_tripped(streak, phase):
-        return None
-    return _failure_policy_abort_record(
-        phase,
-        consecutive_failures=streak,
-        completion_sequence=sequence,
-        trial_target=phase.n_trials,
-    )
 
 
 @dataclass(frozen=True)
@@ -1006,7 +956,6 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     overrides = _composed_overrides(experiment, phase, sampled, run.inherited_winners)
 
     attempt_id = uuid4().hex
-    # Continuing a directory keeps its opener's trainer and tracking identity.
     try:
         trials = {frozen.number: frozen for frozen in run.study.get_trials(deepcopy=False)}
         directory = _trial_dir_for_attempt(
@@ -1016,8 +965,9 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             trials[trial.number],
             attempt_id=attempt_id,
             recovered=frozenset(_cleanup_recovered_trial_numbers(run.study)),
+            studies=(run.study, *run.other_studies),
         )
-        reusing_directory = directory.opener_number != trial.number
+        reusing_directory = directory.opener_attempt_id != attempt_id
         earlier_attempts = (
             earlier_directory_launches(
                 (run.study, *run.other_studies), directory.path, trials, trials[trial.number]
@@ -1619,16 +1569,10 @@ def _run_phase(
 ) -> Winner:
     """Execute one phase end-to-end (sampler, study.optimize, winner selection).
 
-    Opens the study the parents' winners and the reading settings address
-    (:func:`phase_study_name`). One that records no identity is first filled from the kept
-    evidence of the phase's study under earlier reading settings, when there is one
-    (:mod:`phasesweep.engine.reread`); otherwise the run says when it starts a new study beside
-    the phase's other studies, which stay as they are.
-    Validates the phase's durable state (:func:`_resume_phase`), runs Optuna's
-    optimize loop with every worker sharing one :class:`_PhaseExecution`, and
-    turns how that loop ended into the phase's winner or refusal
-    (:func:`_finish_phase`). A phase with trials to launch claims ``generation``
-    once every launch check has passed, before its first durable trial-target write.
+    Fill the study addressed by the parents' winners and reading settings, or resume it
+    from its kept evidence and any matching runs a sibling already finished. Validate
+    the target and failure policy before adopting results. Claim the generation for new
+    launches only after their checks pass.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase to execute.
@@ -1674,13 +1618,9 @@ def _run_phase(
     others = [
         other for other in ledger.studies.get(phase.name, ()) if other.study_name != study_name
     ]
-    # The live opener also claims a newly created study's publication root,
-    # before any inspection, reaping, or trial work below can run against it.
     study = open_phase_study(ledger, phase, study_name)
     _validate_study_direction(study, experiment.metric.goal)
     if _recorded_identity(study) is None:
-        # A changed reading setting addresses a study of its own; the trials another study of
-        # the phase measured under the same values are re-read into it, never retrained.
         source = fill_source(experiment, phase, inherited, others, target=study)
         if source is not None:
             filled = fill_study(
@@ -1692,6 +1632,16 @@ def _run_phase(
         if note is not None:
             report.info("%s  %s", phase.name, note)
     resumed = _resume_phase(experiment, phase, inherited_winners, study)
+    if not isinstance(resumed, Winner) and reread_sibling_retries(
+        experiment,
+        phase,
+        study,
+        others,
+        run_deadline,
+        generation.generation_id,
+        recovery_abort=resumed.recovery_abort,
+    ):
+        resumed = _resume_phase(experiment, phase, inherited_winners, study)
     if phase.inherits:
         # Its study was unknown before the run selected its parents' winners.
         _validate_selection_evidence(experiment, {phase.name: study})

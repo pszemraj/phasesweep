@@ -211,7 +211,7 @@ def _preflight_existing_studies(
             _reached_study_refusals(
                 experiment,
                 [
-                    ReachedStudy(phase, known[phase.name])
+                    ReachedStudy(phase, known[phase.name], siblings=studies[phase.name])
                     for _, phase in experiment.phases_from(from_phase)
                     if phase.name in known
                 ],

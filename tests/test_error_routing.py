@@ -52,7 +52,7 @@ from phasesweep.engine.paths import (
     _attempt_dir,
     _attempts_dir,
 )
-from phasesweep.engine.phase import _abort_record, _failure_policy_abort_record, _finish_phase
+from phasesweep.engine.phase import _finish_phase
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.selection import (
@@ -74,6 +74,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
 )
+from phasesweep.engine.study_policy import _abort_record, _failure_policy_abort_record
 from phasesweep.engine.trial import EnvironmentIdentity
 from phasesweep.errors import (
     ACCEPT_INCOMPLETE_STEP,

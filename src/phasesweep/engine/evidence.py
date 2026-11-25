@@ -34,9 +34,11 @@ from phasesweep.engine.state import (
     constraint_attr,
 )
 from phasesweep.engine.trial_dirs import (
+    ProducingAttempt,
     _expected_trial_dir_name,
     _rerun_directory_sources,
     _unavailable_trial_directory,
+    producing_attempts,
 )
 from phasesweep.errors import (
     NEW_STUDY_STEP,
@@ -110,24 +112,28 @@ def _selection_candidate_identity(trial: optuna.trial.FrozenTrial) -> tuple[str,
 
 
 def _earlier_attempts(
-    trials: Mapping[int, optuna.trial.FrozenTrial], trial: optuna.trial.FrozenTrial
+    trials: Mapping[int, optuna.trial.FrozenTrial],
+    trial: optuna.trial.FrozenTrial,
+    *,
+    attempts: Mapping[str, ProducingAttempt] | None = None,
 ) -> tuple[tuple[str, str], ...]:
     """Name the earlier attempts that recorded the directory a rerun continues.
 
     :param Mapping[int, optuna.trial.FrozenTrial] trials: The study's trials by number.
     :param optuna.trial.FrozenTrial trial: A trial continuing its source's directory, or
         one that recorded its directory.
+    :param Mapping[str, ProducingAttempt] | None attempts: Producers for copied rows.
     :raises ProcessCleanupUncertainError: A source is invalid or its recorded directory is malformed.
     :return tuple[tuple[str, str], ...]: ``(generation_id, attempt_id)`` per earlier attempt,
         oldest first; empty for a trial in a directory of its own.
     """
-    attempts: list[tuple[str, str]] = []
-    for source in _rerun_directory_sources(trials, trial):
+    earlier: list[tuple[str, str]] = []
+    for source in _rerun_directory_sources(trials, trial, attempts=attempts):
         generation_id = source.user_attrs.get(GENERATION_ID_ATTR)
         attempt_id = source.user_attrs.get(ATTEMPT_ID_ATTR)
         if isinstance(generation_id, str) and isinstance(attempt_id, str):
-            attempts.append((generation_id, attempt_id))
-    return tuple(reversed(attempts))
+            earlier.append((generation_id, attempt_id))
+    return tuple(reversed(earlier))
 
 
 def _trial_objective_provenance(trial: optuna.trial.FrozenTrial) -> dict[str, Any]:
@@ -875,10 +881,13 @@ def _selection_evidence(
     :raises PhaseSweepError: A trial directory's path could not be inspected.
     :return tuple[int, ...]: The candidates whose directory is gone, ascending.
     """
+    from phasesweep.engine.ledger import phase_studies_for
+
     phase_dir = _phase_dir(experiment, phase.name)
     verification = _EvidenceVerification(experiment, phase)
     trials = {trial.number: trial for trial in study.get_trials(deepcopy=False)}
     pruned: dict[int, Path] = {}
+    attempts: dict[str, ProducingAttempt] | None = None
     for trial in trials.values():
         identity = _selection_candidate_identity(trial)
         if identity is None:
@@ -899,7 +908,11 @@ def _selection_evidence(
             ) from None
         # The directory must name its own opener, even after a fresh-directory rerun.
         expected_name = _expected_trial_dir_name(trials, trial)
-        if expected_name is None or recorded != expected_name:
+        if expected_name != recorded:
+            if attempts is None:
+                attempts = producing_attempts(phase_studies_for(study))
+            expected_name = _expected_trial_dir_name(trials, trial, attempts=attempts)
+        if expected_name != recorded:
             raise TrialEvidenceMissingError(
                 f"{subject} records evidence directory {recorded!r}, which does "
                 f"not name the attempt that opened it (expected {expected_name!r})."

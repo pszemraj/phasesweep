@@ -694,8 +694,8 @@ def _record_stale_trial_outcome(
     :raises StudySchemaMismatchError: The durable completion order is invalid.
     :raises StudyStorageUnavailableError: Recovery could not read or commit the decision.
     """
-    from phasesweep.engine.phase import _abort_decision
     from phasesweep.engine.study_policy import (
+        _abort_decision,
         _counted_outcome,
         _load_phase_policy_state,
         _recorded_outcome_sequence,
@@ -1407,15 +1407,16 @@ def _recover_completed_trial(
         ) from exc
     history = DirectoryHistory()
     if baseline.reused:
-        launches = directory_launches(
-            producing_attempts(phase_studies_for(study)), directory=record.trial_dir
-        )
+        attempts = producing_attempts(phase_studies_for(study))
+        launches = directory_launches(attempts, directory=record.trial_dir)
         history = directory_history(
             launches.get(record.trial_dir.name, ()),
             attempt_id=record.attempt_id,
             launched_at=baseline.launched_at,
             ancestors=_earlier_attempts(
-                {other.number: other for other in study.get_trials(deepcopy=False)}, trial
+                {other.number: other for other in study.get_trials(deepcopy=False)},
+                trial,
+                attempts=attempts,
             ),
         )
     try:

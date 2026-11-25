@@ -31,12 +31,14 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.ledger import _resolve_storage, validate_ledger
 from phasesweep.engine.optuna import _PositionCmaEsSampler
+from phasesweep.engine.paths import _generation_config_snapshot_path
 from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.read import inspect_status, read_status, read_trial_tables
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FAILURE_REASON_ATTR,
+    GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_IDENTITY_ATTR,
@@ -45,6 +47,8 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     _trial_attempt_dir,
 )
+from phasesweep.engine.study_policy import _record_reruns
+from phasesweep.engine.trial_dirs import producing_attempts
 from phasesweep.evidence.baseline import EVIDENCE_BASELINE_FILE
 from phasesweep.evidence.evaluation import TrialContext
 from phasesweep.evidence.models import (
@@ -266,6 +270,14 @@ def test_reread_keeps_its_own_attempt_identity_when_its_source_is_removed(tmp_pa
     assert current["trials"] == {"COMPLETE": 2}
     assert current["generation_trials"] == {"COMPLETE": 1}
     assert original["generation_trials"] == {}
+    original_reading = phase_study_of(corrected).trials
+    reversed_goal = _experiment(tmp_path, trainer, _metric("acc", "maximize"), phases=[enlarged])
+    run_experiment(reversed_goal)
+    new_reading = phase_study_of(reversed_goal).trials
+    assert [(row.user_attrs[ATTEMPT_ID_ATTR], row.value) for row in new_reading] == [
+        (row.user_attrs[ATTEMPT_ID_ATTR], row.value) for row in original_reading
+    ]
+    assert _launches(launches) == 2
 
 
 def test_reread_releases_retry_budget_for_cells_that_now_have_a_result(
@@ -1534,6 +1546,156 @@ def test_preview_checks_a_failure_streak_when_no_read_can_change_it(tmp_path: Pa
 
     with pytest.raises(PhaseAbortRefusedError, match="1 consecutive failed/infeasible"):
         run_experiment(changed, dry_run=True)
+
+
+@pytest.mark.integration
+def test_a_finished_sibling_retry_replays_without_the_trainer(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A settled sibling retry fills the pending target even when no trainer can start."""
+    launches = tmp_path / "launches.txt"
+    pause = tmp_path / "pause"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import json, os, sys, time
+        from pathlib import Path
+        out = Path(sys.argv[sys.argv.index("--out") + 1])
+        started = out.with_name("checkpoint")
+        continued = started.exists()
+        started.touch()
+        with Path({str(launches)!r}).open("a") as log:
+            log.write(os.environ["PHASESWEEP_ATTEMPT_ID"] + "\\n")
+        pause = Path({str(pause)!r})
+        if pause.exists():
+            pause.unlink()
+            time.sleep(60)
+        out.write_text(json.dumps({{"loss": 0.1 if continued else 0.9, "acc": 2 if continued else 3}}))
+        """,
+    )
+    phase = Phase(
+        name="p",
+        n_trials=1,
+        gpu_policy="none",
+        sampler=Sampler(type="random", seed=5),
+        search_space={"x": IntParam(type="int", low=1, high=100)},
+    )
+    command = f"{shlex.quote(str(trainer))} --out {{trial_dir}}/r.json {{overrides}}"
+
+    def config(key: str, phase: Phase) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path, trial_command=command, phases=[phase], metric=_metric(key)
+        )
+
+    original = config("loss", phase)
+    assert run_experiment(original)["p"].metric == 0.9
+    raised = phase.model_copy(update={"n_trials": 2})
+    interrupted = config("loss", raised.model_copy(update={"timeout_seconds_per_phase": 2.0}))
+    pause.touch()
+    with pytest.raises(PhaseTimeoutError, match="timed out via phase guard"):
+        run_experiment(interrupted)
+    sibling = config("acc", raised)
+    result = run_experiment(sibling)["p"]
+    assert result.metric == 2
+    parent_attempt, sibling_retry = phase_study_of(sibling).trials[-2:]
+    assert sibling_retry.user_attrs[RERUN_OF_ATTR] == parent_attempt.number
+    assert sibling_retry.user_attrs[TRIAL_DIR_ATTR] == parent_attempt.user_attrs[TRIAL_DIR_ATTR]
+    assert _launches(launches) == 3
+    trainer.unlink()
+
+    restored = config("loss", raised)
+    before = tree_snapshot(tmp_path)
+    caplog.set_level(logging.INFO)
+    run_experiment(restored, dry_run=True)
+    assert "would re-read 1 finished trial from a sibling study" in caplog.text
+    assert "would launch no trials" in caplog.text
+    assert tree_changes(before, tree_snapshot(tmp_path)) == {}
+    needs_launch = config("loss", raised.model_copy(update={"n_trials": 3}))
+    with pytest.raises(LaunchEnvironmentError, match="which is not an executable file"):
+        run_experiment(needs_launch, dry_run=True)
+    with pytest.raises(LaunchEnvironmentError, match="which is not an executable file"):
+        run_experiment(needs_launch)
+    returned = run_experiment(restored)["p"]
+    assert returned.metric == 0.1
+    assert returned.attempt_id == result.attempt_id
+    assert _launches(launches) == 3
+
+
+@pytest.mark.integration
+def test_returning_to_an_initialized_study_adopts_a_finished_sibling_rerun(
+    tmp_path: Path,
+) -> None:
+    """A completed draw in a sibling's reopened directory fills a local queued rerun."""
+    launches, pause = tmp_path / "launches", tmp_path / "pause"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse, json, time
+        from pathlib import Path
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", required=True)
+        parser.add_argument("--x", type=float, required=True)
+        args = parser.parse_args()
+        marker = Path({str(pause)!r})
+        with Path({str(launches)!r}).open("a") as handle:
+            handle.write("launch\\n")
+        if marker.exists():
+            marker.unlink()
+            time.sleep(30)
+        Path(args.out).write_text(json.dumps({{"loss": args.x, "acc": 100 + args.x}}))
+        """,
+    )
+    phase = Phase(
+        name="p",
+        n_trials=1,
+        gpu_policy="none",
+        sampler=Sampler(type="random", seed=11),
+        search_space={"x": FloatParam(type="float", low=0.1, high=3.0)},
+    )
+    raised = phase.model_copy(update={"n_trials": 2})
+    timed = raised.model_copy(update={"timeout_seconds_per_phase": 2})
+    original = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
+    run_experiment(original)
+    pause.touch()
+    with pytest.raises(PhaseTimeoutError, match="timed out via phase guard"):
+        run_experiment(_experiment(tmp_path, trainer, _metric("loss"), phases=[timed]))
+    recorded = phase_study_of(original)
+    interrupted_dir = Path(recorded.trials[-1].user_attrs[TRIAL_DIR_ATTR])
+    interrupted_dir.rename(tmp_path / "pruned-original")
+    for _ in range(2):
+        pause.touch()
+        with pytest.raises(PhaseTimeoutError, match="timed out via phase guard"):
+            run_experiment(_experiment(tmp_path, trainer, _metric("acc"), phases=[timed]))
+    sibling = _experiment(tmp_path, trainer, _metric("acc"), phases=[raised])
+    run_experiment(sibling)
+    donor_study = phase_study_of(sibling)
+    donor = donor_study.trials[-1]
+    donor_path = Path(donor.user_attrs[TRIAL_DIR_ATTR])
+    assert donor_path != interrupted_dir
+    _record_reruns(recorded, raised)
+    queued = recorded.trials[-1]
+    assert queued.state == optuna.trial.TrialState.WAITING
+    launches_before = _launches(launches)
+
+    run_experiment(_experiment(tmp_path, trainer, _metric("loss"), phases=[raised]))
+
+    adopted = recorded.trials[-1]
+    assert _launches(launches) == launches_before
+    assert adopted.number != donor.number
+    assert adopted.user_attrs[ATTEMPT_ID_ATTR] == donor.user_attrs[ATTEMPT_ID_ATTR]
+    assert adopted.user_attrs[RERUN_OF_ATTR] == queued.number
+    assert adopted.value == adopted.params["x"]
+    assert not recorded.get_trials(states=(optuna.trial.TrialState.WAITING,))
+    attempt_id = donor.user_attrs[ATTEMPT_ID_ATTR]
+    owner = producing_attempts((recorded, donor_study))[attempt_id]
+    assert owner.study.study_name == study_name(sibling, "p")
+    assert owner.trial.number == donor.number
+    assert attempt_id not in producing_attempts((recorded,))
+    generation = donor.user_attrs[GENERATION_ID_ATTR]
+    snapshot = _generation_config_snapshot_path(donor_path.parent.parent, generation)
+    snapshot.rename(tmp_path / "removed-generation-config")
+    assert attempt_id not in producing_attempts((recorded,))
+    assert producing_attempts((recorded, donor_study))[attempt_id] == owner
 
 
 @pytest.mark.integration

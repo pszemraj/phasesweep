@@ -955,7 +955,8 @@ def _ranked_revision_sources(
     if len(ranked) < 2 or not reruns:
         return sources
     by_number = {trial.number: trial for trial in trials}
-    launches = directory_launches(producing_attempts(phase_studies_for(study)))
+    attempts = producing_attempts(phase_studies_for(study))
+    launches = directory_launches(attempts)
     for trial in reruns:
         # A malformed ancestor must not turn a code revision advisory into a refusal.
         with contextlib.suppress(ProcessCleanupUncertainError, ValueError):
@@ -969,7 +970,7 @@ def _ranked_revision_sources(
                 candidates,
                 attempt_id=attempt_id,
                 launched_at=epoch,
-                ancestors=_earlier_attempts(by_number, trial),
+                ancestors=_earlier_attempts(by_number, trial, attempts=attempts),
             ).earlier
             if earlier:
                 sources[trial.number] = [generation for generation, _ in earlier]

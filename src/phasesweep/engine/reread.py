@@ -22,7 +22,7 @@ import logging
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 import optuna
 
@@ -30,6 +30,7 @@ from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import retry_target_ceiling
 from phasesweep.engine.attempts import (
     _pending_evidence_refusal,
+    _record_stale_trial_outcome,
     _trial_attempt_record,
     read_finished_attempt,
 )
@@ -85,9 +86,16 @@ from phasesweep.engine.state import (
     _trial_outcome_payload,
 )
 from phasesweep.engine.study_policy import (
+    _abort_decision,
     _accepted_trial_target,
+    _counted_outcome,
     _initialize_study_schema,
+    _load_phase_policy_state,
     _parse_accepted_partial_decision,
+    _record_recovery_boundary,
+    _record_trial_target,
+    _recorded_outcome_sequence,
+    _scheduled_reruns,
 )
 from phasesweep.engine.trial import TrialResult, _failed_trial, record_trial_result
 from phasesweep.engine.trial_dirs import (
@@ -95,6 +103,7 @@ from phasesweep.engine.trial_dirs import (
     DirectoryLaunch,
     ProducingAttempt,
     _fill_source_name,
+    _rerun_chain,
     directory_history,
     directory_launches,
     producing_attempts,
@@ -102,9 +111,10 @@ from phasesweep.engine.trial_dirs import (
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.evidence.baseline import read_evidence_baseline
 from phasesweep.runtime.json import JsonObject, json_object
-from phasesweep.runtime.terminal import plural
+from phasesweep.runtime.terminal import REPORT_LOGGER, plural
 
 log = logging.getLogger(__name__)
+report = logging.getLogger(REPORT_LOGGER)
 
 #: The source's identity, root, schema and any earlier fill belong to the source study.
 _NOT_COPIED = frozenset(
@@ -352,12 +362,15 @@ def _reread_trial(
     """
     seconds = _trainer_seconds(trial, attempts=attempts)
     outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
-    overrides_json = trial.user_attrs.get(OVERRIDES_ATTR)
+    attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+    owner = attempts.get(attempt_id) if isinstance(attempt_id, str) else None
+    physical = trial if owner is None else owner.trial
+    overrides_json = physical.user_attrs.get(OVERRIDES_ATTR)
     if seconds is None or outcome is None or not isinstance(overrides_json, str):
         return None
     try:
-        directory = _required_trial_dir(trial)
-        record = _trial_attempt_record(trial, phase.name, directory)
+        directory = _required_trial_dir(physical)
+        record = _trial_attempt_record(physical, phase.name, directory)
     except ValueError:
         return None
     if record is None or record.generation_id is None:
@@ -380,9 +393,9 @@ def _reread_trial(
                 launches.get(directory.name, ()),
                 attempt_id=record.attempt_id,
                 launched_at=baseline.launched_at,
-                ancestors=_earlier_attempts(trials, trial),
+                ancestors=_earlier_attempts(trials, trial, attempts=attempts),
             ),
-            trial,
+            physical,
             record,
             producing=launched,
             reading=experiment,
@@ -497,6 +510,18 @@ def _fill_timeout(experiment: Experiment, phase: Phase) -> PhaseTimeoutError:
     )
 
 
+def _require_reread_time(experiment: Experiment, phase: Phase, deadline: float | None) -> None:
+    """Refuse to start or commit a re-read after the invocation's deadline.
+
+    :param Experiment experiment: Current configuration for recovery instructions.
+    :param Phase phase: Phase re-reading evidence.
+    :param float | None deadline: Absolute invocation deadline.
+    :raises PhaseTimeoutError: The invocation deadline has passed.
+    """
+    if deadline is not None and time.monotonic() >= deadline:
+        raise _fill_timeout(experiment, phase)
+
+
 def _finish_fill(
     experiment: Experiment,
     phase: Phase,
@@ -516,8 +541,7 @@ def _finish_fill(
     :return tuple[int, int] | None: The source and adjusted trial targets, if changed.
     """
     adjusted = _copy_study_attrs(phase, target, source)
-    if deadline is not None and time.monotonic() >= deadline:
-        raise _fill_timeout(experiment, phase)
+    _require_reread_time(experiment, phase, deadline)
     _stamp_identity(target, _reread_record(source.record, reading_settings(experiment, phase)))
     return adjusted
 
@@ -577,13 +601,7 @@ def fill_study(
     :raises TrackingTargetUnavailableError: A tracker gave no answer for a finished trial.
     :return FillResult: What the fill wrote in this call.
     """
-
-    def require_time() -> None:
-        """Refuse to start or commit fill work after the invocation's deadline."""
-        if run_deadline is not None and time.monotonic() >= run_deadline:
-            raise _fill_timeout(experiment, phase)
-
-    require_time()
+    _require_reread_time(experiment, phase, run_deadline)
     trials = source.copyable_trials
     present = target.get_trials(deepcopy=False)
     if [(t.number, t.params, t.user_attrs.get(ATTEMPT_ID_ATTR)) for t in present] != [
@@ -609,7 +627,7 @@ def fill_study(
     producing: dict[str, Experiment | WinnerIntegrityError] = {}
     rereads = changed = 0
     for trial in trials[len(present) :]:
-        require_time()
+        _require_reread_time(experiment, phase, run_deadline)
         if trial.number in source.reread_trials:
             log.info(
                 "Phase %s re-reading trial %d (%d/%d).",
@@ -629,16 +647,203 @@ def fill_study(
             deadline=run_deadline,
             reader_generation_id=reader_generation_id,
         )
-        require_time()
+        _require_reread_time(experiment, phase, run_deadline)
         if reread is not None:
             rereads += 1
             changed += (reread.state, reread.value) != (trial.state, trial.value)
         target.add_trial(
             _sampling_trial_for_reread(trial if reread is None else reread, target.sampler)
         )
-    require_time()
+    _require_reread_time(experiment, phase, run_deadline)
     adjusted_target = _finish_fill(experiment, phase, target, source, deadline=run_deadline)
     return FillResult(len(trials) - len(present), rereads, changed, adjusted_target)
+
+
+class SiblingRetry(NamedTuple):
+    """One target-local rerun slot and the physical attempt that already ran it."""
+
+    source: optuna.trial.FrozenTrial
+    producer: ProducingAttempt
+
+
+def pending_sibling_retries(
+    phase: Phase, study: optuna.Study, others: Sequence[optuna.Study]
+) -> tuple[SiblingRetry, ...]:
+    """Resolve outstanding reruns that already finished training in sibling studies.
+
+    A shared physical ancestor identifies the draw even when a continuation opened a
+    fresh directory. Studies can number the same draw differently and can also sample
+    the same parameters independently.
+
+    :param Phase phase: Config whose remaining target and rerun policy choose the slots.
+    :param optuna.Study study: Target study whose reruns are examined.
+    :param Sequence[optuna.Study] others: The phase's other reading studies.
+    :return tuple[SiblingRetry, ...]: Completed training matching outstanding slots.
+    """
+    others = tuple(other for other in others if other.study_name != study.study_name)
+    if not others or _recorded_identity(study) is None:
+        return ()
+    trials = study.get_trials(deepcopy=False)
+    room = phase.n_trials - _finished_trial_count(trials)
+    if room <= 0:
+        return ()
+    queued = [
+        trial
+        for trial in trials
+        if trial.state == optuna.trial.TrialState.WAITING and RERUN_OF_ATTR in trial.user_attrs
+    ]
+    pending = [*queued, *_scheduled_reruns(study, trials, phase)][:room]
+    if not pending:
+        return ()
+    by_number = {trial.number: trial for trial in trials}
+    attempts = producing_attempts((study, *others))
+    slots: dict[str, optuna.trial.FrozenTrial] = {}
+    for trial in pending:
+        for ancestor in _rerun_chain(by_number, trial, attempts=attempts):
+            identity = ancestor.user_attrs.get(ATTEMPT_ID_ATTR)
+            if isinstance(identity, str):
+                slots[identity] = trial
+    if not slots:
+        return ()
+    present = {trial.user_attrs.get(ATTEMPT_ID_ATTR) for trial in trials}
+    sibling_names = {other.study_name for other in others}
+    candidates = [
+        owner
+        for attempt_id, owner in attempts.items()
+        if attempt_id not in present
+        and owner.study.study_name in sibling_names
+        and RERUN_OF_ATTR in owner.trial.user_attrs
+        and _trainer_seconds(owner.trial) is not None
+    ]
+
+    # Physical study rows carry the time of allocation even when the directory was reopened.
+    def launch_order(owner: ProducingAttempt) -> tuple[float, str, int]:
+        start = owner.trial.datetime_start
+        return (
+            0.0 if start is None else start.timestamp(),
+            owner.study.study_name,
+            owner.trial.number,
+        )
+
+    matches: dict[int, SiblingRetry] = {}
+    for owner in sorted(candidates, key=launch_order, reverse=True):
+        # The first row is this attempt. An earlier row must establish a shared draw.
+        ancestors = _rerun_chain(owner.rows, owner.trial, attempts=attempts)
+        next(ancestors)
+        for ancestor in ancestors:
+            identity = ancestor.user_attrs.get(ATTEMPT_ID_ATTR)
+            slot = slots.get(identity) if isinstance(identity, str) else None
+            if slot is not None and _same_value(slot.params, owner.trial.params):
+                matches.setdefault(slot.number, SiblingRetry(slot, owner))
+                break
+    return tuple(matches[trial.number] for trial in pending if trial.number in matches)
+
+
+def reread_sibling_retries(
+    experiment: Experiment,
+    phase: Phase,
+    study: optuna.Study,
+    others: Sequence[optuna.Study],
+    run_deadline: float | None,
+    reader_generation_id: str,
+    *,
+    recovery_abort: JsonObject | None = None,
+) -> int:
+    """Read a sibling's finished rerun under this study's settings before launching.
+
+    The physical attempt comes from the producer. The slot, failure streak and outcome
+    sequence belong to this study. A queued rerun is settled as unlaunched first, so a
+    killed reader can still find the pending slot without leaving a stale launch queued.
+
+    :param Experiment experiment: Current reading and budget settings.
+    :param Phase phase: Phase whose target and failure policy apply.
+    :param optuna.Study study: Initialized study accepting its sibling's kept work.
+    :param Sequence[optuna.Study] others: The phase's other reading studies.
+    :param float | None run_deadline: Absolute invocation deadline.
+    :param str reader_generation_id: Generation that owns any tracker reader.
+    :param JsonObject | None recovery_abort: Previous abort the run may retire, if any.
+    :raises PhaseTimeoutError: The deadline stopped a read before its row was committed.
+    :raises StudySchemaMismatchError: A resolved finished attempt lacks its training record.
+    :return int: Terminal results appended to this study.
+    """
+    retries = pending_sibling_retries(phase, study, others)
+    if not retries:
+        return 0
+    attempts = producing_attempts(
+        (study, *(other for other in others if other.study_name != study.study_name))
+    )
+    launches = directory_launches(attempts)
+    producing: dict[str, Experiment | WinnerIntegrityError] = {}
+    recorded = 0
+    for retry in retries:
+        _require_reread_time(experiment, phase, run_deadline)
+        donor = retry.producer
+        reread = _reread_trial(
+            experiment,
+            phase,
+            donor.trial,
+            donor.rows,
+            producing,
+            attempts,
+            launches,
+            deadline=run_deadline,
+            reader_generation_id=reader_generation_id,
+        )
+        _require_reread_time(experiment, phase, run_deadline)
+        if reread is None:
+            raise StudySchemaMismatchError(
+                f"Finished sibling trial {donor.trial.number} in {donor.study.study_name!r} "
+                "cannot be re-read from its recorded training."
+            )
+        if recovery_abort is not None and recorded == 0:
+            sequence = recovery_abort["completion_sequence"]
+            assert type(sequence) is int
+            _record_recovery_boundary(study, phase, sequence)
+        if _finished_trial_count(study.get_trials(deepcopy=False)) >= _accepted_trial_target(study):
+            _record_trial_target(study, phase)
+        if retry.source.state == optuna.trial.TrialState.WAITING:
+            study._storage.set_trial_state_values(
+                retry.source._trial_id, optuna.trial.TrialState.RUNNING
+            )
+            _record_stale_trial_outcome(
+                study, retry.source, cause="a sibling reading study finished this rerun"
+            )
+            study.tell(retry.source.number, state=optuna.trial.TrialState.FAIL)
+        state = _load_phase_policy_state(study, experiment)
+        sequence = _recorded_outcome_sequence(study)
+        measured = _parsed_trial_outcome(reread.user_attrs.get(TRIAL_OUTCOME_ATTR))
+        assert measured is not None
+        abort = _abort_decision(
+            phase,
+            len(study.get_trials(deepcopy=False)),
+            _counted_outcome(measured.outcome, measured.metric, reread, experiment),
+            completion_sequence=sequence,
+            consecutive_failures=state.consecutive_failures,
+            abort_recorded=state.abort is not None,
+        )
+        reread.user_attrs[RERUN_OF_ATTR] = retry.source.number
+        reread.user_attrs[TRIAL_OUTCOME_ATTR] = _trial_outcome_payload(
+            sequence + 1,
+            measured.outcome,
+            metric=measured.metric,
+            cause=measured.cause,
+            abort=abort,
+        )
+        reread.distributions = retry.source.distributions
+        reread.system_attrs = retry.source.system_attrs
+        reread.intermediate_values = dict(retry.source.intermediate_values)
+        _require_reread_time(experiment, phase, run_deadline)
+        study.add_trial(reread)
+        recorded += 1
+        if abort is not None:
+            break
+    if recorded:
+        report.info(
+            "%s re-read %s already finished in sibling studies without launching a trainer.",
+            phase.name,
+            plural(recorded, "rerun"),
+        )
+    return recorded
 
 
 def describe_changes(changes: Sequence[tuple[str, object, object]]) -> str:
