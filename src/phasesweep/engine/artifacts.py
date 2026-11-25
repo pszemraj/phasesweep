@@ -202,18 +202,15 @@ def _refresh_recovered_trials_csv(
     :param Mapping[str, Sequence[optuna.Study]] studies: Every recovered study by phase.
     :param Experiment experiment: Config that locates the CSV and checks the study semantics.
     """
-    from phasesweep.engine.read import (
-        _latest_study_names,
-        _read_generation_selection,
-        _replay_study_names,
-    )
+    from phasesweep.engine.preview import replay_study_names
+    from phasesweep.engine.read import _latest_parent_overrides, _read_generation_selection
 
     if not studies:
         return
     try:
         current, _, publication = _read_generation_selection(experiment)
-        addressed = _latest_study_names(experiment, publication, current)
-        addressed.update(_replay_study_names(experiment, studies))
+        latest = _latest_parent_overrides(experiment, publication, current)
+        addressed, _ = replay_study_names(experiment, studies, latest)
     except Exception as exc:
         log.warning("Could not address recovered studies for trials.csv: %s", exc)
         return

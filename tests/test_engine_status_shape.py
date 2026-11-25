@@ -27,6 +27,7 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
 )
 from phasesweep.engine.read import read_status, read_trial_tables
+from phasesweep.errors import PhaseSweepError
 from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
 from phasesweep.runtime.json import JsonValue
 from tests.conftest import (
@@ -271,6 +272,125 @@ def test_status_uses_the_parent_winner_the_current_reader_replays(tmp_path: Path
     assert child["trials"] == {"COMPLETE": 1}
     assert child["winner_config_matches_current"] is False
     assert "child: 1 of 1 trial" in table.output, table.output
+
+    conflict = write_experiment_config(tmp_path / "conflict.yaml", plan("score", 7))
+    for options in ([], ["--trials"]):
+        diagnosed = CliRunner().invoke(cli, ["status", str(conflict), *options])
+        assert diagnosed.exit_code == 0, diagnosed.output
+        assert "was created with a different config" in " ".join(diagnosed.output.split())
+
+
+def _grid_parent(name: str, key: str, choices: list[int]) -> Phase:
+    return Phase(
+        name=name,
+        n_trials=len(choices),
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        search_space={key: CategoricalParam(type="categorical", choices=choices)},
+    )
+
+
+@pytest.mark.integration
+def test_status_waits_for_a_parent_top_up_before_applying_a_child_abort(tmp_path: Path) -> None:
+    """Both status formats keep failed rows visible while a parent top-up can select another child study."""
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out")
+        parser.add_argument("--x", type=int)
+        parser.add_argument("--y", type=int)
+        args = parser.parse_args()
+        if args.y is not None and args.x == 1:
+            raise SystemExit(3)
+        print(f"x={args.x}")
+    """,
+    )
+    child = Phase(
+        name="child",
+        n_trials=2,
+        gpu_policy="none",
+        inherits=["parent"],
+        max_consecutive_failures=1,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"y": IntParam(type="int", low=0, high=3)},
+    )
+
+    def plan(choices: list[int]) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            trainer=trainer,
+            phases=[_grid_parent("parent", "x", choices), child],
+        )
+
+    assert run_experiment(plan([3, 5]))["parent"].params == {"x": 3}
+    with pytest.raises(PhaseSweepError, match="Phase 'child' aborted"):
+        run_experiment(plan([3, 5, 1]))
+    current = plan([3, 5, 1, 0])
+    config = write_experiment_config(tmp_path / "current.yaml", current)
+    for options in ([], ["--trials"]):
+        shown = CliRunner().invoke(cli, ["status", str(config), *options])
+        assert shown.exit_code == 0, shown.output
+        assert "shows counts using the last recorded values from 'parent'" in " ".join(
+            shown.output.split()
+        )
+        assert "previously aborted" not in shown.output
+        assert "FAIL" in shown.output
+    assert run_experiment(current)["child"].effective_overrides["x"] == 0
+
+
+@pytest.mark.integration
+def test_status_combines_a_replayed_parent_with_a_parent_still_training(tmp_path: Path) -> None:
+    """A conditional child count uses the replayed value from each settled parent."""
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json
+        from pathlib import Path
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", required=True)
+        for key in ("x", "b", "y"):
+            parser.add_argument("--" + key, type=int, default=0)
+        args = parser.parse_args()
+        Path(args.out).write_text(json.dumps({"score": args.x + args.b, "alt": -args.x + args.b}))
+    """,
+    )
+
+    def plan(key: str, choices: list[int], target: int) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            trainer=trainer,
+            metric=Metric(
+                name="score",
+                goal="minimize",
+                extractor=JsonExtractor(type="json", path="r.json", key=key),
+            ),
+            phases=[
+                _grid_parent("a", "x", [1, 2]),
+                _grid_parent("b", "b", choices),
+                Phase(
+                    name="child",
+                    n_trials=target,
+                    gpu_policy="none",
+                    inherits=["a", "b"],
+                    sampler=Sampler(type="random", seed=0),
+                    search_space={"y": IntParam(type="int", low=0, high=3)},
+                ),
+            ],
+        )
+
+    original = run_experiment(plan("score", [3, 5], 2))["child"]
+    assert run_experiment(plan("alt", [3, 5], 1))["a"].params == {"x": 2}
+    current = plan("score", [3, 5, 6], 2)
+    config = write_experiment_config(tmp_path / "current.yaml", current)
+    status = CliRunner().invoke(cli, ["status", str(config)])
+    table = CliRunner().invoke(cli, ["status", str(config), "--trials"])
+    assert status.exit_code == table.exit_code == 0, (status.output, table.output)
+    assert yaml.safe_load(status.output)["phases"][-1]["trials"] == {"COMPLETE": 2}
+    assert "child: 2 of 2 trials" in table.output
+    assert "last recorded values from 'b'" in status.output
+    assert run_experiment(current)["child"].attempt_id == original.attempt_id
 
 
 def test_reordered_parents_keep_the_published_result_matching_the_config(tmp_path: Path) -> None:

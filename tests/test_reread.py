@@ -1180,9 +1180,8 @@ def test_a_child_follows_its_re_read_parent_from_its_own_study(
     # Status agrees with the dry run: the child's re-read holds only if the parent keeps x.
     child = inspect_status(changed, validate_ledger(changed)).refusals["c"]
     assert child.remediation == (
-        "Run the same configuration. If 'p' keeps its winner after re-reading, this phase "
-        "re-reads 2 finished trials from kept evidence without retraining them; a new winner "
-        "starts a new study here."
+        "Run the same configuration. If 'p' keeps its winner, this phase re-reads 2 finished trials "
+        "from kept evidence without retraining them. Different inherited values select a different study."
     )
 
     winners = run_experiment(changed)

@@ -1325,13 +1325,12 @@ def _pending_notice(
         names = " and ".join(repr(name) for name in unsettled)
         keeps = "keeps its winner" if len(unsettled) == 1 else "keep their winners"
         remediation = (
-            f"Run the same configuration. If {names} {keeps} after re-reading, this phase "
-            f"re-reads {trials} from kept evidence without retraining them; a new winner "
-            "starts a new study here."
+            f"Run the same configuration. If {names} {keeps}, this phase re-reads {trials} "
+            "from kept evidence without retraining them. Different inherited values select a different study."
         )
         statement = (
             f"{opening} ({settings} changed); the next run re-reads {trials} from kept evidence "
-            f"if {names} {keeps} after re-reading, and otherwise starts a new study."
+            f"if {names} {keeps}. Different inherited values select a different study."
         )
     else:
         remediation = (

@@ -26,6 +26,7 @@ from phasesweep.engine.artifact_roots import (
 from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.evidence import _validate_selection_evidence
 from phasesweep.engine.fingerprints import (
+    CarriesOverrides,
     _inherited_override_payload,
     _inherited_override_suppliers,
     _judge_identity,
@@ -38,6 +39,7 @@ from phasesweep.engine.growth import describe_gains
 from phasesweep.engine.guards import (
     _raise_collected_errors,
     _validate_known_study_direction,
+    addressed_study,
     known_studies,
 )
 from phasesweep.engine.ledger import open_preview_study, read_every_phase_study, validate_ledger
@@ -813,6 +815,81 @@ def _preview_phase(
         _launch_preflight(experiment, phase.name, cohort)
     GpuPool.for_phase(phase, cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"))
     return _preview_launches(experiment, phase, inherited_winners, remaining, reruns)
+
+
+def replay_study_names(
+    experiment: Experiment,
+    every: Mapping[str, Sequence[optuna.Study]],
+    latest: Mapping[str, CarriesOverrides],
+) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
+    """Resolve phases whose parents can already replay under the inspected config.
+
+    Just as a dry run would, select from the captured trials before using a winner's inherited
+    values to address a child. If a parent needs more work, callers use the latest winner's
+    address for counts and can still describe a conditional re-read.
+
+    :param Experiment experiment: Config the next run would use.
+    :param Mapping[str, Sequence[optuna.Study]] every: Phase studies from one journal capture.
+    :param Mapping[str, CarriesOverrides] latest: Parent values from the captured winner files.
+    :return tuple[dict[str, str], dict[str, tuple[str, ...]]]: Addressable studies, including historical forecasts, and the parents whose next choices could change those forecasts.
+    """
+    needed = {parent for phase in experiment.phases for parent in phase.inherits}
+    winners: dict[str, Winner] = {}
+    names: dict[str, str] = {}
+    unresolved: dict[str, tuple[str, ...]] = {}
+    missing: dict[str, set[str]] = {}
+    for phase in experiment.phases:
+        inherited_winners = {parent: winners[parent] for parent in phase.inherits}
+        stand_ins = _inherited_placeholder_keys(phase, inherited_winners)
+        missing_values = {
+            key for parent, keys in stand_ins.items() for key in keys if key in missing[parent]
+        }
+        if phase.name in needed:
+            previous = latest.get(phase.name)
+            observed = {} if previous is None else previous.effective_overrides
+            samples = _placeholder_values_for(phase.search_space)
+            samples.update({key: observed[key] for key in samples.keys() & observed.keys()})
+            winners[phase.name] = _placeholder_winner(
+                experiment, phase, inherited_winners, sampled_params=samples
+            )
+            missing[phase.name] = missing_values | (phase.search_space.keys() - observed.keys())
+        if stand_ins:
+            unresolved[phase.name] = tuple(stand_ins)
+        # A display can forecast from the latest measured values. Fabricated defaults have no study.
+        if missing_values:
+            continue
+        inherited = _inherited_override_payload(phase, inherited_winners)
+        name = phase_study_name(experiment, phase, inherited)
+        names[phase.name] = name
+        if stand_ins or phase.name not in needed:
+            continue
+        study = addressed_study(every, phase.name, name)
+        if study is None:
+            continue
+        trials = study.get_trials(deepcopy=False)
+        if any(trial.state == optuna.trial.TrialState.RUNNING for trial in trials):
+            continue
+        try:
+            resumed = _judge_recorded_phase(
+                experiment,
+                phase,
+                inherited_winners,
+                study,
+                policy_state=_load_phase_policy_state(study, experiment),
+                phase_fingerprint=_judge_identity(study, experiment, phase, inherited).fingerprint,
+                verify_evidence=False,
+                emit_advisories=False,
+            )
+            if isinstance(resumed, Winner):
+                winners[phase.name] = resumed
+            elif _finished_trial_count(trials) >= phase.n_trials:
+                winners[phase.name] = _replay_met_target(
+                    experiment, phase, inherited_winners, study, resumed, verify_evidence=False
+                )
+        except PhaseSweepError:
+            # Normal status diagnostics handle the refusal using this study's captured rows.
+            continue
+    return names, unresolved
 
 
 def _preview_launches(
