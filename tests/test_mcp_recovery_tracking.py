@@ -6,8 +6,6 @@ import os
 import re
 import shlex
 import signal
-import threading
-import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -47,6 +45,7 @@ from tests.tracking_helpers import (
     leak_tracking_worker,
     leave_cleanup_uncertain_attempt,
     remote_mlflow_example,
+    signal_when_uploads_start,
 )
 
 _RUN_ID = "mcp-recovered-run"
@@ -558,12 +557,6 @@ def test_a_shutdown_signal_during_recover_run_stops_its_worker_and_prints_the_co
     run.uploads.clear()
     uploading: list[str] = []
 
-    def signal_once_the_upload_runs() -> None:
-        deadline = time.monotonic() + 30.0
-        while (not uploading or not shutdown._active_children) and time.monotonic() < deadline:
-            time.sleep(0.02)
-        os.kill(os.getpid(), signum)
-
     command = shlex.join(
         [
             "phasesweep",
@@ -579,8 +572,7 @@ def test_a_shutdown_signal_during_recover_run_stops_its_worker_and_prints_the_co
     with monkeypatch.context() as patch:
         hang_uploads_until_killed(patch, uploading)
         capsys.readouterr()
-        sender = threading.Thread(target=signal_once_the_upload_runs, daemon=True)
-        sender.start()
+        sender = signal_when_uploads_start(uploading, signum)
         status = invoke_cli_boundary(shlex.split(command)[1:], monkeypatch)
         sender.join(timeout=5)
 

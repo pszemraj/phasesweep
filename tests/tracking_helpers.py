@@ -9,6 +9,7 @@ import os
 import shlex
 import sys
 import threading
+import time
 from collections.abc import Mapping
 from functools import partial
 from pathlib import Path
@@ -31,7 +32,7 @@ from phasesweep.engine.state import ATTEMPT_ID_ATTR, CLEANUP_CONFIRMED_ATTR
 from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 from phasesweep.evidence.evaluation import TrialContext
 from phasesweep.evidence.mlflow import compile_query
-from phasesweep.runtime import process
+from phasesweep.runtime import process, shutdown
 from phasesweep.runtime.json import JsonObject
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
@@ -379,6 +380,24 @@ def leak_tracking_worker(monkeypatch, *, action="publish", name=None):
     monkeypatch.setattr(session, "request_operation", leaky)
     monkeypatch.setattr(worker, "request_operation", leaky)
     return leaked
+
+
+def signal_when_uploads_start(
+    started: list[str], signum: int, *, count: int = 1
+) -> threading.Thread:
+    """Signal the test process once its upload workers register, or after 30 seconds to unblock it."""
+
+    def send() -> None:
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if len(started) >= count and len(shutdown._active_children) >= count:
+                break
+            time.sleep(0.02)
+        os.kill(os.getpid(), signum)
+
+    sender = threading.Thread(target=send, daemon=True)
+    sender.start()
+    return sender
 
 
 def hang_uploads_until_killed(monkeypatch: pytest.MonkeyPatch, started: list[str]) -> None:

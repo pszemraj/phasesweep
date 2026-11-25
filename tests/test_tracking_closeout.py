@@ -8,7 +8,6 @@ import os
 import re
 import shlex
 import signal
-import threading
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -50,6 +49,7 @@ from tests.tracking_helpers import (
     leak_tracking_worker,
     native_experiment,
     remote_mlflow_example,
+    signal_when_uploads_start,
 )
 
 _PENDING_STEP = f"results are saved locally. Send them with {SYNC_TRACKING_STEP}."
@@ -448,20 +448,9 @@ def test_a_ctrl_c_while_trials_upload_stops_delivery_without_blaming_mlflow(
     experiment = Experiment.model_validate(config)
     requests: list[str] = []
 
-    def interrupt_once_every_upload_runs() -> None:
-        # A trial uploads once its trainer has exited, so then the registered children are the
-        # upload workers alone.
-        deadline = time.monotonic() + 30.0
-        while (
-            len(requests) < n_jobs or len(shutdown._active_children) < n_jobs
-        ) and time.monotonic() < deadline:
-            time.sleep(0.02)
-        os.kill(os.getpid(), signal.SIGINT)
-
     hang_uploads_until_killed(monkeypatch, requests)
-    sender = threading.Thread(target=interrupt_once_every_upload_runs, daemon=True)
     caplog.set_level(logging.INFO)
-    sender.start()
+    sender = signal_when_uploads_start(requests, signal.SIGINT, count=n_jobs)
     with pytest.raises(PhaseSweepShutdown):
         run_experiment(experiment)
     sender.join(timeout=5.0)
@@ -1087,17 +1076,10 @@ def test_a_ctrl_c_during_sync_tracking_says_what_stays_pending_and_exits_130(
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
     uploading: list[str] = []
 
-    def interrupt_once_the_upload_runs() -> None:
-        deadline = time.monotonic() + 30.0
-        while (not uploading or not shutdown._active_children) and time.monotonic() < deadline:
-            time.sleep(0.02)
-        os.kill(os.getpid(), signal.SIGINT)
-
     hang_uploads_until_killed(monkeypatch, uploading)
     config = write_experiment_config(Path.cwd() / "experiment.yaml", sweep.experiment)
     capsys.readouterr()
-    sender = threading.Thread(target=interrupt_once_the_upload_runs, daemon=True)
-    sender.start()
+    sender = signal_when_uploads_start(uploading, signal.SIGINT)
 
     status = invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch)
     sender.join(timeout=5)
