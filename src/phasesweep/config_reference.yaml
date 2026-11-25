@@ -653,7 +653,7 @@ WandbTarget:
   # W&B account or team, for example research-team: nonempty, without slash or whitespace. The trainer environment's credentials must be able to read it.
   entity: string (required)
 
-  # W&B project, for example bart-search: nonempty, without slash or whitespace.
+  # W&B project, for example bart-search: nonempty, without slash or whitespace. Each attempt records its destination at launch, so a changed project applies to new draws and finished trials are read from the project they ran in.
   project: string (required)
 
   # Seconds between polls of the run state and summary, greater than 0.
