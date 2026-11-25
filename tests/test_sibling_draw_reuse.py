@@ -17,6 +17,7 @@ from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Sam
 from phasesweep.engine import reread as reread_ops
 from phasesweep.engine.errors import LaunchEnvironmentError, PhaseTimeoutError
 from phasesweep.engine.read import read_status
+from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     RERUN_OF_ATTR,
@@ -92,6 +93,34 @@ def _config(
 def _launches(path: Path) -> int:
     """Count the actual trainer executions."""
     return len(path.read_text().splitlines())
+
+
+def test_recovered_abort_accepts_sibling_draw_under_raised_target(tmp_path: Path) -> None:
+    """A recovery target covers an adopted draw on both the recovering run and its replay."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import argparse, json
+        from pathlib import Path
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", type=Path)
+        args, _ = parser.parse_known_args()
+        count = Path(__file__).with_name("count")
+        n = int(count.read_text()) + 1 if count.exists() else 1
+        count.write_text(str(n))
+        args.out.write_text(json.dumps({"alt": -n} if n == 2 else {"alt": -n, "loss": -n}))
+        """,
+    )
+    phase = _phase("random", 2).model_copy(update={"max_consecutive_failures": 1})
+    with pytest.raises(PhaseTrialsFailedError):
+        run_experiment(_config(tmp_path, trainer, phase))
+    raised = phase.model_copy(update={"n_trials": 3})
+    donor = run_experiment(_config(tmp_path, trainer, raised, "alt"))["p"]
+    target = _config(tmp_path, trainer, raised)
+    for _ in range(2):
+        winner = run_experiment(target)["p"]
+        assert (winner.metric, winner.attempt_id) == (-3, donor.attempt_id)
+    assert trainer.with_name("count").read_text() == "3"
 
 
 def test_returning_grid_reuses_finished_draws_without_launch_resources(

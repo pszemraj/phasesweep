@@ -681,13 +681,15 @@ def _accepted_trial_target(study: optuna.Study) -> int:
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} has trial state but no {TRIAL_TARGET_ATTR!r}.",
         )
-    if type(stored) is not int or stored < 1 or finished > stored:
-        raise StudySchemaMismatchError(
-            f"Study {study.study_name!r} has invalid {TRIAL_TARGET_ATTR!r}={stored!r} "
-            f"for {plural(finished, 'finished trial')}."
-        )
-    recovery = _load_recovery_record(study)
-    return stored if recovery is None else max(stored, recovery.trial_target)
+    if type(stored) is int and stored > 0:
+        recovery = _load_recovery_record(study)
+        accepted = stored if recovery is None else max(stored, recovery.trial_target)
+        if finished <= accepted:
+            return accepted
+    raise StudySchemaMismatchError(
+        f"Study {study.study_name!r} has invalid {TRIAL_TARGET_ATTR!r}={stored!r} "
+        f"for {plural(finished, 'finished trial')}."
+    )
 
 
 def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
