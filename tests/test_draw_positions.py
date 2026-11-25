@@ -29,9 +29,8 @@ from phasesweep.engine.optuna import (
     _sampling_trial_for_reread,
     _suggest,
 )
-from phasesweep.engine.state import REREAD_FILL_ATTR, RERUN_OF_ATTR, TRIAL_OUTCOME_ATTR
+from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.engine.study_policy import _record_reruns
-from phasesweep.engine.trial_dirs import REREAD_FILL_SCHEMA_VERSION
 from tests.conftest import trial_outcome
 
 _GRID_SPACE: dict[str, SearchParam] = {
@@ -472,10 +471,6 @@ def test_cmaes_reread_replays_later_batches_after_an_incomplete_one_fills() -> N
     reread = optuna.create_study(
         study_name=f"{source.study_name}::reread", sampler=sampler, storage=source._storage
     )
-    reread.set_user_attr(
-        REREAD_FILL_ATTR,
-        {"schema_version": REREAD_FILL_SCHEMA_VERSION, "study_name": source.study_name},
-    )
     for trial in source.get_trials():
         retained = _sampling_trial_for_reread(trial, sampler)
         if trial.number == 8:
@@ -492,6 +487,47 @@ def test_cmaes_reread_replays_later_batches_after_an_incomplete_one_fills() -> N
     resumed = _reopen(reread, _CMAES, _CMA_SPACE)
     _run(resumed, _CMA_SPACE, 1)
     assert resumed.trials[-1].system_attrs[sampler._attr_key_generation] == 3
+
+
+def test_cmaes_batch_replay_leaves_a_study_of_its_own_asks_unchanged() -> None:
+    """A study whose rows its own sampler asked draws what it drew before the replay ran for every study.
+
+    The trials that tell a generation are interrupted and rerun, so the newest completed snapshot
+    lags its generation; the expected draws were captured before the replay applied to such studies.
+    """
+    study = _study(_build_sampler(_CMAES, _CMA_SPACE))
+    for cut in (8, 15):
+        _run(study, _CMA_SPACE, 30, interrupt_at=frozenset({cut}))
+        _interrupt_and_rerun(study)
+        study = _reopen(study, _CMAES, _CMA_SPACE)
+    _run(study, _CMA_SPACE, 22 - len(study.get_trials()))
+    drawn = [
+        (trial.system_attrs.get("cma:generation"), *(round(v, 9) for v in trial.params.values()))
+        for trial in study.get_trials()
+    ]
+    assert drawn == [
+        (None, 0.338015138, 0.094874535),
+        (0, 0.364011665, 0.816008698),
+        (0, 0.286488237, -0.77355552),
+        (0, -0.393063841, -0.164850226),
+        (0, -0.161891305, -0.51060516),
+        (0, 0.119059413, 0.46048664),
+        (0, 0.244764865, 0.054201806),
+        (1, 0.155100571, 0.43629854),
+        (1, 0.388416049, 0.564462026),
+        (1, 0.388416049, 0.564462026),
+        (1, -0.121595945, 0.820749391),
+        (1, 0.271521873, 0.46686865),
+        (1, 0.046768141, -0.364243533),
+        (1, 0.115848461, 0.457999333),
+        (2, 0.231106423, 0.421011275),
+        (2, 0.031173059, 0.434716363),
+        (2, 0.031173059, 0.434716363),
+        (2, 0.10593717, 0.792312379),
+        (2, 0.388061132, 0.36081531),
+        (2, 0.576206315, 0.868281608),
+        (2, -0.056961132, 0.673844903),
+    ]
 
 
 def test_the_optuna_internals_the_position_samplers_build_on_exist() -> None:
