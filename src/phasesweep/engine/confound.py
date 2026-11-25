@@ -1067,7 +1067,8 @@ def _describe_code_revision(detail: CodeRevisionDetail) -> str:
     for entry in generations:
         members.setdefault(_revision_label(entry), set()).update(entry["trials"])
     listed = ", ".join(
-        f"{label} ({_trial_ranges(sorted(numbers))})" for label, numbers in members.items()
+        f"{label} ({_numbered('trial', sorted(numbers), ranges=True)})"
+        for label, numbers in members.items()
     )
     return (
         f"code_revision: ranked trials span {plural(len(generations), 'generation')} with "
@@ -1085,22 +1086,6 @@ def _revision_label(entry: GenerationRevision) -> str:
     if commit is None:
         return entry["record"]
     return f"{commit[:12]}{' dirty' if entry['dirty'] else ''}"
-
-
-def _trial_ranges(numbers: Sequence[int]) -> str:
-    """Name trials by number, three or more consecutive numbers as ``first-last``.
-
-    :param Sequence[int] numbers: Trial numbers in ascending order, at least one.
-    :return str: Such as ``trial 4``, ``trials 13, 14`` or ``trials 0-3, 5, 7-9``.
-    """
-    runs: list[list[int]] = []
-    for number in numbers:
-        if runs and number == runs[-1][-1] + 1:
-            runs[-1].append(number)
-        else:
-            runs.append([number])
-    named = [f"{run[0]}-{run[-1]}" if len(run) > 2 else ", ".join(map(str, run)) for run in runs]
-    return f"trial{'' if len(numbers) == 1 else 's'} {', '.join(named)}"
 
 
 def _describe_survivorship(
@@ -1238,14 +1223,26 @@ def _code_revision_remedy() -> str:
     )
 
 
-def _numbered(noun: str, numbers: Sequence[int]) -> str:
+def _numbered(noun: str, numbers: Sequence[int], *, ranges: bool = False) -> str:
     """Name trials or groups by number, the noun in the plural for more than one.
 
     :param str noun: ``trial`` or ``group``.
-    :param Sequence[int] numbers: Their trial numbers, at least one.
-    :return str: Such as ``group 5`` or ``groups 5, 8``.
+    :param Sequence[int] numbers: Their trial numbers, at least one; ascending with ``ranges``.
+    :param bool ranges: Write three or more consecutive numbers as ``first-last``.
+    :return str: Such as ``group 5``, ``groups 5, 8`` or, with ``ranges``, ``trials 0-3, 5, 7-9``.
     """
-    return f"{noun}{'' if len(numbers) == 1 else 's'} {', '.join(map(str, numbers))}"
+    runs: list[list[int]] = []
+    for number in numbers if ranges else ():
+        if runs and number == runs[-1][-1] + 1:
+            runs[-1].append(number)
+        else:
+            runs.append([number])
+    named = (
+        [f"{run[0]}-{run[-1]}" if len(run) > 2 else ", ".join(map(str, run)) for run in runs]
+        if ranges
+        else list(map(str, numbers))
+    )
+    return f"{noun}{'' if len(numbers) == 1 else 's'} {', '.join(named)}"
 
 
 def _describe_group_tie(
