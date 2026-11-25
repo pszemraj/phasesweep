@@ -315,7 +315,7 @@ _NO_RUN_ACTIVE = (
 
 
 def test_status_tells_a_killed_run_from_a_live_one(harness: RerunHarness) -> None:
-    """After SIGKILL both status views say no run is active; a live lock silences them and a rerun clears them."""
+    """Both status views warn about a killed run across reading settings until recovery."""
     phase = Phase(
         name="p",
         n_trials=2,
@@ -329,26 +329,26 @@ def test_status_tells_a_killed_run_from_a_live_one(harness: RerunHarness) -> Non
     harness.interrupt(config, 0, signal.SIGKILL)
 
     assert [t.state.name for t in phase_trials(experiment)] == ["RUNNING"]
-    for arguments in (["status"], ["status", "--trials"]):
-        shown = CliRunner().invoke(cli, [*arguments, str(config)])
+    commands = [
+        ["status", str(config), *options, *settings]
+        for options in ([], ["--trials"])
+        for settings in ([], ["--set", 'metric.extractor.split="test"'])
+    ]
+    for command in commands:
+        shown = CliRunner().invoke(cli, command)
         assert shown.exit_code == 0, shown.output
-        # The table form wraps the comment to the terminal width, each line still a comment.
-        comment = [line for line in shown.output.splitlines() if line.startswith("# ")]
-        assert " ".join(line.removeprefix("# ") for line in comment) == _NO_RUN_ACTIVE.removeprefix(
-            "# "
-        )
-        assert shown.output.splitlines()[0] == comment[0]
+        assert shown.output.replace("\n# ", " ").startswith(_NO_RUN_ACTIVE)
         assert shown.output.count("No run is active") == 1
         with _experiment_lock(experiment):
-            live = CliRunner().invoke(cli, [*arguments, str(config)])
+            live = CliRunner().invoke(cli, command)
         assert live.exit_code == 0, live.output
         assert "No run is active" not in live.output
 
     harness.release()
     harness.complete(config)
 
-    for arguments in (["status"], ["status", "--trials"]):
-        recovered = CliRunner().invoke(cli, [*arguments, str(config)])
+    for command in commands:
+        recovered = CliRunner().invoke(cli, command)
         assert recovered.exit_code == 0, recovered.output
         assert "No run is active" not in recovered.output
 

@@ -1414,7 +1414,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     if show_trials:
         tables = read_trial_tables(config, latest=True)
         width = terminal_width(sys.stdout)
-        running = sum(row["state"] == "RUNNING" for table in tables.phases for row in table.rows)
+        running = tables.unsettled_trials
         if running and _status_can_suggest_resume(config):
             click.echo(unsettled_running_comment(running, width))
         click.echo(
@@ -1441,12 +1441,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     phase_payloads = (
         [phase for phase in phases if isinstance(phase, dict)] if isinstance(phases, list) else []
     )
-    running = 0
-    for phase in phase_payloads:
-        counts = phase.get("trials")
-        recorded = counts.get("RUNNING") if isinstance(counts, dict) else None
-        if isinstance(recorded, int):
-            running += recorded
+    running = inspection.unsettled_trials
     retained = any(
         phase.get("winner") is not None and phase.get("winner_is_published") is False
         for phase in phase_payloads
