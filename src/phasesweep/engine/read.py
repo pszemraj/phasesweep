@@ -36,6 +36,7 @@ from phasesweep.engine.errors import (
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrialEvidenceMissingError,
+    TrialTargetRefusedError,
 )
 from phasesweep.engine.evidence import _selection_evidence
 from phasesweep.engine.fingerprints import (
@@ -122,6 +123,7 @@ from phasesweep.engine.study_policy import (
     _at_accepted_partial_target,
     _load_accepted_partial_decision,
     _load_phase_policy_state,
+    _validate_trial_target,
 )
 from phasesweep.engine.trial_dirs import reused_checkpoint_warnings, standing_repeat_attempts
 from phasesweep.errors import (
@@ -1344,13 +1346,17 @@ PhaseRefusal: TypeAlias = (
     | PendingRereadNotice
     | PendingParentNotice
     | TrialEvidenceMissingError
+    | TrialTargetRefusedError
 )
 
 
 def _study_diagnostics(
     experiment: Experiment, phase: Phase, study: optuna.Study
 ) -> tuple[PhaseRefusal | None, tuple[int, ...]]:
-    """Report the failure policy, identity or evidence refusal for a known study in run order.
+    """Report the identity, target, failure policy or evidence refusal for a known study.
+
+    The checks run in the order of a run's preflight and phase start, and the target is judged
+    by the run's own check (:func:`~phasesweep.engine.study_policy._validate_trial_target`).
 
     :param Experiment experiment: Current config.
     :param Phase phase: The phase the study belongs to.
@@ -1360,15 +1366,17 @@ def _study_diagnostics(
         (:func:`phasesweep.engine.evidence._selection_evidence`).
     """
     try:
+        _verify_recorded_identity(study, experiment, phase)
+        _validate_trial_target(study, phase)
         refusal = _status_phase_refusal(experiment, phase, study)
         if refusal is not None:
             return refusal, ()
-        _verify_recorded_identity(study, experiment, phase)
         return None, _selection_evidence(experiment, phase, study)
     except (
         StudyFingerprintMismatchError,
         StudySchemaMismatchError,
         TrialEvidenceMissingError,
+        TrialTargetRefusedError,
     ) as exc:
         return exc, ()
 

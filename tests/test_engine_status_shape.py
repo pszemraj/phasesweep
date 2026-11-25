@@ -7,6 +7,7 @@ contract for downstream consumers.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -534,6 +535,25 @@ def test_status_counts_follow_the_trial_table_state_names(tmp_path: Path) -> Non
     assert next(iter(phase_status)) == "name"
     (table,) = read_trial_tables(experiment).phases
     assert sorted(str(row["state"]) for row in table.rows) == sorted(expected)
+
+
+def test_status_gives_the_refusal_a_run_gives_for_a_lowered_target(tmp_path: Path) -> None:
+    """A phase whose study accepted a larger ``n_trials`` shows the run's refusal and fix in both status forms, not a run command that would be refused."""
+    run_experiment(make_experiment(persistent=tmp_path, n_trials=3))
+    lowered = make_experiment(persistent=tmp_path, n_trials=2)
+    config = write_experiment_config(tmp_path / "lowered.yaml", lowered)
+    message = "Phase 'p' has already accepted a target of 3 finished trials; the config requests 2."
+    fix = "Set phases[p].n_trials to at least 3."
+
+    with pytest.raises(PhaseSweepError, match=re.escape(message)):
+        run_experiment(lowered)
+    status = CliRunner().invoke(cli, ["status", str(config)])
+    trials = CliRunner().invoke(cli, ["status", str(config), "--trials"])
+
+    assert status.exit_code == 0, status.output
+    assert status.output.startswith(f"# {message}\n# fix: {fix}\n")
+    assert trials.exit_code == 0, trials.output
+    assert " ".join(trials.output.split()).count(f"{message} fix: {fix}") == 1
 
 
 def test_published_completion_counts_every_measured_trial(tmp_path: Path) -> None:
