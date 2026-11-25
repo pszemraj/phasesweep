@@ -124,25 +124,16 @@ def test_an_interrupted_trial_is_named_beside_the_progress_it_does_not_add_to(
     ]
 
 
-@pytest.mark.parametrize(
-    ("width", "heading"),
-    [
-        (80, ["learning_rate: 2 of 2 trials (1 interrupted), eval_loss (lower is better)"]),
-        (60, ["learning_rate: 2 of 2 trials (1 interrupted), eval_loss", "  (lower is better)"]),
-    ],
-)
-def test_a_finished_phase_with_a_rerun_still_names_the_interrupted_original(
-    width: int, heading: list[str]
-) -> None:
-    """The rerun counts and the trial it replaced does not, so the phase is done with one row aside."""
+def test_an_interrupted_trial_its_rerun_replaced_is_not_named_as_pending() -> None:
+    """The rerun counts and the trial it replaced stays a row, but the heading names no pending interruption."""
     lines = _heading_and_rows(
         [_interrupted(5), _complete(5, 0.4, **{RERUN_OF_ATTR: 0}), _complete(4, 0.3)],
-        width,
+        80,
         n_trials=2,
     )
 
     assert lines == [
-        *heading,
+        "learning_rate: 2 of 2 trials, eval_loss (lower is better)",
         "          trial  eval_loss  x  state        time  rerun of",
         "              2        0.3  4  COMPLETE     0.5s         -",
         "              0          -  5  INTERRUPTED  0.5s         -",

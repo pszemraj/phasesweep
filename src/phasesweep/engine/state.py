@@ -174,7 +174,8 @@ class PhaseCounts:
     ``earlier`` counts the trials of a state in :data:`FINISHED_TRIAL_STATES` that a previous run
     recorded, so it is a part of :attr:`counted`. ``winner_dirs`` holds the trial directory of
     each trial the phase's winner stands on, in trial order, leaving out one that recorded none;
-    it is read for the summary and never saved.
+    it is read for the summary and never saved. ``interrupted`` counts the interrupted trials
+    still waiting for a rerun (:func:`_unreplaced_attempts`), as the status heading does.
     """
 
     complete: int = 0

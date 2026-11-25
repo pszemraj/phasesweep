@@ -25,7 +25,12 @@ from phasesweep.engine.paths import _phase_dir
 from phasesweep.engine.read import read_trial_tables
 from phasesweep.engine.run import _phase_counts
 from phasesweep.engine.selection import PhaseTrialsFailedError
-from phasesweep.engine.state import GENERATION_ID_ATTR, TRIAL_OUTCOME_ATTR, Winner
+from phasesweep.engine.state import (
+    GENERATION_ID_ATTR,
+    RERUN_OF_ATTR,
+    TRIAL_OUTCOME_ATTR,
+    Winner,
+)
 from phasesweep.errors import UnsafeProcessCleanupError, operator_step
 from phasesweep.evidence.models import RequiredFileGate, WandbExtractor
 from phasesweep.run_report import (
@@ -1563,3 +1568,42 @@ def test_phase_counts_keep_an_interrupted_trial_out_of_the_counted_and_earlier_t
     assert counts is not None
     assert (counts.complete, counts.interrupted) == (2, 1)
     assert (counts.counted, counts.earlier) == (2, 2)
+
+
+def test_phase_counts_name_no_interrupted_trial_that_a_rerun_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted trial its rerun completed is no pending work, so the summary counts none."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=write_constant_trainer(tmp_path), n_trials=2, gpu_policy="none"
+    )
+    winner = run_experiment(experiment)["p"]
+    study = phase_study(experiment)
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=optuna.trial.TrialState.FAIL,
+            user_attrs={
+                TRIAL_OUTCOME_ATTR: trial_outcome(9, "interrupted", cause="interrupted by SIGINT")
+            },
+        )
+    )
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=optuna.trial.TrialState.COMPLETE,
+            value=0.5,
+            user_attrs={RERUN_OF_ATTR: 2, TRIAL_OUTCOME_ATTR: trial_outcome(10, "success")},
+        )
+    )
+
+    counts = _phase_counts(
+        validate_ledger(experiment),
+        experiment,
+        experiment.phases[0],
+        study_name(experiment),
+        "this-run",
+        winner,
+    )
+
+    assert counts is not None
+    assert (counts.complete, counts.interrupted) == (3, 0)

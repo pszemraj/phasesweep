@@ -54,6 +54,7 @@ from phasesweep.engine.state import (
     Winner,
     _recorded_trial_dir,
     _stands_under_winner,
+    _unreplaced_attempts,
     _winning_trials,
 )
 from phasesweep.engine.trial_dirs import reused_checkpoint_warnings
@@ -669,7 +670,7 @@ def _phase_counts(
         complete=states["COMPLETE"],
         infeasible=states["INFEASIBLE"],
         failed=states["FAIL"],
-        interrupted=states["INTERRUPTED"],
+        interrupted=len(_unreplaced_attempts(trials, interrupted=True)),
         earlier=_finished_trial_count(
             trial for trial in trials if trial.user_attrs.get(GENERATION_ID_ATTR) != generation_id
         ),

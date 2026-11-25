@@ -13,6 +13,7 @@ import logging
 import math
 import statistics
 import typing
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
@@ -116,6 +117,7 @@ from phasesweep.engine.state import (
     _recorded_identity,
     _recorded_trial_dir,
     _stands_under_winner,
+    _unreplaced_attempts,
     _validate_observed_block,
     _winning_trials,
 )
@@ -1223,7 +1225,9 @@ class TrialTable:
     ``INFEASIBLE``. ``winner`` is ``*`` on the trials the represented phase's
     winner stands on and empty elsewhere. ``finished`` is how many rows count toward the
     phase's ``n_trials``, and ``uncounted`` pairs each state of the rows that do not with its
-    row count, in :data:`~phasesweep.engine.state.TRIAL_STATE_NAMES` order.
+    row count, in :data:`~phasesweep.engine.state.TRIAL_STATE_NAMES` order. ``INTERRUPTED``
+    counts only the interrupted trials no rerun names yet
+    (:func:`~phasesweep.engine.state._unreplaced_attempts`).
     """
 
     phase: str
@@ -1742,6 +1746,9 @@ def _trial_table(
         row[_WINNER_COLUMN] = "*" if _stands_under_winner(trial, standing) else ""
         rows.append(row)
     states = [_trial_run_state(trial) for trial in trials]
+    # An interrupted trial a rerun names is settled; only one still waiting for its rerun is pending.
+    states_counted = Counter(states)
+    states_counted["INTERRUPTED"] = len(_unreplaced_attempts(trials, interrupted=True))
     return TrialTable(
         phase=phase.name,
         available=available,
@@ -1749,9 +1756,9 @@ def _trial_table(
         rows=tuple(rows),
         finished=_finished_trial_count(trials),
         uncounted=tuple(
-            (state, states.count(state))
+            (state, states_counted[state])
             for state in TRIAL_STATE_NAMES
-            if state not in FINISHED_TRIAL_STATES and state in states
+            if state not in FINISHED_TRIAL_STATES and states_counted[state]
         ),
         groups=_repeat_group_views(experiment, phase, trials, rows),
         refusal=refusal,
