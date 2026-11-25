@@ -9,7 +9,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal, TypeAlias, get_args
+from typing import Annotated, Literal, NamedTuple, TypeAlias, get_args
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -186,6 +186,24 @@ class LogRegexExtractor(_Frozen):
         return value
 
 
+WANDB_DESTINATION_ENV = ("WANDB_BASE_URL", "WANDB_ENTITY", "WANDB_PROJECT")
+
+
+class WandbDestination(NamedTuple):
+    """Public location of the run a managed attempt logs to."""
+
+    base_url: str
+    entity: str
+    project: str
+
+    def environment(self) -> dict[str, str]:
+        """Provide the managed trainer's destination bindings.
+
+        :return dict[str, str]: The endpoint, entity and project as W&B environment variables.
+        """
+        return dict(zip(WANDB_DESTINATION_ENV, self, strict=True))
+
+
 class _WandbSummarySource(_Frozen):
     """One normalized remote target and a bounded finished-summary query."""
 
@@ -196,6 +214,14 @@ class _WandbSummarySource(_Frozen):
     # W&B can serve a finished run's summary minutes after the run finished, longest for a
     # resumed run, so the default rides out that lag.
     timeout_seconds: ConfigFloat = Field(default=600.0, ge=1, allow_inf_nan=False)
+
+    @property
+    def destination(self) -> WandbDestination:
+        """Return the configured run location separately from the reading settings.
+
+        :return WandbDestination: Normalized endpoint, entity and project.
+        """
+        return WandbDestination(self.base_url, self.entity, self.project)
 
     @field_validator("base_url")
     @classmethod
@@ -516,12 +542,7 @@ def compose_wandb_environment(
     :return dict[str, str]: Bound base environment, before the attempt's run bindings.
     :raises ValueError: Explicit managed settings conflict, or remote logging is disabled.
     """
-    source = query.source
-    bindings = {
-        "WANDB_BASE_URL": source.base_url,
-        "WANDB_ENTITY": source.entity,
-        "WANDB_PROJECT": source.project,
-    }
+    bindings = query.source.destination.environment()
     for key, expected in bindings.items():
         if key in configured:
             actual = configured[key]

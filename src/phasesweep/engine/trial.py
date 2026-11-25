@@ -41,7 +41,11 @@ from phasesweep.engine.state import (
     constraint_attr,
     observed_attr,
 )
-from phasesweep.evidence.baseline import write_evidence_baseline
+from phasesweep.evidence.baseline import (
+    EVIDENCE_BASELINE_FILE,
+    read_evidence_baseline,
+    write_evidence_baseline,
+)
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
     EvidenceUnreadableError,
@@ -55,6 +59,7 @@ from phasesweep.evidence.evaluation import (
 )
 from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
 from phasesweep.evidence.models import (
+    WANDB_DESTINATION_ENV,
     Gate,
     JsonEnvelopeExtractor,
     ObjectiveExtractor,
@@ -271,8 +276,9 @@ def _environment_identity(
 ) -> EnvironmentIdentity:
     """Hash the trainer environment's semantic values for the persistent-study cohort.
 
-    Track base names, explicit inheritance, configured env, and configured backend
-    bindings. Exclude pass-through values and per-trial bindings; explicit env entries
+    Track base names, explicit inheritance, configured env, and MLflow bindings.
+    Managed W&B destinations belong to attempts and have their own record. Exclude
+    pass-through values and per-trial bindings; explicit env entries
     remain semantic even when they reuse a pass-through name. Under ``inherit_env: all``,
     other ambient values reach the trainer without entering the cohort. Hash compact
     JSON name/value pairs sorted by name, with each search-path list (a name ending in
@@ -305,7 +311,7 @@ def _environment_identity(
     phase = experiment.phase(phase_name)
     query = _wandb_query(experiment, phase.gates)
     if query is not None:
-        cohort_names.update(("WANDB_BASE_URL", "WANDB_ENTITY", "WANDB_PROJECT"))
+        cohort_names.difference_update(WANDB_DESTINATION_ENV)
         try:
             env = compose_wandb_environment(
                 query,
@@ -846,10 +852,20 @@ def launch_trial(
     env = dict(environment_identity.values)
     phase = experiment.phase(phase_name)
     wandb_query = _wandb_query(experiment, phase.gates)
+    wandb_destination = None
     # Every attempt of the trial logs to one run, named by the attempt that opened its
     # directory, so W&B keeps the history steps and summary aggregates of the whole trial.
     # Without a W&B query, the trainer keeps its own WANDB_RUN_ID.
     if wandb_query is not None:
+        wandb_destination = wandb_query.source.destination
+        for _, prior_id in earlier_attempts:
+            prior = attempt_dir.with_name(prior_id)
+            if (prior / EVIDENCE_BASELINE_FILE).is_file():
+                recorded = read_evidence_baseline(prior).wandb_destination
+                if recorded is not None:
+                    wandb_destination = recorded
+                    break
+        env.update(wandb_destination.environment())
         env["WANDB_RUN_ID"] = opener_attempt
         env["WANDB_RESUME"] = "never" if opener_attempt == attempt_id else "allow"
     if experiment.mlflow is not None:
@@ -906,7 +922,12 @@ def launch_trial(
     _record_trainer_environment(experiment, environment_identity, env, attempt_dir)
     # Before the trainer starts: what an earlier attempt left in this directory is refused.
     baseline = write_evidence_baseline(
-        experiment, phase, workdir, attempt_dir, reused=opener_attempt != attempt_id
+        experiment,
+        phase,
+        workdir,
+        attempt_dir,
+        reused=opener_attempt != attempt_id,
+        wandb_destination=wandb_destination,
     )
 
     log.info("[%s/trial_%d] %s", phase_name, trial_id, cmd)
@@ -1110,6 +1131,9 @@ def extract_trial_result(
     )
     if isinstance(metric_value, TrialResult):
         return metric_value
+    if executed.ctx.managed_envelope_path is not None:
+        # Only the objective used the trainer's managed output path.
+        executed = replace(executed, ctx=replace(executed.ctx, managed_envelope_path=None))
     primary_source = objective_provenance.get("source")
     constraint_files: list[JsonValue] = []
     for c in experiment.constraints:

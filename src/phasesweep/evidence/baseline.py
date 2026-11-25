@@ -23,19 +23,20 @@ from phasesweep.evidence.models import (
     ObjectiveExtractor,
     RequiredFileGate,
     Sha256Gate,
+    WandbDestination,
     WandbExtractor,
     WandbSummaryRequiredGate,
     is_captured_stream,
 )
 from phasesweep.runtime.files import atomic_write_text
-from phasesweep.runtime.json import strict_json_loads
+from phasesweep.runtime.json import json_object, json_text, strict_json_loads
 
 if TYPE_CHECKING:
     from os import stat_result
 
     from phasesweep.config.models import Experiment, Phase
 
-EVIDENCE_BASELINE_SCHEMA_VERSION = 6
+EVIDENCE_BASELINE_SCHEMA_VERSION = 7
 EVIDENCE_BASELINE_FILE = "evidence_baseline.json"
 
 
@@ -72,6 +73,7 @@ class EvidenceBaseline(NamedTuple):
     # Unix time just before a rerun's trainer started, which the trial's W&B run must show
     # a row logged after; None in a directory of the attempt's own, whose run is its own.
     launched_at: float | None = None
+    wandb_destination: WandbDestination | None = None
 
 
 def _extractor_value_path(extractor: ObjectiveExtractor) -> str | None:
@@ -141,6 +143,7 @@ def write_evidence_baseline(
     attempt_dir: Path,
     *,
     reused: bool = False,
+    wandb_destination: WandbDestination | None = None,
 ) -> EvidenceBaseline:
     """Record where each value path resolves and the stamp of any file there before launch.
 
@@ -155,6 +158,7 @@ def write_evidence_baseline(
     :param Path trial_dir: The trial directory the trainer writes into.
     :param Path attempt_dir: The attempt's directory, which receives the record.
     :param bool reused: The trial directory already held an interrupted attempt, defaults to False.
+    :param WandbDestination | None wandb_destination: Managed tracker location set for the trainer.
     :raises OSError: The record could not be written, so no trainer may start.
     :return EvidenceBaseline: The baseline, for the attempt's own extraction.
     """
@@ -191,9 +195,10 @@ def write_evidence_baseline(
             for relative, before in files.items()
         },
         "launched_at": launched_at,
+        "wandb_destination": None if wandb_destination is None else wandb_destination._asdict(),
     }
     atomic_write_text(attempt_dir / EVIDENCE_BASELINE_FILE, json.dumps(payload) + "\n")
-    return EvidenceBaseline(reused, files, launched_at)
+    return EvidenceBaseline(reused, files, launched_at, wandb_destination)
 
 
 def read_evidence_baseline(attempt_dir: Path) -> EvidenceBaseline:
@@ -219,6 +224,7 @@ def read_evidence_baseline(attempt_dir: Path) -> EvidenceBaseline:
     if (
         type(reused) is not bool
         or not isinstance(files, dict)
+        or "wandb_destination" not in payload
         or (launched_at is None) == reused
         or not (launched_at is None or (type(launched_at) is float and launched_at > 0))
     ):
@@ -243,4 +249,18 @@ def read_evidence_baseline(attempt_dir: Path) -> EvidenceBaseline:
         ):
             raise ValueError(f"Evidence baseline {path} records {relative!r} malformed.")
         baseline[relative] = FileStamp(resolved, size, mtime_ns, ctime_ns, nlink)
-    return EvidenceBaseline(reused, baseline, launched_at)
+    destination = None
+    raw_destination = payload["wandb_destination"]
+    if raw_destination is not None:
+        try:
+            fields = json_object(raw_destination)
+            destination = WandbDestination(
+                json_text(fields, "base_url"),
+                json_text(fields, "entity"),
+                json_text(fields, "project"),
+            )
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                f"Evidence baseline {path} records a malformed W&B destination."
+            ) from exc
+    return EvidenceBaseline(reused, baseline, launched_at, destination)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shlex
@@ -34,13 +35,20 @@ from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedE
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FAILURE_REASON_ATTR,
+    OBJECTIVE_PROVENANCE_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_RECOVERY_ATTR,
     RERUN_OF_ATTR,
     TRIAL_DIR_ATTR,
 )
 from phasesweep.evidence.baseline import EVIDENCE_BASELINE_FILE
-from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
+from phasesweep.evidence.models import (
+    JsonEnvelopeExtractor,
+    JsonExtractor,
+    LogRegexExtractor,
+    WandbExtractor,
+)
+from phasesweep.evidence.wandb import WandbRunMissingError
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
@@ -289,6 +297,240 @@ def test_cmaes_topup_relearns_from_the_reread_values(tmp_path: Path) -> None:
     ]
     assert sampler._restore_optimizer(after[:9]) is None
     assert sampler._restore_optimizer(after) is not None
+
+
+def test_managed_envelope_path_change_reuses_the_producing_envelope(tmp_path: Path) -> None:
+    """Existing attempts keep their output path and new attempts use the changed path."""
+    launches = tmp_path / "launches.txt"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import json, os
+        from pathlib import Path
+        from phasesweep import report_objective
+        path = Path(os.environ["PHASESWEEP_OBJECTIVE_PATH"])
+        with Path({str(launches)!r}).open("a") as log:
+            log.write(path.name + "\\n")
+        report_objective(name="loss", split="test", value=0.8, policy="final", checkpoint="last", step=10)
+        constraint = json.loads(path.read_text())
+        constraint["objective"]["value"] = 1.5
+        path.with_name("constraint.json").write_text(json.dumps(constraint))
+        """,
+    )
+    phase = Phase(
+        name="p",
+        n_trials=1,
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        allow_partial_grid=True,
+        search_space={"x": IntParam(type="int", low=0, high=1)},
+    )
+
+    def config(path: str, trials: int) -> Experiment:
+        metric = Metric(
+            extractor=JsonEnvelopeExtractor(
+                type="json_envelope", path=path, objective_name="loss", split="test", policy="final"
+            )
+        )
+        constraint = Constraint(
+            name="resource",
+            max=2,
+            extractor=metric.extractor.model_copy(update={"path": "constraint.json"}),
+        )
+        return _experiment(
+            tmp_path,
+            trainer,
+            metric,
+            phases=[phase.model_copy(update={"n_trials": trials})],
+            constraints=[constraint],
+        )
+
+    original = config("original.json", 1)
+    assert run_experiment(original)["p"].metric == 0.8
+    original_id = phase_study_of(original).trials[0].user_attrs[ATTEMPT_ID_ATTR]
+    changed = config("next.json", 2)
+    winner = run_experiment(changed)["p"]
+    assert winner.metric == 0.8 and winner.constraints == {"resource": 1.5}
+    old, new = phase_study_of(changed).trials
+    assert old.value == new.value == 0.8
+    assert old.user_attrs[ATTEMPT_ID_ATTR] == original_id
+    assert all(
+        json.loads(record.user_attrs[OBJECTIVE_PROVENANCE_ATTR])["source"]["path"] == path
+        for record, path in [(old, "original.json"), (new, "next.json")]
+    )
+    assert run_experiment(original)["p"].attempt_id == original_id
+    assert launches.read_text().splitlines() == ["original.json", "next.json"]
+
+
+def test_wandb_project_change_keeps_prior_trials_and_routes_new_draws(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """W&B lookup and offline winner verification use the launch target of each result."""
+    launches = tmp_path / "launches.jsonl"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import json, os
+        from pathlib import Path
+        with Path({str(launches)!r}).open("a") as log:
+            log.write(json.dumps([os.environ["WANDB_PROJECT"], os.environ["WANDB_RUN_ID"]]) + "\\n")
+        """,
+    )
+    phase = Phase(
+        name="p",
+        n_trials=1,
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        allow_partial_grid=True,
+        search_space={"x": IntParam(type="int", low=0, high=1)},
+    )
+
+    def config(project: str, trials: int) -> Experiment:
+        metric = Metric(
+            extractor=WandbExtractor(
+                type="wandb",
+                entity="owner",
+                project=project,
+                metric_key="score",
+            )
+        )
+        return _experiment(
+            tmp_path,
+            trainer,
+            metric,
+            phases=[phase.model_copy(update={"n_trials": trials})],
+            env={"WANDB_PROJECT": project},
+        )
+
+    def launched_runs() -> list[list[str]]:
+        return [json.loads(line) for line in launches.read_text().splitlines()]
+
+    summary_paths: list[list[str]] = []
+    position_paths: list[list[str]] = []
+
+    def summary(*, project: str, run_id: str, **_: object) -> dict[str, object]:
+        path = [project, run_id]
+        summary_paths.append(path)
+        if path not in launched_runs():
+            raise WandbRunMissingError(run_id)
+        return {
+            "values": {"score": 0.25 if project == "original" else 0.5},
+            "present_keys": [],
+            "retrieved_at": "2026-01-01T00:00:00+00:00",
+        }
+
+    def position(*, project: str, run_id: str, **_: object) -> int:
+        position_paths.append([project, run_id])
+        return 10
+
+    monkeypatch.setattr("phasesweep.evidence.wandb.require_wandb_sdk", lambda: None)
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", summary)
+    monkeypatch.setattr("phasesweep.evidence.evaluation.locate_wandb_position", position)
+    original = config("original", 1)
+    original_id = run_experiment(original)["p"].attempt_id
+    changed = config("new-project", 2)
+    winner = run_experiment(changed)["p"]
+    old, new = phase_study_of(changed).trials
+    new_id = new.user_attrs[ATTEMPT_ID_ATTR]
+    assert [old.value, new.value] == [0.25, 0.5]
+    assert winner.attempt_id == original_id and winner.metric == 0.25
+    assert launched_runs() == [["original", original_id], ["new-project", new_id]]
+    assert (
+        summary_paths
+        == position_paths
+        == [
+            ["original", original_id],
+            ["original", original_id],
+            ["new-project", new_id],
+        ]
+    )
+    assert run_experiment(original)["p"].attempt_id == original_id
+    assert len(launched_runs()) == 2
+
+
+def test_reread_never_queries_an_unbound_wandb_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A local-only launch supplies no managed run when a later extractor asks for W&B."""
+    trainer, launches = _counting_trainer(tmp_path)
+    phase = Phase(name="p", n_trials=1, gpu_policy="none", sampler=Sampler(type="grid"))
+    original = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
+    assert run_experiment(original)["p"].metric == 4
+
+    def reject_lookup(**_: object) -> dict[str, object]:
+        raise AssertionError("a local-only trial cannot own a managed W&B run")
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", reject_lookup)
+    metric = Metric(
+        extractor=WandbExtractor(type="wandb", entity="owner", project="p", metric_key="score")
+    )
+    changed = _experiment(tmp_path, trainer, metric, phases=[phase])
+    with pytest.raises(NoFeasibleTrialError, match="No completed trials"):
+        run_experiment(changed)
+    (copied,) = phase_study_of(changed).trials
+    assert "no managed W&B destination at launch" in copied.user_attrs[FAILURE_REASON_ATTR]
+    assert _launches(launches) == 1
+
+
+def test_wandb_retry_keeps_the_checkpoint_runs_bound_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An attempt reusing a checkpoint continues the original W&B run after a project change."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import json, os
+        from pathlib import Path
+        path = Path(os.environ["PHASESWEEP_TRIAL_DIR"]) / "runs.jsonl"
+        first = not path.exists()
+        with path.open("a") as log:
+            log.write(json.dumps([os.environ["WANDB_PROJECT"], os.environ["WANDB_RUN_ID"],
+                                  os.environ["WANDB_RESUME"]]) + "\\n")
+        raise SystemExit(1 if first else 0)
+        """,
+    )
+    phase = Phase(name="p", n_trials=1, gpu_policy="none", sampler=Sampler(type="grid"))
+
+    def config(project: str, trials: int) -> Experiment:
+        metric = Metric(
+            extractor=WandbExtractor(
+                type="wandb",
+                entity="owner",
+                project=project,
+                metric_key="score",
+            )
+        )
+        return _experiment(
+            tmp_path, trainer, metric, phases=[phase.model_copy(update={"n_trials": trials})]
+        )
+
+    paths: list[tuple[str, str]] = []
+
+    def summary(*, project: str, run_id: str, **_: object) -> dict[str, object]:
+        paths.append((project, run_id))
+        return {
+            "values": {"score": 0.25},
+            "present_keys": [],
+            "retrieved_at": "2026-01-01T00:00:00+00:00",
+        }
+
+    monkeypatch.setattr("phasesweep.evidence.wandb.require_wandb_sdk", lambda: None)
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", summary)
+    monkeypatch.setattr("phasesweep.evidence.evaluation.locate_wandb_position", lambda **_: None)
+    original = config("original", 1)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(original)
+    changed = config("new-project", 2)
+    assert run_experiment(changed)["p"].metric == 0.25
+    opener, retry = phase_study_of(changed).trials
+    opener_id = opener.user_attrs[ATTEMPT_ID_ATTR]
+    assert opener.user_attrs[TRIAL_DIR_ATTR] == retry.user_attrs[TRIAL_DIR_ATTR]
+    launches = Path(retry.user_attrs[TRIAL_DIR_ATTR], "runs.jsonl").read_text().splitlines()
+    assert [json.loads(line) for line in launches] == [
+        ["original", opener_id, "never"],
+        ["original", opener_id, "allow"],
+    ]
+    assert paths == [("original", opener_id)]
 
 
 def test_published_reread_history_belongs_to_the_selecting_study(tmp_path: Path) -> None:

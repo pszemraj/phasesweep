@@ -45,6 +45,7 @@ from phasesweep.errors import (
     format_mismatch,
     short_digest,
 )
+from phasesweep.evidence.baseline import read_evidence_baseline
 from phasesweep.evidence.evaluation import (
     EVIDENCE_PROVENANCE_SCHEMA_VERSION,
     TrialPathError,
@@ -730,12 +731,17 @@ def _verify_trial_evidence_dir(
                 f"{subject} W&B capture belongs to another trial's run."
             )
     if verification.wandb_query is not None:
+        try:
+            destination = read_evidence_baseline(attempt_dir).wandb_destination
+        except ValueError as exc:
+            raise TrialEvidenceMissingError(
+                f"{subject} has no usable W&B launch binding: {exc}"
+            ) from exc
         if (
             capture is None
-            or any(
-                capture[field] != getattr(verification.wandb_query.source, field)
-                for field in ("base_url", "entity", "project")
-            )
+            or capture.get("kind") != "wandb"
+            or destination is None
+            or any(capture.get(field) != value for field, value in destination._asdict().items())
             or set(capture["values"]) != set(verification.wandb_query.numeric_keys)
             or capture.get("constraint_keys") != dict(verification.wandb_query.constraint_keys)
             or capture.get("gate_keys")
@@ -812,10 +818,6 @@ def _verify_trial_evidence_dir(
         source = provenance["source"]
         if (
             capture is None
-            or any(
-                capture[field] != getattr(verification.extractor, field)
-                for field in ("base_url", "entity", "project")
-            )
             or source.get("metric_key") != verification.extractor.metric_key
             or source["evaluation"]["progress"]["axis"] != verification.extractor.evaluation_axis
             or capture["values"].get(verification.extractor.metric_key) != metric_value

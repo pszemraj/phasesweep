@@ -14,7 +14,7 @@ from typing import Any, Literal, Protocol
 import optuna
 
 from phasesweep.config.common import TRACKER_READ_CONTROLS
-from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.models import Experiment, Phase, _wandb_query
 from phasesweep.engine.bounds import selection_bounds
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.growth import _GrowthVerdict, _search_space_growth, describe_gains
@@ -34,6 +34,7 @@ from phasesweep.errors import (
     restore_or_new_study,
     short_digest,
 )
+from phasesweep.evidence.models import WANDB_DESTINATION_ENV
 from phasesweep.runtime.json import JsonObject, json_object
 from phasesweep.runtime.terminal import plural
 
@@ -61,7 +62,7 @@ _RUN_CONTROL_KEYS = frozenset(
 #: Where W&B read controls sit inside a dumped phase: a summary-presence gate carries them.
 _PHASE_READ_CONTROLS = {"gates": {"__all__": set(TRACKER_READ_CONTROLS)}}
 # Increment the schema versions when their fingerprint payloads change.
-FINGERPRINT_SCHEMA_VERSION = 13
+FINGERPRINT_SCHEMA_VERSION = 14
 #: Where a phase identity payload keeps its reading settings (:func:`reading_settings`).
 READING_KEY = "reading"
 EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 11
@@ -456,6 +457,13 @@ def _identity_payload(
         "inherited_effective_overrides": _inherited_values(phase, inherited),
         READING_KEY: reading_settings(experiment, phase),
     }
+    if _wandb_query(experiment, phase.gates) is not None:
+        # Config load requires these redundant bindings to equal the managed destination.
+        payload["env"] = {
+            name: value
+            for name, value in experiment.env.items()
+            if name not in WANDB_DESTINATION_ENV
+        }
     return json_object(json.loads(json.dumps(payload, default=str)))
 
 

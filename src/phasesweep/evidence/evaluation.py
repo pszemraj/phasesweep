@@ -583,6 +583,7 @@ class TrialContext:
     baseline: EvidenceBaseline | None = field(default=None, compare=False)
     # End of the attributable period for mutable evidence in a directory another attempt reused.
     evidence_before: float | str | None = None
+    managed_envelope_path: str | None = None
     # (generation ID, attempt ID) of the earlier attempts that trained in trial_dir, oldest
     # first, whose tracker histories are the start of this trial's.
     earlier_attempts: tuple[tuple[str, str], ...] = ()
@@ -665,20 +666,19 @@ def _extract_json_envelope(
         directory, is malformed, or belongs to another execution attempt.
     :return float: Validated objective value from the envelope.
     """
-    target = trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.path, checked=False)
+    path = ctx.managed_envelope_path or cfg.path
+    target = trial_file(ctx.trial_dir, ctx.attempt_dir, path, checked=False)
     with _trial_json_read_errors(
         target,
         noun="JSON envelope",
         trainer_step=(
             "the trainer must call `phasesweep.report_objective(...)` before it exits, from rank "
-            f"0 only; it writes `{cfg.path}` under PHASESWEEP_TRIAL_DIR"
+            f"0 only; it writes `{path}` under PHASESWEEP_TRIAL_DIR"
         ),
     ):
-        retained = retained_evidence_file(ctx.attempt_dir, cfg.path)
+        retained = retained_evidence_file(ctx.attempt_dir, path)
         raw = (
-            retained
-            if retained is not None
-            else trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.path)
+            retained if retained is not None else trial_file(ctx.trial_dir, ctx.attempt_dir, path)
         ).read_bytes()
         data = strict_json_loads(raw.decode("utf-8"))
 
@@ -764,7 +764,7 @@ def _extract_json_envelope(
     if provenance is not None:
         provenance["source"] = {
             "kind": "file",
-            "path": cfg.path,
+            "path": path,
             **_file_digest(raw),
             # Evaluation metadata as validated from the envelope body — the
             # checkpoint, step, and progress position are the envelope's own
@@ -950,9 +950,14 @@ def _capture_wandb(
     capped = deadline is not None and deadline <= poll_deadline
     if deadline is not None:
         poll_deadline = min(poll_deadline, deadline)
-    target = f"{source.base_url}/{source.entity}/{source.project}/{run_id}"
     evidence_before = ctx.evidence_before
     try:
+        destination = source.destination if ctx.baseline is None else ctx.baseline.wandb_destination
+        if destination is None:
+            raise ExtractorError(
+                f"Attempt {ctx.attempt_id!r} had no managed W&B destination at launch."
+            )
+        target = f"{destination.base_url}/{destination.entity}/{destination.project}/{run_id}"
         if isinstance(evidence_before, str):
             raise ExtractorError(
                 f"W&B run {target} cannot be attributed to this attempt: {evidence_before}."
@@ -974,9 +979,9 @@ def _capture_wandb(
                     if launched_at is not None:
                         earlier_launches.append(launched_at)
             capture = poll_wandb_summary(
-                base_url=source.base_url,
-                entity=source.entity,
-                project=source.project,
+                base_url=destination.base_url,
+                entity=destination.entity,
+                project=destination.project,
                 run_id=run_id,
                 attempt_id=ctx.attempt_id,
                 attempt_dir=ctx.attempt_dir,
@@ -1062,9 +1067,7 @@ def _capture_wandb(
     ctx.wandb_capture.update(
         {
             "kind": "wandb",
-            "base_url": source.base_url,
-            "entity": source.entity,
-            "project": source.project,
+            **destination._asdict(),
             "run_id": run_id,
             "run_state": "finished",
             "constraint_keys": dict(query.constraint_keys),
@@ -1133,10 +1136,11 @@ def locate_objective_position(
     if not isinstance(cfg, WandbExtractor):
         return
     progress = provenance["source"]["evaluation"]["progress"]
+    capture = provenance["remote_capture"]
     progress["value"] = locate_wandb_position(
-        base_url=cfg.base_url,
-        entity=cfg.entity,
-        project=cfg.project,
+        base_url=capture["base_url"],
+        entity=capture["entity"],
+        project=capture["project"],
         run_id=ctx.wandb_run_id,
         attempt_id=ctx.attempt_id,
         attempt_dir=ctx.attempt_dir,
@@ -1144,7 +1148,7 @@ def locate_objective_position(
         timeout_seconds=cfg.timeout_seconds,
         metric_key=cfg.metric_key,
         axis=cfg.evaluation_axis,
-        value=provenance["remote_capture"]["values"][cfg.metric_key],
+        value=capture["values"][cfg.metric_key],
         environment=ctx.wandb_environment,
         deadline=deadline,
     )

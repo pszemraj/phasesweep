@@ -1233,6 +1233,7 @@ def read_finished_attempt(
     )
     from phasesweep.evidence.evaluation import TrialContext
     from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
+    from phasesweep.evidence.models import JsonEnvelopeExtractor
     from phasesweep.runtime.process import ProcessResult
 
     if record.trial_dir is None or record.generation_id is None:
@@ -1250,6 +1251,9 @@ def read_finished_attempt(
     environment = _environment_identity(
         producing, record.phase_name, require_wandb_online=False
     ).values
+    if baseline.wandb_destination is not None:
+        environment.update(baseline.wandb_destination.environment())
+    producing_extractor = producing.metric.extractor
     trainer_input = trial.user_attrs.get(TRAINER_INPUT_ATTR)
     overrides_json = trial.user_attrs.get(OVERRIDES_ATTR)
     if (
@@ -1282,6 +1286,11 @@ def read_finished_attempt(
         mlflow_environment=environment,
         baseline=baseline,
         evidence_before=evidence_before,
+        managed_envelope_path=(
+            producing_extractor.path
+            if isinstance(producing_extractor, JsonEnvelopeExtractor)
+            else None
+        ),
         earlier_attempts=_earlier_attempts(trials, trial),
     )
     result = extract_trial_result(

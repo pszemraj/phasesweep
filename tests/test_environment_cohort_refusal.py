@@ -475,9 +475,9 @@ def test_inherit_all_has_the_cohort_of_inherit_none(monkeypatch: pytest.MonkeyPa
 
     assert all_identity.digest == none_identity.digest
     assert all_identity.tracked == none_identity.tracked
-    assert {"CONFIGURED", "WANDB_ENTITY", "WANDB_PROJECT", "MLFLOW_TRACKING_URI"} <= set(
-        all_identity.tracked
-    )
+    assert {"CONFIGURED", "MLFLOW_TRACKING_URI"} <= set(all_identity.tracked)
+    assert {"WANDB_ENTITY", "WANDB_PROJECT"} <= set(all_identity.values)
+    assert not {"WANDB_ENTITY", "WANDB_PROJECT"} & set(all_identity.tracked)
     assert {"HF_HOME", "SHLVL", "WANDB_MODE"} <= set(all_identity.values)
     assert not {"HF_HOME", "SHLVL", "WANDB_MODE"} & set(all_identity.tracked)
 
