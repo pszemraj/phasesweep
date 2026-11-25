@@ -741,8 +741,8 @@ def _retained_series(
             if not track:
                 raise _RetainedHistoryError(
                     f"W&B metric {series!r} has rows in an attempt that never logged {axis!r}, "
-                    "so the rerun's replaced history cannot be told apart. Log "
-                    f"{axis!r} with every {series!r} row."
+                    "so the rerun's replaced history cannot be told apart. Set "
+                    "metric.extractor.evaluation_axis to a key every attempt logs."
                 )
             index = bisect_left(track, step, key=lambda entry: entry[0])
             points[step] = (segment, track[max(index - 1, 0)][1], metric)
