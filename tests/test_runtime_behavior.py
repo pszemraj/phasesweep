@@ -104,6 +104,7 @@ from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 from phasesweep.runtime.remote_worker import run_worker
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
+    addressed_phase_study,
     bounded_metric,
     copy_fake_train,
     make_experiment,
@@ -1644,9 +1645,7 @@ def test_gpu_unavailability_preserves_accepted_target_and_old_config(
         phase = experiment.phases[0].model_copy(update={"n_trials": 2})
         with pytest.raises(RuntimeError, match="no GPUs detected"):
             run_experiment(experiment.model_copy(update={"phases": [phase]}))
-        study = optuna.load_study(
-            study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
-        )
+        study = addressed_phase_study(experiment)
         assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
         assert len(study.trials) == 1
 
@@ -1654,9 +1653,7 @@ def test_gpu_unavailability_preserves_accepted_target_and_old_config(
     assert rerun["p"].trial_number == first["p"].trial_number
     assert rerun["p"].metric == first["p"].metric
 
-    study = optuna.load_study(
-        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
-    )
+    study = addressed_phase_study(experiment)
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
     assert len(study.trials) == 1
 

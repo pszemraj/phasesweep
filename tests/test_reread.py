@@ -61,6 +61,7 @@ from phasesweep.evidence.models import (
 from phasesweep.evidence.wandb import WandbRunMissingError
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
+    addressed_phase_study,
     invoke_cli_boundary,
     make_experiment,
     record_accepted_partial_timeout,
@@ -141,14 +142,6 @@ def _experiment(tmp_path: Path, trainer: Path, metric: Metric, **extra: object) 
     )
 
 
-def phase_study_of(experiment: Experiment, phase: str = "p") -> optuna.Study:
-    """The study the current config addresses for a phase that inherits nothing."""
-    return optuna.load_study(
-        study_name=study_name(experiment, phase),
-        storage=_resolve_storage(experiment.resolved_storage),
-    )
-
-
 def test_a_misspelled_key_is_corrected_by_re_reading_every_finished_trial(tmp_path: Path) -> None:
     """Every trial failed at extraction under a typo; the corrected key completes them all unlaunched."""
     trainer, launches = _counting_trainer(tmp_path)
@@ -162,10 +155,12 @@ def test_a_misspelled_key_is_corrected_by_re_reading_every_finished_trial(tmp_pa
 
     assert _launches(launches) == 3
     assert winners["p"].effective_overrides == {"x": 4}
-    trials = phase_study_of(fixed).get_trials()
+    trials = addressed_phase_study(fixed).get_trials()
     assert [trial.state for trial in trials] == [optuna.trial.TrialState.COMPLETE] * 3
     assert sorted(trial.value for trial in trials) == [1.0, 1.0, 4.0]
-    assert [t.number for t in trials] == [t.number for t in phase_study_of(typo).get_trials()]
+    assert [t.number for t in trials] == [
+        t.number for t in addressed_phase_study(typo).get_trials()
+    ]
 
 
 def test_reread_uses_recorded_trainer_exit_after_evidence_worker_timeout(tmp_path: Path) -> None:
@@ -174,7 +169,7 @@ def test_reread_uses_recorded_trainer_exit_after_evidence_worker_timeout(tmp_pat
     phase = Phase(name="p", n_trials=1, gpu_policy="none")
     original = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
     assert run_experiment(original)["p"].metric == 4
-    [measured] = phase_study_of(original).trials
+    [measured] = addressed_phase_study(original).trials
     attempt_dir = _trial_attempt_dir(measured)
     assert attempt_dir is not None
     write_attempt_lifecycle(
@@ -228,7 +223,7 @@ def test_reread_keeps_a_repeat_measurement_before_an_unsuccessful_retry(tmp_path
 
     assert winner.metric == 1.5
     assert _launches(counter) == 3
-    assert [trial.state.name for trial in phase_study_of(fixed).trials] == [
+    assert [trial.state.name for trial in addressed_phase_study(fixed).trials] == [
         "COMPLETE",
         "COMPLETE",
         "FAIL",
@@ -270,10 +265,10 @@ def test_reread_keeps_its_own_attempt_identity_when_its_source_is_removed(tmp_pa
     assert current["trials"] == {"COMPLETE": 2}
     assert current["generation_trials"] == {"COMPLETE": 1}
     assert original["generation_trials"] == {}
-    original_reading = phase_study_of(corrected).trials
+    original_reading = addressed_phase_study(corrected).trials
     reversed_goal = _experiment(tmp_path, trainer, _metric("acc", "maximize"), phases=[enlarged])
     run_experiment(reversed_goal)
-    new_reading = phase_study_of(reversed_goal).trials
+    new_reading = addressed_phase_study(reversed_goal).trials
     assert [(row.user_attrs[ATTEMPT_ID_ATTR], row.value) for row in new_reading] == [
         (row.user_attrs[ATTEMPT_ID_ATTR], row.value) for row in original_reading
     ]
@@ -292,7 +287,7 @@ def test_reread_releases_retry_budget_for_cells_that_now_have_a_result(
     retry = phase.model_copy(update={"n_trials": 6})
     with pytest.raises(NoFeasibleTrialError, match="5 consecutive failed/infeasible trials"):
         run_experiment(_experiment(tmp_path, trainer, _metric("los"), phases=[retry]))
-    source = phase_study_of(typo).get_trials()
+    source = addressed_phase_study(typo).get_trials()
     assert source[-1].state == optuna.trial.TrialState.WAITING
     assert _launches(launches) == 5
 
@@ -320,11 +315,11 @@ def test_reread_releases_retry_budget_for_cells_that_now_have_a_result(
 
     assert run_experiment(corrected)["p"].metric == 1.0
     assert _launches(launches) == 5
-    copied = phase_study_of(corrected).get_trials()
+    copied = addressed_phase_study(corrected).get_trials()
     assert [(t.number, t.user_attrs[ATTEMPT_ID_ATTR]) for t in copied] == [
         (t.number, t.user_attrs[ATTEMPT_ID_ATTR]) for t in source[:-1]
     ]
-    assert phase_study_of(typo).get_trials()[-1].state == optuna.trial.TrialState.WAITING
+    assert addressed_phase_study(typo).get_trials()[-1].state == optuna.trial.TrialState.WAITING
 
 
 def test_reread_at_retry_ceiling_can_acknowledge_an_inherited_failure_streak(
@@ -354,7 +349,7 @@ def test_reread_at_retry_ceiling_can_acknowledge_an_inherited_failure_streak(
     retry = phase.model_copy(update={"n_trials": 6, "max_consecutive_failures": 2})
     with pytest.raises(NoFeasibleTrialError, match="2 consecutive failed/infeasible trials"):
         run_experiment(_experiment(tmp_path, trainer, _metric("los"), phases=[retry]))
-    source = phase_study_of(typo)
+    source = addressed_phase_study(typo)
     assert source.user_attrs[PHASE_RECOVERY_ATTR]["trial_target"] == 6
     metric = Metric(
         name="loss",
@@ -365,7 +360,7 @@ def test_reread_at_retry_ceiling_can_acknowledge_an_inherited_failure_streak(
     with pytest.raises(PhaseAbortRefusedError, match="accepted n_trials=6") as refusal:
         run_experiment(fixed)
     assert "raise phases[p].max_consecutive_failures above 2" in refusal.value.remediation
-    assert phase_study_of(fixed).user_attrs[PHASE_RECOVERY_ATTR]["trial_target"] == 5
+    assert addressed_phase_study(fixed).user_attrs[PHASE_RECOVERY_ATTR]["trial_target"] == 5
 
     acknowledged = corrected.model_copy(update={"max_consecutive_failures": 10})
     result = run_experiment(_experiment(tmp_path, trainer, metric, phases=[acknowledged]))
@@ -378,14 +373,16 @@ def test_a_flipped_goal_re_reads_into_a_study_of_the_other_direction(tmp_path: P
     trainer, launches = _counting_trainer(tmp_path)
     minimize = _experiment(tmp_path, trainer, _metric("loss"))
     assert run_experiment(minimize)["p"].effective_overrides == {"x": 4}
-    before = {t.number: t.user_attrs[TRIAL_DIR_ATTR] for t in phase_study_of(minimize).get_trials()}
+    before = {
+        t.number: t.user_attrs[TRIAL_DIR_ATTR] for t in addressed_phase_study(minimize).get_trials()
+    }
 
     maximize = _experiment(tmp_path, trainer, _metric("loss", goal="maximize"))
     winners = run_experiment(maximize)
 
     assert _launches(launches) == 3
     assert winners["p"].effective_overrides == {"x": 1}
-    study = phase_study_of(maximize)
+    study = addressed_phase_study(maximize)
     assert study.direction == optuna.study.StudyDirection.MAXIMIZE
     assert {t.number: t.user_attrs[TRIAL_DIR_ATTR] for t in study.get_trials()} == before
 
@@ -403,7 +400,7 @@ def test_cmaes_topup_relearns_from_the_reread_values(tmp_path: Path) -> None:
     )
     original = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
     run_experiment(original)
-    before = phase_study_of(original).trials
+    before = addressed_phase_study(original).trials
     sampler = _PositionCmaEsSampler(seed=5)
     assert sampler._restore_optimizer(before) is not None
 
@@ -412,7 +409,7 @@ def test_cmaes_topup_relearns_from_the_reread_values(tmp_path: Path) -> None:
     assert run_experiment(changed)["p"].metric >= max(
         t.value for t in before if t.value is not None
     )
-    after = phase_study_of(changed).trials
+    after = addressed_phase_study(changed).trials
     retained = after[:-1]
     assert _launches(launches) == len(after) == 20
     assert [trial.params for trial in retained] == [trial.params for trial in before]
@@ -474,11 +471,11 @@ def test_managed_envelope_path_change_reuses_the_producing_envelope(tmp_path: Pa
 
     original = config("original.json", 1)
     assert run_experiment(original)["p"].metric == 0.8
-    original_id = phase_study_of(original).trials[0].user_attrs[ATTEMPT_ID_ATTR]
+    original_id = addressed_phase_study(original).trials[0].user_attrs[ATTEMPT_ID_ATTR]
     changed = config("next.json", 2)
     winner = run_experiment(changed)["p"]
     assert winner.metric == 0.8 and winner.constraints == {"resource": 1.5}
-    old, new = phase_study_of(changed).trials
+    old, new = addressed_phase_study(changed).trials
     assert old.value == new.value == 0.8
     assert old.user_attrs[ATTEMPT_ID_ATTR] == original_id
     assert all(
@@ -557,7 +554,7 @@ def test_wandb_project_change_keeps_prior_trials_and_routes_new_draws(
     original_id = run_experiment(original)["p"].attempt_id
     changed = config("new-project", 2)
     winner = run_experiment(changed)["p"]
-    old, new = phase_study_of(changed).trials
+    old, new = addressed_phase_study(changed).trials
     new_id = new.user_attrs[ATTEMPT_ID_ATTR]
     assert [old.value, new.value] == [0.25, 0.5]
     assert winner.attempt_id == original_id and winner.metric == 0.25
@@ -594,7 +591,7 @@ def test_reread_never_queries_an_unbound_wandb_run(
     changed = _experiment(tmp_path, trainer, metric, phases=[phase])
     with pytest.raises(NoFeasibleTrialError, match="No completed trials"):
         run_experiment(changed)
-    (copied,) = phase_study_of(changed).trials
+    (copied,) = addressed_phase_study(changed).trials
     assert "no managed W&B destination at launch" in copied.user_attrs[FAILURE_REASON_ATTR]
     assert _launches(launches) == 1
 
@@ -649,7 +646,7 @@ def test_wandb_retry_keeps_the_checkpoint_runs_bound_project(
         run_experiment(original)
     changed = config("new-project", 2)
     assert run_experiment(changed)["p"].metric == 0.25
-    opener, retry = phase_study_of(changed).trials
+    opener, retry = addressed_phase_study(changed).trials
     opener_id = opener.user_attrs[ATTEMPT_ID_ATTR]
     assert opener.user_attrs[TRIAL_DIR_ATTR] == retry.user_attrs[TRIAL_DIR_ATTR]
     launches = Path(retry.user_attrs[TRIAL_DIR_ATTR], "runs.jsonl").read_text().splitlines()
@@ -736,7 +733,7 @@ def test_reread_attributes_results_to_their_attempt_and_keeps_the_retry_budget(
     )
     corrected = _experiment(tmp_path, trainer, metric, phases=[retried])
     run_experiment(corrected)
-    trials = phase_study_of(corrected).get_trials()
+    trials = addressed_phase_study(corrected).get_trials()
     first, last = trials[0], trials[-1]
     assert last.user_attrs[RERUN_OF_ATTR] == first.number
     assert last.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
@@ -793,8 +790,8 @@ def test_reread_does_not_score_a_file_overwritten_from_another_reading_study(
 
     corrected = _experiment(tmp_path, trainer, _metric("loss"))
     assert run_experiment(corrected)["p"].metric == 2
-    trials = phase_study_of(corrected).get_trials()
-    assert len(trials) == len(phase_study_of(sibling).get_trials()) == 3
+    trials = addressed_phase_study(corrected).get_trials()
+    assert len(trials) == len(addressed_phase_study(sibling).get_trials()) == 3
     assert trials[0].state == optuna.trial.TrialState.FAIL
     assert "changed after this attempt finished" in trials[0].user_attrs[FAILURE_REASON_ATTR]
     assert _launches(launches) == 4
@@ -857,7 +854,7 @@ def test_retry_keeps_the_measured_evidence_of_a_sibling_reading_study(
 
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(config("typo", retry))
-    first, last = phase_study_of(original).get_trials()
+    first, last = addressed_phase_study(original).get_trials()
     assert first.user_attrs[TRIAL_DIR_ATTR] == last.user_attrs[TRIAL_DIR_ATTR]
     assert _launches(launches) == 2
     assert (
@@ -874,13 +871,13 @@ def test_retry_keeps_the_measured_evidence_of_a_sibling_reading_study(
         "alternate", retry, constraint_key="peaky", constraint_path="unmeasured.json"
     )
     assert run_experiment(unmeasured)["p"].metric == 2
-    assert [trial.value for trial in phase_study_of(unmeasured).get_trials()] == [None, 2]
+    assert [trial.value for trial in addressed_phase_study(unmeasured).get_trials()] == [None, 2]
 
     alternate = config("alternate", retry, constraint_key="peak")
     winner = run_experiment(alternate)["p"]
     assert winner.metric == 1
     assert winner.constraints == {"memory": 21}
-    assert [trial.value for trial in phase_study_of(alternate).get_trials()] == [1, 2]
+    assert [trial.value for trial in addressed_phase_study(alternate).get_trials()] == [1, 2]
 
     assert _launches(launches) == 2
 
@@ -908,7 +905,7 @@ def test_reread_unrecorded_path_refuses_a_predecessors_file(tmp_path: Path) -> N
     retry = phase.model_copy(update={"n_trials": 2})
     retried = _experiment(tmp_path, trainer, _metric("loss"), phases=[retry])
     assert run_experiment(retried)["p"].metric == 0.9
-    first, second = phase_study_of(retried).trials
+    first, second = addressed_phase_study(retried).trials
     assert first.user_attrs[TRIAL_DIR_ATTR] == second.user_attrs[TRIAL_DIR_ATTR]
 
     corrected_metric = Metric(
@@ -917,7 +914,7 @@ def test_reread_unrecorded_path_refuses_a_predecessors_file(tmp_path: Path) -> N
     corrected = _experiment(tmp_path, trainer, corrected_metric, phases=[retry])
     with pytest.raises(NoFeasibleTrialError, match="No completed trials"):
         run_experiment(corrected)
-    copied = phase_study_of(corrected).trials[1]
+    copied = addressed_phase_study(corrected).trials[1]
     assert copied.value is None
     assert "trainer exited without writing it" in copied.user_attrs[FAILURE_REASON_ATTR]
 
@@ -955,7 +952,7 @@ def test_reread_refuses_an_older_file_reached_through_a_retargeted_link(tmp_path
     corrected = _experiment(tmp_path, trainer, _metric("loss"), phases=[retried])
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(corrected)
-    older, retry = phase_study_of(corrected).get_trials()
+    older, retry = addressed_phase_study(corrected).get_trials()
     assert "changed after this attempt finished" in older.user_attrs[FAILURE_REASON_ATTR]
     assert "last changed before this attempt started" in retry.user_attrs[FAILURE_REASON_ATTR]
 
@@ -1005,7 +1002,7 @@ def test_reread_uses_the_next_launch_instead_of_local_times(
     finally:
         time.tzset()
 
-    first, middle, last = phase_study_of(corrected).get_trials()
+    first, middle, last = addressed_phase_study(corrected).get_trials()
     assert len({trial.user_attrs[TRIAL_DIR_ATTR] for trial in (first, middle, last)}) == 1
     assert [trial.value for trial in (first, middle, last)] == [None, 2, None]
     assert "changed after this attempt finished" in first.user_attrs[FAILURE_REASON_ATTR]
@@ -1027,14 +1024,14 @@ def test_reread_refuses_undated_reuse_only_for_shared_evidence(tmp_path: Path) -
         run_experiment(_experiment(tmp_path, trainer, _metric("typo"), phases=[phase]))
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(original)
-    _, retry = phase_study_of(original).get_trials()
+    _, retry = addressed_phase_study(original).get_trials()
     records = Path(retry.user_attrs[TRIAL_DIR_ATTR]).parent / "attempts"
     (records / retry.user_attrs[ATTEMPT_ID_ATTR] / EVIDENCE_BASELINE_FILE).unlink()
 
     shared = _experiment(tmp_path, trainer, _metric("loss"), phases=[retried])
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(shared)
-    opener, _ = phase_study_of(shared).get_trials()
+    opener, _ = addressed_phase_study(shared).get_trials()
     reason = opener.user_attrs[FAILURE_REASON_ATTR]
     assert "cannot be attributed to this attempt" in reason
     assert f"launch time of attempt {retry.user_attrs[ATTEMPT_ID_ATTR]!r}" in reason
@@ -1042,7 +1039,7 @@ def test_reread_refuses_undated_reuse_only_for_shared_evidence(tmp_path: Path) -
     log = Metric(extractor=LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[0-9.]+)"))
     private = _experiment(tmp_path, trainer, log, phases=[retried])
     assert run_experiment(private)["p"].metric == 4
-    assert [trial.value for trial in phase_study_of(private).get_trials()] == [4, None]
+    assert [trial.value for trial in addressed_phase_study(private).get_trials()] == [4, None]
     assert _launches(launches) == 2
 
 
@@ -1061,7 +1058,7 @@ def test_an_added_constraint_is_measured_for_every_finished_trial(tmp_path: Path
     assert winners["p"].effective_overrides == {"x": 2}
     measured = {
         trial.params["x"]: trial.user_attrs["constraint:mem"]
-        for trial in phase_study_of(constrained).get_trials()
+        for trial in addressed_phase_study(constrained).get_trials()
     }
     assert measured == {1: 10.0, 2: 20.0, 4: 40.0}
 
@@ -1073,7 +1070,7 @@ def test_evidence_deleted_since_fails_only_its_trial_with_the_readers_reason(
     trainer, launches = _counting_trainer(tmp_path)
     original = _experiment(tmp_path, trainer, _metric("loss"))
     run_experiment(original)
-    lost = next(t for t in phase_study_of(original).get_trials() if t.params["x"] == 2)
+    lost = next(t for t in addressed_phase_study(original).get_trials() if t.params["x"] == 2)
     (Path(lost.user_attrs[TRIAL_DIR_ATTR]) / "r.json").unlink()
 
     changed = _experiment(tmp_path, trainer, _metric("acc"))
@@ -1081,7 +1078,7 @@ def test_evidence_deleted_since_fails_only_its_trial_with_the_readers_reason(
 
     assert _launches(launches) == 3
     assert winners["p"].effective_overrides == {"x": 1}
-    by_x = {t.params["x"]: t for t in phase_study_of(changed).get_trials()}
+    by_x = {t.params["x"]: t for t in addressed_phase_study(changed).get_trials()}
     assert by_x[2].state == optuna.trial.TrialState.FAIL
     assert "JSON file not found" in by_x[2].user_attrs[FAILURE_REASON_ATTR]
     assert (by_x[1].value, by_x[4].value) == (1.0, 4.0)
@@ -1150,7 +1147,7 @@ def test_reread_keeps_the_partial_timeout_boundary_with_the_new_measurement_coun
     short = _phases()[0].model_copy(update={"n_trials": 2, "allow_partial_grid": True})
     original = _experiment(tmp_path, trainer, _metric("loss"), phases=[short])
     run_experiment(original)
-    source = phase_study_of(original)
+    source = addressed_phase_study(original)
     for trial in source.get_trials()[measured:]:
         (Path(trial.user_attrs[TRIAL_DIR_ATTR]) / "r.json").write_text('{"loss": 1}')
     record_accepted_partial_timeout(source, 3)
@@ -1182,7 +1179,7 @@ def test_reread_keeps_the_partial_timeout_boundary_with_the_new_measurement_coun
                 run_experiment(changed)
 
     assert _launches(launches) == 2
-    assert phase_study_of(changed).user_attrs[PHASE_DECISION_ATTR] == {
+    assert addressed_phase_study(changed).user_attrs[PHASE_DECISION_ATTR] == {
         **decision,
         "measured_trials": measured,
     }
@@ -1316,12 +1313,12 @@ def test_fill_source_keeps_a_failed_draw_missing_from_a_shorter_copy(tmp_path: P
     run_experiment(config("acc", 1))
     original = config("loss", 2)
     run_experiment(original)
-    failed = phase_study_of(original).trials[1]
+    failed = addressed_phase_study(original).trials[1]
     assert failed.state == optuna.trial.TrialState.FAIL
 
     changed = config("mem", 2)
     run_experiment(changed)
-    copied = phase_study_of(changed).trials[1]
+    copied = addressed_phase_study(changed).trials[1]
     assert copied.state == failed.state
     assert copied.user_attrs[ATTEMPT_ID_ATTR] == failed.user_attrs[ATTEMPT_ID_ATTR]
     assert _launches(calls) == 2
@@ -1359,14 +1356,14 @@ def test_a_fill_killed_part_way_is_finished_by_the_next_run(tmp_path: Path) -> N
         check=False,
     )
     assert killed.returncode == 9, killed.stderr
-    assert len(phase_study_of(fixed).get_trials()) == 1
+    assert len(addressed_phase_study(fixed).get_trials()) == 1
 
     winners = run_experiment(fixed)
 
     assert _launches(launches) == 3
     assert winners["p"].effective_overrides == {"x": 4}
-    filled = phase_study_of(fixed).get_trials()
-    source = phase_study_of(typo).get_trials()
+    filled = addressed_phase_study(fixed).get_trials()
+    source = addressed_phase_study(typo).get_trials()
     assert [(t.number, t.params, t.user_attrs[TRIAL_DIR_ATTR]) for t in filled] == [
         (t.number, t.params, t.user_attrs[TRIAL_DIR_ATTR]) for t in source
     ]
@@ -1410,7 +1407,7 @@ def test_an_interrupted_fill_reuses_new_source_trials_when_studies_grow(
     grown = config("loss", 4)
     run_experiment(grown, dry_run=True)
     run_experiment(grown)
-    source_trials = phase_study_of(grown).get_trials()
+    source_trials = addressed_phase_study(grown).get_trials()
     run_experiment(config("acc", 5))
     before = _launches(launches)
 
@@ -1423,7 +1420,7 @@ def test_an_interrupted_fill_reuses_new_source_trials_when_studies_grow(
 
     run_experiment(interrupted)
     assert _launches(launches) == before
-    filled = phase_study_of(interrupted).get_trials()
+    filled = addressed_phase_study(interrupted).get_trials()
     assert [t.user_attrs[ATTEMPT_ID_ATTR] for t in filled] == [
         t.user_attrs[ATTEMPT_ID_ATTR] for t in source_trials
     ]
@@ -1457,7 +1454,7 @@ def test_reread_keeps_rows_committed_before_its_run_deadline(
             run_experiment(bounded)
         assert reads == [0, 1]
 
-    study = phase_study_of(changed)
+    study = addressed_phase_study(changed)
     assert [trial.number for trial in study.get_trials()] == [0]
     assert PHASE_IDENTITY_ATTR not in study.user_attrs
     reads.clear()
@@ -1558,7 +1555,7 @@ def test_preview_replays_the_partial_boundary_of_a_fully_read_fill(
     original = _experiment(tmp_path, trainer, _metric("absent"))
     with pytest.raises(NoFeasibleTrialError, match="No completed trials"):
         run_experiment(original)
-    source = phase_study_of(original)
+    source = addressed_phase_study(original)
     directory = Path(source.get_trials()[0].user_attrs[TRIAL_DIR_ATTR])
     (directory / "r.json").write_text('{"loss": 1}')
     record_accepted_partial_timeout(source, 5)
@@ -1641,7 +1638,7 @@ def test_a_finished_sibling_retry_replays_without_the_trainer(
     sibling = config("acc", raised)
     result = run_experiment(sibling)["p"]
     assert result.metric == 2
-    parent_attempt, sibling_retry = phase_study_of(sibling).trials[-2:]
+    parent_attempt, sibling_retry = addressed_phase_study(sibling).trials[-2:]
     assert sibling_retry.user_attrs[RERUN_OF_ATTR] == parent_attempt.number
     assert sibling_retry.user_attrs[TRIAL_DIR_ATTR] == parent_attempt.user_attrs[TRIAL_DIR_ATTR]
     assert _launches(launches) == 3
@@ -1713,7 +1710,7 @@ def test_preview_keeps_a_budgeted_sibling_retry_conditional(
     assert run_experiment(original)["p"].metric == 0.9
     retry.touch()
     assert run_experiment(config("second", 3))["p"].metric == 0.1
-    before = phase_study_of(original).trials
+    before = addressed_phase_study(original).trials
     offline = trainer.rename(tmp_path / "offline")
 
     targeted_retry = config("first", 3)
@@ -1726,7 +1723,7 @@ def test_preview_keeps_a_budgeted_sibling_retry_conditional(
     assert tree_changes(artifacts, tree_snapshot(tmp_path)) == {}
     with pytest.raises(LaunchEnvironmentError, match="which is not an executable file"):
         run_experiment(targeted_retry)
-    assert phase_study_of(original).trials == before
+    assert addressed_phase_study(original).trials == before
 
     offline.rename(trainer)
     retry.write_text("pause")
@@ -1774,7 +1771,7 @@ def test_returning_to_an_initialized_study_adopts_a_finished_sibling_rerun(
     pause.touch()
     with pytest.raises(PhaseTimeoutError, match="timed out via phase guard"):
         run_experiment(_experiment(tmp_path, trainer, _metric("loss"), phases=[timed]))
-    recorded = phase_study_of(original)
+    recorded = addressed_phase_study(original)
     interrupted_dir = Path(recorded.trials[-1].user_attrs[TRIAL_DIR_ATTR])
     interrupted_dir.rename(tmp_path / "pruned-original")
     for _ in range(2):
@@ -1783,7 +1780,7 @@ def test_returning_to_an_initialized_study_adopts_a_finished_sibling_rerun(
             run_experiment(_experiment(tmp_path, trainer, _metric("acc"), phases=[timed]))
     sibling = _experiment(tmp_path, trainer, _metric("acc"), phases=[raised])
     run_experiment(sibling)
-    donor_study = phase_study_of(sibling)
+    donor_study = addressed_phase_study(sibling)
     donor = donor_study.trials[-1]
     donor_path = Path(donor.user_attrs[TRIAL_DIR_ATTR])
     assert donor_path != interrupted_dir

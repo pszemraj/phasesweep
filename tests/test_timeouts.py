@@ -32,6 +32,7 @@ from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import ProcessResult
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
+    addressed_phase_study,
     bounded_metric,
     make_experiment,
     make_trial_context,
@@ -344,10 +345,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
     assert completion["incomplete"] is True
     assert completion["reason"] == "timeout"
     assert completion["timeout_scope"] == "phase"
-    study = optuna.load_study(
-        study_name=study_name(exp),
-        storage=_resolve_storage(exp.storage),
-    )
+    study = addressed_phase_study(exp)
     deadline_trials = [
         trial
         for trial in study.trials
@@ -450,19 +448,13 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     with pytest.raises(RuntimeError, match="simulated crash"):
         run_experiment(exp)
 
-    study = optuna.load_study(
-        study_name=study_name(exp),
-        storage=_resolve_storage(exp.storage),
-    )
+    study = addressed_phase_study(exp)
     assert study.user_attrs[PHASE_DECISION_ATTR]["decision"] == "accepted_partial_timeout"
     trial_count = len(study.trials)
 
     winners = run_experiment(exp)
 
-    study = optuna.load_study(
-        study_name=study_name(exp),
-        storage=_resolve_storage(exp.storage),
-    )
+    study = addressed_phase_study(exp)
     assert len(study.trials) == trial_count
 
     assert winners["p"].trial_number == 0
@@ -611,10 +603,7 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
     with pytest.raises(TimeoutError, match="timed out via phase guard after 2/3 finished trials"):
         run_experiment(exp)
 
-    study = optuna.load_study(
-        study_name=study_name(exp),
-        storage=_resolve_storage(exp.storage),
-    )
+    study = addressed_phase_study(exp)
     assert _load_phase_policy_state(study, exp).abort is None
     assert _load_phase_policy_state(study, exp).consecutive_failures == 0
 
@@ -666,13 +655,13 @@ def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
 
     assert exc_info.value.published_result_committed is False
 
-    study = optuna.load_study(study_name=study_name(exp), storage=_resolve_storage(exp.storage))
+    study = addressed_phase_study(exp)
     assert _load_phase_policy_state(study, exp).abort is None
     assert study.trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "interrupted"
 
     winners = run_experiment(exp)
     assert winners["p"].metric == pytest.approx(0.5)
-    study = optuna.load_study(study_name=study_name(exp), storage=_resolve_storage(exp.storage))
+    study = addressed_phase_study(exp)
     assert _load_phase_policy_state(study, exp).abort is None
 
 

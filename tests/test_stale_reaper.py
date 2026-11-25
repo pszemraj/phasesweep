@@ -76,6 +76,7 @@ from phasesweep.runtime.reaper import (
 )
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
+    addressed_phase_study,
     make_experiment,
     mark_current_format,
     new_phase_study,
@@ -963,9 +964,7 @@ def test_allocation_context_recovers_repeated_optuna_allocation_interruptions(
     winners = run_experiment(exp)
 
     assert winners["p"].metric == pytest.approx(1.0)
-    study = optuna.load_study(
-        study_name=study_name(exp), storage=engine_ledger._resolve_storage(exp.storage)
-    )
+    study = addressed_phase_study(exp)
     trials = study.get_trials(deepcopy=False)
     # Each interrupted allocation reruns: the second run popped the first's
     # rerun before dying, and the last run reruns that one before two new draws.
@@ -1015,9 +1014,7 @@ def test_allocation_context_covers_first_environment_write_failure(
     winners = run_experiment(resumed)
 
     assert winners["p"].metric == pytest.approx(1.0)
-    study = optuna.load_study(
-        study_name=study_name(exp), storage=engine_ledger._resolve_storage(exp.storage)
-    )
+    study = addressed_phase_study(exp)
     trials = study.get_trials(deepcopy=False)
     assert [trial.state for trial in trials] == [
         optuna.trial.TrialState.FAIL,
@@ -1377,8 +1374,7 @@ def test_registry_reads_its_attempt_after_repairing_a_partial_journal_record(
     assert not healthy_entry.exists()
 
     def trial_states(experiment: Experiment) -> list[optuna.trial.TrialState]:
-        storage = engine_ledger._resolve_storage(experiment.resolved_storage)
-        study = optuna.load_study(study_name=study_name(experiment), storage=storage)
+        study = addressed_phase_study(experiment)
         return [trial.state for trial in study.get_trials(deepcopy=False)]
 
     assert trial_states(experiment) == trial_states(healthy_experiment)

@@ -22,7 +22,6 @@ from phasesweep.config.models import ExecutionContext, Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.artifacts import _write_trials_csv
 from phasesweep.engine.errors import StudyFingerprintMismatchError, TrialTargetRefusedError
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _generation_winner_path, _phase_dir
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import TRAINER_ENV_ATTR, TRAINER_ENV_DIGEST_ATTR
@@ -40,10 +39,10 @@ from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import WandbSummaryRequiredGate
 from phasesweep.tracking.models import MlflowSettings
 from tests.conftest import (
+    addressed_phase_study,
     make_experiment,
     phase_study,
     stamped_environment_attrs,
-    study_name,
     study_with_stamped_environment,
     write_constant_trainer,
 )
@@ -531,9 +530,7 @@ def test_winner_and_trial_attrs_record_trainer_environment_identity(
     assert winner["trainer_env_digest"] == identity.digest
     assert "trainer_inherit_env" not in winner
 
-    study = optuna.load_study(
-        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
-    )
+    study = addressed_phase_study(experiment)
     attrs = study.get_trials(deepcopy=False)[0].user_attrs
     assert attrs[TRAINER_ENV_DIGEST_ATTR] == identity.digest
     recorded = attrs[TRAINER_ENV_ATTR]
@@ -570,9 +567,7 @@ def test_a_real_run_records_the_mapping_and_a_changed_tz_is_refused(
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(experiment)
 
-    study = optuna.load_study(
-        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
-    )
+    study = addressed_phase_study(experiment)
     attrs = study.get_trials(deepcopy=False)[0].user_attrs
     assert attrs[TRAINER_ENV_ATTR] == _identity(experiment).tracked
     assert attrs[TRAINER_ENV_ATTR]["TZ"] == "Europe/Berlin"

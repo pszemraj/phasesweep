@@ -32,13 +32,18 @@ from phasesweep.engine.growth import (
     _search_space_growth,
     recorded_growth,
 )
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _build_sampler, _draw_positions, _suggest_all
 from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_DIR_ATTR, _recorded_identity
 from phasesweep.runtime.json import dump_json
-from tests.conftest import make_experiment, phase_study, phase_trials, study_name, write_trainer
+from tests.conftest import (
+    addressed_phase_study,
+    make_experiment,
+    phase_study,
+    phase_trials,
+    write_trainer,
+)
 from tests.recovery_helpers import RerunHarness
 
 _ORIGINAL = [1e-4, 3e-4, 1e-3, 3e-3]
@@ -317,9 +322,7 @@ def test_grown_numeric_choices_survive_replay_by_another_worker(tmp_path: Path) 
     run_experiment(grown)
 
     # A fresh storage replays the journal as a worker that wrote none of it.
-    replayed = optuna.load_study(
-        study_name=study_name(grown), storage=_resolve_storage(grown.resolved_storage)
-    ).get_trials(deepcopy=False)
+    replayed = addressed_phase_study(grown).get_trials(deepcopy=False)
     assert sorted(t.params["lr"] for t in replayed) == sorted(_GROWN)
     assert {type(t.params["lr"]) for t in replayed} == {float}
 

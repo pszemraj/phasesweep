@@ -21,7 +21,6 @@ from phasesweep import run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, Repeats, Sampler
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.optuna import _draw_positions, _finished_trial_count, _trial_run_state
 from phasesweep.engine.read import read_result
@@ -32,7 +31,12 @@ from phasesweep.engine.state import (
     _trial_interrupted,
 )
 from phasesweep.engine.study_policy import _load_phase_policy_state
-from tests.conftest import FAKE_TRAIN_METRIC, make_experiment, phase_trials, study_name
+from tests.conftest import (
+    FAKE_TRAIN_METRIC,
+    addressed_phase_study,
+    make_experiment,
+    phase_trials,
+)
 from tests.recovery_helpers import RerunHarness
 
 pytestmark = pytest.mark.integration
@@ -78,8 +82,7 @@ def _assert_matches_control(experiment: Experiment, control: Experiment) -> list
     assert "WAITING" not in {t.state.name for t in trials}
     phase = experiment.phases[0]
     assert _finished_trial_count(trials) == phase.n_trials
-    storage = _resolve_storage(experiment.resolved_storage)
-    study = optuna.load_study(study_name=study_name(experiment), storage=storage)
+    study = addressed_phase_study(experiment)
     assert _load_phase_policy_state(study, experiment).consecutive_failures == 0
     _, (winner,) = read_result(experiment, phase_names=["p"])
     _, (expected,) = read_result(control, phase_names=["p"])

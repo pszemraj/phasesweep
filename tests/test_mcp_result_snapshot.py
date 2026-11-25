@@ -22,7 +22,6 @@ from phasesweep.config.io import load_experiment
 from phasesweep.config.models import Experiment, Metric, Phase, Repeats
 from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.errors import StudyStorageUnavailableError
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _experiment_dir,
@@ -55,13 +54,13 @@ from phasesweep.mcp.snapshots import (
 )
 from phasesweep.mcp.tools import PhaseSweepMCP
 from tests.conftest import (
+    addressed_phase_study,
     fail_pointer_commit,
     make_experiment,
     mark_current_format,
     new_phase_study,
     phase_study,
     single_trial_confound,
-    study_name,
     trial_outcome,
     write_constant_trainer,
     write_experiment_config,
@@ -1022,9 +1021,7 @@ def test_recover_run_keeps_the_producing_verdict_after_a_reread(tmp_path: Path) 
     )
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(reread)
-    study = optuna.load_study(
-        study_name=study_name(reread, "p"), storage=_resolve_storage(reread.resolved_storage)
-    )
+    study = addressed_phase_study(reread, "p")
     [copy] = study.get_trials()
     assert copy.state == optuna.trial.TrialState.FAIL
     assert original.get_trials()[winner.trial_number].state == optuna.trial.TrialState.COMPLETE

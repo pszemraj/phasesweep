@@ -5,23 +5,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import optuna
 import pytest
 
 from phasesweep import run_experiment
 from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import METRIC_EXTRACTOR_LABEL
 from phasesweep.evidence.evaluation import ExtractorError, run_extractor
 from phasesweep.evidence.models import JsonEnvelopeExtractor, JsonExtractor
 from tests.conftest import (
+    addressed_phase_study,
     make_experiment,
     make_trial_context,
     no_winner_remedy,
-    study_name,
     write_trainer,
 )
 
@@ -130,8 +128,7 @@ def test_an_aborted_phase_with_an_unreadable_objective_gives_steps_that_work(
     assert "correct them and rerun" in message
 
     def states_of(config: Experiment) -> list[str]:
-        storage = _resolve_storage(config.resolved_storage)
-        study = optuna.load_study(study_name=study_name(config), storage=storage)
+        study = addressed_phase_study(config)
         return [trial.state.name for trial in study.get_trials(deepcopy=False)]
 
     corrected = experiment("t", "loss", 4)

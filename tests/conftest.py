@@ -406,6 +406,14 @@ def new_phase_study(experiment: Experiment, phase_name: str) -> optuna.Study:
     return study
 
 
+def addressed_phase_study(experiment: Experiment, phase_name: str = "p") -> optuna.Study:
+    """Open the configured reading of a phase with no inherited values, even among sibling studies."""
+    return optuna.load_study(
+        study_name=study_name(experiment, phase_name),
+        storage=_resolve_storage(experiment.resolved_storage),
+    )
+
+
 def phase_study(experiment: Experiment, phase_name: str = "p") -> optuna.Study:
     """Read a phase's one study from the experiment's ledger.
 

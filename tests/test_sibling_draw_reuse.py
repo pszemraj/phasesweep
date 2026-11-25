@@ -16,7 +16,6 @@ from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Sampler
 from phasesweep.engine import reread as reread_ops
 from phasesweep.engine.errors import LaunchEnvironmentError, PhaseTimeoutError
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.read import read_status
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -25,7 +24,7 @@ from phasesweep.engine.state import (
     TRIAL_TARGET_ATTR,
 )
 from phasesweep.evidence.models import JsonExtractor
-from tests.conftest import make_experiment, study_name, write_trainer
+from tests.conftest import addressed_phase_study, make_experiment, write_trainer
 
 
 def _trainer(tmp_path: Path) -> tuple[Path, Path]:
@@ -90,13 +89,6 @@ def _config(
     )
 
 
-def _study(experiment: Experiment) -> optuna.Study:
-    """Read the study addressed by these reading settings, among the phase's siblings."""
-    return optuna.load_study(
-        study_name=study_name(experiment), storage=_resolve_storage(experiment.resolved_storage)
-    )
-
-
 def _launches(path: Path) -> int:
     """Count the actual trainer executions."""
     return len(path.read_text().splitlines())
@@ -119,7 +111,7 @@ def test_returning_grid_reuses_finished_draws_without_launch_resources(
     )
     sibling = _config(tmp_path, trainer, wider, "acc")
     run_experiment(sibling)
-    donors = _study(sibling).trials
+    donors = addressed_phase_study(sibling).trials
     target = _config(tmp_path, trainer, raised)
     trainer.unlink()
     caplog.set_level(logging.INFO)
@@ -128,7 +120,7 @@ def test_returning_grid_reuses_finished_draws_without_launch_resources(
     assert "would re-read 2 finished trials from a sibling study" in caplog.text
     assert "may need to launch up to 2 trials depending on the re-read results" in caplog.text
     run_experiment(target)
-    rows = _study(target).trials
+    rows = addressed_phase_study(target).trials
 
     assert _launches(launches) == 4
     assert sorted(row.params["x"] for row in rows) == [1, 2, 3]
@@ -152,11 +144,11 @@ def test_repeated_random_configs_keep_independent_draw_slots(tmp_path: Path) -> 
     run_experiment(_config(tmp_path, trainer, phase))
     sibling = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 3}), "acc")
     run_experiment(sibling)
-    donors = _study(sibling).trials
+    donors = addressed_phase_study(sibling).trials
     for target in (2, 3, 4):
         config = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": target}))
         run_experiment(config)
-        rows = _study(config).trials
+        rows = addressed_phase_study(config).trials
         assert len(rows) == target
         assert len({row.user_attrs[ATTEMPT_ID_ATTR] for row in rows}) == target
         assert _launches(launches) == max(3, target)
@@ -174,14 +166,14 @@ def test_ordinary_trainer_failure_is_spent_without_another_launch(tmp_path: Path
     raised = phase.model_copy(update={"n_trials": 2})
     sibling = _config(tmp_path, trainer, raised, "acc")
     run_experiment(sibling)
-    failed = _study(sibling).trials[-1]
+    failed = addressed_phase_study(sibling).trials[-1]
     assert failed.state == optuna.trial.TrialState.FAIL
     trainer.unlink()
     target = _config(tmp_path, trainer, raised)
 
     run_experiment(target)
 
-    adopted = _study(target).trials[-1]
+    adopted = addressed_phase_study(target).trials[-1]
     assert _launches(launches) == 2
     assert adopted.state == optuna.trial.TrialState.FAIL
     assert adopted.user_attrs[RETURN_CODE_ATTR] == 7
@@ -198,7 +190,7 @@ def test_grown_grid_reuses_a_later_donor_between_parallel_launches(
     run_experiment(_config(tmp_path, trainer, phase))
     sibling = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 2}), "acc")
     run_experiment(sibling)
-    donor = _study(sibling).trials[-1]
+    donor = addressed_phase_study(sibling).trials[-1]
     grown = phase.model_copy(
         update={
             "n_trials": 4,
@@ -216,7 +208,7 @@ def test_grown_grid_reuses_a_later_donor_between_parallel_launches(
     assert _launches(launches) == 2
     run_experiment(target)
 
-    rows = _study(target).trials
+    rows = addressed_phase_study(target).trials
     assert _launches(launches) == 4
     assert sorted(row.params["x"] for row in rows) == [1, 2, 3, 4]
     assert donor.user_attrs[ATTEMPT_ID_ATTR] in [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows]
@@ -231,12 +223,12 @@ def test_adaptive_reuse_checks_the_next_proposal_after_each_read(tmp_path: Path)
     raised = phase.model_copy(update={"n_trials": 3})
     sibling = _config(tmp_path, trainer, raised, "acc", "maximize")
     run_experiment(sibling)
-    donors = _study(sibling).trials
+    donors = addressed_phase_study(sibling).trials
     target = _config(tmp_path, trainer, raised)
 
     run_experiment(target)
 
-    rows = _study(target).trials
+    rows = addressed_phase_study(target).trials
     assert rows[1].user_attrs[ATTEMPT_ID_ATTR] == donors[1].user_attrs[ATTEMPT_ID_ATTR]
     assert rows[2].params != donors[2].params
     assert rows[2].user_attrs[ATTEMPT_ID_ATTR] != donors[2].user_attrs[ATTEMPT_ID_ATTR]
@@ -270,12 +262,12 @@ def test_kept_grid_retry_and_new_cell_need_no_launch_preflight(tmp_path: Path) -
     trainer.unlink()
 
     run_experiment(target, dry_run=True)
-    assert len(_study(target).trials) == 2
+    assert len(addressed_phase_study(target).trials) == 2
     run_experiment(target)
 
-    rows = _study(target).trials
+    rows = addressed_phase_study(target).trials
     assert [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows] == [
-        row.user_attrs[ATTEMPT_ID_ATTR] for row in _study(sibling).trials
+        row.user_attrs[ATTEMPT_ID_ATTR] for row in addressed_phase_study(sibling).trials
     ]
     assert rows[2].user_attrs[RERUN_OF_ATTR] == 1
     assert RERUN_OF_ATTR not in rows[3].user_attrs
@@ -295,7 +287,7 @@ def test_adaptive_donor_positions_bound_coverage_before_adoption(tmp_path: Path)
     for dry_run in (True, False):
         with pytest.raises(LaunchEnvironmentError, match="not an executable file"):
             run_experiment(target, dry_run=dry_run)
-        study = _study(target)
+        study = addressed_phase_study(target)
         assert len(study.trials) == study.user_attrs[TRIAL_TARGET_ATTR] == 1
     assert _launches(launches) == 2
 
@@ -324,7 +316,7 @@ def test_fill_preview_counts_donors_outside_its_source(
             read.side_effect = [DEFAULT, reread_ops._fill_timeout(target, target.phases[0])]
             with pytest.raises(PhaseTimeoutError):
                 run_experiment(target)
-        assert len(_study(target).trials) == 1
+        assert len(addressed_phase_study(target).trials) == 1
     trainer.unlink()
     journal = tmp_path / "studies.journal"
     before = journal.read_bytes()
@@ -341,11 +333,11 @@ def test_fill_preview_counts_donors_outside_its_source(
     assert journal.read_bytes() == before
     run_experiment(target)
     assert _launches(launches) == 3
-    rows = _study(target).trials
+    rows = addressed_phase_study(target).trials
     assert [row.params["x"] for row in rows] == [3, 4, 2]
     assert (
         rows[-1].user_attrs[ATTEMPT_ID_ATTR]
-        == _study(sibling).trials[-1].user_attrs[ATTEMPT_ID_ATTR]
+        == addressed_phase_study(sibling).trials[-1].user_attrs[ATTEMPT_ID_ATTR]
     )
     assert read_status(target)["publication_integrity"] == "ok"
 
@@ -402,11 +394,11 @@ def test_fill_preview_counts_the_rerun_that_sibling_draws_cannot_cover(
     assert _launches(launches) == before
     run_experiment(target)
 
-    rows = _study(target).trials
+    rows = addressed_phase_study(target).trials
     assert _launches(launches) == before + 1
     assert rows[2].user_attrs[RERUN_OF_ATTR] == 1
     assert [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows[3:]] == [
-        row.user_attrs[ATTEMPT_ID_ATTR] for row in _study(sibling).trials[2:4]
+        row.user_attrs[ATTEMPT_ID_ATTR] for row in addressed_phase_study(sibling).trials[2:4]
     ]
 
 
@@ -424,7 +416,7 @@ def test_fill_preview_refuses_an_unavoidable_launch_outside_the_donor_domain(
     )
     sibling = _config(tmp_path, trainer, wider, "acc")
     run_experiment(sibling)
-    assert _study(sibling).trials[1].params["x"] > 2
+    assert addressed_phase_study(sibling).trials[1].params["x"] > 2
     target = _config(tmp_path, trainer, narrow.model_copy(update={"n_trials": 2}), goal="maximize")
     journal = tmp_path / "studies.journal"
     before = journal.read_bytes()
@@ -438,7 +430,7 @@ def test_fill_preview_refuses_an_unavoidable_launch_outside_the_donor_domain(
     offline.rename(trainer)
     run_experiment(target)
     assert _launches(launches) == 4
-    assert _study(target).trials[-1].params["x"] in (1, 2)
+    assert addressed_phase_study(target).trials[-1].params["x"] in (1, 2)
 
 
 def test_mid_phase_adoption_deadline_preserves_new_training_on_restart(tmp_path: Path) -> None:
@@ -462,7 +454,7 @@ def test_mid_phase_adoption_deadline_preserves_new_training_on_restart(tmp_path:
         pytest.raises(PhaseTimeoutError, match="phase guard after 2/4"),
     ):
         run_experiment(target)
-    assert len(_study(target).trials) == 2
+    assert len(addressed_phase_study(target).trials) == 2
     run_experiment(target)
-    assert sorted(row.params["x"] for row in _study(target).trials) == [1, 2, 3, 4]
+    assert sorted(row.params["x"] for row in addressed_phase_study(target).trials) == [1, 2, 3, 4]
     assert _launches(launches) == 4

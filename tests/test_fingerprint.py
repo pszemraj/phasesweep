@@ -78,6 +78,7 @@ from phasesweep.runtime.files import (
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
+    addressed_phase_study,
     copy_fake_train,
     drop_artifact_root_binding,
     make_experiment,
@@ -519,9 +520,7 @@ def test_changed_semantic_inherited_value_rejects_topup_before_allocation(
     with pytest.raises(StudyFingerprintMismatchError, match="different trainer environment"):
         run_experiment(_with_trial_target(experiment, 2))
 
-    study = optuna.load_study(
-        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
-    )
+    study = addressed_phase_study(experiment)
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
 
 
@@ -609,9 +608,7 @@ def test_identical_semantic_environment_resumes_persistent_study(
     monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", "/tmp/outer-objective-b.json")
     run_experiment(_with_trial_target(experiment, 2))
 
-    study = optuna.load_study(
-        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
-    )
+    study = addressed_phase_study(experiment)
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
     base = _environment_identity(experiment, "p")
     assert not {
@@ -637,9 +634,7 @@ def test_passthrough_token_rotation_resumes_persistent_study(
     monkeypatch.setenv("WANDB_API_KEY", "rotated-secret")
     run_experiment(_with_trial_target(experiment, 2))
 
-    study = optuna.load_study(
-        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
-    )
+    study = addressed_phase_study(experiment)
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
 
 
@@ -663,9 +658,7 @@ def test_populated_study_without_environment_identity_fails_closed(
     ):
         run_experiment(_with_trial_target(experiment, 2))
 
-    study = optuna.load_study(
-        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
-    )
+    study = addressed_phase_study(experiment)
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
 
 
@@ -862,9 +855,7 @@ def test_same_workdir_top_up_keeps_the_artifact_root_binding(tmp_path: Path) -> 
     topped_up = _with_trial_target(experiment, 2)
     run_experiment(topped_up)
 
-    study = optuna.load_study(
-        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
-    )
+    study = addressed_phase_study(experiment)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment))
     assert len([trial for trial in study.trials if trial.state.is_finished()]) == 2
 
@@ -1498,9 +1489,7 @@ def test_generation_id_reuse_is_rejected_without_overwriting_history(tmp_path: P
         run_experiment(experiment, generation_id=generation_id)
 
     assert {path: path.read_bytes() for path in protected} == before
-    study = optuna.load_study(
-        study_name=study_name(experiment), storage=_resolve_storage(experiment.storage)
-    )
+    study = addressed_phase_study(experiment)
     assert len(study.trials) == 1
 
 
