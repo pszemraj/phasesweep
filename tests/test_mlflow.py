@@ -205,10 +205,12 @@ def test_remote_identity_failures_name_their_cause(problem, message):
 
 
 @pytest.mark.parametrize("status", ["FAILED", "KILLED"])
-def test_unsuccessful_remote_cannot_be_finished(status):
+@pytest.mark.parametrize("delivered", [False, True], ids=["trainer", "outcome-tag-only"])
+def test_unsuccessful_remote_cannot_be_finished(status, delivered):
+    """A run the trainer ended unsuccessfully, or one with only an outcome tag, is never read."""
     binding = mlflow_binding()
     run = mlflow_run(binding, status=status)
-    run.data.tags["phasesweep.outcome"] = status
+    run.data.tags.update({"phasesweep.outcome": status} if delivered else {})
     client = SimpleNamespace(get_run=lambda _: run)
     with pytest.raises(ValueError, match="unsuccessfully"):
         _capture(
