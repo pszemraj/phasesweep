@@ -103,7 +103,6 @@ from phasesweep.engine.study_policy import (
     _parse_accepted_partial_decision,
     _pending_rerun_count,
     _record_recovery_boundary,
-    _record_trial_target,
     _recorded_outcome_sequence,
     _rerun_sources,
     _scheduled_reruns,
@@ -1232,10 +1231,6 @@ def reread_sibling_trials(
                 sequence = recovery_abort["completion_sequence"]
                 assert type(sequence) is int
                 _record_recovery_boundary(study, phase, sequence)
-            if _finished_trial_count(study.get_trials(deepcopy=False)) >= _accepted_trial_target(
-                study
-            ):
-                _record_trial_target(study, phase)
             if retry.source.state == optuna.trial.TrialState.WAITING:
                 study._storage.set_trial_state_values(
                     retry.source._trial_id, optuna.trial.TrialState.RUNNING

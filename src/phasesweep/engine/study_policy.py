@@ -660,36 +660,27 @@ def _validate_study_direction(
 
 
 def _accepted_trial_target(study: optuna.Study) -> int:
-    """Return the durable target for a current-format study.
+    """Return the target a study's run accepted or its finished trials already hold.
 
-    Recovery records advance before ``TRIAL_TARGET_ATTR``; use the larger target
-    to preserve the accepted budget across an interrupted recovery.
+    A run stores ``TRIAL_TARGET_ATTR`` only once its launch checks pass, and recovery records
+    advance before it, so the larger target preserves the accepted budget across an
+    interrupted recovery. Kept attempts a study adopts before any launch add finished trials
+    without accepting a target, so those trials are a floor of their own.
 
     :param optuna.Study study: Study whose accepted trial target is read.
-    :return int: The larger of the stored ``phasesweep_trial_target`` user
-        attr and the recovery record's target, or zero for a newly initialized
-        empty study.
-    :raises StudySchemaMismatchError: The stored target is not a positive int,
-        is lower than the number of already-finished trials, or the recovery
+    :return int: The largest of the stored ``phasesweep_trial_target`` user attr, the recovery
+        record's target and the finished trial count; zero for an empty study.
+    :raises StudySchemaMismatchError: The stored target is not a positive int, or the recovery
         record is malformed.
     """
     finished = _finished_trial_count(study.get_trials(deepcopy=False))
     stored = study.user_attrs.get(TRIAL_TARGET_ATTR)
-    if stored is None:
-        if not study.get_trials(deepcopy=False):
-            return 0
+    if stored is not None and (type(stored) is not int or stored < 1):
         raise StudySchemaMismatchError(
-            f"Study {study.study_name!r} has trial state but no {TRIAL_TARGET_ATTR!r}.",
+            f"Study {study.study_name!r} has invalid {TRIAL_TARGET_ATTR!r}={stored!r}."
         )
-    if type(stored) is int and stored > 0:
-        recovery = _load_recovery_record(study)
-        accepted = stored if recovery is None else max(stored, recovery.trial_target)
-        if finished <= accepted:
-            return accepted
-    raise StudySchemaMismatchError(
-        f"Study {study.study_name!r} has invalid {TRIAL_TARGET_ATTR!r}={stored!r} "
-        f"for {plural(finished, 'finished trial')}."
-    )
+    recovery = _load_recovery_record(study)
+    return max(stored or 0, finished, 0 if recovery is None else recovery.trial_target)
 
 
 def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:

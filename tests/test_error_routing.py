@@ -231,7 +231,6 @@ def test_no_feasible_subclasses_rewrap_with_the_donated_action():
 
 _UNMARKED_STUDY_DIAGNOSTIC_MARKERS = {
     "study schema": "has no format version; this PhaseSweep reads format",
-    "trial target": "has trial state but no",
     "environment cohort": "without a semantic trainer-environment identity",
     "phase fingerprint": "has no semantic fingerprint",
 }
@@ -241,7 +240,6 @@ _UNMARKED_STUDY_DIAGNOSTIC_MARKERS = {
     ("label", "call"),
     [
         ("study schema", lambda: study_policy._validate_study_schema(_populated_study())),
-        ("trial target", lambda: study_policy._accepted_trial_target(_populated_study())),
         (
             "environment cohort",
             lambda: study_policy._validate_environment_cohort(

@@ -14,8 +14,13 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Sampler
+from phasesweep.engine import phase as phase_ops
 from phasesweep.engine import reread as reread_ops
-from phasesweep.engine.errors import LaunchEnvironmentError, PhaseTimeoutError
+from phasesweep.engine.errors import (
+    LaunchEnvironmentError,
+    PhaseTimeoutError,
+    TrialTargetRefusedError,
+)
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import (
@@ -460,6 +465,26 @@ def test_fill_preview_refuses_an_unavoidable_launch_outside_the_donor_domain(
     run_experiment(target)
     assert _launches(launches) == 4
     assert addressed_phase_study(target).trials[-1].params["x"] in (1, 2)
+
+
+def test_adoption_stopped_before_launch_accepts_only_the_rows_it_holds(tmp_path: Path) -> None:
+    """A Ctrl-C after adopting kept attempts leaves a floor of the adopted rows, not the requested target."""
+    trainer, launches = _trainer(tmp_path)
+    phase = _phase("random", 2)
+    run_experiment(_config(tmp_path, trainer, phase))
+    run_experiment(_config(tmp_path, trainer, phase.model_copy(update={"n_trials": 4}), "acc"))
+    target = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 5}))
+    with (
+        patch.object(phase_ops, "_launch_preflight", side_effect=KeyboardInterrupt),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        run_experiment(target)
+    assert len(addressed_phase_study(target).trials) == 4
+
+    run_experiment(_config(tmp_path, trainer, phase.model_copy(update={"n_trials": 4})))
+    with pytest.raises(TrialTargetRefusedError, match="accepted a target of 4 finished trials"):
+        run_experiment(_config(tmp_path, trainer, phase.model_copy(update={"n_trials": 3})))
+    assert _launches(launches) == 4
 
 
 def test_mid_phase_adoption_deadline_preserves_new_training_on_restart(tmp_path: Path) -> None:
