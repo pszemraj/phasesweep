@@ -48,7 +48,7 @@ from phasesweep.evidence.wandb import (
     WandbMissingKeysError,
     WandbPollTimeout,
     WandbRunMissingError,
-    WandbRunStaleError,
+    WandbRunSupersededError,
     WandbRunTerminalError,
     WandbSetupError,
     locate_wandb_position,
@@ -938,10 +938,12 @@ def _capture_wandb(
     :param float | None deadline: Absolute monotonic deadline, also bounded by the source timeout.
     :raises DeadlineExceededError: The execution deadline prevents capture.
     :raises EvidenceUnreadableError: W&B gave no answer: authentication or setup failed, the
-        SDK is missing, the reader worker failed, or the last poll failed in transport or
-        found a finished summary still being ingested.
-    :raises ExtractorError: The run is missing, ended unsuccessfully or never finished, shows
-        nothing a rerun logged, the finished summary lacks required keys, or evidence is invalid.
+        SDK is missing, the reader worker failed, or the last poll failed in transport, found
+        a finished summary still being ingested, or found a rerun's run still showing only an
+        earlier attempt's summary.
+    :raises ExtractorError: The run is missing, ended unsuccessfully or never finished, was
+        reused by a later attempt, the finished summary lacks required keys, or evidence is
+        invalid.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     :return dict: Finished run identity, numeric values, present keys, and retrieval time.
     """
@@ -1044,19 +1046,13 @@ def _capture_wandb(
             raise ExtractorError(
                 f"W&B run {target} ended in {exc.state!r}; only finished runs can provide evidence."
             ) from exc
-        # Both are verdicts reached only at the deadline, so an execution deadline that was
-        # the binding limit cut the wait short instead.
-        except WandbRunStaleError as exc:
-            if exc.superseded:
-                raise ExtractorError(
-                    f"W&B run {target} was reused by another attempt and its current summary "
-                    "cannot be attributed to this attempt."
-                ) from exc
-            raise (DeadlineExceededError if capped else ExtractorError)(
-                f"W&B run {target} was not written by this attempt: after "
-                f"{exc.waited_seconds:.0f} s its summary still records no wandb.log() call "
-                "after the attempt launched."
+        except WandbRunSupersededError as exc:
+            raise ExtractorError(
+                f"W&B run {target} was reused by another attempt and its current summary "
+                "cannot be attributed to this attempt."
             ) from exc
+        # A verdict reached only at the deadline, so an execution deadline that was the binding
+        # limit cut the wait short instead.
         except WandbMissingKeysError as exc:
             raise (DeadlineExceededError if capped else ExtractorError)(
                 f"W&B run {target} finished without required summary key(s) {exc.missing!r} "

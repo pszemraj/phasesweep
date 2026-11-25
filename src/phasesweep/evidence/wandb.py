@@ -66,12 +66,10 @@ class WandbRunTerminalError(RuntimeError):
 
 
 @dataclass(eq=False)
-class WandbRunStaleError(RuntimeError):
-    """The run's last logged row cannot be attributed to the attempt being read."""
+class WandbRunSupersededError(RuntimeError):
+    """A later attempt reused the run, so its current summary is not the one being re-read."""
 
     run_id: str
-    waited_seconds: float
-    superseded: bool = False
 
 
 @dataclass(eq=False)
@@ -253,10 +251,10 @@ def poll_wandb_summary(
     :param float | None deadline: Absolute deadline including worker startup.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
     :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget; it was
-        reached only when the worker reports that its last poll got a usable answer.
+        reached only when the worker reports that its last poll got a usable answer. A run
+        that still shows only an earlier attempt's rows is not such an answer.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
-    :raises WandbRunStaleError: By the deadline the rerun's run never showed a row logged
-        after it launched, or a newer attempt replaced the retained summary.
+    :raises WandbRunSupersededError: A newer attempt replaced the retained summary.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
     :raises WandbMissingKeysError: At the deadline the finished run's summary still lacked
@@ -298,7 +296,7 @@ def poll_wandb_summary(
                 "import_error",
                 "timeout",
                 "run_missing",
-                "stale",
+                "superseded",
             }
         ),
         run_id=attempt_id,
@@ -313,13 +311,9 @@ def poll_wandb_summary(
         raise WandbRunTerminalError(run_id, json_text(response, "state"))
     if response.get("status") == "run_missing":
         raise WandbRunMissingError(run_id)
+    if response.get("status") == "superseded":
+        raise WandbRunSupersededError(run_id)
     waited = finite_nonnegative(response.get("waited_seconds"))
-    if response.get("status") == "stale":
-        if waited is None:
-            raise RuntimeError(
-                f"W&B evidence worker returned a malformed stale-run report for attempt {attempt_id!r}."
-            )
-        raise WandbRunStaleError(run_id, float(waited), response.get("superseded") is True)
     if response.get("status") == "missing_keys":
         missing = json_text_list(response.get("missing"))
         available = json_text_list(response.get("available"))
@@ -786,7 +780,8 @@ def _poll_wandb_summary(
     attempt's end left it. Until the summary's ``_timestamp``, the time of the last logged
     history row, passes ``logged_after``, the state and summary are the earlier attempt's,
     so neither a terminal state nor a finished summary decides anything; a run that still
-    shows nothing newer at the deadline was not written by this attempt. A trainer axis can
+    shows nothing newer at the deadline is unread, like one whose summary is still empty, and
+    leaves the trial pending. A trainer axis can
     show where a rerun re-logged progress, letting min/max exclude the replaced history.
 
     :param str base_url: Normalized W&B API endpoint.
@@ -808,8 +803,7 @@ def _poll_wandb_summary(
     :raises WandbPollTimeout: The run did not finish with the required keys in time,
         reached when the last poll got a usable answer about the run.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
-    :raises WandbRunStaleError: At the deadline the run still showed no row logged after
-        ``logged_after``, or a newer attempt replaced the retained summary.
+    :raises WandbRunSupersededError: A newer attempt replaced the retained summary.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
     :raises WandbMissingKeysError: At the deadline the finished run's summary still lacked
@@ -827,8 +821,6 @@ def _poll_wandb_summary(
     last_error: Exception | None = None
     # Whether the latest poll got an answer that can settle the trial at the deadline.
     reached = False
-    # Whether the latest answered poll still showed only an earlier attempt's run.
-    stale = False
     # The keys the latest answered poll's finished summary lacked, and the keys it had.
     missing: list[str] = []
     available: list[str] = []
@@ -880,8 +872,12 @@ def _poll_wandb_summary(
                         f"history's last step {_last_history_step(run)!r}."
                     )
                 elif stale:
+                    # W&B serves the earlier attempt's run for minutes after a rerun finishes,
+                    # so an unchanged summary is a lag to wait out, never a verdict.
+                    reached = False
                     last_error = RuntimeError(
-                        "The summary records no row logged since the attempt launched."
+                        "The run still shows only an earlier attempt's summary: it records no "
+                        "row logged since the attempt launched."
                     )
                 elif run.state in {"failed", "crashed", "killed", "preempted"}:
                     raise WandbRunTerminalError(run_id, run.state)
@@ -889,9 +885,7 @@ def _poll_wandb_summary(
                     if logged_before is not None:
                         stamp = finite_nonnegative(summary.get("_timestamp"))
                         if stamp is None or stamp >= logged_before:
-                            raise WandbRunStaleError(
-                                run_id, time.monotonic() - started, superseded=True
-                            )
+                            raise WandbRunSupersededError(run_id)
                     if all(key in summary for key in required):
                         values = {}
                         for key in required:
@@ -932,8 +926,6 @@ def _poll_wandb_summary(
     waited = time.monotonic() - started
     if isinstance(last_error, WandbRunMissingError):
         raise last_error
-    if reached and stale:
-        raise WandbRunStaleError(run_id, waited)
     if reached and missing:
         raise WandbMissingKeysError(run_id, missing, available, waited)
     raise WandbPollTimeout(run_id, timeout_seconds, reached=reached, last_error=last_error)
@@ -1093,12 +1085,8 @@ def main(argv: list[str] | None = None) -> int:
         }
     except WandbRunMissingError:
         response = {"status": "run_missing"}
-    except WandbRunStaleError as exc:
-        response = {
-            "status": "stale",
-            "waited_seconds": exc.waited_seconds,
-            "superseded": exc.superseded,
-        }
+    except WandbRunSupersededError:
+        response = {"status": "superseded"}
     except WandbPollTimeout as exc:
         response = {
             "status": "timeout",

@@ -273,7 +273,7 @@ def test_wandb_invalid_scalar_is_not_retryable(monkeypatch, value):
         ("WandbRunTerminalError", ("attempt", "crashed")),
         ("WandbSetupError", ("attempt", "denied")),
         ("WandbMissingKeysError", ("attempt", ["loss"], ["eval/loss"], 1.0)),
-        ("WandbRunStaleError", ("attempt", 1.0)),
+        ("WandbRunSupersededError", ("attempt",)),
     ],
 )
 def test_wandb_errors_unwind_through_context_managers(name, arguments):

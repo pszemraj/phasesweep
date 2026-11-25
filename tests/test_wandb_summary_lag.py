@@ -11,6 +11,7 @@ import json
 import math
 import re
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,7 +22,13 @@ from phasesweep.config.models import Experiment, Metric
 from phasesweep.engine.errors import TrackingTargetUnavailableError
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import ATTEMPT_ID_ATTR
-from phasesweep.evidence.evaluation import DeadlineExceededError, ExtractorError, run_extractor
+from phasesweep.evidence.baseline import EvidenceBaseline
+from phasesweep.evidence.evaluation import (
+    DeadlineExceededError,
+    EvidenceUnreadableError,
+    ExtractorError,
+    run_extractor,
+)
 from phasesweep.evidence.mlflow import merge_histories, select_observation
 from phasesweep.evidence.models import MlflowExtractor, WandbExtractor
 from tests.conftest import make_experiment, make_trial_context, phase_trials, write_trainer
@@ -246,13 +253,12 @@ def test_reread_only_accepts_a_shared_summary_logged_during_the_attempt(
 
     :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
     """
-    from phasesweep.evidence.wandb import WandbRunStaleError
+    from phasesweep.evidence.wandb import WandbRunSupersededError
 
     _serve(monkeypatch, lambda _: ("finished", {"_step": 3, _KEY: 0.1, "_timestamp": 50.0}, 3))
     assert _poll(logged_before=51.0)["values"] == {_KEY: 0.1}
-    with pytest.raises(WandbRunStaleError) as failure:
+    with pytest.raises(WandbRunSupersededError):
         _poll(logged_before=50.0)
-    assert failure.value.superseded
 
 
 @pytest.mark.parametrize("unindexed", [-1, None], ids=["no-keys", "null"])
@@ -399,17 +405,55 @@ def test_a_reruns_read_waits_out_the_state_its_earlier_attempt_left(
     assert clock.now == 10
 
 
-def test_a_reruns_run_that_never_moves_is_refused_at_the_deadline(
+def test_a_reruns_run_that_never_moves_is_unanswered_at_the_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A run whose summary never passes the rerun's launch fails as not written by this attempt only at the deadline."""
-    from phasesweep.evidence.wandb import WandbRunStaleError
+    """A run whose summary never passes the rerun's launch gives no usable answer, only at the deadline."""
+    from phasesweep.evidence.wandb import WandbPollTimeout
 
     left = {"_step": 5, _KEY: 0.5, "_timestamp": _LAUNCHED_AT - 60}
     clock, _ = _serve(monkeypatch, lambda read: ("finished", left, 5))
-    with pytest.raises(WandbRunStaleError) as caught:
+    with pytest.raises(WandbPollTimeout) as caught:
         _poll(logged_after=_LAUNCHED_AT)
-    assert caught.value.waited_seconds == clock.now == 240
+    assert not caught.value.reached
+    assert "earlier attempt's summary" in str(caught.value.last_error)
+    assert clock.now == 240
+
+
+def test_a_resumed_runs_earlier_summary_past_the_deadline_leaves_the_trial_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rerun whose run still serves the earlier attempt's summary at the deadline stays pending with what was seen, and a later read scores the rerun's summary."""
+    served = {
+        "left": ({"_step": 5, _KEY: 0.5, "_timestamp": _LAUNCHED_AT - 60}, 5),
+        "logged": ({"_step": 11, _KEY: 0.1, "_timestamp": _LAUNCHED_AT + 30}, 11),
+    }
+    phase = ["left"]
+
+    def answer(_read: int) -> Answer:
+        summary, last_step = served[phase[0]]
+        return "finished", summary, last_step
+
+    _serve(monkeypatch, answer)
+    monkeypatch.setattr("phasesweep.evidence.wandb.run_worker", _in_process_worker(tmp_path))
+    extractor = WandbExtractor(
+        type="wandb", entity="e", project="p", metric_key=_KEY, poll_seconds=5, timeout_seconds=60
+    )
+
+    def read() -> float:
+        baseline = EvidenceBaseline(False, {}, _LAUNCHED_AT, extractor.destination)
+        return run_extractor(replace(make_trial_context(tmp_path), baseline=baseline), extractor)
+
+    with pytest.raises(EvidenceUnreadableError) as caught:
+        read()
+    assert type(caught.value) is EvidenceUnreadableError
+    assert str(caught.value) == (
+        "W&B gave no answer for https://api.wandb.ai/e/p/attempt-test before the evidence "
+        f"deadline; required summary keys: ({_KEY!r},). Last observation: The run still shows "
+        "only an earlier attempt's summary: it records no row logged since the attempt launched."
+    )
+    phase[0] = "logged"
+    assert read() == 0.1
 
 
 def test_a_reruns_own_crash_fails_the_read(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -651,14 +695,18 @@ def test_the_real_client_reads_the_history_index_with_the_summary(tmp_path, monk
     assert all("historyKeys" in query for query in queries)
 
 
-def test_the_missing_key_report_crosses_the_worker_with_its_wait(tmp_path, monkeypatch) -> None:
-    """The worker's missing-keys reply carries how long it polled, and the trial's failure says so."""
+def _in_process_worker(tmp_path: Path) -> Callable[..., object]:
+    """Build a stand-in for the supervised worker that runs the reader in this process.
+
+    :param Path tmp_path: Directory for each request and response file.
+    :return Callable[..., object]: A ``run_worker`` replacement.
+    """
     from phasesweep.evidence import wandb as wandb_evidence
 
-    _serve(monkeypatch, lambda read: ("finished", {"_step": 3, "eval/loss": 0.1}, 3))
+    calls = iter(range(10**6))
 
-    def in_process_worker(request, _worker_path, _backend, **_):
-        directory = tmp_path / "worker"
+    def run(request, _worker_path, _backend, **_):
+        directory = tmp_path / f"worker-{next(calls)}"
         directory.mkdir(mode=0o700)
         request_path, response_path = directory / "request.json", directory / "response.json"
         request_path.write_text(json.dumps(dict(request)))
@@ -669,7 +717,13 @@ def test_the_missing_key_report_crosses_the_worker_with_its_wait(tmp_path, monke
             None,
         )
 
-    monkeypatch.setattr(wandb_evidence, "run_worker", in_process_worker)
+    return run
+
+
+def test_the_missing_key_report_crosses_the_worker_with_its_wait(tmp_path, monkeypatch) -> None:
+    """The worker's missing-keys reply carries how long it polled, and the trial's failure says so."""
+    _serve(monkeypatch, lambda read: ("finished", {"_step": 3, "eval/loss": 0.1}, 3))
+    monkeypatch.setattr("phasesweep.evidence.wandb.run_worker", _in_process_worker(tmp_path))
     extractor = WandbExtractor(
         type="wandb", entity="e", project="p", metric_key=_KEY, poll_seconds=5, timeout_seconds=240
     )
@@ -684,19 +738,16 @@ def test_the_missing_key_report_crosses_the_worker_with_its_wait(tmp_path, monke
     )
 
 
-@pytest.mark.parametrize("verdict", ["missing_keys", "stale"])
 @pytest.mark.parametrize("capped", [False, True], ids=["source-timeout", "phase-deadline"])
 def test_a_deadline_verdict_cut_short_by_the_phase_is_an_interruption(
-    tmp_path, monkeypatch, verdict: str, capped: bool
+    tmp_path, monkeypatch, capped: bool
 ) -> None:
-    """A missing-key or not-written verdict reached at a phase deadline shorter than the source's timeout interrupts the trial instead of failing it."""
+    """A missing-key verdict reached at a phase deadline shorter than the source's timeout interrupts the trial instead of failing it."""
     import time
 
     from phasesweep.evidence import wandb as wandb_evidence
 
     def poll(**kwargs: object) -> dict[str, object]:
-        if verdict == "stale":
-            raise wandb_evidence.WandbRunStaleError("opener", 9.0)
         raise wandb_evidence.WandbMissingKeysError("opener", [_KEY], [], 9.0)
 
     monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", poll)

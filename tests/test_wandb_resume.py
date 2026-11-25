@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,16 +12,15 @@ import pytest
 import phasesweep.runtime.reaper as reaper
 from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Metric
+from phasesweep.engine.errors import TrackingTargetUnavailableError
 from phasesweep.engine.evidence import _verify_winner_evidence
 from phasesweep.engine.paths import _attempts_dir
-from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     RERUN_OF_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
-    _parsed_trial_outcome,
     _trial_attempt_dir,
 )
 from phasesweep.evidence.models import WandbExtractor
@@ -157,26 +155,26 @@ def test_a_rerun_resumes_its_trials_wandb_run_and_is_scored_from_it(
 
 
 @pytest.mark.integration
-def test_a_rerun_that_logs_nothing_fails_as_not_written_by_this_attempt(
+def test_a_rerun_whose_run_still_shows_the_earlier_summary_stays_pending_until_it_is_served(
     tmp_path: Path, wandb_worker_sdk: Callable[[str], None]
 ) -> None:
-    """A rerun that exits 0 leaving the trial's run crashed with the earlier attempt's summary fails instead of scoring that summary."""
+    """A rerun that exits 0 while its run still serves the earlier attempt's crashed summary is neither scored from it nor failed: the trial stays pending without a second launch and the next run scores it."""
     tracker = _fake_wandb(wandb_worker_sdk, tmp_path)
     experiment = _interrupted_wandb_trial(tmp_path, timeout_seconds=2)
     tracker.mode.write_text("left")
 
-    with pytest.raises(NoFeasibleTrialError):
+    with pytest.raises(TrackingTargetUnavailableError, match="earlier attempt's summary"):
         run_experiment(experiment)
     first, rerun = phase_trials(experiment)
-    outcome = _parsed_trial_outcome(rerun.user_attrs[TRIAL_OUTCOME_ATTR])
-    assert outcome is not None and outcome.outcome == "failure"
-    target = f"https://example.test/e/p/{first.user_attrs[ATTEMPT_ID_ATTR]}"
-    assert re.fullmatch(
-        rf"metric extractor: W&B run {re.escape(target)} was not written by this attempt: "
-        r"after \d+ s its summary still records no wandb\.log\(\) call after the attempt "
-        r"launched\.",
-        outcome.cause,
-    )
+    assert rerun.state.name == "RUNNING" and TRIAL_OUTCOME_ATTR not in rerun.user_attrs
+    assert len(_launch_envs(tmp_path)) == 2
+
+    tracker.mode.write_text("logged")
+    assert run_experiment(experiment)["p"].metric == 1.0
+    _first, scored = phase_trials(experiment)
+    assert scored.state.name == "COMPLETE"
+    assert scored.user_attrs[ATTEMPT_ID_ATTR] == rerun.user_attrs[ATTEMPT_ID_ATTR]
+    assert len(_launch_envs(tmp_path)) == 2
 
 
 @pytest.mark.integration
