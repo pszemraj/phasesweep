@@ -8,7 +8,7 @@ current-journal/ledger/study.journal   journal ledger
 current-journal/artifact_root/t/...    the artifact tree that claimed that ledger
 ```
 
-Use `golden_publication` or `materialize` from [`ledger_fixtures.py`](../../ledger_fixtures.py) to copy the fixture into a temporary directory. The helper rebuilds its config, relocates artifact-root and study bindings in `tree` mode, and snapshots bytes before the read. [`test_ledger_read_paths.py`](../../test_ledger_read_paths.py) runs the read-path matrix.
+Use `golden_publication` from [`ledger_fixtures.py`](../../ledger_fixtures.py) for a temporary copy of the published tree and its generation ID. The [read-path matrix](../../test_ledger_read_paths.py) uses `materialize` from the same module to configure each mode, relocate bindings in `tree` mode, and snapshot bytes before the read.
 
 ## Inventory
 

@@ -17,7 +17,7 @@ For MCP runs, install the [MCP extra](../../docs/mcp_setup.md#1-install-the-mcp-
 
 Review the pinned trainer's [device and precision support](https://github.com/pszemraj/decoder-pytorch-template/blob/9c90a551ae79061f0ed797e035462539c8a08403/README.md#device-selection--precision) and [requirements](https://github.com/pszemraj/decoder-pytorch-template/blob/9c90a551ae79061f0ed797e035462539c8a08403/README.md#requirements) before extending this example. Make trainer changes upstream, then update the submodule pointer here.
 
-Run GPU validation, dry runs, and training from a shell with [host GPU access](../../docs/runtime.md#gpu-isolation). Run the commands below from the PhaseSweep repo root: `gpu_smoke.yaml`, `experiment.yaml` and `mlflow_gpu_smoke.yaml` leave `execution.cwd` unset, so their repo-relative `trial_command` resolves against the invocation directory.
+Run GPU validation, dry runs, and training from a shell with [host GPU access](../../docs/runtime.md#gpu-isolation). Run the commands below from the PhaseSweep repo root. The example commands are repo-relative. A CLI config with no `execution.cwd` runs the trainer from the invocation directory. A relative `execution.cwd`, as in `repeats.yaml`, resolves against the YAML file. For a config copied outside the checkout, set `execution.cwd` to the absolute PhaseSweep repo path. See the [trainer contract](../../docs/config.md#trainer-contract).
 
 ## CLI smoke sweep
 
@@ -29,7 +29,7 @@ phasesweep run examples/tiny_decoder_enwik8/gpu_smoke.yaml
 phasesweep show-winners examples/tiny_decoder_enwik8/gpu_smoke.yaml
 ```
 
-The in-memory smoke executes both trials on every invocation. The `runtime.accelerated == true` gate requires final-checkpoint evaluation on CUDA or MPS. `result.json` records the device type. The full sweep below uses a persistent Optuna journal.
+The in-memory smoke executes both trials on every invocation. The `runtime.accelerated == true` gate requires final-checkpoint evaluation on CUDA or MPS. `result.json` records the device type.
 
 Use the full three-phase example only when you want the longer experiment:
 
@@ -48,7 +48,7 @@ The upstream trainer records periodic validation with labels 0, 100, ..., 900, a
 
 ## Learning rates over seeds
 
-The runnable [`repeats.yaml`](repeats.yaml) compares three learning rates over seeds 7, 17, and 27. For a continuous key such as learning rate, [more distinct values with one trial each](../../docs/config.md#noisy-objectives-and-small-budgets) usually tell more; repeats suit a few discrete finalists. This config includes persistent storage and provenance, and resolves the trainer's working directory relative to the YAML file. When copying it outside the checkout, set `execution.cwd` to the absolute PhaseSweep repository path. After setup, run from the repository root:
+The runnable [`repeats.yaml`](repeats.yaml) compares three learning rates over seeds 7, 17, and 27. See [when to use repeats](../../docs/config.md#noisy-objectives-and-small-budgets) for the trade-off between trying more values and repeating a few finalists.
 
 ```bash
 phasesweep validate examples/tiny_decoder_enwik8/repeats.yaml
@@ -65,7 +65,7 @@ The last command replays a completed study without training again. Artifacts and
 
 ## Continue one checkpoint
 
-To continue training a particular saved model, use the pinned upstream trainer's existing `--resume` option. For a repeat winner, choose a seed explicitly; the aggregate score summarizes several models. `show-winners` prints `repeats.key` and each winning member's `repeat`, `trial_number` and `trial_dir` under `repeats.members`. Choose the member there; this example saves its checkpoint at `trainer/final.pt` below that `trial_dir`. The `# full record:` path retains the complete checkpoint evidence.
+To continue training a particular saved model, use the pinned upstream trainer's `--resume` option. For a [repeat winner](../../docs/runtime.md#repeat-groups), choose the member to continue from `show-winners`. Its checkpoint is at `trainer/final.pt` below that member's `trial_dir`.
 
 Run this from the PhaseSweep repository root, replacing the checkpoint path with the chosen member's file. The recipe reads the checkpoint's own trainer config and requests five additional optimizer updates. A step-80 checkpoint therefore finishes at step 85. The pinned trainer interprets `num_batches` as additional updates when resuming; setting it to 85 would instead finish at 165.
 
@@ -98,7 +98,7 @@ The subprocess runs from the upstream checkout so the saved relative `data_path`
 
 ## Native MLflow GPU smoke
 
-The [MLflow smoke configuration](mlflow_gpu_smoke.yaml) uses the same two learning rates, model, and ten-batch budget as the local GPU fixture. It runs one trial at a time on CUDA device `0`. Complete the trainer setup above, then install MLflow and start the local tracking server as in [Run the CPU example locally](../../docs/mlflow.md#run-the-cpu-example-locally). In another terminal, run from the PhaseSweep repository root. Create the experiment once; if it already exists, reuse it:
+The [MLflow smoke configuration](mlflow_gpu_smoke.yaml) uses the same two learning rates, model, and ten-batch budget as the [CLI smoke](#cli-smoke-sweep). It runs one trial at a time on CUDA device `0`. Complete the trainer setup above, then [install MLflow and start the local tracking server](../../docs/mlflow.md#run-the-cpu-example-locally). In another terminal at the PhaseSweep repo root, provision the GPU smoke's experiment and run the sweep:
 
 ```bash
 python -c 'from mlflow import MlflowClient; c = MlflowClient(tracking_uri="http://127.0.0.1:5000"); c.get_experiment_by_name("phasesweep-tiny-decoder") or c.create_experiment("phasesweep-tiny-decoder")'
@@ -112,7 +112,7 @@ The `--mlflow` option of `run_trial.py` logs the evaluated `final.pt` loss as na
 
 The smoke uses [managed run ownership](../../docs/mlflow.md#choose-run-ownership). To exercise trainer ownership, copy the config, set `mlflow.run_mode: trainer`, and choose a fresh `experiment` and `workdir`. Open `http://127.0.0.1:5000` to inspect the native metrics and `phasesweep.*` results.
 
-The MLflow smoke uses persistent storage. Rerunning the same configuration reuses completed trials. When copying the config outside the checkout, set `execution.cwd` to the absolute PhaseSweep repository path. To use another server, set `mlflow.tracking_uri` and provision `mlflow.experiment_name` there first.
+The MLflow smoke uses persistent storage. Rerunning the same configuration reuses completed trials. To use another server, [configure its existing source experiment](../../docs/mlflow.md#configure-the-source-experiment).
 
 ## MCP smoke
 
@@ -153,6 +153,6 @@ Run the full sweep through [`catalog.yaml`](catalog.yaml), which registers [`mcp
 phasesweep mcp check --catalog examples/tiny_decoder_enwik8/catalog.yaml
 ```
 
-Configure your client with the absolute `phasesweep-mcp` executable and this catalog's absolute path as described in [MCP setup](../../docs/mcp_setup.md#3-configure-your-client), then [verify the read-only catalog operation](../../docs/mcp_setup.md#4-verify-the-connection).
+[Configure your MCP client](../../docs/mcp_setup.md#3-configure-your-client) with this catalog's absolute path and [verify the connection](../../docs/mcp_setup.md#4-verify-the-connection).
 
 The MCP variant uses scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-tiny-decoder-enwik8`; choose a fresh root before the first run as described in the [fresh MCP state](../../docs/mcp.md#fresh-mcp-state) section.

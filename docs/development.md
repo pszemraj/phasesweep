@@ -116,7 +116,7 @@ The W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's summary decodi
 
 Use `tests/conftest.py` for isolation fixtures, model builders and trial records; `tests/experiments.py` for dictionary-based YAML configuration; `tests/ledger_fixtures.py` for golden publications and journal mutations; `tests/mcp_helpers.py` and `tests/recovery_helpers.py` for MCP and recovery setup; `tests/error_routing_helpers.py` for the case record and assertions the two routing contract modules share; and `tests/tracking_helpers.py` for shared tracking fakes and experiment setup. Import shared setup from these support modules rather than another test module. Keep assertions and scenario-specific malformed input or trainer programs with their tests. Helpers that other modules import have public names.
 
-The golden ledger fixture under `tests/fixtures/ledgers` is committed output of a real run. Regenerate it when a persisted format changes; the [fixture guide](../tests/fixtures/ledgers/README.md) gives the command and what churns.
+For a persisted format change, follow the [ledger fixture regeneration procedure](../tests/fixtures/ledgers/README.md#regeneration).
 
 ## PyPI releases
 
@@ -216,25 +216,15 @@ flowchart TD
 
 ## Test map
 
-The principal test groups and what each covers:
+The [durability invariants](invariants.md) identify the code and tests for storage, publication, process supervision, recovery, reruns, and result reuse. For other changes, start with these suites.
 
 - `tests/test_e2e.py`: complete experiment and `--from-phase` replay.
 - `tests/test_config.py`, `tests/test_param_validation.py`, and `tests/test_overrides.py`: Experiment validation, composition, parameter domains, and retained input boundaries.
 - `tests/test_run_overrides.py`: shared `--set` key syntax, created-key notes, derived-config validation and study inspection with overrides.
 - `tests/test_config_reference.py` and `tests/test_explain.py`: the configuration reference against the schema, its parser's shared blocks and section rules, and `phasesweep explain`.
-- `tests/test_extractors.py`, `tests/test_trial_evidence.py`, and `tests/test_trial_launch.py`: scalar evidence, shared W&B captures, gates, supervised trials, and durable input verification.
-- `tests/test_attempt_lifecycle.py`, `tests/test_process_supervision.py` and `tests/test_guardian_settle.py`: lifecycle parsing, process identity and launch ordering, descendant cleanup including descendants the guardian adopts after they leave the trainer's group, the helper settle after a trainer root exits, and guardian completion evidence.
-- `tests/test_attempt_endings.py`: the `ended_by` value each way an attempt can end records in its lifecycle record, and the verdict each earns live and in recovery, including a crash that a shutdown or a killed runner follows.
-- `tests/test_resume_in_place.py`: a trial's rerun in its own trial directory, scored only from files its attempt wrote.
-- `tests/test_reread.py` covers reading retained evidence under changed settings. `tests/test_sibling_draw_reuse.py` covers matching completed training to a returning study's draws across top-ups and interruptions.
-- `tests/test_search_space_growth.py`: a search space that only gains values keeps its finished trials and runs only the added cells, and the refusals for a dropped value, `repeats.values` and CMA-ES.
-- `tests/test_mlflow.py` and `tests/test_mlflow_terminal_delivery.py`: native history selection, run bindings, shared captures, and terminal delivery retries.
-- `tests/test_mlflow_integration.py`: both ownership modes against a temporary HTTP server, stopped-server replay, worker cleanup, and delivery retries.
-- Storage, publication, recovery, interrupted trials and sampler resume: owning code and representative tests are listed by [durability invariant](invariants.md).
-- `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots, detached launch, status, cancellation, and recovery.
-- `tests/test_terminal.py`, `tests/test_terminal_output.py`, `tests/test_trial_table.py` and `tests/test_cli_help.py`: the terminal primitives (the colour decision per stream, width, wrapping, display paths), the CLI's closing lines, refusal layout and the exit status a closed terminal leaves, the exact plain-text output of `status --trials`, command help text, and the quiet exit on a closed output pipe.
-- `tests/test_run_report_summary.py`: the closing summary and the nothing-to-run block of `phasesweep run`, as exact text at 80 and 60 columns (counts, winners, flagged checks, the winners' directories).
-- `tests/test_run_report.py`: what `phasesweep run` prints, as exact text at 80 and 60 columns for each report block (banner, phase start, trial, rerun, skipped, winner), the console handler (time prefix, warning and prose wrapping, styling, contiguous records from threads, the INFO lines of a dry run) and the CLI around it (`-v`, the closing `log:` line, a replay, a resume, the starter's pinned dry-run lines, and a phase abort, failed extraction or fatal error printing once).
+- `tests/test_extractors.py` covers scalar extractors, shared W&B captures and gates. `tests/test_mlflow.py` covers native history selection, run bindings and shared captures. `tests/test_mlflow_integration.py` covers both ownership modes and stopped-server replay against a temporary HTTP server.
+- `tests/test_terminal.py`, `tests/test_terminal_output.py`, `tests/test_trial_table.py` and `tests/test_cli_help.py` cover terminal formatting, `status --trials`, help text, and closed-terminal and closed-pipe behavior.
+- `tests/test_run_report.py` and `tests/test_run_report_summary.py` check exact live and closing report text at 80 and 60 columns, plus console logging and CLI integration.
 - `tests/test_init.py`, `tests/test_fake_train.py` and `tests/test_reporting.py`: template creation and runs, the toy trainer's seed noise, catalog scaffolding, and the objective-envelope writer (`report_objective` and `report-objective`).
 
 ## Tracked TODOs
