@@ -49,6 +49,11 @@ INITIAL_PID_NAMESPACE_LINK = "pid:[4026531836]"
 #: time. The pair distinguishes namespace-inode reuse within one boot.
 _PID_NAMESPACE_PATTERN = re.compile(r"pid:\[[1-9][0-9]*\]@(?:0|[1-9][0-9]*)")
 _PROC = Path("/proc")
+#: The step that clears a foreign-namespace refusal: either namespace can settle the attempt.
+FOREIGN_NAMESPACE_STEP = (
+    "Run the same command from the host's initial PID namespace or the container that recorded "
+    "the attempt, after any host process the error names has exited."
+)
 
 
 @dataclass(frozen=True)
@@ -227,10 +232,7 @@ def recorded_process_blocker(
     if read_pid_namespace() == "darwin":
         return "macOS cannot inspect processes recorded in a Linux PID namespace"
     if not in_initial_pid_namespace():
-        return (
-            "only the host's initial PID namespace can see another namespace's processes, "
-            "so run this from there"
-        )
+        return "only the host's initial PID namespace can see another namespace's processes"
     link = _pid_namespace_link(pid_namespace)
     if link == INITIAL_PID_NAMESPACE_LINK:
         # That namespace is never freed, so a differing PID 1 start time means
@@ -307,10 +309,7 @@ def foreign_pid_namespace_reason(pid_namespace: str, blocker: str) -> str:
     :return str: A clause naming both namespaces and what blocked the proof.
     """
     current = read_pid_namespace() or "unreadable"
-    return (
-        f"it was recorded in PID namespace {pid_namespace}, but this process is in {current}, "
-        f"and {blocker}"
-    )
+    return f"recorded in PID namespace {pid_namespace}, this process is in {current}; {blocker}"
 
 
 @dataclass(frozen=True)
@@ -590,7 +589,8 @@ def stale_trial_process_decision(identity: StaleProcessIdentity) -> StaleProcess
             )
         raise ForeignPidNamespaceError(
             f"Attempt {identity.attempt_id} (pid={identity.pid}) cannot be cleaned from here: "
-            f"{foreign_pid_namespace_reason(identity.pid_namespace, blocker)}."
+            f"{foreign_pid_namespace_reason(identity.pid_namespace, blocker)}.",
+            remediation=FOREIGN_NAMESPACE_STEP,
         )
     if identity.boot_id is None or current_boot_id is None:
         return StaleProcessDecision("refuse", "robust process-birth identity is unavailable")

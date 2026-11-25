@@ -23,7 +23,12 @@ import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
 import phasesweep.mcp.tools as mcp_tools
 import phasesweep.runtime.reaper as reaper
-from phasesweep.errors import ForeignPidNamespaceError, OperatorAction, PhaseSweepError
+from phasesweep.errors import (
+    ForeignPidNamespaceError,
+    OperatorAction,
+    PhaseSweepError,
+    operator_step,
+)
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import CatalogError, ExperimentBusyError, RunNamespaceMismatchError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
@@ -507,6 +512,10 @@ def test_cleanup_stale_trial_process_refuses_foreign_namespace_without_signallin
     assert NESTED_READER in message
     assert "cannot be cleaned from here" in message
     assert "kill -9" not in message
+    assert len(message) < 280 and "so run this from there" not in message
+    assert operator_step(caught.value).startswith(
+        "Run the same command from the host's initial PID namespace"
+    )
 
 
 def test_cleanup_stale_trial_process_settles_an_absent_trial_without_signalling(
