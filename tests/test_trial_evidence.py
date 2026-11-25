@@ -574,6 +574,35 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
     assert _pointer_bytes(topup) == pointer_before
 
 
+def test_reread_checks_losing_candidates_before_publication(tmp_path: Path) -> None:
+    """A root's re-read verifies retained audit files before publishing its new selection."""
+    experiment = _evidence_experiment(tmp_path, n_trials=2)
+    assert run_experiment(experiment)["p"].trial_number == 0
+    losing_trial = phase_trials(experiment)[1]
+    attempt_dir = _trial_attempt_dir(losing_trial)
+    assert attempt_dir is not None
+    attempts_before = set(attempt_dir.parent.iterdir())
+    command = attempt_dir / "command.txt"
+    command_bytes = command.read_bytes()
+    command.unlink()
+    pointer_before = _pointer_bytes(experiment)
+    reread = experiment.model_copy(
+        update={"metric": experiment.metric.model_copy(update={"goal": "maximize"})}
+    )
+
+    with pytest.raises(
+        TrialEvidenceMissingError, match=r"trial 1 .* is missing its 'command.txt' audit artifact"
+    ):
+        run_experiment(reread)
+
+    assert _pointer_bytes(experiment) == pointer_before
+    assert read_status(reread)["phases"][0]["trials"] == {"COMPLETE": 2}
+    command.write_bytes(command_bytes)
+    assert run_experiment(reread)["p"].trial_number == 0
+    assert _pointer_bytes(experiment) != pointer_before
+    assert set(attempt_dir.parent.iterdir()) == attempts_before
+
+
 def _losing_trial_dir(experiment: Experiment, number: int) -> Path:
     """Return the trial directory one trial of phase ``p`` recorded."""
     (directory,) = _phase_dir(experiment, "p").glob(f"trial_{number:05d}__*")

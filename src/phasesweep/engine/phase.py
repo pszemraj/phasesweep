@@ -1620,12 +1620,16 @@ def _run_phase(
     ]
     study = open_phase_study(ledger, phase, study_name)
     _validate_study_direction(study, experiment.metric.goal)
+    # Preflight checks root studies before their rows can change and before child
+    # addresses are known.
+    recheck_evidence = bool(phase.inherits)
     if _recorded_identity(study) is None:
         source = fill_source(experiment, phase, inherited, others, target=study)
         if source is not None:
             filled = fill_study(
                 experiment, phase, study, source, others, run_deadline, generation.generation_id
             )
+            recheck_evidence = True
             report.info("%s  %s", phase.name, fill_note(source, filled))
     if not study.get_trials(deepcopy=False):
         note = new_study_note(phase, inherited, others)
@@ -1641,9 +1645,9 @@ def _run_phase(
         generation.generation_id,
         recovery_abort=resumed.recovery_abort,
     ):
+        recheck_evidence = True
         resumed = _resume_phase(experiment, phase, inherited_winners, study)
-    if phase.inherits:
-        # Its study was unknown before the run selected its parents' winners.
+    if recheck_evidence:
         _validate_selection_evidence(experiment, {phase.name: study})
     if others:
         # Recovery refreshes trials.csv from each study it settles, which can leave it showing
