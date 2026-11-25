@@ -110,7 +110,7 @@ phasesweep status examples/tiny_decoder_enwik8/mlflow_gpu_smoke.yaml
 
 The `--mlflow` option of `run_trial.py` logs the evaluated `final.pt` loss as native `val_loss` at step `10`, with trainer parameters and evaluation/device tags. It logs `runtime/cuda=1` when final evaluation uses CUDA; a native constraint requires that value before a trial can win. Periodic upstream validation losses remain local and do not enter the objective. In this mode, the objective comes from MLflow rather than a JSON envelope. The upstream trainer runs as pinned, with no modification.
 
-The smoke uses [managed run ownership](../../docs/mlflow.md#choose-run-ownership). To exercise trainer ownership, copy the config, set `mlflow.run_mode: trainer`, and choose a fresh `experiment` and `workdir`. Open `http://127.0.0.1:5000` to inspect the native metrics and `phasesweep.*` results.
+The smoke uses [managed run ownership](../../docs/mlflow.md#choose-run-ownership). To exercise trainer ownership, copy the config, set `mlflow.run_mode: trainer`, and choose a fresh local `experiment` and `workdir`. You can keep the existing remote `mlflow.experiment_name`. Open `http://127.0.0.1:5000` to inspect the native metrics and `phasesweep.*` results.
 
 The MLflow smoke uses persistent storage. Rerunning the same configuration reuses completed trials. To use another server, [configure its existing source experiment](../../docs/mlflow.md#configure-the-source-experiment).
 

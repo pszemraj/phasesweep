@@ -15,11 +15,11 @@ mlflow server --host 127.0.0.1 --port 5000 \
   --artifacts-destination /tmp/phasesweep-mlflow-demo/artifacts
 ```
 
-In another terminal, generate the packaged MLflow template, provision its experiment and run it. Its trainer ships with PhaseSweep, so no repository checkout is needed:
+In another terminal, generate the packaged MLflow template, provision its experiment and run it. Its trainer ships with PhaseSweep, so no repository checkout is needed. If the server already has the experiment, reuse it.
 
 ```bash
 phasesweep init --template mlflow
-python -c 'from mlflow import MlflowClient; MlflowClient(tracking_uri="http://127.0.0.1:5000").create_experiment("phasesweep-native")'
+python -c 'from mlflow import MlflowClient; c = MlflowClient(tracking_uri="http://127.0.0.1:5000"); c.get_experiment_by_name("phasesweep-native") or c.create_experiment("phasesweep-native")'
 phasesweep validate mlflow.yaml
 phasesweep run mlflow.yaml
 phasesweep show-winners mlflow.yaml
@@ -47,13 +47,19 @@ metric:
   extractor: {type: mlflow, metric_key: eval/loss, select: last}
 ```
 
-The experiment must already exist and be active. Quote a numeric `experiment_id` so YAML keeps it a string. `tracking_uri` accepts HTTP(S), `databricks`, and `databricks://profile`; HTTP credentials belong in SDK authentication or the environment rather than the URI. Before a phase allocates its first trial, PhaseSweep resolves the experiment; the first such phase also creates the generation-summary run. A server, credential or experiment failure spends none of that phase's trial slots; when no trial has launched, it writes no generation. The refusal names the target. The resolved ID is saved in `<workdir>/<experiment>/tracking/source.json`. PhaseSweep refuses to continue if the experiment resolves to a different ID.
+The `mlflow` block requires `metric.extractor.type: mlflow`. If the controller and trainer use separate environments, install `phasesweep[mlflow]` for the controller and make the native `mlflow` API available to the trainer. A trainer that calls `bind_mlflow_run` also needs PhaseSweep installed.
+
+The experiment must already exist and be active. Quote a numeric `experiment_id` so YAML keeps it a string. `tracking_uri` accepts HTTP(S), `databricks`, and `databricks://profile`. Supply HTTP credentials through the SDK's authentication environment. Before a phase allocates its first trial, PhaseSweep resolves the experiment. The first such phase also creates the generation-summary run. A failed target check names the target and spends none of that phase's trial slots. If it fails before the run's first trial, PhaseSweep writes no generation. The resolved ID is saved in `<workdir>/<experiment>/tracking/source.json`. PhaseSweep refuses to continue if the experiment resolves to a different ID.
 
 The MLflow client retries a server that refuses or does not answer. When those retries outlast `timeout_seconds`, the refusal says the target did not answer within `timeout_seconds`; when they end sooner, it names the refused connection, including when MLflow wraps the transport failure. Either way, the `fix:` step is to start the server or correct `tracking_uri`, then run again. A refusal MLflow answered, such as for a missing experiment, gets a configuration fix instead.
 
-`tracking_uri`, `experiment_id`, `experiment_name` and `run_mode` are in the study fingerprint, so changing one needs a new experiment name; a retry reads the original attempt with the current `poll_seconds` and `timeout_seconds`. `phasesweep validate` and `run --dry-run` check neither authentication nor the experiment. The credentials need write access: PhaseSweep creates runs, logs metrics, params and tags, uploads artifacts and ends runs. An `env` entry for `MLFLOW_TRACKING_URI`, `MLFLOW_EXPERIMENT_ID` or `MLFLOW_EXPERIMENT_NAME` must equal the block's own normalized value (lowercase scheme and host, no trailing slash), so the selector the block leaves unset cannot appear, and `env` may not set `MLFLOW_RUN_ID`; config load fails otherwise.
+`tracking_uri`, `experiment_id`, `experiment_name` and `run_mode` are in the study fingerprint. Use a fresh PhaseSweep study when changing one, for example by changing the top-level `experiment` with `storage: auto`. A retry reads the original attempt with the current `poll_seconds` and `timeout_seconds`. `phasesweep validate` and `run --dry-run` check neither authentication nor the experiment. The credentials need write access to create runs, log metrics, params and tags, upload artifacts and end runs.
 
-Controller tracking workers run outside GPU leases. `timeout_seconds` bounds SDK retries. The remaining phase or run deadline also caps experiment resolution, run creation and evidence capture. The run deadline caps the pass that sends earlier runs' records before the first trial, and the phase's own budget starts once that pass ends. Other uploads can continue after the deadline. After allocation, a run preparation error normally spends a trial and counts toward `max_consecutive_failures`. An expired phase or run deadline interrupts the draw. If a setup worker's cleanup is uncertain, PhaseSweep stops launching work. With persistent storage, the next run can retry the unlaunched draw once cleanup is confirmed. If MLflow cannot answer after training, [trial recovery](runtime.md#trial-execution-and-evidence) determines whether the finished result can be kept.
+An `env` entry for `MLFLOW_TRACKING_URI`, `MLFLOW_EXPERIMENT_ID` or `MLFLOW_EXPERIMENT_NAME` must match the block's configured value exactly. For HTTP(S), use the normalized URI with lowercase scheme and host and no trailing slash. Omit the selector that the `mlflow` block leaves unset, and leave `MLFLOW_RUN_ID` to PhaseSweep.
+
+Controller tracking workers run outside GPU leases. `timeout_seconds` bounds each operation, including SDK retries. An uncertain managed run creation can use a second operation to look for the run. The remaining phase or run deadline also caps experiment resolution, run creation and evidence capture. The run deadline caps the pass that sends earlier runs' records before the first trial, and the phase's own budget starts once that pass ends. Other uploads can continue after the deadline.
+
+After allocation, a run preparation error normally spends a trial and counts toward `max_consecutive_failures`. An expired phase or run deadline interrupts the draw. If a setup worker's cleanup is uncertain, PhaseSweep stops launching work. With persistent storage, the next run can retry the unlaunched draw once cleanup is confirmed. If MLflow cannot answer after training, [trial recovery](runtime.md#trial-execution-and-evidence) determines whether the finished result can be kept.
 
 ## Choose run ownership
 
@@ -70,7 +76,7 @@ Lightning's `MLFlowLogger` needs the supplied run ID passed as its `run_id`; rea
 
 Transformers' MLflow callback ends its run at the end of training, so call `mlflow.start_run()` before constructing the Trainer to keep its final evaluation in the same active run.
 
-Each [rerun](runtime.md#interrupted-trials-rerun) gets a new managed run under the same name. PhaseSweep finishes a successful managed run that the trainer left open. A FAILED or KILLED run can contribute earlier history to a later attempt of the same trial. See [result delivery and recovery](#result-delivery-and-recovery) for how PhaseSweep closes unaccepted attempts.
+Each [rerun](runtime.md#interrupted-trials-rerun) gets a new managed run. It keeps the display name when it reuses the training directory. PhaseSweep finishes a managed run that a successful trainer left open. A bound run marked FAILED or KILLED fails evidence capture, but it can contribute earlier history to a later attempt. See [result delivery and recovery](#result-delivery-and-recovery) for how PhaseSweep closes unaccepted attempts.
 
 In **trainer** mode, your existing logger creates and finishes the run. The trainer receives `MLFLOW_TRACKING_URI` and the resolved `MLFLOW_EXPERIMENT_ID`, so a plain `mlflow.start_run()` opens it in the configured experiment. Bind that exact run once it exists:
 
@@ -112,7 +118,7 @@ gates:
 
 At least one namespace must be nonempty. The finished-run check fails at once when required evidence is missing and names the missing and available keys, for example `MLflow run finished without metric 'loss'; available metric keys: ['accuracy', 'eval_loss'].` When a managed run lacks the objective metric, the first such trial in a phase also logs one hint on logging into the supplied run. The stored failure reason carries the diagnostic only. An unfinished run is polled every `poll_seconds` until timeout, which reports its last state. A trainer-owned run left open fails this way. The capture budget includes worker startup and stops polling `min(5, timeout_seconds / 2)` seconds before expiry to retain that diagnostic. Accepted evidence freezes the selected value, step, timestamp, native run identity and required metadata. See [local reads of retained evidence](runtime.md#trial-execution-and-evidence) and [evaluation-position checks](runtime.md#confound-verdicts).
 
-On a rerun, each selector uses the retained prefix of earlier attempts' history and the retry's own points. The retry's first point for each metric replaces earlier history from that step onward, even when the retry stops sooner. The retry must log the objective and gate evidence. A constraint can use a metric the retry omits, such as a parameter count logged once at step 0. Sparse evaluations can leave earlier points between the loaded checkpoint and the retry's first logged step in the retained prefix. See [rerun evidence](invariants.md#33-a-trials-rerun-continues-in-its-directory-alone-and-is-scored-only-from-files-its-own-attempt-wrote).
+On a rerun, each selector uses the retained prefix of earlier attempts' history and the retry's own points. For each metric, the retry replaces earlier history at and above its lowest logged step, even when it stops sooner. The retry must log the objective and gate evidence. A constraint can use a metric the retry omits, such as a parameter count logged once at step 0. With sparse evaluations, the retained prefix can include earlier points between the loaded checkpoint and the retry's lowest logged step. See [rerun evidence](invariants.md#33-a-trials-rerun-continues-in-its-directory-alone-and-is-scored-only-from-files-its-own-attempt-wrote).
 
 ## Result delivery and recovery
 

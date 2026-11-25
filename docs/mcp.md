@@ -25,7 +25,7 @@ experiments:
 
 The catalog and experiment YAML each reject unknown fields and duplicate keys. At startup the server validates both. If the catalog itself cannot be parsed or its `state_dir` is unusable, startup exits with code 2. If an individual experiment fails to load, the server prints its ID and remedy on stderr and serves the entries it could load. The failed ID still supports run reads, lookup and cancellation according to its catalog permissions. Inspection of that experiment and launches across the whole catalog are refused.
 
-The server checks for edits before each tool call. A valid edit takes effect on that call. A detached run keeps its launch snapshot, subject to the cancellation and visibility rules below. An invalid edit leaves the last valid catalog available for reads and cancellation, blocks inspection of any entry whose config changed, and blocks all launches until the files validate. Run `phasesweep mcp check --catalog <catalog>` for the diagnostic. Changing `state_dir` requires a restart. Until then the server keeps the previous catalog and refuses launches.
+Before each tool call, the server checks the catalog and experiment files for edits. A valid edit takes effect on that call. A detached run keeps its launch snapshot, subject to the cancellation and visibility rules below. A refused reload keeps the held catalog's cancellation and visibility policies, blocks inspection of any entry whose config changed, and blocks all launches until the files validate. Run `phasesweep mcp check --catalog <catalog>` for the diagnostic. Changing `state_dir` requires a restart. Until then the server keeps the previous catalog and refuses launches.
 
 Catalog-backed reads expose `catalog_status.stale`, `reload_refusal` (`invalid` or `state_dir_changed`) and a path-free `remediation` naming affected IDs. While stale, `list_experiments` reports `capabilities.launch: false` for every entry. A successful reload clears the flag. The server logs accepted and refused reloads on stderr.
 
@@ -38,7 +38,7 @@ These are all accepted catalog fields. Entry paths expand `~`; relative `state_d
 | `experiments` | Nonempty list of objects; required | Use one catalog entry per engine output and study namespace. Aliases are rejected. |
 | `experiments[].id` | String; required | Unique case-sensitive agent-visible identifier matching `[A-Za-z0-9_-]+`, such as `tiny_lm`. It need not equal the experiment YAML's `experiment` name. |
 | `experiments[].config` | Path; required | Existing experiment YAML file, kept operator-only. Its configuration must satisfy the detached-run storage/path rules below. |
-| `experiments[].cwd` | Path or `null`; `null` | Existing detached-run working directory. Unset/null uses the resolved experiment file's parent directory. See the [trainer contract](config.md#trainer-contract) for precedence with `execution.cwd`. If this directory disappears, the entry fails to load and the catalog becomes stale. Historical results remain readable by run ID with all parameters redacted for the failed entry. An entry can still load and serve saved results after its separate `execution.cwd` disappears. |
+| `experiments[].cwd` | Path or `null`; `null` | Detached-run working directory. Unset/null uses the resolved experiment file's parent directory. See the [trainer contract](config.md#trainer-contract) for precedence with `execution.cwd`. A missing detached-run directory fails entry validation at startup or on reload. Its disappearance alone does not trigger a reload. A startup failure leaves historical results readable by run ID with sampled parameters redacted. An entry can still load and serve saved results after its separate `execution.cwd` disappears. |
 | `experiments[].description` | String, at most 500 characters; `""` | Purpose shown to the agent during catalog discovery; paths and secrets do not belong here. |
 | `experiments[].allow` | Object; `{}` | Permission block with all child permissions false by default; omitting it leaves the entry read-only. |
 | `experiments[].allow.launch` | Boolean; `false` | Permit detached launches for this entry; concurrency and experiment-busy checks still apply. |
@@ -66,7 +66,7 @@ Catalog operations use an experiment ID, except `explain_config`:
 4. `get_latest_run(experiment_id)` is the reconnection lookup when a client lost a run ID. It returns the newest handle for that catalog experiment, or `found: false` with a null `run` when no matching run exists. Stop there if reconnecting. A missing handle does not authorize a replacement launch.
 5. `explain_config(key?)` is for config-authoring help and needs no catalog entry. It returns the configuration reference for a key and every key below it, the same entries as `phasesweep explain` with the section rules and shared-block descriptions that govern them in `rules`, except that `phases` returns every entry below it where the CLI prints a compact index, or the top-level keys when `key` is omitted, together with the general notes of `phasesweep explain --notes` in `notes` (empty when a key was given). When `found` is false it lists the `closest` documented keys. It describes the schema, never an approved experiment's config, and returns no paths or values.
 
-Run lifecycle reads use a run ID only:
+Use the run ID for each lifecycle tool:
 
 ```text
 get_run_status(run_id)
@@ -93,7 +93,7 @@ Launch returns a top-level `run_id`; `get_latest_run` nests it under `run`, and 
 }
 ```
 
-`await_run` defaults to a client-safe 20 seconds and accepts 5 to 600. Its response is the `get_run_status` payload plus `reason`, why the wait returned (`recovery_required`, `terminal`, `phase_completed` when a phase gained a winner, or `timeout`), and `changed`, true when the run state, recovery flag, trial counts or winner presence moved during the wait. Repeat it with the same `run_id` while running, including after `reason: phase_completed`; a phase winner is not terminal completion.
+`await_run` defaults to a client-safe 20 seconds and accepts 5 to 600. Its response is the `get_run_status` payload plus `reason`, why the wait returned (`recovery_required`, `terminal`, `phase_completed` when a phase gained a winner, or `timeout`), and `changed`, true when the run state, recovery flag, trial counts or winner presence moved during the wait. Repeat with the same `run_id` while `run.state` is `running` and `run.recovery_required` is false, including after `reason: phase_completed`. If `run.recovery_required` is true, stop monitoring and report the step in `run.failure.remediation`. Call `get_run_results` when the run is terminal.
 
 `cancel_run` sends SIGTERM to the runner's process group, waits up to 40 seconds, then sends SIGKILL. The wait covers [cleanup of the trial's helpers](runtime.md#timeouts-cleanup-and-continuation). A successful call returns `state`, `cleanup_confirmed` (null for an already terminal run) and `recovery_required`, with a `failure` naming the operator's step when recovery is required. Unconfirmed cleanup returns a tool error with the same [recovery instruction](#run-state-and-recovery) as `get_run_status`. If cancellation cannot stop the runner, the saved remedy [names it](#pid-namespaces). Clear the cause on the host first. A process in uninterruptible I/O ignores SIGKILL until the I/O ends. A runner with no saved process identity, or one that is unobservable with no recorded cleanup failure, is refused without signalling. See [PID namespaces](#pid-namespaces).
 
@@ -112,7 +112,7 @@ The optional last argument is a JSON object of tool arguments and defaults to `{
 
 A `launch_run` call from a shell outside the host's initial PID namespace, such as a sandboxed agent shell, prints a warning: the runner belongs to that namespace and ends when it does, so launch a run that must last from a shell outside any sandbox (see [PID namespaces](#pid-namespaces)).
 
-To wait on a run longer than one `await_run` call allows, repeat the call with the same `run_id` until the run stops running:
+To wait longer than one `await_run` call allows, repeat with the same `run_id` until the run reaches a terminal state or needs recovery:
 
 ```bash
 catalog=/absolute/path/to/catalog.yaml
@@ -205,8 +205,11 @@ Run recovery from an operator shell on the machine that holds the catalog. Confi
 
 With MLflow, recovery checks registered tracking workers before finalizing the snapshot and releasing the slot. If it cannot confirm worker cleanup while reading evidence, looking up a run or sending results, the command fails and leaves the run reserved for another pass, even when the runner wrote a status. After a reboot, the next launch checks the worker during preflight. Confirmation reports delivered and pending MLflow records. See [result delivery and recovery](mlflow.md#result-delivery-and-recovery) for how to send the remainder.
 
+Set `run_id` to the durable ID named in the recovery remedy.
+
 ```bash
-phasesweep mcp recover-run --state-dir /absolute/path/to/phasesweep-mcp-state --run-id <run-id>
+run_id=tiny_lm-0123456789abcdef0123456789abcdef
+phasesweep mcp recover-run --state-dir /absolute/path/to/phasesweep-mcp-state --run-id "$run_id"
 ```
 
 Without `--confirm`, the command only inspects the run and reports the actions it would take. Each inspected trial process group is reported once, identified by its attempt, phase, trial, PID and PGID. The report says whether confirmation would terminate it if still alive, reconcile without signalling, or refuse cleanup. With persistent storage, waiting for an orphaned trainer to exit successfully lets recovery keep its result. The preview says so when confirmation would otherwise terminate it. It names a stored-PGID fallback when the original leader has exited or its PID was reused, and explicitly spares a group whose PGID has been reused by an unrelated leader. An earlier boot or host proof that foreign-namespace processes are absent requires no signal. Confirmation checks the process evidence again before acting. If the runner is still alive, the command refuses and names its PID and process group. Stop it with `cancel_run` if the run should end, or clear the cause on the host when cancellation could not stop it, then repeat the command.

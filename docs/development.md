@@ -174,6 +174,7 @@ Within `phasesweep.engine`, responsibilities map to modules as follows:
 | Trial launch, objective extraction and worker threads | `trial`, `workers` |
 | Samplers and trial identity | `optuna` |
 | Winner selection and repeat groups | `selection`, `repeats` |
+| Feasibility under the configured metric and constraint bounds | `bounds` |
 | Dry-run planning and the live progress report | `preview`, `progress` |
 | Artifact serialization and generation provenance | `artifacts`, `provenance` |
 | Typed engine failures | `errors` |
@@ -182,7 +183,8 @@ Within `phasesweep.engine`, responsibilities map to modules as follows:
 | Locks and stale-attempt cleanup | `locking`, `attempts`, `cleanup` |
 | Root ownership and retained evidence checks | `artifact_roots`, `evidence` |
 | Paths, state records, and fingerprints | `paths`, `state`, `fingerprints` |
-| Which trial directory an attempt runs in: its own, or an interrupted trial's | `trial_dirs` |
+| Trial directory reuse, physical attempt lineage and the shared-evidence cutoff | `trial_dirs` |
+| Filling a study under changed reading settings and reusing sibling attempts | `reread` |
 | Growing a search space in place, and the grid cell order across its recorded spaces | `growth`, `grid_order` |
 | Advisory confound verdicts on the ranked population, frozen at selection | `confound` |
 | Publication and read-only views | `generation`, `publication`, `publication_validation`, `read` |
@@ -198,8 +200,9 @@ flowchart TD
     cli["CLI or detached MCP runner"] --> run["run.run_experiment"]
     run --> preflight["take experiment lock, check and bind artifact root and ledger, preflight attempts"]
     preflight --> phase["phase._run_phase"]
-    phase --> work{"trials to launch?"}
-    work -->|yes| claim["claim the generation once"]
+    phase --> retained["fill from retained evidence and reuse sibling attempts when available"]
+    retained --> work{"trials to launch?"}
+    work -->|yes| claim["pass launch checks and claim the generation once"]
     work -->|no| select
     claim --> optimize["Optuna optimize"]
     optimize --> launch["supervise trainer"]
@@ -207,9 +210,9 @@ flowchart TD
     evidence --> select["select feasible winner"]
     select --> next{"more phases?"}
     next -->|yes| phase
-    next -->|no| changed{"claimed, or winners differ from the publication?"}
+    next -->|no| changed{"claimed, or no matching publication?"}
     changed -->|yes| generation["write immutable generation"]
-    changed -->|no| unchanged["leave both pointers as they were"]
+    changed -->|no| unchanged["make the matching publication current"]
     generation --> pointer["commit last-successful pointer"]
     pointer --> snapshot["freeze MCP terminal result when applicable"]
 ```
@@ -238,7 +241,7 @@ The [durability invariants](invariants.md) identify the code and tests for stora
 - TODO(runtime): During a live run, a dry run can encounter an ongoing extraction and refuse to predict a trial count. Show the phase as awaiting evidence and label its remaining work as an estimate.
 - TODO(runtime): Use the recorded phase's repeat grouping to rebuild its `trials.csv` after recovery with a renamed or incompatible phase. An interrupted in-memory run also needs its final CSV snapshot taken while the settled study is still available.
 - TODO(runtime): Recover draws whose bookkeeping failed before the trainer started. A fatal pre-launch write can currently spend the draw and require a top-up.
-- TODO(runtime): Account for repeated configuration–seed pairs so running the same seed twice does not inflate the pooled noise band's effective sample size.
+- TODO(runtime): Account for repeated configuration-seed pairs so running the same seed twice does not inflate the pooled noise band's effective sample size.
 - TODO(runtime): Recheck process identity in `_signal_members` so PID reuse between enumeration and signalling cannot redirect a signal to another group.
 - TODO(runtime): Withhold edge advice when a restored journal cannot be matched to the population that selected the published winner.
 - TODO(runtime): Reuse the phase trial reads behind `status` when computing winner advisories.

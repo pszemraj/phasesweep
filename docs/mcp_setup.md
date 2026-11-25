@@ -75,13 +75,13 @@ ssh -T HOST /absolute/path/to/phasesweep-mcp --catalog /absolute/path/to/catalog
 
 A relative `--catalog` resolves against the server's working directory, and a bare `phasesweep-mcp` runs only if the session's `PATH` finds it; otherwise the client sees only the connection close. A terminal (`ssh -t`) mixes the server's log lines and echoed input into the protocol stream and breaks it.
 
-`ssh -T HOST printenv PATH LANG` shows these values in the SSH session's environment. To set `PATH` for the server, use `ssh -T HOST env PATH=/absolute/path/to/env/bin:/usr/bin:/bin /absolute/path/to/phasesweep-mcp --catalog /absolute/path/to/catalog.yaml`. If the same study will also be run from a shell on that machine, pin `PATH` and `LANG` under the experiment's `env` instead: the trainer environment is then identical whoever starts the study. `env` is part of the study's identity, so put it in the config before the first trial.
+`ssh -T HOST printenv PATH LANG` shows these values in the SSH session's environment. To set `PATH` for the server, use `ssh -T HOST env PATH=/absolute/path/to/env/bin:/usr/bin:/bin /absolute/path/to/phasesweep-mcp --catalog /absolute/path/to/catalog.yaml`. If you will also run the study from a shell, pin values such as `PATH` and `LANG` under the experiment's `env` before the first trial and make sure the remaining [tracked environment](config.md#trainer-contract) matches across both launch contexts.
 
-To verify, run the check and a dry run through the same SSH form, with the absolute `phasesweep` path rather than the bare command the setup steps print, and the same `env PATH=…` prefix if you use one:
+To verify, use the absolute `phasesweep` path and the same `env PATH=…` prefix if you set one for the server. Start the dry run from the catalog entry's `cwd`, which defaults to the experiment file's directory. An explicit `execution.cwd` still controls the trainer's directory.
 
 ```bash
 ssh -T HOST /absolute/path/to/phasesweep mcp check --catalog /absolute/path/to/catalog.yaml
-ssh -T HOST /absolute/path/to/phasesweep run /absolute/path/to/experiment.yaml --dry-run
+ssh -T HOST 'cd /absolute/path/to/trainer-checkout && /absolute/path/to/phasesweep run /absolute/path/to/experiment.yaml --dry-run'
 ```
 
 The dry run names a missing program when the study still needs trials. Confirm that nothing is printed before the server starts by running `ssh -T HOST true | wc -c`. It must print `0` because output from a shell start-up file corrupts the protocol stream.

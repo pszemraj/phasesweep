@@ -1,6 +1,6 @@
 PhaseSweep runs hyperparameter sweeps on this server's host. The operator owns the catalog and the experiment configs behind it: work only with the experiments `list_experiments` returns, and change a config only when the user asks for config help, starting from `explain_config`.
 
-Each tool's description says when to call it. The loop is `list_experiments`, `inspect_experiment`, `launch_run` once the user authorizes that experiment, `await_run` with the returned `run_id` until the run is terminal, then `get_run_results`.
+Call `list_experiments`, `inspect_experiment`, then `launch_run` once the user authorizes that experiment. Use `await_run` with the returned `run_id` while the run is `running`. Stop monitoring and report the operator step if `run.recovery_required` is true. Call `get_run_results` once the run is terminal.
 
 If `catalog_status.stale` is true, report its `remediation` and pause launches. Use `get_latest_run` to reconnect, keep monitoring by `run_id`, and cancel only at the user's request when permitted. For a run `failure`, report its `remediation` and any retained results.
 
