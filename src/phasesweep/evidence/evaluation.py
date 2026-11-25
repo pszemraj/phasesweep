@@ -1024,7 +1024,7 @@ def _capture_wandb(
             )
             if isinstance(exc, WandbRunMissingError):
                 message = (
-                    f"No W&B run {run_id!r} was found in {source.entity}/{source.project} "
+                    f"No W&B run {run_id!r} was found in {destination.entity}/{destination.project} "
                     "at the evidence deadline. The trainer should call wandb.init() without "
                     "its own project, entity or id."
                 )

@@ -757,3 +757,27 @@ def test_a_deadline_verdict_cut_short_by_the_phase_is_an_interruption(
         run_extractor(make_trial_context(tmp_path), extractor, deadline=deadline)
     assert type(caught.value) is (DeadlineExceededError if capped else ExtractorError)
     assert re.search(r"after 9 s", str(caught.value))
+
+
+def test_a_missing_run_names_the_project_the_attempt_logged_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The missing-run message names the destination recorded at launch, not the configured project a reading study has since changed to."""
+    from phasesweep.evidence import wandb as wandb_evidence
+
+    def poll(**kwargs: object) -> dict[str, object]:
+        assert kwargs["project"] == "recorded"
+        raise wandb_evidence.WandbRunMissingError("opener")
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", poll)
+    extractor = WandbExtractor(type="wandb", entity="e", project="configured", metric_key=_KEY)
+    recorded = extractor.destination._replace(project="recorded")
+    context = replace(
+        make_trial_context(tmp_path), baseline=EvidenceBaseline(False, {}, None, recorded)
+    )
+    with pytest.raises(ExtractorError) as caught:
+        run_extractor(context, extractor)
+    assert str(caught.value).startswith(
+        "No W&B run 'attempt-test' was found in e/recorded at the evidence deadline."
+    )
+    assert "configured" not in str(caught.value)
