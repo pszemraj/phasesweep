@@ -41,6 +41,7 @@ from phasesweep.evidence.models import WandbSummaryRequiredGate
 from phasesweep.tracking.models import MlflowSettings
 from tests.conftest import (
     make_experiment,
+    phase_study,
     stamped_environment_attrs,
     study_name,
     study_with_stamped_environment,
@@ -116,7 +117,8 @@ def _refusal(study: optuna.Study, current: EnvironmentIdentity) -> str:
             {},
             {"PATH": "/usr/bin:/opt/first/bin"},
             [],
-            "Compared with trial 0: PATH: the same entries in another order.",
+            "Compared with trial 0: PATH: the same entries in another order "
+            '(recorded "/opt/first/bin:/usr/bin").',
             id="reordered-path",
         ),
         pytest.param(
@@ -588,9 +590,11 @@ def test_a_real_run_records_the_mapping_and_a_changed_tz_is_refused(
     assert 'Compared with trial 0: TZ "Europe/Berlin" -> "Asia/Tokyo".' in str(caught.value)
 
 
-def _two_phase_study(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Experiment:
-    """Run two phases of two trials each, and return the experiment that ran them."""
-    monkeypatch.setenv("PATH", _REAL_PATH)
+def _two_phase_study(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str = _REAL_PATH
+) -> Experiment:
+    """Run two phases of two trials each under ``PATH=path``, and return the experiment."""
+    monkeypatch.setenv("PATH", path)
     phases = [
         Phase(
             name=name,
@@ -646,3 +650,34 @@ def test_two_lowered_targets_carry_both_steps_in_a_run_and_a_dry_run(
         "Set phases[a].n_trials to at least 2. Set phases[b].n_trials to at least 2."
     )
     assert _operational_error_text(caught.value).endswith(f"\nfix: {caught.value.remediation}")
+
+
+@pytest.mark.integration
+def test_a_path_that_only_dropped_repeated_entries_continues_the_study(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A top-up under the first run's ``PATH`` without its repeated entries runs the new trial."""
+    experiment = _two_phase_study(tmp_path, monkeypatch, path=f"{_REAL_PATH}:{_REAL_PATH}")
+    monkeypatch.setenv("PATH", _REAL_PATH)
+
+    run_experiment(_with_targets(experiment, 3))
+
+    assert len(phase_study(experiment, "a").get_trials(deepcopy=False)) == 3
+    assert len(phase_study(experiment, "b").get_trials(deepcopy=False)) == 3
+
+
+def test_a_path_in_another_order_is_refused_with_the_recorded_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Order decides which entry a lookup finds first, so it stays a difference, and the message restores it."""
+    monkeypatch.setenv("PATH", "/opt/a/bin:/usr/bin:/opt/a/bin:/opt/b/bin")
+    experiment = make_experiment()
+    study = study_with_stamped_environment(_identity(experiment))
+    monkeypatch.setenv("PATH", "/usr/bin:/opt/a/bin:/opt/b/bin")
+
+    message = _refusal(study, _identity(experiment))
+
+    assert (
+        "PATH: the same entries in another order "
+        '(recorded "/opt/a/bin:/usr/bin:/opt/b/bin").' in message
+    )

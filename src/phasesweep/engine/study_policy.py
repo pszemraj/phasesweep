@@ -71,7 +71,12 @@ from phasesweep.engine.state import (
     _unique_trial_outcomes,
     _unreplaced_attempts,
 )
-from phasesweep.engine.trial import EnvironmentIdentity, _environment_identity, _missing_trainer_cwd
+from phasesweep.engine.trial import (
+    EnvironmentIdentity,
+    _environment_identity,
+    _is_search_path,
+    _missing_trainer_cwd,
+)
 from phasesweep.errors import (
     FRESH_STUDY,
     OTHER_FORMAT_STEP,
@@ -1311,7 +1316,7 @@ def _environment_entries(old: dict[str, str], new: dict[str, str]) -> list[_Envi
                     name, f"removed {name} (was {_render_value(before)})", recorded=True
                 )
             )
-        elif name.endswith("PATH") and isinstance(before, str) and isinstance(after, str):
+        elif _is_search_path(name) and isinstance(before, str) and isinstance(after, str):
             changed.append(
                 _EnvironmentChange(
                     name, f"{name}: {_path_list_difference(before, after)}", recorded=True
@@ -1327,12 +1332,17 @@ def _environment_entries(old: dict[str, str], new: dict[str, str]) -> list[_Envi
 
 
 def _path_list_difference(before: str, after: str) -> str:
-    """Name the entries two search-path lists do not share, or how the shared ones moved.
+    """Name the entries two search-path lists do not share, or show the recorded order.
+
+    Both values come from :func:`phasesweep.engine.trial._environment_identity`, which keeps
+    each entry once, so lists with the same entries differ only in order. Order decides which
+    entry a lookup finds first, and the entries alone do not say how to restore it, so that
+    case shows the recorded value whole.
 
     :param str before: Recorded value.
     :param str after: Current value.
     :return str: ``only recorded: a, b; only current: c``, with a side left out when it has
-        none, or for equal entries whether their order or their repeats changed.
+        none, or the recorded value for the same entries in another order.
     """
     recorded, current = before.split(os.pathsep), after.split(os.pathsep)
     parts = [
@@ -1345,9 +1355,7 @@ def _path_list_difference(before: str, after: str) -> str:
     ]
     if parts:
         return "; ".join(parts)
-    if sorted(recorded) == sorted(current):
-        return "the same entries in another order"
-    return "the same entries, repeated differently"
+    return f"the same entries in another order (recorded {_render_value(before)})"
 
 
 def _describe_environment_changes(old: dict[str, str], new: dict[str, str]) -> str:

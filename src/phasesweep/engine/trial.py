@@ -242,6 +242,27 @@ class EnvironmentIdentity:
     values: dict[str, str]
 
 
+def _is_search_path(name: str) -> bool:
+    """Tell whether an environment variable holds a list of directories to search.
+
+    :param str name: Variable name.
+    :return bool: Whether the name ends in ``PATH``, as ``PATH`` and ``PYTHONPATH`` do.
+    """
+    return name.endswith("PATH")
+
+
+def _without_repeated_entries(value: str) -> str:
+    """Drop each later repeat of an entry in a search-path list, keeping order.
+
+    A lookup stops at the first entry that has the program or module, so a later repeat of an
+    entry never changes what resolves. Order and empty entries are kept: both can.
+
+    :param str value: Search-path value, entries joined by ``os.pathsep``.
+    :return str: The value with each entry at its first occurrence only.
+    """
+    return os.pathsep.join(dict.fromkeys(value.split(os.pathsep)))
+
+
 def _environment_identity(
     experiment: Experiment,
     phase_name: str,
@@ -254,7 +275,9 @@ def _environment_identity(
     bindings. Exclude pass-through values and per-trial bindings; explicit env entries
     remain semantic even when they reuse a pass-through name. Under ``inherit_env: all``,
     other ambient values reach the trainer without entering the cohort. Hash compact
-    JSON name/value pairs sorted by name. Each allocated trial records the mapping and
+    JSON name/value pairs sorted by name, with each search-path list (a name ending in
+    ``PATH``) cut to the first occurrence of each entry, so a shell that appends a directory
+    twice does not start another cohort. Each allocated trial records the mapping and
     digest; populated studies must match before allocation.
 
     :param Experiment experiment: Experiment supplying the environment contract.
@@ -309,7 +332,7 @@ def _environment_identity(
             env["MLFLOW_EXPERIMENT_NAME"] = str(experiment.mlflow.experiment_name)
     passthrough = frozenset(experiment.execution.effective_passthrough_env()) - set(experiment.env)
     tracked = {
-        name: value
+        name: _without_repeated_entries(value) if _is_search_path(name) else value
         for name, value in sorted(env.items())
         if name in cohort_names and name not in passthrough
     }
