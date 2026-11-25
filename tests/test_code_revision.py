@@ -17,7 +17,8 @@ from click.testing import CliRunner
 
 from phasesweep import run_experiment
 from phasesweep.cli import cli
-from phasesweep.config.models import ExecutionContext, Experiment
+from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
+from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_dir,
@@ -26,11 +27,13 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.provenance import _code_revision
 from phasesweep.engine.selection import _ranked_code_revisions, _ranked_revision_sources
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
     REPRODUCIBILITY_SCHEMA_VERSION,
     RERUN_OF_ATTR,
     TRIAL_DIR_ATTR,
 )
+from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
@@ -334,7 +337,12 @@ def test_ranked_revision_sources_read_every_generation_in_the_rerun_chain(tmp_pa
     study = optuna.create_study()
     study.add_trial(
         optuna.trial.create_trial(
-            state=failed, user_attrs={GENERATION_ID_ATTR: "opener", TRIAL_DIR_ATTR: directory}
+            state=failed,
+            user_attrs={
+                GENERATION_ID_ATTR: "opener",
+                ATTEMPT_ID_ATTR: "opener",
+                TRIAL_DIR_ATTR: directory,
+            },
         )
     )
     study.add_trial(
@@ -345,14 +353,97 @@ def test_ranked_revision_sources_read_every_generation_in_the_rerun_chain(tmp_pa
     study.add_trial(
         optuna.trial.create_trial(
             state=failed,
-            user_attrs={GENERATION_ID_ATTR: "rerun", RERUN_OF_ATTR: 1, TRIAL_DIR_ATTR: directory},
+            user_attrs={
+                GENERATION_ID_ATTR: "rerun",
+                ATTEMPT_ID_ATTR: "rerun",
+                RERUN_OF_ATTR: 1,
+                TRIAL_DIR_ATTR: directory,
+            },
         )
     )
-    study.add_trial(optuna.trial.create_trial(value=0.5, user_attrs={RERUN_OF_ATTR: 2}))
+    study.add_trial(
+        optuna.trial.create_trial(
+            value=0.5,
+            user_attrs={
+                GENERATION_ID_ATTR: "final",
+                ATTEMPT_ID_ATTR: "final",
+                RERUN_OF_ATTR: 2,
+                TRIAL_DIR_ATTR: directory,
+            },
+        )
+    )
     study.add_trial(optuna.trial.create_trial(value=0.6))
     trials = study.get_trials(deepcopy=False)
 
-    assert _ranked_revision_sources(trials, trials[3:]) == {3: ["opener", "rerun"]}
+    assert _ranked_revision_sources(study, trials, trials[3:]) == {3: ["opener", "rerun"]}
+
+
+def test_ranked_revision_sources_include_sibling_checkpoint_writers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selection records the revision that produced a checkpoint in a sibling reading study."""
+    stage = tmp_path / "stage"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse
+        import os
+        from pathlib import Path
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--x", type=int)
+        args, _ = ap.parse_known_args()
+        checkpoint = Path(os.environ["PHASESWEEP_TRIAL_DIR"]) / "checkpoint"
+        stage = Path({str(stage)!r}).read_text()
+        if stage == "1" and args.x == 2:
+            print("first=0.9")
+            print("second=0.9")
+        elif stage == "2" and args.x == 1:
+            checkpoint.write_text("sibling checkpoint")
+            print("second=0.1")
+        elif stage == "3" and args.x == 1:
+            assert checkpoint.read_text() == "sibling checkpoint"
+            print("first=0.2")
+        """,
+    )
+    phase = Phase(
+        name="p",
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
+    )
+    for revision, key, target, expected in (
+        ("1", "first", 2, 0.9),
+        ("2", "second", 3, 0.1),
+        ("3", "first", 3, 0.2),
+    ):
+        stage.write_text(revision)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                "phasesweep.engine.provenance._code_revision",
+                lambda _, commit=revision: {"commit": commit * 40, "dirty": False},
+            )
+            experiment = make_experiment(
+                persistent=tmp_path,
+                trainer=trainer,
+                metric=Metric(
+                    extractor=LogRegexExtractor(
+                        type="log_regex", pattern=key + r"=(?P<value>[0-9.]+)"
+                    )
+                ),
+                phases=[phase.model_copy(update={"n_trials": target})],
+            )
+            winner = run_experiment(experiment)["p"]
+        assert winner.metric == expected
+
+    assert winner.confound is not None
+    check = winner.confound["checks"]["code_revision"]
+    assert check["verdict"] == "heterogeneous"
+    assert [entry["commit"] for entry in check["detail"]["generations"]] == [
+        "1" * 40,
+        "2" * 40,
+        "3" * 40,
+    ]
 
 
 @pytest.mark.integration

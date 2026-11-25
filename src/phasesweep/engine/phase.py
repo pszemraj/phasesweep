@@ -36,7 +36,6 @@ from phasesweep.engine.errors import (
     tracker_unreadable,
 )
 from phasesweep.engine.evidence import (
-    _earlier_attempts,
     _preserve_shared_measurements,
     _shared_measurements,
     _SharedMeasurement,
@@ -135,7 +134,7 @@ from phasesweep.engine.trial import (
     record_trial_result,
     trial_run_name,
 )
-from phasesweep.engine.trial_dirs import _trial_dir_for_attempt
+from phasesweep.engine.trial_dirs import _trial_dir_for_attempt, earlier_directory_launches
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import (
     ABORT_START_AGAIN_STEP,
@@ -1020,7 +1019,9 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         )
         reusing_directory = directory.opener_number != trial.number
         earlier_attempts = (
-            _earlier_attempts(trials, trials[trial.number]) if reusing_directory else ()
+            earlier_directory_launches((run.study, *run.other_studies), directory.path)
+            if reusing_directory
+            else ()
         )
     except PhaseSweepError as exc:
         # Unconfirmed cleanup or a directory that cannot be inspected stops the launch.

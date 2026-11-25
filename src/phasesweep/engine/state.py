@@ -579,7 +579,10 @@ def _unique_trial_outcomes(
 
 
 def _completed_trainer_duration(
-    trial: FrozenTrial | Trial, lifecycle: AttemptLifecycle | None
+    trial: FrozenTrial | Trial,
+    lifecycle: AttemptLifecycle | None,
+    *,
+    rechecking_evidence: bool = False,
 ) -> float | None:
     """Return completed trainer time without confusing SDK worker exits with trainer exits.
 
@@ -589,10 +592,19 @@ def _completed_trainer_duration(
 
     :param FrozenTrial | Trial trial: Trial carrying trainer exit attributes, when committed.
     :param AttemptLifecycle | None lifecycle: Current process-slot evidence, or None to require trainer ledger attributes.
+    :param bool rechecking_evidence: A committed outcome can record an extraction failure
+        after a successful trainer exit. Count that trainer for a re-read, but skip a trainer
+        interrupted by its per-trial timeout, even if it exited cleanly on termination.
     :return float | None: Successful trainer duration, or None when exit evidence is incomplete or invalid.
     """
     if FAILURE_REASON_ATTR in trial.user_attrs:
-        return None
+        from phasesweep.runtime.process import TIMEOUT_REASON_PREFIX
+
+        reason = trial.user_attrs[FAILURE_REASON_ATTR]
+        if not rechecking_evidence or (
+            isinstance(reason, str) and reason.startswith(TIMEOUT_REASON_PREFIX)
+        ):
+            return None
     record = lifecycle if lifecycle is not None and lifecycle.ended_by == "trainer" else None
     return_code = trial.user_attrs.get(
         RETURN_CODE_ATTR, None if record is None else record.return_code

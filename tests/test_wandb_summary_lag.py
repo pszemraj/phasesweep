@@ -16,16 +16,108 @@ from types import SimpleNamespace
 import pytest
 
 from phasesweep import run_experiment
+from phasesweep.config.models import Experiment, Metric
 from phasesweep.engine.errors import TrackingTargetUnavailableError
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import ATTEMPT_ID_ATTR
 from phasesweep.evidence.evaluation import DeadlineExceededError, ExtractorError, run_extractor
 from phasesweep.evidence.mlflow import merge_histories, select_observation
 from phasesweep.evidence.models import MlflowExtractor, WandbExtractor
-from tests.conftest import make_trial_context, phase_trials
+from tests.conftest import make_experiment, make_trial_context, phase_trials, write_trainer
 from tests.tracking_helpers import ManualClock, switchable_wandb, wandb_objective_experiment
 
 _LAUNCHED_AT = 1_000.0
 _KEY = "eval/loss.min"
+
+
+def test_sibling_retry_replaces_tracker_history_before_recovery_and_reread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An attempt uses every earlier checkpoint writer's history across reading studies."""
+    from phasesweep.evidence import evaluation, wandb
+
+    launches, history = tmp_path / "launches", tmp_path / "history"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import json, os, time
+        from pathlib import Path
+        launches, history = Path({str(launches)!r}), Path({str(history)!r})
+        attempt = len(launches.read_text().splitlines()) if launches.exists() else 0
+        with launches.open("a") as log:
+            log.write(os.environ["WANDB_RUN_ID"] + "\\n")
+        rows = json.loads(history.read_text()) if history.exists() else []
+        points = [[(100, 0.20), (300, 0.01)], [(200, 0.40)], [(400, 0.90)]][attempt]
+        for progress, loss in points:
+            rows.append({{"_step": len(rows), "_timestamp": time.time(), "eval/step": progress,
+                          "eval/loss": loss}})
+        history.write_text(json.dumps(rows))
+        raise SystemExit(1 if attempt < 2 else 0)
+        """,
+    )
+
+    def config(key: str, target: int, *, maximize: bool = False) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            trainer=trainer,
+            metric=Metric(
+                goal="maximize" if maximize else "minimize",
+                extractor=WandbExtractor(
+                    type="wandb",
+                    entity="e",
+                    project="p",
+                    base_url="https://example.test",
+                    metric_key=key,
+                    evaluation_axis="eval/step",
+                    poll_seconds=0.01,
+                    timeout_seconds=2,
+                ),
+            ),
+            n_trials=target,
+            search_space={},
+            gpu_policy="none",
+        )
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(config(_KEY, 1))
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(config("eval/loss.max", 2))
+
+    earlier_counts: list[int] = []
+
+    def capture(**options: object) -> dict[str, object]:
+        epochs = options["earlier_launches"]
+        assert isinstance(epochs, tuple)
+        earlier_counts.append(len(epochs))
+        if len(earlier_counts) == 1:
+            run_id = options["run_id"]
+            assert isinstance(run_id, str)
+            raise wandb.WandbPollTimeout(run_id, 2, reached=False)
+        rows = tuple(json.loads(history.read_text()))
+        last = len(rows) - 1
+        summary = {"_step": last, "_timestamp": rows[-1]["_timestamp"], _KEY: 0.01}
+        after = options["logged_after"]
+        assert isinstance(after, float)
+        with monkeypatch.context() as sdk:
+            _serve(sdk, lambda _: ("finished", summary, last), rows=rows)
+            return _poll(
+                logged_after=after,
+                logged_before=options.get("logged_before"),
+                earlier_launches=epochs,
+                resume_axis="eval/step",
+            )
+
+    monkeypatch.setattr(evaluation, "poll_wandb_summary", capture)
+    monkeypatch.setattr(evaluation, "locate_wandb_position", lambda **_: 100)
+    returned = config(_KEY, 2)
+    with pytest.raises(TrackingTargetUnavailableError):
+        run_experiment(returned)
+    assert run_experiment(returned)["p"].metric == pytest.approx(0.20)
+    assert run_experiment(config(_KEY, 2, maximize=True))["p"].metric == pytest.approx(0.20)
+    assert earlier_counts == [1, 1, 1]
+    assert len(launches.read_text().splitlines()) == 3
+    assert len(set(launches.read_text().splitlines())) == 1
+
 
 Answer = tuple[str, dict[str, object], int | None]
 """A run's state, its summary, and its history index's last step in the same answer.

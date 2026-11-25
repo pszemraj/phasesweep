@@ -33,8 +33,13 @@ from phasesweep.engine.confound import (
     _params_text,
 )
 from phasesweep.engine.errors import TrialEvidenceMissingError, WinnerIntegrityError
-from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
+from phasesweep.engine.evidence import (
+    _earlier_attempts,
+    _selection_candidate_identity,
+    _trial_objective_provenance,
+)
 from phasesweep.engine.growth import STANDALONE_PHASE, _grid_kind
+from phasesweep.engine.ledger import phase_studies_for
 from phasesweep.engine.optuna import (
     _any_objective_unreadable,
     _any_trial_timed_out,
@@ -64,12 +69,13 @@ from phasesweep.engine.state import (
     GATES_ATTR,
     GENERATION_ID_ATTR,
     OBSERVED_PREFIX,
+    RERUN_OF_ATTR,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
     TRIAL_DIR_ATTR,
     Winner,
-    _unreplaced_attempts,
+    _recorded_trial_dir,
     _validate_observed_block,
     constraint_attr,
 )
@@ -83,7 +89,12 @@ from phasesweep.engine.study_policy import (
     _recovery_advice,
     _replayed_streak_abort,
 )
-from phasesweep.engine.trial_dirs import _rerun_directory_sources
+from phasesweep.engine.trial_dirs import (
+    directory_history,
+    directory_launches,
+    producing_attempts,
+    standing_repeat_attempts,
+)
 from phasesweep.errors import (
     REJUDGE_BOUNDS_STEP,
     STORAGE_NULL_KEEPS_NOTHING,
@@ -513,7 +524,7 @@ def select_winner(
     phase = next((phase for phase in experiment.phases if phase.name == phase_name), None)
     untried_cells = _untried_grid_cells(phase, trials)
     extractor = experiment.metric.extractor
-    revision_sources = _ranked_revision_sources(trials, survivors)
+    revision_sources = _ranked_revision_sources(study, trials, survivors)
     confound = _assess_population(
         trials,
         survivors,
@@ -813,12 +824,9 @@ def _rank_groups(
     """Group a repeats phase's trials by configuration and keep the complete groups.
 
     A group is complete when it holds one trial per repeat value and every one
-    of them is eligible (:func:`_eligible`). Only the attempts that stand for
-    their cell join a group (:func:`~phasesweep.engine.state._unreplaced_attempts`):
-    an interrupted trial's rerun takes its place, in the same group because it has
-    the same draw position, and a failed grid member replaced by a retry leaves its
-    group to that replacement. Trials that never recorded the repeat param belong
-    to no group.
+    of them is eligible (:func:`_eligible`). Each draw stands in the group through its latest
+    measurement, including one recovered by re-reading an attempt before an unsuccessful retry.
+    Trials that never recorded the repeat param belong to no group.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the phase study.
     :param Experiment experiment: Parsed experiment; supplies the eligibility bounds.
@@ -828,7 +836,7 @@ def _rank_groups(
     """
     by_key: dict[str, list[optuna.trial.FrozenTrial]] = {}
     draw_positions = _draw_positions(trials)
-    for trial in _unreplaced_attempts(trials, interrupted=False):
+    for trial in standing_repeat_attempts(trials):
         if axis.key in trial.params:
             key = group_key(draw_positions[trial.number], trial.params, axis)
             by_key.setdefault(key, []).append(trial)
@@ -928,33 +936,43 @@ def _observed_values(trial: optuna.trial.FrozenTrial, *, subject: str) -> dict[s
 
 
 def _ranked_revision_sources(
-    trials: Sequence[optuna.trial.FrozenTrial], ranked: Sequence[optuna.trial.FrozenTrial]
+    study: optuna.Study,
+    trials: Sequence[optuna.trial.FrozenTrial],
+    ranked: Sequence[optuna.trial.FrozenTrial],
 ) -> dict[int, list[str]]:
     """Find the earlier generations that may have trained in each ranked trial's directory.
 
-    Every ancestor back to the attempt that opened the same directory
-    (:func:`~phasesweep.engine.trial_dirs._rerun_directory_sources`) and recorded a generation counts.
-    One that never launched its trainer may add a revision that trained nothing, which the
-    check's "may have trained" wording covers.
+    The physical launch order includes sibling reading studies that reused the same
+    directory and excludes launches after the ranked attempt.
 
+    :param optuna.Study study: The study that ranks the trials.
     :param Sequence[optuna.trial.FrozenTrial] trials: The phase's full trial history.
     :param Sequence[optuna.trial.FrozenTrial] ranked: The trials eligible for selection.
     :return dict[int, list[str]]: Possible contributing generations per ranked trial, oldest first.
     """
     sources: dict[int, list[str]] = {}
-    if len(ranked) < 2:
+    reruns = [trial for trial in ranked if RERUN_OF_ATTR in trial.user_attrs]
+    if len(ranked) < 2 or not reruns:
         return sources
     by_number = {trial.number: trial for trial in trials}
-    for trial in ranked:
-        generations: list[str] = []
+    launches = directory_launches(producing_attempts(phase_studies_for(study)))
+    for trial in reruns:
         # A malformed ancestor must not turn a code revision advisory into a refusal.
-        with contextlib.suppress(ProcessCleanupUncertainError):
-            for source in _rerun_directory_sources(by_number, trial):
-                generation = source.user_attrs.get(GENERATION_ID_ATTR)
-                if isinstance(generation, str) and generation:
-                    generations.append(generation)
-        if generations:
-            sources[trial.number] = generations[::-1]
+        with contextlib.suppress(ProcessCleanupUncertainError, ValueError):
+            directory = _recorded_trial_dir(trial)
+            attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+            if directory is None or not isinstance(attempt_id, str):
+                continue
+            candidates = launches.get(directory.name, ())
+            epoch = next((item.epoch for item in candidates if item.attempt_id == attempt_id), None)
+            earlier = directory_history(
+                candidates,
+                attempt_id=attempt_id,
+                launched_at=epoch,
+                ancestors=_earlier_attempts(by_number, trial),
+            ).earlier
+            if earlier:
+                sources[trial.number] = [generation for generation, _ in earlier]
     return sources
 
 

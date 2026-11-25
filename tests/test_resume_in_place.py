@@ -711,7 +711,11 @@ def test_tracking_and_code_revision_ancestry_stop_at_the_directory_opener(tmp_pa
     assert _earlier_attempts(trials, trials[1]) == ()
     assert _earlier_attempts(trials, trials[2]) == (("g1", "a1"),)
     assert _earlier_attempts(trials, trials[4]) == (("g1", "a1"), ("g2", "a2"))
-    assert _ranked_revision_sources(list(trials.values()), [trials[1], trials[2]]) == {2: ["g1"]}
+    study = optuna.create_study()
+    study.add_trials(trials.values())
+    assert _ranked_revision_sources(study, list(trials.values()), [trials[1], trials[2]]) == {
+        2: ["g1"]
+    }
     assert _trial_dir_for_attempt(
         experiment, "p", trials, trials[4], attempt_id="a4", recovered=frozenset({2})
     ) == TrialDirectory(fresh, 1, "a1")

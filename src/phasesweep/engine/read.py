@@ -113,7 +113,6 @@ from phasesweep.engine.state import (
     _recorded_identity,
     _recorded_trial_dir,
     _stands_under_winner,
-    _unreplaced_attempts,
     _validate_observed_block,
     _winning_trials,
 )
@@ -122,6 +121,7 @@ from phasesweep.engine.study_policy import (
     _load_accepted_partial_decision,
     _load_phase_policy_state,
 )
+from phasesweep.engine.trial_dirs import standing_repeat_attempts
 from phasesweep.errors import (
     PERSISTENT_STUDY_KEEPS_TRIALS,
     START_AGAIN_STEP,
@@ -806,8 +806,9 @@ def read_status(
     determine ``published_config_matches_current`` against the producing phase prefix,
     or ``None`` if no fingerprint exists. Appended phases do not change that agreement.
 
-    ``generation_trials`` counts ``trial_generation_id`` when given, else the pinned
-    generation, else the current generation; other counts are cumulative. Counts and ``running_attempts`` share one storage capture.
+    ``generation_trials`` counts the attempts launched by ``trial_generation_id`` when given,
+    else the pinned generation, else the current generation. Cumulative counts describe the
+    addressed study. Counts and ``running_attempts`` share one storage capture.
     Absent studies have zero counts; unreadable storage sets ``trial_data_available=False``
     and ``running_attempts=None``. ``published_study_unavailable`` marks missing/replaced
     trial identities or incomplete history when readable, otherwise incomplete inspection.
@@ -1724,7 +1725,7 @@ def _repeat_group_views(
     labels = group_labels_for(trials, axis)
     ranking = _rank_groups(trials, experiment, axis)
     eligible = {labels[group.representative]: group for group in ranking.groups}
-    standing = {trial.number for trial in _unreplaced_attempts(trials, interrupted=False)}
+    standing = {trial.number for trial in standing_repeat_attempts(trials)}
     marked = {row["trial"] for row in rows if row["winner"] == "*"}
     members: dict[int, list[optuna.trial.FrozenTrial]] = {}
     params: dict[int, JsonObject] = {}
@@ -1857,12 +1858,13 @@ def read_trial_tables(
         if refusal is None:
             refusal, pruned = _status_evidence(experiment, phase, study)
         identity = _recorded_identity(study)
+        winner = winners.get(phase.name)
         tables.append(
             _trial_table(
                 experiment,
                 phase,
                 study.get_trials(deepcopy=False),
-                winners.get(phase.name),
+                winner if winner is not None and winner.study_name == study.study_name else None,
                 refusal=refusal,
                 growth=() if identity is None else recorded_growth(identity),
                 pruned=pruned,

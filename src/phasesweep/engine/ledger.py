@@ -66,7 +66,6 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
-    _recorded_identity,
     _recovered_trial_state,
     _study_schema_supported,
     _unique_trial_outcomes,
@@ -567,11 +566,11 @@ def _repair_incomplete_journal_record(storage_url: str) -> None:
 
 
 def _load_snapshot_study(
-    storage: JournalStorage | optuna.storages.InMemoryStorage, study_name: str
+    storage: optuna.storages.BaseStorage, study_name: str
 ) -> optuna.Study | None:
-    """Load and schema-check a snapshot study, returning only confirmed absence.
+    """Load and schema-check a study, returning only confirmed absence.
 
-    :param JournalStorage | optuna.storages.InMemoryStorage storage: Captured or invocation-local storage.
+    :param optuna.storages.BaseStorage storage: Captured or invocation-local storage.
     :param str study_name: Named study to inspect.
     :return optuna.Study | None: Existing study, or ``None`` when its name is absent.
     :raises StudyStorageUnavailableError: The study or its trials could not be read.
@@ -766,33 +765,32 @@ def _published_history_retained(
     )
 
 
-def _phase_trial_stats(study: optuna.Study | None, experiment: Experiment) -> _PhaseTrialStats:
-    """Read one captured study's counts and RUNNING identities.
+def _phase_trial_stats(
+    study: optuna.Study | None, experiment: Experiment, studies: tuple[optuna.Study, ...]
+) -> _PhaseTrialStats:
+    """Read the addressed study's progress and count each generation's producing rows.
 
-    Counts and RUNNING identities come from one snapshot, so they describe the same moment.
-    An absent study reports available zero counts.
+    Counts and RUNNING identities come from one capture. An absent addressed study has no
+    progress, but the ledger may still hold another study's attempts for the requested run.
 
     :param optuna.Study | None study: The phase's addressed study from the snapshot, if any.
     :param Experiment experiment: Config whose bounds judge the measured trials.
-    :return _PhaseTrialStats: The study's available counts and identities.
+    :param tuple[optuna.Study, ...] studies: Every study of the phase from that snapshot.
+    :return _PhaseTrialStats: Counts and identities from that snapshot.
     """
-    if study is None:
-        return _PhaseTrialStats({}, True, {}, [])
-    study_name = study.study_name
-    trials = study.get_trials(deepcopy=False)
+    from phasesweep.engine.trial_dirs import producing_attempts
+
+    trials = [] if study is None else study.get_trials(deepcopy=False)
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_TrialRef] = []
-    outcomes = _unique_trial_outcomes(study_name, trials)
+    outcomes = {} if study is None else _unique_trial_outcomes(study.study_name, trials)
     for trial in trials:
         state = _trial_count_state(trial, experiment)
         counts[state] = counts.get(state, 0) + 1
-        generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
-        if isinstance(generation_id, str):
-            states = generation_counts.setdefault(generation_id, {})
-            states[state] = states.get(state, 0) + 1
         if trial.state.name != "RUNNING":
             continue
+        generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
         attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
         running_attempts.append(
             _TrialRef(
@@ -802,7 +800,16 @@ def _phase_trial_stats(study: optuna.Study | None, experiment: Experiment) -> _P
                 recovers_as=_recovered_trial_state(trial, outcomes.get(trial.number)),
             )
         )
-    return _PhaseTrialStats(counts, True, generation_counts, running_attempts)
+    owned = [owner.trial for owner in producing_attempts(studies).values()]
+    # A live allocation stamps its generation before its attempt ID.
+    owned.extend(trial for trial in trials if ATTEMPT_ID_ATTR not in trial.user_attrs)
+    for trial in owned:
+        generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
+        if isinstance(generation_id, str):
+            state = _trial_count_state(trial, experiment)
+            states = generation_counts.setdefault(generation_id, {})
+            states[state] = states.get(state, 0) + 1
+    return _PhaseTrialStats(counts, True, generation_counts, running_attempts, studies=studies)
 
 
 def resolved_ledger_path(experiment: Experiment) -> Path | None:
@@ -880,14 +887,13 @@ def validate_ledger(experiment: Experiment) -> ValidatedLedger:
 
 
 def _phase_study_names(
-    storage: JournalStorage | optuna.storages.InMemoryStorage,
+    storage: optuna.storages.BaseStorage,
     experiment_name: str,
     phase_name: str,
 ) -> list[str]:
     """List every study of one phase in captured storage, oldest first.
 
-    :param JournalStorage | optuna.storages.InMemoryStorage storage: Captured or
-        invocation-local storage.
+    :param optuna.storages.BaseStorage storage: Captured or invocation-local storage.
     :param str experiment_name: The experiment's name.
     :param str phase_name: The phase's name.
     :return list[str]: The phase's study names, whatever values each was addressed by.
@@ -905,6 +911,20 @@ def _phase_study_names(
         for study in studies
         if _belongs_to_phase(study.study_name, experiment_name, phase_name)
     ]
+
+
+def phase_studies_for(study: optuna.Study) -> tuple[optuna.Study, ...]:
+    """Open sibling studies from the exact storage already holding a study.
+
+    :param optuna.Study study: Known study in a live or captured ledger.
+    :raises StudyStorageUnavailableError: The storage could not be replayed.
+    :return tuple[optuna.Study, ...]: Every study of the same phase, including this study.
+    """
+    experiment, _, addressed = study.study_name.partition("::")
+    phase, address_separator, _ = addressed.partition("::")
+    if not address_separator:
+        return (study,)
+    return _phase_studies(study._storage, experiment, phase, addressed=study)
 
 
 def open_existing_studies(ledger: ValidatedLedger, phase_name: str) -> list[optuna.Study]:
@@ -960,32 +980,27 @@ def repair_incomplete_journal_record(ledger: ValidatedLedger) -> None:
     _repair_incomplete_journal_record(ledger.storage_url)
 
 
-def _fill_candidates(
-    snapshot: JournalStorage | optuna.storages.InMemoryStorage,
+def _phase_studies(
+    storage: optuna.storages.BaseStorage,
     experiment_name: str,
     phase_name: str,
-    addressed: optuna.Study | None,
+    *,
+    addressed: optuna.Study | None = None,
 ) -> tuple[optuna.Study, ...]:
-    """Give a status read the studies that tell whether a phase waits for a fill.
+    """Load all studies of a phase from one storage, reusing the addressed view if supplied.
 
-    A study that records its identity is filled or bound, so only an addressed study without
-    one needs the phase's other studies (:func:`phasesweep.engine.reread.pending_reread`).
-
-    :param JournalStorage | optuna.storages.InMemoryStorage snapshot: The read's one capture.
+    :param optuna.storages.BaseStorage storage: A read's captured ledger or a live study's storage.
     :param str experiment_name: The experiment.
     :param str phase_name: The phase.
-    :param optuna.Study | None addressed: The phase's addressed study, already loaded.
-    :return tuple[optuna.Study, ...]: The addressed study alone when it records an identity,
-        otherwise every study of the phase, oldest first, the addressed one not reloaded.
+    :param optuna.Study | None addressed: The phase's addressed study, if already loaded.
+    :return tuple[optuna.Study, ...]: Every study of the phase, oldest first.
     """
-    if addressed is not None and _recorded_identity(addressed) is not None:
-        return (addressed,)
     studies: list[optuna.Study] = []
-    for name in _phase_study_names(snapshot, experiment_name, phase_name):
+    for name in _phase_study_names(storage, experiment_name, phase_name):
         study = (
             addressed
             if addressed is not None and name == addressed.study_name
-            else _load_snapshot_study(snapshot, name)
+            else _load_snapshot_study(storage, name)
         )
         if study is not None:
             studies.append(study)
@@ -1037,14 +1052,16 @@ def read_trial_stats(
             continue
         try:
             addressed = None if study_name is None else _load_snapshot_study(snapshot, study_name)
+            phase_studies = _phase_studies(
+                snapshot, ledger.experiment_name, phase.name, addressed=addressed
+            )
             stats[phase.name] = replace(
-                _phase_trial_stats(addressed, ledger.experiment),
+                _phase_trial_stats(addressed, ledger.experiment, phase_studies),
                 published_trial_available=_published_history_retained(
                     snapshot,
                     published_trials.get(phase.name),
                     addressed,
                 ),
-                studies=_fill_candidates(snapshot, ledger.experiment_name, phase.name, addressed),
             )
         except StudySchemaMismatchError:
             raise
@@ -1172,13 +1189,11 @@ def read_every_phase_study(
     snapshot = _snapshot_storage(ledger)
     studies: dict[str, list[optuna.Study]] = {}
     for phase_name in phase_names:
-        names = (
+        studies[phase_name] = (
             []
             if snapshot is None
-            else _phase_study_names(snapshot, ledger.experiment_name, phase_name)
+            else list(_phase_studies(snapshot, ledger.experiment_name, phase_name))
         )
-        loaded = (None if snapshot is None else _load_snapshot_study(snapshot, n) for n in names)
-        studies[phase_name] = [study for study in loaded if study is not None]
     return studies
 
 

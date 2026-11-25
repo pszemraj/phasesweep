@@ -18,7 +18,7 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.config.models import Constraint, Experiment, Metric, Phase
-from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Sampler
+from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Repeats, Sampler
 from phasesweep.engine import reread as reread_ops
 from phasesweep.engine.errors import (
     PhaseTimeoutError,
@@ -30,7 +30,7 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.ledger import _resolve_storage, validate_ledger
 from phasesweep.engine.optuna import _PositionCmaEsSampler
 from phasesweep.engine.preview import validate_trial_targets
-from phasesweep.engine.read import inspect_status, read_status
+from phasesweep.engine.read import inspect_status, read_status, read_trial_tables
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -40,6 +40,7 @@ from phasesweep.engine.state import (
     PHASE_RECOVERY_ATTR,
     RERUN_OF_ATTR,
     TRIAL_DIR_ATTR,
+    _trial_attempt_dir,
 )
 from phasesweep.evidence.baseline import EVIDENCE_BASELINE_FILE
 from phasesweep.evidence.models import (
@@ -49,6 +50,7 @@ from phasesweep.evidence.models import (
     WandbExtractor,
 )
 from phasesweep.evidence.wandb import WandbRunMissingError
+from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
@@ -155,6 +157,110 @@ def test_a_misspelled_key_is_corrected_by_re_reading_every_finished_trial(tmp_pa
     assert [trial.state for trial in trials] == [optuna.trial.TrialState.COMPLETE] * 3
     assert sorted(trial.value for trial in trials) == [1.0, 1.0, 4.0]
     assert [t.number for t in trials] == [t.number for t in phase_study_of(typo).get_trials()]
+
+
+def test_reread_uses_recorded_trainer_exit_after_evidence_worker_timeout(tmp_path: Path) -> None:
+    """The process slot's last worker cannot override the committed trainer exit."""
+    trainer, launches = _counting_trainer(tmp_path)
+    phase = Phase(name="p", n_trials=1, gpu_policy="none")
+    original = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
+    assert run_experiment(original)["p"].metric == 4
+    [measured] = phase_study_of(original).trials
+    attempt_dir = _trial_attempt_dir(measured)
+    assert attempt_dir is not None
+    write_attempt_lifecycle(
+        attempt_dir,
+        attempt_id=measured.user_attrs[ATTEMPT_ID_ATTR],
+        state="exited",
+        ended_by="timed_out",
+        cleanup_confirmed=True,
+    )
+
+    corrected = _experiment(tmp_path, trainer, _metric("acc"), phases=[phase])
+    assert run_experiment(corrected)["p"].metric == 1
+    assert _launches(launches) == 1
+
+
+def test_reread_keeps_a_repeat_measurement_before_an_unsuccessful_retry(tmp_path: Path) -> None:
+    """Repeat selection and status keep a measured source when its retry did not measure."""
+    counter = tmp_path / "launches"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        from pathlib import Path
+        launches = Path({str(counter)!r})
+        prior = launches.read_text().splitlines() if launches.exists() else []
+        with launches.open("a") as log:
+            log.write("launch\\n")
+        if len(prior) < 2:
+            print(f"loss={{len(prior) + 1.0}}")
+        """,
+    )
+    phase = Phase(
+        name="p",
+        n_trials=2,
+        gpu_policy="none",
+        max_consecutive_failures=5,
+        sampler=Sampler(type="grid"),
+        repeats=Repeats(key="seed", values=[1, 2]),
+    )
+    retry = phase.model_copy(update={"n_trials": 3})
+    for planned in (phase, retry):
+        with pytest.raises(NoFeasibleTrialError, match="No complete repeat group"):
+            run_experiment(_experiment(tmp_path, trainer, _metric("typo"), phases=[planned]))
+    fixed = _experiment(
+        tmp_path,
+        trainer,
+        Metric(extractor=LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[0-9.]+)")),
+        phases=[retry],
+    )
+
+    winner = run_experiment(fixed)["p"]
+
+    assert winner.metric == 1.5
+    assert _launches(counter) == 3
+    assert [trial.state.name for trial in phase_study_of(fixed).trials] == [
+        "COMPLETE",
+        "COMPLETE",
+        "FAIL",
+    ]
+    [group] = read_trial_tables(fixed).phases[0].groups
+    assert group.n == 2 and group.aggregate == 1.5 and group.winner
+
+
+def test_reread_keeps_its_own_attempt_identity_when_its_source_is_removed(tmp_path: Path) -> None:
+    """A new draw in an enlarged reading study still belongs to its launch generation."""
+    trainer, launches = _counting_trainer(tmp_path)
+    one_cell = Phase(
+        name="p",
+        n_trials=1,
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1])},
+    )
+    source = _experiment(tmp_path, trainer, _metric("loss"), phases=[one_cell])
+    run_experiment(source)
+    original_generation = read_status(source)["current_generation_id"]
+    assert isinstance(original_generation, str)
+    enlarged = one_cell.model_copy(
+        update={
+            "n_trials": 2,
+            "search_space": {"x": CategoricalParam(type="categorical", choices=[1, 2])},
+        }
+    )
+    corrected = _experiment(tmp_path, trainer, _metric("acc"), phases=[enlarged])
+    run_experiment(corrected)
+    assert _launches(launches) == 2
+    optuna.delete_study(
+        study_name=study_name(source, "p"),
+        storage=_resolve_storage(source.resolved_storage),
+    )
+
+    current = read_status(corrected)["phases"][0]
+    original = read_status(corrected, generation_id=original_generation)["phases"][0]
+    assert current["trials"] == {"COMPLETE": 2}
+    assert current["generation_trials"] == {"COMPLETE": 1}
+    assert original["generation_trials"] == {}
 
 
 def test_reread_releases_retry_budget_for_cells_that_now_have_a_result(

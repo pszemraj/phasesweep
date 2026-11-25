@@ -2,33 +2,311 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections import defaultdict
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from stat import S_ISLNK
 from typing import NamedTuple
 
-from optuna.trial import FrozenTrial
+from optuna import Study
+from optuna.trial import FrozenTrial, TrialState
 
 from phasesweep.config.models import Experiment
 from phasesweep.engine.attempts import _attempt_process_resolution
+from phasesweep.engine.errors import StudySchemaMismatchError, WinnerIntegrityError
+from phasesweep.engine.fingerprints import _recorded_inheritance, phase_study_name
+from phasesweep.engine.optuna import _draw_positions
 from phasesweep.engine.paths import (
     _attempt_dir,
     _phase_dir,
     _trial_dir_for,
     _trial_dir_name,
+    _trial_dir_opener,
     _valid_trial_dir_name,
 )
+from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    GENERATION_ID_ATTR,
+    REREAD_FILL_ATTR,
     RERUN_OF_ATTR,
+    RETURN_CODE_ATTR,
     TRIAL_DIR_ATTR,
+    _recorded_identity,
     _recorded_trial_dir,
     _required_trial_dir,
+    _trial_lifecycle,
+    _unreplaced_attempts,
 )
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
+from phasesweep.evidence.baseline import read_evidence_baseline
 from phasesweep.runtime.files import broken_symlink_detail
+from phasesweep.runtime.json import json_object
 from phasesweep.runtime.process import read_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
+
+REREAD_FILL_SCHEMA_VERSION = 3
+_FILL_FIELDS = frozenset({"schema_version", "study_name"})
+
+
+def _fill_source_name(target: Study | None) -> str | None:
+    """Read the source study a filled study explicitly names.
+
+    :param Study | None target: Study whose copy provenance to read.
+    :raises StudySchemaMismatchError: The saved source record is malformed.
+    :return str | None: Source study name, or None when no copy started.
+    """
+    if target is None or (raw := target.user_attrs.get(REREAD_FILL_ATTR)) is None:
+        return None
+    try:
+        record = json_object(raw)
+        name = record["study_name"]
+        if (
+            record.keys() != _FILL_FIELDS
+            or type(record.get("schema_version")) is not int
+            or record["schema_version"] != REREAD_FILL_SCHEMA_VERSION
+            or not isinstance(name, str)
+            or not name
+        ):
+            raise ValueError("invalid source name or schema version")
+    except (KeyError, ValueError) as exc:
+        raise StudySchemaMismatchError(
+            f"Study {target.study_name!r} has a malformed {REREAD_FILL_ATTR!r} record: {exc}."
+        ) from exc
+    return name
+
+
+class ProducingAttempt(NamedTuple):
+    """The study and row that allocated an attempt, rather than a copy of that row."""
+
+    study: Study
+    trial: FrozenTrial
+
+
+def producing_attempts(studies: Sequence[Study]) -> dict[str, ProducingAttempt]:
+    """Resolve physical attempts by identity across all studies of a phase.
+
+    Each fill pins its source, and never changes the attempt IDs it copies. A row whose
+    direct source contains its ID is a copy, even if its source was itself filled.
+    Later trials can have the same number in siblings, so numbers cannot identify copies.
+    If the source was lost, the generation that launched the trainer still proves its
+    address from its frozen config and the inherited values kept by both studies.
+
+    :param Sequence[Study] studies: Studies of the phase from one ledger or live run.
+    :raises StudySchemaMismatchError: A study's fill provenance is malformed.
+    :return dict[str, ProducingAttempt]: Unambiguous producing rows by attempt ID.
+    """
+    rows = {
+        study.study_name: {
+            attempt_id: trial
+            for trial in study.get_trials(deepcopy=False)
+            if isinstance(attempt_id := trial.user_attrs.get(ATTEMPT_ID_ATTR), str)
+        }
+        for study in studies
+    }
+    owners: dict[str, list[ProducingAttempt]] = defaultdict(list)
+    snapshots: dict[tuple[Path, str], Experiment | None] = {}
+    for study in studies:
+        source_name = _fill_source_name(study)
+        source = None if source_name is None else rows.get(source_name)
+        for attempt_id, trial in rows[study.study_name].items():
+            if (
+                source_name is None
+                or (source is not None and attempt_id not in source)
+                or source is None
+                and _generation_addresses(study, trial, snapshots)
+            ):
+                owners[attempt_id].append(ProducingAttempt(study, trial))
+    return {attempt_id: matches[0] for attempt_id, matches in owners.items() if len(matches) == 1}
+
+
+def _generation_addresses(
+    study: Study, trial: FrozenTrial, snapshots: dict[tuple[Path, str], Experiment | None]
+) -> bool:
+    """Check whether retained launch settings identify a row whose fill source is gone.
+
+    :param Study study: Possible launching study.
+    :param FrozenTrial trial: Row with a physical attempt identity.
+    :param dict[tuple[Path, str], Experiment | None] snapshots: Validated generation configs
+        by artifact root and generation, reused across their trials.
+    :return bool: Whether the generation's configuration names this study.
+    """
+    generation = trial.user_attrs.get(GENERATION_ID_ATTR)
+    identity = _recorded_identity(study)
+    if not isinstance(generation, str) or identity is None:
+        return False
+    try:
+        directory = _recorded_trial_dir(trial)
+    except ValueError:
+        return False
+    if directory is None:
+        return False
+    path = directory.parent.parent
+    key = path, generation
+    if key not in snapshots:
+        try:
+            snapshots[key] = _load_generation_experiment(path, generation)
+        except WinnerIntegrityError:
+            snapshots[key] = None
+    producing = snapshots[key]
+    if producing is None:
+        return False
+    return any(
+        phase_study_name(producing, phase, _recorded_inheritance(identity)) == study.study_name
+        for phase in producing.phases
+        if phase.name == directory.parent.name
+    )
+
+
+class DirectoryHistory(NamedTuple):
+    """Identity of earlier launches and the cutoff for evidence shared with later ones."""
+
+    earlier: tuple[tuple[str, str], ...] = ()
+    evidence_before: float | str | None = None
+
+
+class DirectoryLaunch(NamedTuple):
+    """A physical attempt and the evidence of when it started."""
+
+    attempt_id: str
+    generation: str
+    epoch: float | None
+    order: float
+
+
+def directory_launches(
+    attempts: Mapping[str, ProducingAttempt], *, directory: Path | None = None
+) -> dict[str, list[DirectoryLaunch]]:
+    """Index the physical launches sharing each training directory.
+
+    The opener always sorts first. The launch baseline provides the epoch of each reuse.
+    An attempt that reached RUNNING before starting has no shared evidence if its lifecycle
+    records that it never launched.
+
+    :param Mapping[str, ProducingAttempt] attempts: Producing rows across the phase's studies.
+    :param Path | None directory: When supplied, inspect only this directory's launches.
+    :return dict[str, list[DirectoryLaunch]]: Launch records indexed by training directory name.
+    """
+    launches: dict[str, list[DirectoryLaunch]] = defaultdict(list)
+    for identity, producing in attempts.items():
+        row = producing.trial
+        gen = row.user_attrs.get(GENERATION_ID_ATTR)
+        try:
+            path = _recorded_trial_dir(row)
+            opener = None if path is None else _trial_dir_opener(path)
+        except ValueError:
+            continue
+        if path is None or not isinstance(gen, str) or (directory and path.name != directory.name):
+            continue
+        if type(row.user_attrs.get(RETURN_CODE_ATTR)) is not int:
+            try:
+                lifecycle = _trial_lifecycle(row)
+            except ValueError:
+                lifecycle = None
+            if lifecycle is not None and (
+                lifecycle.state == "allocated" or lifecycle.ended_by == "not_started"
+            ):
+                continue
+        if identity == opener:
+            epoch = float("-inf")
+            launches[path.name].append(DirectoryLaunch(identity, gen, epoch, epoch))
+            continue
+        try:
+            epoch = read_evidence_baseline(_attempt_dir(path.parent, identity)).launched_at
+        except ValueError:
+            epoch = None
+        start = row.datetime_start
+        fallback = 0.0 if start is None else start.timestamp()
+        launches[path.name].append(
+            DirectoryLaunch(identity, gen, epoch, fallback if epoch is None else epoch)
+        )
+    return launches
+
+
+def directory_history(
+    launches: Sequence[DirectoryLaunch],
+    *,
+    attempt_id: str | None = None,
+    launched_at: float | None = None,
+    ancestors: Sequence[tuple[str, str]] = (),
+) -> DirectoryHistory:
+    """Resolve earlier attempts and the next reuse of a shared trainer directory.
+
+    A known ancestor without an epoch is still earlier. An undated non-ancestor can
+    prevent attribution of a previously finished attempt's shared evidence.
+
+    :param Sequence[DirectoryLaunch] launches: One directory's physical launch records.
+    :param str | None attempt_id: Existing attempt to attribute, or None before a new launch.
+    :param float | None launched_at: Existing reused attempt's launch epoch.
+    :param Sequence[tuple[str, str]] ancestors: Proven earlier generations and attempt IDs,
+        used when an ancestor's launch epoch is unavailable.
+    :return DirectoryHistory: Earlier launches in order and cutoff for other shared evidence.
+    """
+    known_earlier = {identity for _, identity in ancestors}
+    earlier: list[DirectoryLaunch] = []
+    later: list[float] = []
+    undated: list[str] = []
+    for launch in launches:
+        identity, _, epoch, _ = launch
+        if identity == attempt_id:
+            continue
+        if epoch is None:
+            if attempt_id is None or identity in known_earlier:
+                earlier.append(launch)
+            else:
+                undated.append(identity)
+        elif (
+            attempt_id is None
+            or epoch == float("-inf")
+            or (launched_at is not None and epoch < launched_at)
+        ):
+            earlier.append(launch)
+        else:
+            later.append(epoch)
+    before: float | str | None = min(later, default=None)
+    if undated:
+        before = (
+            f"the launch time of attempt {min(undated)!r} in its shared directory is unavailable"
+        )
+    return DirectoryHistory(
+        tuple(
+            (launch.generation, launch.attempt_id)
+            for launch in sorted(earlier, key=lambda launch: launch.order)
+        ),
+        before,
+    )
+
+
+def earlier_directory_launches(
+    studies: Sequence[Study], directory: Path
+) -> tuple[tuple[str, str], ...]:
+    """Return the launch order before a new attempt starts in this directory.
+
+    :param Sequence[Study] studies: All studies that can share the directory.
+    :param Path directory: Trainer directory the new attempt will continue.
+    :return tuple[tuple[str, str], ...]: Earlier generation and attempt IDs in launch order.
+    """
+    launches = directory_launches(producing_attempts(studies), directory=directory)
+    return directory_history(launches.get(directory.name, ())).earlier
+
+
+def standing_repeat_attempts(trials: Sequence[FrozenTrial]) -> list[FrozenTrial]:
+    """Choose one reading's representative per draw for repeat ranking and reporting.
+
+    A measurement recovered by a re-read still stands when a later retry did not measure.
+    When several attempts measured a draw, the last measurement stands.
+
+    :param Sequence[FrozenTrial] trials: One study's trials in trial-number order.
+    :return list[FrozenTrial]: One representative per draw with a non-interrupted attempt.
+    """
+    positions = _draw_positions(trials)
+    standing = {
+        positions[trial.number]: trial for trial in _unreplaced_attempts(trials, interrupted=False)
+    }
+    for trial in trials:
+        if trial.state == TrialState.COMPLETE:
+            standing[positions[trial.number]] = trial
+    return list(standing.values())
 
 
 def _rerun_directory_sources(

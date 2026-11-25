@@ -28,6 +28,7 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.read import experiment_status, read_result, read_status, read_trial_tables
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import DURATION_ATTR, TRIAL_OUTCOME_ATTR, observed_attr
 from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
@@ -38,6 +39,7 @@ from tests.conftest import (
     study_name,
     trial_outcome,
     write_constant_trainer,
+    write_param_echo_trainer,
     write_trainer,
 )
 from tests.ledger_fixtures import materialize, published_generation_id, tree_snapshot
@@ -652,6 +654,65 @@ def _edited(experiment: Experiment, metric: Metric | None = None, **phase: objec
     if metric is not None:
         update["metric"] = metric
     return experiment.model_copy(update=update)
+
+
+@pytest.mark.integration
+def test_trial_table_marks_only_rows_in_the_winners_selecting_study(tmp_path: Path) -> None:
+    """The same attempt can have different rankings in different reading studies."""
+    metric = Metric(extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9]+)"))
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_param_echo_trainer(tmp_path),
+        metric=metric,
+        phases=[
+            Phase(
+                name="p",
+                n_trials=2,
+                gpu_policy="none",
+                sampler=Sampler(type="grid"),
+                search_space={"x": IntParam(type="int", low=1, high=2)},
+            )
+        ],
+    )
+    first = run_experiment(experiment)["p"]
+    changed = experiment.model_copy(
+        update={"metric": metric.model_copy(update={"goal": "maximize"})}
+    )
+    latest = run_experiment(changed)["p"]
+    assert first.study_name != latest.study_name
+    assert first.trial_number != latest.trial_number
+    assert [row["trial"] for row in read_trial_tables(changed).phases[0].rows if row["winner"]] == [
+        latest.trial_number
+    ]
+
+    historical = read_trial_tables(experiment)
+    assert historical.winner_generations["p"][1]
+    assert len(historical.phases[0].rows) == 2
+    assert all(not row["winner"] for row in historical.phases[0].rows)
+
+
+def test_pinned_generation_counts_the_verdicts_of_its_producing_study(tmp_path: Path) -> None:
+    """The addressed study reports new readings while a generation retains its own outcomes."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_constant_trainer(tmp_path),
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="missing")),
+        phases=[Phase(name="p", n_trials=1, gpu_policy="none")],
+    )
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+    initial = read_status(experiment)
+    generation = initial["current_generation_id"]
+    assert generation is not None
+    assert initial["phases"][0]["generation_trials"] == {"FAIL": 1}
+
+    changed = experiment.model_copy(
+        update={"metric": Metric(extractor=JsonExtractor(type="json", path="r.json", key="x"))}
+    )
+    run_experiment(changed)
+    [phase] = read_status(changed, generation_id=generation)["phases"]
+    assert phase["trials"] == {"COMPLETE": 1}
+    assert phase["generation_trials"] == {"FAIL": 1}
 
 
 def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -> None:

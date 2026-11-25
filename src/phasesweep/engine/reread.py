@@ -18,7 +18,7 @@ current ledger, including trials the source finished while the fill was stopped.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -58,12 +58,11 @@ from phasesweep.engine.optuna import (
     _measured_trial_count,
     _sampling_trial_for_reread,
 )
-from phasesweep.engine.paths import _attempt_dir, _experiment_dir, _trial_dir_opener
+from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
-    DURATION_ATTR,
     FAILURE_REASON_ATTR,
     OVERRIDES_ATTR,
     PHASE_DECISION_ATTR,
@@ -71,16 +70,14 @@ from phasesweep.engine.state import (
     PHASE_RECOVERY_ATTR,
     REREAD_FILL_ATTR,
     RERUN_OF_ATTR,
-    RETURN_CODE_ATTR,
     STUDY_SCHEMA_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
     PhaseIdentityRecord,
+    _completed_trainer_duration,
     _parsed_trial_outcome,
     _recorded_identity,
-    _recorded_trial_dir,
     _required_trial_dir,
-    _trial_lifecycle,
     _trial_outcome_payload,
 )
 from phasesweep.engine.study_policy import (
@@ -89,13 +86,20 @@ from phasesweep.engine.study_policy import (
     _parse_accepted_partial_decision,
 )
 from phasesweep.engine.trial import TrialResult, _failed_trial, record_trial_result
+from phasesweep.engine.trial_dirs import (
+    REREAD_FILL_SCHEMA_VERSION,
+    DirectoryLaunch,
+    ProducingAttempt,
+    _fill_source_name,
+    directory_history,
+    directory_launches,
+    producing_attempts,
+)
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.evidence.baseline import read_evidence_baseline
-from phasesweep.runtime.json import JsonObject, finite_nonnegative, json_object
+from phasesweep.runtime.json import JsonObject, json_object
 from phasesweep.runtime.terminal import plural
 
-REREAD_FILL_SCHEMA_VERSION = 3
-_FILL_FIELDS = frozenset({"schema_version", "study_name"})
 #: The source's identity, root, schema and any earlier fill belong to the source study.
 _NOT_COPIED = frozenset(
     {REREAD_FILL_ATTR, PHASE_IDENTITY_ATTR, ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR}
@@ -125,35 +129,6 @@ class FillSource:
         :return int: Number of trials with a finished trainer and no row in the target.
         """
         return len(self.reread_trials)
-
-
-def _fill_source_name(target: optuna.Study | None) -> str | None:
-    """Read the study name recorded before a fill began.
-
-    :param optuna.Study | None target: The addressed study, if it exists.
-    :raises StudySchemaMismatchError: The saved source record is malformed.
-    :return str | None: The saved source name, or None for a fresh fill.
-    """
-    raw = None if target is None else target.user_attrs.get(REREAD_FILL_ATTR)
-    if raw is None:
-        return None
-    assert target is not None
-    try:
-        record = json_object(raw)
-        name = record["study_name"]
-        if (
-            record.keys() != _FILL_FIELDS
-            or type(record.get("schema_version")) is not int
-            or record["schema_version"] != REREAD_FILL_SCHEMA_VERSION
-            or not isinstance(name, str)
-            or not name
-        ):
-            raise ValueError("invalid source name or schema version")
-    except (KeyError, ValueError) as exc:
-        raise StudySchemaMismatchError(
-            f"Study {target.study_name!r} has a malformed {REREAD_FILL_ATTR!r} record: {exc}."
-        ) from exc
-    return name
 
 
 def _fill_candidates(name: str | None, others: Sequence[optuna.Study]) -> Sequence[optuna.Study]:
@@ -213,36 +188,32 @@ def _reread_record(record: PhaseIdentityRecord, reading: JsonObject) -> PhaseIde
     )
 
 
-def _trainer_seconds(trial: optuna.trial.FrozenTrial) -> float | None:
+def _trainer_seconds(
+    trial: optuna.trial.FrozenTrial, *, attempts: Mapping[str, ProducingAttempt] | None = None
+) -> float | None:
     """Return a finished trial's trainer time when its trainer exited successfully.
 
-    The trainer's exit is what the ledger recorded when it ended (return code and duration),
-    confirmed by the attempt's lifecycle record while that is kept. Only a trial whose recorded
-    outcome is a success or a failure is read again; an interruption or a fatal outcome is not
-    a reading result.
+    The committed trainer exit comes from the ledger. An evidence worker may have replaced
+    the attempt's process slot after the trainer exited. Only a trial whose recorded outcome
+    is a success or failure is read again.
 
     :param optuna.trial.FrozenTrial trial: A source study's trial.
+    :param Mapping[str, ProducingAttempt] | None attempts: Resolved launch rows, when available.
     :return float | None: The trainer's seconds, or ``None`` when the trial is copied unread.
     """
-    outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
-    return_code = trial.user_attrs.get(RETURN_CODE_ATTR)
-    seconds = finite_nonnegative(trial.user_attrs.get(DURATION_ATTR))
+    attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+    producer = (
+        attempts.get(attempt_id) if attempts is not None and isinstance(attempt_id, str) else None
+    )
+    producing = trial if producer is None else producer.trial
+    outcome = _parsed_trial_outcome(producing.user_attrs.get(TRIAL_OUTCOME_ATTR))
     if (
-        trial.state not in {optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.FAIL}
+        producing.state not in {optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.FAIL}
         or outcome is None
         or outcome.outcome not in _REREAD_OUTCOMES
-        or type(return_code) is not int
-        or return_code != 0
-        or seconds is None
     ):
         return None
-    try:
-        lifecycle = _trial_lifecycle(trial)
-    except ValueError:
-        lifecycle = None
-    if lifecycle is not None and (lifecycle.ended_by != "trainer" or lifecycle.return_code != 0):
-        return None
-    return float(seconds)
+    return _completed_trainer_duration(producing, None, rechecking_evidence=True)
 
 
 def fill_source(
@@ -276,6 +247,7 @@ def fill_source(
     copied = 0 if target is None else len(target.get_trials(deepcopy=False))
     found: list[FillSource] = []
     refusal: StudyFingerprintMismatchError | None = None
+    attempts = producing_attempts(others)
     for study in _fill_candidates(pinned, others):
         record = _recorded_identity(study)
         trials = study.get_trials(deepcopy=False)
@@ -307,7 +279,9 @@ def fill_source(
         recorded = payload.get(READING_KEY)
         changes = _changed_payload_keys(recorded if isinstance(recorded, dict) else {}, reading)
         rereads = frozenset(
-            trial.number for trial in trials[copied:] if _trainer_seconds(trial) is not None
+            trial.number
+            for trial in trials[copied:]
+            if _trainer_seconds(trial, attempts=attempts) is not None
         )
         attrs = json_object(
             {key: value for key, value in study.user_attrs.items() if key not in _NOT_COPIED}
@@ -320,95 +294,14 @@ def fill_source(
     return max(reversed(found), key=lambda source: source.rereads)
 
 
-def _directory_reuses(
-    trials: Iterable[optuna.trial.FrozenTrial],
-) -> dict[str, dict[str, float | None]]:
-    """Collect the launch epochs of attempts that could write a reused directory.
-
-    A continued directory keeps its basename even if the artifact tree moves. Copies in
-    another reading study keep the same attempt ID. The opener needs no launch epoch.
-
-    :param Iterable[optuna.trial.FrozenTrial] trials: Attempts visible in the phase's studies.
-    :return dict[str, dict[str, float | None]]: Launch epochs by directory name and attempt ID.
-        A missing epoch marks a possible writer whose launch time cannot be established.
-    """
-    reuses: dict[str, dict[str, float | None]] = {}
-    for trial in trials:
-        try:
-            directory = _recorded_trial_dir(trial)
-            opener = None if directory is None else _trial_dir_opener(directory)
-        except ValueError:
-            continue
-        attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
-        if (
-            directory is None
-            or not isinstance(attempt_id, str)
-            or not attempt_id
-            or attempt_id == opener
-        ):
-            continue
-        launches = reuses.setdefault(directory.name, {})
-        if attempt_id in launches:
-            continue
-        if type(trial.user_attrs.get(RETURN_CODE_ATTR)) is not int:
-            try:
-                lifecycle = _trial_lifecycle(trial)
-            except ValueError:
-                lifecycle = None
-            if lifecycle is not None and (
-                lifecycle.state == "allocated" or lifecycle.ended_by == "not_started"
-            ):
-                continue
-        try:
-            launches[attempt_id] = read_evidence_baseline(
-                _attempt_dir(directory.parent, attempt_id)
-            ).launched_at
-        except ValueError:
-            launches[attempt_id] = None
-    return reuses
-
-
-def _shared_evidence_cutoff(
-    launches: Mapping[str, float | None],
-    trials: Mapping[int, optuna.trial.FrozenTrial],
-    trial: optuna.trial.FrozenTrial,
-    attempt_id: str,
-    launched_at: float | None,
-) -> float | str | None:
-    """Find the next reuse of the directory, after which its evidence belongs elsewhere.
-
-    :param Mapping[str, float | None] launches: Launch epochs of attempts that reused the directory.
-    :param Mapping[int, optuna.trial.FrozenTrial] trials: Source study's trials by number.
-    :param optuna.trial.FrozenTrial trial: The trial being re-read.
-    :param str attempt_id: The trial's attempt ID.
-    :param float | None launched_at: The attempt's launch epoch, absent for the opener.
-    :return float | str | None: The next launch epoch, a reason shared evidence cannot be attributed,
-        or None when there was no later reuse.
-    """
-    other_launches = {other: start for other, start in launches.items() if other != attempt_id}
-    undated = {other for other, start in other_launches.items() if start is None}
-    if undated:
-        earlier = {earlier_id for _, earlier_id in _earlier_attempts(trials, trial)}
-        unknown = min(undated - earlier, default=None)
-        if unknown is not None:
-            return f"the launch time of attempt {unknown!r} in its shared directory is unavailable"
-    return min(
-        (
-            start
-            for start in other_launches.values()
-            if start is not None and (launched_at is None or start >= launched_at)
-        ),
-        default=None,
-    )
-
-
 def _reread_trial(
     experiment: Experiment,
     phase: Phase,
     trial: optuna.trial.FrozenTrial,
     trials: Mapping[int, optuna.trial.FrozenTrial],
     producing: dict[str, Experiment | WinnerIntegrityError],
-    directory_reuses: Mapping[str, Mapping[str, float | None]],
+    attempts: Mapping[str, ProducingAttempt],
+    launches: Mapping[str, Sequence[DirectoryLaunch]],
 ) -> optuna.trial.FrozenTrial | None:
     """Read one finished trial again under the current settings, as the trial a fill writes.
 
@@ -421,14 +314,14 @@ def _reread_trial(
     :param Mapping[int, optuna.trial.FrozenTrial] trials: The source study's trials by number.
     :param dict[str, Experiment | WinnerIntegrityError] producing: Producing configurations by
         generation, filled as they are loaded.
-    :param Mapping[str, Mapping[str, float | None]] directory_reuses: Attempts that reused each
-        trainer directory and their launch epochs.
+    :param Mapping[str, ProducingAttempt] attempts: Producing rows by physical attempt ID.
+    :param Mapping[str, Sequence[DirectoryLaunch]] launches: Physical launches by directory.
     :raises TrackingTargetUnavailableError: The tracker gave no answer, so the verdict waits for
         a later run; the trials already copied stay and the fill resumes.
     :return optuna.trial.FrozenTrial | None: The trial to write, or ``None`` when the trial is
         copied as it was recorded.
     """
-    seconds = _trainer_seconds(trial)
+    seconds = _trainer_seconds(trial, attempts=attempts)
     outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
     overrides_json = trial.user_attrs.get(OVERRIDES_ATTR)
     if seconds is None or outcome is None or not isinstance(overrides_json, str):
@@ -454,7 +347,12 @@ def _reread_trial(
         if isinstance(launched, WinnerIntegrityError):
             raise ValueError(str(launched))
         result, _ = read_finished_attempt(
-            trials,
+            directory_history(
+                launches.get(directory.name, ()),
+                attempt_id=record.attempt_id,
+                launched_at=baseline.launched_at,
+                ancestors=_earlier_attempts(trials, trial),
+            ),
             trial,
             record,
             producing=launched,
@@ -462,13 +360,6 @@ def _reread_trial(
             current=experiment,
             trainer_duration=seconds,
             baseline=baseline,
-            evidence_before=_shared_evidence_cutoff(
-                directory_reuses.get(directory.name, {}),
-                trials,
-                trial,
-                record.attempt_id,
-                baseline.launched_at,
-            ),
         )
     except ValueError as exc:
         result = _failed_trial(rc=0, duration=seconds, failure_reason=str(exc))
@@ -611,13 +502,12 @@ def fill_study(
             },
         )
     by_number = {trial.number: trial for trial in trials}
-    directory_reuses = _directory_reuses(
-        trial for study in other_studies for trial in study.get_trials(deepcopy=False)
-    )
+    attempts = producing_attempts(other_studies)
+    launches = directory_launches(attempts)
     producing: dict[str, Experiment | WinnerIntegrityError] = {}
     rereads = changed = 0
     for trial in trials[len(present) :]:
-        reread = _reread_trial(experiment, phase, trial, by_number, producing, directory_reuses)
+        reread = _reread_trial(experiment, phase, trial, by_number, producing, attempts, launches)
         if reread is not None:
             rereads += 1
             changed += (reread.state, reread.value) != (trial.state, trial.value)

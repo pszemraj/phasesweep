@@ -81,6 +81,7 @@ from phasesweep.runtime.shutdown import PhaseSweepShutdown, servicing_shutdown_s
 
 if TYPE_CHECKING:
     from phasesweep.engine.trial import TrialResult
+    from phasesweep.engine.trial_dirs import DirectoryHistory
     from phasesweep.evidence.baseline import EvidenceBaseline
 
 log = logging.getLogger(__name__)
@@ -1188,7 +1189,7 @@ def _resolve_attempt(
 
 
 def read_finished_attempt(
-    trials: Mapping[int, optuna.trial.FrozenTrial],
+    history: DirectoryHistory,
     trial: optuna.trial.FrozenTrial,
     record: _AttemptRecord,
     *,
@@ -1197,7 +1198,6 @@ def read_finished_attempt(
     current: Experiment,
     trainer_duration: float,
     baseline: EvidenceBaseline,
-    evidence_before: float | str | None = None,
 ) -> tuple[TrialResult, str]:
     """Read a finished attempt's kept evidence after the fact, through the live extraction path.
 
@@ -1208,8 +1208,8 @@ def read_finished_attempt(
     come from ``producing``; the extractors, constraints and gates come from ``reading``; the
     attempt's own evidence baseline says which value files are its own.
 
-    :param Mapping[int, optuna.trial.FrozenTrial] trials: The trial's study's trials by number,
-        for the earlier attempts a rerun's directory holds.
+    :param DirectoryHistory history: Physical launches and later evidence cutoff for the
+        directory the attempt trained in.
     :param optuna.trial.FrozenTrial trial: The trial whose attempt finished.
     :param _AttemptRecord record: Its attempt, with a trial directory and generation.
     :param Experiment producing: The configuration that launched the attempt.
@@ -1217,14 +1217,11 @@ def read_finished_attempt(
     :param Experiment current: The invocation's configuration, for its MLflow polling controls.
     :param float trainer_duration: The trainer's recorded wall-clock seconds.
     :param EvidenceBaseline baseline: The attempt's evidence baseline.
-    :param float | str | None evidence_before: Unix time shared evidence must predate, or the
-        reason it cannot be attributed to the attempt, defaults to None.
     :raises ProcessCleanupUncertainError: The attempt records an unusable trial directory, so
         the run its trial logs to cannot be named.
     :raises StudyStorageUnavailableError: The trial lacks its recorded trainer input or overrides.
     :return tuple[TrialResult, str]: The extraction result and the trial's recorded overrides.
     """
-    from phasesweep.engine.evidence import _earlier_attempts
     from phasesweep.engine.trial import (
         ExecutedTrial,
         _environment_identity,
@@ -1285,13 +1282,13 @@ def read_finished_attempt(
         wandb_environment=environment,
         mlflow_environment=environment,
         baseline=baseline,
-        evidence_before=evidence_before,
+        evidence_before=history.evidence_before,
         managed_envelope_path=(
             producing_extractor.path
             if isinstance(producing_extractor, JsonEnvelopeExtractor)
             else None
         ),
-        earlier_attempts=_earlier_attempts(trials, trial),
+        earlier_attempts=history.earlier,
     )
     result = extract_trial_result(
         experiment=reading,
@@ -1343,7 +1340,15 @@ def _recover_completed_trial(
         a malformed directory, so the trial's W&B run or the attempts whose histories it
         continues cannot be named.
     """
+    from phasesweep.engine.evidence import _earlier_attempts
+    from phasesweep.engine.ledger import phase_studies_for
     from phasesweep.engine.trial import record_trial_result
+    from phasesweep.engine.trial_dirs import (
+        DirectoryHistory,
+        directory_history,
+        directory_launches,
+        producing_attempts,
+    )
     from phasesweep.evidence.baseline import read_evidence_baseline
 
     lifecycle = read_attempt_lifecycle(record.attempt_dir, expected_attempt_id=record.attempt_id)
@@ -1385,9 +1390,22 @@ def _recover_completed_trial(
         raise StudyStorageUnavailableError(
             f"Completed attempt {record.attempt_id} trainer exit evidence could not be recorded; its trial remains RUNNING."
         ) from exc
+    history = DirectoryHistory()
+    if baseline.reused:
+        launches = directory_launches(
+            producing_attempts(phase_studies_for(study)), directory=record.trial_dir
+        )
+        history = directory_history(
+            launches.get(record.trial_dir.name, ()),
+            attempt_id=record.attempt_id,
+            launched_at=baseline.launched_at,
+            ancestors=_earlier_attempts(
+                {other.number: other for other in study.get_trials(deepcopy=False)}, trial
+            ),
+        )
     try:
         result, overrides_json = read_finished_attempt(
-            {other.number: other for other in study.get_trials(deepcopy=False)},
+            history,
             trial,
             record,
             producing=experiment,

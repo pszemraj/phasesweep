@@ -90,7 +90,8 @@ class _PhaseTrialStats:
     ``running_attempts`` is part of the *same* snapshot as ``counts``, not a
     second read: it lists the RUNNING trials those counts describe, and is
     ``None`` exactly when ``available`` is ``False`` (the counts are unknown).
-    A confirmed absent study has known zero counts and an empty attempt list.
+    A confirmed absent addressed study has zero progress and an empty attempt list.
+    ``generation_counts`` counts producing rows from every study, without counting their copies.
     ``published_trial_available`` says whether the same snapshot holds the requested published
     trial identity, in whichever of the phase's studies it was selected from, with that study's
     recorded count boundary met; false also covers unreadable or absent storage.
