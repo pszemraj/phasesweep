@@ -494,6 +494,11 @@ def killed_sweep(
     return experiment, uploads, [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials]
 
 
+def attach_wandb_transport(api: object, transport: object) -> None:
+    """Initialize the real SDK client's instance fields for a test transport without authenticating."""
+    vars(api).update(_runs={}, _service_api=transport, api_key=None)
+
+
 @dataclasses.dataclass(frozen=True)
 class SwitchableWandb:
     """A fake W&B server the real supervised reader polls, switched by a mode file.

@@ -24,7 +24,12 @@ from phasesweep.evidence.evaluation import DeadlineExceededError, ExtractorError
 from phasesweep.evidence.mlflow import merge_histories, select_observation
 from phasesweep.evidence.models import MlflowExtractor, WandbExtractor
 from tests.conftest import make_experiment, make_trial_context, phase_trials, write_trainer
-from tests.tracking_helpers import ManualClock, switchable_wandb, wandb_objective_experiment
+from tests.tracking_helpers import (
+    ManualClock,
+    attach_wandb_transport,
+    switchable_wandb,
+    wandb_objective_experiment,
+)
 
 _LAUNCHED_AT = 1_000.0
 _KEY = "eval/loss.min"
@@ -622,9 +627,7 @@ def test_the_real_client_reads_the_history_index_with_the_summary(tmp_path, monk
     def initialize(self, overrides=None, timeout=None):
         clients.append(self)
         self.settings = {"entity": "e", "project": "p"}
-        self._runs = {}
-        self._service_api = Transport()
-        self.api_key = None
+        attach_wandb_transport(self, Transport())
 
     monkeypatch.setattr(public.Api, "__init__", initialize)
     from phasesweep.evidence.wandb import _poll_wandb_summary

@@ -36,7 +36,7 @@ from phasesweep.evidence.models import (
     WandbSummaryRequiredGate,
 )
 from tests.conftest import make_trial_context
-from tests.tracking_helpers import ManualClock
+from tests.tracking_helpers import ManualClock, attach_wandb_transport
 
 
 def _wandb_poll(**kwargs):
@@ -170,9 +170,7 @@ def test_wandb_real_sdk_decodes_refreshed_finished_summary(tmp_path, monkeypatch
     def initialize(self, overrides=None, timeout=None):
         assert overrides == {"base_url": "https://example.test"}
         self.settings = {"entity": "entity", "project": "project"}
-        self._runs = {}
-        self._service_api = Transport()
-        self.api_key = None
+        attach_wandb_transport(self, Transport())
 
     monkeypatch.setattr(public.Api, "__init__", initialize)
     capture = _wandb_poll(required_keys=["eval/loss"], presence_keys=["large", "absent"])
@@ -1772,9 +1770,7 @@ def test_wandb_real_sdk_missing_run_polls_until_the_visibility_deadline(
 
     def initialize(self, overrides: object = None, timeout: object = None) -> None:
         self.settings = {"entity": "entity", "project": "project"}
-        self._runs = {}
-        self._service_api = Transport()
-        self.api_key = None
+        attach_wandb_transport(self, Transport())
 
     monkeypatch.setattr(public.Api, "__init__", initialize)
     with pytest.raises(WandbRunMissingError) as refused:
