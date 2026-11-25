@@ -811,6 +811,7 @@ def summary(
     written: Sequence[str],
     next_command: str,
     show_winners_command: str,
+    launch_free_generation_id: str | None = None,
 ) -> Summary:
     """Build the summary a successful run closes with.
 
@@ -824,6 +825,8 @@ def summary(
     :param Sequence[str] written: The files this run wrote, relative to ``written_root``.
     :param str next_command: The command that reads the result.
     :param str show_winners_command: The ``show-winners`` command a flagged winner points to.
+    :param str | None launch_free_generation_id: The generation a run that launched no trial
+        wrote only to publish its winners, which the headline names, defaults to None.
     :return Summary: The block to log.
     """
     reached = {phase.name for _index, phase in experiment.phases_from(from_phase)}
@@ -848,6 +851,11 @@ def summary(
                 directories = tuple(display_path(path) for path in counts[phase.name].winner_dirs)
         phases.append(SummaryPhase(phase.name, clauses, facts, directories, flagged))
     headline = f"Finished in {duration_text(elapsed)}: {run_totals(counts)}"
+    if launch_free_generation_id is not None:
+        headline += (
+            f". No trial launched; generation {launch_free_generation_id} publishes these "
+            "winners under the current config."
+        )
     return Summary(
         headline, tuple(phases), written_root, tuple(written), next_command, show_winners_command
     )

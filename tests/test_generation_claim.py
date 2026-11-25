@@ -166,6 +166,46 @@ def test_an_edit_that_keeps_the_winners_publishes_them_under_the_current_config(
         assert reports[-1].replayed_generation_id == republished.generation_id
 
 
+def test_a_launch_free_publication_says_so_in_the_run_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The summary of a run that published without launching names the generation it wrote."""
+    config = write_experiment(
+        tmp_path / "exp.yaml",
+        trial_command=_ECHO,
+        metric={"extractor": {"type": "log_regex", "pattern": r"x=(?P<value>[0-9.eE+-]+)"}},
+        storage="auto",
+        workdir=str(tmp_path / "runs"),
+        provenance={"revision": "rev-1"},
+        phases=[
+            {
+                "name": "p",
+                "n_trials": 2,
+                "sampler": {"type": "random", "seed": 0},
+                "search_space": {"x": {"type": "int", "low": 0, "high": 10}},
+            }
+        ],
+    )
+    bound = ["--set", "metric.max=100"]
+    assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 0
+    assert "No trial launched" not in capsys.readouterr().err
+
+    assert invoke_cli_boundary(["run", str(config), *bound], monkeypatch) == 0
+    experiment = load_experiment(config)
+    assert isinstance(experiment, Experiment)
+    published = published_generation_id(experiment)
+    text = " ".join(capsys.readouterr().err.split())
+    assert (
+        f"No trial launched; generation {published} publishes these winners under the "
+        "current config." in text
+    )
+
+    assert invoke_cli_boundary(["run", str(config), *bound], monkeypatch) == 0
+    assert f"generation {published} already publishes these winners." in " ".join(
+        capsys.readouterr().err.split()
+    )
+
+
 def test_an_interrupted_launch_free_publication_is_finished_by_the_next_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

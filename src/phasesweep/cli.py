@@ -824,6 +824,9 @@ def _closing_block(
         show_winners_command=command_line(
             "show-winners", *_config_arguments(config_path, settings)
         ),
+        launch_free_generation_id=(
+            outcome.generation_id if outcome.published_without_launch else None
+        ),
     )
 
 

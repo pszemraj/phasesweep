@@ -94,7 +94,8 @@ class TerminalReport:
     on success, so a terminal-result consumer need not re-read storage. It is
     ``None`` on every failure path. ``replayed_generation_id`` names the published
     generation whose winners a successful invocation replayed without writing a
-    generation, and is ``None`` otherwise. ``phase_counts`` holds the trial counts of
+    generation, and is ``None`` otherwise. ``published_without_launch`` says that a successful
+    invocation wrote its generation only to publish, launching no trial. ``phase_counts`` holds the trial counts of
     each phase a successful invocation ran, read from its ledger, so a run on in-memory
     storage reports them too.
     """
@@ -109,6 +110,7 @@ class TerminalReport:
     failure_stage: str | None = None
     winners: Mapping[str, Winner] | None = None
     replayed_generation_id: str | None = None
+    published_without_launch: bool = False
     phase_counts: Mapping[str, PhaseCounts] = field(default_factory=dict)
 
 
@@ -153,6 +155,7 @@ def _terminal_report_from_cleanup(
     failure_stage: str | None,
     winners: Mapping[str, Winner] | None = None,
     replayed_generation_id: str | None = None,
+    published_without_launch: bool = False,
     phase_counts: Mapping[str, PhaseCounts] | None = None,
 ) -> TerminalReport:
     """Freeze accumulated cleanup evidence into one terminal report.
@@ -164,6 +167,8 @@ def _terminal_report_from_cleanup(
     :param Mapping[str, Winner] | None winners: Successful published winners.
     :param str | None replayed_generation_id: Published generation whose winners a successful
         invocation replayed without writing a generation.
+    :param bool published_without_launch: Whether a successful invocation wrote its generation
+        only to publish, launching no trial, defaults to False.
     :param Mapping[str, PhaseCounts] | None phase_counts: Trial counts of each phase the
         invocation ran, for a successful one.
     :return TerminalReport: Immutable terminal outcome snapshot.
@@ -179,6 +184,7 @@ def _terminal_report_from_cleanup(
         failure_stage=failure_stage,
         winners=MappingProxyType(dict(winners)) if winners is not None else None,
         replayed_generation_id=replayed_generation_id,
+        published_without_launch=published_without_launch,
         phase_counts=MappingProxyType(dict(phase_counts or {})),
     )
 
@@ -534,6 +540,7 @@ def _run_experiment_outcome(
                     failure_stage=None,
                     winners=result,
                     replayed_generation_id=generation.replayed_generation_id,
+                    published_without_launch=generation.published_without_launch,
                     phase_counts=generation.phase_counts,
                 )
             # Pairs with the start line, so a log that holds several runs shows which finished.
@@ -813,6 +820,7 @@ def _run_experiment_inner(
             )
             generation.replay(published_id)
             return winners
+        generation.published_without_launch = True
     generation_id = generation.claim()
     summary_path = path_ops._generation_summary_path(experiment, generation_id)
     summary_path.parent.mkdir(parents=True, exist_ok=True)

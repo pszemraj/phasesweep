@@ -100,6 +100,8 @@ class InvocationGeneration:
         self.generation_id = generation_id
         self.claimed = False
         self.replayed_generation_id: str | None = None
+        #: Whether the invocation claimed its generation only to publish, launching no trial.
+        self.published_without_launch = False
         #: Trial counts of each phase this invocation ran, recorded as the phase ends.
         self.phase_counts: dict[str, PhaseCounts] = {}
         self._caller_owned_id = caller_owned_id
