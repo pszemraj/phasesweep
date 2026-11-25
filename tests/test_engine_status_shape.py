@@ -27,7 +27,7 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
 )
 from phasesweep.engine.read import read_status, read_trial_tables
-from phasesweep.evidence.models import LogRegexExtractor
+from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
 from phasesweep.runtime.json import JsonValue
 from tests.conftest import (
     invoke_cli_boundary,
@@ -206,6 +206,71 @@ def test_status_counts_a_child_in_the_study_its_parents_latest_winner_addresses(
     child = yaml.safe_load(result.output)["phases"][1]
     assert child["name"] == "child"
     assert child["trials"] == {"COMPLETE": 1}
+
+
+@pytest.mark.integration
+def test_status_uses_the_parent_winner_the_current_reader_replays(tmp_path: Path) -> None:
+    """A restored reader reuses its child study even after another reader publishes a different parent."""
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json
+        from pathlib import Path
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", required=True)
+        parser.add_argument("--x", type=int)
+        parser.add_argument("--y", type=int, default=0)
+        args = parser.parse_args()
+        Path(args.out).write_text(json.dumps({"score": args.x, "alt": -args.x}))
+        """,
+    )
+    parent = Phase(
+        name="parent",
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
+    )
+
+    def plan(key: str, child_y: int) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            trainer=trainer,
+            metric=Metric(
+                name="score",
+                goal="minimize",
+                extractor=JsonExtractor(type="json", path="r.json", key=key),
+            ),
+            phases=[
+                parent,
+                Phase(
+                    name="child",
+                    n_trials=1,
+                    gpu_policy="none",
+                    inherits=["parent"],
+                    fixed_overrides={"y": child_y},
+                ),
+            ],
+        )
+
+    original = plan("score", 0)
+    original_winners = run_experiment(original)
+    assert original_winners["parent"].params == {"x": 1}
+    alternate_winners = run_experiment(plan("alt", 7))
+    assert alternate_winners["parent"].params == {"x": 2}
+    config = write_experiment_config(tmp_path / "original.yaml", original)
+
+    status = CliRunner().invoke(cli, ["status", str(config)])
+    table = CliRunner().invoke(cli, ["status", str(config), "--trials"])
+
+    assert status.exit_code == table.exit_code == 0, (status.output, table.output)
+    assert "was created with a different config" not in status.output
+    assert "was created with a different config" not in table.output
+    child = yaml.safe_load(status.output)["phases"][1]
+    assert child["trials"] == {"COMPLETE": 1}
+    assert child["winner_config_matches_current"] is False
+    assert "child: 1 of 1 trial" in table.output, table.output
 
 
 def test_reordered_parents_keep_the_published_result_matching_the_config(tmp_path: Path) -> None:

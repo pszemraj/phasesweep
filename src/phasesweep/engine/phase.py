@@ -474,6 +474,7 @@ def _judge_recorded_phase(
     policy_state: _PhasePolicyState,
     phase_fingerprint: str,
     verify_evidence: bool,
+    emit_advisories: bool = True,
 ) -> _PhaseResume | Winner:
     """Apply the trial-target, partial-decision and abort rules to a phase's recorded study.
 
@@ -489,6 +490,7 @@ def _judge_recorded_phase(
     :param str phase_fingerprint: Fingerprint carried on a replayed winner.
     :param bool verify_evidence: Whether a replayed winner's evidence is re-proved;
         see :func:`_select_phase_winner` for everything it covers.
+    :param bool emit_advisories: Whether a replayed partial result logs selection diagnostics.
     :raises TrialTargetRefusedError: ``phase.n_trials`` is below the accepted
         target, or a fixed configuration asks for more attempts than it may retry.
     :raises PhaseAbortRefusedError: The phase aborted and the current config does not
@@ -525,6 +527,7 @@ def _judge_recorded_phase(
                 phase_fingerprint=phase_fingerprint,
                 completion=completion,
                 verify_evidence=verify_evidence,
+                emit_advisories=emit_advisories,
             )
         except NoFeasibleTrialError as exc:
             raise _no_feasible_before_deadline(

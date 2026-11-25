@@ -1461,14 +1461,15 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
             _render_phase_comment(rerun_command, prefix="# ")
     for phase_name, pruned in inspection.pruned.items():
         click.echo(f"# {phase_name}: {pruned_trials_note(pruned)}")
-    if retained and suggest_resume and not refusals:
-        step = unpublished_winner_step(config, ledger, inspection.study_names)
-        if step is not None:
-            click.echo(
-                "# Winner retained but not published"
-                f"{'.' if step.cause is None else f'; {step.cause}'}"
-            )
-            click.echo(f"# fix: {step.fix}")
+    trial_data_available = not config.persistent or all(
+        phase.get("trial_data_available") is True for phase in phase_payloads
+    )
+    if retained and suggest_resume and not refusals and trial_data_available:
+        step = unpublished_winner_step(config, inspection.studies)
+        click.echo(
+            f"# Winner retained but not published{'.' if step.cause is None else f'; {step.cause}'}"
+        )
+        click.echo(f"# fix: {step.fix}")
     click.echo(yaml.dump(payload, Dumper=_WinnerDumper, sort_keys=False).rstrip())
     raise_for_unusable_publication(
         str(payload["experiment"]),

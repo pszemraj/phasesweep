@@ -39,16 +39,20 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.evidence import _selection_evidence
 from phasesweep.engine.fingerprints import (
     _experiment_semantic_fingerprint,
+    _inherited_override_payload,
+    _judge_identity,
     _recorded_config_matches,
     _verify_recorded_identity,
     addressed_study_names,
+    phase_study_name,
 )
 from phasesweep.engine.growth import recorded_growth
+from phasesweep.engine.guards import addressed_study
 from phasesweep.engine.ledger import (
     ValidatedLedger,
     log_storage_read_failure,
+    phase_trial_stats,
     read_every_phase_study,
-    read_phase_studies,
     read_trial_stats,
     resolved_ledger_path,
     validate_ledger,
@@ -70,6 +74,7 @@ from phasesweep.engine.paths import (
     _generation_summary_path,
     _generation_winner_path,
 )
+from phasesweep.engine.phase import _judge_recorded_phase, _replay_met_target
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.publication import PublicationPointer, _resolve_publication_pointer
 from phasesweep.engine.publication_validation import ValidatedWinner, _parse_phase_plan
@@ -106,6 +111,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     TRIAL_STATE_NAMES,
     PublicationState,
+    Winner,
     WinnerSource,
     _parse_winner_source,
     _parsed_trial_outcome,
@@ -125,6 +131,7 @@ from phasesweep.errors import (
     PERSISTENT_STUDY_KEEPS_TRIALS,
     START_AGAIN_STEP,
     OperatorAction,
+    PhaseSweepError,
 )
 from phasesweep.evidence.models import EXTRACTOR_KINDS
 from phasesweep.runtime.json import JsonObject, JsonValue, float_or_none, json_object
@@ -918,7 +925,7 @@ def _read_status(
 ) -> tuple[
     EngineStatus,
     PublicationPointer,
-    dict[str, str],
+    dict[str, optuna.Study],
     dict[str, PhaseRefusal],
     int,
 ]:
@@ -937,7 +944,7 @@ def _read_status(
         is bound to a different storage ledger or experiment.
     :raises ValueError: If ``generation_id`` or ``trial_generation_id`` is not a safe
         generation name.
-    :return tuple[EngineStatus, PublicationPointer, dict[str, str], dict[str, PhaseRefusal], int]:
+    :return tuple[EngineStatus, PublicationPointer, dict[str, optuna.Study], dict[str, PhaseRefusal], int]:
         The status payload, its pointer resolution, the study each phase's counts were read
         from (:func:`_latest_study_names`), any pending fill or refusal
         (:func:`_pending_rereads`), and the count of unsettled trials across those phases.
@@ -968,12 +975,25 @@ def _read_status(
         if experiment.persistent and published is not None
         else {}
     )
-    study_names = _latest_study_names(experiment, publication, current_generation_id)
+    latest_names = _latest_study_names(experiment, publication, current_generation_id)
     # Captured after the pointer is resolved: a publication tells its trials
     # before it moves the pointer, so this capture holds every trial the
     # pointer's generation published.
-    phase_stats = read_trial_stats(ledger, published_trials, study_names)
+    phase_stats = read_trial_stats(ledger, published_trials, latest_names)
     every = {name: stats.studies for name, stats in phase_stats.items()}
+    replay_names = _replay_study_names(experiment, every)
+    study_names = {**latest_names, **replay_names}
+    addressed = {
+        phase: study
+        for phase, name in study_names.items()
+        if (study := addressed_study(every, phase, name)) is not None
+    }
+    for phase, name in replay_names.items():
+        if name != latest_names.get(phase) and phase_stats[phase].available:
+            phase_stats[phase] = replace(
+                phase_trial_stats(addressed.get(phase), experiment, every[phase]),
+                published_trial_available=phase_stats[phase].published_trial_available,
+            )
     pending = _pending_rereads(experiment, every, study_names)
 
     # Prefer the represented generation's recorded metric semantics; use config as fallback.
@@ -1091,7 +1111,7 @@ def _read_status(
             phase_payload["winner_config_matches_current"] = (
                 None if view is None else view.config_matches_current
             )
-    return status, publication, study_names, pending, _unsettled_trial_count(every.values())
+    return status, publication, addressed, pending, _unsettled_trial_count(every.values())
 
 
 def _unsettled_trial_count(phase_studies: Iterable[Sequence[optuna.Study]]) -> int:
@@ -1123,8 +1143,8 @@ def _latest_study_names(
 
     The latest winner of a phase is the current generation's, when its namespace exists and
     the publication is usable, else the published one, as a ``latest`` read represents them.
-    These are the winners the next run's phases inherit, so the counts describe the study it
-    continues. A phase whose parent has no winner yet addresses none.
+    They supply a fallback when the current config's parent study cannot yet replay its winner.
+    A phase whose parent has no winner yet addresses none.
 
     :param Experiment experiment: The experiment whose phases are addressed.
     :param PublicationPointer publication: The read's one publication resolution.
@@ -1154,6 +1174,60 @@ def _latest_study_names(
                 {str(key): value for key, value in overrides.items()}
             )
     return addressed_study_names(experiment, winners)
+
+
+def _replay_study_names(
+    experiment: Experiment, every: Mapping[str, Sequence[optuna.Study]]
+) -> dict[str, str]:
+    """Resolve phases whose parents can already replay under the inspected config.
+
+    Just as a dry run would, select from the captured trials before using a winner's inherited
+    values to address a child. If a parent needs more work, callers use the latest winner's
+    address for counts and can still describe a conditional re-read.
+
+    :param Experiment experiment: Config the next run would use.
+    :param Mapping[str, Sequence[optuna.Study]] every: Phase studies from one journal capture.
+    :return dict[str, str]: Addresses established without launching or re-reading trials.
+    """
+    needed = {parent for phase in experiment.phases for parent in phase.inherits}
+    winners: dict[str, Winner] = {}
+    names: dict[str, str] = {}
+    for phase in experiment.phases:
+        if any(parent not in winners for parent in phase.inherits):
+            continue
+        inherited_winners = {parent: winners[parent] for parent in phase.inherits}
+        inherited = _inherited_override_payload(phase, inherited_winners)
+        name = phase_study_name(experiment, phase, inherited)
+        names[phase.name] = name
+        if phase.name not in needed:
+            continue
+        study = addressed_study(every, phase.name, name)
+        if study is None:
+            continue
+        trials = study.get_trials(deepcopy=False)
+        if any(trial.state == optuna.trial.TrialState.RUNNING for trial in trials):
+            continue
+        try:
+            resumed = _judge_recorded_phase(
+                experiment,
+                phase,
+                inherited_winners,
+                study,
+                policy_state=_load_phase_policy_state(study, experiment),
+                phase_fingerprint=_judge_identity(study, experiment, phase, inherited).fingerprint,
+                verify_evidence=False,
+                emit_advisories=False,
+            )
+            if isinstance(resumed, Winner):
+                winners[phase.name] = resumed
+            elif _finished_trial_count(trials) >= phase.n_trials:
+                winners[phase.name] = _replay_met_target(
+                    experiment, phase, inherited_winners, study, resumed, verify_evidence=False
+                )
+        except PhaseSweepError:
+            # Normal status diagnostics handle the refusal using this study's captured rows.
+            continue
+    return names
 
 
 @dataclass(frozen=True)
@@ -1376,8 +1450,7 @@ def _pending_rereads(
 
 def _phase_refusals(
     experiment: Experiment,
-    ledger: ValidatedLedger,
-    study_names: Mapping[str, str],
+    studies: Mapping[str, optuna.Study],
     pending: Mapping[str, PhaseRefusal],
 ) -> tuple[dict[str, PhaseRefusal], dict[str, tuple[int, ...]]]:
     """Give the refusal a run would meet at each phase, in the study it would address.
@@ -1393,9 +1466,7 @@ def _phase_refusals(
 
     :param Experiment experiment: Current config, which decides whether a recorded abort is
         retired.
-    :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
-    :param Mapping[str, str] study_names: The study each phase addresses under the latest
-        winners of the status read's own pointer capture (:func:`_latest_study_names`).
+    :param Mapping[str, optuna.Study] studies: Addressed studies from the status read's capture.
     :param Mapping[str, PhaseRefusal] pending: :func:`_pending_rereads` from the same read.
     :return tuple[dict[str, PhaseRefusal], dict[str, tuple[int, ...]]]: Refusals or invalid
         policy diagnostics by phase name, and the finished trials whose directory is gone in
@@ -1403,14 +1474,10 @@ def _phase_refusals(
     """
     if not experiment.persistent:
         return {}, {}
-    try:
-        studies = read_phase_studies(ledger, study_names)
-    except StudyStorageUnavailableError:
-        return {}, {}
     refusals: dict[str, PhaseRefusal] = dict(pending)
     pruned: dict[str, tuple[int, ...]] = {}
     for phase in experiment.phases:
-        study = studies[phase.name]
+        study = studies.get(phase.name)
         if study is None or phase.name in refusals:
             continue
         refusal: PhaseRefusal | None
@@ -1431,28 +1498,21 @@ def _phase_refusals(
 
 
 def unpublished_winner_step(
-    experiment: Experiment, ledger: ValidatedLedger, study_names: Mapping[str, str]
-) -> UnpublishedWinnerStep | None:
+    experiment: Experiment, studies: Mapping[str, optuna.Study]
+) -> UnpublishedWinnerStep:
     """Give one publication remedy from a phase without a feasible winner, for an idle experiment.
 
     A recorded abort or failure streak, or a study whose own config changed, is
     :func:`inspect_status`' refusals to report.
 
     :param Experiment experiment: Current config used to inspect durable phase policy.
-    :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
-    :param Mapping[str, str] study_names: The study each phase addresses, from the same status
-        read (:attr:`StatusInspection.study_names`).
-    :return UnpublishedWinnerStep | None: The recorded cause and remedy, the rerun instruction,
-        or ``None`` if storage is unreadable.
+    :param Mapping[str, optuna.Study] studies: Addressed studies from the status read's capture.
+    :return UnpublishedWinnerStep: The recorded cause and remedy or the rerun instruction.
     """
     if not experiment.persistent:
         return UnpublishedWinnerStep(None, START_AGAIN_STEP)
-    try:
-        studies = read_phase_studies(ledger, study_names)
-    except StudyStorageUnavailableError:
-        return None
     for phase in experiment.phases:
-        study = studies[phase.name]
+        study = studies.get(phase.name)
         if study is None:
             continue
         trials = study.get_trials(deepcopy=False)
@@ -1510,7 +1570,7 @@ class StatusInspection:
     payload: JsonObject
     refusals: dict[str, PhaseRefusal]
     #: The study each phase's counts and refusal were read from, by phase name.
-    study_names: dict[str, str]
+    studies: dict[str, optuna.Study]
     #: Finished trials whose directory is gone, by phase name, for phases that have any.
     pruned: dict[str, tuple[int, ...]]
     #: RUNNING trials in every study of the configured phases.
@@ -1532,28 +1592,28 @@ def inspect_status(experiment: Experiment, ledger: ValidatedLedger) -> StatusIns
     :return StatusInspection: The status payload, the refusals by phase name, the study each
         phase was read from, and the trials whose directory is gone.
     """
-    payload, study_names, pending, unsettled = _experiment_status(
+    payload, studies, pending, unsettled = _experiment_status(
         experiment, generation_id=None, ledger=ledger
     )
-    refusals, pruned = _phase_refusals(experiment, ledger, study_names, pending)
-    return StatusInspection(payload, refusals, study_names, pruned, unsettled)
+    refusals, pruned = _phase_refusals(experiment, studies, pending)
+    return StatusInspection(payload, refusals, studies, pruned, unsettled)
 
 
 def _experiment_status(
     experiment: Experiment, *, generation_id: str | None, ledger: ValidatedLedger | None
-) -> tuple[JsonObject, dict[str, str], dict[str, PhaseRefusal], int]:
+) -> tuple[JsonObject, dict[str, optuna.Study], dict[str, PhaseRefusal], int]:
     """Build the :func:`experiment_status` payload and keep the studies it counted.
 
     :param Experiment experiment: Parsed experiment config to inspect.
     :param str | None generation_id: Optional generation pin, disabling published fallback.
     :param ValidatedLedger | None ledger: Handle the caller already validated, or ``None``.
-    :return tuple[JsonObject, dict[str, str], dict[str, PhaseRefusal], int]: The payload, the study
+    :return tuple[JsonObject, dict[str, optuna.Study], dict[str, PhaseRefusal], int]: The payload, the study
         each phase's counts were read from, by phase name, from the same pointer resolution,
         the phases waiting to be filled from kept evidence (:func:`_pending_rereads`), and
         the count of unsettled trials across configured phases.
     """
     require_study(experiment)
-    status, _, study_names, pending, unsettled = _read_status(
+    status, _, studies, pending, unsettled = _read_status(
         experiment,
         generation_id=generation_id,
         trial_generation_id=None,
@@ -1589,7 +1649,7 @@ def _experiment_status(
         from phasesweep.tracking.publication import delivery_status
 
         payload["tracking_delivery"] = delivery_status(experiment)
-    return json_object(payload), study_names, pending, unsettled
+    return json_object(payload), studies, pending, unsettled
 
 
 def _recorded_count(value: object) -> int | None:
@@ -1812,7 +1872,7 @@ def read_trial_tables(
 
     Resolve publication once before capturing trials; winner marks identify the
     requested generation, or that publication by default. Each phase's rows come from the study
-    its latest parent winners address, as status counts them (:func:`_latest_study_names`).
+    replayed or latest parent winners address, as status counts them.
     Absent studies and in-memory ledgers have no rows. Unreadable phases are reported unavailable. A phase whose recorded abort or
     failure streak would refuse a run carries that refusal, read from the same study snapshot as
     its trials; one whose failure-policy state cannot be replayed keeps its rows and carries
@@ -1852,6 +1912,7 @@ def read_trial_tables(
     pending: Mapping[str, PhaseRefusal] = {}
     try:
         every = read_every_phase_study(ledger, [phase.name for phase in experiment.phases])
+        study_names.update(_replay_study_names(experiment, every))
         pending = _pending_rereads(experiment, every, study_names)
     except StudyStorageUnavailableError as exc:
         unreadable = exc

@@ -90,6 +90,7 @@ __all__ = [
     "open_phase_study",
     "open_preview_study",
     "open_registry_study",
+    "phase_trial_stats",
     "phase_trials",
     "read_every_phase_study",
     "read_phase_studies",
@@ -765,7 +766,7 @@ def _published_history_retained(
     )
 
 
-def _phase_trial_stats(
+def phase_trial_stats(
     study: optuna.Study | None, experiment: Experiment, studies: tuple[optuna.Study, ...]
 ) -> _PhaseTrialStats:
     """Read the addressed study's progress and count each generation's producing rows.
@@ -1056,7 +1057,7 @@ def read_trial_stats(
                 snapshot, ledger.experiment_name, phase.name, addressed=addressed
             )
             stats[phase.name] = replace(
-                _phase_trial_stats(addressed, ledger.experiment, phase_studies),
+                phase_trial_stats(addressed, ledger.experiment, phase_studies),
                 published_trial_available=_published_history_retained(
                     snapshot,
                     published_trials.get(phase.name),
