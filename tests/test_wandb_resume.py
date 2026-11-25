@@ -14,6 +14,7 @@ import phasesweep.runtime.reaper as reaper
 from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Metric
 from phasesweep.engine.evidence import _verify_winner_evidence
+from phasesweep.engine.paths import _attempts_dir
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -217,4 +218,68 @@ def test_recovery_after_a_runner_kill_reads_the_reruns_trial_run(
         assert capture["run_id"] == opener
     finally:
         if reader is not None:
+            reaper.cleanup_stale_trial_process(reader, grace_seconds=0.2)
+
+
+@pytest.mark.integration
+def test_recovery_stops_the_reader_of_a_killed_reread(
+    tmp_path: Path, wandb_worker_sdk: Callable[[str], None]
+) -> None:
+    """The next run stops the registered reader and resumes the fill without training."""
+    tracker = _fake_wandb(wandb_worker_sdk, tmp_path)
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        from pathlib import Path
+        with Path({str(tmp_path / "launches")!r}).open("a") as out:
+            print("launch", file=out)
+        """,
+    )
+    extractor = WandbExtractor(
+        type="wandb",
+        base_url="https://example.test",
+        entity="e",
+        project="p",
+        metric_key="x",
+        poll_seconds=0.05,
+        timeout_seconds=30,
+    )
+    original = make_experiment(
+        persistent=tmp_path, trainer=trainer, metric=Metric(extractor=extractor), n_trials=1
+    )
+    run_experiment(original)
+    (trial,) = phase_trials(original)
+    source_slot = _trial_attempt_dir(trial)
+    assert source_slot is not None
+    source_identity = reaper.read_stale_process_identity(
+        source_slot, expected_attempt_id=trial.user_attrs[ATTEMPT_ID_ATTR]
+    )
+    changed = original.model_copy(update={"metric": Metric(goal="maximize", extractor=extractor)})
+    config = write_experiment_config(tmp_path / "changed.yaml", changed)
+    tracker.mode.write_text("hang")
+    reader = None
+    try:
+        with runner_once(config, tracker.hung):
+            registry = list(_attempts_dir(original).glob("*.json"))
+            if registry:
+                (entry_path,) = registry
+                entry = json.loads(entry_path.read_text())
+                worker_path = Path(entry["attempt_dir"])
+                worker_id = entry["attempt_id"]
+            else:
+                worker_path = source_slot
+                worker_id = trial.user_attrs[ATTEMPT_ID_ATTR]
+            reader = reaper.read_stale_process_identity(worker_path, expected_attempt_id=worker_id)
+        tracker.mode.write_text("logged")
+        assert run_experiment(changed)["p"].metric == 1
+        assert reaper.stale_trial_process_decision(reader).action == "gone"
+        assert (
+            reaper.read_stale_process_identity(
+                source_slot, expected_attempt_id=trial.user_attrs[ATTEMPT_ID_ATTR]
+            )
+            == source_identity
+        )
+        assert (tmp_path / "launches").read_text().splitlines() == ["launch"]
+    finally:
+        if reader is not None and reaper.stale_trial_process_decision(reader).action != "gone":
             reaper.cleanup_stale_trial_process(reader, grace_seconds=0.2)

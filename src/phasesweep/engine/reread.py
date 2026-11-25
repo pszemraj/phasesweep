@@ -18,6 +18,8 @@ current ledger, including trials the source finished while the fill was stopped.
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import ClassVar
@@ -32,9 +34,11 @@ from phasesweep.engine.attempts import (
     read_finished_attempt,
 )
 from phasesweep.engine.errors import (
+    PhaseTimeoutError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     WinnerIntegrityError,
+    phase_timeout,
 )
 from phasesweep.engine.evidence import _earlier_attempts
 from phasesweep.engine.fingerprints import (
@@ -99,6 +103,8 @@ from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.evidence.baseline import read_evidence_baseline
 from phasesweep.runtime.json import JsonObject, json_object
 from phasesweep.runtime.terminal import plural
+
+log = logging.getLogger(__name__)
 
 #: The source's identity, root, schema and any earlier fill belong to the source study.
 _NOT_COPIED = frozenset(
@@ -302,6 +308,9 @@ def _reread_trial(
     producing: dict[str, Experiment | WinnerIntegrityError],
     attempts: Mapping[str, ProducingAttempt],
     launches: Mapping[str, Sequence[DirectoryLaunch]],
+    *,
+    deadline: float | None,
+    reader_generation_id: str,
 ) -> optuna.trial.FrozenTrial | None:
     """Read one finished trial again under the current settings, as the trial a fill writes.
 
@@ -316,6 +325,9 @@ def _reread_trial(
         generation, filled as they are loaded.
     :param Mapping[str, ProducingAttempt] attempts: Producing rows by physical attempt ID.
     :param Mapping[str, Sequence[DirectoryLaunch]] launches: Physical launches by directory.
+    :param float | None deadline: Absolute invocation deadline.
+    :param str reader_generation_id: Generation running the reader.
+    :raises PhaseTimeoutError: The invocation deadline stopped a read.
     :raises TrackingTargetUnavailableError: The tracker gave no answer, so the verdict waits for
         a later run; the trials already copied stay and the fill resumes.
     :return optuna.trial.FrozenTrial | None: The trial to write, or ``None`` when the trial is
@@ -360,9 +372,13 @@ def _reread_trial(
             current=experiment,
             trainer_duration=seconds,
             baseline=baseline,
+            deadline=deadline,
+            reader_generation_id=reader_generation_id,
         )
     except ValueError as exc:
         result = _failed_trial(rc=0, duration=seconds, failure_reason=str(exc))
+    if result.deadline_exhausted:
+        raise _fill_timeout(experiment, phase)
     if result.evidence_unreadable and result.failure_reason is not None:
         raise _pending_evidence_refusal({record.attempt_id: result.failure_reason})
     sheet = _AttrSheet(dict(trial.user_attrs))
@@ -449,13 +465,29 @@ def _copy_study_attrs(
     return (source_target, accepted) if accepted < source_target else None
 
 
+def _fill_timeout(experiment: Experiment, phase: Phase) -> PhaseTimeoutError:
+    """Describe a run budget that stopped the fill before it committed all the rows.
+
+    :param Experiment experiment: The invocation whose run deadline expired.
+    :param Phase phase: The phase reading its kept evidence.
+    :return PhaseTimeoutError: The run's timeout refusal and resume instructions.
+    """
+    return phase_timeout(
+        f"Phase {phase.name!r} hit its run deadline while re-reading kept evidence. "
+        "The study keeps the rows already copied.",
+        scope="run",
+        experiment=experiment,
+    )
+
+
 def fill_study(
     experiment: Experiment,
     phase: Phase,
     target: optuna.Study,
     source: FillSource,
-    *,
     other_studies: Sequence[optuna.Study],
+    run_deadline: float | None,
+    reader_generation_id: str,
 ) -> FillResult:
     """Fill a phase's addressed study from its source, re-reading every finished trainer.
 
@@ -471,11 +503,21 @@ def fill_study(
     :param optuna.Study target: The addressed study, writable.
     :param FillSource source: The study to fill from (:func:`fill_source`).
     :param Sequence[optuna.Study] other_studies: Every study of the phase except the target.
+    :param float | None run_deadline: Absolute invocation deadline.
+    :param str reader_generation_id: The generation that owns any supervised tracker work.
+    :raises PhaseTimeoutError: The deadline stopped the fill. Committed rows remain reusable.
     :raises StudySchemaMismatchError: The target holds trials the source does not, or the
         source's accepted partial decision is malformed.
     :raises TrackingTargetUnavailableError: A tracker gave no answer for a finished trial.
     :return FillResult: What the fill wrote in this call.
     """
+
+    def require_time() -> None:
+        """Refuse to start or commit fill work after the invocation's deadline."""
+        if run_deadline is not None and time.monotonic() >= run_deadline:
+            raise _fill_timeout(experiment, phase)
+
+    require_time()
     end = len(source.trials)
     while end > 0 and (
         (trial := source.trials[end - 1]).state == optuna.trial.TrialState.WAITING
@@ -507,14 +549,36 @@ def fill_study(
     producing: dict[str, Experiment | WinnerIntegrityError] = {}
     rereads = changed = 0
     for trial in trials[len(present) :]:
-        reread = _reread_trial(experiment, phase, trial, by_number, producing, attempts, launches)
+        require_time()
+        if trial.number in source.reread_trials:
+            log.info(
+                "Phase %s re-reading trial %d (%d/%d).",
+                phase.name,
+                trial.number,
+                rereads + 1,
+                source.rereads,
+            )
+        reread = _reread_trial(
+            experiment,
+            phase,
+            trial,
+            by_number,
+            producing,
+            attempts,
+            launches,
+            deadline=run_deadline,
+            reader_generation_id=reader_generation_id,
+        )
+        require_time()
         if reread is not None:
             rereads += 1
             changed += (reread.state, reread.value) != (trial.state, trial.value)
         target.add_trial(
             _sampling_trial_for_reread(trial if reread is None else reread, target.sampler)
         )
+    require_time()
     adjusted_target = _copy_study_attrs(phase, target, source)
+    require_time()
     _stamp_identity(target, _reread_record(source.record, reading_settings(experiment, phase)))
     return FillResult(len(trials) - len(present), rereads, changed, adjusted_target)
 

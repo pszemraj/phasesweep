@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -292,7 +292,7 @@ _TRACKING_RECEIPT_FIELDS = frozenset(
 def _register_tracking_operation(
     experiment: Experiment, *, operation_id: str, generation_id: str, directory: Path
 ) -> None:
-    """Register a supervised publisher with no study or Optuna trial.
+    """Register a supervised tracker operation with no active Optuna trial.
 
     :param Experiment experiment: Local experiment namespace.
     :param str operation_id: Process identity.
@@ -1198,6 +1198,8 @@ def read_finished_attempt(
     current: Experiment,
     trainer_duration: float,
     baseline: EvidenceBaseline,
+    deadline: float | None = None,
+    reader_generation_id: str | None = None,
 ) -> tuple[TrialResult, str]:
     """Read a finished attempt's kept evidence after the fact, through the live extraction path.
 
@@ -1217,11 +1219,15 @@ def read_finished_attempt(
     :param Experiment current: The invocation's configuration, for its MLflow polling controls.
     :param float trainer_duration: The trainer's recorded wall-clock seconds.
     :param EvidenceBaseline baseline: The attempt's evidence baseline.
+    :param float | None deadline: Absolute deadline for evidence extraction, defaults to None.
+    :param str | None reader_generation_id: Generation re-reading a terminal trial, which
+        registers its own remote reader. Recovery of a RUNNING trial already owns the attempt slot.
     :raises ProcessCleanupUncertainError: The attempt records an unusable trial directory, so
         the run its trial logs to cannot be named.
     :raises StudyStorageUnavailableError: The trial lacks its recorded trainer input or overrides.
     :return tuple[TrialResult, str]: The extraction result and the trial's recorded overrides.
     """
+    from phasesweep.config.models import _wandb_query
     from phasesweep.engine.trial import (
         ExecutedTrial,
         _environment_identity,
@@ -1232,6 +1238,7 @@ def read_finished_attempt(
     from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
     from phasesweep.evidence.models import JsonEnvelopeExtractor
     from phasesweep.runtime.process import ProcessResult
+    from phasesweep.tracking.session import tracking_operation
 
     if record.trial_dir is None or record.generation_id is None:
         raise StudyStorageUnavailableError(
@@ -1290,11 +1297,19 @@ def read_finished_attempt(
         ),
         earlier_attempts=history.earlier,
     )
-    result = extract_trial_result(
-        experiment=reading,
-        executed=ExecutedTrial(ctx, ProcessResult(0, False, -1, trainer_duration)),
-        gates=gates,
-    )
+    worker: contextlib.AbstractContextManager[tuple[str, Path] | None] = contextlib.nullcontext()
+    if reader_generation_id is not None and (ctx.mlflow_query or _wandb_query(reading, gates)):
+        worker = tracking_operation(current, reader_generation_id)
+    with worker as process_slot:
+        result = extract_trial_result(
+            experiment=reading,
+            executed=ExecutedTrial(
+                replace(ctx, worker_process=process_slot),
+                ProcessResult(0, False, -1, trainer_duration),
+            ),
+            gates=gates,
+            deadline=deadline,
+        )
     return result, overrides_json
 
 

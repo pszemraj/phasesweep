@@ -17,9 +17,10 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config.models import Constraint, Experiment, Metric, Phase
+from phasesweep.config.models import Constraint, Experiment, Metric, Observation, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Repeats, Sampler
 from phasesweep.engine import reread as reread_ops
+from phasesweep.engine import trial as trial_ops
 from phasesweep.engine.errors import (
     PhaseTimeoutError,
     PublishedStudyMissingError,
@@ -37,12 +38,14 @@ from phasesweep.engine.state import (
     FAILURE_REASON_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     PHASE_DECISION_ATTR,
+    PHASE_IDENTITY_ATTR,
     PHASE_RECOVERY_ATTR,
     RERUN_OF_ATTR,
     TRIAL_DIR_ATTR,
     _trial_attempt_dir,
 )
 from phasesweep.evidence.baseline import EVIDENCE_BASELINE_FILE
+from phasesweep.evidence.evaluation import TrialContext
 from phasesweep.evidence.models import (
     JsonEnvelopeExtractor,
     JsonExtractor,
@@ -1366,3 +1369,41 @@ def test_an_interrupted_fill_reuses_new_source_trials_when_studies_grow(
     assert [t.user_attrs[ATTEMPT_ID_ATTR] for t in filled] == [
         t.user_attrs[ATTEMPT_ID_ATTR] for t in source_trials
     ]
+
+
+def test_reread_keeps_rows_committed_before_its_run_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The expired read stays pending, and the next invocation skips the committed row."""
+    trainer, launches = _counting_trainer(tmp_path)
+    run_experiment(_experiment(tmp_path, trainer, _metric("loss")))
+    changed = _experiment(tmp_path, trainer, _metric("acc"))
+    bounded = changed.model_copy(update={"timeout_seconds_per_run": 60.0})
+    real_time = time.monotonic
+    late_by = 0.0
+    reads: list[int] = []
+
+    def observe(
+        ctx: TrialContext, observations: list[Observation], *, deadline: float | None
+    ) -> dict[str, float]:
+        nonlocal late_by
+        reads.append(ctx.trial_id)
+        if len(reads) == 2 and deadline is not None:
+            late_by = deadline - real_time() + 1
+        return {}
+
+    with monkeypatch.context() as clock:
+        clock.setattr(time, "monotonic", lambda: real_time() + late_by)
+        clock.setattr(trial_ops, "_observe", observe)
+        with pytest.raises(PhaseTimeoutError, match="run deadline while re-reading kept evidence"):
+            run_experiment(bounded)
+        assert reads == [0, 1]
+
+    study = phase_study_of(changed)
+    assert [trial.number for trial in study.get_trials()] == [0]
+    assert PHASE_IDENTITY_ATTR not in study.user_attrs
+    reads.clear()
+    monkeypatch.setattr(trial_ops, "_observe", observe)
+    assert run_experiment(changed)["p"].metric == 1
+    assert reads == [1, 2]
+    assert _launches(launches) == 3

@@ -587,6 +587,16 @@ class TrialContext:
     # (generation ID, attempt ID) of the earlier attempts that trained in trial_dir, oldest
     # first, whose tracker histories are the start of this trial's.
     earlier_attempts: tuple[tuple[str, str], ...] = ()
+    # Reading a terminal attempt uses a separately registered worker process.
+    worker_process: tuple[str, Path] | None = None
+
+    @property
+    def process_slot(self) -> tuple[str, Path]:
+        """Return the process identity and directory a tracker worker may claim.
+
+        :return tuple[str, Path]: The registered reader slot, or the active attempt's slot.
+        """
+        return self.worker_process or (self.attempt_id, self.attempt_dir)
 
 
 def _extract_json(
@@ -978,13 +988,14 @@ def _capture_wandb(
                     launched_at = read_evidence_baseline(directory).launched_at
                     if launched_at is not None:
                         earlier_launches.append(launched_at)
+            worker_id, worker_dir = ctx.process_slot
             capture = poll_wandb_summary(
                 base_url=destination.base_url,
                 entity=destination.entity,
                 project=destination.project,
                 run_id=run_id,
-                attempt_id=ctx.attempt_id,
-                attempt_dir=ctx.attempt_dir,
+                attempt_id=worker_id,
+                attempt_dir=worker_dir,
                 poll_seconds=source.poll_seconds,
                 timeout_seconds=source.timeout_seconds,
                 required_keys=query.numeric_keys,
@@ -1137,13 +1148,14 @@ def locate_objective_position(
         return
     progress = provenance["source"]["evaluation"]["progress"]
     capture = provenance["remote_capture"]
+    worker_id, worker_dir = ctx.process_slot
     progress["value"] = locate_wandb_position(
         base_url=capture["base_url"],
         entity=capture["entity"],
         project=capture["project"],
         run_id=ctx.wandb_run_id,
-        attempt_id=ctx.attempt_id,
-        attempt_dir=ctx.attempt_dir,
+        attempt_id=worker_id,
+        attempt_dir=worker_dir,
         poll_seconds=cfg.poll_seconds,
         timeout_seconds=cfg.timeout_seconds,
         metric_key=cfg.metric_key,
@@ -1238,6 +1250,7 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
             raise ValueError("MLflow binding belongs to a different attempt or target.")
         earlier = _earlier_mlflow_bindings(ctx, binding)
         stop = time.monotonic() + ctx.mlflow_settings["timeout_seconds"]
+        worker_id, worker_dir = ctx.process_slot
         retrieved = request_operation(
             {
                 "action": "capture",
@@ -1247,8 +1260,8 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
                 "query": ctx.mlflow_query,
                 "timeout_at": stop,
             },
-            operation_id=ctx.attempt_id,
-            directory=ctx.attempt_dir,
+            operation_id=worker_id,
+            directory=worker_dir,
             environment=ctx.mlflow_environment or {},
             deadline=min(stop, deadline) if deadline is not None else stop,
         )
