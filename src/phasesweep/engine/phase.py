@@ -1019,7 +1019,9 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         )
         reusing_directory = directory.opener_number != trial.number
         earlier_attempts = (
-            earlier_directory_launches((run.study, *run.other_studies), directory.path)
+            earlier_directory_launches(
+                (run.study, *run.other_studies), directory.path, trials, trials[trial.number]
+            )
             if reusing_directory
             else ()
         )

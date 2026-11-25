@@ -112,7 +112,7 @@ def _selection_candidate_identity(trial: optuna.trial.FrozenTrial) -> tuple[str,
 def _earlier_attempts(
     trials: Mapping[int, optuna.trial.FrozenTrial], trial: optuna.trial.FrozenTrial
 ) -> tuple[tuple[str, str], ...]:
-    """Name the earlier attempts that trained in the directory a rerun continues.
+    """Name the earlier attempts that recorded the directory a rerun continues.
 
     :param Mapping[int, optuna.trial.FrozenTrial] trials: The study's trials by number.
     :param optuna.trial.FrozenTrial trial: A trial continuing its source's directory, or

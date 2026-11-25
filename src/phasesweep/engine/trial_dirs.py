@@ -166,12 +166,13 @@ class DirectoryHistory(NamedTuple):
 
 
 class DirectoryLaunch(NamedTuple):
-    """A physical attempt and the evidence of when it started."""
+    """A directory's recorded attempt and what is known about its start."""
 
     attempt_id: str
     generation: str
     epoch: float | None
     order: float
+    may_have_started: bool
 
 
 def directory_launches(
@@ -180,8 +181,7 @@ def directory_launches(
     """Index the physical launches sharing each training directory.
 
     The opener always sorts first. The launch baseline provides the epoch of each reuse.
-    An attempt that reached RUNNING before starting has no shared evidence if its lifecycle
-    records that it never launched.
+    An attempt that never started can belong to the rerun's ancestry without writing evidence.
 
     :param Mapping[str, ProducingAttempt] attempts: Producing rows across the phase's studies.
     :param Path | None directory: When supplied, inspect only this directory's launches.
@@ -198,6 +198,7 @@ def directory_launches(
             continue
         if path is None or not isinstance(gen, str) or (directory and path.name != directory.name):
             continue
+        may_have_started = True
         if type(row.user_attrs.get(RETURN_CODE_ATTR)) is not int:
             try:
                 lifecycle = _trial_lifecycle(row)
@@ -206,10 +207,12 @@ def directory_launches(
             if lifecycle is not None and (
                 lifecycle.state == "allocated" or lifecycle.ended_by == "not_started"
             ):
-                continue
+                may_have_started = False
         if identity == opener:
-            epoch = float("-inf")
-            launches[path.name].append(DirectoryLaunch(identity, gen, epoch, epoch))
+            opener_epoch = float("-inf")
+            launches[path.name].append(
+                DirectoryLaunch(identity, gen, opener_epoch, opener_epoch, may_have_started)
+            )
             continue
         try:
             epoch = read_evidence_baseline(_attempt_dir(path.parent, identity)).launched_at
@@ -218,7 +221,9 @@ def directory_launches(
         start = row.datetime_start
         fallback = 0.0 if start is None else start.timestamp()
         launches[path.name].append(
-            DirectoryLaunch(identity, gen, epoch, fallback if epoch is None else epoch)
+            DirectoryLaunch(
+                identity, gen, epoch, fallback if epoch is None else epoch, may_have_started
+            )
         )
     return launches
 
@@ -232,14 +237,14 @@ def directory_history(
 ) -> DirectoryHistory:
     """Resolve earlier attempts and the next reuse of a shared trainer directory.
 
-    A known ancestor without an epoch is still earlier. An undated non-ancestor can
-    prevent attribution of a previously finished attempt's shared evidence.
+    An explicit ancestor is known to be earlier, even if it stopped before launch. An
+    unrelated attempt can affect shared evidence only if it may have started.
 
     :param Sequence[DirectoryLaunch] launches: One directory's physical launch records.
     :param str | None attempt_id: Existing attempt to attribute, or None before a new launch.
     :param float | None launched_at: Existing reused attempt's launch epoch.
-    :param Sequence[tuple[str, str]] ancestors: Proven earlier generations and attempt IDs,
-        used when an ancestor's launch epoch is unavailable.
+    :param Sequence[tuple[str, str]] ancestors: Earlier generations and attempt IDs from
+        the recorded rerun chain.
     :return DirectoryHistory: Earlier launches in order and cutoff for other shared evidence.
     """
     known_earlier = {identity for _, identity in ancestors}
@@ -247,11 +252,15 @@ def directory_history(
     later: list[float] = []
     undated: list[str] = []
     for launch in launches:
-        identity, _, epoch, _ = launch
+        identity, epoch = launch.attempt_id, launch.epoch
         if identity == attempt_id:
             continue
-        if epoch is None:
-            if attempt_id is None or identity in known_earlier:
+        if identity in known_earlier:
+            earlier.append(launch)
+        elif not launch.may_have_started:
+            continue
+        elif epoch is None:
+            if attempt_id is None:
                 earlier.append(launch)
             else:
                 undated.append(identity)
@@ -278,16 +287,25 @@ def directory_history(
 
 
 def earlier_directory_launches(
-    studies: Sequence[Study], directory: Path
+    studies: Sequence[Study],
+    directory: Path,
+    trials: Mapping[int, FrozenTrial],
+    trial: FrozenTrial,
 ) -> tuple[tuple[str, str], ...]:
     """Return the launch order before a new attempt starts in this directory.
 
     :param Sequence[Study] studies: All studies that can share the directory.
     :param Path directory: Trainer directory the new attempt will continue.
+    :param Mapping[int, FrozenTrial] trials: The current study's trials by number.
+    :param FrozenTrial trial: Trial about to launch, with its recorded rerun source.
     :return tuple[tuple[str, str], ...]: Earlier generation and attempt IDs in launch order.
     """
+    from phasesweep.engine.evidence import _earlier_attempts
+
     launches = directory_launches(producing_attempts(studies), directory=directory)
-    return directory_history(launches.get(directory.name, ())).earlier
+    return directory_history(
+        launches.get(directory.name, ()), ancestors=_earlier_attempts(trials, trial)
+    ).earlier
 
 
 def standing_repeat_attempts(trials: Sequence[FrozenTrial]) -> list[FrozenTrial]:
