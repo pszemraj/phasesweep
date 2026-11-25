@@ -8,6 +8,7 @@ import re
 import shutil
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 import optuna
 import pytest
@@ -590,10 +591,18 @@ def test_reread_checks_losing_candidates_before_publication(tmp_path: Path) -> N
         update={"metric": experiment.metric.model_copy(update={"goal": "maximize"})}
     )
 
-    with pytest.raises(
-        TrialEvidenceMissingError, match=r"trial 1 .* is missing its 'command.txt' audit artifact"
+    with (
+        patch("phasesweep.engine.reread._stamp_identity", side_effect=RuntimeError("after rows")),
+        pytest.raises(RuntimeError, match="after rows"),
     ):
         run_experiment(reread)
+
+    for dry_run in (True, False):
+        with pytest.raises(
+            TrialEvidenceMissingError,
+            match=r"trial 1 .* is missing its 'command.txt' audit artifact",
+        ):
+            run_experiment(reread, dry_run=dry_run)
 
     assert _pointer_bytes(experiment) == pointer_before
     assert read_status(reread)["phases"][0]["trials"] == {"COMPLETE": 2}

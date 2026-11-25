@@ -127,6 +127,8 @@ class RecordedPhase:
     study: optuna.Study | None
     #: The source of a pending fill, whose old scores cannot supply a winner.
     fill: FillSource | None = None
+    #: Committed fill rows in the ledger snapshot, with their physical attempts' sibling studies.
+    copied_study: optuna.Study | None = None
     #: Whether the next run can launch work only if the re-read leaves enough retry capacity.
     fill_retry_uncertain: bool = False
 
@@ -324,7 +326,8 @@ def _addressed_record(
             if addressed is None or addressed.study is None
             else addressed.study.get_trials(deepcopy=False)
         )
-        return name, _recorded_fill(experiment, phase, name, source, copied)
+        projected = _recorded_fill(experiment, phase, name, source, copied)
+        return name, replace(projected, copied_study=None if addressed is None else addressed.study)
     note = new_study_note(
         phase,
         inherited,
@@ -665,9 +668,11 @@ def _preview_phase(
             phase_fingerprint=phase_fingerprint,
             verify_evidence=False,
         )
-        if phase.inherits:
-            # As a run does once it reaches the phase whose study its parents' winners pick.
-            _validate_selection_evidence(experiment, {phase.name: study})
+        # A projected fill supplies the policy. Its committed rows supply the evidence,
+        # including the ledger used to resolve directories opened in sibling studies.
+        evidence_study = recorded.copied_study if fill is not None else study
+        if evidence_study is not None and (phase.inherits or fill is not None):
+            _validate_selection_evidence(experiment, {phase.name: evidence_study})
         if isinstance(resumed, Winner):
             # A run replays an accepted partial result before it logs a header.
             if fill is not None:
