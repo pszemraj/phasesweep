@@ -1622,6 +1622,65 @@ def test_a_finished_sibling_retry_replays_without_the_trainer(
 
 
 @pytest.mark.integration
+def test_preview_keeps_a_budgeted_sibling_retry_conditional(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A sibling read only settles a counted failure when it produces the requested score."""
+    retry = tmp_path / "retry"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse
+        from pathlib import Path
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--x", type=int, required=True)
+        args = ap.parse_args()
+        if args.x == 2:
+            print("first=0.9")
+            print("second=0.9")
+        elif Path({str(retry)!r}).exists():
+            print("second=0.1")
+        """,
+    )
+    phase = Phase(
+        name="p",
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
+    )
+
+    def config(key: str, target: int) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            trial_command=f"{shlex.quote(str(trainer))} {{overrides}}",
+            metric=Metric(
+                extractor=LogRegexExtractor(type="log_regex", pattern=key + r"=(?P<value>[0-9.]+)")
+            ),
+            phases=[phase.model_copy(update={"n_trials": target})],
+        )
+
+    original = config("first", 2)
+    assert run_experiment(original)["p"].metric == 0.9
+    retry.touch()
+    assert run_experiment(config("second", 3))["p"].metric == 0.1
+    before = phase_study_of(original).trials
+    trainer.unlink()
+
+    targeted_retry = config("first", 3)
+    caplog.set_level(logging.INFO)
+    artifacts = tree_snapshot(tmp_path)
+    run_experiment(targeted_retry, dry_run=True)
+    assert "would re-read 1 finished trial from a sibling study" in caplog.text
+    assert "may need up to 1 trainer launch depending on the re-read results" in caplog.text
+    assert "would launch no trials" not in caplog.text
+    assert tree_changes(artifacts, tree_snapshot(tmp_path)) == {}
+    with pytest.raises(LaunchEnvironmentError, match="which is not an executable file"):
+        run_experiment(targeted_retry)
+    assert phase_study_of(original).trials == before
+
+
+@pytest.mark.integration
 def test_returning_to_an_initialized_study_adopts_a_finished_sibling_rerun(
     tmp_path: Path,
 ) -> None:
@@ -1696,6 +1755,58 @@ def test_returning_to_an_initialized_study_adopts_a_finished_sibling_rerun(
     snapshot.rename(tmp_path / "removed-generation-config")
     assert attempt_id not in producing_attempts((recorded,))
     assert producing_attempts((recorded, donor_study))[attempt_id] == owner
+
+
+@pytest.mark.integration
+def test_budgeted_sibling_retry_can_use_an_older_measurement(tmp_path: Path) -> None:
+    """A newer sibling without the target metric leaves a usable older attempt."""
+    stage, launches = tmp_path / "stage", tmp_path / "launches"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse
+        from pathlib import Path
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--x", type=int)
+        args, _ = parser.parse_known_args()
+        with Path({str(launches)!r}).open("a") as out:
+            out.write("launch\\n")
+        stage = Path({str(stage)!r}).read_text()
+        if stage == "first" and args.x == 2:
+            print("first=0.9 older=0.9 newer=0.9")
+        if stage == "older" and args.x == 1:
+            print("first=0.2 older=0.1")
+        if stage == "newer" and args.x == 1:
+            print("newer=0.1")
+        """,
+    )
+    grid = _phases()[0].model_copy(
+        update={"search_space": {"x": CategoricalParam(type="categorical", choices=[1, 2])}}
+    )
+
+    def config(key: str, target: int) -> Experiment:
+        metric = Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=key + r"=(?P<value>[0-9.]+)")
+        )
+        return _experiment(
+            tmp_path, trainer, metric, phases=[grid.model_copy(update={"n_trials": target})]
+        )
+
+    stage.write_text("first")
+    assert run_experiment(config("first", 2))["p"].metric == 0.9
+    stage.write_text("older")
+    older = run_experiment(config("older", 3))["p"]
+    stage.write_text("newer")
+    newer = run_experiment(config("newer", 4))["p"]
+    assert older.metric == newer.metric == 0.1
+    assert older.attempt_id != newer.attempt_id
+    assert _launches(launches) == 4
+
+    returned = run_experiment(config("first", 3))["p"]
+
+    assert returned.attempt_id == older.attempt_id
+    assert returned.metric == 0.2
+    assert _launches(launches) == 4
 
 
 @pytest.mark.integration

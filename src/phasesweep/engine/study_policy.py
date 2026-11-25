@@ -1834,6 +1834,8 @@ def _reached_study_refusals(
                 _validate_fixed_configuration_target(phase, finished=finished, measured=measured)
                 _validate_grown_grid_target(study, phase, study.get_trials(deepcopy=False))
                 needs_new_trials = phase.n_trials > finished
+            # Preflight a definite launch. A kept result may cover a budgeted retry, but
+            # if its read cannot measure the trial, the reached phase preflights before launching.
             if needs_new_trials and phase.n_trials > finished + len(
                 pending_sibling_retries(phase, study, item.siblings)
             ):

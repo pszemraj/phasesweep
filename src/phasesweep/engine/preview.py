@@ -692,23 +692,24 @@ def _preview_phase(
             siblings = tuple(
                 record.study for record in recorded_studies or () if record.study is not None
             )
-            kept = min(remaining, len(pending_sibling_retries(phase, study, siblings)))
+            kept = pending_sibling_retries(phase, study, siblings)
             if kept:
+                assured = sum(not retry.requires_measurement for retry in kept)
                 log.info(
                     "DRY RUN phase=%s would re-read %s from a sibling study to settle pending reruns",
                     phase.name,
-                    plural(kept, "finished trial"),
+                    plural(len(kept), "finished trial"),
                 )
-                if kept == remaining:
+                if assured == remaining:
                     log.info("DRY RUN phase=%s would launch no trials", phase.name)
                     winner = _placeholder_winner(experiment, phase, inherited_winners)
                     return PhasePreview(winner=winner, launches=0, reruns=0)
-                if phase.inherits:
+                if phase.inherits and len(kept) < remaining:
                     _launch_preflight(experiment, phase.name, study)
                 warn_dry_run(
-                    "phase=%s would need up to %s if the re-read evidence permits this target",
+                    "phase=%s may need up to %s depending on the re-read results",
                     phase.name,
-                    plural(remaining - kept, "trainer launch"),
+                    plural(remaining - assured, "trainer launch"),
                 )
                 winner = _preview_trial_command(experiment, phase, inherited_winners)
                 return PhasePreview(winner=winner, launches=None, reruns=0)

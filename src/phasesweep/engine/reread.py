@@ -62,6 +62,7 @@ from phasesweep.engine.optuna import (
     _measured_draw_count,
     _measured_trial_count,
     _sampling_trial_for_reread,
+    _trial_run_state,
 )
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.provenance import _load_generation_experiment
@@ -660,10 +661,11 @@ def fill_study(
 
 
 class SiblingRetry(NamedTuple):
-    """One target-local rerun slot and the physical attempt that already ran it."""
+    """One target-local slot and its finished physical candidates, newest first."""
 
     source: optuna.trial.FrozenTrial
-    producer: ProducingAttempt
+    producers: list[ProducingAttempt]
+    requires_measurement: bool
 
 
 def pending_sibling_retries(
@@ -678,7 +680,7 @@ def pending_sibling_retries(
     :param Phase phase: Config whose remaining target and rerun policy choose the slots.
     :param optuna.Study study: Target study whose reruns are examined.
     :param Sequence[optuna.Study] others: The phase's other reading studies.
-    :return tuple[SiblingRetry, ...]: Completed training matching outstanding slots.
+    :return tuple[SiblingRetry, ...]: Completed training matching each outstanding slot.
     """
     others = tuple(other for other in others if other.study_name != study.study_name)
     if not others or _recorded_identity(study) is None:
@@ -697,12 +699,19 @@ def pending_sibling_retries(
         return ()
     by_number = {trial.number: trial for trial in trials}
     attempts = producing_attempts((study, *others))
-    slots: dict[str, optuna.trial.FrozenTrial] = {}
+    slots: dict[str, tuple[optuna.trial.FrozenTrial, bool]] = {}
     for trial in pending:
+        source_number = trial.user_attrs.get(RERUN_OF_ATTR)
+        source = (
+            by_number.get(source_number)
+            if trial.state == optuna.trial.TrialState.WAITING and type(source_number) is int
+            else trial
+        )
+        requires_measurement = source is not None and _trial_run_state(source) == "FAIL"
         for ancestor in _rerun_chain(by_number, trial, attempts=attempts):
             identity = ancestor.user_attrs.get(ATTEMPT_ID_ATTR)
             if isinstance(identity, str):
-                slots[identity] = trial
+                slots[identity] = trial, requires_measurement
     if not slots:
         return ()
     present = {trial.user_attrs.get(ATTEMPT_ID_ATTR) for trial in trials}
@@ -733,8 +742,14 @@ def pending_sibling_retries(
         for ancestor in ancestors:
             identity = ancestor.user_attrs.get(ATTEMPT_ID_ATTR)
             slot = slots.get(identity) if isinstance(identity, str) else None
-            if slot is not None and _same_value(slot.params, owner.trial.params):
-                matches.setdefault(slot.number, SiblingRetry(slot, owner))
+            if slot is None:
+                continue
+            source, requires_measurement = slot
+            if _same_value(source.params, owner.trial.params):
+                retry = matches.setdefault(
+                    source.number, SiblingRetry(source, [], requires_measurement)
+                )
+                retry.producers.append(owner)
                 break
     return tuple(matches[trial.number] for trial in pending if trial.number in matches)
 
@@ -752,8 +767,10 @@ def reread_sibling_retries(
     """Read a sibling's finished rerun under this study's settings before launching.
 
     The physical attempt comes from the producer. The slot, failure streak and outcome
-    sequence belong to this study. A queued rerun is settled as unlaunched first, so a
-    killed reader can still find the pending slot without leaving a stale launch queued.
+    sequence belong to this study. Finished attempts are read in newest-first order until
+    one measures the requested result. If none measures, an interrupted slot keeps the
+    newest verdict and a budgeted retry can still launch. An adopted queued retry is settled
+    as unlaunched first so it cannot launch again after the terminal result is appended.
 
     :param Experiment experiment: Current reading and budget settings.
     :param Phase phase: Phase whose target and failure policy apply.
@@ -776,25 +793,33 @@ def reread_sibling_retries(
     producing: dict[str, Experiment | WinnerIntegrityError] = {}
     recorded = 0
     for retry in retries:
-        _require_reread_time(experiment, phase, run_deadline)
-        donor = retry.producer
-        reread = _reread_trial(
-            experiment,
-            phase,
-            donor.trial,
-            donor.rows,
-            producing,
-            attempts,
-            launches,
-            deadline=run_deadline,
-            reader_generation_id=reader_generation_id,
-        )
-        _require_reread_time(experiment, phase, run_deadline)
-        if reread is None:
-            raise StudySchemaMismatchError(
-                f"Finished sibling trial {donor.trial.number} in {donor.study.study_name!r} "
-                "cannot be re-read from its recorded training."
+        reread = None
+        for donor in retry.producers:
+            _require_reread_time(experiment, phase, run_deadline)
+            candidate = _reread_trial(
+                experiment,
+                phase,
+                donor.trial,
+                donor.rows,
+                producing,
+                attempts,
+                launches,
+                deadline=run_deadline,
+                reader_generation_id=reader_generation_id,
             )
+            _require_reread_time(experiment, phase, run_deadline)
+            if candidate is None:
+                raise StudySchemaMismatchError(
+                    f"Finished sibling trial {donor.trial.number} in {donor.study.study_name!r} "
+                    "cannot be re-read from its recorded training."
+                )
+            if candidate.state == optuna.trial.TrialState.COMPLETE:
+                reread = candidate
+                break
+            if reread is None and not retry.requires_measurement:
+                reread = candidate
+        if reread is None:
+            continue
         if recovery_abort is not None and recorded == 0:
             sequence = recovery_abort["completion_sequence"]
             assert type(sequence) is int
