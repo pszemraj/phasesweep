@@ -33,7 +33,7 @@ demo/
     attempts/<attempt-id>/      # one per attempt: PhaseSweep's own records, never the trainer's
       attempt_lifecycle.json
       process_identity.json
-      evidence_baseline.json    # resolved value paths, file freshness metadata and a rerun's launch time, recorded before the trainer starts
+      evidence_baseline.json    # resolved value paths, file freshness metadata, a rerun's launch time and the W&B destination the attempt launched with, recorded before the trainer starts
       command.txt
       stdout.log
       stderr.log
