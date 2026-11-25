@@ -421,7 +421,6 @@ def locate_wandb_position(
 
 def _history_position(
     run: Any,
-    summary: Mapping[str, Any],
     *,
     metric_key: str,
     axis: str,
@@ -440,15 +439,15 @@ def _history_position(
     rows are checked for ``metric_key`` first, independently of the axis when the key
     looks like an aggregate. Use the head of an aggregate only when no row carries
     the literal key. Positions come from rows that carry the series with its axis.
-    History is lagging only while
-    its index is behind the summary's ``_step``, which the summary capture has normally
-    already waited out; an axis the index does not list, or a series no row carries,
-    settles with no position at once. Transient read failures and deadline expiry
-    request retry; other failures settle with no position. The captured objective is
-    never changed.
+    The summary and the history index are read from the same fresh load of the run on
+    every call, so a retry never reuses an earlier answer. History is lagging while
+    that summary is still empty or its index is behind the summary's ``_step``, which the
+    summary capture has normally already waited out; a populated summary without a
+    ``_step``, an axis the index does not list, or a series no row carries, settles with
+    no position at once. Transient read failures and deadline expiry request retry;
+    other failures settle with no position. The captured objective is never changed.
 
     :param Any run: Finished public-API run.
-    :param Mapping[str, Any] summary: Its decoded summary.
     :param str metric_key: Configured objective summary key.
     :param str axis: History key marking where the metric was measured.
     :param float value: Captured objective value.
@@ -459,13 +458,16 @@ def _history_position(
     """
     from phasesweep.evidence.evaluation import json_float
 
-    last_step = finite_nonnegative(summary.get("_step"))
-    if last_step is None:
-        return "settled", None
     head, dot, aggregation = metric_key.rpartition(".")
     position: int | float | None = None
     try:
         run.load(force=True)
+        summary = run.summary_metrics
+        if not summary:
+            return "lagging", None
+        last_step = finite_nonnegative(summary.get("_step"))
+        if last_step is None:
+            return "settled", None
         indexed = _last_history_step(run)
         if indexed is None or indexed < last_step:
             return "lagging", None
@@ -1029,7 +1031,6 @@ def _locate_wandb_position(
         else:
             read, position = _history_position(
                 run,
-                run.summary_metrics,
                 metric_key=metric_key,
                 axis=axis,
                 value=value,

@@ -300,20 +300,23 @@ class _HistoryRun:
     index's last steps on successive loads before it reaches the last row, ``None`` for
     a null index and -1 for one without keys, as W&B serves before indexing; ``visible``
     slices the rows successive sampled reads return, as W&B has served scanned rows
-    before sampled ones.
+    before sampled ones; ``summaries`` are the summaries successive loads serve after the
+    one the lookup returned.
     """
 
-    def __init__(self, summary, rows, indexed_steps=(), visible=()):
+    def __init__(self, summary, rows, indexed_steps=(), visible=(), summaries=()):
         self.state = "finished"
         self.summary_metrics = summary
         self.rows = rows
         self.indexed_steps = iter(indexed_steps)
         self.visible = iter(visible)
+        self.summaries = iter(summaries)
         self.history_keys = None
         self.reads = []
 
     def load(self, force=False):
         assert force is True
+        self.summary_metrics = next(self.summaries, self.summary_metrics)
         listed = {key for row in self.rows for key in row} | set(self.summary_metrics)
         indexed = next(self.indexed_steps, max((row["_step"] for row in self.rows), default=-1))
         self.history_keys = (
@@ -348,7 +351,13 @@ class _HistoryRun:
 
 
 def _history_position(
-    monkeypatch, run, metric_key="eval/loss", axis="_step", poll_seconds=0.001, timeout_seconds=1
+    monkeypatch,
+    run,
+    metric_key="eval/loss",
+    axis="_step",
+    poll_seconds=0.001,
+    timeout_seconds=1,
+    value=None,
 ):
     from phasesweep.evidence.wandb import _locate_wandb_position
 
@@ -362,7 +371,7 @@ def _history_position(
         poll_seconds=poll_seconds,
         metric_key=metric_key,
         axis=axis,
-        value=run.summary_metrics[metric_key],
+        value=run.summary_metrics[metric_key] if value is None else value,
         deadline=time.monotonic() + timeout_seconds,
     )
 
@@ -582,6 +591,13 @@ def test_wandb_waits_for_history_to_reach_the_summary_step(monkeypatch, indexed_
     run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=indexed_steps)
     assert _history_position(monkeypatch, run, axis="eval/step") == 400
     assert len(run.reads) == 1
+
+
+def test_wandb_position_is_read_from_the_summary_each_load_serves(monkeypatch):
+    """A lookup that returned an unserved summary, and a first load that still does, are read again until the summary is served, never settled as no position from the first snapshot."""
+    served = {"eval/loss": 0.2, "_step": 5}
+    run = _HistoryRun({}, _EVAL_ROWS, summaries=[{}, served])
+    assert _history_position(monkeypatch, run, axis="eval/step", value=0.2) == 400
 
 
 def test_wandb_history_that_never_settles_stops_at_the_deadline(monkeypatch):
