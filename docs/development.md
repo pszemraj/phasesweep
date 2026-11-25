@@ -245,9 +245,7 @@ The [durability invariants](invariants.md) identify the code and tests for stora
 - TODO(runtime): Account for repeated configuration-seed pairs so running the same seed twice does not inflate the pooled noise band's effective sample size.
 - TODO(runtime): Recheck process identity in `_signal_members` so PID reuse between enumeration and signalling cannot redirect a signal to another group.
 - TODO(runtime): Withhold edge advice when a restored journal cannot be matched to the population that selected the published winner.
-- TODO(runtime): Reuse the phase trial reads behind `status` when computing winner advisories.
 - TODO(runtime): Let `_phase_counts` use the trials from the completed phase instead of reopening the journal for the closing summary.
-- TODO(runtime): When a config returns to earlier reading settings, merge into their study the trials a later reading-settings study gained; today the earlier study is addressed as it was.
 - TODO(tracking): Share the phase trial reads used to match MLflow attempts across generations within a delivery pass.
 - TODO(cli): Preserve argument boundaries when a dry-run command contains an argument with a newline.
 - TODO(cli): Include W&B in the run banner when the only W&B reader is an evidence gate.
