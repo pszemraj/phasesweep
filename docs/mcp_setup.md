@@ -81,7 +81,7 @@ To verify, use the absolute `phasesweep` path and the same `env PATH=…` prefix
 
 ```bash
 ssh -T HOST /absolute/path/to/phasesweep mcp check --catalog /absolute/path/to/catalog.yaml
-ssh -T HOST 'cd /absolute/path/to/trainer-checkout && /absolute/path/to/phasesweep run /absolute/path/to/experiment.yaml --dry-run'
+ssh -T HOST 'cd /absolute/path/to/entry-cwd && /absolute/path/to/phasesweep run /absolute/path/to/experiment.yaml --dry-run'
 ```
 
 The dry run names a missing program when the study still needs trials. Confirm that nothing is printed before the server starts by running `ssh -T HOST true | wc -c`. It must print `0` because output from a shell start-up file corrupts the protocol stream.
