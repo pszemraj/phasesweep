@@ -728,6 +728,12 @@ class SiblingTrial(NamedTuple):
         return cls(source, producers, needs_read, True)
 
 
+def _allocation_order(owner: ProducingAttempt) -> tuple[float, str, int]:
+    """Order sibling donors by the physical row's allocation, even when its directory was reused."""
+    start = owner.trial.datetime_start
+    return (0.0 if start is None else start.timestamp(), owner.study.study_name, owner.trial.number)
+
+
 def pending_sibling_retries(
     phase: Phase,
     study: optuna.Study,
@@ -794,17 +800,8 @@ def pending_sibling_retries(
         and _trainer_seconds(owner.trial) is not None
     ]
 
-    # Physical study rows carry the time of allocation even when the directory was reopened.
-    def launch_order(owner: ProducingAttempt) -> tuple[float, str, int]:
-        start = owner.trial.datetime_start
-        return (
-            0.0 if start is None else start.timestamp(),
-            owner.study.study_name,
-            owner.trial.number,
-        )
-
     matches: dict[int, SiblingTrial] = {}
-    for owner in sorted(candidates, key=launch_order, reverse=True):
+    for owner in sorted(candidates, key=_allocation_order, reverse=True):
         # The first row is this attempt. An earlier row must establish a shared draw.
         ancestors = _rerun_chain(owner.rows, owner.trial, attempts=attempts)
         next(ancestors)
@@ -902,14 +899,7 @@ def _sibling_draw_candidates(
         and outcome.outcome in _REREAD_OUTCOMES
         and (adaptive_domain is None or _draw_params_in_domain(owner.trial.params, adaptive_domain))
     ]
-    candidates.sort(
-        key=lambda owner: (
-            0.0 if owner.trial.datetime_start is None else owner.trial.datetime_start.timestamp(),
-            owner.study.study_name,
-            owner.trial.number,
-        ),
-        reverse=True,
-    )
+    candidates.sort(key=_allocation_order, reverse=True)
     return candidates
 
 
