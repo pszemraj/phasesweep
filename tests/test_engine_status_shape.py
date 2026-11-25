@@ -7,6 +7,8 @@ contract for downstream consumers.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -119,32 +121,40 @@ def _published(tmp_path: Path) -> Experiment:
     return materialize("current-journal", tmp_path, mode="tree").experiment
 
 
+@contextmanager
+def _claim_after_pointer_read(experiment: Experiment) -> Iterator[None]:
+    """Claim the next generation just after inspection captures the current pointer once."""
+    pointer = _generation_path(experiment)
+    _generation_dir(_experiment_dir(experiment), "next-generation").mkdir()
+    original_read = engine_read.read_yaml_or_none
+    reads = 0
+
+    def claim_after_read(path: Path) -> JsonValue:
+        nonlocal reads
+        payload = original_read(path)
+        if path == pointer:
+            reads += 1
+            pointer.write_text(yaml.safe_dump({"generation_id": "next-generation"}))
+        return payload
+
+    with pytest.MonkeyPatch.context() as capture:
+        capture.setattr(engine_read, "read_yaml_or_none", claim_after_read)
+        yield
+    assert reads == 1
+
+
 @pytest.mark.parametrize("arguments", [("status",), ("status", "--trials"), ("show-winners",)])
 def test_inspection_uses_one_current_pointer_capture(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments: tuple[str, ...]
+    tmp_path: Path, arguments: tuple[str, ...]
 ) -> None:
     """A concurrent generation claim cannot split inspection identity and results."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     generation = published_generation_id(experiment)
     assert generation is not None
-    pointer = _generation_path(experiment)
-    _generation_dir(_experiment_dir(experiment), "next-generation").mkdir()
-    original_read = engine_read.read_yaml_or_none
-    reads: list[None] = []
-
-    def claim_after_read(path: Path) -> JsonValue:
-        payload = original_read(path)
-        if path == pointer:
-            reads.append(None)
-            pointer.write_text(yaml.safe_dump({"generation_id": "next-generation"}))
-        return payload
-
-    with monkeypatch.context() as capture:
-        capture.setattr(engine_read, "read_yaml_or_none", claim_after_read)
+    with _claim_after_pointer_read(experiment):
         result = CliRunner().invoke(cli, [*arguments, str(materialized.config_path)])
-    assert result.exit_code == 0, result.output
-    assert len(reads) == 1
+        assert result.exit_code == 0, result.output
     if arguments == ("status",):
         payload = yaml.safe_load(result.output)
         assert (
@@ -159,7 +169,7 @@ def test_inspection_uses_one_current_pointer_capture(
 
 
 def test_status_counts_a_child_in_the_study_its_parents_latest_winner_addresses(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     """Status reads the pointer once and counts a child whose parent's top-up changed its winner in the study that winner addresses, not the earlier one, even when a generation is claimed right after the read."""
 
@@ -189,24 +199,9 @@ def test_status_counts_a_child_in_the_study_its_parents_latest_winner_addresses(
     grown = plan([3, 5, 1], child_trials=1)
     run_experiment(grown)
     config = write_experiment_config(tmp_path / "grown.yaml", grown)
-    pointer = _generation_path(grown)
-    _generation_dir(_experiment_dir(grown), "next-generation").mkdir()
-    original_read = engine_read.read_yaml_or_none
-    reads: list[None] = []
-
-    def claim_after_read(path: Path) -> JsonValue:
-        payload = original_read(path)
-        if path == pointer:
-            reads.append(None)
-            pointer.write_text(yaml.safe_dump({"generation_id": "next-generation"}))
-        return payload
-
-    with monkeypatch.context() as capture:
-        capture.setattr(engine_read, "read_yaml_or_none", claim_after_read)
+    with _claim_after_pointer_read(grown):
         result = CliRunner().invoke(cli, ["status", str(config)])
-
-    assert result.exit_code == 0, result.output
-    assert len(reads) == 1
+        assert result.exit_code == 0, result.output
     assert "different config" not in result.output
     child = yaml.safe_load(result.output)["phases"][1]
     assert child["name"] == "child"
