@@ -269,6 +269,33 @@ def directory_launches(
     return launches
 
 
+def reused_checkpoint_warnings(
+    studies: Sequence[Study], winning_trials: Mapping[int, str | None]
+) -> tuple[str, ...]:
+    """Name winning attempts whose trainer directory a later physical launch could have changed.
+
+    :param Sequence[Study] studies: Studies of the phase from the same ledger capture.
+    :param Mapping[int, str | None] winning_trials: Selected trial numbers and physical attempt IDs, including repeat members.
+    :return tuple[str, ...]: One checkpoint warning per affected member, in trial order.
+    """
+    numbers = {attempt: number for number, attempt in winning_trials.items() if attempt is not None}
+    if not numbers:
+        return ()
+    warnings: dict[int, str] = {}
+    for directory, launches in directory_launches(producing_attempts(studies)).items():
+        started = sorted(
+            (item for item in launches if item.may_have_started), key=lambda item: item.order
+        )
+        for item in started[:-1]:
+            number = numbers.get(item.attempt_id)
+            if number is not None:
+                warnings[number] = (
+                    f"Trial {number}'s checkpoint directory {directory} was reused by a later attempt. "
+                    f"Use a checkpoint saved for winning attempt {item.attempt_id}. A shared filename may contain a later model."
+                )
+    return tuple(warnings[number] for number in sorted(warnings))
+
+
 def directory_history(
     launches: Sequence[DirectoryLaunch],
     *,

@@ -1279,6 +1279,8 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                     "# Historical published phase result: does not match the current config."
                 )
             _render_phase_comment(comment, prefix="# ")
+            for warning in winner.checkpoint_warnings:
+                click.echo(f"# WARNING: {warning}")
             if winner.repeats is not None:
                 repeats = winner.repeats
                 click.echo(f"# metric is the {repeats['reduce']} over {repeats['n']} repeats.")

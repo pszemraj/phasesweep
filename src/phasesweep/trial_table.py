@@ -486,6 +486,7 @@ def _phase_lines(
         )
     if table.pruned:
         notes.append(pruned_trials_note(table.pruned))
+    notes.extend(table.checkpoint_warnings)
     sources = set(tables.winner_generations.values())
     source = tables.winner_generations.get(table.phase)
     if len(sources) > 1 and source is not None:

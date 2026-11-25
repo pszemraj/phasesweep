@@ -56,6 +56,7 @@ from phasesweep.engine.state import (
     _stands_under_winner,
     _winning_trials,
 )
+from phasesweep.engine.trial_dirs import reused_checkpoint_warnings
 from phasesweep.errors import (
     OperatorAction,
     PhaseSweepError,
@@ -649,13 +650,16 @@ def _phase_counts(
     :return PhaseCounts | None: The counts, or ``None`` when the phase's trials cannot be read.
     """
     try:
-        read = ledger_ops.read_phase_trials(ledger, study_name)
+        studies = ledger_ops.read_every_phase_study(ledger, [phase.name])[phase.name]
+        study = next((item for item in studies if item.study_name == study_name), None)
+        standing = _winning_trials(winner.trial_number, winner.attempt_id, winner.repeats)
+        for warning in reused_checkpoint_warnings(studies, standing):
+            log.warning("[%s] %s", phase.name, warning)
     except (PhaseSweepError, OSError) as exc:
         log.warning("Could not count phase %r's trials for the run summary: %s", phase.name, exc)
         return None
-    trials = [] if read is None else read.trials
+    trials = [] if study is None else study.get_trials(deepcopy=False)
     states = Counter(_trial_count_state(trial, experiment) for trial in trials)
-    standing = _winning_trials(winner.trial_number, winner.attempt_id, winner.repeats)
     standing_dirs = (
         _recorded_trial_dir(trial)
         for trial in sorted(trials, key=lambda trial: trial.number)

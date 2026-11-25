@@ -49,7 +49,6 @@ from phasesweep.engine.ledger import (
     log_storage_read_failure,
     read_every_phase_study,
     read_phase_studies,
-    read_phase_trials,
     read_trial_stats,
     resolved_ledger_path,
     validate_ledger,
@@ -121,7 +120,7 @@ from phasesweep.engine.study_policy import (
     _load_accepted_partial_decision,
     _load_phase_policy_state,
 )
-from phasesweep.engine.trial_dirs import standing_repeat_attempts
+from phasesweep.engine.trial_dirs import reused_checkpoint_warnings, standing_repeat_attempts
 from phasesweep.errors import (
     PERSISTENT_STUDY_KEEPS_TRIALS,
     START_AGAIN_STEP,
@@ -196,6 +195,7 @@ class PhaseWinnerView:
     # (:func:`phasesweep.engine.repeats._repeats_summary`).
     repeats: RepeatsSummary | None = None
     repeats_detail: RepeatsRecord | None = None
+    checkpoint_warnings: tuple[str, ...] = ()
     generation_id: str | None = None
     is_published: bool = False
     config_matches_current: bool | None = None
@@ -503,6 +503,7 @@ def _represented_winners(
                     tie_groups=advisories.tie_groups,
                     edge_advisory=advisories.edge_advisory,
                     edge_advisory_status=advisories.edge_advisory_status,
+                    checkpoint_warnings=advisories.checkpoint_warnings,
                 )
             )
     return chosen
@@ -564,6 +565,7 @@ class WinnerAdvisories(typing.NamedTuple):
     tie_groups: list[TieGroupComparison] | None
     edge_advisory: str | None
     edge_advisory_status: EdgeAdvisoryStatus
+    checkpoint_warnings: tuple[str, ...] = ()
 
 
 def winner_advisories(
@@ -591,10 +593,15 @@ def winner_advisories(
     """
     phase = next((phase for phase in experiment.phases if phase.name == winner.phase), None)
     try:
-        read = None if winner.study_name is None else read_phase_trials(ledger, winner.study_name)
+        studies = (
+            read_every_phase_study(ledger, [winner.phase])[winner.phase]
+            if winner.study_name
+            else []
+        )
     except StudyStorageUnavailableError:
-        read = None
-    trials = None if read is None else read.trials
+        studies = []
+    study = next((item for item in studies if item.study_name == winner.study_name), None)
+    trials = None if study is None else study.get_trials(deepcopy=False)
     ranking = _winner_ranked_groups(winner, trials)
     tie_groups = (
         []
@@ -639,6 +646,14 @@ def winner_advisories(
         tie_groups=tie_groups,
         edge_advisory=edge,
         edge_advisory_status=edge_status,
+        checkpoint_warnings=reused_checkpoint_warnings(
+            studies,
+            _winning_trials(
+                winner.trial_number,
+                None if winner.source is None else winner.source.attempt_id,
+                winner.repeats_detail,
+            ),
+        ),
     )
 
 
@@ -1199,6 +1214,7 @@ class TrialTable:
     growth: tuple[tuple[int, str], ...] = ()
     #: Finished trials whose directory is gone, which rank by their recorded values.
     pruned: tuple[int, ...] = ()
+    checkpoint_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1712,6 +1728,7 @@ def _trial_table(
         refusal=refusal,
         growth=growth,
         pruned=pruned,
+        checkpoint_warnings=() if winner is None else winner.checkpoint_warnings,
     )
 
 

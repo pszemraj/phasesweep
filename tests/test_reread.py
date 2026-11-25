@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -31,7 +32,7 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.ledger import _resolve_storage, validate_ledger
 from phasesweep.engine.optuna import _PositionCmaEsSampler
-from phasesweep.engine.paths import _generation_config_snapshot_path
+from phasesweep.engine.paths import _experiment_dir, _generation_config_snapshot_path
 from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.read import inspect_status, read_status, read_trial_tables
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
@@ -56,6 +57,7 @@ from phasesweep.evidence.models import (
     JsonExtractor,
     LogRegexExtractor,
     RequiredFileGate,
+    Sha256Gate,
     WandbExtractor,
 )
 from phasesweep.evidence.wandb import WandbRunMissingError
@@ -795,6 +797,58 @@ def test_reread_does_not_score_a_file_overwritten_from_another_reading_study(
     assert trials[0].state == optuna.trial.TrialState.FAIL
     assert "changed after this attempt finished" in trials[0].user_attrs[FAILURE_REASON_ATTR]
     assert _launches(launches) == 4
+
+
+def test_older_winner_warns_about_its_reused_checkpoint_directory(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Warn before overwriting a shared checkpoint and identify the older winner's own model on read."""
+    from click.testing import CliRunner
+
+    from phasesweep.cli import cli
+
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import json, os
+        from pathlib import Path
+        directory = Path(os.environ["PHASESWEEP_TRIAL_DIR"])
+        shared = directory / "best.ckpt"
+        value = 2 if shared.exists() else 1
+        shared.write_text(str(value))
+        (directory / os.environ["PHASESWEEP_ATTEMPT_ID"]).write_text(str(value))
+        (directory / "r.json").write_text(json.dumps({"loss": value}))
+        """,
+    )
+
+    def config(value: int) -> Experiment:
+        digest = hashlib.sha256(str(value).encode()).hexdigest()
+        gate = Sha256Gate(type="sha256", path="best.ckpt", sha256=digest)
+        phase = Phase(
+            name="p", gpu_policy="none", n_trials=value, sampler=Sampler(type="grid"), gates=[gate]
+        )
+        return _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
+
+    original = config(1)
+    first = run_experiment(original)["p"]
+    assert not any("shared checkpoint directory" in message for message in caplog.messages)
+    later = run_experiment(config(2))["p"]
+    assert any("Retrying in shared checkpoint directory" in message for message in caplog.messages)
+    assert first.trial_dir == later.trial_dir and first.attempt_id != later.attempt_id
+    caplog.clear()
+    winner = run_experiment(original)["p"]
+    assert winner.metric == 1 and winner.attempt_id == first.attempt_id
+    assert first.attempt_id is not None and first.trial_dir is not None
+    directory = _experiment_dir(original) / "p" / first.trial_dir
+    assert (directory / "best.ckpt").read_text() == "2"
+    assert (directory / first.attempt_id).read_text() == "1"
+    warning = f"Use a checkpoint saved for winning attempt {first.attempt_id}"
+    assert any(warning in message for message in caplog.messages)
+    path = write_experiment_config(tmp_path / "sweep.yaml", original)
+    for args in (["show-winners", str(path)], ["status", str(path), "--trials"]):
+        shown = CliRunner().invoke(cli, args, env={"COLUMNS": "300"})
+        assert shown.exit_code == 0, shown.output
+        assert warning in " ".join(shown.output.split())
 
 
 @pytest.mark.parametrize("interrupt_fill", [False, True])

@@ -19,6 +19,7 @@ from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.state import (
     DURATION_ATTR,
     RERUN_OF_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     _parsed_trial_outcome,
 )
@@ -207,6 +208,14 @@ def _log_trial_start(
     :param bool in_place: Whether it continues its source's trial directory.
     """
     params, repeat = _repeat_split(phase, trial.params)
+    if in_place:
+        log.warning(
+            "[%s/trial_%d] Retrying in shared checkpoint directory %s. The trainer can overwrite "
+            "an earlier attempt's model. Include PHASESWEEP_ATTEMPT_ID in checkpoint names you want to keep.",
+            phase.name,
+            trial.number,
+            trial.user_attrs.get(TRIAL_DIR_ATTR),
+        )
     report.info(
         trial_start_line(
             experiment,
