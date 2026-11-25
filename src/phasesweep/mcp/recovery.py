@@ -844,16 +844,16 @@ def _recover_trial_evidence(
             if generation_id == run_id or operation_id in causal_attempt_ids
         )
         every = [(each, s) for each in config.phases for s in loaded_studies.get(each.name, ())]
-        for phase, study in every:
-            inspected_studies += 1
-            # The study ledger precedes the run recovery record. Read evidence
-            # left by an interrupted pass before this pass can append to it.
-            previously_recovered = _previously_recovered_attempt_locations(
-                study, phase.name, run_id, causal_attempt_ids=causal_attempt_ids
-            )
-            evidence.reaped_attempt_ids.update(previously_recovered)
-            evidence.reaped_attempt_locations.update(previously_recovered)
-            try:
+        try:
+            for phase, study in every:
+                inspected_studies += 1
+                # The study ledger precedes the run recovery record. Read evidence
+                # left by an interrupted pass before this pass can append to it.
+                previously_recovered = _previously_recovered_attempt_locations(
+                    study, phase.name, run_id, causal_attempt_ids=causal_attempt_ids
+                )
+                evidence.reaped_attempt_ids.update(previously_recovered)
+                evidence.reaped_attempt_locations.update(previously_recovered)
                 evidence.cleanup_recovered += _recover_cleanup_uncertain_trials(
                     study,
                     config,
@@ -873,9 +873,14 @@ def _recover_trial_evidence(
                     inspection_messages=active_report.inspection_messages,
                     report=active_report,
                 )
-            finally:
-                if confirm:
-                    _refresh_recovered_trials_csv(study, config, phase)
+        finally:
+            if confirm and (
+                evidence.reaped
+                or evidence.cleanup_recovered
+                or inspected_attempts
+                or evidence.reaped_attempt_locations
+            ):
+                _refresh_recovered_trials_csv(loaded_studies, config)
         evidence.terminated = sum(active_report.process_actions.values())
         evidence.retained_results = active_report.retained_results
         evidence.pending_evidence = active_report.unreadable_evidence

@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import csv
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -195,29 +195,46 @@ def _write_trials_csv(
 
 
 def _refresh_recovered_trials_csv(
-    study: optuna.Study, experiment: Experiment, phase: Phase
+    studies: Mapping[str, Sequence[optuna.Study]], experiment: Experiment
 ) -> None:
-    """Refresh the recovered study's CSV when the supplied phase matches its semantics.
+    """Refresh the same addressed studies as status, from the studies recovery opened.
 
-    :param optuna.Study study: Study whose recovery ran under the experiment lock.
-    :param Experiment experiment: Owner of the phase artifact directory.
-    :param Phase phase: Phase to use for group labels if its semantics agree with the study.
+    :param Mapping[str, Sequence[optuna.Study]] studies: Every recovered study by phase.
+    :param Experiment experiment: Config that locates the CSV and checks the study semantics.
     """
-    # Recovery can settle earlier work even when the supplied phase will be refused at launch.
-    # Keep the prior projection when that phase cannot supply the study's repeat grouping.
+    from phasesweep.engine.read import _latest_study_names, _read_generation_selection
+
+    if not studies:
+        return
     try:
-        recorded = _recorded_identity(study)
-        if recorded is not None and recorded["payload"].get(
-            "phase"
-        ) == fingerprint_ops._identity_phase_dump(phase):
-            _write_trials_csv(
-                study,
-                path_ops._trials_csv_path(experiment, phase.name),
-                experiment,
-                repeats=repeat_axis(phase),
-            )
+        current, _, publication = _read_generation_selection(experiment)
+        addressed = _latest_study_names(experiment, publication, current)
     except Exception as exc:
-        log.warning("Could not refresh trials.csv for study %r: %s", study.study_name, exc)
+        log.warning("Could not address recovered studies for trials.csv: %s", exc)
+        return
+
+    for phase in experiment.phases:
+        name = addressed.get(phase.name)
+        study = next(
+            (item for item in studies.get(phase.name, ()) if item.study_name == name), None
+        )
+        if study is None:
+            continue
+        # Recovery can settle work even when a launch would refuse the supplied phase.
+        # Keep the prior projection when that phase cannot supply the study's repeat grouping.
+        try:
+            recorded = _recorded_identity(study)
+            if recorded is not None and recorded["payload"].get(
+                "phase"
+            ) == fingerprint_ops._identity_phase_dump(phase):
+                _write_trials_csv(
+                    study,
+                    path_ops._trials_csv_path(experiment, phase.name),
+                    experiment,
+                    repeats=repeat_axis(phase),
+                )
+        except Exception as exc:
+            log.warning("Could not refresh trials.csv for study %r: %s", study.study_name, exc)
 
 
 def _save_winner(

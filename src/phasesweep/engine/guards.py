@@ -195,8 +195,6 @@ def _preflight_existing_studies(
                 report.mark_uncertain(exc)
             errors.append(exc)
             continue
-        finally:
-            _refresh_recovered_trials_csv(study, experiment, phase)
         try:
             _validate_known_study_direction(experiment, phase, study)
             _initialize_study_schema(study)
@@ -204,6 +202,7 @@ def _preflight_existing_studies(
             errors.append(exc)
         else:
             studies[phase.name] = (*studies.get(phase.name, ()), study)
+    _refresh_recovered_trials_csv(loaded, experiment)
     # An unreadable tracker leaves finished training pending. Until it answers, neither the
     # retry ceiling nor the need for a trainer is known, and the run reports pending evidence.
     if not report.unreadable_evidence:

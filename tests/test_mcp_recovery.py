@@ -19,7 +19,7 @@ import phasesweep.engine.attempts as attempts_module
 import phasesweep.mcp.recovery as mcp_recovery
 import phasesweep.mcp.runs as mcp_runs
 from phasesweep.config.io import load_experiment
-from phasesweep.config.models import Experiment
+from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.engine.artifact_roots import (
     _write_artifact_root_binding,
 )
@@ -40,12 +40,15 @@ from phasesweep.engine.paths import (
     _attempts_dir,
     _generation_record_path,
     _trial_dir_for,
+    _trials_csv_path,
 )
 from phasesweep.engine.run import run_experiment
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
 )
+from phasesweep.evidence.models import JsonExtractor
 from phasesweep.mcp.errors import (
     NEW_RUN_RESUMES,
     ExperimentBusyError,
@@ -68,10 +71,13 @@ from phasesweep.runtime.reaper import (
 from phasesweep.tracking.publication import sync_tracking
 from phasesweep.tracking.session import tracking_root
 from tests.conftest import (
+    make_experiment,
     mark_current_format,
     phase_study,
     reaped_pid,
     study_name,
+    write_constant_trainer,
+    write_experiment_config,
 )
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
@@ -115,6 +121,52 @@ def test_recovery_cli_renders_state_directory_remedy(tmp_path: Path) -> None:
     assert f"fix: {FRESH_STATE_DIR_STEP}" in result.output
     assert "artifact root" not in result.output
     assert marker.read_bytes() == before
+
+
+@pytest.mark.integration
+def test_recover_run_keeps_trials_csv_in_the_addressed_study(tmp_path: Path) -> None:
+    """Sweeping cleanup across sibling studies cannot relabel the current CSV."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_constant_trainer(tmp_path),
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x")),
+        phases=[Phase(name="p", n_trials=1, gpu_policy="none")],
+    )
+    config = write_experiment_config(tmp_path / "srv.yaml", experiment)
+    winner = run_experiment(experiment)["p"]
+    run_id = winner.generation_id
+    assert run_id is not None
+    phase_study(experiment).set_user_attr(CLEANUP_RECOVERED_TRIALS_ATTR, [winner.trial_number])
+
+    changed = experiment.model_copy(
+        update={
+            "metric": Metric(extractor=JsonExtractor(type="json", path="r.json", key="missing"))
+        }
+    )
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(changed)
+    run_experiment(experiment)
+    path = _trials_csv_path(experiment, "p")
+    before = path.read_bytes()
+    assert b"COMPLETE" in before
+    assert b"FAIL" not in before
+
+    _app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
+    stage_dead_run(store, run_id, config, registry.get("srv").id, cleanup_uncertain=True)
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+        result_snapshot_state="complete",
+        result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
+    )
+
+    mcp_recovery.recover_run(registry.state_dir, run_id, confirm=True, emit=lambda _: None)
+    assert path.read_bytes() == before
 
 
 def _interrupt_first_cleanup_clear() -> Callable[[RunStore, RunHandle], None]:
