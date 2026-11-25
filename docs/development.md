@@ -226,6 +226,7 @@ The [durability invariants](invariants.md) identify the code and tests for stora
 - `tests/test_run_overrides.py`: shared `--set` key syntax, created-key notes, derived-config validation and study inspection with overrides.
 - `tests/test_config_reference.py` and `tests/test_explain.py`: the configuration reference against the schema, its parser's shared blocks and section rules, and `phasesweep explain`.
 - `tests/test_extractors.py` covers scalar extractors, shared W&B captures and gates. `tests/test_mlflow.py` covers native history selection, run bindings and shared captures. `tests/test_mlflow_integration.py` covers both ownership modes and stopped-server replay against a temporary HTTP server.
+- `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots, detached launch, status, cancellation, and recovery.
 - `tests/test_terminal.py`, `tests/test_terminal_output.py`, `tests/test_trial_table.py` and `tests/test_cli_help.py` cover terminal formatting, `status --trials`, help text, and closed-terminal and closed-pipe behavior.
 - `tests/test_run_report.py` and `tests/test_run_report_summary.py` check exact live and closing report text at 80 and 60 columns, plus console logging and CLI integration.
 - `tests/test_init.py`, `tests/test_fake_train.py` and `tests/test_reporting.py`: template creation and runs, the toy trainer's seed noise, catalog scaffolding, and the objective-envelope writer (`report_objective` and `report-objective`).
