@@ -136,6 +136,23 @@ class FillSource:
         """
         return len(self.reread_trials)
 
+    @property
+    def copyable_trials(self) -> Sequence[optuna.trial.FrozenTrial]:
+        """Return the rows a fill copies.
+
+        The ordinary retry policy schedules the trailing WAITING reruns again after
+        judging the new measurements.
+
+        :return Sequence[optuna.trial.FrozenTrial]: Stored history, before queued reruns.
+        """
+        end = len(self.trials)
+        while end > 0 and (
+            (trial := self.trials[end - 1]).state == optuna.trial.TrialState.WAITING
+            and RERUN_OF_ATTR in trial.user_attrs
+        ):
+            end -= 1
+        return self.trials[:end]
+
 
 def _fill_candidates(name: str | None, others: Sequence[optuna.Study]) -> Sequence[optuna.Study]:
     """Use only the already chosen source when resuming a fill.
@@ -480,6 +497,55 @@ def _fill_timeout(experiment: Experiment, phase: Phase) -> PhaseTimeoutError:
     )
 
 
+def _finish_fill(
+    experiment: Experiment,
+    phase: Phase,
+    target: optuna.Study,
+    source: FillSource,
+    *,
+    deadline: float | None = None,
+) -> tuple[int, int] | None:
+    """Import the phase policy and seal a fully decided fill.
+
+    :param Experiment experiment: Current reading and budget settings.
+    :param Phase phase: Phase whose new study is filled.
+    :param optuna.Study target: Filled live study or in-memory preview.
+    :param FillSource source: Recorded phase policy and training identity.
+    :param float | None deadline: Absolute invocation deadline, defaults to None.
+    :raises PhaseTimeoutError: The invocation deadline passed before sealing.
+    :return tuple[int, int] | None: The source and adjusted trial targets, if changed.
+    """
+    adjusted = _copy_study_attrs(phase, target, source)
+    if deadline is not None and time.monotonic() >= deadline:
+        raise _fill_timeout(experiment, phase)
+    _stamp_identity(target, _reread_record(source.record, reading_settings(experiment, phase)))
+    return adjusted
+
+
+def preview_filled_study(
+    experiment: Experiment,
+    phase: Phase,
+    study_name: str,
+    source: FillSource,
+    trials: Sequence[optuna.trial.FrozenTrial],
+) -> optuna.Study:
+    """Project already-known fill verdicts using the same policy as the live fill.
+
+    :param Experiment experiment: Current reading settings.
+    :param Phase phase: Phase whose run is being previewed.
+    :param str study_name: Addressed study's name.
+    :param FillSource source: Source study and its recorded phase policy.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Already-known rows of the addressed study.
+    :return optuna.Study: An in-memory study ready for the ordinary recorded-phase checks.
+    """
+    from phasesweep.engine.ledger import open_preview_study
+
+    study = open_preview_study(experiment, phase, study_name=study_name)
+    study.add_trials(trials)
+    _finish_fill(experiment, phase, study, source)
+    return study
+
+
 def fill_study(
     experiment: Experiment,
     phase: Phase,
@@ -518,13 +584,7 @@ def fill_study(
             raise _fill_timeout(experiment, phase)
 
     require_time()
-    end = len(source.trials)
-    while end > 0 and (
-        (trial := source.trials[end - 1]).state == optuna.trial.TrialState.WAITING
-        and RERUN_OF_ATTR in trial.user_attrs
-    ):
-        end -= 1
-    trials = source.trials[:end]
+    trials = source.copyable_trials
     present = target.get_trials(deepcopy=False)
     if [(t.number, t.params, t.user_attrs.get(ATTEMPT_ID_ATTR)) for t in present] != [
         (t.number, t.params, t.user_attrs.get(ATTEMPT_ID_ATTR)) for t in trials[: len(present)]
@@ -577,9 +637,7 @@ def fill_study(
             _sampling_trial_for_reread(trial if reread is None else reread, target.sampler)
         )
     require_time()
-    adjusted_target = _copy_study_attrs(phase, target, source)
-    require_time()
-    _stamp_identity(target, _reread_record(source.record, reading_settings(experiment, phase)))
+    adjusted_target = _finish_fill(experiment, phase, target, source, deadline=run_deadline)
     return FillResult(len(trials) - len(present), rereads, changed, adjusted_target)
 
 

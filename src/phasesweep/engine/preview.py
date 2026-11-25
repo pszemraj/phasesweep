@@ -58,7 +58,7 @@ from phasesweep.engine.phase import (
     _winner_overrides,
 )
 from phasesweep.engine.progress import _log_phase_header
-from phasesweep.engine.reread import FillSource, describe_changes, fill_source
+from phasesweep.engine.reread import FillSource, describe_changes, fill_source, preview_filled_study
 from phasesweep.engine.state import (
     PHASE_DECISION_ATTR,
     RecoveredTrialState,
@@ -69,13 +69,17 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import (
     ReachedStudy,
+    _accepted_trial_target,
     _at_accepted_partial_target,
     _launch_preflight,
     _load_phase_policy_state,
     _parse_accepted_partial_decision,
     _pending_rerun_count,
     _reached_study_refusals,
+    _rerun_sources,
+    _validate_accepted_trial_target,
     _validate_fixed_configuration_target,
+    _validate_grown_grid_target,
     _validate_study_direction,
     _validate_study_schema,
 )
@@ -110,9 +114,8 @@ class RecordedPhase:
     measured: int
     #: How many attempts are RUNNING, which a launch recovers before it checks anything.
     running: int
-    #: Predicted reruns while the study still needs recovery: interrupted and already queued
-    #: attempts plus RUNNING attempts that recover as interrupted. With no recovery pending,
-    #: preview instead counts reruns, including grid retries, after the phase passes preflight.
+    #: Reruns already known while a study awaits recovery or re-reading. Settled studies
+    #: use their full retry policy after the phase passes preflight.
     recovery_reruns: int
     #: The phase's study as a read-only snapshot, or ``None`` when the ledger holds none.
     study: optuna.Study | None
@@ -315,24 +318,7 @@ def _addressed_record(
             if addressed is None or addressed.study is None
             else addressed.study.get_trials(deepcopy=False)
         )
-        trials = [*copied, *source.trials[len(copied) :]]
-        stand_in = _recorded_phase(phase, source.study, trials=trials)
-        uncertain = False
-        if phase.n_trials > stand_in.finished:
-            # Each draw that might measure can remove one retry from the available budget.
-            ceiling = retry_target_ceiling(
-                phase,
-                finished=stand_in.finished,
-                measured=_measured_draw_count(trials, assumed_complete=source.reread_trials),
-            )
-            uncertain = ceiling is not None and phase.n_trials > ceiling
-        if uncertain:
-            _validate_fixed_configuration_target(
-                phase,
-                finished=stand_in.finished,
-                measured=_measured_draw_count(trials, excluded=source.reread_trials),
-            )
-        return name, replace(stand_in, study=None, fill=source, fill_retry_uncertain=uncertain)
+        return name, _recorded_fill(experiment, phase, name, source, copied)
     note = new_study_note(
         phase,
         inherited,
@@ -341,6 +327,67 @@ def _addressed_record(
     if note is not None:
         log.info("DRY RUN phase=%s %s", phase.name, note)
     return name, fresh
+
+
+def _recorded_fill(
+    experiment: Experiment,
+    phase: Phase,
+    study_name: str,
+    source: FillSource,
+    copied: Sequence[optuna.trial.FrozenTrial],
+) -> RecordedPhase:
+    """Project a fill, preserving exact decisions and bounds on unresolved ones.
+
+    :param Experiment experiment: Current run configuration.
+    :param Phase phase: Phase whose addressed study is waiting for a fill.
+    :param str study_name: Address of the target study.
+    :param FillSource source: Source study and still-unread evidence.
+    :param Sequence[optuna.trial.FrozenTrial] copied: Rows already committed to the target.
+    :return RecordedPhase: Exact recorded policy, or the minimum target and known reruns.
+    """
+    trials = [*copied, *source.copyable_trials[len(copied) :]]
+    record = _recorded_phase(phase, source.study, trials=trials)
+    unread = source.reread_trials
+    if not unread and not record.running:
+        study = preview_filled_study(experiment, phase, study_name, source, trials)
+        return replace(record, study=study, fill=source)
+
+    # A newly measured draw closes its retry slot. Check the limits that apply
+    # whichever of the unread trials ultimately supplies a measurement.
+    recorded_target = _accepted_trial_target(source.study)
+    measured = _measured_draw_count(trials, excluded=unread)
+    optimistic_capacity = retry_target_ceiling(phase, finished=record.finished, measured=measured)
+    pessimistic_capacity = retry_target_ceiling(
+        phase,
+        finished=record.finished,
+        measured=_measured_draw_count(trials, assumed_complete=unread),
+    )
+    min_target = (
+        recorded_target
+        if pessimistic_capacity is None
+        else min(recorded_target, pessimistic_capacity)
+    )
+    max_target = (
+        recorded_target
+        if optimistic_capacity is None
+        else min(recorded_target, optimistic_capacity)
+    )
+    _validate_accepted_trial_target(phase, min_target)
+    _validate_fixed_configuration_target(
+        phase, finished=record.finished, measured=measured, accepted=max_target
+    )
+    reruns = len(_rerun_sources(trials, assumed_complete=unread))
+    _validate_grown_grid_target(source.study, phase, trials, pending_reruns=reruns)
+    uncertain = phase.n_trials < max_target or (
+        pessimistic_capacity is not None and phase.n_trials > pessimistic_capacity
+    )
+    return replace(
+        record,
+        study=None,
+        fill=source,
+        fill_retry_uncertain=uncertain,
+        recovery_reruns=max(reruns, record.recovery_reruns),
+    )
 
 
 def validate_trial_targets(experiment: Experiment) -> None:
@@ -392,7 +439,7 @@ def validate_trial_targets(experiment: Experiment) -> None:
             if source is not None:
                 study = source.study
                 unread = source.reread_trials
-                trials = [*trials, *source.trials[len(trials) :]]
+                trials = [*trials, *source.copyable_trials[len(trials) :]]
         recovered = [] if study is None else _recovered_running_states(study.study_name, trials)
         _validate_fixed_configuration_target(
             phase,
@@ -540,7 +587,12 @@ def _preview_phase(
             return PhasePreview(winner=winner, launches=None, reruns=0)
         study_name = study_name if addressed is None else addressed
     fill = None if recorded is None else recorded.fill
-    if fill is not None:
+    if (
+        recorded is not None
+        and fill is not None
+        and recorded.study is None
+        and not recorded.fill_retry_uncertain
+    ):
         partial = _parse_accepted_partial_decision(
             fill.attrs.get(PHASE_DECISION_ATTR), fill.study.study_name
         )
@@ -559,7 +611,7 @@ def _preview_phase(
     finished = 0 if recorded is None else recorded.finished
     reruns = 0 if recorded is None else recorded.recovery_reruns
     remaining = max(0, phase.n_trials - finished)
-    if recorded is not None and recorded.fill_retry_uncertain:
+    if recorded is not None and recorded.fill_retry_uncertain and remaining > 0:
         warn_dry_run(
             "phase=%s has %d of %d trials recorded. Its launch count depends on how much retry "
             "capacity remains after re-reading the evidence",
@@ -610,6 +662,15 @@ def _preview_phase(
             _validate_selection_evidence(experiment, {phase.name: study})
         if isinstance(resumed, Winner):
             # A run replays an accepted partial result before it logs a header.
+            if fill is not None:
+                log.info(
+                    "DRY RUN phase=%s accepted a partial result at %d of %d trials: would select "
+                    "from the re-read evidence and launch no trials",
+                    phase.name,
+                    resumed.completion["finished_trials"],
+                    resumed.completion["requested_trials"],
+                )
+                return PhasePreview(winner=resumed, launches=0, reruns=0)
             log.info(
                 "DRY RUN phase=%s accepted a partial result at %d of %d trials: would "
                 "replay it and launch no trials",
@@ -661,12 +722,15 @@ def _preview_phase(
         if fill is not None:
             return PhasePreview(winner=winner, launches=0, reruns=0)
         return _replayed_phase_preview(phase, inherited_winners, winner)
-    if recorded is None or phase.inherits:
+    if recorded is None or phase.inherits or fill is not None:
         # A readable ledger had the launch of every reached phase whose study is known before
         # any phase runs preflighted before any phase previewed (_refuse_as_a_launch_would).
         # One previewed fresh from an unreadable ledger, or one whose study its parents'
         # winners pick, gets it here, as a run's does when it reaches the phase.
-        _launch_preflight(experiment, phase.name, None if recorded is None else recorded.study)
+        cohort = None if recorded is None else recorded.study
+        if cohort is None and fill is not None:
+            cohort = fill.study
+        _launch_preflight(experiment, phase.name, cohort)
     GpuPool.for_phase(phase, cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"))
     of_them = f", {rerun_clause(reruns)}" if reruns else ""
     log.info("DRY RUN phase=%s would launch %s%s", phase.name, plural(remaining, "trial"), of_them)

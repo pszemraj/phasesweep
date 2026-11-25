@@ -22,6 +22,7 @@ from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Rep
 from phasesweep.engine import reread as reread_ops
 from phasesweep.engine import trial as trial_ops
 from phasesweep.engine.errors import (
+    LaunchEnvironmentError,
     PhaseTimeoutError,
     PublishedStudyMissingError,
     StudyFingerprintMismatchError,
@@ -50,6 +51,7 @@ from phasesweep.evidence.models import (
     JsonEnvelopeExtractor,
     JsonExtractor,
     LogRegexExtractor,
+    RequiredFileGate,
     WandbExtractor,
 )
 from phasesweep.evidence.wandb import WandbRunMissingError
@@ -1407,3 +1409,157 @@ def test_reread_keeps_rows_committed_before_its_run_deadline(
     assert run_experiment(changed)["p"].metric == 1
     assert reads == [1, 2]
     assert _launches(launches) == 3
+
+
+def test_preview_checks_the_executable_before_launching_after_a_reread(tmp_path: Path) -> None:
+    """A pending root fill with a certain top-up checks its trainer executable."""
+    trainer, _ = _counting_trainer(tmp_path)
+    trainer.write_text(f"#!{sys.executable}\n{trainer.read_text()}")
+    trainer.chmod(0o700)
+    phase = _phases()[0].model_copy(update={"n_trials": 1, "allow_partial_grid": True})
+    config = make_experiment(
+        persistent=tmp_path,
+        trial_command=f"{shlex.quote(str(trainer))} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=_metric("loss"),
+        phases=[phase],
+    )
+    run_experiment(config)
+    trainer.chmod(0o600)
+    changed = config.model_copy(
+        update={"metric": _metric("acc"), "phases": [phase.model_copy(update={"n_trials": 2})]}
+    )
+
+    with pytest.raises(LaunchEnvironmentError, match="which is not an executable file"):
+        run_experiment(changed, dry_run=True)
+
+
+def test_preview_checks_the_inherited_fills_trainer_cohort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child that keeps its parent's values preflights against its donor's cohort."""
+    trainer, _ = _counting_trainer(tmp_path)
+    parent, child = _phases(child=True)
+    short = child.model_copy(update={"n_trials": 1, "allow_partial_grid": True})
+    monkeypatch.setenv("TZ", "UTC")
+    run_experiment(_experiment(tmp_path, trainer, _metric("loss"), phases=[parent, short]))
+    gated = child.model_copy(
+        update={"gates": [RequiredFileGate(type="required_file", path="r.json")]}
+    )
+    changed = _experiment(tmp_path, trainer, _metric("loss"), phases=[parent, gated])
+    monkeypatch.setenv("TZ", "US/Pacific")
+
+    with pytest.raises(StudyFingerprintMismatchError, match='TZ "UTC" -> "US/Pacific"'):
+        run_experiment(changed, dry_run=True)
+
+
+def test_preview_refuses_a_reread_target_below_its_accepted_floor(tmp_path: Path) -> None:
+    """A preview cannot lower the target below the attempts the fill already keeps."""
+    trainer, _ = _counting_trainer(tmp_path)
+    phase = _phases()[0].model_copy(update={"allow_partial_grid": True})
+    run_experiment(_experiment(tmp_path, trainer, _metric("loss"), phases=[phase]))
+    lower = phase.model_copy(update={"n_trials": 2})
+
+    with pytest.raises(TrialTargetRefusedError, match="already accepted a target of 3 finished"):
+        run_experiment(_experiment(tmp_path, trainer, _metric("acc"), phases=[lower]), dry_run=True)
+
+
+def test_preview_reserves_undrawn_cells_after_a_reread(tmp_path: Path) -> None:
+    """A grown full grid must reserve its new cell even when a retry filled the old target."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import sys
+        from pathlib import Path
+        launched = Path({str(tmp_path / "launched")!r})
+        if not launched.exists():
+            launched.touch()
+            raise SystemExit(1)
+        Path(sys.argv[sys.argv.index("--out") + 1]).write_text('{{"loss": 1, "acc": 2}}')
+        """,
+    )
+    phase = _phases()[0]
+    smaller = phase.model_copy(
+        update={
+            "search_space": {"x": CategoricalParam(type="categorical", choices=[1, 2])},
+            "n_trials": 2,
+        }
+    )
+    original = _experiment(tmp_path, trainer, _metric("loss"), phases=[smaller])
+    run_experiment(original)
+    retry = smaller.model_copy(update={"n_trials": 3})
+    run_experiment(_experiment(tmp_path, trainer, _metric("loss"), phases=[retry]))
+    grown = _experiment(tmp_path, trainer, _metric("acc"), phases=[phase])
+
+    with pytest.raises(TrialTargetRefusedError, match="too few trials for the enlarged grid"):
+        run_experiment(grown, dry_run=True)
+
+
+def test_preview_replays_the_partial_boundary_of_a_fully_read_fill(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When all rows already committed, preview uses the known retargeted partial result."""
+    trainer, launches = _counting_trainer(tmp_path)
+    original = _experiment(tmp_path, trainer, _metric("absent"))
+    with pytest.raises(NoFeasibleTrialError, match="No completed trials"):
+        run_experiment(original)
+    source = phase_study_of(original)
+    directory = Path(source.get_trials()[0].user_attrs[TRIAL_DIR_ATTR])
+    (directory / "r.json").write_text('{"loss": 1}')
+    record_accepted_partial_timeout(source, 5)
+    phase = original.phases[0].model_copy(
+        update={"n_trials": 4, "allow_incomplete_on_timeout": True}
+    )
+    changed = _experiment(tmp_path, trainer, _metric("acc"), phases=[phase])
+    with (
+        patch.object(reread_ops, "_stamp_identity", side_effect=RuntimeError("pause after rows")),
+        pytest.raises(RuntimeError, match="pause after rows"),
+    ):
+        run_experiment(changed)
+
+    caplog.set_level(logging.INFO)
+    run_experiment(changed, dry_run=True)
+    assert "partial result at 3 of 4 trials" in caplog.text
+    assert "would select from the re-read evidence and launch no trials" in caplog.text
+    assert run_experiment(changed)["p"].completion["incomplete"]
+    assert _launches(launches) == 3
+
+
+def test_preview_checks_a_failure_streak_when_no_read_can_change_it(tmp_path: Path) -> None:
+    """A fill with only trainer failures still refuses the original standing abort."""
+    trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(9)")
+    phase = _phases()[0].model_copy(update={"max_consecutive_failures": 1})
+    with pytest.raises(NoFeasibleTrialError, match="1 consecutive failed/infeasible"):
+        run_experiment(_experiment(tmp_path, trainer, _metric("loss"), phases=[phase]))
+    changed = _experiment(tmp_path, trainer, _metric("acc"), phases=[phase])
+
+    with pytest.raises(PhaseAbortRefusedError, match="1 consecutive failed/infeasible"):
+        run_experiment(changed, dry_run=True)
+
+
+@pytest.mark.integration
+def test_preview_counts_an_interrupted_checkpoint_that_the_fill_will_rerun(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A known interrupted draw still counts as a rerun while another draw awaits a reread."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import sys, time
+        from pathlib import Path
+        launched = Path({str(tmp_path / "launched")!r})
+        if launched.exists():
+            time.sleep(60)
+        launched.touch()
+        Path(sys.argv[sys.argv.index("--out") + 1]).write_text('{{"loss": 1, "acc": 2}}')
+        """,
+    )
+    phase = _phases()[0].model_copy(update={"n_trials": 2, "allow_partial_grid": True})
+    original = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
+    bounded = original.model_copy(update={"timeout_seconds_per_run": 3.0})
+    with pytest.raises(PhaseTimeoutError, match="timed out via run guard"):
+        run_experiment(bounded)
+    changed = _experiment(tmp_path, trainer, _metric("acc"), phases=[phase])
+
+    caplog.set_level(logging.INFO)
+    run_experiment(changed, dry_run=True)
+    assert "would launch 1 trial, 1 of them a rerun" in caplog.text

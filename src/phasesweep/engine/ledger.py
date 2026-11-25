@@ -1347,7 +1347,9 @@ def open_phase_study(ledger: ClaimedLedger, phase: Phase, study_name: str) -> op
     return study
 
 
-def open_preview_study(experiment: Experiment, phase: Phase) -> optuna.Study:
+def open_preview_study(
+    experiment: Experiment, phase: Phase, *, study_name: str | None = None
+) -> optuna.Study:
     """Create a fresh in-memory study for a dry run without resolving configured storage.
 
     Its draws depend on the phase's namespace alone, so it samples what any study of the
@@ -1355,10 +1357,14 @@ def open_preview_study(experiment: Experiment, phase: Phase) -> optuna.Study:
 
     :param Experiment experiment: Parsed experiment supplying direction and study name.
     :param Phase phase: Phase whose sampler and search space the preview uses.
+    :param str | None study_name: Address when projecting a known study, defaults to the phase namespace.
     :return optuna.Study: Fresh in-memory study for the phase.
     """
     return _build_phase_study(
-        experiment, phase, None, _phase_namespace(experiment.experiment, phase.name)
+        experiment,
+        phase,
+        None,
+        study_name or _phase_namespace(experiment.experiment, phase.name),
     )
 
 
