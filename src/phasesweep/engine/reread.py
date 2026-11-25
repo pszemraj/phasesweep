@@ -858,6 +858,18 @@ def _sibling_draw_positions(
     return by_position
 
 
+class SiblingPlan(NamedTuple):
+    """Matched trials and the number of later adaptive slots a sibling might also supply."""
+
+    reads: tuple[SiblingTrial, ...] = ()
+    possible_later: int = 0
+
+    @property
+    def capacity(self) -> int:
+        """Return the maximum number of target slots the siblings could settle."""
+        return len(self.reads) + self.possible_later
+
+
 def _planned_sibling_draws(
     experiment: Experiment,
     phase: Phase,
@@ -865,18 +877,20 @@ def _planned_sibling_draws(
     candidates: Sequence[ProducingAttempt],
     *,
     after_gap: bool = False,
-) -> tuple[SiblingTrial, ...]:
+    pending_reruns: int = 0,
+) -> SiblingPlan:
     """Match this study's prospective draws, stopping when an adaptive result is unknown.
 
     :param Experiment experiment: Current reading settings and sampler.
     :param Phase phase: Phase whose remaining target and proposals apply.
-    :param optuna.Study study: Initialized target, with no pending reruns.
+    :param optuna.Study study: Initialized target study.
     :param Sequence[ProducingAttempt] candidates: Compatible physical draws, newest first.
     :param bool after_gap: Include later deterministic draws after one needs a launch.
-    :return tuple[SiblingTrial, ...]: Kept attempts at their prospective target slots.
+    :param int pending_reruns: Slots already owed to retries before any new draw.
+    :return SiblingPlan: Matched draws and additional possible adaptive positions.
     """
     if not candidates:
-        return ()
+        return SiblingPlan()
     trials = study.get_trials(deepcopy=False)
     record = _recorded_identity(study)
     assert record is not None
@@ -887,7 +901,9 @@ def _planned_sibling_draws(
     )
     identity = verdict.record or record
     position = max(_draw_positions(trials).values(), default=-1) + 1
-    room = max(0, phase.n_trials - _finished_trial_count(trials))
+    room = max(0, phase.n_trials - _finished_trial_count(trials) - pending_reruns)
+    adaptive = phase.sampler.type in {"tpe", "cmaes"}
+    possible_later = 0
     grid_slots: list[tuple[int, dict[str, object], list[ProducingAttempt]]] = []
     by_position: dict[int, list[ProducingAttempt]] = {}
     if phase.sampler.type == "grid":
@@ -902,14 +918,14 @@ def _planned_sibling_draws(
             phase_name=study.study_name,
         )
         for at in range(position, min(position + room, len(order))):
-            params = dict(zip(names, order[at], strict=True))
+            params: dict[str, object] = dict(zip(names, order[at], strict=True))
             matches = by_cell.get(_semantic_payload_digest(params), [])
             if matches:
                 grid_slots.append((at, params, matches))
             elif not after_gap:
                 break
         if not grid_slots:
-            return ()
+            return SiblingPlan()
     else:
         by_position = {
             at: owners
@@ -917,7 +933,13 @@ def _planned_sibling_draws(
             if position <= at < position + room
         }
         if not by_position:
-            return ()
+            return SiblingPlan()
+        if adaptive and after_gap:
+            # A retry's unknown result can change even the first new proposal. Once a
+            # proposal is known, only strictly later positions still depend on its score.
+            if pending_reruns:
+                return SiblingPlan(possible_later=len(by_position))
+            possible_later = len(by_position) - int(position in by_position)
         room = min(room, max(by_position) - position + 1)
 
     projected = open_preview_study(experiment, phase, study_name=study.study_name)
@@ -925,6 +947,11 @@ def _planned_sibling_draws(
     for key, value in json_object(study.user_attrs).items():
         projected.set_user_attr(key, value)
     _stamp_identity(projected, identity)
+    if pending_reruns:
+        # An Optuna ask takes queued retries first; each already owns a draw position.
+        for trial in trials:
+            if trial.state == optuna.trial.TrialState.WAITING:
+                projected.ask()
     reads: list[SiblingTrial] = []
     if grid_slots:
         proposed = projected.ask()
@@ -936,7 +963,7 @@ def _planned_sibling_draws(
             source.params = params
             source.system_attrs = {**prototype.system_attrs, "grid_id": at}
             reads.append(SiblingTrial.draw(source, matches))
-        return tuple(reads)
+        return SiblingPlan(tuple(reads))
     for offset in range(room):
         proposed = projected.ask()
         params = _suggest_all(proposed, phase)
@@ -948,10 +975,10 @@ def _planned_sibling_draws(
         ]
         if matches:
             reads.append(SiblingTrial.draw(source, matches))
-        if phase.sampler.type in {"tpe", "cmaes"} or (not matches and not after_gap):
+        if adaptive or (not matches and not after_gap):
             break
         projected.tell(proposed, 0.0)
-    return tuple(reads)
+    return SiblingPlan(tuple(reads), possible_later)
 
 
 def pending_sibling_trials(
@@ -960,8 +987,8 @@ def pending_sibling_trials(
     study: optuna.Study,
     others: Sequence[optuna.Study],
     *,
-    after_gap: bool = False,
-) -> tuple[SiblingTrial, ...]:
+    forecast: bool = False,
+) -> SiblingPlan:
     """Find kept training for pending reruns or the next draws this study would make.
 
     Grid cells match by their complete parameters. Stochastic draws additionally match their
@@ -972,21 +999,24 @@ def pending_sibling_trials(
     :param Phase phase: Phase whose next draws and remaining target apply.
     :param optuna.Study study: Initialized target study.
     :param Sequence[optuna.Study] others: Other reading studies of the phase.
-    :param bool after_gap: Include later deterministic draws after one needs a launch.
-    :return tuple[SiblingTrial, ...]: Kept attempts for the next eligible target slots.
+    :param bool forecast: Include slots after pending retries and possible launches.
+    :return SiblingPlan: Available reads and remaining adaptive positions with donors.
     """
     retries = pending_sibling_retries(phase, study, others)
-    if retries or _pending_rerun_count(study, phase):
-        return retries
-    if phase.n_trials <= _finished_trial_count(study.get_trials(deepcopy=False)):
-        return ()
-    return _planned_sibling_draws(
+    pending = _pending_rerun_count(study, phase)
+    if (pending and not forecast) or (
+        phase.n_trials <= _finished_trial_count(study.get_trials(deepcopy=False)) + pending
+    ):
+        return SiblingPlan(retries)
+    draws = _planned_sibling_draws(
         experiment,
         phase,
         study,
         _sibling_draw_candidates(experiment, phase, study, others),
-        after_gap=after_gap,
+        after_gap=forecast,
+        pending_reruns=pending,
     )
+    return SiblingPlan(retries + draws.reads, draws.possible_later)
 
 
 def sibling_launch_batch(
@@ -1020,7 +1050,7 @@ def sibling_launch_batch(
             if donor_positions
             else remaining
         )
-    planned = _planned_sibling_draws(experiment, phase, study, candidates, after_gap=True)
+    planned = _planned_sibling_draws(experiment, phase, study, candidates, after_gap=True).reads
     return min(remaining, max(1, planned[0].source.number - len(trials))) if planned else remaining
 
 
@@ -1053,7 +1083,7 @@ def reread_sibling_trials(
     :raises StudySchemaMismatchError: A resolved finished attempt lacks its training record.
     :return int: Terminal results appended to this study.
     """
-    retries = pending_sibling_trials(experiment, phase, study, others)
+    retries = pending_sibling_trials(experiment, phase, study, others).reads
     if not retries:
         return 0
     attempts = producing_attempts(
@@ -1163,7 +1193,7 @@ def reread_sibling_trials(
                 break
         if needs_launch or abort is not None or recorded == before:
             break
-        retries = pending_sibling_trials(experiment, phase, study, others)
+        retries = pending_sibling_trials(experiment, phase, study, others).reads
     if recorded:
         report.info(
             "%s re-read %s already finished in sibling studies without launching a trainer.",

@@ -697,43 +697,40 @@ def _preview_phase(
             siblings = tuple(
                 record.study for record in recorded_studies or () if record.study is not None
             )
-            kept = pending_sibling_trials(experiment, phase, study, siblings, after_gap=True)
-            if kept:
-                assured = sum(not retry.requires_measurement for retry in kept)
-                log.info(
-                    "DRY RUN phase=%s would re-read %s from a sibling study to reuse kept training",
-                    phase.name,
-                    plural(len(kept), "finished trial"),
-                )
+            plan = pending_sibling_trials(experiment, phase, study, siblings, forecast=True)
+            if plan.capacity:
+                assured = sum(not trial.requires_measurement for trial in plan.reads)
+                if plan.reads:
+                    log.info(
+                        "DRY RUN phase=%s would re-read %s from a sibling study "
+                        "to reuse kept training",
+                        phase.name,
+                        plural(len(plan.reads), "finished trial"),
+                    )
                 if assured == remaining:
                     log.info("DRY RUN phase=%s would launch no trials", phase.name)
                     winner = _placeholder_winner(experiment, phase, inherited_winners)
                     return PhasePreview(winner=winner, launches=0, reruns=0)
-                adaptive_read = phase.sampler.type in {"tpe", "cmaes"} and any(
-                    trial.new_draw for trial in kept
-                )
-                known_draws = all(trial.new_draw for trial in kept) and not adaptive_read
-                if known_draws and assured == len(kept):
+                minimum = remaining - plan.capacity
+                if minimum > 0:
                     if phase.inherits:
                         _launch_preflight(experiment, phase.name, study)
                     GpuPool.for_phase(
                         phase, cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES")
                     )
-                    launches = remaining - assured
+                if assured == plan.capacity:
                     log.info(
                         "DRY RUN phase=%s would launch %s after re-reading kept training",
                         phase.name,
-                        plural(launches, "trial"),
+                        plural(minimum, "trial"),
                     )
                     winner = _preview_trial_command(experiment, phase, inherited_winners)
-                    return PhasePreview(winner=winner, launches=launches, reruns=0)
-                if phase.inherits and len(kept) < remaining and not adaptive_read:
-                    _launch_preflight(experiment, phase.name, study)
-                if known_draws and len(kept) < remaining:
+                    return PhasePreview(winner=winner, launches=minimum, reruns=0)
+                if minimum > 0:
                     log.info(
-                        "DRY RUN phase=%s would launch %s if every retained draw supplies a result",
+                        "DRY RUN phase=%s would launch at least %s to fill the target",
                         phase.name,
-                        plural(remaining - len(kept), "trial"),
+                        plural(minimum, "trial"),
                     )
                 warn_dry_run(
                     "phase=%s may need to launch up to %s depending on the re-read results",

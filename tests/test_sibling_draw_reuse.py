@@ -15,10 +15,15 @@ from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Sampler
 from phasesweep.engine import reread as reread_ops
-from phasesweep.engine.errors import PhaseTimeoutError
+from phasesweep.engine.errors import LaunchEnvironmentError, PhaseTimeoutError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.read import read_status
-from phasesweep.engine.state import ATTEMPT_ID_ATTR, RERUN_OF_ATTR, RETURN_CODE_ATTR
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    RERUN_OF_ATTR,
+    RETURN_CODE_ATTR,
+    TRIAL_TARGET_ATTR,
+)
 from phasesweep.evidence.models import JsonExtractor
 from tests.conftest import make_experiment, study_name, write_trainer
 
@@ -206,7 +211,7 @@ def test_grown_grid_reuses_a_later_donor_between_parallel_launches(
     caplog.set_level(logging.INFO)
 
     run_experiment(target, dry_run=True)
-    assert "would launch 2 trials if every retained draw supplies a result" in caplog.text
+    assert "would launch at least 2 trials to fill the target" in caplog.text
     assert "may need to launch up to 3 trials depending on the re-read results" in caplog.text
     assert _launches(launches) == 2
     run_experiment(target)
@@ -248,6 +253,50 @@ def test_stochastic_preview_stops_after_the_final_possible_donor(tmp_path: Path)
     with patch.object(reread_ops, "_suggest_all", wraps=reread_ops._suggest_all) as suggest:
         run_experiment(target, dry_run=True)
     assert suggest.call_count < 10
+    assert _launches(launches) == 2
+
+
+def test_kept_grid_retry_and_new_cell_need_no_launch_preflight(tmp_path: Path) -> None:
+    """A successful sibling retry and the next grid cell can cover one top-up together."""
+    trainer, launches = _trainer(tmp_path)
+    phase = _phase("grid", 2)
+    (tmp_path / "fail").touch()
+    run_experiment(_config(tmp_path, trainer, phase))
+    (tmp_path / "fail").unlink()
+    raised = phase.model_copy(update={"n_trials": 4})
+    sibling = _config(tmp_path, trainer, raised, "acc")
+    run_experiment(sibling)
+    target = _config(tmp_path, trainer, raised)
+    trainer.unlink()
+
+    run_experiment(target, dry_run=True)
+    assert len(_study(target).trials) == 2
+    run_experiment(target)
+
+    rows = _study(target).trials
+    assert [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows] == [
+        row.user_attrs[ATTEMPT_ID_ATTR] for row in _study(sibling).trials
+    ]
+    assert rows[2].user_attrs[RERUN_OF_ATTR] == 1
+    assert RERUN_OF_ATTR not in rows[3].user_attrs
+    assert _launches(launches) == 4
+    assert read_status(target)["publication_integrity"] == "ok"
+
+
+def test_adaptive_donor_positions_bound_coverage_before_adoption(tmp_path: Path) -> None:
+    """A definite launch beyond the last donor is checked before the target accepts work."""
+    trainer, launches = _trainer(tmp_path)
+    phase = _phase("tpe", 1)
+    run_experiment(_config(tmp_path, trainer, phase))
+    run_experiment(_config(tmp_path, trainer, phase.model_copy(update={"n_trials": 2}), "acc"))
+    target = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 4}))
+    trainer.unlink()
+
+    for dry_run in (True, False):
+        with pytest.raises(LaunchEnvironmentError, match="not an executable file"):
+            run_experiment(target, dry_run=dry_run)
+        study = _study(target)
+        assert len(study.trials) == study.user_attrs[TRIAL_TARGET_ATTR] == 1
     assert _launches(launches) == 2
 
 

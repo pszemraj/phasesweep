@@ -1837,11 +1837,10 @@ def _reached_study_refusals(
             # Preflight a definite launch. A kept result may cover a budgeted retry, but
             # if its read cannot measure the trial, the reached phase preflights before launching.
             if needs_new_trials:
-                kept = pending_sibling_trials(experiment, phase, study, item.siblings)
-                adaptive_read = phase.sampler.type in {"tpe", "cmaes"} and any(
-                    trial.new_draw for trial in kept
+                plan = pending_sibling_trials(
+                    experiment, phase, study, item.siblings, forecast=True
                 )
-                if phase.n_trials > finished + len(kept) and not adaptive_read:
+                if phase.n_trials > finished + plan.capacity:
                     _launch_preflight(experiment, phase.name, study)
             _validate_selection_evidence(experiment, {phase.name: study})
         except Exception as exc:
