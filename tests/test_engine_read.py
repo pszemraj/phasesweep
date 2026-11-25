@@ -906,6 +906,38 @@ def test_read_status_reuses_the_pointer_authenticated_summary(
     assert _resolve_publication_pointer(experiment).state == "failed"
 
 
+@pytest.mark.integration
+def test_read_status_addresses_child_from_the_validated_parent_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The child study's counts use the captured published parent inputs."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_constant_trainer(tmp_path),
+        phases=[
+            Phase(name="parent", n_trials=1, gpu_policy="none", fixed_overrides={"x": 4}),
+            Phase(name="child", n_trials=1, gpu_policy="none", inherits=["parent"]),
+        ],
+    )
+    run_experiment(experiment)
+    publication = _resolve_publication_pointer(experiment)
+    assert publication.state == "ok"
+    generation_id = publication.generation_id
+    assert generation_id is not None
+
+    path = _generation_winner_path(experiment, generation_id, "parent")
+    swapped = yaml.safe_load(path.read_text())
+    swapped["effective_overrides"]["x"] = 500
+    path.write_text(yaml.safe_dump(swapped), encoding="utf-8")
+    monkeypatch.setattr(engine_read, "_resolve_publication_pointer", lambda _exp: publication)
+
+    status = read_status(experiment)
+    assert status["publication_integrity"] == "ok"
+    assert status["phases"][1]["phase"] == "child"
+    assert status["phases"][1]["trials"] == {"COMPLETE": 1}
+    assert _resolve_publication_pointer(experiment).state == "failed"
+
+
 @pytest.mark.parametrize("unsafe_name", ["../escape", "", "phases/p"])
 def test_read_result_refuses_phase_names_that_are_not_path_components(
     tmp_path: Path, unsafe_name: str, monkeypatch: pytest.MonkeyPatch

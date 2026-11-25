@@ -1122,7 +1122,7 @@ def _latest_study_names(
     winners: dict[str, _RecordedOverrides] = {}
     for phase in experiment.phases:
         overrides: object = None
-        if current is not None:
+        if current is not None and (validated is None or current != validated.generation_id):
             loaded = read_yaml_or_none(_generation_winner_path(experiment, current, phase.name))
             overrides = loaded.get("effective_overrides") if isinstance(loaded, Mapping) else None
         if not isinstance(overrides, Mapping) and validated is not None:
