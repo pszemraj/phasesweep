@@ -582,22 +582,19 @@ def _render_changed_values(old: object, new: object) -> tuple[str, str]:
     return window(old_text), window(new_text)
 
 
-def _describe_changed_keys(changes: list[tuple[str, object, object]]) -> str:
-    """Name the keys that changed, with both values, for a fingerprint refusal.
+def format_changed_keys(changes: Sequence[tuple[str, object, object]]) -> str:
+    """Format the bounded list of config differences shown in phase diagnostics.
 
-    :param list[tuple[str, object, object]] changes: Output of :func:`_changed_payload_keys`.
-    :return str: A sentence naming up to :data:`_MAX_REPORTED_CHANGES` keys and a count of
-        the rest; empty when nothing changed.
+    :param Sequence[tuple[str, object, object]] changes: Paths with their recorded and current values.
+    :return str: The rendered differences and omitted count, or an empty string.
     """
-    if not changes:
-        return ""
     shown = []
     for path, old, new in changes[:_MAX_REPORTED_CHANGES]:
         old_text, new_text = _render_changed_values(old, new)
         shown.append(f"{path}: {old_text} -> {new_text}")
     if len(changes) > _MAX_REPORTED_CHANGES:
         shown.append(f"and {len(changes) - _MAX_REPORTED_CHANGES} more")
-    return f"Changed: {'; '.join(shown)}."
+    return "; ".join(shown)
 
 
 def restore_or_rename_step(phase: Phase, *, recorded: str) -> str:
@@ -637,14 +634,7 @@ def new_study_note(
     recorded = None if record is None else record["payload"].get("inherited_effective_overrides")
     current = _inherited_values(phase, inherited)
     changes = _changed_payload_keys(recorded if isinstance(recorded, dict) else {}, current)
-    shown = "; ".join(
-        f"{path}: {' -> '.join(_render_changed_values(old, new))}"
-        for path, old, new in changes[:_MAX_REPORTED_CHANGES]
-    )
-    more = len(changes) - _MAX_REPORTED_CHANGES
-    if more > 0:
-        shown += f"; and {more} more"
-    change = f"inherits {shown or 'different values'}"
+    change = f"inherits {format_changed_keys(changes) or 'different values'}"
     return f"{change}, so it starts a new study; the earlier study keeps its {plural(len(trials), 'trial')}."
 
 
@@ -1018,12 +1008,12 @@ def _mismatch_refusal(
             f" (fingerprint {short_digest(existing)} != "
             f"{short_digest(_semantic_payload_digest(payload))})."
         )
-    elif refused is not None:
-        found = f". {_describe_changed_keys(changes)} {refused[0]}"
-        way_forward = refused[1]
     else:
-        found = f". {_describe_changed_keys(changes)}"
-        if all(path.startswith("phase.") for path, _old, _new in changes):
+        found = f". Changed: {format_changed_keys(changes)}."
+        if refused is not None:
+            found += f" {refused[0]}"
+            way_forward = refused[1]
+        elif all(path.startswith("phase.") for path, _old, _new in changes):
             way_forward = restore_or_rename_step(phase, recorded=_RECORDED_VALUES)
         else:
             way_forward = restore_or_new_study(_RECORDED_VALUES)

@@ -44,7 +44,6 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.evidence import _earlier_attempts
 from phasesweep.engine.fingerprints import (
-    _MAX_REPORTED_CHANGES,
     READING_KEY,
     _changed_payload_keys,
     _identity_payload,
@@ -53,11 +52,11 @@ from phasesweep.engine.fingerprints import (
     _judge_record,
     _payload_search_space,
     _recorded_inheritance,
-    _render_changed_values,
     _same_value,
     _semantic_payload_digest,
     _stamp_identity,
     _with_search_space,
+    format_changed_keys,
     phase_study_name,
     reading_settings,
 )
@@ -150,6 +149,11 @@ class FillSource:
     #: The source's current trials and study attributes.
     trials: list[optuna.trial.FrozenTrial]
     attrs: JsonObject
+
+    @property
+    def change_description(self) -> str:
+        """Describe the new reading even when the recorded settings have no named differences."""
+        return format_changed_keys(self.changes) or "reading settings"
 
     @property
     def rereads(self) -> int:
@@ -1283,21 +1287,6 @@ def reread_sibling_trials(
     return recorded
 
 
-def describe_changes(changes: Sequence[tuple[str, object, object]]) -> str:
-    """Name the reading settings that changed, with both values.
-
-    :param Sequence[tuple[str, object, object]] changes: :attr:`FillSource.changes`.
-    :return str: Such as ``metric.extractor.key: "eval_los" -> "eval_loss"``.
-    """
-    shown = [
-        f"{path}: {' -> '.join(_render_changed_values(old, new))}"
-        for path, old, new in changes[:_MAX_REPORTED_CHANGES]
-    ]
-    if len(changes) > _MAX_REPORTED_CHANGES:
-        shown.append(f"and {len(changes) - _MAX_REPORTED_CHANGES} more")
-    return "; ".join(shown) or "reading settings"
-
-
 class PendingRereadNotice(PhaseSweepError):
     """A phase not started under the current reading settings, which a run re-reads, not retrains.
 
@@ -1354,7 +1343,7 @@ def _pending_notice(
             "and retrains nothing."
         )
     notice = PendingRereadNotice(
-        f"{opening} ({describe_changes(source.changes)}).", remediation=remediation
+        f"{opening} ({source.change_description}).", remediation=remediation
     )
     notice.statement = statement
     notice.finished_trials = source.rereads
@@ -1421,7 +1410,7 @@ def fill_note(source: FillSource, result: FillResult) -> str:
             f" The re-read results reduce the accepted trial target from {previous} to {accepted}."
         )
     return (
-        f"reading settings changed ({describe_changes(source.changes)}): re-read "
+        f"reading settings changed ({source.change_description}): re-read "
         f"{plural(result.rereads, 'finished trial')} from kept evidence, {result.changed} "
         f"changed outcome{copied}; nothing was retrained.{adjustment}"
     )

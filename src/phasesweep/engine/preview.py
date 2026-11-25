@@ -60,7 +60,6 @@ from phasesweep.engine.phase import (
 from phasesweep.engine.progress import _log_phase_header
 from phasesweep.engine.reread import (
     FillSource,
-    describe_changes,
     fill_source,
     pending_sibling_trials,
     preview_filled_study,
@@ -320,7 +319,7 @@ def _addressed_record(
             "DRY RUN phase=%s reading settings changed (%s): would re-read %s from kept "
             "evidence; nothing would retrain",
             phase.name,
-            describe_changes(source.changes),
+            source.change_description,
             plural(source.rereads, "finished trial"),
         )
         copied = (
