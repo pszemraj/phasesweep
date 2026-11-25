@@ -256,6 +256,31 @@ def unusable_link(
     return _link_refusal(owner, relative, directory=directory)
 
 
+def _require_before_next_launch(
+    trial_dir: Path, relative: str, target: Path, evidence_before: float | str | None
+) -> None:
+    """Refuse a shared artifact whose state cannot be attributed to the earlier attempt.
+
+    :param Path trial_dir: Directory shared by a trial's attempts.
+    :param str relative: Configured trial-relative artifact path.
+    :param Path target: Location already resolved by the evidence reader.
+    :param float | str | None evidence_before: Next launch time, an attribution failure, or None.
+    :raises StaleEvidenceError: The artifact can no longer be attributed to this attempt.
+    :raises OSError: The artifact or a link to it could not be inspected.
+    """
+    if evidence_before is None or is_captured_stream(relative):
+        return
+    if isinstance(evidence_before, str):
+        raise StaleEvidenceError(
+            f"`{target}` cannot be attributed to this attempt: {evidence_before}."
+        )
+    if resolved_file_change_ns(trial_dir, target) >= round(evidence_before * 1e9):
+        raise StaleEvidenceError(
+            f"`{target}` changed after this attempt finished and another attempt reused its "
+            "directory. The earlier value cannot be recovered from this path."
+        )
+
+
 def _require_fresh(
     baseline: EvidenceBaseline | None,
     trial_dir: Path,
@@ -289,21 +314,11 @@ def _require_fresh(
     """
     if is_captured_stream(relative):
         return
-    if isinstance(evidence_before, str):
-        raise StaleEvidenceError(
-            f"`{target}` cannot be attributed to this attempt: {evidence_before}."
-        )
-    if evidence_before is not None and resolved_file_change_ns(trial_dir, target) >= round(
-        evidence_before * 1e9
-    ):
-        raise StaleEvidenceError(
-            f"`{target}` changed after this attempt finished and another attempt reused its "
-            "directory. The earlier value cannot be recovered from this file."
-        )
+    _require_before_next_launch(trial_dir, relative, target, evidence_before)
     if baseline is None or not baseline.reused:
         return
-    before = baseline.files.get(relative, relative)
-    if before is None:
+    before = baseline.files.get(relative)
+    if before is None and relative in baseline.files:
         raise StaleEvidenceError(
             f"`{target}` could not be inspected before this attempt, so its value "
             "cannot be attributed to this attempt."
@@ -1360,6 +1375,10 @@ def _required_file(ctx: TrialContext, gate: RequiredFileGate) -> GateResult:
     """
     path = trial_file(ctx.trial_dir, ctx.attempt_dir, gate.path, checked=False)
     if path.is_file():
+        try:
+            _require_before_next_launch(ctx.trial_dir, gate.path, path, ctx.evidence_before)
+        except (OSError, StaleEvidenceError) as exc:
+            return GateResult(gate.type, False, str(exc))
         return GateResult(gate.type, True, f"{gate.path} exists")
     refusal = unusable_link(ctx.trial_dir, ctx.attempt_dir, gate.path)
     return GateResult(gate.type, False, refusal or f"{gate.path} is missing")
@@ -1439,7 +1458,10 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
         try:
             if not path.is_file():
                 return GateResult(gate.type, False, f"{gate.path} is not a file")
+            _require_before_next_launch(ctx.trial_dir, gate.path, path, ctx.evidence_before)
             size = path.stat().st_size
+        except StaleEvidenceError as exc:
+            return GateResult(gate.type, False, str(exc))
         except OSError as exc:
             return GateResult(gate.type, False, f"could not inspect {gate.path}: {exc}")
         label = f"{gate.path} file size"
@@ -1455,6 +1477,9 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
         while directories:
             directory = directories.pop()
             try:
+                _require_before_next_launch(
+                    ctx.trial_dir, gate.path, directory, ctx.evidence_before
+                )
                 with os.scandir(directory) as entries:
                     for entry in entries:
                         entry_path = Path(entry.path)
@@ -1463,6 +1488,9 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
                                 directories.append(entry_path)
                             # Count file-symlink targets without traversing directory symlinks.
                             elif entry.is_file():
+                                _require_before_next_launch(
+                                    ctx.trial_dir, gate.path, entry_path, ctx.evidence_before
+                                )
                                 size += entry_path.stat().st_size
                         except OSError as exc:
                             return GateResult(
@@ -1470,6 +1498,8 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
                                 False,
                                 f"could not inspect {gate.path}: {entry_path}: {exc}",
                             )
+            except StaleEvidenceError as exc:
+                return GateResult(gate.type, False, str(exc))
             except OSError as exc:
                 return GateResult(
                     gate.type,
@@ -1514,8 +1544,9 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
         path = trial_file(ctx.trial_dir, ctx.attempt_dir, gate.path)
         if not path.is_file():
             return GateResult(gate.type, False, f"{gate.path} is missing")
+        _require_before_next_launch(ctx.trial_dir, gate.path, path, ctx.evidence_before)
         digest = file_sha256(path)
-    except TrialPathError as exc:
+    except (TrialPathError, StaleEvidenceError) as exc:
         return GateResult(gate.type, False, str(exc))
     except OSError as exc:
         return GateResult(gate.type, False, f"could not read {gate.path}: {exc}")

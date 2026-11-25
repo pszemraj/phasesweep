@@ -484,6 +484,43 @@ def test_retry_keeps_the_measured_evidence_of_a_sibling_reading_study(
     assert _launches(launches) == 2
 
 
+def test_reread_unrecorded_path_refuses_a_predecessors_file(tmp_path: Path) -> None:
+    """A path that was not checked before a retry needs launch-time evidence of a write."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import sys
+        from pathlib import Path
+        out = Path(sys.argv[sys.argv.index("--out") + 1])
+        alternate = out.with_name("alternate.json")
+        if not alternate.exists():
+            alternate.write_text('{"loss": 0.01}')
+            raise SystemExit(1)
+        out.write_text('{"loss": 0.9}')
+        """,
+    )
+    phase = Phase(name="p", n_trials=1, gpu_policy="none", sampler=Sampler(type="grid"))
+    original = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(original)
+
+    retry = phase.model_copy(update={"n_trials": 2})
+    retried = _experiment(tmp_path, trainer, _metric("loss"), phases=[retry])
+    assert run_experiment(retried)["p"].metric == 0.9
+    first, second = phase_study_of(retried).trials
+    assert first.user_attrs[TRIAL_DIR_ATTR] == second.user_attrs[TRIAL_DIR_ATTR]
+
+    corrected_metric = Metric(
+        extractor=JsonExtractor(type="json", path="alternate.json", key="loss")
+    )
+    corrected = _experiment(tmp_path, trainer, corrected_metric, phases=[retry])
+    with pytest.raises(NoFeasibleTrialError, match="No completed trials"):
+        run_experiment(corrected)
+    copied = phase_study_of(corrected).trials[1]
+    assert copied.value is None
+    assert "trainer exited without writing it" in copied.user_attrs[FAILURE_REASON_ATTR]
+
+
 def test_reread_refuses_an_older_file_reached_through_a_retargeted_link(tmp_path: Path) -> None:
     """A redirected result path gives no score even when its new target predates the retry.
 

@@ -30,6 +30,8 @@ from phasesweep.evidence.models import (
     LogRegexExtractor,
     MlflowExtractor,
     MlflowRequiredGate,
+    RequiredFileGate,
+    Sha256Gate,
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
@@ -51,6 +53,36 @@ def _wandb_poll(**kwargs):
             **kwargs,
         }
     )
+
+
+def test_reread_artifact_gates_require_state_from_before_the_next_launch(tmp_path):
+    """A shared file, directory or digest from a later retry cannot pass an earlier gate."""
+    ctx = make_trial_context(tmp_path)
+    earlier = ctx.trial_dir / "earlier.txt"
+    earlier.write_bytes(b"checkpoint")
+    time.sleep(0.01)
+    with_later_contents = ctx.trial_dir / "checkpoints"
+    with_later_contents.mkdir()
+    file = with_later_contents / "new.pt"
+    file.write_bytes(b"checkpoint")
+    cutoff = (earlier.stat().st_ctime_ns + file.stat().st_ctime_ns) / 2e9
+    gates = [
+        RequiredFileGate(type="required_file", path="earlier.txt"),
+        RequiredFileGate(type="required_file", path="checkpoints/new.pt"),
+        Sha256Gate(
+            type="sha256",
+            path="checkpoints/new.pt",
+            sha256=hashlib.sha256(b"checkpoint").hexdigest(),
+        ),
+        ArtifactSizeGate(
+            type="artifact_size", source="file", path="checkpoints/new.pt", min_bytes=1
+        ),
+        ArtifactSizeGate(type="artifact_size", source="directory", path="checkpoints", min_bytes=1),
+    ]
+    assert all(gate.passed for gate in evaluate_gates(ctx, gates))
+    old, *new = evaluate_gates(replace(ctx, evidence_before=cutoff), gates)
+    assert old.passed
+    assert all(not gate.passed and "another attempt reused" in gate.detail for gate in new), new
 
 
 def test_json_float_overflow_is_invalid_evidence(tmp_path):
