@@ -19,7 +19,8 @@ from phasesweep import run_experiment
 from phasesweep.engine.errors import TrackingTargetUnavailableError
 from phasesweep.engine.state import ATTEMPT_ID_ATTR
 from phasesweep.evidence.evaluation import DeadlineExceededError, ExtractorError, run_extractor
-from phasesweep.evidence.models import WandbExtractor
+from phasesweep.evidence.mlflow import merge_histories, select_observation
+from phasesweep.evidence.models import MlflowExtractor, WandbExtractor
 from tests.conftest import make_trial_context, phase_trials
 from tests.tracking_helpers import ManualClock, switchable_wandb, wandb_objective_experiment
 
@@ -329,7 +330,7 @@ def test_a_reruns_own_crash_fails_the_read(monkeypatch: pytest.MonkeyPatch) -> N
         ("_step", "native", (0.01, 0.99)),
         ("eval/step", "literal", (0.01, 0.99)),
         ("eval/step", "summary-only", (0.11, 0.88)),
-        ("eval/step", "missing-axis", (0.01, 0.99)),
+        ("eval/step", "missing-axis", (0.02, 0.9)),
         ("eval/step", "history-outage", (0.02, 0.9)),
     ],
 )
@@ -420,7 +421,7 @@ def test_a_rerun_replaces_only_the_history_of_the_metric_it_logs(
         required=(_KEY, "eval/acc.min", "eval/acc.max"),
         deadline=5.0,
     )["values"] == {_KEY: 0.1, "eval/acc.min": 0.6, "eval/acc.max": 0.7}
-    assert len(readings) == 6
+    assert len(readings) == 7
 
 
 def test_a_rerun_that_only_logs_teardown_keeps_the_final_loss(
@@ -448,6 +449,59 @@ def test_a_rerun_that_replaces_every_finite_observation_fails_the_read(
     _serve(monkeypatch, lambda _: ("finished", summary, 1), rows=rows)
     with pytest.raises(ValueError, match="no finite observation in the retained history"):
         _poll(logged_after=_LAUNCHED_AT, resume_axis="eval/step")
+
+
+def test_a_measurement_without_the_axis_sits_at_its_attempts_last_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An abandoned measurement logged without the axis is replaced, and the rerun's own is kept."""
+    rows = (
+        {"_step": 0, "_timestamp": 990.0, "eval/step": 100, "eval/loss": 0.5},
+        {"_step": 1, "_timestamp": 991.0, "eval/step": 250, "train/loss": 0.3},
+        {"_step": 2, "_timestamp": 992.0, "eval/loss": 0.05},
+        {"_step": 3, "_timestamp": 1010.0, "eval/step": 200, "eval/loss": 0.4},
+        {"_step": 4, "_timestamp": 1011.0, "eval/loss": 0.45},
+    )
+    summary = {"_step": 4, "_timestamp": 1011.0, _KEY: 0.05}
+    _serve(monkeypatch, lambda _: ("finished", summary, 4), rows=rows)
+    assert _poll(logged_after=_LAUNCHED_AT, resume_axis="eval/step")["values"] == {_KEY: 0.4}
+
+
+def test_an_attempt_that_never_logs_the_axis_fails_the_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without any progress in an attempt, its measurements cannot be retained or replaced."""
+    rows = (
+        {"_step": 0, "_timestamp": 990.0, "eval/loss": 0.05},
+        {"_step": 1, "_timestamp": 1010.0, "eval/step": 5, "eval/loss": 0.4},
+    )
+    summary = {"_step": 1, "_timestamp": 1010.0, _KEY: 0.05}
+    _serve(monkeypatch, lambda _: ("finished", summary, 1), rows=rows)
+    with pytest.raises(ValueError, match="never logged 'eval/step'"):
+        _poll(logged_after=_LAUNCHED_AT, resume_axis="eval/step")
+
+
+def test_wandb_and_mlflow_retain_the_same_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both trackers keep an earlier attempt's values only below a later attempt's lowest position."""
+    attempts = (((100, 0.5), (200, 0.1)), ((300, 0.3), (150, 0.9)))
+    mlflow_history = merge_histories(
+        [
+            [{"step": step, "timestamp": 10 * n + i, "value": v} for i, (step, v) in enumerate(a)]
+            for n, a in enumerate(attempts)
+        ]
+    )
+    expected = select_observation(
+        mlflow_history, MlflowExtractor(type="mlflow", metric_key="eval/loss", select="min")
+    )["value"]
+    rows = tuple(
+        {"_step": 2 * n + i, "_timestamp": 990.0 + 20 * n + i, "eval/step": step, "eval/loss": v}
+        for n, a in enumerate(attempts)
+        for i, (step, v) in enumerate(a)
+    )
+    summary = {"_step": 3, "_timestamp": 1011.0, _KEY: 0.1}
+    _serve(monkeypatch, lambda _: ("finished", summary, 3), rows=rows)
+    assert _poll(logged_after=_LAUNCHED_AT, resume_axis="eval/step")["values"] == {_KEY: expected}
+    assert expected == 0.3
 
 
 def test_the_real_client_reads_the_history_index_with_the_summary(tmp_path, monkeypatch) -> None:

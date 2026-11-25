@@ -92,8 +92,8 @@ class WandbMissingKeysError(RuntimeError):
     waited_seconds: float
 
 
-class _NoRetainedMetricError(ValueError):
-    """An observed rollback discarded every finite metric observation."""
+class _RetainedHistoryError(ValueError):
+    """An observed rollback left a native aggregate with no history it can be scored on."""
 
 
 WANDB_SDK_MISSING = 'W&B evidence requires the optional SDK: pip install "phasesweep[wandb]".'
@@ -615,8 +615,8 @@ def _resumed_extrema(
 ) -> dict[str, float]:
     """Reduce required native aggregates, sharing the reads of their underlying series.
 
-    A literal dotted metric, an incomplete axis, and a separately supplied summary scalar keep
-    their summary value.
+    A literal dotted metric, a series whose rows carrying the axis show no replacement, and a
+    separately supplied summary scalar keep their summary value.
 
     :param _HistoryReader run: Finished public-API run.
     :param Mapping[str, float] values: Finite scalar values from the summary.
@@ -626,7 +626,8 @@ def _resumed_extrema(
     :param float deadline: Monotonic deadline for history queries.
     :return dict[str, float]: Corrected extrema keyed by their exact summary names.
     :raises TimeoutError: History could not be read before the deadline.
-    :raises _NoRetainedMetricError: The native aggregate has no retained finite row.
+    :raises _RetainedHistoryError: The native aggregate has no retained finite row, or a
+        row's attempt never logged the axis.
     """
     operations: dict[str, list[str]] = {}
     for key in values:
@@ -653,7 +654,7 @@ def _resumed_extrema(
             if reduce(all_values) != values[key]:
                 continue
             if not kept_values:
-                raise _NoRetainedMetricError(
+                raise _RetainedHistoryError(
                     f"W&B metric {key!r} has no finite observation in the retained history "
                     "after checkpoint rollback."
                 )
@@ -672,59 +673,82 @@ def _retained_series(
 ) -> tuple[list[float], list[float]] | None:
     """Read a series whose rerun replaced part of its history.
 
-    Each rerun replaces the earlier suffix starting at its first measurement of the series.
+    Rows belong to attempts by the reruns' launch times and sit at their trainer progress,
+    and :func:`merge_attempt_histories` retains them by the rule MLflow histories use. A
+    row without the axis sits at the progress its attempt logged last before it, where
+    W&B's ``define_metric(step_sync=True)`` records it, or first after it when the attempt
+    had logged none yet. Reading the series with and without the axis finds those rows, and
+    the run's whole axis is read only when there are some.
 
     :param _HistoryReader run: Finished public-API run.
     :param str series: History key underlying one or both summary extrema.
-    :param str axis: Trainer's progress key logged on the same rows.
+    :param str axis: Trainer's progress key.
     :param tuple[float, ...] launches: Chronological launch times of all reruns.
     :param int | float last_step: The summary's last W&B history step.
     :param float deadline: Monotonic deadline for history queries.
     :return tuple[list[float], list[float]] | None: All and retained finite measurements,
         or ``None`` when no replacement is established.
     :raises TimeoutError: History could not be read before the deadline.
+    :raises _RetainedHistoryError: An attempt logged the series but never the axis.
     """
     from phasesweep.evidence.evaluation import json_float
 
-    axis_keys = list(dict.fromkeys((series, axis, "_step", "_timestamp")))
-    rows = _read_series(run, axis_keys, last_step=last_step, deadline=deadline, scan=True)
-    if rows is None:
-        raise TimeoutError("W&B history read expired.")
+    def scan(keys: list[str]) -> list[Mapping[str, object]]:
+        rows = _read_series(run, keys, last_step=last_step, deadline=deadline, scan=True)
+        if rows is None:
+            raise TimeoutError("W&B history read expired.")
+        return rows
 
-    points: list[tuple[int | float, int, int | float, float]] = []
-    for row in rows:
+    def measurement(row: Mapping[str, object]) -> tuple[int | float, int, float] | None:
         step = finite_nonnegative(row.get("_step"))
         timestamp = finite_nonnegative(row.get("_timestamp"))
-        progress = finite_nonnegative(row.get(axis))
-        if step is None or timestamp is None or progress is None:
-            return None
         try:
             metric = json_float(row[series], label=series)
         except ValueError:
             return None
-        points.append((step, bisect_left(launches, timestamp), progress, metric))
-
-    histories: list[list[tuple[int | float, float]]] = [[] for _ in range(len(launches) + 1)]
-    for _, segment, progress, metric in sorted(points):
-        history = histories[segment]
-        if history and progress < history[-1][0]:
+        if step is None or timestamp is None:
             return None
-        history.append((progress, metric))
-    retained = merge_attempt_histories(histories)
-    if len(retained) == len(points):
-        return None
+        return step, bisect_left(launches, timestamp), metric
 
-    full_series = _read_series(
-        run, [series, "_step"], last_step=last_step, deadline=deadline, scan=True
-    )
-    if full_series is None:
-        raise TimeoutError("W&B history read expired.")
-    if {finite_nonnegative(row.get("_step")) for row in full_series} != {
-        step for step, _, _, _ in points
-    }:
-        return None
-    all_values = [metric for _, _, _, metric in points if math.isfinite(metric)]
-    if not all_values:
+    def retain(points: Mapping[int | float, tuple[int, int | float, float]]) -> list[float]:
+        histories: list[list[tuple[int | float, float]]] = [[] for _ in range(len(launches) + 1)]
+        for segment, progress, metric in points.values():
+            histories[segment].append((progress, metric))
+        return merge_attempt_histories(histories)
+
+    points: dict[int | float, tuple[int, int | float, float]] = {}
+    for row in scan(list(dict.fromkeys((series, axis, "_step", "_timestamp")))):
+        found, progress = measurement(row), finite_nonnegative(row.get(axis))
+        if found is not None and progress is not None:
+            points[found[0]] = (found[1], progress, found[2])
+    unplaced: dict[int | float, tuple[int, float]] = {}
+    for row in scan([series, "_step", "_timestamp"]):
+        found = measurement(row)
+        if found is not None and found[0] not in points:
+            unplaced[found[0]] = (found[1], found[2])
+    if unplaced:
+        tracks: list[list[tuple[int | float, int | float]]] = [[] for _ in range(len(launches) + 1)]
+        for row in scan([axis, "_step", "_timestamp"]):
+            step = finite_nonnegative(row.get("_step"))
+            timestamp = finite_nonnegative(row.get("_timestamp"))
+            progress = finite_nonnegative(row.get(axis))
+            if step is not None and timestamp is not None and progress is not None:
+                tracks[bisect_left(launches, timestamp)].append((step, progress))
+        for track in tracks:
+            track.sort()
+        for step, (segment, metric) in unplaced.items():
+            track = tracks[segment]
+            if not track:
+                raise _RetainedHistoryError(
+                    f"W&B metric {series!r} has rows in an attempt that never logged {axis!r}, "
+                    "so the rerun's replaced history cannot be told apart. Log "
+                    f"{axis!r} with every {series!r} row."
+                )
+            index = bisect_left(track, step, key=lambda entry: entry[0])
+            points[step] = (segment, track[max(index - 1, 0)][1], metric)
+    retained = retain(points)
+    all_values = [metric for _, _, metric in points.values() if math.isfinite(metric)]
+    if len(retained) == len(points) or not all_values:
         return None
     return all_values, [metric for metric in retained if math.isfinite(metric)]
 
@@ -1080,7 +1104,7 @@ def main(argv: list[str] | None = None) -> int:
             "cause": str(exc.last_error) if exc.last_error else None,
             "reached": exc.reached,
         }
-    except _NoRetainedMetricError as exc:
+    except _RetainedHistoryError as exc:
         response = {"status": "invalid_evidence", "cause": str(exc)}
     except ValueError:
         response = {
