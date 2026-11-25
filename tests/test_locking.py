@@ -876,14 +876,24 @@ def test_directory_fsync_failure_policy_closes_descriptor(
         os.fstat(synced_fd)
 
 
-def test_directory_fsync_addressing_policy(tmp_path: Path) -> None:
+def test_directory_fsync_addressing_policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Best-effort directory fsync follows symlinks."""
     directory = tmp_path / "state"
     directory.mkdir(mode=0o700)
     link = tmp_path / "linked-state"
     link.symlink_to(directory, target_is_directory=True)
+    synced: list[tuple[int, int]] = []
+    fsync = os.fsync
 
+    def observe_fsync(fd: int) -> None:
+        target = os.fstat(fd)
+        synced.append((target.st_dev, target.st_ino))
+        fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", observe_fsync)
     runtime_files.fsync_directory(link)
+    target = directory.stat()
+    assert synced == [(target.st_dev, target.st_ino)]
 
 
 def test_open_directory_fd_shutdown_mid_walk_does_not_double_close(
