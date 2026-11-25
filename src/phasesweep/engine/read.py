@@ -34,7 +34,9 @@ from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
+    TrialEvidenceMissingError,
 )
+from phasesweep.engine.evidence import _selection_evidence
 from phasesweep.engine.fingerprints import (
     _experiment_semantic_fingerprint,
     _recorded_config_matches,
@@ -1189,6 +1191,8 @@ class TrialTable:
     #: Each search-space growth the study recorded: the draw position it took effect at and the
     #: values it added (:func:`phasesweep.engine.growth.recorded_growth`).
     growth: tuple[tuple[int, str], ...] = ()
+    #: Finished trials whose directory is gone, which rank by their recorded values.
+    pruned: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1283,7 +1287,26 @@ PhaseRefusal: TypeAlias = (
     | StudySchemaMismatchError
     | StudyFingerprintMismatchError
     | PendingRereadNotice
+    | TrialEvidenceMissingError
 )
+
+
+def _status_evidence(
+    experiment: Experiment, phase: Phase, study: optuna.Study
+) -> tuple[TrialEvidenceMissingError | None, tuple[int, ...]]:
+    """Judge a phase's selection evidence as a run's preflight does, without refusing status.
+
+    :param Experiment experiment: Current config.
+    :param Phase phase: The phase the study belongs to.
+    :param optuna.Study study: The study the phase addresses.
+    :return tuple[TrialEvidenceMissingError | None, tuple[int, ...]]: The refusal a run would
+        meet over the evidence, and the finished trials whose directory is gone
+        (:func:`phasesweep.engine.evidence._selection_evidence`).
+    """
+    try:
+        return None, _selection_evidence(experiment, phase, study)
+    except TrialEvidenceMissingError as exc:
+        return exc, ()
 
 
 def _pending_rereads(
@@ -1332,7 +1355,7 @@ def _phase_refusals(
     ledger: ValidatedLedger,
     study_names: Mapping[str, str],
     pending: Mapping[str, PhaseRefusal],
-) -> dict[str, PhaseRefusal]:
+) -> tuple[dict[str, PhaseRefusal], dict[str, tuple[int, ...]]]:
     """Give the refusal a run would meet at each phase, in the study it would address.
 
     A phase whose addressed study waits to be filled from kept evidence under changed reading
@@ -1340,8 +1363,9 @@ def _phase_refusals(
     Otherwise a phase's recorded failure policy is judged first, as a run's preflight does,
     then a populated study is judged against its recorded identity, whose inherited values and
     reading settings are the ones that address it, so only a change to what was trained
-    refuses. Invalid policy state is reported for its phase alongside other refusals. It does
-    not prevent status from reporting trial counts and publication facts.
+    refuses, then its selection evidence (:func:`_status_evidence`). Invalid policy state is
+    reported for its phase alongside other refusals. It does not prevent status from reporting
+    trial counts and publication facts.
 
     :param Experiment experiment: Current config, which decides whether a recorded abort is
         retired.
@@ -1349,20 +1373,23 @@ def _phase_refusals(
     :param Mapping[str, str] study_names: The study each phase addresses under the latest
         winners of the status read's own pointer capture (:func:`_latest_study_names`).
     :param Mapping[str, PhaseRefusal] pending: :func:`_pending_rereads` from the same read.
-    :return dict[str, PhaseRefusal]: Refusals or invalid policy diagnostics by phase name; empty
-        without a readable ledger.
+    :return tuple[dict[str, PhaseRefusal], dict[str, tuple[int, ...]]]: Refusals or invalid
+        policy diagnostics by phase name, and the finished trials whose directory is gone in
+        each phase that has any; both empty without a readable ledger.
     """
     if not experiment.persistent:
-        return {}
+        return {}, {}
     try:
         studies = read_phase_studies(ledger, study_names)
     except StudyStorageUnavailableError:
-        return {}
+        return {}, {}
     refusals: dict[str, PhaseRefusal] = dict(pending)
+    pruned: dict[str, tuple[int, ...]] = {}
     for phase in experiment.phases:
         study = studies[phase.name]
         if study is None or phase.name in refusals:
             continue
+        refusal: PhaseRefusal | None
         try:
             refusal = _status_phase_refusal(experiment, phase, study)
             if refusal is None:
@@ -1370,9 +1397,13 @@ def _phase_refusals(
         except (StudyFingerprintMismatchError, StudySchemaMismatchError) as exc:
             refusals[phase.name] = exc
             continue
+        if refusal is None:
+            refusal, gone = _status_evidence(experiment, phase, study)
+            if gone:
+                pruned[phase.name] = gone
         if refusal is not None:
             refusals[phase.name] = refusal
-    return refusals
+    return refusals, pruned
 
 
 def unpublished_winner_step(
@@ -1456,6 +1487,8 @@ class StatusInspection:
     refusals: dict[str, PhaseRefusal]
     #: The study each phase's counts and refusal were read from, by phase name.
     study_names: dict[str, str]
+    #: Finished trials whose directory is gone, by phase name, for phases that have any.
+    pruned: dict[str, tuple[int, ...]]
 
 
 def inspect_status(experiment: Experiment, ledger: ValidatedLedger) -> StatusInspection:
@@ -1470,15 +1503,14 @@ def inspect_status(experiment: Experiment, ledger: ValidatedLedger) -> StatusIns
     :raises ArtifactRootConflictError: The root belongs to another ledger or experiment.
     :raises StudySchemaMismatchError: The stored study format is unsupported.
     :raises WinnerIntegrityError: An unpublished winner's producing snapshot is unavailable or invalid.
-    :return StatusInspection: The status payload, the refusals by phase name, and the study each
-        phase was read from.
+    :return StatusInspection: The status payload, the refusals by phase name, the study each
+        phase was read from, and the trials whose directory is gone.
     """
     payload, study_names, pending = _experiment_status(
         experiment, generation_id=None, ledger=ledger
     )
-    return StatusInspection(
-        payload, _phase_refusals(experiment, ledger, study_names, pending), study_names
-    )
+    refusals, pruned = _phase_refusals(experiment, ledger, study_names, pending)
+    return StatusInspection(payload, refusals, study_names, pruned)
 
 
 def _experiment_status(
@@ -1594,6 +1626,7 @@ def _trial_table(
     available: bool = True,
     refusal: PhaseRefusal | None = None,
     growth: tuple[tuple[int, str], ...] = (),
+    pruned: tuple[int, ...] = (),
 ) -> TrialTable:
     """Build one phase's table from its trials and the winner the publication holds for it.
 
@@ -1609,6 +1642,7 @@ def _trial_table(
         kept evidence, defaults to none.
     :param tuple[tuple[int, str], ...] growth: The search-space growths the study recorded,
         defaults to none.
+    :param tuple[int, ...] pruned: Finished trials whose directory is gone, defaults to none.
     :return TrialTable: The rows and the columns they carry.
     """
     axis = repeat_axis(phase)
@@ -1666,6 +1700,7 @@ def _trial_table(
         groups=_repeat_group_views(experiment, phase, trials, rows),
         refusal=refusal,
         growth=growth,
+        pruned=pruned,
     )
 
 
@@ -1753,7 +1788,9 @@ def read_trial_tables(
     Absent studies and in-memory ledgers have no rows. Unreadable phases are reported unavailable. A phase whose recorded abort or
     failure streak would refuse a run carries that refusal, read from the same study snapshot as
     its trials; one whose failure-policy state cannot be replayed keeps its rows and carries
-    that diagnostic instead.
+    that diagnostic instead. Otherwise the phase carries the refusal a run's selection evidence
+    check would meet, or names its finished trials whose directory is gone
+    (:func:`_status_evidence`).
 
     :param Experiment experiment: Parsed experiment config whose phases are read.
     :param str | None generation_id: Generation whose winners are marked, defaulting to publication.
@@ -1816,6 +1853,9 @@ def read_trial_tables(
                 refusal = _status_phase_refusal(experiment, phase, study)
             except StudySchemaMismatchError as exc:
                 refusal = exc
+        pruned: tuple[int, ...] = ()
+        if refusal is None:
+            refusal, pruned = _status_evidence(experiment, phase, study)
         identity = _recorded_identity(study)
         tables.append(
             _trial_table(
@@ -1825,6 +1865,7 @@ def read_trial_tables(
                 winners.get(phase.name),
                 refusal=refusal,
                 growth=() if identity is None else recorded_growth(identity),
+                pruned=pruned,
             )
         )
     return TrialTables(

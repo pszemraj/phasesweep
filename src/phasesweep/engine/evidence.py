@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import shutil
@@ -20,7 +21,7 @@ from phasesweep.engine.errors import (
     TrialEvidenceMissingError,
 )
 from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trial_dir_opener
-from phasesweep.engine.repeats import evidence_members
+from phasesweep.engine.repeats import evidence_members, repeat_axis
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
@@ -35,6 +36,7 @@ from phasesweep.engine.state import (
 from phasesweep.engine.trial_dirs import (
     _expected_trial_dir_name,
     _rerun_directory_sources,
+    _unavailable_trial_directory,
 )
 from phasesweep.errors import (
     NEW_STUDY_STEP,
@@ -71,9 +73,12 @@ from phasesweep.runtime.json import finite_nonnegative
 from phasesweep.runtime.process import (
     read_attempt_lifecycle,
 )
+from phasesweep.runtime.terminal import REPORT_LOGGER, plural
 
 if TYPE_CHECKING:
     from phasesweep.engine.selection import SelectedTrial
+
+report = logging.getLogger(REPORT_LOGGER)
 
 
 # Audit artifacts every launched attempt writes into its own trial directory
@@ -675,7 +680,8 @@ def _verify_trial_evidence_dir(
     for directory in (trial_dir, attempt_dir):
         if not directory.is_dir():
             raise TrialEvidenceMissingError(
-                f"{subject} has no evidence directory at {str(directory)!r}."
+                f"{subject} has no evidence directory at {str(directory)!r}.",
+                remediation=f"Restore {directory}.",
             )
     try:
         lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt_id)
@@ -826,65 +832,155 @@ def _verify_trial_evidence_dir(
         )
 
 
+def pruned_trials_note(numbers: Sequence[int]) -> str:
+    """Say which finished trials have no directory and that they keep their ranking.
+
+    :param Sequence[int] numbers: Trial numbers whose directory is gone, ascending; not empty.
+    :return str: One line for the phase's note, such as ``1 finished trial has no directory
+        (trial 0); it ranks by its recorded value``.
+    """
+    if len(numbers) == 1:
+        return f"1 finished trial has no directory (trial {numbers[0]}); it ranks by its recorded value"
+    listed = ", ".join(str(number) for number in numbers)
+    return (
+        f"{plural(len(numbers), 'finished trial')} have no directory (trials {listed}); "
+        "they rank by their recorded values"
+    )
+
+
+def _selection_evidence(
+    experiment: Experiment, phase: Phase, study: optuna.Study
+) -> tuple[int, ...]:
+    """Verify the evidence of every trial that could win a phase's selection.
+
+    Check selection eligibility through :func:`_selection_candidate_identity`. A candidate
+    whose whole trial directory is gone, by the rule a rerun uses to open a fresh one
+    (:func:`phasesweep.engine.trial_dirs._unavailable_trial_directory`), keeps its recorded
+    value and its place in the ranking: that value was verified when it was measured, and
+    deleting a finished trial's directory is how an operator frees disk. Only the trial the
+    ranking selects needs its directory, because a published winner names it and selection
+    digest-verifies it (:func:`_verify_winner_evidence`). Every other candidate's generated
+    input is content-verified and its objective source's existence and recorded size checked.
+
+    :param Experiment experiment: Parsed experiment naming the artifact tree.
+    :param Phase phase: The phase the study belongs to.
+    :param optuna.Study study: The phase study a run would select from.
+    :raises TrialEvidenceMissingError: A selection-eligible trial records an unusable trial
+        directory name; its directory exists but its attempt records, audit artifacts,
+        generated trainer input, or recorded objective source are no longer in this tree; or
+        the trial the ranking selects (any member of its group, with ``repeats``) has no
+        directory.
+    :raises PhaseSweepError: A trial directory's path could not be inspected.
+    :return tuple[int, ...]: The candidates whose directory is gone, ascending.
+    """
+    phase_dir = _phase_dir(experiment, phase.name)
+    verification = _EvidenceVerification(experiment, phase)
+    trials = {trial.number: trial for trial in study.get_trials(deepcopy=False)}
+    pruned: dict[int, Path] = {}
+    for trial in trials.values():
+        identity = _selection_candidate_identity(trial)
+        if identity is None:
+            continue
+        generation_id, attempt_id = identity
+        assert trial.value is not None
+        subject = (
+            f"Study {study.study_name!r} phase {phase.name!r} trial {trial.number} "
+            "is eligible to win selection but"
+        )
+        try:
+            recorded = _required_trial_dir(trial).name
+        except ValueError:
+            raise TrialEvidenceMissingError(
+                f"{subject} records an invalid {TRIAL_DIR_ATTR!r} user attribute "
+                f"{trial.user_attrs.get(TRIAL_DIR_ATTR)!r}, so its evidence cannot be "
+                "located."
+            ) from None
+        # The directory must name its own opener, even after a fresh-directory rerun.
+        expected_name = _expected_trial_dir_name(trials, trial)
+        if expected_name is None or recorded != expected_name:
+            raise TrialEvidenceMissingError(
+                f"{subject} records evidence directory {recorded!r}, which does "
+                f"not name the attempt that opened it (expected {expected_name!r})."
+            )
+        trial_dir = phase_dir / expected_name
+        if _unavailable_trial_directory(trial_dir) is not None:
+            pruned[trial.number] = trial_dir
+            continue
+        verification.verify_trial(
+            trial,
+            trial_dir,
+            generation_id,
+            attempt_id,
+            float(trial.value),
+            subject=subject,
+            verify_digest=False,
+        )
+    if pruned:
+        _refuse_a_pruned_winner(experiment, phase, study, pruned)
+    return tuple(sorted(pruned))
+
+
+def _refuse_a_pruned_winner(
+    experiment: Experiment, phase: Phase, study: optuna.Study, pruned: Mapping[int, Path]
+) -> None:
+    """Refuse a phase whose ranking selects a trial whose directory is gone.
+
+    No mechanism measures one finished trial again, so the remedy is the directory itself, or
+    a renamed phase, whose new study trains every trial again while a child whose inherited
+    values it selects again keeps its own study.
+
+    :param Experiment experiment: Parsed experiment whose goal and bounds rank the trials.
+    :param Phase phase: The phase the study belongs to.
+    :param optuna.Study study: The phase study a run would select from.
+    :param Mapping[int, Path] pruned: Each candidate whose directory is gone, by trial number.
+    :raises TrialEvidenceMissingError: The selected trial, or a member of its group, is pruned.
+    """
+    from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
+
+    try:
+        selected = select_winner(
+            study,
+            experiment,
+            phase_name=phase.name,
+            repeats=repeat_axis(phase),
+            emit_advisories=False,
+        )
+    except NoFeasibleTrialError:
+        return
+    for member in evidence_members(selected):
+        trial_dir = pruned.get(member.trial_number)
+        if trial_dir is not None:
+            raise TrialEvidenceMissingError(
+                f"Study {study.study_name!r} phase {phase.name!r} would select trial "
+                f"{member.trial_number}, whose directory {str(trial_dir)!r} is gone; only a "
+                "winner needs its directory.",
+                remediation=(
+                    f"Restore {trial_dir}, or rename phase {phase.name!r} to retrain its trials "
+                    "in a new study (later phases keep theirs if it selects the same values)."
+                ),
+            )
+
+
 def _validate_selection_evidence(
     experiment: Experiment,
     studies: Mapping[str, optuna.Study],
 ) -> None:
-    """Require on-disk evidence for every trial that could win before new execution.
+    """Require on-disk evidence for the trials that could win, and note pruned ones.
 
-    Check selection eligibility through :func:`_selection_candidate_identity`.
-    Content-verify each candidate's generated input and check its objective source's
-    existence and recorded size. Digest-verify the winning objective at selection
-    through :func:`_verify_winner_evidence`. Missing eligible evidence
-    refuses the run without dropping trials from the ranked population.
+    Each phase's candidates are judged by :func:`_selection_evidence`. A phase with
+    candidates whose directory is gone logs one line naming them.
 
     :param Experiment experiment: Parsed experiment naming the artifact tree.
-    :param Mapping[str, optuna.Study] studies: Existing phase studies keyed by
-        phase name, as returned by :func:`phasesweep.engine.guards._preflight_existing_studies`.
-    :raises TrialEvidenceMissingError: A selection-eligible trial records an
-        unusable trial directory, or its evidence directory, audit artifacts,
-        generated trainer input, or recorded objective source are no longer in
-        this tree.
+    :param Mapping[str, optuna.Study] studies: Phase studies a run would select from, keyed by
+        phase name.
+    :raises TrialEvidenceMissingError: A candidate's evidence is present but no longer the
+        recorded evidence, or the trial a phase would select has no directory.
+    :raises PhaseSweepError: A trial directory's path could not be inspected.
     """
     for phase_name, study in studies.items():
-        phase_dir = _phase_dir(experiment, phase_name)
-        phase = experiment.phase(phase_name)
-        verification = _EvidenceVerification(experiment, phase)
-        trials = {trial.number: trial for trial in study.get_trials(deepcopy=False)}
-        for trial in trials.values():
-            identity = _selection_candidate_identity(trial)
-            if identity is None:
-                continue
-            generation_id, attempt_id = identity
-            assert trial.value is not None
-            subject = (
-                f"Study {study.study_name!r} phase {phase_name!r} trial {trial.number} "
-                "is eligible to win selection but"
-            )
-            try:
-                recorded = _required_trial_dir(trial).name
-            except ValueError:
-                raise TrialEvidenceMissingError(
-                    f"{subject} records an invalid {TRIAL_DIR_ATTR!r} user attribute "
-                    f"{trial.user_attrs.get(TRIAL_DIR_ATTR)!r}, so its evidence cannot be "
-                    "located."
-                ) from None
-            # The directory must name its own opener, even after a fresh-directory rerun.
-            expected_name = _expected_trial_dir_name(trials, trial)
-            if expected_name is None or recorded != expected_name:
-                raise TrialEvidenceMissingError(
-                    f"{subject} records evidence directory {recorded!r}, which does "
-                    f"not name the attempt that opened it (expected {expected_name!r})."
-                )
-            verification.verify_trial(
-                trial,
-                phase_dir / expected_name,
-                generation_id,
-                attempt_id,
-                float(trial.value),
-                subject=subject,
-                verify_digest=False,
-            )
+        pruned = _selection_evidence(experiment, experiment.phase(phase_name), study)
+        if pruned:
+            report.info("%s  %s", phase_name, pruned_trials_note(pruned))
 
 
 def _verify_winner_evidence(

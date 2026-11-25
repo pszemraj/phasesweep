@@ -14,6 +14,7 @@ from typing import TypeGuard
 
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import CategoricalParam, SearchParam, sampler_search_space
+from phasesweep.engine.evidence import pruned_trials_note
 from phasesweep.engine.paths import TRIALS_CSV_FILENAME
 from phasesweep.engine.read import (
     _REPEAT_GROUP_COLUMN,
@@ -435,7 +436,8 @@ def _phase_lines(
     count toward the target, by state, then the configured metric name and the direction of its
     goal, which addresses the study the rows come from. A phase a run would refuse prints that
     refusal and its fix before any other note. Each search-space growth the study recorded then
-    gets a note naming the draw position it took effect at and the values it added.
+    gets a note naming the draw position it took effect at and the values it added, and finished
+    trials whose directory is gone get one naming them.
 
     :param TrialTable table: The phase's trials.
     :param Phase phase: The configured phase.
@@ -482,6 +484,8 @@ def _phase_lines(
                 subsequent_indent=INDENT * 2,
             )
         )
+    if table.pruned:
+        notes.append(pruned_trials_note(table.pruned))
     sources = set(tables.winner_generations.values())
     source = tables.winner_generations.get(table.phase)
     if len(sources) > 1 and source is not None:

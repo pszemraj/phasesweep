@@ -20,7 +20,7 @@ from phasesweep.config.models import Constraint, ExecutionContext, Experiment, M
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.fingerprints import phase_study_name
-from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.ledger import _resolve_storage, validate_ledger
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
@@ -29,7 +29,7 @@ from phasesweep.engine.paths import (
     _phase_dir,
     _trial_dir_for,
 )
-from phasesweep.engine.read import read_result, read_status
+from phasesweep.engine.read import inspect_status, read_result, read_status, read_trial_tables
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     OBJECTIVE_PROVENANCE_ATTR,
@@ -508,7 +508,7 @@ def test_cli_trainer_input_record_is_the_merged_trainer_config(
 @pytest.mark.parametrize(
     ("damage", "expected"),
     [
-        pytest.param("directory", "has no evidence directory", id="whole-trial-directory"),
+        pytest.param("directory", "would select trial 0, whose directory", id="winner-directory"),
         pytest.param(
             "overrides",
             "missing its 'overrides_resolved.json' audit artifact",
@@ -537,7 +537,7 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
     """Missing candidate evidence fails the next top-up closed, before it launches.
 
     Each variant removes a different piece of the one completed trial's
-    evidence: the whole trial directory, the resolved-overrides audit artifact,
+    evidence: the whole trial directory (the winner's), the resolved-overrides audit artifact,
     the objective source the metric was extracted from, the whole attempt
     directory, and the attempt directory replaced by an empty one of the same
     name (which passes a bare existence check but lacks the current-format
@@ -572,6 +572,69 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
     # whose evidence was broken, and nothing published over the damaged tree.
     assert len(phase_trials(topup)) == 1
     assert _pointer_bytes(topup) == pointer_before
+
+
+def _losing_trial_dir(experiment: Experiment, number: int) -> Path:
+    """Return the trial directory one trial of phase ``p`` recorded."""
+    (directory,) = _phase_dir(experiment, "p").glob(f"trial_{number:05d}__*")
+    return directory
+
+
+@pytest.mark.parametrize("prune", ["deleted", "dangling_link"])
+def test_a_pruned_losing_trial_keeps_its_rank_in_every_command(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, prune: str
+) -> None:
+    """A loser whose directory is gone keeps its value and rank; nothing refuses, one note says so.
+
+    The run, its dry run and both status reads judge it from one rule, and the top-up launches
+    only its one new trial.
+    """
+    experiment = _evidence_experiment(tmp_path, n_trials=2)
+    run_experiment(experiment)
+    pruned = _losing_trial_dir(experiment, 1)
+    shutil.rmtree(pruned)
+    if prune == "dangling_link":
+        pruned.symlink_to(tmp_path / "moved-away", target_is_directory=True)
+    topup = _evidence_experiment(tmp_path, n_trials=3)
+    note = "1 finished trial has no directory (trial 1); it ranks by its recorded value"
+
+    run_experiment(topup, dry_run=True)
+    inspection = inspect_status(topup, validate_ledger(topup))
+    assert inspection.refusals == {}
+    assert inspection.pruned == {"p": (1,)}
+    (table,) = read_trial_tables(topup).phases
+    assert (table.refusal, table.pruned) == (None, (1,))
+    caplog.clear()
+    winners = run_experiment(topup)
+
+    assert caplog.text.count(note) == 1
+    assert winners["p"].trial_number == 0
+    trials = phase_trials(topup)
+    assert [trial.number for trial in trials] == [0, 1, 2]
+    assert trials[1].value == trials[0].value
+
+
+def test_a_pruned_winner_refuses_every_command_with_its_path(tmp_path: Path) -> None:
+    """The trial selection picks must keep its directory; the refusal's fix names that path."""
+    experiment = _evidence_experiment(tmp_path, n_trials=2)
+    run_experiment(experiment)
+    pruned = _losing_trial_dir(experiment, 0)
+    shutil.rmtree(pruned)
+    pointer_before = _pointer_bytes(experiment)
+    expected = f"phase 'p' would select trial 0, whose directory {str(pruned)!r} is gone"
+    fix = f"Restore {pruned}, or rename phase 'p' to retrain its trials in a new study"
+
+    for dry_run in (True, False):
+        with pytest.raises(TrialEvidenceMissingError, match=re.escape(expected)) as excinfo:
+            run_experiment(experiment, dry_run=dry_run)
+        assert excinfo.value.remediation is not None
+        assert excinfo.value.remediation.startswith(fix)
+    refusal = inspect_status(experiment, validate_ledger(experiment)).refusals["p"]
+    assert expected in str(refusal)
+    (table,) = read_trial_tables(experiment).phases
+    assert expected in str(table.refusal)
+    assert len(phase_trials(experiment)) == 2
+    assert _pointer_bytes(experiment) == pointer_before
 
 
 @pytest.mark.parametrize(

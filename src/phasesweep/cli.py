@@ -50,6 +50,7 @@ from phasesweep.config.run_overrides import (
 )
 from phasesweep.config.search import phase_draws
 from phasesweep.engine.errors import WinnerIntegrityError
+from phasesweep.engine.evidence import pruned_trials_note
 from phasesweep.engine.fingerprints import _recorded_config_matches
 from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.locking import experiment_is_busy
@@ -1458,6 +1459,8 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
             click.echo(f"# {line}")
         if isinstance(refusal, PendingRereadNotice):
             _render_phase_comment(rerun_command, prefix="# ")
+    for phase_name, pruned in inspection.pruned.items():
+        click.echo(f"# {phase_name}: {pruned_trials_note(pruned)}")
     if retained and suggest_resume and not refusals:
         step = unpublished_winner_step(config, ledger, inspection.study_names)
         if step is not None:

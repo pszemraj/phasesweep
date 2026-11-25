@@ -24,6 +24,7 @@ from phasesweep.engine.artifact_roots import (
     _check_published_phase_studies,
 )
 from phasesweep.engine.errors import StudyStorageUnavailableError
+from phasesweep.engine.evidence import _validate_selection_evidence
 from phasesweep.engine.fingerprints import (
     _inherited_override_payload,
     _inherited_override_suppliers,
@@ -412,10 +413,10 @@ def _refuse_as_a_launch_would(
 
     The reached studies get the checks a launch gives them after its recovery, from the same
     function (:func:`phasesweep.engine.study_policy._reached_study_refusals`): recorded
-    identity, then target, then the launch preflight of a phase that needs new trials. A
-    RUNNING study gets the fixed-target check on predicted recovery counts in place of its
-    accepted target. Preview inspects each study's artifact-root claim without making it,
-    and does not verify evidence.
+    identity, then target, then the launch preflight of a phase that needs new trials, then
+    the selection evidence. A RUNNING study gets the fixed-target check on predicted recovery
+    counts in place of its accepted target. Preview inspects each study's artifact-root claim
+    without making it, and leaves the winner's digest check to the run's selection.
 
     :param Experiment experiment: Parsed experiment being previewed.
     :param RecordedStudies recorded: Every study the ledger holds for each phase.
@@ -434,6 +435,8 @@ def _refuse_as_a_launch_would(
     :raises TrialTargetRefusedError: A study already accepted a higher target
         than its phase requests, or a fixed configuration asks for more
         attempts than it may retry.
+    :raises TrialEvidenceMissingError: A candidate's evidence changed, or the trial a reached
+        phase would select has no directory.
     """
     studies = {
         name: tuple(record.study for record in records if record.study is not None)
@@ -602,6 +605,9 @@ def _preview_phase(
             phase_fingerprint=phase_fingerprint,
             verify_evidence=False,
         )
+        if phase.inherits:
+            # As a run does once it reaches the phase whose study its parents' winners pick.
+            _validate_selection_evidence(experiment, {phase.name: study})
         if isinstance(resumed, Winner):
             # A run replays an accepted partial result before it logs a header.
             log.info(

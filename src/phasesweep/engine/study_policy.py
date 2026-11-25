@@ -32,6 +32,7 @@ from phasesweep.engine.errors import (
     StudySchemaMismatchError,
     TrialTargetRefusedError,
 )
+from phasesweep.engine.evidence import _validate_selection_evidence
 from phasesweep.engine.fingerprints import (
     _ABSENT,
     _MAX_REPORTED_CHANGES,
@@ -1720,14 +1721,16 @@ class ReachedStudy(NamedTuple):
 def _reached_study_refusals(
     experiment: Experiment, reached: Sequence[ReachedStudy]
 ) -> list[Exception]:
-    """Check each reached study before any phase runs: its recorded identity, its target, its launch.
+    """Check each reached study before any phase runs: identity, target, launch, then evidence.
 
     A run (:func:`phasesweep.engine.guards._preflight_existing_studies`) and its dry run
     (:func:`phasesweep.engine.preview._refuse_as_a_launch_would`) both call this, so they refuse
     in one order, and each step assumes the ones before it passed. A changed config comes first
     and alone, for the first study in phase order that recorded another, because restoring it or
-    renaming the phase decides every later check. Target and launch refusals are collected per
-    study. A phase's actual inherited values are checked once its parents have selected winners.
+    renaming the phase decides every later check. Target, launch and selection-evidence refusals
+    (:func:`phasesweep.engine.evidence._validate_selection_evidence`, which also notes trials
+    whose directory is gone) are collected per study. A phase's actual inherited values, and
+    the evidence of the study they address, are checked once its parents have selected winners.
 
     :param Experiment experiment: Current experiment config.
     :param Sequence[ReachedStudy] reached: The reached phases' studies, in phase order, each
@@ -1762,6 +1765,7 @@ def _reached_study_refusals(
                 needs_new_trials = phase.n_trials > finished
             if needs_new_trials:
                 _launch_preflight(experiment, phase.name, study)
+            _validate_selection_evidence(experiment, {phase.name: study})
         except Exception as exc:
             errors.append(exc)
     return errors

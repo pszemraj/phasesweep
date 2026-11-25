@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.attempts as attempt_ops
-import phasesweep.engine.evidence as evidence_ops
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.generation as generation_ops
 import phasesweep.engine.guards as guard_ops
@@ -386,11 +385,6 @@ def _run_experiment_outcome(
             if cleanup.unreadable_evidence:
                 # New trials would bury finished training the tracker has yet to report.
                 raise attempt_ops._pending_evidence_refusal(cleanup.unreadable_evidence)
-            # Validate candidate evidence after recovery and before launching new work; a phase
-            # that inherits validates the study it addresses once the run reaches it.
-            evidence_ops._validate_selection_evidence(
-                experiment, guard_ops.known_studies(experiment, existing_studies)
-            )
             resume_ops._reject_fixed_targets_without_study(
                 experiment,
                 from_phase=from_phase,
