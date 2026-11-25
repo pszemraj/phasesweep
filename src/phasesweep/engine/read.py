@@ -14,6 +14,7 @@ import math
 import statistics
 import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from stat import S_ISDIR, S_ISREG
@@ -406,6 +407,7 @@ def _represented_winners(
     phase_names: Sequence[str],
     *,
     ledger: ValidatedLedger,
+    captured: Mapping[str, Sequence[optuna.Study]] | None = None,
     fallback_published: bool = False,
     comparison_experiment: Experiment | None = None,
 ) -> list[PhaseWinnerView]:
@@ -420,6 +422,7 @@ def _represented_winners(
     :param Sequence[str] phase_names: Safe phase names to enumerate.
     :param ValidatedLedger ledger: Handle the command validated for ``experiment``, which
         the read-time advice reads the phases' trials through (:func:`winner_advisories`).
+    :param Mapping[str, Sequence[optuna.Study]] | None captured: Studies already captured for this read's trial counts or rows.
     :param bool fallback_published: Fill missing latest phase winners from the publication.
     :param Experiment | None comparison_experiment: Current config for drift comparisons.
     :return list[PhaseWinnerView]: One view per named phase that has a usable winner.
@@ -487,7 +490,11 @@ def _represented_winners(
                     phase_count=len(producing.phases),
                 )
             advisories = winner_advisories(
-                experiment, view, config_matches=config_matches is True, ledger=ledger
+                experiment,
+                view,
+                config_matches=config_matches is True,
+                ledger=ledger,
+                captured=captured,
             )
             cost_status = advisories.cost_advisory_status
             if config_matches is not True and cost_status == "not_configured":
@@ -577,6 +584,7 @@ def winner_advisories(
     *,
     config_matches: bool,
     ledger: ValidatedLedger,
+    captured: Mapping[str, Sequence[optuna.Study]] | None = None,
 ) -> WinnerAdvisories:
     """Recompute a winner's tie groups, cost advisory and edge advisory from its phase's trials.
 
@@ -592,17 +600,16 @@ def winner_advisories(
     :param bool config_matches: Whether ``experiment`` agrees with the producing config.
     :param ValidatedLedger ledger: Handle the command validated for ``experiment``, so a read
         of every winner's advice validates the ledger once.
+    :param Mapping[str, Sequence[optuna.Study]] | None captured: Studies from this read's trial snapshot. A standalone winner or a phase outside that snapshot reads its own history.
     :return WinnerAdvisories: The advice and whether each could be checked.
     """
     phase = next((phase for phase in experiment.phases if phase.name == winner.phase), None)
-    try:
-        studies = (
-            read_every_phase_study(ledger, [winner.phase])[winner.phase]
-            if winner.study_name
-            else []
-        )
-    except StudyStorageUnavailableError:
-        studies = []
+    studies: Sequence[optuna.Study] = ()
+    if captured is not None and winner.phase in captured:
+        studies = captured[winner.phase]
+    elif winner.study_name:
+        with suppress(StudyStorageUnavailableError):
+            studies = read_every_phase_study(ledger, [winner.phase])[winner.phase]
     study = next((item for item in studies if item.study_name == winner.study_name), None)
     trials = None if study is None else study.get_trials(deepcopy=False)
     ranking = _winner_ranked_groups(winner, trials)
@@ -848,7 +855,7 @@ def read_status(
     :return EngineStatus: Identities, integrity, result semantics, progress and artifact
         presence. Path-free ``publication_error`` appears only for failed or denied validation.
     """
-    status, _publication, _studies, _pending, _unsettled = _read_status(
+    status, _publication, _studies, _pending, _every = _read_status(
         experiment,
         generation_id=generation_id,
         trial_generation_id=trial_generation_id,
@@ -892,7 +899,7 @@ def read_result(
         else [_validate_safe_name("phase", name) for name in phase_names]
     )
     ledger = validate_ledger(experiment) if ledger is None else ledger
-    status, publication, _studies, _pending, _unsettled = _read_status(
+    status, publication, _studies, _pending, every = _read_status(
         experiment,
         generation_id=generation_id,
         trial_generation_id=None,
@@ -905,6 +912,7 @@ def read_result(
         status["represented_generation_id"],
         status["result_phase_plan"] if names is None else names,
         ledger=ledger,
+        captured=every,
         comparison_experiment=comparison_experiment,
     )
     return status, winners
@@ -923,7 +931,7 @@ def _read_status(
     PublicationPointer,
     dict[str, optuna.Study],
     dict[str, PhaseRefusal],
-    int,
+    dict[str, tuple[optuna.Study, ...]],
 ]:
     """Build the :func:`read_status` payload and return the resolution behind it.
 
@@ -940,10 +948,10 @@ def _read_status(
         is bound to a different storage ledger or experiment.
     :raises ValueError: If ``generation_id`` or ``trial_generation_id`` is not a safe
         generation name.
-    :return tuple[EngineStatus, PublicationPointer, dict[str, optuna.Study], dict[str, PhaseRefusal], int]:
+    :return tuple[EngineStatus, PublicationPointer, dict[str, optuna.Study], dict[str, PhaseRefusal], dict[str, tuple[optuna.Study, ...]]]:
         The status payload, its pointer resolution, the study each phase's counts were read
         from (:func:`~phasesweep.engine.preview.replay_study_names`), any pending fill or refusal
-        (:func:`_pending_study_notices`), and the count of unsettled trials across those phases.
+        (:func:`_pending_study_notices`), and every study captured for those phases.
     """
     ledger = validate_ledger(experiment) if ledger is None else ledger
     current_generation_id, represented_generation_id, publication = _read_generation_selection(
@@ -1066,6 +1074,7 @@ def _read_status(
                 represented_generation_id,
                 result_phase_plan,
                 ledger=ledger,
+                captured=every,
                 fallback_published=True,
                 comparison_experiment=comparison_experiment,
             )
@@ -1107,7 +1116,7 @@ def _read_status(
             phase_payload["winner_config_matches_current"] = (
                 None if view is None else view.config_matches_current
             )
-    return status, publication, addressed, pending, _unsettled_trial_count(every.values())
+    return status, publication, addressed, pending, every
 
 
 def _unsettled_trial_count(phase_studies: Iterable[Sequence[optuna.Study]]) -> int:
@@ -1564,7 +1573,7 @@ def _experiment_status(
         the count of unsettled trials across configured phases.
     """
     require_study(experiment)
-    status, _, studies, pending, unsettled = _read_status(
+    status, _, studies, pending, every = _read_status(
         experiment,
         generation_id=generation_id,
         trial_generation_id=None,
@@ -1600,7 +1609,7 @@ def _experiment_status(
         from phasesweep.tracking.publication import delivery_status
 
         payload["tracking_delivery"] = delivery_status(experiment)
-    return json_object(payload), studies, pending, unsettled
+    return json_object(payload), studies, pending, _unsettled_trial_count(every.values())
 
 
 def _recorded_count(value: object) -> int | None:
@@ -1845,20 +1854,9 @@ def read_trial_tables(
     published_generation_id = _published_generation_id(publication)
     if publication.state not in {"ok", "absent"}:
         represented_generation_id = None
-    winners = {
-        view.phase: view
-        for view in _represented_winners(
-            experiment,
-            publication,
-            represented_generation_id,
-            [phase.name for phase in experiment.phases],
-            ledger=ledger,
-            fallback_published=latest and generation_id is None,
-        )
-    }
     tables: list[TrialTable] = []
     unreadable: StudyStorageUnavailableError | None = None
-    every: dict[str, list[optuna.Study]] = {}
+    every: dict[str, list[optuna.Study]] = {phase.name: [] for phase in experiment.phases}
     parent_overrides = _latest_parent_overrides(experiment, publication, current_generation_id)
     study_names: dict[str, str] = {}
     pending: Mapping[str, PhaseRefusal] = {}
@@ -1868,6 +1866,18 @@ def read_trial_tables(
         pending = _pending_study_notices(experiment, every, study_names, unresolved)
     except StudyStorageUnavailableError as exc:
         unreadable = exc
+    winners = {
+        view.phase: view
+        for view in _represented_winners(
+            experiment,
+            publication,
+            represented_generation_id,
+            [phase.name for phase in experiment.phases],
+            ledger=ledger,
+            captured=every,
+            fallback_published=latest and generation_id is None,
+        )
+    }
     for phase in experiment.phases:
         if unreadable is not None:
             log_storage_read_failure(ledger, phase, unreadable, logger=log)

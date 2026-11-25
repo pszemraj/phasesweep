@@ -800,12 +800,13 @@ def test_reread_does_not_score_a_file_overwritten_from_another_reading_study(
 
 
 def test_older_winner_warns_about_its_reused_checkpoint_directory(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Warn before overwriting a shared checkpoint and identify the older winner's own model on read."""
     from click.testing import CliRunner
 
     from phasesweep.cli import cli
+    from phasesweep.engine import read
 
     trainer = write_trainer(
         tmp_path / "trainer.py",
@@ -832,9 +833,20 @@ def test_older_winner_warns_about_its_reused_checkpoint_directory(
     original = config(1)
     first = run_experiment(original)["p"]
     assert not any("shared checkpoint directory" in message for message in caplog.messages)
-    later = run_experiment(config(2))["p"]
+    latest_overrides = read._latest_parent_overrides
+
+    def retry_before_trial_capture(experiment, publication, current_generation_id):
+        overrides = latest_overrides(experiment, publication, current_generation_id)
+        later = run_experiment(config(2))["p"]
+        assert first.trial_dir == later.trial_dir and first.attempt_id != later.attempt_id
+        return overrides
+
+    with monkeypatch.context() as patch:
+        patch.setattr(read, "_latest_parent_overrides", retry_before_trial_capture)
+        table = read_trial_tables(original).phases[0]
+    warning = f"Use a checkpoint saved for winning attempt {first.attempt_id}"
+    assert any(warning in message for message in table.checkpoint_warnings)
     assert any("Retrying in shared checkpoint directory" in message for message in caplog.messages)
-    assert first.trial_dir == later.trial_dir and first.attempt_id != later.attempt_id
     caplog.clear()
     winner = run_experiment(original)["p"]
     assert winner.metric == 1 and winner.attempt_id == first.attempt_id
@@ -842,7 +854,6 @@ def test_older_winner_warns_about_its_reused_checkpoint_directory(
     directory = _experiment_dir(original) / "p" / first.trial_dir
     assert (directory / "best.ckpt").read_text() == "2"
     assert (directory / first.attempt_id).read_text() == "1"
-    warning = f"Use a checkpoint saved for winning attempt {first.attempt_id}"
     assert any(warning in message for message in caplog.messages)
     path = write_experiment_config(tmp_path / "sweep.yaml", original)
     for args in (["show-winners", str(path)], ["status", str(path), "--trials"]):
