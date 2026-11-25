@@ -1293,6 +1293,11 @@ def _pending_rereads(
 ) -> dict[str, PhaseRefusal]:
     """Name each phase whose addressed study waits to be filled from kept evidence.
 
+    A phase is addressed by its parents' latest winners. A parent that waits to be re-read, or
+    descends from one, selects its winner again on the next run, so a child's notice says its
+    re-read holds only if those parents keep their winners, as the dry run leaves the child's
+    study unresolved.
+
     :param Experiment experiment: Current config.
     :param Mapping[str, Sequence[optuna.Study]] every: Every study of each phase, oldest first,
         from the caller's one capture.
@@ -1301,17 +1306,24 @@ def _pending_rereads(
         inherited values and another training identity or a malformed one, by phase name.
     """
     pending: dict[str, PhaseRefusal] = {}
+    unsettled: set[str] = set()
     for phase in experiment.phases:
+        parents = [parent for parent in phase.inherits if parent in unsettled]
+        if parents:
+            unsettled.add(phase.name)
         name = study_names.get(phase.name)
         if name is None:
             continue
         try:
-            notice = pending_reread(experiment, phase, name, every.get(phase.name, []))
+            notice = pending_reread(
+                experiment, phase, name, every.get(phase.name, []), unsettled=parents
+            )
         except (StudyFingerprintMismatchError, StudySchemaMismatchError) as exc:
             pending[phase.name] = exc
             continue
         if notice is not None:
             pending[phase.name] = notice
+            unsettled.add(phase.name)
     return pending
 
 

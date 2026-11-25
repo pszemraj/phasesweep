@@ -657,34 +657,60 @@ class PendingRereadNotice(PhaseSweepError):
     finished_trials: int = 0
 
 
-def _pending_notice(source: FillSource, phase: str) -> PendingRereadNotice:
+def _pending_notice(
+    source: FillSource, phase: str, unsettled: Sequence[str] = ()
+) -> PendingRereadNotice:
     """Build both texts of a :class:`PendingRereadNotice` from one description of the fill.
+
+    A parent that is itself re-read first may select another winner, and then this phase
+    inherits other values and runs in another study, so the re-read here is conditional.
 
     :param FillSource source: The study the fill would read from.
     :param str phase: The phase's name.
+    :param Sequence[str] unsettled: Parents whose winner the next run selects again first,
+        defaults to none.
     :return PendingRereadNotice: The notice, with its message and step for the CLI and its
         :attr:`PendingRereadNotice.statement` for the status payload.
     """
     opening = f"Phase {phase!r} has not started under the current reading settings"
     trials = plural(source.rereads, "finished trial")
-    notice = PendingRereadNotice(
-        f"{opening} ({describe_changes(source.changes)}).",
-        remediation=(
+    settings = ", ".join(path for path, _old, _new in source.changes) or "reading settings"
+    if unsettled:
+        names = " and ".join(repr(name) for name in unsettled)
+        keeps = "keeps its winner" if len(unsettled) == 1 else "keep their winners"
+        remediation = (
+            f"Run the same configuration. If {names} {keeps} after re-reading, this phase "
+            f"re-reads {trials} from kept evidence without retraining them; a new winner "
+            "starts a new study here."
+        )
+        statement = (
+            f"{opening} ({settings} changed); the next run re-reads {trials} from kept evidence "
+            f"if {names} {keeps} after re-reading, and otherwise starts a new study."
+        )
+    else:
+        remediation = (
             f"Run the same configuration to re-read {trials} from kept evidence without "
             "retraining those trials."
-        ),
+        )
+        statement = (
+            f"{opening} ({settings} changed); the next run re-reads {trials} from kept evidence "
+            "and retrains nothing."
+        )
+    notice = PendingRereadNotice(
+        f"{opening} ({describe_changes(source.changes)}).", remediation=remediation
     )
-    settings = ", ".join(path for path, _old, _new in source.changes) or "reading settings"
-    notice.statement = (
-        f"{opening} ({settings} changed); the next run re-reads {trials} from kept evidence and "
-        "retrains nothing."
-    )
+    notice.statement = statement
     notice.finished_trials = source.rereads
     return notice
 
 
 def pending_reread(
-    experiment: Experiment, phase: Phase, study_name: str, studies: Sequence[optuna.Study]
+    experiment: Experiment,
+    phase: Phase,
+    study_name: str,
+    studies: Sequence[optuna.Study],
+    *,
+    unsettled: Sequence[str] = (),
 ) -> PendingRereadNotice | None:
     """Say that a phase's addressed study waits for its fill, for a read that writes nothing.
 
@@ -695,6 +721,8 @@ def pending_reread(
     :param Phase phase: The phase.
     :param str study_name: The study it addresses (:func:`phase_study_name`).
     :param Sequence[optuna.Study] studies: Every study of the phase, oldest first.
+    :param Sequence[str] unsettled: Parents whose winner the next run selects again before this
+        phase, so the address holds only if they keep it; defaults to none.
     :raises StudyFingerprintMismatchError: A study with these inherited values has another
         training identity (:func:`fill_source`).
     :return PendingRereadNotice | None: The notice, or ``None`` when the addressed study is
@@ -712,7 +740,7 @@ def pending_reread(
         inherited = _recorded_inheritance(record)
         if phase_study_name(experiment, phase, inherited) == study_name:
             source = fill_source(experiment, phase, inherited, others, target=addressed)
-            return None if source is None else _pending_notice(source, phase.name)
+            return None if source is None else _pending_notice(source, phase.name, unsettled)
     if pinned is not None:
         raise StudySchemaMismatchError(
             f"Saved fill source {pinned!r} does not address study {study_name!r}."

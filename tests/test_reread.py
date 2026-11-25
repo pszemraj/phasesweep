@@ -688,6 +688,13 @@ def test_a_child_follows_its_re_read_parent_from_its_own_study(
     ) in caplog.text
     assert tree_changes(before, tree_snapshot(tmp_path)) == {}
     assert _launches(launches) == 5
+    # Status agrees with the dry run: the child's re-read holds only if the parent keeps x.
+    child = inspect_status(changed, validate_ledger(changed)).refusals["c"]
+    assert child.remediation == (
+        "Run the same configuration. If 'p' keeps its winner after re-reading, this phase "
+        "re-reads 2 finished trials from kept evidence without retraining them; a new winner "
+        "starts a new study here."
+    )
 
     winners = run_experiment(changed)
 

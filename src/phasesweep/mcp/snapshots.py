@@ -91,7 +91,8 @@ class RereadPendingSnapshot(_SnapshotModel):
     statement: str
     """:attr:`phasesweep.engine.reread.PendingRereadNotice.statement`, free of config values."""
     finished_trials: NonNegativeInt
-    """Finished trials the next run re-reads without launching a trainer."""
+    """Finished trials the next run re-reads without launching a trainer, if each parent it
+    re-reads first keeps its winner."""
 
 
 class PhaseStatusSnapshot(_SnapshotModel):
