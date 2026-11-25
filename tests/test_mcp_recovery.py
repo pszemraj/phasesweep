@@ -98,6 +98,7 @@ from tests.mcp_helpers import (
     write_unsafe_cleanup_status,
 )
 from tests.recovery_helpers import (
+    make_stale_trial_dirs,
     recover_run_cli,
     stamp_artifact_root,
     write_launched_stale_trial,
@@ -785,10 +786,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
 
     mark_current_format(experiment)
     attempt_id = "registry-only-attempt"
-    trial_dir = _trial_dir_for(experiment, "p", 0, attempt_id=attempt_id)
-    trial_dir.mkdir(parents=True)
-    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
-    attempt_dir.mkdir(parents=True)
+    trial_dir, attempt_dir = make_stale_trial_dirs(experiment, "p", 0, attempt_id)
     write_attempt_lifecycle(attempt_dir, attempt_id=attempt_id, state="allocated")
     write_trial_identity(
         attempt_dir,

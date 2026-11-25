@@ -38,7 +38,7 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.fingerprints import _fresh_identity, _stamp_identity
 from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.guards import _preflight_existing_studies, _reconcile_existing_studies
-from phasesweep.engine.paths import _attempt_dir, _attempts_dir, _experiment_dir, _trial_dir_for
+from phasesweep.engine.paths import _attempts_dir, _experiment_dir
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.selection import PhaseAbortRefusedError
@@ -91,6 +91,7 @@ from tests.mcp_helpers import stage_dead_run
 from tests.recovery_helpers import (
     fabricate_registered_attempt,
     fabricate_stale_trial,
+    make_stale_trial_dirs,
     stamp_artifact_root,
     write_trial_identity,
 )
@@ -1312,10 +1313,7 @@ def _fabricate_registered_journal_attempt(
     )
     study = new_phase_study(experiment, "p")
     trial = study.ask()
-    trial_dir = _trial_dir_for(experiment, "p", trial.number, attempt_id=attempt_id)
-    trial_dir.mkdir(parents=True)
-    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
-    attempt_dir.mkdir(parents=True)
+    trial_dir, attempt_dir = make_stale_trial_dirs(experiment, "p", trial.number, attempt_id)
     _register_active_attempt(
         experiment,
         attempt_id=attempt_id,
@@ -1616,10 +1614,7 @@ def test_attempt_registry_refuses_unsafe_private_authority(
         workdir=tmp_path / "runs",
         storage=f"journal:///{tmp_path / 'study.journal'}",
     )
-    trial_dir = _trial_dir_for(experiment, "p", 0, attempt_id="unsafe-attempt")
-    trial_dir.mkdir(parents=True)
-    attempt_dir = _attempt_dir(trial_dir.parent, "unsafe-attempt")
-    attempt_dir.mkdir(parents=True)
+    trial_dir, attempt_dir = make_stale_trial_dirs(experiment, "p", 0, "unsafe-attempt")
     _register_active_attempt(
         experiment,
         attempt_id="unsafe-attempt",
@@ -1731,10 +1726,7 @@ def test_in_memory_attempt_registry_accepts_locatorless_entries(tmp_path: Path) 
         workdir=tmp_path / "runs",
         storage=None,
     )
-    trial_dir = _trial_dir_for(experiment, "p", 0, attempt_id="memory-attempt")
-    trial_dir.mkdir(parents=True)
-    attempt_dir = _attempt_dir(trial_dir.parent, "memory-attempt")
-    attempt_dir.mkdir(parents=True)
+    trial_dir, attempt_dir = make_stale_trial_dirs(experiment, "p", 0, "memory-attempt")
     write_attempt_lifecycle(attempt_dir, attempt_id="memory-attempt", state="allocated")
     _register_active_attempt(
         experiment,

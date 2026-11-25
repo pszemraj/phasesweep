@@ -39,13 +39,11 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
-    _attempt_dir,
     _experiment_dir,
     _generation_path,
     _generation_record_path,
     _generation_summary_path,
     _phase_dir,
-    _trial_dir_for,
 )
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
@@ -113,7 +111,7 @@ from tests.mcp_helpers import (
     write_srv_catalog,
     write_srv_config,
 )
-from tests.recovery_helpers import recover_run_cli
+from tests.recovery_helpers import make_stale_trial_dirs, recover_run_cli
 
 
 @pytest.mark.integration
@@ -1172,10 +1170,7 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     trial = study.ask()
     attempt_id = "terminal-identity-attempt"
     generation_id = "earlier-generation"
-    trial_dir = _trial_dir_for(experiment, phase.name, trial.number, attempt_id=attempt_id)
-    trial_dir.mkdir(parents=True)
-    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
-    attempt_dir.mkdir(parents=True)
+    trial_dir, attempt_dir = make_stale_trial_dirs(experiment, phase.name, trial.number, attempt_id)
     write_attempt_lifecycle(attempt_dir, attempt_id=attempt_id, state="allocated")
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
     trial.set_user_attr(GENERATION_ID_ATTR, generation_id)

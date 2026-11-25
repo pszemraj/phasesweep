@@ -107,6 +107,17 @@ def stamp_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
     study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment)))
 
 
+def make_stale_trial_dirs(
+    experiment: Experiment, phase_name: str, trial_number: int, attempt_id: str
+) -> tuple[Path, Path]:
+    """Create the trainer output directory and the separate attempt records for a recovery fixture."""
+    trial_dir = _trial_dir_for(experiment, phase_name, trial_number, attempt_id=attempt_id)
+    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
+    trial_dir.mkdir(parents=True)
+    attempt_dir.mkdir(parents=True)
+    return trial_dir, attempt_dir
+
+
 def fabricate_stale_trial(
     experiment: Experiment,
     phase_name: str,
@@ -127,10 +138,7 @@ def fabricate_stale_trial(
     identity = _environment_identity(experiment, phase_name)
     trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
     trial.set_user_attr(TRAINER_ENV_ATTR, dict(identity.tracked))
-    trial_dir = _trial_dir_for(experiment, phase_name, trial.number, attempt_id=attempt_id)
-    trial_dir.mkdir(parents=True)
-    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
-    attempt_dir.mkdir(parents=True)
+    trial_dir, attempt_dir = make_stale_trial_dirs(experiment, phase_name, trial.number, attempt_id)
     if persist_generation_id:
         trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
     if persist_attempt_id:
@@ -184,10 +192,7 @@ def write_launched_stale_trial(
     study = new_phase_study(exp, phase.name)
     trial = study.ask()
     attempt_id = f"stale-attempt-{trial.number}"
-    trial_dir = _trial_dir_for(exp, phase.name, trial.number, attempt_id=attempt_id)
-    trial_dir.mkdir(parents=True)
-    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
-    attempt_dir.mkdir(parents=True)
+    trial_dir, attempt_dir = make_stale_trial_dirs(exp, phase.name, trial.number, attempt_id)
     write_trial_identity(
         attempt_dir,
         attempt_id=attempt_id,
@@ -214,10 +219,7 @@ def write_uncertain_failed_trial(
     study = new_phase_study(exp, phase.name)
     trial = study.ask()
     attempt_id = f"stale-attempt-{trial.number}"
-    trial_dir = _trial_dir_for(exp, phase.name, trial.number, attempt_id=attempt_id)
-    trial_dir.mkdir(parents=True)
-    attempt_dir = _attempt_dir(trial_dir.parent, attempt_id)
-    attempt_dir.mkdir(parents=True)
+    trial_dir, attempt_dir = make_stale_trial_dirs(exp, phase.name, trial.number, attempt_id)
     write_trial_identity(
         attempt_dir,
         attempt_id=attempt_id,
