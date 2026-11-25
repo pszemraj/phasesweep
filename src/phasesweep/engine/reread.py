@@ -262,8 +262,9 @@ def fill_source(
 
     A candidate holds trials measured under the same inherited values and would continue
     under the current config once its reading settings are replaced. The
-    Prefer the most finished trainers to read, then the history with the most spent attempts
-    and retained rows, so a shorter copy cannot erase a failure or an interrupted checkpoint.
+    Prefer histories within the requested trial budget. Among them, keep the most finished
+    trainers to read, then the most spent attempts and retained rows, so a shorter copy
+    cannot erase a failure or an interrupted checkpoint.
     Equally complete histories use the most recently created study.
     An interrupted fill keeps its source and uses its latest trials and study metadata.
 
@@ -327,14 +328,18 @@ def fill_source(
         if refusal is not None:
             raise refusal
         return None
-    return max(
-        reversed(found),
-        key=lambda source: (
+
+    def history_rank(source: FillSource) -> tuple[bool, bool, int, int, int]:
+        spent = _finished_trial_count(source.trials)
+        return (
+            _accepted_trial_target(source.study) <= phase.n_trials,
+            spent <= phase.n_trials,
             source.rereads,
-            _finished_trial_count(source.trials),
+            spent,
             len(source.copyable_trials),
-        ),
-    )
+        )
+
+    return max(reversed(found), key=history_rank)
 
 
 def _reread_trial(
