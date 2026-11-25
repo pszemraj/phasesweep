@@ -17,7 +17,7 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.config.models import Constraint, Experiment, Metric, Phase
-from phasesweep.config.search import CategoricalParam, IntParam, Sampler
+from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Sampler
 from phasesweep.engine import reread as reread_ops
 from phasesweep.engine.errors import (
     PhaseTimeoutError,
@@ -27,6 +27,7 @@ from phasesweep.engine.errors import (
     WinnerIntegrityError,
 )
 from phasesweep.engine.ledger import _resolve_storage, validate_ledger
+from phasesweep.engine.optuna import _PositionCmaEsSampler
 from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.read import inspect_status, read_status
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
@@ -259,6 +260,37 @@ def test_a_flipped_goal_re_reads_into_a_study_of_the_other_direction(tmp_path: P
 
 
 @pytest.mark.integration
+def test_cmaes_topup_relearns_from_the_reread_values(tmp_path: Path) -> None:
+    """An objective direction change keeps draw batches and drops fitted CMA-ES state."""
+    trainer, launches = _counting_trainer(tmp_path)
+    phase = Phase(
+        name="p",
+        n_trials=9,
+        gpu_policy="none",
+        sampler=Sampler(type="cmaes", seed=5),
+        search_space={key: FloatParam(type="float", low=-1, high=1) for key in ("x", "y")},
+    )
+    original = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
+    run_experiment(original)
+    before = phase_study_of(original).trials
+    sampler = _PositionCmaEsSampler(seed=5)
+    assert sampler._restore_optimizer(before) is not None
+
+    top_up = phase.model_copy(update={"n_trials": 10})
+    changed = _experiment(tmp_path, trainer, _metric("loss", goal="maximize"), phases=[top_up])
+    assert run_experiment(changed)["p"].metric >= max(
+        t.value for t in before if t.value is not None
+    )
+    after = phase_study_of(changed).trials
+    assert _launches(launches) == len(after) == 10
+    assert [trial.params for trial in after[:9]] == [trial.params for trial in before]
+    assert [trial.system_attrs.get(sampler._attr_key_generation) for trial in after[:9]] == [
+        trial.system_attrs.get(sampler._attr_key_generation) for trial in before
+    ]
+    assert sampler._restore_optimizer(after[:9]) is None
+    assert sampler._restore_optimizer(after) is not None
+
+
 def test_published_reread_history_belongs_to_the_selecting_study(tmp_path: Path) -> None:
     """An older sibling can neither block replay nor replace the missing publisher."""
     launches = tmp_path / "launches.txt"

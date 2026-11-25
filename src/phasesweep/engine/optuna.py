@@ -789,6 +789,30 @@ class _PositionCmaEsSampler(optuna.samplers.CmaEsSampler):
         return super()._restore_optimizer([newest])
 
 
+def _sampling_trial_for_reread(
+    trial: optuna.trial.FrozenTrial, sampler: optuna.samplers.BaseSampler
+) -> optuna.trial.FrozenTrial:
+    """Keep measured draw positions without importing a fitted optimizer.
+
+    CMA-ES's generation identifies the draw batch. Its optimizer snapshot stores the
+    updates learned from scores and direction; later asks reconstruct updates from the
+    new study's batches and values. TPE fits directly from the new study's history.
+
+    :param optuna.trial.FrozenTrial trial: The trial the new reading study will add.
+    :param optuna.samplers.BaseSampler sampler: The new reading study's sampler.
+    :return optuna.trial.FrozenTrial: A trial carrying only reusable sampling state.
+    """
+    if not isinstance(sampler, _PositionCmaEsSampler):
+        return trial
+    retained = copy.copy(trial)
+    retained.system_attrs = {
+        key: value
+        for key, value in trial.system_attrs.items()
+        if not key.startswith(sampler._attr_key_optimizer)
+    }
+    return retained
+
+
 def _build_sampler(
     cfg: Sampler,
     search_space: dict[str, SearchParam],

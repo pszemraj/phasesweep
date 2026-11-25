@@ -56,6 +56,7 @@ from phasesweep.engine.optuna import (
     _finished_trial_count,
     _measured_draw_count,
     _measured_trial_count,
+    _sampling_trial_for_reread,
 )
 from phasesweep.engine.paths import _attempt_dir, _experiment_dir, _trial_dir_opener
 from phasesweep.engine.provenance import _load_generation_experiment
@@ -620,7 +621,9 @@ def fill_study(
         if reread is not None:
             rereads += 1
             changed += (reread.state, reread.value) != (trial.state, trial.value)
-        target.add_trial(trial if reread is None else reread)
+        target.add_trial(
+            _sampling_trial_for_reread(trial if reread is None else reread, target.sampler)
+        )
     adjusted_target = _copy_study_attrs(phase, target, source)
     _stamp_identity(target, _reread_record(source.record, reading_settings(experiment, phase)))
     return FillResult(len(trials) - len(present), rereads, changed, adjusted_target)
