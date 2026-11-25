@@ -199,13 +199,18 @@ def _no_feasible_remedy(
         step = _raised_target_step(phase, trials)
         if _any_trial_timed_out(trials):
             fix = f"{timeout_step(phase.name)} and fix any other failure"
-    objective_lead = f"{unreadable_objective_step(persistent=True)} " if unreadable else ""
     then = (
         f"{fix}, then {step}"
         if step is not None
         else f"{fix}; every configuration was measured, so no larger n_trials retries one."
     )
-    return f"{evidence} {objective_lead}{then}"
+    if unreadable:
+        # Corrected metric settings re-read every finished trial, so the retry is the
+        # alternative for a trainer-side failure, not a step after the correction.
+        then = (
+            f"{unreadable_objective_step(persistent=True)} Otherwise, {then[0].lower()}{then[1:]}"
+        )
+    return f"{evidence} {then}"
 
 
 @dataclass

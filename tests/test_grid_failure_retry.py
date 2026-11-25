@@ -95,7 +95,8 @@ def test_fully_failed_grid_recovers_only_the_raised_target(tmp_path: Path, repea
     assert run_experiment(recovered)["p"].metric == 1.0
     with pytest.raises(TrialTargetRefusedError, match="allow at most 4") as refused:
         run_experiment(_grid(tmp_path, trainer, 5, repeats=repeats))
-    assert refused.value.remediation == "Set phases[p].n_trials to at most 4."
+    # 4 is both the accepted target and the ceiling, so the step names it exactly.
+    assert refused.value.remediation == "Set phases[p].n_trials to 4."
     assert len(calls.read_text().splitlines()) == 4
 
 
@@ -767,11 +768,13 @@ def test_validate_refuses_an_oversized_fresh_persistent_grid(
 
 
 @pytest.mark.integration
-def test_oversized_grid_target_over_a_recorded_study_names_the_maximum(tmp_path: Path) -> None:
-    """A target past a measured grid names its maximum and launches nothing."""
+def test_oversized_grid_target_over_a_recorded_study_names_the_target_it_takes(
+    tmp_path: Path,
+) -> None:
+    """A target past a measured grid names the one target it takes and launches nothing."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=0)
     assert run_experiment(_grid(tmp_path, trainer, 2))["p"].metric == 1.0
     with pytest.raises(TrialTargetRefusedError) as refused:
         run_experiment(_grid(tmp_path, trainer, 4))
-    assert refused.value.remediation == "Set phases[p].n_trials to at most 2."
+    assert refused.value.remediation == "Set phases[p].n_trials to 2."
     assert len(calls.read_text().splitlines()) == 2

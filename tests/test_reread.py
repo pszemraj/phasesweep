@@ -180,9 +180,11 @@ def test_reread_releases_retry_budget_for_cells_that_now_have_a_result(
     assert tree_changes(before, tree_snapshot(tmp_path)) == {}
     assert _launches(launches) == 5
 
-    with pytest.raises(TrialTargetRefusedError, match="allow at most 5"):
+    with pytest.raises(TrialTargetRefusedError, match="allow at most 5") as refused:
         run_experiment(fixed)
     assert "reduce the accepted trial target from 6 to 5" in caplog.text
+    # 5 is also the accepted floor, so the step names the one target that runs.
+    assert refused.value.remediation == "Set phases[p].n_trials to 5."
 
     assert run_experiment(corrected)["p"].metric == 1.0
     assert _launches(launches) == 5

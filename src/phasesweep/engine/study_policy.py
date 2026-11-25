@@ -657,12 +657,17 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
         )
     trials = study.get_trials(deepcopy=False)
     _validate_fixed_configuration_target(
-        phase, finished=_finished_trial_count(trials), measured=_measured_draw_count(trials)
+        phase,
+        finished=_finished_trial_count(trials),
+        measured=_measured_draw_count(trials),
+        accepted=accepted_target,
     )
     _validate_grown_grid_target(study, phase, trials)
 
 
-def _validate_fixed_configuration_target(phase: Phase, *, finished: int, measured: int) -> None:
+def _validate_fixed_configuration_target(
+    phase: Phase, *, finished: int, measured: int, accepted: int = 0
+) -> None:
     """Reject a fixed configuration or grid target that would repeat measured cells.
 
     A fixed configuration draws nothing, so every attempt runs the same trial.
@@ -671,19 +676,28 @@ def _validate_fixed_configuration_target(phase: Phase, *, finished: int, measure
     COMPLETE attempt, feasible or not, closes it. A grid applies the same rule
     per cell: its target may add one attempt per cell without a COMPLETE result.
     Other sampled phases are unrestricted. A missing study counts zero finished
-    and zero measured.
+    and zero measured. When the accepted target equals the largest allowed one, the remedy
+    names that one target, since any lower value falls below the accepted target.
 
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
     :param int finished: Finished attempts the phase's study holds.
     :param int measured: How many draws have a COMPLETE attempt, feasible or not.
+    :param int accepted: The study's accepted target, defaults to 0 for no study.
     :raises TrialTargetRefusedError: The fixed configuration asks for more
         attempts than it may retry; the message names the largest allowed target.
     """
     refusal = fixed_configuration_target_refusal(phase, finished=finished, measured=measured)
+    # A completed fixed configuration's remedy already names its one target.
+    bounded = refusal is None or measured == 0
     if refusal is None:
         refusal = grid_target_refusal(phase, finished=finished, measured=measured)
     if refusal is not None:
         message, remediation = refusal
+        if (
+            bounded
+            and retry_target_ceiling(phase, finished=finished, measured=measured) == accepted
+        ):
+            remediation = f"Set phases[{phase.name}].n_trials to {accepted}."
         raise TrialTargetRefusedError(message, remediation=remediation)
 
 
@@ -1094,16 +1108,16 @@ def _recovery_advice(
             f"{REJUDGE_BOUNDS_STEP} {remedies}"
         )
     trials = study.get_trials(deepcopy=False)
-    objective_lead = (
-        f"{unreadable_objective_step(persistent=True)} "
-        if _any_objective_unreadable(trials)
-        else ""
-    )
-    lead_in = (
-        f"{timeout_step(phase.name)} and fix any other cause, then "
+    unreadable = _any_objective_unreadable(trials)
+    # Corrected metric settings re-read every finished trial, so the retry is the
+    # alternative for a trainer-side failure, not a step after the correction.
+    objective_lead = f"{unreadable_objective_step(persistent=True)} " if unreadable else ""
+    fix = (
+        f"{timeout_step(phase.name)} and fix any other cause"
         if _any_trial_timed_out(trials)
-        else "Fix the cause, then "
+        else "Fix the cause"
     )
+    lead_in = f"Otherwise, {fix[0].lower()}{fix[1:]}, then " if unreadable else f"{fix}, then "
     remedies = _recovery_remedies(experiment, phase, study, abort, lead_in=lead_in)
     if remedies is None:
         return None

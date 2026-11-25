@@ -38,11 +38,11 @@ def _remedy(tmp_path: Path, reasons: list[str], *, persistent: bool) -> str:
 def test_an_unreadable_objective_says_which_fix_continues_the_study_and_which_starts_one(
     tmp_path: Path,
 ) -> None:
-    """The retry step is preceded by the sentence that sends a wrong `metric` to a fresh study."""
+    """A wrong `metric` is re-read; the retry step is offered only as the alternative to that."""
     remedy = _remedy(tmp_path, [_KEY_MISSING] * 2, persistent=True)
 
     assert remedy.index(_UNREADABLE) < remedy.index(
-        "Fix the failure, then raise phases[p].n_trials"
+        "not retrained. Otherwise, fix the failure, then raise phases[p].n_trials"
     )
     assert (
         f"{_UNREADABLE}; if the `metric` settings are wrong, correct them and rerun: the "
@@ -125,7 +125,7 @@ def test_an_aborted_phase_with_an_unreadable_objective_gives_steps_that_work(
         run_experiment(wrong)
     message = _operational_error_text(aborted.value)
     assert message.index(_UNREADABLE) < message.index(
-        "Fix the cause, then raise phases[p].n_trials"
+        "not retrained. Otherwise, fix the cause, then raise phases[p].n_trials"
     )
     assert "correct them and rerun" in message
 
