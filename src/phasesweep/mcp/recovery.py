@@ -47,7 +47,8 @@ from phasesweep.engine.ledger import (
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.state import ATTEMPT_ID_ATTR, GENERATION_ID_ATTR, TrialStateName
+from phasesweep.engine.state import GENERATION_ID_ATTR, TrialStateName
+from phasesweep.engine.trial_dirs import producing_attempts
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.mcp.errors import NEW_RUN_RESUMES, live_runner_step, sync_tracking_command
 from phasesweep.mcp.runner import FailurePayload
@@ -921,24 +922,17 @@ def _recover_trial_evidence(
         if pending_ids:
             if not loaded_studies:
                 _ledger, loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
-            for phase_name, study in (
-                (name, study) for name, studies in loaded_studies.items() for study in studies
-            ):
-                for trial in study.get_trials(deepcopy=False):
-                    trial_attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
-                    if (
-                        not isinstance(trial_attempt_id, str)
-                        or trial_attempt_id not in pending_ids
-                        or not trial.state.is_finished()
-                    ):
+            for phase_name, studies in loaded_studies.items():
+                for attempt_id, owner in producing_attempts(studies).items():
+                    trial = owner.trial
+                    if attempt_id not in pending_ids or not trial.state.is_finished():
                         continue
-                    location = evidence.reaped_attempt_locations.get(trial_attempt_id)
+                    location = evidence.reaped_attempt_locations.get(attempt_id)
                     generation = trial.user_attrs.get(GENERATION_ID_ATTR)
-                    if location != (phase_name, trial.number, generation):
-                        continue
-                    evidence.reaped_attempt_states[trial_attempt_id] = _trial_count_state(
-                        trial, config
-                    )
+                    if location == (phase_name, trial.number, generation):
+                        evidence.reaped_attempt_states[attempt_id] = _trial_count_state(
+                            trial, config
+                        )
     _require_cleanup_evidence(needs, evidence, inspected_studies)
     return evidence
 

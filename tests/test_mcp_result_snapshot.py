@@ -19,7 +19,7 @@ from pydantic import ValidationError
 
 import phasesweep.mcp.recovery as mcp_recovery
 from phasesweep.config.io import load_experiment
-from phasesweep.config.models import Experiment, Phase, Repeats
+from phasesweep.config.models import Experiment, Metric, Phase, Repeats
 from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.ledger import _resolve_storage
@@ -42,11 +42,13 @@ from phasesweep.engine.state import (
     Winner,
     WinnerSource,
 )
+from phasesweep.evidence.models import JsonExtractor
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.redaction import winners_payload
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.snapshots import (
+    RunningAttemptSnapshot,
     RunResultSnapshot,
     capture_pre_generation_result_snapshot,
     capture_result_snapshot,
@@ -974,6 +976,71 @@ def test_pending_snapshot_uses_actual_recovered_state_without_changing_frozen_co
     assert "EVIDENCE_PENDING" not in recovered["trials"]
     assert status["result_snapshot_state"] == "complete"
     assert len(study.get_trials()) == 2
+
+
+@pytest.mark.integration
+def test_recover_run_keeps_the_producing_verdict_after_a_reread(tmp_path: Path) -> None:
+    """A frozen pending trial takes its verdict from the study that launched it."""
+    metric = Metric(extractor=JsonExtractor(type="json", path="r.json", key="x"))
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_constant_trainer(tmp_path),
+        metric=metric,
+        phases=[Phase(name="p", n_trials=1, gpu_policy="none")],
+    )
+    config = write_experiment_config(tmp_path / "srv.yaml", experiment)
+    winner = run_experiment(experiment)["p"]
+    run_id = winner.generation_id
+    assert run_id is not None and winner.attempt_id is not None
+
+    original = phase_study(experiment)
+    original.set_user_attr(CLEANUP_RECOVERED_TRIALS_ATTR, [winner.trial_number])
+    _app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
+    stage_dead_run(store, run_id, config, registry.get("srv").id, cleanup_uncertain=True)
+    snapshot = RunResultSnapshot.model_validate(
+        capture_result_snapshot(experiment, generation_id=run_id)
+    )
+    [phase] = snapshot.status.phases
+    phase.trials = {"RUNNING": 1}
+    phase.generation_trials = {"RUNNING": 1}
+    phase.running_attempts = [
+        RunningAttemptSnapshot(
+            trial_number=winner.trial_number,
+            generation_id=run_id,
+            attempt_id=winner.attempt_id,
+            recovers_as="EVIDENCE_PENDING",
+        )
+    ]
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+        result_snapshot_state="complete",
+        result_snapshot=snapshot.model_dump(mode="json"),
+    )
+    reread = experiment.model_copy(
+        update={
+            "metric": Metric(extractor=JsonExtractor(type="json", path="r.json", key="missing")),
+        }
+    )
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(reread)
+    study = optuna.load_study(
+        study_name=study_name(reread, "p"), storage=_resolve_storage(reread.resolved_storage)
+    )
+    [copy] = study.get_trials()
+    assert copy.state == optuna.trial.TrialState.FAIL
+    assert original.get_trials()[winner.trial_number].state == optuna.trial.TrialState.COMPLETE
+
+    mcp_recovery.recover_run(registry.state_dir, run_id, confirm=True, emit=lambda _: None)
+    outcome = json.loads(store.status_path(run_id).read_text())
+    [phase_result] = outcome["result_snapshot"]["status"]["phases"]
+    assert phase_result["trials"] == {"RUNNING": 0, "COMPLETE": 1}
+    assert phase_result["generation_trials"] == {"RUNNING": 0, "COMPLETE": 1}
 
 
 def test_run_results_say_whether_the_run_wrote_its_generation(tmp_path: Path) -> None:
