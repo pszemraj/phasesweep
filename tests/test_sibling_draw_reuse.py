@@ -410,6 +410,37 @@ def test_fill_preview_counts_the_rerun_that_sibling_draws_cannot_cover(
     ]
 
 
+def test_fill_preview_refuses_an_unavoidable_launch_outside_the_donor_domain(
+    tmp_path: Path,
+) -> None:
+    """A wider sibling's out-of-range proposal cannot cover a narrow adaptive top-up."""
+    trainer, launches = _trainer(tmp_path)
+    narrow = _phase("tpe", 1).model_copy(
+        update={"search_space": {"x": IntParam(type="int", low=1, high=2)}}
+    )
+    run_experiment(_config(tmp_path, trainer, narrow))
+    wider = narrow.model_copy(
+        update={"n_trials": 3, "search_space": {"x": IntParam(type="int", low=1, high=10000)}}
+    )
+    sibling = _config(tmp_path, trainer, wider, "acc")
+    run_experiment(sibling)
+    assert _study(sibling).trials[1].params["x"] > 2
+    target = _config(tmp_path, trainer, narrow.model_copy(update={"n_trials": 2}), goal="maximize")
+    journal = tmp_path / "studies.journal"
+    before = journal.read_bytes()
+    offline = trainer.rename(tmp_path / "offline")
+
+    with pytest.raises(LaunchEnvironmentError, match="not an executable file"):
+        run_experiment(target, dry_run=True)
+
+    assert journal.read_bytes() == before
+    assert _launches(launches) == 3
+    offline.rename(trainer)
+    run_experiment(target)
+    assert _launches(launches) == 4
+    assert _study(target).trials[-1].params["x"] in (1, 2)
+
+
 def test_mid_phase_adoption_deadline_preserves_new_training_on_restart(tmp_path: Path) -> None:
     """A stopped sibling read between batches keeps the just-finished new grid cell."""
     trainer, launches = _trainer(tmp_path)

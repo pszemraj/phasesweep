@@ -28,7 +28,7 @@ from typing import ClassVar, NamedTuple
 import optuna
 
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.config.search import retry_target_ceiling
+from phasesweep.config.search import retry_target_ceiling, sampler_search_space
 from phasesweep.engine.attempts import (
     _pending_evidence_refusal,
     _record_stale_trial_outcome,
@@ -63,6 +63,7 @@ from phasesweep.engine.fingerprints import (
 )
 from phasesweep.engine.grid_order import grid_axis_names, grid_cell_order
 from phasesweep.engine.optuna import (
+    _distribution,
     _draw_positions,
     _finished_trial_count,
     _measured_draw_count,
@@ -832,6 +833,31 @@ def pending_sibling_retries(
     return required[:room] + optional[:optional_slots]
 
 
+def _draw_params_in_domain(
+    params: Mapping[str, object], domain: Mapping[str, optuna.distributions.BaseDistribution]
+) -> bool:
+    """Check whether an adaptive proposal could have these exact parameters.
+
+    :param Mapping[str, object] params: Parameters from the sibling's physical trial.
+    :param Mapping[str, optuna.distributions.BaseDistribution] domain: Target search parameters.
+    :return bool: Whether the parameters match the keys, values and types the target can draw.
+    """
+    if params.keys() != domain.keys():
+        return False
+    for name, value in params.items():
+        distribution = domain[name]
+        try:
+            internal = distribution.to_internal_repr(value)
+        except (ValueError, OverflowError):
+            return False
+        # Optuna can coerce equal values such as 1.0 and 1, but proposal matching cannot.
+        if not distribution._contains(internal) or not _same_value(
+            value, distribution.to_external_repr(internal)
+        ):
+            return False
+    return True
+
+
 def _sibling_draw_candidates(
     experiment: Experiment, phase: Phase, study: optuna.Study, others: Sequence[optuna.Study]
 ) -> list[ProducingAttempt]:
@@ -861,6 +887,13 @@ def _sibling_draw_candidates(
             continue
         compatible.append(other)
     present = {trial.user_attrs.get(ATTEMPT_ID_ATTR) for trial in study.get_trials(deepcopy=False)}
+    # Grid and seeded random check exact proposals at every position. Adaptive forecasts
+    # can leave a proposal unknown, but its parameters still have to be in the search space.
+    adaptive_domain = (
+        {name: _distribution(param) for name, param in sampler_search_space(phase).items()}
+        if phase.sampler.type in {"tpe", "cmaes"}
+        else None
+    )
     candidates = [
         owner
         for identity, owner in producing_attempts(compatible).items()
@@ -869,6 +902,7 @@ def _sibling_draw_candidates(
         and (outcome := _parsed_trial_outcome(owner.trial.user_attrs.get(TRIAL_OUTCOME_ATTR)))
         is not None
         and outcome.outcome in _REREAD_OUTCOMES
+        and (adaptive_domain is None or _draw_params_in_domain(owner.trial.params, adaptive_domain))
     ]
     candidates.sort(
         key=lambda owner: (
