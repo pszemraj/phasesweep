@@ -8,6 +8,7 @@ import shlex
 import signal
 import sys
 from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -598,6 +599,44 @@ def test_sync_rebuilds_accepted_attempt_records_from_the_ledger(tmp_path, monkey
     rate = [r for r in records if r["binding"]["phase"] == "rate"]
     depth_runs = {r["binding"]["run_id"] for r in records if r["binding"]["phase"] == "depth"}
     assert all(r["projection"]["tags"]["phasesweep.inherits.depth"] in depth_runs for r in rate)
+
+
+@pytest.mark.integration
+def test_sync_rebuilds_the_producing_attempt_record_after_a_reread(tmp_path, monkeypatch):
+    """A reread winner does not change the objective delivered to the trainer's native run."""
+    config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config.update(storage="auto", phases=config["phases"][:1])
+    respond = worker.request_operation
+
+    def capture_cost(request, **kwargs):
+        result = respond(request, **kwargs)
+        if request["action"] == "capture":
+            for key, observation in result["observations"].items():
+                if "cost" in key:
+                    observation["value"] = 3.0
+        return result
+
+    monkeypatch.setattr(worker, "request_operation", capture_cost)
+    original = Experiment.model_validate(config)
+    winner = run_experiment(original)["depth"]
+    assert winner.generation_id is not None and winner.attempt_id is not None
+    record = publication.delivery_record_path(
+        original, winner.generation_id, f"attempt-{winner.attempt_id}"
+    )
+    delivered = read_record(record)
+    assert delivered["projection"]["metrics"]["phasesweep.objective"] == 1.0
+
+    config = deepcopy(config)
+    config["metric"]["extractor"]["metric_key"] = "cost"
+    reread = run_experiment(Experiment.model_validate(config))["depth"]
+    assert reread.attempt_id == winner.attempt_id
+    assert reread.metric == 3.0
+    record.unlink()
+
+    publication.sync_tracking(original, winner.generation_id)
+    rebuilt = read_record(record)
+    assert rebuilt["binding"] == delivered["binding"]
+    assert rebuilt["projection"]["metrics"]["phasesweep.objective"] == 1.0
 
 
 def test_the_run_that_confirms_an_attempts_cleanup_finishes_its_managed_run(tmp_path, monkeypatch):

@@ -478,21 +478,23 @@ class _AttemptTrial(NamedTuple):
 def _attempt_trials(ledger: ValidatedLedger, phases: Iterable[str]) -> dict[str, _AttemptTrial]:
     """Index readable study trials by attempt ID with study-local cleanup confirmation.
 
-    Every study of each phase is read, whatever values its parents' winners addressed it by,
-    since an attempt belongs to the one study that opened it. Unreadable studies contribute no
-    trials, leaving their attempts unresolved.
+    An attempt's delivery projects the row that launched it. Its reread copies can have
+    different outcomes and do not own tracker delivery. Unreadable studies leave their
+    attempts unresolved.
 
     :param ValidatedLedger ledger: Ledger the trials were recorded in.
     :param Iterable[str] phases: Phase names whose studies are read.
     :return dict[str, _AttemptTrial]: Trials that carry an attempt id.
     """
-    from phasesweep.engine.ledger import phase_trials, read_every_phase_study
-    from phasesweep.engine.state import ATTEMPT_ID_ATTR
+    from phasesweep.engine.attempts import _cleanup_recovered_trial_numbers
+    from phasesweep.engine.ledger import read_every_phase_study
+    from phasesweep.engine.trial_dirs import producing_attempts
 
     trials: dict[str, _AttemptTrial] = {}
     for phase in sorted(set(phases)):
         try:
             studies = read_every_phase_study(ledger, [phase])[phase]
+            owners = producing_attempts(studies)
         except (StudyStorageUnavailableError, StudySchemaMismatchError) as exc:
             log.warning(
                 "MLflow attempt outcomes of phase %s are unresolved: its study is unreadable (%s).",
@@ -500,13 +502,12 @@ def _attempt_trials(ledger: ValidatedLedger, phases: Iterable[str]) -> dict[str,
                 str(exc).rstrip("."),
             )
             continue
-        for read in (phase_trials(study) for study in studies):
-            for trial in read.trials:
-                attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
-                if isinstance(attempt_id, str):
-                    trials[attempt_id] = _AttemptTrial(
-                        trial, trial.number in read.cleanup_recovered
-                    )
+        recovered = {study.study_name: _cleanup_recovered_trial_numbers(study) for study in studies}
+        for attempt_id, owner in owners.items():
+            trial = owner.trial
+            trials[attempt_id] = _AttemptTrial(
+                trial, trial.number in recovered[owner.study.study_name]
+            )
     return trials
 
 
