@@ -26,7 +26,7 @@ from phasesweep.runtime.json import (
 )
 from phasesweep.runtime.remote_worker import report_reserve, run_worker
 from phasesweep.runtime.time import utc_now_iso
-from phasesweep.tracking.records import STATUS_BEFORE_DELIVERY, readable_run_state
+from phasesweep.tracking.records import OUTCOME_TAG, STATUS_BEFORE_DELIVERY, readable_run_state
 
 if TYPE_CHECKING:
     from mlflow.entities import Metric, Param, RunTag
@@ -266,6 +266,14 @@ class _SdkClient(Protocol):
         :param str key: Tag name.
         :param str value: Tag value.
         :return object: SDK response, unused by PhaseSweep.
+        """
+        ...
+
+    def delete_tag(self, run_id: str, key: str) -> None:
+        """Remove one tag from an existing run.
+
+        :param str run_id: Remote run identifier.
+        :param str key: Tag name.
         """
         ...
 
@@ -743,7 +751,7 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
                 raise ValueError("MLflow run restarted during evidence capture.")
             tag_keys = {key for gate in gates for key in gate.tags}
             if status != "FINISHED":
-                tag_keys.update((STATUS_BEFORE_DELIVERY, "phasesweep.outcome"))
+                tag_keys.update((STATUS_BEFORE_DELIVERY, OUTCOME_TAG))
             return {
                 "kind": "mlflow",
                 "binding": binding,
@@ -767,12 +775,15 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
 def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
     """Upload a retained projection and apply its managed run's terminal outcome.
 
-    The retained outcome takes precedence over the status left by the trainer.
+    The retained outcome takes precedence over the status left by the trainer. An accepted
+    reading finishes a run PhaseSweep had delivered FAILED or KILLED and drops the tags that
+    delivery set; a run the trainer itself ended unsuccessfully is never finished.
     Projection-specific artifact names keep winner uploads distinct from trial summaries.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param PublishRequest request: Trusted target, bound run, and projection.
-    :raises ValueError: Termination was requested for a trainer-owned run.
+    :raises ValueError: Termination was requested for a trainer-owned run, or a FINISHED
+        outcome for a run the trainer ended unsuccessfully.
     :return JsonObject: Empty success response.
     """
     from mlflow.entities import Metric, Param, RunTag
@@ -783,13 +794,18 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
     finish = request.get("finish")
     if finish and binding["run_mode"] != "managed":
         raise ValueError("Only runs PhaseSweep created may be terminated.")
-    tags = dict(projection["tags"])
+    status = run.info.status
+    attempt = request["name"].startswith("attempt-")
     if (
-        request["name"].startswith("attempt-")
-        and finish in ("FAILED", "KILLED")
-        and run.info.status in ("RUNNING", "FINISHED")
+        attempt
+        and finish == "FINISHED"
+        and status != "RUNNING"
+        and not readable_run_state(status, binding["run_mode"], run.data.tags)
     ):
-        tags[STATUS_BEFORE_DELIVERY] = run.info.status
+        raise ValueError("MLflow run ended unsuccessfully; it cannot be finished.")
+    tags = dict(projection["tags"])
+    if attempt and finish in ("FAILED", "KILLED") and status in ("RUNNING", "FINISHED"):
+        tags[STATUS_BEFORE_DELIVERY] = status
     client.log_batch(
         binding["run_id"],
         metrics=[
@@ -805,8 +821,13 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
             json.dumps(projection["summary"], sort_keys=True, allow_nan=False), encoding="utf-8"
         )
         client.log_artifact(binding["run_id"], str(path), artifact_path="phasesweep")
-    if finish and run.info.status != finish:
+    if finish and status != finish:
         client.set_terminated(binding["run_id"], status=finish)
+    if attempt and finish == "FINISHED":
+        # Dropped only once the run is FINISHED, so a retry after a lost answer still reads it.
+        for key in (OUTCOME_TAG, STATUS_BEFORE_DELIVERY):
+            if key in run.data.tags:
+                client.delete_tag(binding["run_id"], key)
     return {}
 
 

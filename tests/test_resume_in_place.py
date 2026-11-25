@@ -491,14 +491,14 @@ def test_each_attempt_delivers_its_own_mlflow_run(
     assert bindings[stopped]["run_id"] != bindings[resumed]["run_id"]
     capture = json.loads(rerun.user_attrs[OBJECTIVE_PROVENANCE_ATTR])["remote_capture"]
     assert capture["earlier_bindings"] == ([] if directory_missing else [bindings[stopped]])
-    # PhaseSweep finishes the stopped attempt's run; an accepted attempt's run is the
-    # trainer's to end, so its record carries the result and no status.
+    # PhaseSweep ends the stopped attempt's run KILLED and the accepted attempt's run FINISHED,
+    # so a reading accepted after a delivered failure can correct it.
     finishes = {
         record["binding"]["attempt_id"]: record["finish"]
         for record in uploads
         if str(record["name"]).startswith("attempt-")
     }
-    assert finishes == {stopped: "KILLED", resumed: None}
+    assert finishes == {stopped: "KILLED", resumed: "FINISHED"}
     assert publication.sync_tracking(experiment)["pending"] == 0
 
 

@@ -154,6 +154,41 @@ class DeliveryTally:
         self.refused.add(path)
         return "refused"
 
+    def warn_failure(
+        self,
+        experiment: Experiment,
+        path: Path,
+        exc: BaseException,
+        *,
+        state: str = "is pending",
+        waiting: str,
+    ) -> bool:
+        """Record one failed request, warn about it, and say whether the pass ends here.
+
+        A shutdown is not MLflow's failure, and a refusal this delivery met before is counted
+        by the closing line, so neither is warned about.
+
+        :param Experiment experiment: The delivery's MLflow-backed experiment.
+        :param Path path: The delivery record or creation intent the request was for.
+        :param BaseException exc: The request's error.
+        :param str state: What the warning says of ``path``, defaults to ``is pending``.
+        :param str waiting: What else waits when MLflow gave no answer, such as ``2 later
+            records must wait``, or an empty string when nothing does.
+        :return bool: Whether the pass ends: on a shutdown or when MLflow gave no answer.
+        """
+        failure = self.note_failure(experiment, path, exc)
+        if failure not in ("shutdown", "refused again"):
+            log.warning(
+                "MLflow: %s %s (%s).%s",
+                record_name(path),
+                state,
+                str(exc).rstrip("."),
+                f" MLflow did not answer, so {waiting} too."
+                if failure == "no answer" and waiting
+                else "",
+            )
+        return failure in ("shutdown", "no answer")
+
 
 def gave_no_answer(exc: BaseException) -> bool:
     """Tell a request MLflow gave no answer to from one it answered with a failure.
@@ -514,6 +549,7 @@ def _create_bound(
     *,
     run_name: str,
     deadline: float | None,
+    worker_generation: str | None = None,
 ) -> RunBinding:
     """Bind or create an identity's run, persisting intent before sending creation.
 
@@ -527,6 +563,8 @@ def _create_bound(
     :param Mapping[str, str] environment: Composed credentials and transport.
     :param str run_name: Display name for a newly created run.
     :param float | None deadline: Existing execution deadline.
+    :param str | None worker_generation: Invocation registering the workers, defaulting to the
+        identity's own generation.
     :raises OperationRejectedError: The worker reported that the request failed.
     :raises RuntimeError: The creation outcome is unresolved.
     :return RunBinding: Bound native run identity.
@@ -549,6 +587,7 @@ def _create_bound(
                 environment,
                 timeout_at=operation_deadline(experiment, deadline),
                 deadline=deadline,
+                worker_generation=worker_generation,
             )
             if found is not None:
                 return found
@@ -566,7 +605,11 @@ def _create_bound(
         request: CreateAction = {"action": "create", "binding": identity, "run_name": run_name}
         try:
             created = call_tracking(
-                experiment, identity["generation_id"], request, environment, deadline
+                experiment,
+                worker_generation or identity["generation_id"],
+                request,
+                environment,
+                deadline,
             )
         except OperationRejectedError:
             # A refused or unsent request created nothing, so a later call may send it afresh.
@@ -755,18 +798,14 @@ def _reconcile_creation(
     except PhaseSweepError:
         raise
     except (TimeoutError, ValueError, RuntimeError) as exc:  # every NO_ANSWER error included
-        failure = tally.note_failure(experiment, pending, exc)
-        # Nothing blames MLflow for a shutdown, and a refusal met before is counted already.
-        if failure not in ("shutdown", "refused again"):
-            # After no answer the pass sends nothing more, so this is its only outage warning.
-            log.warning(
-                "MLflow: %s is still unresolved (%s).%s",
-                record_name(pending),
-                str(exc).rstrip("."),
-                " MLflow did not answer, so later searches and uploads wait too."
-                if failure == "no answer"
-                else "",
-            )
+        # After no answer the pass sends nothing more, so this is its only outage warning.
+        tally.warn_failure(
+            experiment,
+            pending,
+            exc,
+            state="is still unresolved",
+            waiting="later searches and uploads wait",
+        )
         return
     if binding is not None:
         write_record(path, binding)
@@ -829,13 +868,23 @@ def prepare_generation(
     generation_id: str,
     environment: Mapping[str, str],
     deadline: float | None,
+    config_fingerprint: str | None = None,
+    worker_generation: str | None = None,
 ) -> RunBinding:
-    """Resolve the source experiment and bind this generation's summary run once.
+    """Resolve the source experiment and bind a generation's summary run once.
+
+    A run binds its own before its first trial; a generation that published without launching
+    has its summary run bound by a delivery pass.
 
     :param Experiment experiment: MLflow-backed experiment.
-    :param str generation_id: Current invocation identity.
+    :param str generation_id: Generation whose summary run is bound.
     :param Mapping[str, str] environment: Composed trainer environment.
     :param float | None deadline: Existing phase/run deadline.
+    :param str | None config_fingerprint: The generation's recorded config fingerprint, for a
+        published generation the configured experiment may not describe; ``None`` takes the
+        configured experiment's.
+    :param str | None worker_generation: Invocation registering the workers, defaulting to
+        ``generation_id``.
     :return RunBinding: The generation summary run's binding.
     """
     assert experiment.mlflow is not None
@@ -844,7 +893,10 @@ def prepare_generation(
         if parent_path.is_file():
             return read_binding(parent_path.parent, parent_path.name)
         experiment_id = _resolve_source(
-            experiment, generation_id=generation_id, environment=environment, deadline=deadline
+            experiment,
+            generation_id=worker_generation or generation_id,
+            environment=environment,
+            deadline=deadline,
         )
         from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 
@@ -853,7 +905,7 @@ def prepare_generation(
             "tracking_uri": experiment.mlflow.tracking_uri,
             "experiment": experiment.experiment,
             "generation_id": generation_id,
-            "overrides_sha256": _experiment_semantic_fingerprint(experiment),
+            "overrides_sha256": config_fingerprint or _experiment_semantic_fingerprint(experiment),
             "run_mode": "managed",
             "experiment_id": experiment_id,
             "phase": "generation",
@@ -866,6 +918,7 @@ def prepare_generation(
             environment,
             run_name=f"{experiment.experiment}-generation-{generation_id}",
             deadline=deadline,
+            worker_generation=worker_generation,
         )
 
 
@@ -881,7 +934,8 @@ def require_tracking_target(
 
     A generation whose summary run is bound only resolves the target, as does a check for a
     caller that only sends recovered outcomes, so a run that launches nothing binds no summary
-    run. Its worker is registered under ``generation_id`` either way.
+    run here; its delivery creates one if it publishes. Its worker is registered under
+    ``generation_id`` either way.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param str generation_id: Generation of the run checking the target, whose summary run is

@@ -16,6 +16,8 @@ RunMode: TypeAlias = Literal["managed", "trainer"]
 IdentityText: TypeAlias = Annotated[str, Field(min_length=1)]
 CaptureRunState: TypeAlias = Literal["FINISHED", "FAILED", "KILLED"]
 STATUS_BEFORE_DELIVERY = "phasesweep.status_before_delivery"
+# The terminal status PhaseSweep delivered to a run whose attempt or generation it did not accept.
+OUTCOME_TAG = "phasesweep.outcome"
 
 
 def readable_run_state(
@@ -31,7 +33,7 @@ def readable_run_state(
     return status == "FINISHED" or (
         mode == "managed"
         and status in ("FAILED", "KILLED")
-        and tags.get("phasesweep.outcome") == status
+        and tags.get(OUTCOME_TAG) == status
         and tags.get(STATUS_BEFORE_DELIVERY) in ("RUNNING", "FINISHED")
     )
 

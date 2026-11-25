@@ -618,7 +618,7 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
 
 
 def test_corrected_key_reads_the_managed_run_after_failed_delivery(local_server, tmp_path):
-    """A corrected key reads the original successful trainer while its delivered verdict stays FAILED."""
+    """A corrected key reads the original successful trainer, and its publication finishes the run PhaseSweep had failed."""
     from phasesweep.engine.selection import NoFeasibleTrialError
     from phasesweep.evidence.models import MlflowExtractor
     from phasesweep.tracking.session import BINDING_FILE, attempt_tracking_records, read_binding
@@ -646,7 +646,11 @@ def test_corrected_key_reads_the_managed_run_after_failed_delivery(local_server,
     assert capture["run_state"] == "FAILED"
     assert capture["tags"]["phasesweep.status_before_delivery"] == "FINISHED"
     assert list(attempt_tracking_records(corrected, BINDING_FILE, None)) == [record]
-    assert client.get_run(binding["run_id"]).info.status == "FAILED"
+    run = client.get_run(binding["run_id"])
+    assert run.info.status == "FINISHED"
+    assert run.data.metrics["phasesweep.objective"] == 0.25
+    assert {"phasesweep.outcome", "phasesweep.status_before_delivery"}.isdisjoint(run.data.tags)
+    assert run.data.tags["phasesweep.winner"] == "true"
 
 
 def test_managed_missing_objective_hint_is_logged_once_per_phase(

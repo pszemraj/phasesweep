@@ -402,7 +402,7 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
     assert requests == []
     saved = [read_record(path) for path in publication._pending_records(experiment, generation)]
     assert [(r["binding"]["attempt_id"][0], r["finish"]) for r in saved] == [
-        ("4", None),
+        ("4", "FINISHED"),
         ("a", "KILLED"),
     ]
     accepted = saved[0]["projection"]
@@ -475,7 +475,7 @@ def test_failed_invocation_leaves_a_pending_trials_managed_run_open_only_when_pe
     study.tell(pending.number, 0.5)
     publication._rebuild_attempt_intents(experiment, validate_ledger(experiment), [generation])
     record = read_record(delivery / f"attempt-{attempt}.json")
-    assert record["finish"] is None
+    assert record["finish"] == "FINISHED"
     assert record["projection"]["metrics"]["phasesweep.objective"] == 0.5
 
 
@@ -563,7 +563,7 @@ def test_unsaved_accepted_attempt_keeps_its_accepted_projection(tmp_path, monkey
         run_experiment(experiment, terminal_callback=reports.append)
     [path] = failed
     record = read_record(path)
-    assert record["finish"] is None
+    assert record["finish"] == "FINISHED"
     assert record["projection"]["metrics"]["phasesweep.objective"] == 1.0
     assert "phasesweep.outcome" not in record["projection"]["tags"]
     assert [r["projection"] for r in uploads if r["name"] == path.stem] == [record["projection"]]
@@ -578,7 +578,11 @@ def test_unsaved_accepted_attempt_keeps_its_accepted_projection(tmp_path, monkey
 
 
 def test_sync_rebuilds_accepted_attempt_records_from_the_ledger(tmp_path, monkeypatch):
-    """A controller that dies between Optuna's commit and its callback saved no record."""
+    """A published generation's lost attempt records are rebuilt from its ledger rows.
+
+    The closeout saves what no trial callback saved, and sync-tracking rebuilds a record deleted
+    later even while the generation's summary record is still present.
+    """
     config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["storage"] = f"journal:///{tmp_path}/study.journal"
     experiment = Experiment.model_validate(config)
@@ -586,7 +590,10 @@ def test_sync_rebuilds_accepted_attempt_records_from_the_ledger(tmp_path, monkey
     run_experiment(experiment)
     [generation] = [path.name for path in tracking_root(experiment).iterdir() if path.is_dir()]
     delivery = tracking_root(experiment) / generation / "delivery"
-    assert not list(delivery.glob("attempt-*.json"))
+    saved = sorted(delivery.glob("attempt-*.json"))
+    assert len(saved) == 4 and all(read_record(path)["state"] == "delivered" for path in saved)
+    for path in saved:
+        path.unlink()
     journal = (tmp_path / "study.journal").read_bytes()
 
     assert publication.sync_tracking(experiment, generation) == {"pending": 0, "delivered": 7}
@@ -594,7 +601,7 @@ def test_sync_rebuilds_accepted_attempt_records_from_the_ledger(tmp_path, monkey
     records = [read_record(path) for path in sorted(delivery.glob("attempt-*.json"))]
     assert len(records) == 4
     for record in records:
-        assert record["finish"] is None
+        assert record["finish"] == "FINISHED"
         assert record["projection"]["metrics"]["phasesweep.objective"] == 1.0
     rate = [r for r in records if r["binding"]["phase"] == "rate"]
     depth_runs = {r["binding"]["run_id"] for r in records if r["binding"]["phase"] == "depth"}
@@ -602,9 +609,9 @@ def test_sync_rebuilds_accepted_attempt_records_from_the_ledger(tmp_path, monkey
 
 
 @pytest.mark.integration
-def test_sync_rebuilds_the_producing_attempt_record_after_a_reread(tmp_path, monkeypatch):
-    """A reread winner does not change the objective delivered to the trainer's native run."""
-    config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
+def test_each_generation_delivers_its_own_reading_of_a_reread_attempt(tmp_path, monkeypatch):
+    """A reread generation sends its objective; a rebuilt older record keeps its own and is not resent."""
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config.update(storage="auto", phases=config["phases"][:1])
     respond = worker.request_operation
 
@@ -628,15 +635,30 @@ def test_sync_rebuilds_the_producing_attempt_record_after_a_reread(tmp_path, mon
 
     config = deepcopy(config)
     config["metric"]["extractor"]["metric_key"] = "cost"
-    reread = run_experiment(Experiment.model_validate(config))["depth"]
+    reports = []
+    reread = run_experiment(Experiment.model_validate(config), terminal_callback=reports.append)[
+        "depth"
+    ]
     assert reread.attempt_id == winner.attempt_id
     assert reread.metric == 3.0
+    newer = read_record(
+        publication.delivery_record_path(
+            original, reports[0].generation_id, f"attempt-{winner.attempt_id}"
+        )
+    )
+    assert (newer["state"], newer["binding"]) == ("delivered", delivered["binding"])
+    assert newer["projection"]["metrics"]["phasesweep.objective"] == 3.0
+    assert newer["projection"]["timestamp"] > delivered["projection"]["timestamp"]
+    uploads.clear()
     record.unlink()
 
     publication.sync_tracking(original, winner.generation_id)
     rebuilt = read_record(record)
     assert rebuilt["binding"] == delivered["binding"]
     assert rebuilt["projection"]["metrics"]["phasesweep.objective"] == 1.0
+    assert rebuilt["projection"]["timestamp"] < newer["projection"]["timestamp"]
+    assert rebuilt["state"] == "delivered"
+    assert [upload["name"] for upload in uploads] == []
 
 
 def test_the_run_that_confirms_an_attempts_cleanup_finishes_its_managed_run(tmp_path, monkeypatch):
@@ -1432,7 +1454,7 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     assert record["state"] == "delivered"
     assert delivered["projection"] == record["projection"]
     if answer == "accepted":
-        assert delivered["finish"] is None
+        assert delivered["finish"] == "FINISHED"
         assert delivered["projection"]["metrics"]["phasesweep.objective"] == 1.0
     else:
         assert not _trial_interrupted(recovered)
@@ -1493,10 +1515,9 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
         assert (sorted(tracking_root(experiment).rglob("*")), uploads) == (tree, [])
         reports = []
         run_experiment(experiment, terminal_callback=reports.append)
-        # Only a trial killed in flight is rerun, so only then does the run bind its own
-        # summary run, which its publication finishes.
-        own = [(reports[0].generation_id, "FINISHED")] if in_flight else []
-        assert sorted(_summaries(uploads)) == sorted([(generation, "KILLED"), *own])
+        # The run publishes whether or not it reruns a trial, so its summary run is finished.
+        own = (reports[0].generation_id, "FINISHED")
+        assert sorted(_summaries(uploads)) == sorted([(generation, "KILLED"), own])
         uploads.clear()
         run_experiment(experiment)
         assert uploads == []

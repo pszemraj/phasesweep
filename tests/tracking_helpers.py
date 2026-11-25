@@ -98,7 +98,7 @@ def delivery_record(generation_id, *, state="pending", **fields):
         "state": state,
         "source": {},
         "binding": {},
-        "projection": {},
+        "projection": {"timestamp": 0},
         "finish": None,
         **fields,
     }
