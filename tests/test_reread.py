@@ -1669,12 +1669,12 @@ def test_a_finished_sibling_retry_replays_without_the_trainer(
 def test_preview_keeps_a_budgeted_sibling_retry_conditional(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A sibling read only settles a counted failure when it produces the requested score."""
+    """A sibling needs the requested score to settle a paid retry, even after interruption."""
     retry = tmp_path / "retry"
     trainer = write_trainer(
         tmp_path / "trainer.py",
         f"""
-        import argparse
+        import argparse, time
         from pathlib import Path
         ap = argparse.ArgumentParser()
         ap.add_argument("--x", type=int, required=True)
@@ -1682,7 +1682,12 @@ def test_preview_keeps_a_budgeted_sibling_retry_conditional(
         if args.x == 2:
             print("first=0.9")
             print("second=0.9")
-        elif Path({str(retry)!r}).exists():
+        elif (stage := Path({str(retry)!r})).exists():
+            if stage.read_text() == "pause":
+                stage.write_text("resume")
+                time.sleep(30)
+            if stage.read_text() == "resume":
+                print("first=0.2")
             print("second=0.1")
         """,
     )
@@ -1709,7 +1714,7 @@ def test_preview_keeps_a_budgeted_sibling_retry_conditional(
     retry.touch()
     assert run_experiment(config("second", 3))["p"].metric == 0.1
     before = phase_study_of(original).trials
-    trainer.unlink()
+    offline = trainer.rename(tmp_path / "offline")
 
     targeted_retry = config("first", 3)
     caplog.set_level(logging.INFO)
@@ -1722,6 +1727,13 @@ def test_preview_keeps_a_budgeted_sibling_retry_conditional(
     with pytest.raises(LaunchEnvironmentError, match="which is not an executable file"):
         run_experiment(targeted_retry)
     assert phase_study_of(original).trials == before
+
+    offline.rename(trainer)
+    retry.write_text("pause")
+    with pytest.raises(PhaseTimeoutError, match="run guard"):
+        run_experiment(targeted_retry.model_copy(update={"timeout_seconds_per_run": 3.0}))
+    assert retry.read_text() == "resume"
+    assert run_experiment(targeted_retry)["p"].metric == 0.2
 
 
 @pytest.mark.integration

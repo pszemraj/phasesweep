@@ -772,13 +772,11 @@ def pending_sibling_retries(
     attempts = producing_attempts((study, *others))
     slots: dict[str, tuple[optuna.trial.FrozenTrial, bool]] = {}
     for trial in pending:
-        source_number = trial.user_attrs.get(RERUN_OF_ATTR)
-        source = (
-            by_number.get(source_number)
-            if trial.state == optuna.trial.TrialState.WAITING and type(source_number) is int
-            else trial
+        # An interruption keeps the paid retry of a failure outstanding. The target's
+        # verdicts decide what is owed; producer ancestry identifies the physical donors.
+        requires_measurement = any(
+            _trial_run_state(ancestor) == "FAIL" for ancestor in _rerun_chain(by_number, trial)
         )
-        requires_measurement = source is not None and _trial_run_state(source) == "FAIL"
         for ancestor in _rerun_chain(by_number, trial, attempts=attempts):
             identity = ancestor.user_attrs.get(ATTEMPT_ID_ATTR)
             if isinstance(identity, str):
