@@ -30,11 +30,11 @@ from phasesweep.runtime.json import JsonValue
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
+    new_phase_study,
     write_experiment_config,
     write_trainer,
 )
 from tests.ledger_fixtures import materialize, published_generation_id
-from tests.recovery_helpers import new_phase_study
 
 EXPERIMENT_STATUS_KEYS = [
     "kind",

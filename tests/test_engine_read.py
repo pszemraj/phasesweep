@@ -35,6 +35,7 @@ from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor
 from tests.conftest import (
     make_experiment,
     mark_current_format,
+    new_phase_study,
     phase_trials,
     study_name,
     trial_outcome,
@@ -43,7 +44,6 @@ from tests.conftest import (
     write_trainer,
 )
 from tests.ledger_fixtures import materialize, published_generation_id, tree_snapshot
-from tests.recovery_helpers import new_phase_study
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
@@ -126,11 +126,7 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     """Unread trial data reports no RUNNING identities, not an empty list."""
     ledger = tmp_path / "corrupt.journal"
     exp = _experiment(tmp_path, storage=f"journal:///{ledger}")
-    study = optuna.create_study(
-        study_name=study_name(exp),
-        storage=engine_ledger._resolve_storage(exp.resolved_storage),
-    )
-    mark_current_format(exp, study)
+    new_phase_study(exp, "p")
     # Journal tolerates a torn final record; an earlier malformed record must fail.
     ledger.write_text("not a database or journal\nanother record\n", encoding="utf-8")
 
@@ -294,13 +290,9 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
 ) -> None:
     ledger = tmp_path / "study.journal"
     experiment = _experiment(tmp_path, storage=f"journal:///{ledger}")
-    study = optuna.create_study(
-        study_name=study_name(experiment),
-        storage=engine_ledger._resolve_storage(experiment.resolved_storage),
-    )
     # Stamped first, as the engine does, so the journal's last record is the
     # trial's completion: a partial copy of it reads as a RUNNING trial.
-    mark_current_format(experiment, study)
+    study = new_phase_study(experiment, "p")
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "generation")
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
@@ -415,11 +407,7 @@ def test_read_status_captures_trial_data_after_resolving_the_publication_pointer
     """A trial finished before the pointer is read shows in the same status read."""
     ledger = tmp_path / "study.journal"
     experiment = _experiment(tmp_path, storage=f"journal:///{ledger}")
-    study = optuna.create_study(
-        study_name=study_name(experiment),
-        storage=engine_ledger._resolve_storage(experiment.resolved_storage),
-    )
-    mark_current_format(experiment, study)
+    study = new_phase_study(experiment, "p")
     trial = study.ask()
     real_resolve = engine_read._resolve_publication_pointer
 

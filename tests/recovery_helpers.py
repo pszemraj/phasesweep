@@ -20,7 +20,6 @@ from phasesweep.cli import cli as cli_main
 from phasesweep.config.io import load_experiment
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.attempts import _register_active_attempt
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _attempt_dir, _experiment_dir, _trial_dir_for
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
@@ -48,9 +47,8 @@ from tests.conftest import (
     console_script,
     copy_fake_train,
     make_experiment,
-    mark_current_format,
+    new_phase_study,
     reaped_pid,
-    study_name,
     write_experiment_config,
     write_trainer,
 )
@@ -87,17 +85,6 @@ def write_trial_identity(
             guardian_starttime=1,
         ),
     )
-
-
-def new_phase_study(experiment: Experiment, phase_name: str) -> optuna.Study:
-    """Create one phase's minimizing study."""
-    study = optuna.create_study(
-        study_name=study_name(experiment, phase_name),
-        storage=_resolve_storage(experiment.resolved_storage),
-        direction="minimize",
-    )
-    mark_current_format(experiment, study)
-    return study
 
 
 class StaleTrial(NamedTuple):

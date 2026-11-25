@@ -10,8 +10,6 @@ from pathlib import Path
 import optuna
 import pytest
 
-from phasesweep.engine.fingerprints import phase_study_name
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.state import Winner, WinnerSource
 from phasesweep.mcp.redaction import status_payload
@@ -26,7 +24,7 @@ from phasesweep.mcp.tools import (
 )
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.time import utc_now_iso
-from tests.conftest import mark_current_format, phase_study, single_trial_confound
+from tests.conftest import mark_current_format, new_phase_study, phase_study, single_trial_confound
 from tests.mcp_helpers import (
     make_dead_run_handle,
     make_mcp_app,
@@ -38,12 +36,7 @@ from tests.mcp_helpers import (
 
 
 def _complete_trials(experiment, *, n: int) -> None:
-    study = optuna.create_study(
-        study_name=phase_study_name(experiment, experiment.phases[0], {}),
-        storage=_resolve_storage(experiment.resolved_storage),
-        direction="minimize",
-    )
-    mark_current_format(experiment, study)
+    study = new_phase_study(experiment, experiment.phases[0].name)
     for i in range(n):
         study.tell(study.ask(), float(i))
 
@@ -286,12 +279,7 @@ def test_await_run_reports_failed_trial_progress_at_timeout(
 
     async def sleep_then_fail_trial(seconds: float) -> None:
         clock["now"] += seconds
-        study = optuna.create_study(
-            study_name=phase_study_name(experiment, experiment.phases[0], {}),
-            storage=_resolve_storage(experiment.resolved_storage),
-            direction="minimize",
-        )
-        mark_current_format(experiment, study)
+        study = new_phase_study(experiment, experiment.phases[0].name)
         study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
 
     monkeypatch.setattr("phasesweep.mcp.tools.time.monotonic", lambda: clock["now"])

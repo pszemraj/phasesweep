@@ -78,6 +78,7 @@ from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupRepor
 from tests.conftest import (
     make_experiment,
     mark_current_format,
+    new_phase_study,
     patch_rejected_trial_user_attr,
     reaped_pid,
     study_name,
@@ -89,7 +90,6 @@ from tests.mcp_helpers import stage_dead_run
 from tests.recovery_helpers import (
     fabricate_registered_attempt,
     fabricate_stale_trial,
-    new_phase_study,
     stamp_artifact_root,
     write_trial_identity,
 )

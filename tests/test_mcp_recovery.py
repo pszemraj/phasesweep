@@ -73,6 +73,7 @@ from phasesweep.tracking.session import tracking_root
 from tests.conftest import (
     make_experiment,
     mark_current_format,
+    new_phase_study,
     phase_study,
     reaped_pid,
     study_name,
@@ -97,7 +98,6 @@ from tests.mcp_helpers import (
     write_unsafe_cleanup_status,
 )
 from tests.recovery_helpers import (
-    new_phase_study,
     recover_run_cli,
     stamp_artifact_root,
     write_launched_stale_trial,

@@ -56,6 +56,7 @@ from tests.conftest import (
     bounded_metric,
     invoke_cli_boundary,
     make_experiment,
+    new_phase_study,
     phase_study,
     phase_trials,
     record_accepted_partial_timeout,
@@ -67,7 +68,7 @@ from tests.conftest import (
     write_trial_zero_trainer,
 )
 from tests.ledger_fixtures import forbid_file_backed_storage, tree_changes, tree_snapshot
-from tests.recovery_helpers import new_phase_study, stamp_artifact_root
+from tests.recovery_helpers import stamp_artifact_root
 
 _STATE = optuna.trial.TrialState
 

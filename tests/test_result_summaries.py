@@ -21,8 +21,7 @@ from phasesweep.engine.state import (
 from phasesweep.evidence.models import JsonExtractor
 from phasesweep.runtime.json import JsonObject
 from phasesweep.trial_table import render_trial_tables
-from tests.conftest import make_experiment, trial_outcome
-from tests.recovery_helpers import new_phase_study
+from tests.conftest import make_experiment, new_phase_study, trial_outcome
 
 
 def _experiment(tmp_path: Path, *, repeats: Repeats, n_trials: int) -> Experiment:

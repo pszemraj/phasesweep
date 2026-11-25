@@ -395,6 +395,17 @@ def study_name(
     return phase_study_name(experiment, experiment.phase(phase_name), inherited or {})
 
 
+def new_phase_study(experiment: Experiment, phase_name: str) -> optuna.Study:
+    """Create one phase's minimizing study."""
+    study = optuna.create_study(
+        study_name=study_name(experiment, phase_name),
+        storage=_resolve_storage(experiment.resolved_storage),
+        direction="minimize",
+    )
+    mark_current_format(experiment, study)
+    return study
+
+
 def phase_study(experiment: Experiment, phase_name: str = "p") -> optuna.Study:
     """Read a phase's one study from the experiment's ledger.
 

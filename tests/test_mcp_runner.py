@@ -88,6 +88,7 @@ from tests.conftest import (
     lose_record_writes,
     make_experiment,
     mark_current_format,
+    new_phase_study,
     requires_nonroot,
     study_name,
     write_constant_trainer,
@@ -1166,12 +1167,7 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     phase = experiment.phases[0]
-    study = optuna.create_study(
-        study_name=study_name(experiment, phase.name),
-        storage=_resolve_storage(experiment.resolved_storage),
-        direction="minimize",
-    )
-    mark_current_format(experiment, study)
+    study = new_phase_study(experiment, phase.name)
     _bind_study_artifact_root(study, experiment)
     trial = study.ask()
     attempt_id = "terminal-identity-attempt"
