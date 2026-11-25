@@ -312,9 +312,23 @@ def test_model_samplers_top_up_real_runs_exactly(
 
 
 _NO_RUN_ACTIVE = (
-    "# No run is active; 1 trial is recorded RUNNING. Rerun the same config to settle it. "
+    "No run is active; 1 trial is recorded RUNNING. Rerun the same config to settle it. "
     "A trainer still running is stopped, so let it exit first to keep its result."
 )
+_RUN_ACTIVE = "A run is active on this experiment; counts and winners are as of this read."
+
+
+def _leading_comment(output: str, expected: str) -> str:
+    """Join the leading ``# `` lines of status output up to the end of ``expected``.
+
+    A comment wraps to the terminal width in the table form, each line still a comment.
+    """
+    joined = ""
+    for line in output.splitlines():
+        if not line.startswith("# ") or joined == expected:
+            break
+        joined = f"{joined} {line[2:]}".strip()
+    return joined
 
 
 def test_status_tells_a_killed_run_from_a_live_one(harness: RerunHarness) -> None:
@@ -340,12 +354,16 @@ def test_status_tells_a_killed_run_from_a_live_one(harness: RerunHarness) -> Non
     for command in commands:
         shown = CliRunner().invoke(cli, command)
         assert shown.exit_code == 0, shown.output
-        assert shown.output.replace("\n# ", " ").startswith(_NO_RUN_ACTIVE)
+        assert _leading_comment(shown.output, _NO_RUN_ACTIVE) == _NO_RUN_ACTIVE
         assert shown.output.count("No run is active") == 1
         with _experiment_lock(experiment):
             live = CliRunner().invoke(cli, command)
         assert live.exit_code == 0, live.output
+        assert _leading_comment(live.output, _RUN_ACTIVE) == _RUN_ACTIVE
         assert "No run is active" not in live.output
+        # A pending re-read's command would start a second run beside the active one.
+        assert "phasesweep run" not in live.output
+        assert "fix:" not in live.output
 
     harness.release()
     harness.complete(config)

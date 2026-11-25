@@ -13,6 +13,7 @@ import time
 import traceback
 from collections.abc import Iterator, Sequence
 from contextvars import ContextVar
+from dataclasses import replace
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn, TextIO
@@ -73,6 +74,8 @@ from phasesweep.engine.publication import (
     raise_for_unusable_publication,
 )
 from phasesweep.engine.read import (
+    PendingParentNotice,
+    PhaseRefusal,
     _read_generation_selection,
     _represented_winners,
     inspect_status,
@@ -1354,18 +1357,34 @@ class _WinnerDumper(yaml.SafeDumper):
 _WinnerDumper.add_representer(float, _WinnerDumper.represent_float)
 
 
-def _status_can_suggest_resume(config: Experiment) -> bool:
-    """Check whether status can confirm the experiment is idle before suggesting a resume.
+def _status_run_is_active(config: Experiment) -> bool | None:
+    """Probe the experiment's run locks once for status.
 
     A lock probe that cannot run leaves the trial data and publication verdict readable.
 
     :param Experiment config: Experiment whose run locks are probed.
-    :return bool: Whether the lock probe found no active run.
+    :return bool | None: Whether another operation holds the locks, ``None`` when the probe
+        could not run, which status treats as neither idle nor active.
     """
     try:
-        return not experiment_is_busy(config)
+        return experiment_is_busy(config)
     except (OSError, UnsafeLockPathError, PlatformCapabilityError):
-        return False
+        return None
+
+
+#: What status says instead of a command that would start a second run, while one is active.
+_RUN_ACTIVE_COMMENT = (
+    "# A run is active on this experiment; counts and winners are as of this read."
+)
+
+
+def _is_settled_by_a_run(refusal: PhaseRefusal | None) -> bool:
+    """Say whether a status notice only asks for a run, which the active run is.
+
+    :param PhaseRefusal | None refusal: A phase's refusal or notice from status.
+    :return bool: Whether it is a pending parent or re-read notice.
+    """
+    return isinstance(refusal, (PendingParentNotice, PendingRereadNotice))
 
 
 @cli.command(
@@ -1396,7 +1415,8 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     to decide what to inspect, and the boundary's one-line diagnostic follows
     on stderr. A phase whose accepted trial target, recorded abort, failure streak or invalid
     failure-policy state would refuse a run gets a comment with that refusal and its fix, active run or not.
-    Otherwise an unpublished winner gets a comment explaining how to resume publication,
+    While a run holds the experiment's locks, one comment says so and replaces every notice
+    whose fix is a run command. Otherwise an unpublished winner gets a comment explaining how to resume publication,
     and trials recorded RUNNING while no run holds the experiment's locks get a comment
     saying that a rerun settles them; both
     require a successful idle lock probe. ``--trials`` prints the trial tables in its place,
@@ -1413,11 +1433,21 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     config = _command_config(config_path, settings=settings)
     require_study(config)
     rerun_command = _rerun_command(config_path, settings, None)
+    active = _status_run_is_active(config)
     if show_trials:
         tables = read_trial_tables(config, latest=True)
         width = terminal_width(sys.stdout)
         running = tables.unsettled_trials
-        if running and _status_can_suggest_resume(config):
+        if active:
+            click.echo(_RUN_ACTIVE_COMMENT)
+            tables = replace(
+                tables,
+                phases=tuple(
+                    replace(table, refusal=None) if _is_settled_by_a_run(table.refusal) else table
+                    for table in tables.phases
+                ),
+            )
+        elif running and active is False:
             click.echo(unsettled_running_comment(running, width))
         click.echo(
             render_trial_tables(
@@ -1448,12 +1478,19 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
         phase.get("winner") is not None and phase.get("winner_is_published") is False
         for phase in phase_payloads
     )
-    # One probe serves both comments: flock cannot test a lock without taking it.
-    suggest_resume = _status_can_suggest_resume(config) if running or retained else False
-    if running and suggest_resume:
+    # One probe serves every comment: flock cannot test a lock without taking it.
+    suggest_resume = active is False
+    if active:
+        click.echo(_RUN_ACTIVE_COMMENT)
+    elif running and suggest_resume:
         click.echo(unsettled_running_comment(running))
-    # A recorded refusal needs no idle probe: it holds whether or not a run is active.
-    refusals = inspection.refusals
+    # A recorded refusal needs no idle probe: it holds whether or not a run is active, unless
+    # it only asks for the run that is active.
+    refusals = {
+        name: refusal
+        for name, refusal in inspection.refusals.items()
+        if not (active and _is_settled_by_a_run(refusal))
+    }
     for refusal in refusals.values():
         for line in _operational_error_text(refusal).splitlines():
             click.echo(f"# {line}")

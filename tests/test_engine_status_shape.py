@@ -21,6 +21,7 @@ from phasesweep import experiment_status, run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Sampler
+from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_dir,
@@ -443,6 +444,45 @@ def test_reordered_parents_keep_the_published_result_matching_the_config(tmp_pat
     assert "does not match the current config" not in trials.output
     assert published_generation_id(reordered) == published
     assert calls.read_text() == launched
+
+
+def test_status_names_an_active_run_instead_of_a_command_that_would_start_another(
+    tmp_path: Path,
+) -> None:
+    """While a run holds the experiment both status forms say so, and drop the notice whose fix is a run command."""
+
+    def plan(choices: list[int]) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            phases=[
+                _grid_parent("parent", "x", choices),
+                Phase(
+                    name="child",
+                    n_trials=2,
+                    gpu_policy="none",
+                    inherits=["parent"],
+                    sampler=Sampler(type="random", seed=0),
+                    search_space={"y": IntParam(type="int", low=0, high=3)},
+                ),
+            ],
+        )
+
+    run_experiment(plan([3, 5]))
+    grown = plan([3, 5, 1])
+    config = write_experiment_config(tmp_path / "grown.yaml", grown)
+    notice = "Run the current configuration to select the parent winners."
+    for options in ([], ["--trials"]):
+        idle = CliRunner().invoke(cli, ["status", str(config), *options])
+        assert idle.exit_code == 0, idle.output
+        assert notice in " ".join(idle.output.split())
+        with _experiment_lock(grown):
+            live = CliRunner().invoke(cli, ["status", str(config), *options])
+        assert live.exit_code == 0, live.output
+        assert live.output.startswith(
+            "# A run is active on this experiment; counts and winners are as of this read.\n"
+        )
+        assert "select the parent winners" not in live.output
+        assert "fix:" not in live.output
 
 
 def test_experiment_status_shape_is_pinned(tmp_path: Path) -> None:
