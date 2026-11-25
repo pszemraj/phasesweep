@@ -121,7 +121,7 @@ def test_returning_grid_reuses_finished_draws_without_launch_resources(
 
     run_experiment(target, dry_run=True)
     assert "would re-read 2 finished trials from a sibling study" in caplog.text
-    assert "would launch no trials" in caplog.text
+    assert "may need to launch up to 2 trials depending on the re-read results" in caplog.text
     run_experiment(target)
     rows = _study(target).trials
 
@@ -206,8 +206,8 @@ def test_grown_grid_reuses_a_later_donor_between_parallel_launches(
     caplog.set_level(logging.INFO)
 
     run_experiment(target, dry_run=True)
-    assert "would launch 2 trials after re-reading kept training" in caplog.text
-    assert "DRY RUN total: would launch 2 trials across 1 phase" in caplog.text
+    assert "would launch 2 trials if every retained draw supplies a result" in caplog.text
+    assert "may need to launch up to 3 trials depending on the re-read results" in caplog.text
     assert _launches(launches) == 2
     run_experiment(target)
 

@@ -1716,7 +1716,7 @@ def test_preview_keeps_a_budgeted_sibling_retry_conditional(
     artifacts = tree_snapshot(tmp_path)
     run_experiment(targeted_retry, dry_run=True)
     assert "would re-read 1 finished trial from a sibling study" in caplog.text
-    assert "may need up to 1 trainer launch depending on the re-read results" in caplog.text
+    assert "may need to launch up to 1 trial depending on the re-read results" in caplog.text
     assert "would launch no trials" not in caplog.text
     assert tree_changes(artifacts, tree_snapshot(tmp_path)) == {}
     with pytest.raises(LaunchEnvironmentError, match="which is not an executable file"):

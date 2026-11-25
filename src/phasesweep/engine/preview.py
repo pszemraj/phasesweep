@@ -712,7 +712,8 @@ def _preview_phase(
                 adaptive_read = phase.sampler.type in {"tpe", "cmaes"} and any(
                     trial.new_draw for trial in kept
                 )
-                if all(trial.new_draw for trial in kept) and not adaptive_read:
+                known_draws = all(trial.new_draw for trial in kept) and not adaptive_read
+                if known_draws and assured == len(kept):
                     if phase.inherits:
                         _launch_preflight(experiment, phase.name, study)
                     GpuPool.for_phase(
@@ -728,10 +729,16 @@ def _preview_phase(
                     return PhasePreview(winner=winner, launches=launches, reruns=0)
                 if phase.inherits and len(kept) < remaining and not adaptive_read:
                     _launch_preflight(experiment, phase.name, study)
+                if known_draws and len(kept) < remaining:
+                    log.info(
+                        "DRY RUN phase=%s would launch %s if every retained draw supplies a result",
+                        phase.name,
+                        plural(remaining - len(kept), "trial"),
+                    )
                 warn_dry_run(
-                    "phase=%s may need up to %s depending on the re-read results",
+                    "phase=%s may need to launch up to %s depending on the re-read results",
                     phase.name,
-                    plural(remaining - assured, "trainer launch"),
+                    plural(remaining - assured, "trial"),
                 )
                 winner = _preview_trial_command(experiment, phase, inherited_winners)
                 return PhasePreview(winner=winner, launches=None, reruns=0)

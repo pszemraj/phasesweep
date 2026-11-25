@@ -77,6 +77,7 @@ from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
     FAILURE_REASON_ATTR,
+    GATES_ATTR,
     OVERRIDES_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_IDENTITY_ATTR,
@@ -690,6 +691,19 @@ class SiblingTrial(NamedTuple):
     requires_measurement: bool
     new_draw: bool = False
 
+    @classmethod
+    def draw(
+        cls, source: optuna.trial.FrozenTrial, producers: list[ProducingAttempt]
+    ) -> SiblingTrial:
+        """Require a usable reading for a budgeted draw unless training itself failed.
+
+        :param optuna.trial.FrozenTrial source: The target sampler's proposed draw.
+        :param list[ProducingAttempt] producers: Matching attempts, newest first.
+        :return SiblingTrial: The target slot and the evidence available for it.
+        """
+        needs_read = all(_trainer_seconds(owner.trial) is not None for owner in producers)
+        return cls(source, producers, needs_read, True)
+
 
 def pending_sibling_retries(
     phase: Phase, study: optuna.Study, others: Sequence[optuna.Study]
@@ -921,7 +935,7 @@ def _planned_sibling_draws(
             source.number = len(trials) + at - position
             source.params = params
             source.system_attrs = {**prototype.system_attrs, "grid_id": at}
-            reads.append(SiblingTrial(source, matches, False, True))
+            reads.append(SiblingTrial.draw(source, matches))
         return tuple(reads)
     for offset in range(room):
         proposed = projected.ask()
@@ -933,7 +947,7 @@ def _planned_sibling_draws(
             if _same_value(params, owner.trial.params)
         ]
         if matches:
-            reads.append(SiblingTrial(source, matches, False, True))
+            reads.append(SiblingTrial.draw(source, matches))
         if phase.sampler.type in {"tpe", "cmaes"} or (not matches and not after_gap):
             break
         projected.tell(proposed, 0.0)
@@ -1051,6 +1065,7 @@ def reread_sibling_trials(
     while retries:
         before = recorded
         abort = None
+        needs_launch = False
         for retry in retries:
             reread = None
             for donor in retry.producers:
@@ -1068,20 +1083,36 @@ def reread_sibling_trials(
                 )
                 _require_reread_time(experiment, phase, run_deadline)
                 if candidate is None:
-                    if retry.new_draw:
+                    if (
+                        retry.new_draw
+                        and donor.trial.state == optuna.trial.TrialState.FAIL
+                        and _trainer_seconds(donor.trial) is None
+                    ):
                         # A definite trainer failure spends the draw, as it would in a fill.
-                        candidate = copy.deepcopy(donor.trial)
-                    else:
-                        raise StudySchemaMismatchError(
-                            f"Finished sibling trial {donor.trial.number} in {donor.study.study_name!r} "
-                            "cannot be re-read from its recorded training."
-                        )
+                        if reread is None:
+                            reread = copy.deepcopy(donor.trial)
+                        continue
+                    raise StudySchemaMismatchError(
+                        f"Finished sibling trial {donor.trial.number} in {donor.study.study_name!r} "
+                        "cannot be re-read from its recorded training."
+                    )
                 if candidate.state == optuna.trial.TrialState.COMPLETE:
                     reread = candidate
                     break
-                if reread is None and not retry.requires_measurement:
+                # A failed gate judged the measured outputs. A donor missing a requested
+                # measurement cannot spend a new draw that the target is entitled to launch.
+                decisive_failure = (
+                    candidate.user_attrs.get(GATES_ATTR) is not None
+                    if retry.new_draw
+                    else not retry.requires_measurement
+                )
+                if reread is None and decisive_failure:
                     reread = candidate
             if reread is None:
+                if retry.new_draw:
+                    # The next draw must occupy this position before any later donor can.
+                    needs_launch = True
+                    break
                 continue
             if recovery_abort is not None and recorded == 0:
                 sequence = recovery_abort["completion_sequence"]
@@ -1130,7 +1161,7 @@ def reread_sibling_trials(
             recorded += 1
             if abort is not None:
                 break
-        if abort is not None or recorded == before:
+        if needs_launch or abort is not None or recorded == before:
             break
         retries = pending_sibling_trials(experiment, phase, study, others)
     if recorded:
