@@ -16,7 +16,7 @@ import phasesweep.engine.optuna as engine_optuna
 import phasesweep.engine.read as engine_read
 from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Metric, Observation, Phase
-from phasesweep.config.search import FloatParam, IntParam, Sampler
+from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Sampler
 from phasesweep.engine.errors import PublishedStudyMissingError
 from phasesweep.engine.paths import (
     _experiment_dir,
@@ -959,16 +959,27 @@ def test_read_status_reuses_the_pointer_authenticated_summary(
 def test_read_status_addresses_child_from_the_validated_parent_winner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The child study's counts use the captured published parent inputs."""
-    experiment = make_experiment(
-        persistent=tmp_path,
-        trainer=write_constant_trainer(tmp_path),
-        phases=[
-            Phase(name="parent", n_trials=1, gpu_policy="none", fixed_overrides={"x": 4}),
-            Phase(name="child", n_trials=1, gpu_policy="none", inherits=["parent"]),
-        ],
-    )
-    run_experiment(experiment)
+    """A parent that cannot replay leaves the child in the study of the captured published winner."""
+
+    def plan(parent_trials: int) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            trainer=write_constant_trainer(tmp_path),
+            phases=[
+                Phase(
+                    name="parent",
+                    n_trials=parent_trials,
+                    gpu_policy="none",
+                    allow_partial_grid=True,
+                    sampler=Sampler(type="grid"),
+                    search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
+                ),
+                Phase(name="child", n_trials=1, gpu_policy="none", inherits=["parent"]),
+            ],
+        )
+
+    run_experiment(plan(1))
+    experiment = plan(2)
     publication = _resolve_publication_pointer(experiment)
     assert publication.state == "ok"
     generation_id = publication.generation_id
