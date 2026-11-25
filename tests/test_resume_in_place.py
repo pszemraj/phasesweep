@@ -352,13 +352,16 @@ for step in range(start, 8):
 
 
 @pytest.mark.integration
-def test_a_killed_runs_trial_resumes_its_checkpoint_in_the_next_run(tmp_path: Path) -> None:
-    """After a runner SIGKILL, the next run reruns the trial in its own directory, the trainer resumes its checkpoint, and each attempt keeps its own records."""
+def test_a_killed_runs_trial_resumes_its_checkpoint_in_the_next_run(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """After a runner SIGKILL, the next run reruns the trial in its own directory without a checkpoint warning, the trainer resumes its checkpoint, and each attempt keeps its own records."""
     experiment = _interrupt_first_attempt(
         tmp_path, _trainer(tmp_path, _CHECKPOINTING, _RESUMING), _JSON_METRIC
     )
 
     winner = run_experiment(experiment)["p"]
+    assert not [message for message in caplog.messages if "overwrit" in message]
     first, rerun = phase_trials(experiment)
     # The rerun started from step 5, the checkpoint the stopped attempt left.
     assert winner.metric == 5.0 and winner.trial_number == rerun.number == 1

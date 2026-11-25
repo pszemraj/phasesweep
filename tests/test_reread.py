@@ -846,7 +846,10 @@ def test_older_winner_warns_about_its_reused_checkpoint_directory(
         table = read_trial_tables(original).phases[0]
     warning = f"Use a checkpoint saved for winning attempt {first.attempt_id}"
     assert any(warning in message for message in table.checkpoint_warnings)
-    assert any("Retrying in shared checkpoint directory" in message for message in caplog.messages)
+    assert any(
+        "where a finished attempt's model can be overwritten" in message
+        for message in caplog.messages
+    )
     caplog.clear()
     winner = run_experiment(original)["p"]
     assert winner.metric == 1 and winner.attempt_id == first.attempt_id

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Container, Iterator, Mapping, Sequence
 from pathlib import Path
 from stat import S_ISLNK
 from typing import NamedTuple
@@ -269,6 +269,26 @@ def directory_launches(
     return launches
 
 
+def overwritable_results(
+    launches: Sequence[DirectoryLaunch], standing: Container[str], *, launching: bool
+) -> list[DirectoryLaunch]:
+    """Pick the standing results in a directory that a later launch can overwrite.
+
+    A trainer owns its checkpoints, so only a finished attempt whose result a study can still
+    publish is disclosed; an interrupted or failed attempt holds nothing to lose.
+
+    :param Sequence[DirectoryLaunch] launches: One directory's physical launch records.
+    :param Container[str] standing: IDs of attempts whose result a study can still publish.
+    :param bool launching: Whether a launch about to start follows every recorded one; when
+        False the ledger is read back and the last recorded launch overwrites nothing.
+    :return list[DirectoryLaunch]: Standing launches a later launch followed, in launch order.
+    """
+    started = sorted((item for item in launches if item.may_have_started), key=lambda i: i.order)
+    return [
+        item for item in (started if launching else started[:-1]) if item.attempt_id in standing
+    ]
+
+
 def reused_checkpoint_warnings(
     studies: Sequence[Study], winning_trials: Mapping[int, str | None]
 ) -> tuple[str, ...]:
@@ -283,17 +303,44 @@ def reused_checkpoint_warnings(
         return ()
     warnings: dict[int, str] = {}
     for directory, launches in directory_launches(producing_attempts(studies)).items():
-        started = sorted(
-            (item for item in launches if item.may_have_started), key=lambda item: item.order
-        )
-        for item in started[:-1]:
-            number = numbers.get(item.attempt_id)
-            if number is not None:
-                warnings[number] = (
-                    f"Trial {number}'s checkpoint directory {directory} was reused by a later attempt. "
-                    f"Use a checkpoint saved for winning attempt {item.attempt_id}. A shared filename may contain a later model."
-                )
+        for item in overwritable_results(launches, numbers, launching=False):
+            number = numbers[item.attempt_id]
+            warnings[number] = (
+                f"Trial {number}'s checkpoint directory {directory} was reused by a later attempt. "
+                f"Use a checkpoint saved for winning attempt {item.attempt_id}. A shared filename may contain a later model."
+            )
     return tuple(warnings[number] for number in sorted(warnings))
+
+
+def reruns_over_finished_results(
+    studies: Sequence[Study], trials: Mapping[int, FrozenTrial], reruns: Sequence[int]
+) -> list[tuple[int, str]]:
+    """Find the reruns whose directory holds a finished attempt's model that they can overwrite.
+
+    :param Sequence[Study] studies: Every study of the phase that can share a directory.
+    :param Mapping[int, FrozenTrial] trials: The rerunning study's trials by number.
+    :param Sequence[int] reruns: Trial numbers of reruns about to launch.
+    :return list[tuple[int, str]]: ``(rerun, directory name)`` for each affected rerun. A
+        rerun whose directory cannot be resolved is left to its launch, which refuses it.
+    """
+    attempts = producing_attempts(studies)
+    finished = {
+        attempt_id
+        for attempt_id, owner in attempts.items()
+        if owner.trial.state == TrialState.COMPLETE
+    }
+    affected: list[tuple[int, str]] = []
+    for number in reruns:
+        try:
+            name = _expected_trial_dir_name(trials, trials[number], attempts=attempts)
+        except PhaseSweepError:
+            continue
+        if name is None:
+            continue
+        launches = directory_launches(attempts, directory=Path(name)).get(name, ())
+        if overwritable_results(launches, finished, launching=True):
+            affected.append((number, name))
+    return affected
 
 
 def directory_history(

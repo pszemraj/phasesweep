@@ -19,7 +19,6 @@ from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.state import (
     DURATION_ATTR,
     RERUN_OF_ATTR,
-    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     _parsed_trial_outcome,
 )
@@ -208,14 +207,6 @@ def _log_trial_start(
     :param bool in_place: Whether it continues its source's trial directory.
     """
     params, repeat = _repeat_split(phase, trial.params)
-    if in_place:
-        log.warning(
-            "[%s/trial_%d] Retrying in shared checkpoint directory %s. The trainer can overwrite "
-            "an earlier attempt's model. Include PHASESWEEP_ATTEMPT_ID in checkpoint names you want to keep.",
-            phase.name,
-            trial.number,
-            trial.user_attrs.get(TRIAL_DIR_ATTR),
-        )
     report.info(
         trial_start_line(
             experiment,
@@ -251,6 +242,9 @@ def _log_reruns(
 ) -> None:
     """Report each interrupted rerun or failed grid-cell retry and its source's cause.
 
+    One further line warns when reruns launch in a directory that holds a finished attempt's
+    model, which an interrupted attempt's resume never does.
+
     :param Experiment experiment: The experiment the phase belongs to.
     :param Phase phase: The phase whose study scheduled the reruns.
     :param optuna.Study study: That study.
@@ -269,4 +263,28 @@ def _log_reruns(
                 source=source,
                 reason=_first_cause_line(trials[source], experiment),
             )
+        )
+    # The trial-directory rules import this module, so they load on first use.
+    from phasesweep.engine.ledger import phase_studies_for
+    from phasesweep.engine.paths import _phase_dir
+    from phasesweep.engine.trial_dirs import reruns_over_finished_results
+
+    overwriting = reruns_over_finished_results(
+        phase_studies_for(study), trials, [rerun for _, rerun in reruns]
+    )
+    if len(overwriting) == 1:
+        number, name = overwriting[0]
+        log.warning(
+            "[%s/trial_%d] Reruns in %s, where a finished attempt's model can be overwritten. "
+            'See docs/runtime.md ("Interrupted trials rerun").',
+            phase.name,
+            number,
+            _phase_dir(experiment, phase.name) / name,
+        )
+    elif overwriting:
+        log.warning(
+            "[%s] %d reruns write where finished attempts' models can be overwritten. "
+            'See docs/runtime.md ("Interrupted trials rerun").',
+            phase.name,
+            len(overwriting),
         )
