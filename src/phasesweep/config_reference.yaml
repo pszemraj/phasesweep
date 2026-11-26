@@ -481,7 +481,7 @@ mlflow: object | null = null
   # Seconds each controller tracking operation may take, at least 1. It never limits training time.
   # Experiment resolution, run creation, evidence capture and each result upload get a separate budget of this length.
   # A creation whose outcome is unconfirmed is never sent again; a search for its identity tags gets a fresh budget of this length to find the run.
-  # Phase and run deadlines also cap resolution, creation and capture, and a capture cut short fails the trial. An upload that runs out waits for the next run or sync-tracking.
+  # Phase and run deadlines also cap resolution, creation and capture. If a deadline cuts capture short after training succeeds, persistent storage keeps the trial pending for the next run to retry capture. A timed-out upload waits for the next run or sync-tracking.
   # Recommended: leave room for SDK startup and a slow server. The default suits most servers.
   timeout_seconds: float = 120.0
 

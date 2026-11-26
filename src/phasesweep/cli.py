@@ -1530,7 +1530,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     "--generation",
     "generation_id",
     default=None,
-    help="Limit reconciliation and uploads to this generation.",
+    help="Retry delivery for this generation, including any shared attempt upload it needs.",
 )
 def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[str, ...]) -> None:
     """Reconcile pending native MLflow runs and retry result delivery.
