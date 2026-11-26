@@ -118,6 +118,56 @@ def test_rebuilding_an_older_generations_records_keeps_the_newer_reading(tmp_pat
     assert _run_shows(uploads, attempt) == ("FINISHED", 3.0, 3.0)
 
 
+def test_the_winner_tag_moves_with_the_newest_reading(tmp_path, monkeypatch):
+    """A reading that selects another run removes the earlier winner's winner tag only."""
+    pytest.importorskip("mlflow")
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config.update(storage="auto", phases=config["phases"][:1])
+    respond = worker.request_operation
+    readings = iter([(1.0, 3.0), (2.0, 2.0)])  # each attempt's eval/loss and cost, first seen first
+    values: dict[str, tuple[float, float]] = {}
+    runs: dict[str, SimpleNamespace] = {}
+
+    def client(binding: JsonObject) -> SimpleNamespace:
+        run = runs.setdefault(binding["run_id"], mlflow_run(binding))
+        return SimpleNamespace(
+            get_run=lambda _: run,
+            log_batch=lambda _, *, tags, **kwargs: run.data.tags.update(
+                {tag.key: tag.value for tag in tags}
+            ),
+            log_artifact=lambda *args, **kwargs: None,
+            set_terminated=lambda _, status: setattr(run.info, "status", status),
+            delete_tag=lambda _, key: run.data.tags.pop(key),
+        )
+
+    def tracker(request: JsonObject, **kwargs: object) -> JsonObject:
+        if request["action"] == "publish":
+            uploads.append(request)
+            return _publish(client(request["binding"]), request)
+        result = respond(request, **kwargs)
+        if request["action"] == "capture":
+            attempt = request["binding"]["attempt_id"]
+            loss, cost = values.setdefault(attempt, next(readings, (5.0, 5.0)))
+            for key, observation in result["observations"].items():
+                observation["value"] = cost if "cost" in key else loss
+        return result
+
+    monkeypatch.setattr(worker, "request_operation", tracker)
+    monkeypatch.setattr(session, "request_operation", tracker)
+    reports: list[TerminalReport] = []
+    first = run_experiment(Experiment.model_validate(config), terminal_callback=reports.append)
+    config["metric"]["extractor"]["metric_key"] = "cost"
+    second = run_experiment(Experiment.model_validate(config), terminal_callback=reports.append)
+    earlier, later = first["depth"].attempt_id, second["depth"].attempt_id
+    assert earlier is not None and later is not None and earlier != later
+
+    tags = {attempt: runs[f"run-{attempt}"].data.tags for attempt in (earlier, later)}
+    assert "phasesweep.winner" not in tags[earlier]
+    assert tags[later]["phasesweep.winner"] == "true"
+    assert tags[earlier][f"phasesweep.winner_generation.{reports[0].generation_id}"] == "depth"
+    assert tags[later][f"phasesweep.winner_generation.{reports[1].generation_id}"] == "depth"
+
+
 def test_a_generation_that_launched_nothing_delivers_its_reading(tmp_path, monkeypatch):
     """A reread sends its objective, its winner tag and its own summary run without a launch."""
     config, uploads, attempt = _reread_setup(tmp_path, monkeypatch)

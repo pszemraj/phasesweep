@@ -28,7 +28,7 @@ from phasesweep.runtime.json import (
 )
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, signal_handler_scope
 from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText, plural
-from phasesweep.tracking.records import OUTCOME_TAG, validate_binding
+from phasesweep.tracking.records import OUTCOME_TAG, WINNER_TAG, validate_binding
 from phasesweep.tracking.session import (
     BINDING_FILE,
     DELIVERY_DIR,
@@ -395,19 +395,32 @@ class _Shown(NamedTuple):
 
     timestamp: int
     content: JsonObject
-    """The record's projection without its timestamp, and its finish."""
+    """The record's projection without its timestamp and winner tag, and its finish."""
+    winner: bool
+    """The record's generation selected the attempt, so its run carries the winner tag."""
 
 
 def _content(projection: Mapping[str, object], finish: str | None) -> JsonObject:
-    """Return what an attempt record sets on its run, apart from the metric timestamp.
+    """Return what an attempt record sets on its run, apart from the timestamp and winner tag.
+
+    The winner tag is left out because a generation's winner reference sets it too, so only
+    its removal needs the attempt record sent.
 
     :param Mapping[str, object] projection: The record's projection.
     :param str | None finish: The record's terminal status.
     :return JsonObject: Comparable content.
     """
+    tags = projection.get("tags")
     return json_object(
         {
-            "projection": {key: value for key, value in projection.items() if key != "timestamp"},
+            "projection": {
+                **{key: value for key, value in projection.items() if key != "timestamp"},
+                "tags": {
+                    key: value
+                    for key, value in (tags.items() if isinstance(tags, dict) else ())
+                    if key != WINNER_TAG
+                },
+            },
             "finish": finish,
         }
     )
@@ -423,15 +436,23 @@ def _shown_attempts(experiment: Experiment) -> dict[str, _Shown]:
     :param Experiment experiment: Configured experiment.
     :raises OSError: A record cannot be read.
     :raises ValueError: A record is malformed.
-    :return dict[str, _Shown]: The newest record's timestamp and content per attempt.
+    :return dict[str, _Shown]: The newest record's timestamp, content and winner verdict per
+        attempt.
     """
+    root = tracking_root(experiment)
+    selected = {
+        (path.parent.parent.name, _read_delivery(path).binding.get("attempt_id"))
+        for path in root.glob(f"*/{DELIVERY_DIR}/winner-*.json")
+    }
     shown: dict[str, _Shown] = {}
-    for path in tracking_root(experiment).glob(f"*/{DELIVERY_DIR}/attempt-*.json"):
+    for path in root.glob(f"*/{DELIVERY_DIR}/attempt-*.json"):
         delivery = _read_delivery(path)
         attempt_id = path.stem.removeprefix("attempt-")
         if attempt_id not in shown or delivery.timestamp > shown[attempt_id].timestamp:
             shown[attempt_id] = _Shown(
-                delivery.timestamp, _content(delivery.projection, delivery.finish)
+                delivery.timestamp,
+                _content(delivery.projection, delivery.finish),
+                (path.parent.parent.name, attempt_id) in selected,
             )
     return shown
 
@@ -663,6 +684,7 @@ def _save_attempt_intents(
     ended: str | None,
     shown: Mapping[str, _Shown] | None = None,
     timestamp: int | None = None,
+    winners: Collection[str] = (),
 ) -> list[Path]:
     """Save unrecorded attempt projections according to their durable Optuna outcomes.
 
@@ -689,6 +711,9 @@ def _save_attempt_intents(
         for a live run's own attempts, which no other record names.
     :param int | None timestamp: Metric timestamp of a record rebuilt for an ended generation,
         from :func:`_generation_timestamp`; ``None`` stamps it now.
+    :param Collection[str] winners: Attempt IDs a published generation selected, whose records
+        carry the winner tag that every other attempt record removes from its run, defaults to
+        none.
     :return list[Path]: The records saved, in attempt order.
     """
     from optuna.trial import TrialState
@@ -698,7 +723,11 @@ def _save_attempt_intents(
     from phasesweep.engine.state import _trial_interrupted
 
     def save(name: str, binding: RunBinding, projection: Projection, finish: str | None) -> Path:
-        """Save one record, delivered when its run shows it or a newer reading already."""
+        """Save one record, delivered when its run shows it or a newer reading already.
+
+        A run an earlier reading selected shows the winner tag, so a reading that does not
+        select it is sent to remove the tag even when it changes nothing else.
+        """
         if timestamp is not None:
             projection["timestamp"] = timestamp
         newest = None if shown is None else shown.get(binding["attempt_id"])
@@ -707,7 +736,10 @@ def _save_attempt_intents(
             if newest is not None
             and (
                 newest.timestamp > projection["timestamp"]
-                or newest.content == _content(projection, finish)
+                or (
+                    newest.content == _content(projection, finish)
+                    and (not newest.winner or WINNER_TAG in projection["tags"])
+                )
             )
             else "pending"
         )
@@ -736,6 +768,8 @@ def _save_attempt_intents(
         trial = found.trial
         if trial.state == TrialState.COMPLETE:
             projection = _accepted_projection(trial, read_inherits(directory), experiment)
+            if binding["attempt_id"] in winners:
+                projection["tags"][WINNER_TAG] = "true"
             finish = "FINISHED" if binding["run_mode"] == "managed" else None
             paths.append(save(name, binding, projection, finish))
             continue
@@ -840,6 +874,12 @@ def _save_reading(
     from phasesweep.engine.generation import _validate_generation_publishable
 
     publication, _ = _validate_generation_publishable(experiment, generation_id)
+    bindings = {
+        name: validate_binding(winner.payload["objective_provenance"]["remote_capture"]["binding"])
+        for name, winner in publication.winners.items()
+    }
+    shown = _shown_attempts(experiment)
+    timestamp = _generation_timestamp(experiment, generation_id) if ended else None
     attempts, trials = _reading_attempts(experiment, ledger, publication)
     if attempts:
         _save_attempt_intents(
@@ -848,13 +888,26 @@ def _save_reading(
             attempts,
             trials,
             ended=None,
-            shown=_shown_attempts(experiment),
-            timestamp=_generation_timestamp(experiment, generation_id) if ended else None,
+            shown=shown,
+            timestamp=timestamp,
+            winners={binding["attempt_id"] for binding in bindings.values()},
         )
-    _save_generation_intents(experiment, publication)
+    # A rebuilt winner reference leaves the winner tag to a newer reading its run shows.
+    superseded = {
+        attempt_id
+        for attempt_id, newest in shown.items()
+        if timestamp is not None and newest.timestamp > timestamp
+    }
+    _save_generation_intents(experiment, publication, bindings, superseded=superseded)
 
 
-def _save_generation_intents(experiment: Experiment, publication: ValidatedPublication) -> None:
+def _save_generation_intents(
+    experiment: Experiment,
+    publication: ValidatedPublication,
+    bindings: Mapping[str, RunBinding],
+    *,
+    superseded: Collection[str],
+) -> None:
     """Build winner projections from a generation's validated committed artifacts.
 
     Build every projection before saving records; preserve records already present. The
@@ -862,13 +915,12 @@ def _save_generation_intents(experiment: Experiment, publication: ValidatedPubli
 
     :param Experiment experiment: Configured experiment.
     :param ValidatedPublication publication: The published generation's validated artifacts.
+    :param Mapping[str, RunBinding] bindings: Each phase winner's run binding.
+    :param Collection[str] superseded: Attempt IDs whose runs show a newer reading, whose
+        winner references set no winner tag.
     :raises OSError: A delivery record cannot be written.
     """
     generation_id = publication.generation_id
-    bindings = {
-        name: validate_binding(winner.payload["objective_provenance"]["remote_capture"]["binding"])
-        for name, winner in publication.winners.items()
-    }
     references = {
         item["name"]: json_object(
             {
@@ -884,7 +936,9 @@ def _save_generation_intents(experiment: Experiment, publication: ValidatedPubli
             metrics={},
             params={},
             tags={
-                "phasesweep.winner": "true",
+                **(
+                    {} if bindings[phase.name]["attempt_id"] in superseded else {WINNER_TAG: "true"}
+                ),
                 f"phasesweep.winner_generation.{generation_id}": phase.name,
                 **{
                     f"phasesweep.inherits.{name}": bindings[name]["run_id"]

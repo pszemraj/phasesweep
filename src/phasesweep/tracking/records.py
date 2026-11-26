@@ -18,6 +18,8 @@ CaptureRunState: TypeAlias = Literal["FINISHED", "FAILED", "KILLED"]
 STATUS_BEFORE_DELIVERY = "phasesweep.status_before_delivery"
 # The terminal status PhaseSweep delivered to a run whose attempt or generation it did not accept.
 OUTCOME_TAG = "phasesweep.outcome"
+# Marks the run the newest reading that names it selected as a phase winner.
+WINNER_TAG = "phasesweep.winner"
 
 
 def readable_run_state(

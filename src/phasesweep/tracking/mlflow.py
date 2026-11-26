@@ -26,7 +26,12 @@ from phasesweep.runtime.json import (
 )
 from phasesweep.runtime.remote_worker import report_reserve, run_worker
 from phasesweep.runtime.time import utc_now_iso
-from phasesweep.tracking.records import OUTCOME_TAG, STATUS_BEFORE_DELIVERY, readable_run_state
+from phasesweep.tracking.records import (
+    OUTCOME_TAG,
+    STATUS_BEFORE_DELIVERY,
+    WINNER_TAG,
+    readable_run_state,
+)
 
 if TYPE_CHECKING:
     from mlflow.entities import Metric, Param, RunTag
@@ -777,7 +782,8 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
 
     The retained outcome takes precedence over the status left by the trainer. An accepted
     reading finishes a run PhaseSweep had delivered FAILED or KILLED and drops the tags that
-    delivery set; a run the trainer itself ended unsuccessfully is never finished.
+    delivery set; a run the trainer itself ended unsuccessfully is never finished. An attempt
+    record that does not name its run a winner drops the winner tag an earlier reading set.
     Projection-specific artifact names keep winner uploads distinct from trial summaries.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
@@ -815,6 +821,9 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
         tags=[RunTag(k, v) for k, v in tags.items()],
         synchronous=True,
     )
+    if attempt and WINNER_TAG not in tags and WINNER_TAG in run.data.tags:
+        # The record is the run's newest reading, and that reading did not select it.
+        client.delete_tag(binding["run_id"], WINNER_TAG)
     with TemporaryDirectory(prefix="phasesweep-mlflow-summary-") as directory:
         path = Path(directory) / f"{request['name']}.json"
         path.write_text(
