@@ -422,6 +422,11 @@ def test_stopped_adoption_takes_the_siblings_continuation_of_an_interrupted_draw
     run_experiment(sibling)
     stage.write_text("measure")
     target = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 4}), goal="maximize")
+    caplog.set_level(logging.INFO)
+    run_experiment(target, dry_run=True)
+    assert "keep 1 interrupted trial as recorded" in caplog.text
+    assert "would launch 0 trials" in caplog.text
+    caplog.clear()
     with (
         patch.object(
             reread_ops,

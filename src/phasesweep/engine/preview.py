@@ -678,7 +678,7 @@ def _preview_adoption(
             "DRY RUN phase=%s %swould %s; nothing would retrain",
             phase.name,
             plan.adoption.changed_reading(reading_settings(experiment, phase)),
-            plan.adoption.describe(planned=True, resumes=not plan.partial),
+            plan.adoption.describe(planned=True),
         )
     study = plan.complete
     low, high = plan.launches
