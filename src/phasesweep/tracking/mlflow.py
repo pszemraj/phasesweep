@@ -782,8 +782,9 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
     """Upload a retained projection and apply its managed run's terminal outcome.
 
     The retained outcome takes precedence over the status left by the trainer. An accepted
-    reading finishes a run PhaseSweep had delivered FAILED or KILLED and drops the tags that
-    delivery set; a run the trainer itself ended unsuccessfully is never finished. An attempt
+    reading finishes a run PhaseSweep had delivered FAILED or KILLED. A run the trainer itself
+    ended unsuccessfully is never finished. An accepted reading drops earlier outcome tags
+    for either ownership mode. An attempt
     record that does not name its run a winner drops the winner tag an earlier reading set.
     Projection-specific artifact names keep winner uploads distinct from trial summaries.
     Historical uploads preserve metric points and generation-specific winner tags. The shared
@@ -846,8 +847,8 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
         client.log_artifact(binding["run_id"], str(path), artifact_path="phasesweep")
     if finish and status != finish:
         client.set_terminated(binding["run_id"], status=finish)
-    if attempt and finish == "FINISHED":
-        # Dropped only once the run is FINISHED, so a retry after a lost answer still reads it.
+    if attempt and OUTCOME_TAG not in tags:
+        # Clear the previous outcome after applying any status change, so it is readable on retry.
         for key in (OUTCOME_TAG, STATUS_BEFORE_DELIVERY):
             if key in run.data.tags:
                 client.delete_tag(binding["run_id"], key)

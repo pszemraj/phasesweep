@@ -553,6 +553,65 @@ def _managed_loss_experiment(
     )
 
 
+def test_trainer_owned_failed_reread_clears_the_previous_winner(local_server, tmp_path: Path):
+    """A published reading owns the outcome and winner while the trainer owns run status."""
+    from phasesweep.tracking.records import OUTCOME_TAG, WINNER_TAG
+
+    uri, client, experiment_id, _process = local_server
+    trainer = tmp_path / "trainer.py"
+    trainer.write_text(
+        """import argparse
+import mlflow
+from phasesweep.tracking import bind_mlflow_run
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--x", type=int)
+x = parser.parse_args().x
+with mlflow.start_run() as run:
+    bind_mlflow_run(run.info.run_id)
+    mlflow.log_metric("loss", x, step=1)
+    if x == 1:
+        mlflow.log_metric("corrected_loss", 2, step=1)
+""",
+        encoding="utf-8",
+    )
+    config = _managed_loss_experiment(tmp_path, uri, experiment_id, trainer, n_trials=2).model_dump(
+        mode="json"
+    )
+    config["mlflow"]["run_mode"] = "trainer"
+    config["phases"][0]["sampler"] = {"type": "grid"}
+    original = Experiment.model_validate(config)
+    first = run_experiment(original)["p"]
+    first_run = first.objective_provenance["remote_capture"]["binding"]["run_id"]
+    initial_native = client.get_run(first_run)
+    assert initial_native.data.tags[WINNER_TAG] == "true"
+
+    config["metric"]["extractor"]["metric_key"] = "corrected_loss"
+    changed = Experiment.model_validate(config)
+    second = run_experiment(changed)["p"]
+    second_run = second.objective_provenance["remote_capture"]["binding"]["run_id"]
+    assert second_run != first_run
+    assert second.metric == 2
+    rejected = client.get_run(first_run)
+    assert rejected.info.status == initial_native.info.status == "FINISHED"
+    assert rejected.info.end_time == initial_native.info.end_time
+    assert rejected.data.tags[OUTCOME_TAG] == "FAILED"
+    assert rejected.data.metrics["phasesweep.objective"] == first.metric
+    assert WINNER_TAG not in rejected.data.tags
+    assert client.get_run(second_run).data.tags[WINNER_TAG] == "true"
+
+    assert run_experiment(original)["p"].attempt_id == first.attempt_id
+    accepted = client.get_run(first_run)
+    assert accepted.info.status == "FINISHED"
+    assert accepted.info.end_time == initial_native.info.end_time
+    assert OUTCOME_TAG not in accepted.data.tags
+    assert accepted.data.tags[WINNER_TAG] == "true"
+    assert WINNER_TAG not in client.get_run(second_run).data.tags
+    attempts = client.search_runs([experiment_id], filter_string="tags.`phasesweep.phase` = 'p'")
+    assert {run.info.run_id for run in attempts} == {first_run, second_run}
+    assert delivery_status(original)["pending"] == 0
+
+
 @pytest.mark.parametrize(
     "trainer_outcome", ["bare_crash", "ended_crash", "no_objective", "ended_then_logged"]
 )

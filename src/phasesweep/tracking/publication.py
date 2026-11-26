@@ -560,10 +560,10 @@ def _accepted_projection(
 
 
 def _unaccepted_projection(binding: RunBinding, status: str) -> Projection:
-    """Freeze the end of a managed attempt run that produced no accepted result.
+    """Freeze a reading of a bound attempt that produced no accepted result.
 
-    :param RunBinding binding: The attempt's managed run binding.
-    :param str status: Terminal MLflow status from the managed attempt outcome.
+    :param RunBinding binding: The attempt's native run binding.
+    :param str status: Outcome of the reading, applied as status only to a managed run.
     :return Projection: The attempt's outcome projection.
     """
     return _projection(
@@ -704,13 +704,15 @@ def _save_attempt_intents(
     shown: Mapping[str, _Shown] | None = None,
     timestamp: int | None = None,
     winners: Collection[str] = (),
+    published: bool = False,
 ) -> list[Path]:
     """Save unrecorded attempt projections according to their durable Optuna outcomes.
 
     COMPLETE trials receive accepted projections, which finish a managed run FINISHED, as a
     run PhaseSweep delivered FAILED or KILLED under another reading can be read again. Unaccepted
     managed runs finish only after cleanup is confirmed by the trial, live controller, or owning
-    study's recovery ledger. Unreadable trials and uncertain cleanup remain unresolved, as
+    study's recovery ledger. Published readings record trainer-owned failures as tags, leaving
+    native status to the trainer. Unreadable trials and uncertain cleanup remain unresolved, as
     do RUNNING trials of a persistent study, whose outcome recovery has yet to record, and
     attempts whose trial a persistent ledger does not hold. A record whose run already shows
     its content, or a newer reading, is saved delivered and never sent.
@@ -733,6 +735,8 @@ def _save_attempt_intents(
     :param Collection[str] winners: Attempt IDs a published generation selected, whose records
         carry the winner tag that every other attempt record removes from its run, defaults to
         none.
+    :param bool published: This generation published a reading of these trials, so mirror
+        failures for trainer-owned runs too.
     :return list[Path]: The records saved, in attempt order.
     """
     from optuna.trial import TrialState
@@ -787,14 +791,15 @@ def _save_attempt_intents(
                 paths.append(save(name, binding, _unaccepted_projection(binding, ended), ended))
             continue
         trial = found.trial
+        managed = binding["run_mode"] == "managed"
         if trial.state == TrialState.COMPLETE:
             projection = _accepted_projection(trial, read_inherits(directory), experiment)
             if binding["attempt_id"] in winners:
                 projection["tags"][WINNER_TAG] = "true"
-            finish = "FINISHED" if binding["run_mode"] == "managed" else None
+            finish = "FINISHED" if managed else None
             paths.append(save(name, binding, projection, finish))
             continue
-        if binding["run_mode"] != "managed":
+        if not managed and not published:
             continue
         settled = trial.state.is_finished() and (
             found.cleanup_confirmed or not _trial_requires_cleanup_recovery(trial)
@@ -810,7 +815,11 @@ def _save_attempt_intents(
             status = "FAILED"
         else:
             continue
-        paths.append(save(name, binding, _unaccepted_projection(binding, status), status))
+        paths.append(
+            save(
+                name, binding, _unaccepted_projection(binding, status), status if managed else None
+            )
+        )
     return paths
 
 
@@ -915,6 +924,7 @@ def _save_reading(
             shown=shown,
             timestamp=timestamp,
             winners={binding["attempt_id"] for binding in bindings.values()},
+            published=True,
         )
     # A rebuilt winner reference leaves the winner tag to a newer reading its run shows.
     superseded = {
