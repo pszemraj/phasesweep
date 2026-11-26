@@ -485,6 +485,46 @@ def test_status_names_an_active_run_instead_of_a_command_that_would_start_anothe
         assert "fix:" not in live.output
 
 
+def test_a_child_behind_a_refused_parent_is_given_the_parents_fix(tmp_path: Path) -> None:
+    """A child waiting on a parent whose target a run refuses names that parent's fix, not a run that would be refused, in both status forms."""
+
+    def plan(parent_trials: int) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            phases=[
+                Phase(
+                    name="parent",
+                    n_trials=parent_trials,
+                    gpu_policy="none",
+                    sampler=Sampler(type="random", seed=0),
+                    search_space={"x": IntParam(type="int", low=0, high=9)},
+                ),
+                Phase(
+                    name="child",
+                    n_trials=1,
+                    gpu_policy="none",
+                    inherits=["parent"],
+                    sampler=Sampler(type="random", seed=0),
+                    search_space={"y": IntParam(type="int", low=0, high=3)},
+                ),
+            ],
+        )
+
+    run_experiment(plan(4))
+    config = write_experiment_config(tmp_path / "lowered.yaml", plan(2))
+    parent_fix = "Set phases[parent].n_trials to at least 4."
+    waiting = (
+        "Phase 'child' shows counts using the last recorded values from 'parent'. "
+        "Its study depends on the values selected by the next run."
+    )
+    for options in ([], ["--trials"]):
+        shown = CliRunner().invoke(cli, ["status", str(config), *options])
+        assert shown.exit_code == 0, shown.output
+        text = " ".join(shown.output.replace("# ", " ").split())
+        assert f"{waiting} fix: {parent_fix}" in text
+        assert "select the parent winners" not in text
+
+
 def test_experiment_status_shape_is_pinned(tmp_path: Path) -> None:
     """A standalone experiment payload carries generation identity plus phases."""
     materialized = materialize("current-journal", tmp_path, mode="tree")

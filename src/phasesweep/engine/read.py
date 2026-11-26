@@ -135,6 +135,7 @@ from phasesweep.errors import (
     START_AGAIN_STEP,
     OperatorAction,
     PhaseSweepError,
+    operator_step,
 )
 from phasesweep.evidence.models import EXTRACTOR_KINDS
 from phasesweep.runtime.json import JsonObject, JsonValue, float_or_none, json_object
@@ -1343,6 +1344,8 @@ class PendingParentNotice(PhaseSweepError):
     """The displayed child's rows depend on a parent whose winner may change."""
 
     default_action: typing.ClassVar[OperatorAction] = OperatorAction.RETRY
+    #: The parents whose next winner the child waits for.
+    parents: tuple[str, ...] = ()
 
 
 PhaseRefusal: TypeAlias = (
@@ -1425,11 +1428,13 @@ def _pending_study_notices(
             continue
         if parents:
             names = ", ".join(repr(parent) for parent in parents)
-            pending[phase.name] = PendingParentNotice(
+            waiting = PendingParentNotice(
                 f"Phase {phase.name!r} shows counts using the last recorded values from {names}. "
                 "Its study depends on the values selected by the next run.",
                 remediation="Run the current configuration to select the parent winners.",
             )
+            waiting.parents = parents
+            pending[phase.name] = waiting
         try:
             notice = pending_reread(
                 experiment, phase, name, every.get(phase.name, []), unsettled=parents
@@ -1480,7 +1485,33 @@ def _phase_refusals(
             pruned[phase.name] = gone
         if refusal is not None:
             refusals[phase.name] = refusal
-    return refusals, pruned
+    return _point_children_at_refused_parents(experiment, refusals), pruned
+
+
+def _point_children_at_refused_parents(
+    experiment: Experiment, refusals: dict[str, PhaseRefusal]
+) -> dict[str, PhaseRefusal]:
+    """Give a child waiting on a refused parent the parent's fix, not a run that would be refused.
+
+    :param Experiment experiment: Config whose phase order and inheritance are followed.
+    :param dict[str, PhaseRefusal] refusals: Refusals and notices by phase name.
+    :return dict[str, PhaseRefusal]: The same, each pending-parent notice of a child behind a
+        refused parent carrying that parent's operator step.
+    """
+    blockers: dict[str, PhaseRefusal] = {}
+    resolved = dict(refusals)
+    for phase in experiment.phases:
+        current = resolved.get(phase.name)
+        if isinstance(current, PendingParentNotice):
+            blocker = next((blockers[name] for name in current.parents if name in blockers), None)
+            if blocker is not None:
+                blockers[phase.name] = blocker
+                redirected = PendingParentNotice(str(current), remediation=operator_step(blocker))
+                redirected.parents = current.parents
+                resolved[phase.name] = redirected
+        elif current is not None and not isinstance(current, PendingRereadNotice):
+            blockers[phase.name] = current
+    return resolved
 
 
 def unpublished_winner_step(
@@ -1907,14 +1938,27 @@ def read_trial_tables(
             fallback_published=latest and generation_id is None,
         )
     }
+    studies: dict[str, optuna.Study | None] = {}
+    refusals: dict[str, PhaseRefusal] = dict(pending)
+    prunings: dict[str, tuple[int, ...]] = {}
+    for phase in experiment.phases:
+        if unreadable is not None:
+            break
+        name = study_names.get(phase.name)
+        study = next((study for study in every[phase.name] if study.study_name == name), None)
+        studies[phase.name] = study
+        if study is not None and phase.name not in refusals:
+            refusal, prunings[phase.name] = _study_diagnostics(experiment, phase, study)
+            if refusal is not None:
+                refusals[phase.name] = refusal
+    refusals = _point_children_at_refused_parents(experiment, refusals)
     for phase in experiment.phases:
         if unreadable is not None:
             log_storage_read_failure(ledger, phase, unreadable, logger=log)
             tables.append(_trial_table(experiment, phase, [], None, available=False))
             continue
-        name = study_names.get(phase.name)
-        study = next((study for study in every[phase.name] if study.study_name == name), None)
-        notice = pending.get(phase.name)
+        study = studies[phase.name]
+        refusal = refusals.get(phase.name)
         if study is None:
             tables.append(
                 _trial_table(
@@ -1922,14 +1966,11 @@ def read_trial_tables(
                     phase,
                     [],
                     winners.get(phase.name),
-                    refusal=notice,
+                    refusal=refusal,
                 )
             )
             continue
-        refusal: PhaseRefusal | None = notice
-        pruned: tuple[int, ...] = ()
-        if refusal is None:
-            refusal, pruned = _study_diagnostics(experiment, phase, study)
+        pruned = prunings.get(phase.name, ())
         identity = _recorded_identity(study)
         winner = winners.get(phase.name)
         tables.append(
