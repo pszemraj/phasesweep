@@ -92,9 +92,11 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import (
     _abort_decision,
+    _at_accepted_partial_target,
     _config_retires_abort,
     _counted_outcome,
     _initialize_study_schema,
+    _load_accepted_partial_decision,
     _load_phase_policy_state,
     _parse_accepted_partial_decision,
     _prelaunch_trial_environment,
@@ -565,14 +567,18 @@ def next_slot(study: optuna.Study, phase: Phase) -> Slot | None:
 
     A queued rerun runs first, then the reruns :func:`_scheduled_reruns` owes (interrupted trials,
     then failed cells or a failed fixed configuration a raised target retries), then a new draw.
-    Every slot spends one trial of the remaining target.
+    Every slot spends one trial of the remaining target. A study that accepted a partial result
+    at the requested target replays that result and allocates nothing until ``n_trials`` rises.
 
     :param optuna.Study study: A live study or an in-memory copy of one.
     :param Phase phase: The phase whose target applies.
-    :return Slot | None: The slot, or ``None`` when the finished trials meet the target.
+    :return Slot | None: The slot, or ``None`` when the finished trials meet the target or an
+        accepted partial result holds it.
     """
     trials = study.get_trials(deepcopy=False)
-    if _finished_trial_count(trials) >= phase.n_trials:
+    if _finished_trial_count(trials) >= phase.n_trials or _at_accepted_partial_target(
+        _load_accepted_partial_decision(study), phase
+    ):
         return None
     by_number = {trial.number: trial for trial in trials}
     for trial in trials:

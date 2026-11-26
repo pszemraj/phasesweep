@@ -34,7 +34,12 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import _allocation_contexts
 from phasesweep.engine.trial_dirs import producing_attempts
 from phasesweep.evidence.models import JsonExtractor
-from tests.conftest import addressed_phase_study, make_experiment, write_trainer
+from tests.conftest import (
+    addressed_phase_study,
+    make_experiment,
+    record_accepted_partial_timeout,
+    write_trainer,
+)
 
 
 def _trainer(tmp_path: Path) -> tuple[Path, Path]:
@@ -719,3 +724,30 @@ def test_an_adopted_attempt_belongs_to_the_study_that_launched_it(tmp_path: Path
     assert {attempt_id: owner.study.study_name for attempt_id, owner in owners.items()} == {
         attempt_id: name for name, ids in launched_by.items() for attempt_id in ids
     }
+
+
+def test_an_accepted_partial_result_replays_until_its_target_rises(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A study at its accepted partial target adopts nothing; a raised target adopts the rest."""
+    trainer, launches = _trainer(tmp_path)
+    partial = _phase("random", 6).model_copy(
+        update={"timeout_seconds_per_phase": 30, "allow_incomplete_on_timeout": True}
+    )
+    accepted = _config(tmp_path, trainer, partial)
+    run_experiment(_config(tmp_path, trainer, partial.model_copy(update={"n_trials": 2})))
+    record_accepted_partial_timeout(addressed_phase_study(accepted), 6)
+    run_experiment(_config(tmp_path, trainer, _phase("random", 8), "acc"))
+    assert _launches(launches) == 8
+    caplog.set_level(logging.INFO)
+
+    run_experiment(accepted, dry_run=True)
+    replayed = run_experiment(accepted)["p"]
+
+    assert "accepted a partial result at 2 of 6 trials" in caplog.text
+    assert replayed.completion["incomplete"]
+    assert len(addressed_phase_study(accepted).trials) == 2
+    raised = _config(tmp_path, trainer, _phase("random", 8))
+    run_experiment(raised)
+    assert len(addressed_phase_study(raised).trials) == 8
+    assert _launches(launches) == 8
