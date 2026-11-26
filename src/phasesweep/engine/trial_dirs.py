@@ -547,10 +547,14 @@ def _trial_dir_for_attempt(
     """Reuse an available training directory after cleanup, or open a fresh one.
 
     A trial that continues another's directory may start only once that directory's last
-    attempt is provably gone, so two live processes never write one directory: its
-    lifecycle says ``exited`` with cleanup confirmed, or ``allocated`` with no process
-    identity beside it, or recovery recorded its cleanup. The first two are recovery's own
-    rule, :func:`phasesweep.engine.attempts._attempt_process_resolution`.
+    attempt is provably gone, so two live processes never write one directory: recovery's own
+    rule, :func:`phasesweep.engine.attempts._attempt_process_resolution`, settles it without a
+    signal (``exited`` with cleanup confirmed, ``allocated``, or ``launching`` with no process
+    identity, whose payload never crossed), or recovery recorded its cleanup in this study. The
+    lifecycle decides for an attempt another study launched, as a changed reading's adopted
+    rows are, since its cleanup record lives in that study. ``launching`` with no identity is
+    safe only under the experiment lock; the only caller is a run's trial launch, which holds
+    it, and the dry run never resolves a directory.
 
     :param Experiment experiment: Configuration naming the phase directory.
     :param str phase_name: Phase the attempt runs in.
@@ -581,11 +585,15 @@ def _trial_dir_for_attempt(
                 lifecycle = read_attempt_lifecycle(source_dir, expected_attempt_id=source_attempt)
             except ValueError:
                 lifecycle = None
-            # Recovery's own rule for an attempt that needs no signal: anything else it
-            # would have to inspect or clean first.
-            settled = lifecycle is not None and _attempt_process_resolution(
-                lifecycle, identity_exists=(source_dir / PROCESS_IDENTITY_FILE).exists()
-            ) in {"exited", "allocated"}
+            # Recovery's own rule for an attempt that needs no signal: a process identity is
+            # one it would have to inspect or clean first.
+            settled = (
+                lifecycle is not None
+                and _attempt_process_resolution(
+                    lifecycle, identity_exists=(source_dir / PROCESS_IDENTITY_FILE).exists()
+                )
+                != "identity"
+            )
         else:
             settled = False
         if not settled:

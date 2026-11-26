@@ -18,6 +18,7 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     _trial_attempt_dir,
 )
@@ -29,6 +30,7 @@ from phasesweep.runtime.process import (
 )
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE, PROCESS_IDENTITY_SCHEMA_VERSION
 from tests.conftest import (
+    addressed_phase_study,
     make_experiment,
     phase_trials,
     reaped_pid,
@@ -206,6 +208,29 @@ def test_trainer_whose_payload_never_crossed_is_interrupted_and_rerun(
     assert interrupted.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "interrupted"
     assert rerun.state == optuna.trial.TrialState.COMPLETE
     assert rerun.user_attrs[RERUN_OF_ATTR] == 0
+    assert launches.read_text() == "launch\n"
+
+
+@pytest.mark.integration
+def test_a_new_reading_reruns_an_adopted_trial_whose_payload_never_crossed(
+    tmp_path: Path,
+) -> None:
+    """A changed reading adopts the settled attempt and reruns it once, in its own directory."""
+    experiment, _config, launches = _strand_launch(
+        tmp_path, slot="trainer", point="before-identity"
+    )
+    (stranded,) = phase_trials(experiment)
+    changed = experiment.model_copy(
+        update={"metric": experiment.metric.model_copy(update={"goal": "maximize"})}
+    )
+
+    assert run_experiment(changed)["p"].metric == 0.25
+
+    adopted, rerun = addressed_phase_study(changed).trials
+    assert adopted.user_attrs[ATTEMPT_ID_ATTR] == stranded.user_attrs[ATTEMPT_ID_ATTR]
+    assert adopted.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "interrupted"
+    assert rerun.user_attrs[RERUN_OF_ATTR] == 0
+    assert rerun.user_attrs[TRIAL_DIR_ATTR] == stranded.user_attrs[TRIAL_DIR_ATTR]
     assert launches.read_text() == "launch\n"
 
 
