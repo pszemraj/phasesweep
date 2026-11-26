@@ -485,8 +485,11 @@ def test_status_names_an_active_run_instead_of_a_command_that_would_start_anothe
         assert "fix:" not in live.output
 
 
-def test_a_child_behind_a_refused_parent_is_given_the_parents_fix(tmp_path: Path) -> None:
-    """A child waiting on a parent whose target a run refuses names that parent's fix, not a run that would be refused, in both status forms."""
+@pytest.mark.parametrize("child_needs_reread", [False, True])
+def test_a_child_behind_a_refused_parent_is_given_the_parents_fix(
+    tmp_path: Path, child_needs_reread: bool
+) -> None:
+    """Both status forms point the child to the target fix before a run can reselect its parent."""
 
     def plan(parent_trials: int) -> Experiment:
         return make_experiment(
@@ -510,19 +513,32 @@ def test_a_child_behind_a_refused_parent_is_given_the_parents_fix(tmp_path: Path
             ],
         )
 
-    run_experiment(plan(4))
-    config = write_experiment_config(tmp_path / "lowered.yaml", plan(2))
-    parent_fix = "Set phases[parent].n_trials to at least 4."
+    original = plan(4)
+    run_experiment(original)
+    lowered = plan(2)
     waiting = (
         "Phase 'child' shows counts using the last recorded values from 'parent'. "
         "Its study depends on the values selected by the next run."
     )
+    if child_needs_reread:
+        metric = Metric(
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"(?:x=)(?P<value>[0-9.eE+-]+)")
+        )
+        run_experiment(
+            original.model_copy(update={"metric": metric, "phases": original.phases[:1]})
+        )
+        lowered = lowered.model_copy(update={"metric": metric})
+        waiting = "Phase 'child' has not started under the current reading settings"
+    config = write_experiment_config(tmp_path / "lowered.yaml", lowered)
+    parent_fix = "Set phases[parent].n_trials to at least 4."
     for options in ([], ["--trials"]):
         shown = CliRunner().invoke(cli, ["status", str(config), *options])
         assert shown.exit_code == 0, shown.output
         text = " ".join(shown.output.replace("# ", " ").split())
-        assert f"{waiting} fix: {parent_fix}" in text
+        assert waiting in text
+        assert text.count(f"fix: {parent_fix}") == 2
         assert "select the parent winners" not in text
+        assert f"phasesweep run {config}" not in text
 
 
 def test_experiment_status_shape_is_pinned(tmp_path: Path) -> None:

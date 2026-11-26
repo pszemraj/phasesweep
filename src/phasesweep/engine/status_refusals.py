@@ -231,14 +231,14 @@ def _point_children_at_refused_parents(
     resolved = dict(refusals)
     for phase in experiment.phases:
         current = resolved.get(phase.name)
-        if isinstance(current, PendingParentNotice):
+        if isinstance(current, (PendingParentNotice, PendingRereadNotice)):
             blocker = next((blockers[name] for name in current.parents if name in blockers), None)
             if blocker is not None:
                 blockers[phase.name] = blocker
                 redirected = PendingParentNotice(str(current), remediation=operator_step(blocker))
                 redirected.parents = current.parents
                 resolved[phase.name] = redirected
-        elif current is not None and not isinstance(current, PendingRereadNotice):
+        elif current is not None:
             blockers[phase.name] = current
     return resolved
 

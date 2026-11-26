@@ -1523,6 +1523,8 @@ class PendingRereadNotice(PhaseSweepError):
     statement: str = ""
     #: Finished trials the next run re-reads (:attr:`AdoptionPlan.rereads`).
     finished_trials: int = 0
+    #: Parents whose next winner the re-read waits for.
+    parents: tuple[str, ...] = ()
 
 
 def _pending_notice(
@@ -1574,6 +1576,7 @@ def _pending_notice(
     )
     notice.statement = statement
     notice.finished_trials = rereads
+    notice.parents = tuple(unsettled)
     return notice
 
 
