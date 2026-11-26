@@ -22,9 +22,13 @@ from phasesweep.engine.errors import (
     TrialTargetRefusedError,
 )
 from phasesweep.engine.ledger import validate_ledger
-from phasesweep.engine.optuna import _draw_positions
 from phasesweep.engine.read import inspect_status, read_status
-from phasesweep.engine.selection import PhaseAbortRefusedError, PhaseTrialsFailedError
+from phasesweep.engine.selection import (
+    NoFeasibleTrialError,
+    PhaseAbortRefusedError,
+    PhaseTrialsFailedError,
+    ReplayWithoutFeasibleTrialError,
+)
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
@@ -316,8 +320,8 @@ def test_kept_grid_retry_and_new_cell_need_no_launch_preflight(tmp_path: Path) -
     assert [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows] == [
         row.user_attrs[ATTEMPT_ID_ATTR] for row in addressed_phase_study(sibling).trials
     ]
-    assert rows[2].user_attrs[RERUN_OF_ATTR] == 1
-    assert RERUN_OF_ATTR not in rows[3].user_attrs
+    assert RERUN_OF_ATTR not in rows[2].user_attrs
+    assert rows[3].user_attrs[RERUN_OF_ATTR] == 1
     assert _launches(launches) == 4
     assert read_status(target)["publication_integrity"] == "ok"
 
@@ -948,7 +952,13 @@ def test_partial_boundary_replays_past_an_unrelated_grid_retry(
     caplog: pytest.LogCaptureFixture,
     case: Literal["restart", "full-union", "interrupted-retry"],
 ) -> None:
-    """Keep the accepted cohort and retry ancestry across a stopped re-read and a later top-up."""
+    """Carry a sibling's counted retry of a cell this reading measured, as a retry of its row.
+
+    Cells A, B, C launch in grid order. Under "loss" A fails and B, C measure; under "acc" A
+    measures and B, C fail. The "acc" donor retries B, then is stopped by its deadline in the
+    retry of C and accepts 4 of 5. Its own next slot never offers B a retry, so the returning
+    study takes B's retry only through the cohort's retry link, and launches nothing.
+    """
     (tmp_path / "case").write_text(case)
     trainer = write_trainer(
         tmp_path / "trainer.py",
@@ -968,80 +978,63 @@ def test_partial_boundary_replays_past_an_unrelated_grid_retry(
         with Path(__file__).with_name("starts").open("a") as starts:
             print(args.out.parent, previous, file=starts)
         checkpoint.write_text(str(launch))
-        interrupted_retry = Path(__file__).with_name("case").read_text() == "interrupted-retry"
-        if launch == (3 if interrupted_retry else 4):
+        if launch == 5:
             time.sleep(60)
         data = {"loss": args.x, "acc": args.x}
         if launch == 1:
             del data["loss"]
-        if launch == (1 if interrupted_retry else 2):
+        if launch in (2, 3):
             del data["acc"]
+        if launch == 3 and Path(__file__).with_name("case").read_text() == "interrupted-retry":
+            del data["loss"]
         args.out.write_text(json.dumps(data))
         """,
     )
-    original = _phase("grid", 2).model_copy(
-        update={
-            "sampler": Sampler(type="grid", seed=19),
-            "search_space": {"x": CategoricalParam(type="categorical", choices=[1, 2, 3, 4])},
-            "allow_incomplete_on_timeout": True,
-        },
-    )
+    original = _phase("grid", 2).model_copy(update={"allow_incomplete_on_timeout": True})
     target = original.model_copy(update={"n_trials": 5})
     returning = _config(tmp_path, trainer, target)
     donor = _config(
         tmp_path, trainer, target.model_copy(update={"timeout_seconds_per_phase": 3}), "acc"
     )
     run_experiment(_config(tmp_path, trainer, original))
-    run_experiment(_config(tmp_path, trainer, original, "acc"))
-    donor_finished = 2 if case == "interrupted-retry" else 3
-    assert run_experiment(donor)["p"].completion["finished_trials"] == donor_finished
+    run_experiment(_config(tmp_path, trainer, original.model_copy(update={"n_trials": 3}), "acc"))
+    assert run_experiment(donor)["p"].completion["finished_trials"] == 4
     donor_rows = addressed_phase_study(donor).trials
+    assert [row.user_attrs.get(RERUN_OF_ATTR) for row in donor_rows] == [None, None, None, 1, 2]
+    cohort = [row.user_attrs[ATTEMPT_ID_ATTR] for row in donor_rows[:4]]
     caplog.set_level(logging.INFO)
 
     if case == "full-union":
-        earlier = _config(tmp_path, trainer, target.model_copy(update={"n_trials": 4}))
-        run_experiment(earlier)
-        original_rows = addressed_phase_study(earlier).trials
+        run_experiment(_config(tmp_path, trainer, target.model_copy(update={"n_trials": 4})))
+        assert trainer.with_name("count").read_text() == "6"
+        own = addressed_phase_study(returning).trials
         run_experiment(returning, dry_run=True)
         assert "target met (5 of 5 trials recorded)" in caplog.text
         assert "would launch 0 trials" in caplog.text
         assert not run_experiment(returning)["p"].completion["incomplete"]
         assert trainer.with_name("count").read_text() == "6"
         rows = addressed_phase_study(returning).trials
-        assert rows[:-1] == original_rows
-        assert rows[-1].user_attrs[ATTEMPT_ID_ATTR] == donor_rows[2].user_attrs[ATTEMPT_ID_ATTR]
+        assert rows[:-1] == own
+        assert rows[-1].user_attrs[ATTEMPT_ID_ATTR] == cohort[3]
         assert rows[-1].user_attrs[RERUN_OF_ATTR] == 1
         return
 
     run_experiment(returning, dry_run=True)
-    assert f"accepted a partial result at {donor_finished} of 5 trials" in caplog.text
+    assert "accepted a partial result at 4 of 5 trials" in caplog.text
     assert "would launch 0 trials" in caplog.text
     if case == "interrupted-retry":
         assert run_experiment(returning)["p"].completion["incomplete"]
         rows = addressed_phase_study(returning).trials
-        assert len(rows) == 2
-        assert donor_rows[2].user_attrs[RERUN_OF_ATTR] == 0
-        assert all(
-            row.user_attrs[ATTEMPT_ID_ATTR] != donor_rows[2].user_attrs[ATTEMPT_ID_ATTR]
-            for row in rows
-        )
-        widened = target.model_copy(
-            update={
-                "n_trials": 6,
-                "search_space": {
-                    "x": CategoricalParam(type="categorical", choices=[1, 2, 3, 4, 5])
-                },
-            }
-        )
-        run_experiment(_config(tmp_path, trainer, widened))
+        assert [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows] == cohort
+        assert rows[3].user_attrs[RERUN_OF_ATTR] == 1
+        run_experiment(_config(tmp_path, trainer, target.model_copy(update={"n_trials": 6})))
         starts = trainer.with_name("starts").read_text().splitlines()
-        interrupted_dir, previous = starts[2].rsplit(" ", 1)
-        assert previous == "1"
-        assert starts[3] == f"{interrupted_dir} 3"
+        retried_dir, previous = starts[4].rsplit(" ", 1)
+        assert (starts[2], previous) == (f"{retried_dir} fresh", "3")
+        assert starts[6] == f"{retried_dir} 5"
         assert len(starts) == 7
         return
 
-    assert _draw_positions(donor_rows) == {0: 0, 1: 1, 2: 1, 3: 2}
     with (
         patch.object(
             reread_ops,
@@ -1053,29 +1046,28 @@ def test_partial_boundary_replays_past_an_unrelated_grid_retry(
     ):
         run_experiment(returning)
     rows = addressed_phase_study(returning).trials
-    assert len(rows) == 3
-    assert rows[-1].user_attrs[ATTEMPT_ID_ATTR] == donor_rows[2].user_attrs[ATTEMPT_ID_ATTR]
+    assert [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows] == cohort[:3]
 
-    with patch.object(
-        reread_ops, "_reread_trial", side_effect=AssertionError("row is already read")
-    ):
+    with patch.object(reread_ops, "_reread_trial", wraps=reread_ops._reread_trial) as reread:
         winner = run_experiment(returning)["p"]
-    assert winner.completion["incomplete"]
-    assert (winner.completion["finished_trials"], winner.completion["measured_trials"]) == (3, 2)
-    assert trainer.with_name("count").read_text() == "4"
-    rows = addressed_phase_study(returning).trials
-    assert _draw_positions(rows) == _draw_positions(donor_rows)
-    assert [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in rows] == [
-        trial.user_attrs[ATTEMPT_ID_ATTR] for trial in donor_rows
+    assert [call.args[2].user_attrs[ATTEMPT_ID_ATTR] for call in reread.call_args_list] == [
+        cohort[3]
     ]
-    assert rows[2].user_attrs[RERUN_OF_ATTR] == 1
+    assert winner.completion["incomplete"]
+    assert (winner.completion["finished_trials"], winner.completion["measured_trials"]) == (4, 3)
+    assert trainer.with_name("count").read_text() == "5"
+    rows = addressed_phase_study(returning).trials
+    assert [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows] == cohort
+    assert rows[3].user_attrs[RERUN_OF_ATTR] == 1
 
-    raised = _config(tmp_path, trainer, target.model_copy(update={"n_trials": 6}))
-    run_experiment(raised)
-    rows = addressed_phase_study(raised).trials
-    assert trainer.with_name("count").read_text() == "7"
-    assert _draw_positions(rows) == {0: 0, 1: 1, 2: 1, 3: 2, 4: 2, 5: 0, 6: 3}
-    assert rows[4].user_attrs[TRIAL_DIR_ATTR] == rows[3].user_attrs[TRIAL_DIR_ATTR]
+    with pytest.raises(TrialTargetRefusedError) as refused:
+        run_experiment(_config(tmp_path, trainer, target.model_copy(update={"n_trials": 6})))
+    assert str(refused.value) == (
+        "Phase 'p': n_trials=6 exceeds the grid's available attempts: 4 finished attempts and "
+        "2 COMPLETE or INFEASIBLE cells in a 3-cell grid allow at most 5."
+    )
+    assert refused.value.remediation == "Set phases[p].n_trials to at most 5."
+    assert trainer.with_name("count").read_text() == "5"
 
 
 @pytest.mark.integration
@@ -1209,4 +1201,159 @@ def test_a_tripped_failure_streak_stops_adoption_in_the_run_and_its_preview(
 
     assert "accepted a partial result" not in caplog.text
     assert addressed_phase_study(returning).trials == rows
+    assert _launches(launches) == 4
+
+
+def test_the_pending_notice_promises_no_retraining_only_of_the_trials_it_re_reads(
+    tmp_path: Path,
+) -> None:
+    """A raised target owes a new launch, so the notice limits "without retraining" to its re-reads."""
+    trainer, launches = _trainer(tmp_path)
+    fixed = Phase(name="p", n_trials=1, gpu_policy="none")
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(_config(tmp_path, trainer, fixed, "typo"))
+    changed = _config(tmp_path, trainer, fixed.model_copy(update={"n_trials": 2}), "other_typo")
+
+    notice = inspect_status(changed, validate_ledger(changed)).refusals["p"]
+
+    assert isinstance(notice, reread_ops.PendingRereadNotice)
+    assert notice.statement == (
+        "Phase 'p' has not started under the current reading settings (metric.extractor.key "
+        "changed); the next run re-reads 1 finished trial from kept evidence without "
+        "retraining them."
+    )
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(changed)
+    assert _launches(launches) == 2
+
+
+def test_a_preview_refuses_a_met_target_whose_kept_attempts_hold_no_winner(
+    tmp_path: Path,
+) -> None:
+    """A changed reading over a known trainer failure that fills the target refuses in both."""
+    trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(2)")
+    fixed = Phase(name="p", n_trials=1, gpu_policy="none")
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(_config(tmp_path, trainer, fixed, "acc"))
+    changed = _config(tmp_path, trainer, fixed)
+
+    for dry_run in (True, False):
+        with pytest.raises(ReplayWithoutFeasibleTrialError, match="launched no trial"):
+            run_experiment(changed, dry_run=dry_run)
+
+
+def test_every_grid_cell_takes_a_slot_before_retries_of_a_failing_cell(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A new reading adopts each measured cell before the kept retries of a cell that keeps failing."""
+    trainer, launches = _trainer(tmp_path)
+    (tmp_path / "fail").touch()
+    phase = _phase("grid", 3).model_copy(update={"allow_partial_grid": False})
+    for target in (3, 4, 5, 6):
+        run_experiment(_config(tmp_path, trainer, phase.model_copy(update={"n_trials": target})))
+    assert _launches(launches) == 6
+    caplog.set_level(logging.INFO)
+
+    for target, forecast in (
+        (4, "would re-read 2 kept trials from other reading studies, keep 2 trainer failures"),
+        (5, "would keep 1 trainer failure as recorded; no kept trial would retrain"),
+    ):
+        config = _config(
+            tmp_path, trainer, phase.model_copy(update={"n_trials": target}), "loss", "maximize"
+        )
+        caplog.clear()
+        run_experiment(config, dry_run=True)
+        assert forecast in caplog.text
+        winner = run_experiment(config)["p"]
+        rows = addressed_phase_study(config).trials
+        assert sorted(row.params["x"] for row in rows) == [1] + [2] * (target - 2) + [3]
+        assert winner.params["x"] == 1
+    assert _launches(launches) == 6
+
+
+def test_a_new_reading_takes_kept_retries_of_two_failing_cells_in_their_rotation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Kept retries of two failing cells cover a new reading's target; one more raise launches one retry."""
+    launches = tmp_path / "launches"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse, json, sys
+        from pathlib import Path
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        ap.add_argument("--x", type=float, default=1)
+        args = ap.parse_args()
+        with Path({str(launches)!r}).open("a") as handle:
+            print(args.x, file=handle)
+        if args.x != 3:
+            sys.exit(7)
+        Path(args.out).write_text(json.dumps({{"loss": args.x, "acc": args.x}}))
+        """,
+    )
+    phase = _phase("grid", 3).model_copy(
+        update={"allow_partial_grid": False, "max_consecutive_failures": 10}
+    )
+    for target in (3, 4, 5):
+        run_experiment(_config(tmp_path, trainer, phase.model_copy(update={"n_trials": target})))
+    kept = addressed_phase_study(_config(tmp_path, trainer, phase)).trials
+    assert _launches(launches) == 5
+    caplog.set_level(logging.INFO)
+
+    for target, forecast, launched in (
+        (5, "may need to launch up to 1 trial depending on the re-read results", 5),
+        (6, "would launch 1 trial, 1 of them a rerun", 6),
+    ):
+        config = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": target}), "acc")
+        caplog.clear()
+        run_experiment(config, dry_run=True)
+        assert forecast in caplog.text
+        run_experiment(config)
+        assert _launches(launches) == launched
+    rows = addressed_phase_study(config).trials
+    assert [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows[:5]] == [
+        row.user_attrs[ATTEMPT_ID_ATTR] for row in kept
+    ]
+    assert [row.user_attrs.get(RERUN_OF_ATTR) for row in rows] == [None, None, None, 1, 2, 3]
+
+
+def test_a_preview_over_a_re_read_failure_and_its_kept_retry_leaves_the_target_open(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A grid's kept retry of an unreadable cell keeps a raised target open in the dry run it fills."""
+    launches = tmp_path / "launches"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse, json
+        from pathlib import Path
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        ap.add_argument("--x", type=float, default=1)
+        args = ap.parse_args()
+        with Path({str(launches)!r}).open("a") as handle:
+            print(args.x, file=handle)
+        first = Path({str(tmp_path / "fail")!r}).exists()
+        Path(args.out).write_text(json.dumps({{}} if args.x == 2 and first else {{"loss": args.x, "acc": args.x}}))
+        """,
+    )
+    phase = _phase("grid", 3).model_copy(update={"allow_partial_grid": False})
+    (tmp_path / "fail").touch()
+    run_experiment(_config(tmp_path, trainer, phase, "acc"))
+    (tmp_path / "fail").unlink()
+    four = phase.model_copy(update={"n_trials": 4})
+    run_experiment(_config(tmp_path, trainer, four, "acc"))
+    target = _config(tmp_path, trainer, four, "loss", "maximize")
+    caplog.set_level(logging.INFO)
+
+    run_experiment(target, dry_run=True)
+    assert "phase=p is refused if every re-read measures" in caplog.text
+    assert "phase=p may need to launch up to 1 trial depending on the re-read results" in (
+        caplog.text
+    )
+    assert "Launch counts are unresolved for 1 phase" in caplog.text
+    assert run_experiment(target)["p"].params["x"] == 3
+    rows = addressed_phase_study(target).trials
+    assert [row.state.name for row in rows] == ["COMPLETE", "FAIL", "COMPLETE", "COMPLETE"]
     assert _launches(launches) == 4

@@ -321,11 +321,11 @@ def test_reread_releases_retry_budget_for_cells_that_now_have_a_result(
     corrected = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
     caplog.set_level(logging.INFO)
     before = tree_snapshot(tmp_path)
-    with pytest.raises(TrialTargetRefusedError, match="measures, at most 5 if every one fails"):
-        run_experiment(fixed, dry_run=True)
+    run_experiment(fixed, dry_run=True)
+    assert "phase=p aborts if every re-read fails (max_consecutive_failures=5)" in caplog.text
     run_experiment(corrected, dry_run=True)
     assert "phase=p is refused if every re-read measures" in caplog.text
-    assert "phase=p may need to launch up to 3 trials" in caplog.text
+    assert "phase=p may need to launch" not in caplog.text
     assert "DRY RUN phase=p would launch" not in caplog.text
     assert tree_changes(before, tree_snapshot(tmp_path)) == {}
     assert _launches(launches) == 5
@@ -1371,7 +1371,7 @@ def test_validate_counts_kept_grid_trials_when_the_reading_settings_change(
 ) -> None:
     """The read-only ceiling counts the attempts a run adopts before its first launch.
 
-    A re-read counts as a failure, whose retry launches before the other cells are adopted.
+    A re-read counts as a failure, so each of the three adopted cells may take one retry.
     """
     trainer, launches = _counting_trainer(tmp_path)
     original = _experiment(tmp_path, trainer, _metric("missing"))
@@ -1396,8 +1396,8 @@ def test_validate_counts_kept_grid_trials_when_the_reading_settings_change(
 
     assert invoke_cli_boundary(["validate", str(retry_path)], monkeypatch) == 0
     assert invoke_cli_boundary(["validate", str(oversized_path)], monkeypatch) == 1
-    assert "allow at most 4" in capsys.readouterr().err
-    with pytest.raises(TrialTargetRefusedError, match="measures, at most 4 if every one fails"):
+    assert "allow at most 6" in capsys.readouterr().err
+    with pytest.raises(TrialTargetRefusedError, match="measures, at most 6 if every one fails"):
         run_experiment(oversized, dry_run=True)
     assert tree_changes(before, tree_snapshot(tmp_path)) == {}
     assert _launches(launches) == 3

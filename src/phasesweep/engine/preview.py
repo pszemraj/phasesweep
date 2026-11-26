@@ -63,7 +63,7 @@ from phasesweep.engine.phase import (
 )
 from phasesweep.engine.progress import _log_phase_header
 from phasesweep.engine.reread import AdoptionPlan, plan_adoption
-from phasesweep.engine.selection import PhaseAbortRefusedError
+from phasesweep.engine.selection import PhaseAbortRefusedError, ReplayWithoutFeasibleTrialError
 from phasesweep.engine.state import Winner
 from phasesweep.engine.study_policy import (
     ReachedStudy,
@@ -590,7 +590,8 @@ def _preview_adoption(
     The run judges the study once adoption has written its rows, so the preview judges the
     projection at its first launch. A re-read's verdict is unknown before the run reads it: a
     projection whose re-reads are all assumed to measure and one whose re-reads all fail bound
-    the launches, and a winner selected over re-read rows is a placeholder.
+    the launches, a refusal is certain only when both meet one of the same kind, and a winner
+    selected over re-read rows is a placeholder.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being previewed.
@@ -623,23 +624,39 @@ def _preview_adoption(
         verdicts: list[_PhaseResume | Winner | PhaseSweepError] = []
         for projected in (plan.complete, plan.failed):
             try:
-                verdicts.append(
-                    _judge_recorded_phase(
+                verdict = _judge_recorded_phase(
+                    experiment,
+                    phase,
+                    inherited_winners,
+                    projected,
+                    policy_state=_load_phase_policy_state(projected, experiment),
+                    phase_fingerprint=_phase_fingerprint(experiment, phase, inherited_winners),
+                    verify_evidence=False,
+                )
+                trials = projected.get_trials(deepcopy=False)
+                if isinstance(verdict, _PhaseResume) and _finished_trial_count(trials) >= (
+                    phase.n_trials
+                ):
+                    # The run selects from adopted rows that meet the target, as it would here.
+                    _replay_met_target(
                         experiment,
                         phase,
                         inherited_winners,
                         projected,
-                        policy_state=_load_phase_policy_state(projected, experiment),
-                        phase_fingerprint=_phase_fingerprint(experiment, phase, inherited_winners),
+                        verdict,
                         verify_evidence=False,
                     )
-                )
+                verdicts.append(verdict)
             except PhaseSweepError as exc:
                 verdicts.append(exc)
         refusals = [verdict for verdict in verdicts if isinstance(verdict, PhaseSweepError)]
-        if len(refusals) == len(verdicts):
+        # Refusals of one kind bracket every mix of re-read outcomes; a ceiling refusal one way
+        # and a streak abort the other leave a mix that meets neither, as the run may find.
+        if len(refusals) == len(verdicts) and type(refusals[0]) is type(refusals[1]):
             raise _refusal_over_both_verdicts(phase, plan, refusals[0])
-        if refusals:
+        if len(refusals) == len(verdicts):
+            low, high_or_unknown = 0, None
+        elif refusals:
             # Mixed verdicts land between the projections. All failing reads give the most
             # launches, all measuring ones the fewest; a failure adds retries only to a fixed
             # configuration or a grid, so elsewhere the measured count is the run's.
@@ -647,21 +664,24 @@ def _preview_adoption(
             study = (plan.complete, plan.failed)[kept]
             if kept:
                 low, high_or_unknown = 0, plan.by_verdict[1]
+            elif isinstance(refusals[0], ReplayWithoutFeasibleTrialError):
+                # The failing reads met the target before selection refused, so both counts hold.
+                low, high_or_unknown = plan.launches
             else:
                 low = plan.by_verdict[0]
                 retries = retry_target_ceiling(phase, finished=0, measured=0) is not None
                 high_or_unknown = None if retries else low
-            outcome = "measures" if kept else "fails"
-            if isinstance(refusals[0], PhaseAbortRefusedError):
+        for outcome, judged in zip(("measures", "fails"), verdicts, strict=True):
+            if isinstance(judged, PhaseAbortRefusedError):
                 warn_dry_run(
                     "phase=%s aborts if every re-read %s (max_consecutive_failures=%d)",
                     phase.name,
                     outcome,
                     phase.max_consecutive_failures,
                 )
-            else:
+            elif isinstance(judged, PhaseSweepError):
                 warn_dry_run(
-                    "phase=%s is refused if every re-read %s: %s", phase.name, outcome, refusals[0]
+                    "phase=%s is refused if every re-read %s: %s", phase.name, outcome, judged
                 )
     finished = _finished_trial_count(study.get_trials(deepcopy=False))
     if recorded.study is not None and recorded.study.get_trials(deepcopy=False):
