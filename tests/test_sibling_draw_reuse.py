@@ -179,10 +179,13 @@ def test_returning_grid_reuses_finished_draws_without_launch_resources(
     assert _launches(launches) == 4
 
 
-def test_repeated_random_configs_keep_independent_draw_slots(tmp_path: Path) -> None:
-    """Equal parameters at distinct positions consume distinct physical attempts."""
+@pytest.mark.parametrize("sampler", ["random", "tpe"])
+def test_repeated_configs_keep_independent_draw_slots(
+    tmp_path: Path, sampler: Literal["random", "tpe"]
+) -> None:
+    """Independent equal-parameter draws take separate slots in every reading."""
     trainer, launches = _trainer(tmp_path)
-    phase = _phase("random", 1).model_copy(
+    phase = _phase(sampler, 1).model_copy(
         update={"search_space": {"x": IntParam(type="int", low=1, high=1)}}
     )
     run_experiment(_config(tmp_path, trainer, phase))
@@ -385,8 +388,9 @@ def test_fill_preview_counts_donors_outside_its_source(
     assert read_status(target)["publication_integrity"] == "ok"
 
 
+@pytest.mark.parametrize("sampler", ["random", "tpe"])
 def test_stopped_adoption_takes_the_siblings_continuation_of_an_interrupted_draw(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, sampler: Literal["random", "tpe"]
 ) -> None:
     """An adoption stopped part-way keeps its rows; the next run takes the continuation, not a rerun."""
     stage = tmp_path / "stage"
@@ -406,7 +410,12 @@ def test_stopped_adoption_takes_the_siblings_continuation_of_an_interrupted_draw
         Path(sys.argv[sys.argv.index("--out") + 1]).write_text('{{"loss": 1, "acc": 2}}')
         """,
     )
-    phase = _phase("random", 1).model_copy(update={"max_consecutive_failures": 10})
+    phase = _phase(sampler, 1).model_copy(
+        update={
+            "max_consecutive_failures": 10,
+            "search_space": {"x": IntParam(type="int", low=1, high=1)},
+        }
+    )
     two = phase.model_copy(update={"n_trials": 2})
     stage.write_text("measure")
     run_experiment(_config(tmp_path, trainer, phase))

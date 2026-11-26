@@ -112,6 +112,7 @@ from phasesweep.engine.trial import TrialResult, _failed_trial, record_trial_res
 from phasesweep.engine.trial_dirs import (
     DirectoryLaunch,
     ProducingAttempt,
+    _rerun_chain,
     directory_history,
     directory_launches,
     producing_attempts,
@@ -408,6 +409,8 @@ class _Candidate(NamedTuple):
     position: int
     #: Whether it finished with a success or failure; otherwise it was interrupted.
     terminal: bool
+    #: Physical opener of an adaptive draw, shared by its reruns.
+    draw: str | None
 
     @property
     def rereads(self) -> bool:
@@ -505,9 +508,27 @@ def _domain(phase: Phase) -> dict[str, optuna.distributions.BaseDistribution]:
     return {name: _distribution(param) for name, param in sampler_search_space(phase).items()}
 
 
+def _first_draw_attempt(
+    attempt_id: str, owner: ProducingAttempt, owners: Mapping[str, ProducingAttempt]
+) -> str:
+    """Identify an adaptive draw by its earliest physical attempt.
+
+    :param str attempt_id: ID of the attempt whose draw is wanted.
+    :param ProducingAttempt owner: Producing row of the attempt.
+    :param Mapping[str, ProducingAttempt] owners: Canonical rows across the compatible studies.
+    :return str: Earliest attempt ID found along the draw's rerun chain.
+    """
+    draw = attempt_id
+    for trial in _rerun_chain(owner.rows, owner.trial, attempts=owners):
+        identity = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+        if isinstance(identity, str):
+            draw = identity
+    return draw
+
+
 def kept_attempts(
     experiment: Experiment, phase: Phase, study: optuna.Study, others: Sequence[optuna.Study]
-) -> list[_Candidate]:
+) -> tuple[list[_Candidate], dict[str, str]]:
     """Collect the attempts compatible studies hold and this study does not, oldest first.
 
     An attempt comes from the study that launched it. When that study is gone, the oldest
@@ -517,24 +538,32 @@ def kept_attempts(
     :param Phase phase: The phase.
     :param optuna.Study study: Study with a recorded identity.
     :param Sequence[optuna.Study] others: The phase's studies.
-    :return list[_Candidate]: Terminal and interrupted attempts with parameters the current
-        search space can draw.
+    :return tuple[list[_Candidate], dict[str, str]]: Compatible terminal and interrupted
+        attempts and the mapping from attempt IDs to physical draws for adaptive samplers.
     """
     compatible = _compatible_studies(experiment, phase, study, others)
     if not compatible:
-        return []
+        return [], {}
     names = {other.study_name for other in compatible}
     present = {trial.user_attrs.get(ATTEMPT_ID_ATTR) for trial in study.get_trials(deepcopy=False)}
     domain = _domain(phase)
     positions: dict[str, dict[int, int]] = {}
     pool = []
     owners = producing_attempts((study, *compatible))
-    for other in compatible:
+    for other in (*compatible, study):
         rows = {trial.number: trial for trial in other.get_trials(deepcopy=False)}
         for trial in rows.values():
             attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
             if isinstance(attempt_id, str) and attempt_id not in owners:
                 owners[attempt_id] = ProducingAttempt(other, trial, rows)
+    draws = (
+        {
+            attempt_id: _first_draw_attempt(attempt_id, owner, owners)
+            for attempt_id, owner in owners.items()
+        }
+        if phase.sampler.type in _ADAPTIVE_SAMPLERS
+        else {}
+    )
     for attempt_id, owner in owners.items():
         if attempt_id in present or owner.study.study_name not in names:
             continue
@@ -550,9 +579,14 @@ def kept_attempts(
         if name not in positions:
             positions[name] = _draw_positions(owner.rows.values())
         pool.append(
-            _Candidate(owner, positions[name][owner.trial.number], outcome.outcome != "interrupted")
+            _Candidate(
+                owner,
+                positions[name][owner.trial.number],
+                outcome.outcome != "interrupted",
+                draws.get(attempt_id),
+            )
         )
-    return _allocation_order(pool)
+    return _allocation_order(pool), draws
 
 
 class Slot(NamedTuple):
@@ -813,16 +847,18 @@ def walk(
     pool: list[_Candidate],
     read: Reader,
     *,
+    draws: Mapping[str, str],
     through_launches: bool = False,
     assumed: optuna.trial.TrialState = optuna.trial.TrialState.COMPLETE,
 ) -> Iterator[Adopt | Launch]:
     """Walk a study's next slots, filling each with the oldest kept attempt that trained it.
 
     A grid slot is its cell. A seeded random slot is its draw position and the configuration the
-    study draws there. An adaptive new draw takes any kept attempt whose configuration the study
-    holds no row of. A rerun takes a terminal attempt of its own configuration only; an
-    interrupted attempt fills only a new draw, so the ordinary rerun continues its checkpoint and
-    no slot holds two. Each filled slot is applied to ``mirror`` before it is yielded.
+    study draws there. An adaptive new draw takes a kept attempt from a physical draw the study
+    does not already hold. A rerun takes a terminal attempt of its own configuration and prefers
+    an adaptive draw's own continuation. An interrupted attempt fills only a new draw, so the
+    ordinary rerun continues its checkpoint. Each filled slot is applied to ``mirror`` before it is
+    yielded.
 
     The rerun of an interrupted trial that no kept attempt fills does not end the walk: it
     continues a checkpoint whatever the later slots hold, so the run launches it with the first
@@ -832,14 +868,25 @@ def walk(
     :param Experiment experiment: Current config.
     :param Phase phase: The phase whose target and failure policy apply.
     :param optuna.Study mirror: In-memory copy of the study, advanced as slots fill.
-    :param list[_Candidate] pool: :func:`kept_attempts`, consumed as slots take them.
+    :param list[_Candidate] pool: Kept attempts, consumed as slots take them.
     :param Reader read: Gives each taken attempt's content under the current settings.
+    :param Mapping[str, str] draws: Physical draw identities for adaptive attempts.
     :param bool through_launches: Keep projecting past unfilled slots, assuming each launch ends
         in ``assumed``, until no kept attempt can fill a later slot; otherwise stop at the first.
     :param optuna.trial.TrialState assumed: State a projected launch ends in.
     :return Iterator[Adopt | Launch]: The slots in allocation order.
     """
     adaptive = phase.sampler.type in _ADAPTIVE_SAMPLERS
+    held = (
+        {
+            draws[attempt_id]
+            for row in mirror.get_trials(deepcopy=False)
+            if isinstance(attempt_id := row.user_attrs.get(ATTEMPT_ID_ATTR), str)
+            and attempt_id in draws
+        }
+        if draws
+        else set()
+    )
     positioned = phase.sampler.type == "random" and phase_draws(phase)
     cells = None
     if phase.sampler.type == "grid" and phase_draws(phase):
@@ -861,30 +908,24 @@ def walk(
         if slot.rerun is not None:
             at = positions[slot.rerun.number]
             params = slot.rerun.params
-            match = next(
-                (
-                    candidate
-                    for candidate in pool
-                    if candidate.terminal
-                    and _same_value(candidate.owner.trial.params, params)
-                    and (not positioned or candidate.position == at)
-                ),
-                None,
+            eligible = (
+                candidate
+                for candidate in pool
+                if candidate.terminal
+                and _same_value(candidate.owner.trial.params, params)
+                and (not positioned or candidate.position == at)
             )
+            attempt_id = slot.rerun.user_attrs.get(ATTEMPT_ID_ATTR)
+            draw = draws.get(attempt_id) if isinstance(attempt_id, str) else None
+            match = next(eligible, None)
+            if draw is not None and match is not None and match.draw != draw:
+                match = next((candidate for candidate in eligible if candidate.draw == draw), match)
         else:
             at = max(positions.values(), default=-1) + 1
             if cells is not None and at >= cells:
                 return
             if adaptive:
-                held = {_semantic_payload_digest(trial.params) for trial in trials}
-                match = next(
-                    (
-                        candidate
-                        for candidate in pool
-                        if _semantic_payload_digest(candidate.owner.trial.params) not in held
-                    ),
-                    None,
-                )
+                match = next((candidate for candidate in pool if candidate.draw not in held), None)
             else:
                 trial = mirror.ask()
                 _suggest_all(trial, phase)
@@ -942,6 +983,8 @@ def walk(
         else:
             mirror.add_trial(row)
         pool.remove(match)
+        if match.draw is not None:
+            held.add(match.draw)
         yield Adopt(match, row, slot.waiting, abort)
 
 
@@ -1238,7 +1281,7 @@ def adopt_kept_attempts(
     adoption = Adoption()
     if _recorded_identity(study) is None:
         return adoption
-    pool = kept_attempts(experiment, phase, study, others)
+    pool, draws = kept_attempts(experiment, phase, study, others)
     state = _load_phase_policy_state(study, experiment)
     abort = state.abort or _replayed_streak_abort(phase, study, state)
     if pool and abort is not None:
@@ -1246,7 +1289,15 @@ def adopt_kept_attempts(
         # the recovery boundary comes first, as before a launch.
         probe = mirror_study(experiment, phase, study, study_name=study.study_name)
         first = next(
-            walk(experiment, phase, probe, list(pool), assumed_reader(experiment, _COMPLETE)), None
+            walk(
+                experiment,
+                phase,
+                probe,
+                list(pool),
+                assumed_reader(experiment, _COMPLETE),
+                draws=draws,
+            ),
+            None,
         )
         if not _config_retires_abort(phase, study, abort) or not isinstance(first, Adopt):
             pool = []
@@ -1273,7 +1324,7 @@ def adopt_kept_attempts(
             flush(False)
             return read(candidate)
 
-        for step in walk(experiment, phase, mirror, pool, read_after_flush):
+        for step in walk(experiment, phase, mirror, pool, read_after_flush, draws=draws):
             if isinstance(step, Launch):
                 flush(True)
             else:
@@ -1303,7 +1354,7 @@ def launch_batch(
     :return int: Maximum launches before checking kept attempts again.
     """
     remaining = max(0, phase.n_trials - _finished_trial_count(study.get_trials(deepcopy=False)))
-    pool = kept_attempts(experiment, phase, study, others)
+    pool, draws = kept_attempts(experiment, phase, study, others)
     if not pool:
         return remaining
     mirror = mirror_study(experiment, phase, study, study_name=study.study_name)
@@ -1314,6 +1365,7 @@ def launch_batch(
         mirror,
         pool,
         assumed_reader(experiment, optuna.trial.TrialState.COMPLETE),
+        draws=draws,
         through_launches=True,
     ):
         if isinstance(step, Launch):
@@ -1442,7 +1494,7 @@ def plan_adoption(
         mirror = mirror_study(experiment, phase, study, study_name=study_name, record=record)
         if not _compatible_studies(experiment, phase, mirror, others):
             return None
-        pool = kept_attempts(experiment, phase, mirror, others)
+        pool, draws = kept_attempts(experiment, phase, mirror, others)
         adoption = Adoption()
         first: optuna.Study | None = None
         last: Adopt | None = None
@@ -1458,6 +1510,7 @@ def plan_adoption(
             mirror,
             pool,
             assumed_reader(experiment, assumed),
+            draws=draws,
             through_launches=True,
             assumed=assumed,
         ):
