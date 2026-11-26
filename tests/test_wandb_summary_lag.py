@@ -115,11 +115,12 @@ def test_sibling_retry_replaces_tracker_history_before_recovery_and_reread(
 
     monkeypatch.setattr(evaluation, "poll_wandb_summary", capture)
     monkeypatch.setattr(evaluation, "locate_wandb_position", lambda **_: 100)
-    returned = config(_KEY, 2)
+    # The sibling's failed retry spends the second trial, so the third launches.
+    returned = config(_KEY, 3)
     with pytest.raises(TrackingTargetUnavailableError):
         run_experiment(returned)
     assert run_experiment(returned)["p"].metric == pytest.approx(0.20)
-    assert run_experiment(config(_KEY, 2, maximize=True))["p"].metric == pytest.approx(0.20)
+    assert run_experiment(config(_KEY, 3, maximize=True))["p"].metric == pytest.approx(0.20)
     assert earlier_counts == [1, 1, 1]
     assert len(launches.read_text().splitlines()) == 3
     assert len(set(launches.read_text().splitlines())) == 1

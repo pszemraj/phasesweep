@@ -1,34 +1,36 @@
-"""Fill a study addressed under changed reading settings from the kept evidence of its trials.
+"""Re-read a phase's kept attempts into the study its current reading settings address.
 
 Optuna keeps a finished trial's value fixed, so results read under other reading settings
-(:func:`phasesweep.engine.fingerprints.reading_settings`) live in another study, which the same
-address finds (:func:`phasesweep.engine.fingerprints.phase_study_name`). When a run reaches a
-phase whose addressed study records no identity yet, and another study of the phase holds
-trials measured under the same inherited values and the same training identity, the new study
-is filled from it before anything launches: each trial is copied in number order, so trial
-numbers, params, distributions, grid positions, rerun links and trial directories all hold,
-and each trial whose trainer finished is read again from its kept evidence under the current
-settings, through the one path recovery reads a finished attempt by
-(:func:`phasesweep.engine.attempts.read_finished_attempt`). No trainer launches.
+(:func:`phasesweep.engine.fingerprints.reading_settings`) live in another study of the same
+phase, which the same address finds (:func:`phasesweep.engine.fingerprints.phase_study_name`).
+The trainer's work does not change with the reading, so a study never retrains an attempt
+another study of its phase already holds under the same training identity and inherited values.
 
-The fill is resumable. The source name is written before copying, each trial is appended in
-one storage write, and the identity is written last. A killed fill resumes from its source's
-current ledger, including trials the source finished while the fill was stopped.
+One procedure serves an empty study, a returning one, the run between launch batches and every
+read that writes nothing (dry run, preflight, ``validate`` and ``status``): :func:`walk` follows
+the study's next slots in the order a run fills them (:func:`next_slot`) and gives each slot the
+oldest compatible attempt that trained it. A terminal attempt is read again under the current
+settings through the one path recovery reads a finished attempt by
+(:func:`phasesweep.engine.attempts.read_finished_attempt`); an interrupted one is copied as
+interrupted, so the ordinary rerun continues it from its checkpoint. The walk stops at the first
+slot no kept attempt fills, where the run launches. A run writes each adopted row in one storage
+write, so an interruption keeps every row written and the next run continues from them.
 """
 
 from __future__ import annotations
 
 import copy
+import heapq
 import logging
 import time
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import ClassVar, NamedTuple
 
 import optuna
 
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.config.search import retry_target_ceiling, sampler_search_space
+from phasesweep.config.search import phase_draws, sampler_search_space
 from phasesweep.engine.attempts import (
     _pending_evidence_refusal,
     _record_stale_trial_outcome,
@@ -38,7 +40,6 @@ from phasesweep.engine.attempts import (
 from phasesweep.engine.errors import (
     PhaseTimeoutError,
     StudyFingerprintMismatchError,
-    StudySchemaMismatchError,
     WinnerIntegrityError,
     phase_timeout,
 )
@@ -60,12 +61,11 @@ from phasesweep.engine.fingerprints import (
     phase_study_name,
     reading_settings,
 )
-from phasesweep.engine.grid_order import grid_axis_names, grid_cell_order
+from phasesweep.engine.grid_order import grid_cell_order
 from phasesweep.engine.optuna import (
     _distribution,
     _draw_positions,
     _finished_trial_count,
-    _measured_draw_count,
     _measured_trial_count,
     _sampling_trial_for_reread,
     _suggest_all,
@@ -74,47 +74,40 @@ from phasesweep.engine.optuna import (
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.state import (
-    ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
     FAILURE_REASON_ATTR,
-    GATES_ATTR,
+    FINISHED_TRIAL_STATES,
     OVERRIDES_ATTR,
     PHASE_DECISION_ATTR,
-    PHASE_IDENTITY_ATTR,
-    PHASE_RECOVERY_ATTR,
-    REREAD_FILL_ATTR,
     RERUN_OF_ATTR,
-    STUDY_SCHEMA_ATTR,
+    TRAINER_ENV_DIGEST_ATTR,
     TRIAL_OUTCOME_ATTR,
-    TRIAL_TARGET_ATTR,
     PhaseIdentityRecord,
     _completed_trainer_duration,
     _parsed_trial_outcome,
     _recorded_identity,
     _required_trial_dir,
     _trial_outcome_payload,
+    constraint_attr,
 )
 from phasesweep.engine.study_policy import (
     _abort_decision,
-    _accepted_trial_target,
+    _config_retires_abort,
     _counted_outcome,
     _initialize_study_schema,
     _load_phase_policy_state,
     _parse_accepted_partial_decision,
-    _pending_rerun_count,
+    _prelaunch_trial_environment,
+    _record_accepted_partial_decision,
     _record_recovery_boundary,
     _recorded_outcome_sequence,
-    _rerun_sources,
+    _replayed_streak_abort,
     _scheduled_reruns,
-    _undrawn_grown_grid_cells,
 )
 from phasesweep.engine.trial import TrialResult, _failed_trial, record_trial_result
 from phasesweep.engine.trial_dirs import (
-    REREAD_FILL_SCHEMA_VERSION,
     DirectoryLaunch,
     ProducingAttempt,
-    _fill_source_name,
-    _rerun_chain,
     directory_history,
     directory_launches,
     producing_attempts,
@@ -127,84 +120,12 @@ from phasesweep.runtime.terminal import REPORT_LOGGER, plural
 log = logging.getLogger(__name__)
 report = logging.getLogger(REPORT_LOGGER)
 
-#: The source's identity, root, schema and any earlier fill belong to the source study.
-_NOT_COPIED = frozenset(
-    {REREAD_FILL_ATTR, PHASE_IDENTITY_ATTR, ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR}
-)
 #: The recorded outcomes a re-read replaces; an interruption or a fatal outcome stands as it was.
 _REREAD_OUTCOMES = frozenset({"success", "failure"})
-
-
-@dataclass(frozen=True)
-class FillSource:
-    """The study a new one is filled from, and what its reading settings were."""
-
-    study: optuna.Study
-    record: PhaseIdentityRecord
-    #: Which trials still have a finished trainer to read.
-    reread_trials: frozenset[int]
-    #: Each reading setting that changed, with its recorded and current value.
-    changes: tuple[tuple[str, object, object], ...]
-    #: The source's current trials and study attributes.
-    trials: list[optuna.trial.FrozenTrial]
-    attrs: JsonObject
-
-    @property
-    def change_description(self) -> str:
-        """Describe the new reading even when the recorded settings have no named differences."""
-        return format_changed_keys(self.changes) or "reading settings"
-
-    @property
-    def rereads(self) -> int:
-        """Count the finished trials the fill still re-reads.
-
-        :return int: Number of trials with a finished trainer and no row in the target.
-        """
-        return len(self.reread_trials)
-
-    @property
-    def copyable_trials(self) -> Sequence[optuna.trial.FrozenTrial]:
-        """Return the rows a fill copies.
-
-        The ordinary retry policy schedules the trailing WAITING reruns again after
-        judging the new measurements.
-
-        :return Sequence[optuna.trial.FrozenTrial]: Stored history, before queued reruns.
-        """
-        end = len(self.trials)
-        while end > 0 and (
-            (trial := self.trials[end - 1]).state == optuna.trial.TrialState.WAITING
-            and RERUN_OF_ATTR in trial.user_attrs
-        ):
-            end -= 1
-        return self.trials[:end]
-
-
-def _fill_candidates(name: str | None, others: Sequence[optuna.Study]) -> Sequence[optuna.Study]:
-    """Use only the already chosen source when resuming a fill.
-
-    :param str | None name: The pinned source name, if there is one.
-    :param Sequence[optuna.Study] others: Other studies of the phase, oldest first.
-    :raises StudySchemaMismatchError: The saved source is unavailable.
-    :return Sequence[optuna.Study]: Every candidate or just the saved source.
-    """
-    if name is None:
-        return others
-    for study in others:
-        if study.study_name == name:
-            return [study]
-    raise StudySchemaMismatchError(f"Saved fill source {name!r} is missing.")
-
-
-@dataclass(frozen=True)
-class FillResult:
-    """What a fill wrote: the trials it copied, re-read, and whose outcome the re-read changed."""
-
-    copied: int
-    rereads: int
-    changed: int
-    #: The source's accepted target and the ceiling after re-reading, when they conflict.
-    adjusted_target: tuple[int, int] | None
+#: Outcomes of attempts another study can take: a fatal outcome is no training result.
+_ADOPTED_OUTCOMES = _REREAD_OUTCOMES | {"interrupted"}
+_ADAPTIVE_SAMPLERS = frozenset({"tpe", "cmaes"})
+_COMPLETE = optuna.trial.TrialState.COMPLETE
 
 
 @dataclass
@@ -223,9 +144,9 @@ class _AttrSheet:
 
 
 def _reread_record(record: PhaseIdentityRecord, reading: JsonObject) -> PhaseIdentityRecord:
-    """Return a source's identity record as it reads under other reading settings.
+    """Return a study's identity record as it reads under other reading settings.
 
-    :param PhaseIdentityRecord record: The source study's record.
+    :param PhaseIdentityRecord record: The study's record.
     :param JsonObject reading: The reading settings to record.
     :return PhaseIdentityRecord: The record with its search-space history and new settings.
     """
@@ -246,7 +167,7 @@ def _trainer_seconds(
     the attempt's process slot after the trainer exited. Only a trial whose recorded outcome
     is a success or failure is read again.
 
-    :param optuna.trial.FrozenTrial trial: A source study's trial.
+    :param optuna.trial.FrozenTrial trial: A trial holding a physical attempt.
     :param Mapping[str, ProducingAttempt] | None attempts: Resolved launch rows, when available.
     :return float | None: The trainer's seconds, or ``None`` when the trial is copied unread.
     """
@@ -265,98 +186,6 @@ def _trainer_seconds(
     return _completed_trainer_duration(producing, None, rechecking_evidence=True)
 
 
-def fill_source(
-    experiment: Experiment,
-    phase: Phase,
-    inherited: Mapping[str, object],
-    others: Sequence[optuna.Study],
-    *,
-    target: optuna.Study | None = None,
-) -> FillSource | None:
-    """Pick the study a phase's new study is filled from, judging without writing anything.
-
-    A candidate holds trials measured under the same inherited values and would continue
-    under the current config once its reading settings are replaced.
-    Prefer histories within the requested trial budget. Among them, keep the most finished
-    trainers to read, then the most spent attempts and retained rows, so a shorter copy
-    cannot erase a failure or an interrupted checkpoint.
-    Equally complete histories use the most recently created study.
-    An interrupted fill keeps its source and uses its latest trials and study metadata.
-
-    :param Experiment experiment: Current config.
-    :param Phase phase: The phase whose addressed study records no identity.
-    :param Mapping[str, object] inherited: The parent layer the phase inherits now.
-    :param Sequence[optuna.Study] others: The phase's other studies, oldest first.
-    :param optuna.Study | None target: The addressed study, when already created.
-    :raises StudyFingerprintMismatchError: A study with these inherited values exists but its
-        training identity differs from the current config; the refusal names what changed.
-    :raises StudySchemaMismatchError: The saved source is unavailable or a record is malformed.
-    :return FillSource | None: The source, or ``None`` when no study holds these values.
-    """
-    reading = reading_settings(experiment, phase)
-    values = _inherited_values(phase, inherited)
-    pinned = _fill_source_name(target)
-    copied = 0 if target is None else len(target.get_trials(deepcopy=False))
-    found: list[FillSource] = []
-    refusal: StudyFingerprintMismatchError | None = None
-    attempts = producing_attempts(others)
-    for study in _fill_candidates(pinned, others):
-        record = _recorded_identity(study)
-        trials = study.get_trials(deepcopy=False)
-        if record is None or not trials:
-            if pinned is not None:
-                raise StudySchemaMismatchError(
-                    f"Saved fill source {study.study_name!r} has no identity or trials."
-                )
-            continue
-        payload = record["payload"]
-        if not _same_value(payload.get("inherited_effective_overrides"), values):
-            if pinned is not None:
-                raise StudySchemaMismatchError(
-                    f"Saved fill source {study.study_name!r} records different inherited values."
-                )
-            continue
-        try:
-            _judge_record(
-                _reread_record(record, reading),
-                trials,
-                study.study_name,
-                experiment,
-                phase,
-                inherited,
-            )
-        except StudyFingerprintMismatchError as exc:
-            refusal = exc
-            continue
-        recorded = payload.get(READING_KEY)
-        changes = _changed_payload_keys(recorded if isinstance(recorded, dict) else {}, reading)
-        rereads = frozenset(
-            trial.number
-            for trial in trials[copied:]
-            if _trainer_seconds(trial, attempts=attempts) is not None
-        )
-        attrs = json_object(
-            {key: value for key, value in study.user_attrs.items() if key not in _NOT_COPIED}
-        )
-        found.append(FillSource(study, record, rereads, tuple(changes), trials, attrs))
-    if not found:
-        if refusal is not None:
-            raise refusal
-        return None
-
-    def history_rank(source: FillSource) -> tuple[bool, bool, int, int, int]:
-        spent = _finished_trial_count(source.trials)
-        return (
-            _accepted_trial_target(source.study) <= phase.n_trials,
-            spent <= phase.n_trials,
-            source.rereads,
-            spent,
-            len(source.copyable_trials),
-        )
-
-    return max(reversed(found), key=history_rank)
-
-
 def _reread_trial(
     experiment: Experiment,
     phase: Phase,
@@ -369,15 +198,15 @@ def _reread_trial(
     deadline: float | None,
     reader_generation_id: str,
 ) -> optuna.trial.FrozenTrial | None:
-    """Read one finished trial again under the current settings, as the trial a fill writes.
+    """Read one finished attempt again under the current settings.
 
     Evidence that is gone or unreadable now fails the trial with the reason its reader gives,
     as a live extraction would, and the phase's retry rules decide whether it runs again.
 
     :param Experiment experiment: Current config, whose reading settings apply.
     :param Phase phase: The trial's phase.
-    :param optuna.trial.FrozenTrial trial: The source trial.
-    :param Mapping[int, optuna.trial.FrozenTrial] trials: The source study's trials by number.
+    :param optuna.trial.FrozenTrial trial: The row holding the attempt.
+    :param Mapping[int, optuna.trial.FrozenTrial] trials: That row's study's trials by number.
     :param dict[str, Experiment | WinnerIntegrityError] producing: Producing configurations by
         generation, filled as they are loaded.
     :param Mapping[str, ProducingAttempt] attempts: Producing rows by physical attempt ID.
@@ -386,9 +215,9 @@ def _reread_trial(
     :param str reader_generation_id: Generation running the reader.
     :raises PhaseTimeoutError: The invocation deadline stopped a read.
     :raises TrackingTargetUnavailableError: The tracker gave no answer, so the verdict waits for
-        a later run; the trials already copied stay and the fill resumes.
-    :return optuna.trial.FrozenTrial | None: The trial to write, or ``None`` when the trial is
-        copied as it was recorded.
+        a later run; the rows already adopted stay and the next run continues.
+    :return optuna.trial.FrozenTrial | None: The re-read row, or ``None`` when the attempt has
+        no finished trainer to read.
     """
     seconds = _trainer_seconds(trial, attempts=attempts)
     outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
@@ -438,7 +267,7 @@ def _reread_trial(
     except ValueError as exc:
         result = _failed_trial(rc=0, duration=seconds, failure_reason=str(exc))
     if result.deadline_exhausted:
-        raise _fill_timeout(experiment, phase)
+        raise _reread_timeout(experiment, phase)
     if result.evidence_unreadable and result.failure_reason is not None:
         raise _pending_evidence_refusal({record.attempt_id: result.failure_reason})
     sheet = _AttrSheet(dict(trial.user_attrs))
@@ -448,14 +277,11 @@ def _reread_trial(
         sheet.user_attrs.pop(FAILURE_REASON_ATTR, None)
     else:
         sheet.user_attrs[FAILURE_REASON_ATTR] = failure
-    # The outcome keeps its completion sequence and any abort it recorded: the failure-policy
-    # replay judges a recorded streak abort against the outcomes as they read now.
     sheet.user_attrs[TRIAL_OUTCOME_ATTR] = _trial_outcome_payload(
         outcome.sequence,
         "success" if failure is None else "failure",
         metric=result.metric if failure is None else None,
         cause=failure,
-        abort=outcome.abort,
     )
     return optuna.trial.FrozenTrial(
         number=trial.number,
@@ -472,61 +298,8 @@ def _reread_trial(
     )
 
 
-def _copy_study_attrs(
-    phase: Phase, target: optuna.Study, source: FillSource
-) -> tuple[int, int] | None:
-    """Copy the source policy with the retry capacity and measurements of the filled study.
-
-    :param Phase phase: The phase whose retry ceiling applies to the re-read results.
-    :param optuna.Study target: The study with all of the copied attempts.
-    :param FillSource source: The source study and its current attributes.
-    :raises StudySchemaMismatchError: The source's accepted target or timeout is malformed.
-    :return tuple[int, int] | None: The source target and reduced target, if it changed.
-    """
-    source_target = _accepted_trial_target(source.study)
-    trials = target.get_trials(deepcopy=False)
-    ceiling = retry_target_ceiling(
-        phase, finished=_finished_trial_count(trials), measured=_measured_draw_count(trials)
-    )
-    accepted = source_target if ceiling is None else min(source_target, ceiling)
-    attrs = {**source.attrs, TRIAL_TARGET_ATTR: accepted}
-    recovery = attrs.get(PHASE_RECOVERY_ATTR)
-    if accepted < source_target and isinstance(recovery, dict):
-        recovered_target = recovery["trial_target"]
-        assert type(recovered_target) is int  # Checked with the accepted target.
-        attrs[PHASE_RECOVERY_ATTR] = {**recovery, "trial_target": min(recovered_target, accepted)}
-    partial = _parse_accepted_partial_decision(
-        attrs.get(PHASE_DECISION_ATTR), source.study.study_name
-    )
-    if partial is not None:
-        retargeted = min(partial.trial_target, accepted)
-        if retargeted <= partial.finished_trials or (
-            partial.trial_target < source_target and retargeted == accepted
-        ):
-            attrs[PHASE_DECISION_ATTR] = None
-        else:
-            measured = _measured_trial_count(
-                trial
-                for trial in trials
-                if (outcome := _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR)))
-                is not None
-                and outcome.sequence <= partial.outcome_sequence
-            )
-            decision = json_object(attrs[PHASE_DECISION_ATTR])
-            attrs[PHASE_DECISION_ATTR] = {
-                **decision,
-                "trial_target": retargeted,
-                "measured_trials": measured,
-            }
-    stored = target.user_attrs
-    for key, value in attrs.items():
-        if stored.get(key) != value:
-            target.set_user_attr(key, value)
-    return (source_target, accepted) if accepted < source_target else None
-
-
-def _fill_timeout(experiment: Experiment, phase: Phase) -> PhaseTimeoutError:
-    """Describe a run budget that stopped the fill before it committed all the rows.
+def _reread_timeout(experiment: Experiment, phase: Phase) -> PhaseTimeoutError:
+    """Describe a run budget that stopped re-reading before it committed every row.
 
     :param Experiment experiment: The invocation whose run deadline expired.
     :param Phase phase: The phase reading its kept evidence.
@@ -534,7 +307,7 @@ def _fill_timeout(experiment: Experiment, phase: Phase) -> PhaseTimeoutError:
     """
     return phase_timeout(
         f"Phase {phase.name!r} hit its run deadline while re-reading kept evidence. "
-        "The study keeps the rows already copied.",
+        "The study keeps the rows already re-read.",
         scope="run",
         experiment=experiment,
     )
@@ -549,296 +322,159 @@ def _require_reread_time(experiment: Experiment, phase: Phase, deadline: float |
     :raises PhaseTimeoutError: The invocation deadline has passed.
     """
     if deadline is not None and time.monotonic() >= deadline:
-        raise _fill_timeout(experiment, phase)
+        raise _reread_timeout(experiment, phase)
 
 
-def _finish_fill(
+def adoption_identity(
     experiment: Experiment,
     phase: Phase,
-    target: optuna.Study,
-    source: FillSource,
-    *,
-    deadline: float | None = None,
-) -> tuple[int, int] | None:
-    """Import the phase policy and seal a fully decided fill.
+    inherited: Mapping[str, object],
+    others: Sequence[optuna.Study],
+) -> tuple[PhaseIdentityRecord, optuna.Study] | None:
+    """Choose the identity an empty study takes so its draws line up with kept attempts.
 
-    :param Experiment experiment: Current reading and budget settings.
-    :param Phase phase: Phase whose new study is filled.
-    :param optuna.Study target: Filled live study or in-memory preview.
-    :param FillSource source: Recorded phase policy and training identity.
-    :param float | None deadline: Absolute invocation deadline, defaults to None.
-    :raises PhaseTimeoutError: The invocation deadline passed before sealing.
-    :return tuple[int, int] | None: The source and adjusted trial targets, if changed.
+    A seeded draw depends on the search-space history in effect at its position, so an empty
+    study takes the newest study of the phase holding trials under the same inherited values and
+    a training identity the current config continues, judged with the current reading settings.
+
+    :param Experiment experiment: Current config.
+    :param Phase phase: The phase whose addressed study holds no trials.
+    :param Mapping[str, object] inherited: The parent layer the phase inherits now.
+    :param Sequence[optuna.Study] others: The phase's other studies, oldest first.
+    :raises StudyFingerprintMismatchError: Studies with these inherited values exist but each one's
+        training identity differs from the current config; the refusal names what changed.
+    :return tuple[PhaseIdentityRecord, optuna.Study] | None: The record and the study it comes
+        from, or ``None`` when no study holds these values.
     """
-    adjusted = _copy_study_attrs(phase, target, source)
-    _require_reread_time(experiment, phase, deadline)
-    _stamp_identity(target, _reread_record(source.record, reading_settings(experiment, phase)))
-    return adjusted
+    reading = reading_settings(experiment, phase)
+    values = _inherited_values(phase, inherited)
+    refusal: StudyFingerprintMismatchError | None = None
+    for study in reversed(others):
+        record = _recorded_identity(study)
+        trials = study.get_trials(deepcopy=False)
+        if (
+            record is None
+            or not trials
+            or not _same_value(record["payload"].get("inherited_effective_overrides"), values)
+        ):
+            continue
+        candidate = _reread_record(record, reading)
+        try:
+            verdict = _judge_record(
+                candidate, trials, study.study_name, experiment, phase, inherited
+            )
+        except StudyFingerprintMismatchError as exc:
+            refusal = refusal or exc
+            continue
+        return verdict.record or candidate, study
+    if refusal is not None:
+        raise refusal
+    return None
 
 
-def _begin_fill(target: optuna.Study, source: FillSource) -> None:
-    """Record the fill's source before importing rows.
-
-    :param optuna.Study target: The study being filled.
-    :param FillSource source: The study whose history is imported.
-    """
-    _initialize_study_schema(target)
-    if REREAD_FILL_ATTR not in target.user_attrs:
-        target.set_user_attr(
-            REREAD_FILL_ATTR,
-            {
-                "schema_version": REREAD_FILL_SCHEMA_VERSION,
-                "study_name": source.study.study_name,
-            },
-        )
-
-
-def preview_filled_study(
+def stamp_adoption_identity(
     experiment: Experiment,
     phase: Phase,
-    study_name: str,
-    source: FillSource,
-    trials: Sequence[optuna.trial.FrozenTrial],
-) -> optuna.Study:
-    """Project fill history for launch planning.
-
-    Unread rows are possible failures for finding retry donors. They cannot supply
-    settled policy or an adaptive proposal until the actual measurements are read.
-
-    :param Experiment experiment: Current reading settings.
-    :param Phase phase: Phase whose run is being previewed.
-    :param str study_name: Addressed study's name.
-    :param FillSource source: Source study and its recorded phase policy.
-    :param Sequence[optuna.trial.FrozenTrial] trials: Committed and forthcoming rows of the fill.
-    :return optuna.Study: An in-memory study with the projected history and identity.
-    """
-    from phasesweep.engine.ledger import open_preview_study
-
-    study = open_preview_study(experiment, phase, study_name=study_name)
-    _begin_fill(study, source)
-    for trial in trials:
-        if trial.number in source.reread_trials:
-            trial = copy.copy(trial)
-            trial.state = optuna.trial.TrialState.FAIL
-            trial.values = None
-        study.add_trial(_sampling_trial_for_reread(trial, study.sampler))
-    if source.reread_trials:
-        _stamp_identity(study, _reread_record(source.record, reading_settings(experiment, phase)))
-    else:
-        _finish_fill(experiment, phase, study, source)
-    return study
-
-
-def fill_study(
-    experiment: Experiment,
-    phase: Phase,
-    target: optuna.Study,
-    source: FillSource,
-    other_studies: Sequence[optuna.Study],
-    run_deadline: float | None,
-    reader_generation_id: str,
-) -> FillResult:
-    """Fill a phase's addressed study from its source, re-reading every finished trainer.
-
-    The target is the study a run opened for the phase and records no identity: empty, or left
-    part-way by a killed fill, whose trials are then the source's first ones, so the fill
-    appends the rest. Queued reruns at the end have yet to launch. Scheduling them after the
-    fill uses the re-read outcomes, and a stopped fill does not copy a row that could gain
-    an outcome in the source before it resumes. The identity, the source's with the current
-    reading settings, is written last and marks the fill complete.
+    inherited: Mapping[str, object],
+    study: optuna.Study,
+    others: Sequence[optuna.Study],
+) -> None:
+    """Bind an empty study to the identity :func:`adoption_identity` chooses, before any row.
 
     :param Experiment experiment: Current config.
     :param Phase phase: The phase.
-    :param optuna.Study target: The addressed study, writable.
-    :param FillSource source: The study to fill from (:func:`fill_source`).
-    :param Sequence[optuna.Study] other_studies: Every study of the phase except the target.
-    :param float | None run_deadline: Absolute invocation deadline.
-    :param str reader_generation_id: The generation that owns any supervised tracker work.
-    :raises PhaseTimeoutError: The deadline stopped the fill. Committed rows remain reusable.
-    :raises StudySchemaMismatchError: The target holds trials the source does not, or the
-        source's accepted partial decision is malformed.
-    :raises TrackingTargetUnavailableError: A tracker gave no answer for a finished trial.
-    :return FillResult: What the fill wrote in this call.
+    :param Mapping[str, object] inherited: The parent layer the phase inherits now.
+    :param optuna.Study study: The addressed study, writable.
+    :param Sequence[optuna.Study] others: The phase's other studies, oldest first.
+    :raises StudyFingerprintMismatchError: See :func:`adoption_identity`.
     """
-    _require_reread_time(experiment, phase, run_deadline)
-    trials = source.copyable_trials
-    present = target.get_trials(deepcopy=False)
-    if [(t.number, t.params, t.user_attrs.get(ATTEMPT_ID_ATTR)) for t in present] != [
-        (t.number, t.params, t.user_attrs.get(ATTEMPT_ID_ATTR)) for t in trials[: len(present)]
-    ]:
-        raise StudySchemaMismatchError(
-            f"Study {target.study_name!r} holds trials that study {source.study.study_name!r} "
-            "does not, so it cannot be filled from it."
-        )
-    _begin_fill(target, source)
-    by_number = {trial.number: trial for trial in trials}
-    attempts = producing_attempts(other_studies)
-    launches = directory_launches(attempts)
-    producing: dict[str, Experiment | WinnerIntegrityError] = {}
-    rereads = changed = 0
-    for trial in trials[len(present) :]:
-        _require_reread_time(experiment, phase, run_deadline)
-        if trial.number in source.reread_trials:
-            log.info(
-                "Phase %s re-reading trial %d (%d/%d).",
-                phase.name,
-                trial.number,
-                rereads + 1,
-                source.rereads,
-            )
-        reread = _reread_trial(
-            experiment,
-            phase,
-            trial,
-            by_number,
-            producing,
-            attempts,
-            launches,
-            deadline=run_deadline,
-            reader_generation_id=reader_generation_id,
-        )
-        _require_reread_time(experiment, phase, run_deadline)
-        if reread is not None:
-            rereads += 1
-            changed += (reread.state, reread.value) != (trial.state, trial.value)
-        target.add_trial(
-            _sampling_trial_for_reread(trial if reread is None else reread, target.sampler)
-        )
-    _require_reread_time(experiment, phase, run_deadline)
-    adjusted_target = _finish_fill(experiment, phase, target, source, deadline=run_deadline)
-    return FillResult(len(trials) - len(present), rereads, changed, adjusted_target)
+    if _recorded_identity(study) is not None or study.get_trials(deepcopy=False):
+        return
+    chosen = adoption_identity(experiment, phase, inherited, others)
+    if chosen is not None:
+        _initialize_study_schema(study)
+        _stamp_identity(study, chosen[0])
 
 
-class SiblingTrial(NamedTuple):
-    """One target-local slot and its finished physical candidates, newest first."""
+class _Candidate(NamedTuple):
+    """A kept attempt another study of the phase holds, as a slot of this study can take it."""
 
-    source: optuna.trial.FrozenTrial
-    producers: list[ProducingAttempt]
-    requires_measurement: bool
-    new_draw: bool = False
+    owner: ProducingAttempt
+    #: Draw position in the study that launched it.
+    position: int
+    #: Whether it finished with a success or failure; otherwise it was interrupted.
+    terminal: bool
 
-    @classmethod
-    def draw(
-        cls, source: optuna.trial.FrozenTrial, producers: list[ProducingAttempt]
-    ) -> SiblingTrial:
-        """Require a usable reading for a budgeted draw unless training itself failed.
-
-        :param optuna.trial.FrozenTrial source: The target sampler's proposed draw.
-        :param list[ProducingAttempt] producers: Matching attempts, newest first.
-        :return SiblingTrial: The target slot and the evidence available for it.
-        """
-        needs_read = all(_trainer_seconds(owner.trial) is not None for owner in producers)
-        return cls(source, producers, needs_read, True)
+    @property
+    def rereads(self) -> bool:
+        """Say whether taking the attempt reads its evidence again under the current settings."""
+        return self.terminal and _trainer_seconds(self.owner.trial) is not None
 
 
-def _allocation_order(owner: ProducingAttempt) -> tuple[float, str, int]:
-    """Order sibling donors by the physical row's allocation, even when its directory was reused."""
-    start = owner.trial.datetime_start
-    return (0.0 if start is None else start.timestamp(), owner.study.study_name, owner.trial.number)
+def _compatible_studies(
+    experiment: Experiment, phase: Phase, study: optuna.Study, others: Sequence[optuna.Study]
+) -> list[optuna.Study]:
+    """Return the other studies whose attempts trained what this study's would.
 
+    Their recorded payload, given this study's reading settings and search space, must equal the
+    current one: the same trainer identity and inherited parent values. A draw trained under
+    another parent value is never adopted, since its score would describe other training.
 
-def pending_sibling_retries(
-    phase: Phase,
-    study: optuna.Study,
-    others: Sequence[optuna.Study],
-    *,
-    required_reruns: frozenset[int] | None = None,
-) -> tuple[SiblingTrial, ...]:
-    """Resolve outstanding reruns that already finished training in sibling studies.
-
-    A shared physical ancestor identifies the draw even when a continuation opened a
-    fresh directory. Studies can number the same draw differently and can also sample
-    the same parameters independently.
-
-    :param Phase phase: Config whose remaining target and rerun policy choose the slots.
-    :param optuna.Study study: Target study whose reruns are examined.
-    :param Sequence[optuna.Study] others: The phase's other reading studies.
-    :param frozenset[int] | None required_reruns: Reruns that unread verdicts cannot close,
-        or None for a settled target.
-    :return tuple[SiblingTrial, ...]: Completed training matching each outstanding slot.
+    :param Experiment experiment: Current config.
+    :param Phase phase: The phase.
+    :param optuna.Study study: Study with a recorded identity.
+    :param Sequence[optuna.Study] others: The phase's studies, oldest first.
+    :return list[optuna.Study]: Compatible studies, oldest first.
     """
-    others = tuple(other for other in others if other.study_name != study.study_name)
-    if not others or _recorded_identity(study) is None:
-        return ()
-    trials = study.get_trials(deepcopy=False)
-    room = phase.n_trials - _finished_trial_count(trials)
-    if room <= 0:
-        return ()
-    queued = [
-        trial
-        for trial in trials
-        if trial.state == optuna.trial.TrialState.WAITING and RERUN_OF_ATTR in trial.user_attrs
-    ]
-    pending = [
-        *queued,
-        *_scheduled_reruns(study, trials, phase, possible=required_reruns is not None),
-    ]
-    if required_reruns is None:
-        pending = pending[:room]
-    if not pending:
-        return ()
-    by_number = {trial.number: trial for trial in trials}
-    attempts = producing_attempts((study, *others))
-    slots: dict[str, tuple[optuna.trial.FrozenTrial, bool]] = {}
-    for trial in pending:
-        # An interruption keeps the paid retry of a failure outstanding. The target's
-        # verdicts decide what is owed; producer ancestry identifies the physical donors.
-        requires_measurement = any(
-            _trial_run_state(ancestor) == "FAIL" for ancestor in _rerun_chain(by_number, trial)
+    record = _recorded_identity(study)
+    if record is None:
+        return []
+    payload = _identity_payload(experiment, phase, _recorded_inheritance(record))
+    space = _payload_search_space(payload)
+    compatible = []
+    for other in others:
+        if other.study_name == study.study_name or (identity := _recorded_identity(other)) is None:
+            continue
+        source = _with_search_space(
+            {**identity["payload"], READING_KEY: payload[READING_KEY]}, space
         )
-        for ancestor in _rerun_chain(by_number, trial, attempts=attempts):
-            identity = ancestor.user_attrs.get(ATTEMPT_ID_ATTR)
-            if isinstance(identity, str):
-                slots[identity] = trial, requires_measurement
-    if not slots:
-        return ()
-    present = {trial.user_attrs.get(ATTEMPT_ID_ATTR) for trial in trials}
-    sibling_names = {other.study_name for other in others}
-    candidates = [
-        owner
-        for attempt_id, owner in attempts.items()
-        if attempt_id not in present
-        and owner.study.study_name in sibling_names
-        and RERUN_OF_ATTR in owner.trial.user_attrs
-        and _trainer_seconds(owner.trial) is not None
+        if _same_value(source, payload):
+            compatible.append(other)
+    return compatible
+
+
+def _allocation_order(pool: Sequence[_Candidate]) -> list[_Candidate]:
+    """Order kept attempts oldest first: each study's by row number, the studies by start time.
+
+    Optuna records a naive local start time, which a changed time zone can move past a later
+    row's, so it only interleaves studies and never reorders rows within one.
+
+    :param Sequence[_Candidate] pool: Kept attempts in any order.
+    :return list[_Candidate]: The attempts in allocation order.
+    """
+    by_study: dict[str, list[_Candidate]] = {}
+    for candidate in pool:
+        by_study.setdefault(candidate.owner.study.study_name, []).append(candidate)
+    rows = [
+        sorted(candidates, key=lambda candidate: candidate.owner.trial.number)
+        for _, candidates in sorted(by_study.items())
     ]
 
-    matches: dict[int, SiblingTrial] = {}
-    for owner in sorted(candidates, key=_allocation_order, reverse=True):
-        # The first row is this attempt. An earlier row must establish a shared draw.
-        ancestors = _rerun_chain(owner.rows, owner.trial, attempts=attempts)
-        next(ancestors)
-        for ancestor in ancestors:
-            identity = ancestor.user_attrs.get(ATTEMPT_ID_ATTR)
-            slot = slots.get(identity) if isinstance(identity, str) else None
-            if slot is None:
-                continue
-            source, requires_measurement = slot
-            if _same_value(source.params, owner.trial.params):
-                retry = matches.setdefault(
-                    source.number, SiblingTrial(source, [], requires_measurement)
-                )
-                retry.producers.append(owner)
-                break
-    matched = tuple(matches[trial.number] for trial in pending if trial.number in matches)
-    if required_reruns is None:
-        return matched
-    # An optional retry must have a slot left after required reruns and reserved grid cells.
-    required = tuple(retry for retry in matched if retry.source.number in required_reruns)
-    optional = tuple(retry for retry in matched if retry.source.number not in required_reruns)
-    undrawn = _undrawn_grown_grid_cells(study, phase, trials)
-    optional_slots = max(0, room - len(required_reruns) - undrawn)
-    return required[:room] + optional[:optional_slots]
+    def started(candidate: _Candidate) -> float:
+        start = candidate.owner.trial.datetime_start
+        return 0.0 if start is None else start.timestamp()
+
+    return list(heapq.merge(*rows, key=started))
 
 
 def _draw_params_in_domain(
     params: Mapping[str, object], domain: Mapping[str, optuna.distributions.BaseDistribution]
 ) -> bool:
-    """Check whether an adaptive proposal could have these exact parameters.
+    """Check whether the current search space could draw these exact parameters.
 
-    :param Mapping[str, object] params: Parameters from the sibling's physical trial.
-    :param Mapping[str, optuna.distributions.BaseDistribution] domain: Target search parameters.
-    :return bool: Whether the parameters match the keys, values and types the target can draw.
+    :param Mapping[str, object] params: Parameters of a kept attempt.
+    :param Mapping[str, optuna.distributions.BaseDistribution] domain: Current search parameters.
+    :return bool: Whether the parameters match the keys, values and types the study can draw.
     """
     if params.keys() != domain.keys():
         return False
@@ -848,7 +484,7 @@ def _draw_params_in_domain(
             internal = distribution.to_internal_repr(value)
         except (ValueError, OverflowError):
             return False
-        # Optuna can coerce equal values such as 1.0 and 1, but proposal matching cannot.
+        # Optuna can coerce equal values such as 1.0 and 1, but slot matching cannot.
         if not distribution._contains(internal) or not _same_value(
             value, distribution.to_external_repr(internal)
         ):
@@ -856,437 +492,963 @@ def _draw_params_in_domain(
     return True
 
 
-def _sibling_draw_candidates(
+def _domain(phase: Phase) -> dict[str, optuna.distributions.BaseDistribution]:
+    """Return the distributions the phase's sampler draws from.
+
+    :param Phase phase: The phase.
+    :return dict[str, optuna.distributions.BaseDistribution]: Distribution by parameter name.
+    """
+    return {name: _distribution(param) for name, param in sampler_search_space(phase).items()}
+
+
+def kept_attempts(
     experiment: Experiment, phase: Phase, study: optuna.Study, others: Sequence[optuna.Study]
-) -> list[ProducingAttempt]:
-    """Resolve terminal physical draws from studies with compatible training identities.
+) -> list[_Candidate]:
+    """Collect the attempts compatible studies hold and this study does not, oldest first.
 
-    :param Experiment experiment: Current trainer and reading settings.
-    :param Phase phase: Phase whose identity the siblings must share.
-    :param optuna.Study study: Initialized target study.
-    :param Sequence[optuna.Study] others: Other reading studies of the phase.
-    :return list[ProducingAttempt]: Terminal candidates, newest first, excluding attempts present.
+    An attempt comes from the study that launched it. When that study is gone, the oldest
+    compatible study holding a copy supplies it, so deleting a study never retrains its work.
+
+    :param Experiment experiment: Current config.
+    :param Phase phase: The phase.
+    :param optuna.Study study: Study with a recorded identity.
+    :param Sequence[optuna.Study] others: The phase's studies.
+    :return list[_Candidate]: Terminal and interrupted attempts with parameters the current
+        search space can draw.
     """
-    record = _recorded_identity(study)
-    if record is None:
+    compatible = _compatible_studies(experiment, phase, study, others)
+    if not compatible:
         return []
-    payload = _identity_payload(experiment, phase, _recorded_inheritance(record))
-    compatible = []
-    for other in others:
-        if other.study_name == study.study_name or (identity := _recorded_identity(other)) is None:
-            continue
-        # An individual draw need not adopt its source's wider search space. Its exact
-        # parameters must match the target proposal; every other training input must agree.
-        source = _with_search_space(
-            {**identity["payload"], READING_KEY: payload[READING_KEY]},
-            _payload_search_space(payload),
-        )
-        if not _same_value(source, payload):
-            continue
-        compatible.append(other)
+    names = {other.study_name for other in compatible}
     present = {trial.user_attrs.get(ATTEMPT_ID_ATTR) for trial in study.get_trials(deepcopy=False)}
-    # Grid and seeded random check exact proposals at every position. Adaptive forecasts
-    # can leave a proposal unknown, but its parameters still have to be in the search space.
-    adaptive_domain = (
-        {name: _distribution(param) for name, param in sampler_search_space(phase).items()}
-        if phase.sampler.type in {"tpe", "cmaes"}
-        else None
-    )
-    candidates = [
-        owner
-        for identity, owner in producing_attempts(compatible).items()
-        if identity not in present
-        and owner.trial.state in {optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.FAIL}
-        and (outcome := _parsed_trial_outcome(owner.trial.user_attrs.get(TRIAL_OUTCOME_ATTR)))
-        is not None
-        and outcome.outcome in _REREAD_OUTCOMES
-        and (adaptive_domain is None or _draw_params_in_domain(owner.trial.params, adaptive_domain))
-    ]
-    candidates.sort(key=_allocation_order, reverse=True)
-    return candidates
+    domain = _domain(phase)
+    positions: dict[str, dict[int, int]] = {}
+    pool = []
+    owners = producing_attempts((study, *compatible))
+    for other in compatible:
+        rows = {trial.number: trial for trial in other.get_trials(deepcopy=False)}
+        for trial in rows.values():
+            attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+            if isinstance(attempt_id, str) and attempt_id not in owners:
+                owners[attempt_id] = ProducingAttempt(other, trial, rows)
+    for attempt_id, owner in owners.items():
+        if attempt_id in present or owner.study.study_name not in names:
+            continue
+        outcome = _parsed_trial_outcome(owner.trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+        if (
+            not owner.trial.state.is_finished()
+            or outcome is None
+            or outcome.outcome not in _ADOPTED_OUTCOMES
+            or not _draw_params_in_domain(owner.trial.params, domain)
+        ):
+            continue
+        name = owner.study.study_name
+        if name not in positions:
+            positions[name] = _draw_positions(owner.rows.values())
+        pool.append(
+            _Candidate(owner, positions[name][owner.trial.number], outcome.outcome != "interrupted")
+        )
+    return _allocation_order(pool)
 
 
-def _sibling_draw_positions(
-    candidates: Sequence[ProducingAttempt],
-) -> dict[int, list[ProducingAttempt]]:
-    """Group physical candidates by draw position, reading each source history once.
+class Slot(NamedTuple):
+    """The next trial a study's run would allocate."""
 
-    :param Sequence[ProducingAttempt] candidates: Compatible draws, newest first.
-    :return dict[int, list[ProducingAttempt]]: Physical candidates at each logical position.
+    #: The row this slot reruns, or ``None`` for a new draw.
+    rerun: optuna.trial.FrozenTrial | None
+    #: The queued WAITING rerun that holds the slot, if one does.
+    waiting: optuna.trial.FrozenTrial | None = None
+
+
+def next_slot(study: optuna.Study, phase: Phase) -> Slot | None:
+    """Return the trial a run of the study allocates next: the one budget rule.
+
+    A queued rerun runs first, then the reruns :func:`_scheduled_reruns` owes (interrupted trials,
+    then failed cells or a failed fixed configuration a raised target retries), then a new draw.
+    Every slot spends one trial of the remaining target.
+
+    :param optuna.Study study: A live study or an in-memory copy of one.
+    :param Phase phase: The phase whose target applies.
+    :return Slot | None: The slot, or ``None`` when the finished trials meet the target.
     """
-    source_positions: dict[str, dict[int, int]] = {}
-    by_position: dict[int, list[ProducingAttempt]] = {}
-    for owner in candidates:
-        if owner.study.study_name not in source_positions:
-            source_positions[owner.study.study_name] = _draw_positions(owner.rows.values())
-        at = source_positions[owner.study.study_name][owner.trial.number]
-        by_position.setdefault(at, []).append(owner)
-    return by_position
+    trials = study.get_trials(deepcopy=False)
+    if _finished_trial_count(trials) >= phase.n_trials:
+        return None
+    by_number = {trial.number: trial for trial in trials}
+    for trial in trials:
+        if trial.state == optuna.trial.TrialState.WAITING and RERUN_OF_ATTR in trial.user_attrs:
+            source = trial.user_attrs[RERUN_OF_ATTR]
+            assert type(source) is int  # _draw_positions validated the link.
+            return Slot(by_number[source], trial)
+    scheduled = _scheduled_reruns(study, trials, phase)
+    return Slot(scheduled[0]) if scheduled else Slot(None)
 
 
-class SiblingPlan(NamedTuple):
-    """Matched trials and adaptive slots with donors whose proposals are still unknown."""
+class Adopt(NamedTuple):
+    """A slot a kept attempt fills."""
 
-    reads: tuple[SiblingTrial, ...] = ()
-    possible_later: int = 0
+    candidate: _Candidate
+    #: The row to append, after the WAITING rerun it settles, if any.
+    row: optuna.trial.FrozenTrial
+    waiting: optuna.trial.FrozenTrial | None
+    #: The abort the target's failure policy records with the row if a launch follows it.
+    abort: JsonObject | None
 
-    @property
-    def capacity(self) -> int:
-        """Return the maximum number of target slots the siblings could settle."""
-        return len(self.reads) + self.possible_later
+
+class Launch(NamedTuple):
+    """A slot no kept attempt fills, so the run launches a trainer for it."""
+
+    slot: Slot
+    #: The in-memory trial the slot's proposal was asked on, which no run holds.
+    asked: int | None
 
 
-def _planned_sibling_draws(
+#: Gives the row content an attempt reads as under the current settings.
+Reader = Callable[[_Candidate], optuna.trial.FrozenTrial]
+
+
+def mirror_study(
     experiment: Experiment,
     phase: Phase,
-    study: optuna.Study,
-    candidates: Sequence[ProducingAttempt],
+    study: optuna.Study | None,
     *,
-    after_gap: bool = False,
-    pending_reruns: int = 0,
-    unread: bool = False,
-) -> SiblingPlan:
-    """Match this study's prospective draws, stopping when an adaptive result is unknown.
+    study_name: str,
+    record: PhaseIdentityRecord | None = None,
+    upto: int | None = None,
+) -> optuna.Study:
+    """Copy a study into memory, so a walk can project its next slots without writing it.
 
-    :param Experiment experiment: Current reading settings and sampler.
-    :param Phase phase: Phase whose remaining target and proposals apply.
-    :param optuna.Study study: Initialized target study.
-    :param Sequence[ProducingAttempt] candidates: Compatible physical draws, newest first.
-    :param bool after_gap: Include later deterministic draws after one needs a launch.
-    :param int pending_reruns: Slots already owed to retries before any new draw.
-    :param bool unread: Whether earlier measurements can still change the next adaptive proposal.
-    :return SiblingPlan: Matched draws and additional possible adaptive positions.
+    :param Experiment experiment: Current config.
+    :param Phase phase: The phase.
+    :param optuna.Study | None study: The study to copy, or ``None`` for one that does not exist.
+    :param str study_name: The study's address.
+    :param PhaseIdentityRecord | None record: Identity to bind the copy to, defaults to the study's.
+    :param int | None upto: Copy only the trials numbered below this, defaults to all.
+    :return optuna.Study: The in-memory copy.
     """
-    if not candidates:
-        return SiblingPlan()
-    trials = study.get_trials(deepcopy=False)
-    record = _recorded_identity(study)
-    assert record is not None
     from phasesweep.engine.ledger import open_preview_study
 
-    verdict = _judge_record(
-        record, trials, study.study_name, experiment, phase, _recorded_inheritance(record)
+    mirror = open_preview_study(experiment, phase, study_name=study_name)
+    if study is not None:
+        mirror.add_trials(study.get_trials(deepcopy=False)[:upto])
+        for key, value in json_object(study.user_attrs).items():
+            mirror.set_user_attr(key, value)
+    if record is not None:
+        _stamp_identity(mirror, record)
+    return mirror
+
+
+def _settle_waiting(study: optuna.Study, number: int) -> None:
+    """Settle a queued rerun that a kept attempt fills, so it cannot launch again.
+
+    :param optuna.Study study: The study holding the WAITING rerun.
+    :param int number: Its trial number.
+    """
+    trial = study.get_trials(deepcopy=False)[number]
+    study._storage.set_trial_state_values(trial._trial_id, optuna.trial.TrialState.RUNNING)
+    _record_stale_trial_outcome(
+        study, trial, cause="a kept attempt of the phase finished this rerun"
     )
-    identity = verdict.record or record
-    position = max(_draw_positions(trials).values(), default=-1) + 1
-    room = max(0, phase.n_trials - _finished_trial_count(trials) - pending_reruns)
-    adaptive = phase.sampler.type in {"tpe", "cmaes"}
-    possible_later = 0
-    grid_slots: list[tuple[int, dict[str, object], list[ProducingAttempt]]] = []
-    by_position: dict[int, list[ProducingAttempt]] = {}
-    if phase.sampler.type == "grid":
-        by_cell: dict[str, list[ProducingAttempt]] = {}
-        for owner in candidates:
-            by_cell.setdefault(_semantic_payload_digest(owner.trial.params), []).append(owner)
-        names = grid_axis_names(list(phase.search_space), phase.repeats)
-        order = grid_cell_order(
-            identity["search_spaces"],
-            seed=phase.sampler.seed,
-            repeats=phase.repeats,
-            phase_name=study.study_name,
-        )
-        for at in range(position, min(position + room, len(order))):
-            params: dict[str, object] = dict(zip(names, order[at], strict=True))
-            matches = by_cell.get(_semantic_payload_digest(params), [])
-            if matches:
-                grid_slots.append((at, params, matches))
-            elif not after_gap:
-                break
-        if not grid_slots:
-            return SiblingPlan()
-    else:
-        by_position = {
-            at: owners
-            for at, owners in _sibling_draw_positions(candidates).items()
-            if position <= at < position + room
-        }
-        if not by_position:
-            return SiblingPlan()
-        if adaptive and after_gap:
-            # A retry's unknown result can change even the first new proposal. Once a
-            # proposal is known, only strictly later positions still depend on its score.
-            if pending_reruns or unread:
-                return SiblingPlan(possible_later=len(by_position))
-            possible_later = len(by_position) - int(position in by_position)
-        room = min(room, max(by_position) - position + 1)
-
-    projected = open_preview_study(experiment, phase, study_name=study.study_name)
-    projected.add_trials(trials)
-    for key, value in json_object(study.user_attrs).items():
-        projected.set_user_attr(key, value)
-    _stamp_identity(projected, identity)
-    if pending_reruns:
-        # An Optuna ask takes queued retries first; each already owns a draw position.
-        for trial in trials:
-            if trial.state == optuna.trial.TrialState.WAITING:
-                projected.ask()
-    reads: list[SiblingTrial] = []
-    if grid_slots:
-        proposed = projected.ask()
-        _suggest_all(proposed, phase)
-        prototype = projected.get_trials(deepcopy=False)[-1]
-        for at, params, matches in grid_slots:
-            source = copy.copy(prototype)
-            source.number = len(trials) + at - position
-            source.params = params
-            source.system_attrs = {**prototype.system_attrs, "grid_id": at}
-            reads.append(SiblingTrial.draw(source, matches))
-        return SiblingPlan(tuple(reads))
-    for offset in range(room):
-        proposed = projected.ask()
-        params = _suggest_all(proposed, phase)
-        source = projected.get_trials(deepcopy=False)[-1]
-        matches = [
-            owner
-            for owner in by_position.get(position + offset, ())
-            if _same_value(params, owner.trial.params)
-        ]
-        if matches:
-            reads.append(SiblingTrial.draw(source, matches))
-        if adaptive or (not matches and not after_gap):
-            break
-        projected.tell(proposed, 0.0)
-    return SiblingPlan(tuple(reads), possible_later)
+    study.tell(number, state=optuna.trial.TrialState.FAIL)
 
 
-def pending_sibling_trials(
-    experiment: Experiment,
+def _finish_asked(study: optuna.Study, trial_id: int, row: optuna.trial.FrozenTrial) -> None:
+    """Turn the in-memory trial a slot's proposal was asked on into the row that fills it.
+
+    :param optuna.Study study: An in-memory copy.
+    :param int trial_id: The asked trial's storage ID.
+    :param optuna.trial.FrozenTrial row: The row, whose parameters the trial already holds.
+    """
+    for key, value in row.user_attrs.items():
+        study._storage.set_trial_user_attr(trial_id, key, value)
+    study._storage.set_trial_state_values(
+        trial_id, row.state, None if row.value is None else [row.value]
+    )
+
+
+def _adopted_row(
     phase: Phase,
     study: optuna.Study,
-    others: Sequence[optuna.Study],
+    slot: Slot,
+    candidate: _Candidate,
+    content: optuna.trial.FrozenTrial,
+    proposal: optuna.trial.FrozenTrial | None,
+    sequence: int,
+) -> optuna.trial.FrozenTrial:
+    """Build the row a slot takes from a kept attempt's content as read under this study.
+
+    The slot's place comes from this study: a rerun names the row it reruns and keeps its
+    sampling state; a new draw takes the proposal's state, or, for an adaptive sampler, the
+    attempt's own without any CMA-ES optimizer fitted to another reading. The outcome takes this
+    study's next completion sequence, and the trainer environment stays the attempt's own.
+
+    :param Phase phase: The phase, whose search space an adaptive new draw takes.
+    :param optuna.Study study: The study, or its in-memory copy.
+    :param Slot slot: The slot being filled.
+    :param _Candidate candidate: The kept attempt.
+    :param optuna.trial.FrozenTrial content: The attempt's row as read under this study.
+    :param optuna.trial.FrozenTrial | None proposal: The study's own draw for a seeded new slot.
+    :param int sequence: The completion sequence the outcome takes.
+    :return optuna.trial.FrozenTrial: The row.
+    """
+    attrs = dict(content.user_attrs)
+    outcome = _parsed_trial_outcome(attrs.get(TRIAL_OUTCOME_ATTR))
+    assert outcome is not None  # kept_attempts takes only attempts with an outcome.
+    attrs[TRIAL_OUTCOME_ATTR] = _trial_outcome_payload(
+        sequence, outcome.outcome, metric=outcome.metric, cause=outcome.cause, policy=outcome.policy
+    )
+    if not attrs.get(TRAINER_ENV_DIGEST_ATTR):
+        environment = _prelaunch_trial_environment(candidate.owner.study, candidate.owner.trial)
+        if environment is not None:
+            attrs[TRAINER_ENV_DIGEST_ATTR] = environment
+    if slot.rerun is not None:
+        source = slot.waiting or slot.rerun
+        attrs[RERUN_OF_ATTR] = source.number
+        distributions, system_attrs = source.distributions, dict(source.system_attrs)
+    else:
+        attrs.pop(RERUN_OF_ATTR, None)
+        if proposal is not None:
+            distributions, system_attrs = proposal.distributions, dict(proposal.system_attrs)
+        else:
+            sampled = _sampling_trial_for_reread(content, study.sampler)
+            distributions = _domain(phase)
+            system_attrs = dict(sampled.system_attrs)
+    return optuna.trial.FrozenTrial(
+        number=len(study.get_trials(deepcopy=False)) if proposal is None else proposal.number,
+        state=content.state,
+        value=content.value,
+        datetime_start=content.datetime_start,
+        datetime_complete=content.datetime_complete,
+        params=dict(content.params),
+        distributions=distributions,
+        user_attrs=attrs,
+        system_attrs=system_attrs,
+        intermediate_values=dict(content.intermediate_values),
+        trial_id=-1,
+    )
+
+
+def _placeholder(
+    experiment: Experiment, study: optuna.Study, slot: Slot, assumed: optuna.trial.TrialState
+) -> optuna.trial.FrozenTrial:
+    """Build the row a projected launch leaves in an in-memory copy.
+
+    :param Experiment experiment: Config whose bounds a stand-in measurement satisfies.
+    :param optuna.Study study: The in-memory copy.
+    :param Slot slot: A rerun slot.
+    :param optuna.trial.TrialState assumed: The state the projection assumes the launch ends in.
+    :return optuna.trial.FrozenTrial: The row.
+    """
+    source = slot.waiting or slot.rerun
+    assert source is not None
+    value, attrs = _assumed_verdict(experiment, study, assumed)
+    return optuna.trial.create_trial(
+        state=assumed,
+        value=value,
+        params=dict(source.params),
+        distributions=source.distributions,
+        system_attrs=dict(source.system_attrs),
+        user_attrs={RERUN_OF_ATTR: source.number, **attrs},
+    )
+
+
+def _inside(low: float | None, high: float | None) -> float:
+    """Return a value no bound excludes.
+
+    :param float | None low: Inclusive lower bound, or ``None``.
+    :param float | None high: Inclusive upper bound, or ``None``.
+    :return float: The midpoint of two bounds, the one bound given, or zero.
+    """
+    if low is not None and high is not None:
+        return (low + high) / 2
+    return next((bound for bound in (low, high) if bound is not None), 0.0)
+
+
+def _assumed_verdict(
+    experiment: Experiment, study: optuna.Study, assumed: optuna.trial.TrialState
+) -> tuple[float | None, dict[str, object]]:
+    """Return the value and attributes a projection records for a verdict it cannot know.
+
+    An assumed measurement satisfies every current bound, so a projection never counts it
+    toward a failure streak.
+
+    :param Experiment experiment: Config whose bounds the measurement satisfies.
+    :param optuna.Study study: The study whose next completion sequence the outcome takes.
+    :param optuna.trial.TrialState assumed: COMPLETE or FAIL.
+    :return tuple[float | None, dict[str, object]]: The value, and the outcome and constraint
+        attributes.
+    """
+    sequence = _recorded_outcome_sequence(study) + 1
+    if assumed != optuna.trial.TrialState.COMPLETE:
+        outcome = _trial_outcome_payload(sequence, "failure", cause="assumed by the projection")
+        return None, {TRIAL_OUTCOME_ATTR: outcome}
+    value = _inside(experiment.metric.min, experiment.metric.max)
+    attrs: dict[str, object] = {
+        constraint_attr(constraint.name): _inside(constraint.min, constraint.max)
+        for constraint in experiment.constraints
+    }
+    attrs[TRIAL_OUTCOME_ATTR] = _trial_outcome_payload(sequence, "success", metric=value)
+    return value, attrs
+
+
+def walk(
+    experiment: Experiment,
+    phase: Phase,
+    mirror: optuna.Study,
+    pool: list[_Candidate],
+    read: Reader,
     *,
-    forecast: bool = False,
-    unread: frozenset[int] = frozenset(),
-) -> SiblingPlan:
-    """Find kept training for pending reruns or the next draws this study would make.
+    through_launches: bool = False,
+    assumed: optuna.trial.TrialState = optuna.trial.TrialState.COMPLETE,
+) -> Iterator[Adopt | Launch]:
+    """Walk a study's next slots, filling each with the oldest kept attempt that trained it.
 
-    Grid cells match by their complete parameters. Stochastic draws additionally match their
-    position, so a repeated configuration never consumes another replicate's slot. Adaptive
-    samplers propose only one draw until its current reading can inform the next proposal.
+    A grid slot is its cell. A seeded random slot is its draw position and the configuration the
+    study draws there. An adaptive new draw takes any kept attempt whose configuration the study
+    holds no row of. A rerun takes a terminal attempt of its own configuration only; an
+    interrupted attempt fills only a new draw, so the ordinary rerun continues its checkpoint and
+    no slot holds two. Each filled slot is applied to ``mirror`` before it is yielded.
 
-    :param Experiment experiment: Current trainer and reading settings.
-    :param Phase phase: Phase whose next draws and remaining target apply.
-    :param optuna.Study study: Initialized target study.
-    :param Sequence[optuna.Study] others: Other reading studies of the phase.
-    :param bool forecast: Include slots after pending retries and possible launches.
-    :param frozenset[int] unread: Fill rows whose verdicts still depend on their measurements.
-    :return SiblingPlan: Available reads and remaining adaptive positions with donors.
+    :param Experiment experiment: Current config.
+    :param Phase phase: The phase whose target and failure policy apply.
+    :param optuna.Study mirror: In-memory copy of the study, advanced as slots fill.
+    :param list[_Candidate] pool: :func:`kept_attempts`, consumed as slots take them.
+    :param Reader read: Gives each taken attempt's content under the current settings.
+    :param bool through_launches: Keep projecting past unfilled slots, assuming each launch ends
+        in ``assumed``, until no kept attempt can fill a later slot; otherwise stop at the first.
+    :param optuna.trial.TrialState assumed: State a projected launch ends in.
+    :return Iterator[Adopt | Launch]: The slots in allocation order.
     """
-    trials = study.get_trials(deepcopy=False)
-    if unread:
-        required = frozenset(
-            trial.number for trial in _rerun_sources(trials, assumed_complete=unread)
-        ) | frozenset(
-            trial.number
-            for trial in trials
-            if trial.state == optuna.trial.TrialState.WAITING and RERUN_OF_ATTR in trial.user_attrs
+    adaptive = phase.sampler.type in _ADAPTIVE_SAMPLERS
+    positioned = phase.sampler.type == "random" and phase_draws(phase)
+    cells = None
+    if phase.sampler.type == "grid" and phase_draws(phase):
+        record = _recorded_identity(mirror)
+        assert record is not None
+        cells = len(
+            grid_cell_order(
+                record["search_spaces"],
+                seed=phase.sampler.seed,
+                repeats=phase.repeats,
+                phase_name=mirror.study_name,
+            )
         )
-        retries = pending_sibling_retries(phase, study, others, required_reruns=required)
-        # An optional covered retry displaces at most one covered new draw, so forecast the
-        # most covered retries that can fit and leave their slots out of the new-draw window.
-        pending = len(required) + sum(retry.source.number not in required for retry in retries)
-    else:
-        retries = pending_sibling_retries(phase, study, others)
-        pending = _pending_rerun_count(study, phase)
-    if (pending and not forecast) or (phase.n_trials <= _finished_trial_count(trials) + pending):
-        return SiblingPlan(retries)
-    draws = _planned_sibling_draws(
-        experiment,
-        phase,
-        study,
-        _sibling_draw_candidates(experiment, phase, study, others),
-        after_gap=forecast,
-        pending_reruns=pending,
-        unread=bool(unread),
-    )
-    return SiblingPlan(retries + draws.reads, draws.possible_later)
+    while pool and (slot := next_slot(mirror, phase)) is not None:
+        trials = mirror.get_trials(deepcopy=False)
+        positions = _draw_positions(trials)
+        asked: optuna.trial.FrozenTrial | None = None
+        if slot.rerun is not None:
+            at = positions[slot.rerun.number]
+            params = slot.rerun.params
+            match = next(
+                (
+                    candidate
+                    for candidate in pool
+                    if candidate.terminal
+                    and _same_value(candidate.owner.trial.params, params)
+                    and (not positioned or candidate.position == at)
+                ),
+                None,
+            )
+        else:
+            at = max(positions.values(), default=-1) + 1
+            if cells is not None and at >= cells:
+                return
+            if adaptive:
+                held = {_semantic_payload_digest(trial.params) for trial in trials}
+                match = next(
+                    (
+                        candidate
+                        for candidate in pool
+                        if _semantic_payload_digest(candidate.owner.trial.params) not in held
+                    ),
+                    None,
+                )
+            else:
+                trial = mirror.ask()
+                _suggest_all(trial, phase)
+                asked = mirror._storage.get_trial(trial._trial_id)
+                match = next(
+                    (
+                        candidate
+                        for candidate in pool
+                        if _same_value(candidate.owner.trial.params, asked.params)
+                        and (not positioned or candidate.position == at)
+                    ),
+                    None,
+                )
+        if match is None:
+            yield Launch(slot, None if asked is None else asked.number)
+            if (
+                not through_launches
+                or (slot.rerun is None and adaptive)
+                or (positioned and all(candidate.position <= at for candidate in pool))
+            ):
+                return
+            if asked is not None:
+                value, attrs = _assumed_verdict(experiment, mirror, assumed)
+                for key, attr in attrs.items():
+                    mirror._storage.set_trial_user_attr(asked._trial_id, key, attr)
+                mirror._storage.set_trial_state_values(
+                    asked._trial_id, assumed, None if value is None else [value]
+                )
+                continue
+            if slot.waiting is not None:
+                _settle_waiting(mirror, slot.waiting.number)
+            mirror.add_trial(_placeholder(experiment, mirror, slot, assumed))
+            continue
+        content = read(match)
+        if slot.waiting is not None:
+            _settle_waiting(mirror, slot.waiting.number)
+        sequence = _recorded_outcome_sequence(mirror) + 1
+        row = _adopted_row(phase, mirror, slot, match, content, asked, sequence)
+        state = _load_phase_policy_state(mirror, experiment)
+        measured = _parsed_trial_outcome(row.user_attrs[TRIAL_OUTCOME_ATTR])
+        assert measured is not None
+        abort = _abort_decision(
+            phase,
+            row.number,
+            _counted_outcome(measured.outcome, measured.metric, row, experiment),
+            completion_sequence=sequence - 1,
+            consecutive_failures=state.consecutive_failures,
+            abort_recorded=state.abort is not None,
+        )
+        if asked is not None:
+            _finish_asked(mirror, asked._trial_id, row)
+        else:
+            mirror.add_trial(row)
+        pool.remove(match)
+        yield Adopt(match, row, slot.waiting, abort)
 
 
-def sibling_launch_batch(
-    experiment: Experiment, phase: Phase, study: optuna.Study, others: Sequence[optuna.Study]
-) -> int:
-    """Bound launches before the next draw a sibling could supply.
+def assumed_reader(experiment: Experiment, assumed: optuna.trial.TrialState) -> Reader:
+    """Read every attempt as a projection must: re-reads end in ``assumed``, the rest as recorded.
 
-    A drained batch lets the ordinary sibling reader run again. Adaptive draws can change
-    after every result; their next possible donor position bounds the batch even when the
-    current proposal does not match. With no candidate, the ordinary optimize budget stands.
+    A re-read assumed to measure keeps the producer's measurement when it has one.
 
-    :param Experiment experiment: Current trainer and reading settings.
-    :param Phase phase: Phase whose next draws and remaining target apply.
-    :param optuna.Study study: Target about to launch trials.
-    :param Sequence[optuna.Study] others: Other reading studies of the phase.
-    :return int: Maximum launches before checking sibling evidence again.
+    :param Experiment experiment: Config whose bounds a stand-in measurement satisfies.
+    :param optuna.trial.TrialState assumed: COMPLETE or FAIL.
+    :return Reader: The reader.
     """
-    trials = study.get_trials(deepcopy=False)
-    remaining = max(0, phase.n_trials - _finished_trial_count(trials))
-    candidates = _sibling_draw_candidates(experiment, phase, study, others)
-    if not candidates:
-        return remaining
-    reruns = _pending_rerun_count(study, phase)
-    if reruns:
-        return min(remaining, reruns)
-    if phase.sampler.type != "grid":
-        position = max(_draw_positions(trials).values(), default=-1) + 1
-        donor_positions = [at for at in _sibling_draw_positions(candidates) if at >= position]
-        return (
-            min(remaining, max(1, min(donor_positions) - position))
-            if donor_positions
-            else remaining
-        )
-    planned = _planned_sibling_draws(experiment, phase, study, candidates, after_gap=True).reads
-    return min(remaining, max(1, planned[0].source.number - len(trials))) if planned else remaining
+
+    def read(candidate: _Candidate) -> optuna.trial.FrozenTrial:
+        trial = copy.deepcopy(candidate.owner.trial)
+        if candidate.rereads and trial.state != assumed:
+            value, attrs = _assumed_verdict(experiment, candidate.owner.study, assumed)
+            trial.state, trial.value = assumed, value
+            trial.user_attrs.update(attrs)
+        return trial
+
+    return read
 
 
-def reread_sibling_trials(
+def _evidence_reader(
     experiment: Experiment,
     phase: Phase,
     study: optuna.Study,
     others: Sequence[optuna.Study],
-    run_deadline: float | None,
+    deadline: float | None,
     reader_generation_id: str,
-    *,
-    recovery_abort: JsonObject | None = None,
-) -> int:
-    """Read a sibling's finished training under this study's settings before launching.
+) -> Reader:
+    """Read each taken attempt from its kept evidence, or copy what has no trainer result to read.
 
-    The physical attempt comes from the producer. The slot, failure streak and outcome
-    sequence belong to this study. Finished attempts are read in newest-first order until
-    one measures the requested result. If none measures, an interrupted slot keeps the
-    newest verdict and a budgeted retry can still launch. An adopted queued retry is settled
-    as unlaunched first so it cannot launch again after the terminal result is appended.
-
-    :param Experiment experiment: Current reading and budget settings.
-    :param Phase phase: Phase whose target and failure policy apply.
-    :param optuna.Study study: Initialized study accepting its sibling's kept work.
-    :param Sequence[optuna.Study] others: The phase's other reading studies.
-    :param float | None run_deadline: Absolute invocation deadline.
-    :param str reader_generation_id: Generation that owns any tracker reader.
-    :param JsonObject | None recovery_abort: Previous abort the run may retire, if any.
-    :raises PhaseTimeoutError: The deadline stopped a read before its row was committed.
-    :raises StudySchemaMismatchError: A resolved finished attempt lacks its training record.
-    :return int: Terminal results appended to this study.
+    :param Experiment experiment: Current config.
+    :param Phase phase: The phase.
+    :param optuna.Study study: The adopting study.
+    :param Sequence[optuna.Study] others: The phase's other studies.
+    :param float | None deadline: Absolute invocation deadline.
+    :param str reader_generation_id: Generation that owns any supervised tracker work.
+    :return Reader: The reader.
     """
-    retries = pending_sibling_trials(experiment, phase, study, others).reads
-    if not retries:
-        return 0
     attempts = producing_attempts(
         (study, *(other for other in others if other.study_name != study.study_name))
     )
     launches = directory_launches(attempts)
     producing: dict[str, Experiment | WinnerIntegrityError] = {}
-    recorded = 0
-    while retries:
-        before = recorded
-        abort = None
-        needs_launch = False
-        for retry in retries:
-            reread = None
-            for donor in retry.producers:
-                _require_reread_time(experiment, phase, run_deadline)
-                candidate = _reread_trial(
-                    experiment,
-                    phase,
-                    donor.trial,
-                    donor.rows,
-                    producing,
-                    attempts,
-                    launches,
-                    deadline=run_deadline,
-                    reader_generation_id=reader_generation_id,
-                )
-                _require_reread_time(experiment, phase, run_deadline)
-                if candidate is None:
-                    if (
-                        retry.new_draw
-                        and donor.trial.state == optuna.trial.TrialState.FAIL
-                        and _trainer_seconds(donor.trial) is None
-                    ):
-                        # A definite trainer failure spends the draw, as it would in a fill.
-                        if reread is None:
-                            reread = copy.deepcopy(donor.trial)
-                        continue
-                    raise StudySchemaMismatchError(
-                        f"Finished sibling trial {donor.trial.number} in {donor.study.study_name!r} "
-                        "cannot be re-read from its recorded training."
-                    )
-                if candidate.state == optuna.trial.TrialState.COMPLETE:
-                    reread = candidate
-                    break
-                # A failed gate judged the measured outputs. A donor missing a requested
-                # measurement cannot spend a new draw that the target is entitled to launch.
-                decisive_failure = (
-                    candidate.user_attrs.get(GATES_ATTR) is not None
-                    if retry.new_draw
-                    else not retry.requires_measurement
-                )
-                if reread is None and decisive_failure:
-                    reread = candidate
-            if reread is None:
-                if retry.new_draw:
-                    # The next draw must occupy this position before any later donor can.
-                    needs_launch = True
-                    break
-                continue
-            if recovery_abort is not None and recorded == 0:
-                sequence = recovery_abort["completion_sequence"]
-                assert type(sequence) is int
-                _record_recovery_boundary(study, phase, sequence)
-            if retry.source.state == optuna.trial.TrialState.WAITING:
-                study._storage.set_trial_state_values(
-                    retry.source._trial_id, optuna.trial.TrialState.RUNNING
-                )
-                _record_stale_trial_outcome(
-                    study, retry.source, cause="a sibling reading study finished this rerun"
-                )
-                study.tell(retry.source.number, state=optuna.trial.TrialState.FAIL)
-            state = _load_phase_policy_state(study, experiment)
-            sequence = _recorded_outcome_sequence(study)
-            measured = _parsed_trial_outcome(reread.user_attrs.get(TRIAL_OUTCOME_ATTR))
-            assert measured is not None
-            abort = _abort_decision(
-                phase,
-                len(study.get_trials(deepcopy=False)),
-                _counted_outcome(measured.outcome, measured.metric, reread, experiment),
-                completion_sequence=sequence,
-                consecutive_failures=state.consecutive_failures,
-                abort_recorded=state.abort is not None,
-            )
-            if retry.new_draw:
-                reread.user_attrs.pop(RERUN_OF_ATTR, None)
-            else:
-                reread.user_attrs[RERUN_OF_ATTR] = retry.source.number
-            reread.user_attrs[TRIAL_OUTCOME_ATTR] = _trial_outcome_payload(
-                sequence + 1,
-                measured.outcome,
-                metric=measured.metric,
-                cause=measured.cause,
-                abort=abort,
-            )
-            reread.distributions = retry.source.distributions
-            reread.system_attrs = retry.source.system_attrs
-            reread.intermediate_values = dict(retry.source.intermediate_values)
-            _require_reread_time(experiment, phase, run_deadline)
-            study.add_trial(reread)
-            recorded += 1
-            if abort is not None:
-                break
-        if needs_launch or abort is not None or recorded == before:
-            break
-        retries = pending_sibling_trials(experiment, phase, study, others).reads
-    if recorded:
-        report.info(
-            "%s re-read %s already finished in sibling studies without launching a trainer.",
+
+    def read(candidate: _Candidate) -> optuna.trial.FrozenTrial:
+        trial = candidate.owner.trial
+        if not candidate.terminal:
+            return copy.deepcopy(trial)
+        if not candidate.rereads:
+            return copy.deepcopy(trial)
+        _require_reread_time(experiment, phase, deadline)
+        log.info(
+            "Phase %s re-reading trial %d of study %s.",
             phase.name,
-            plural(recorded, "trial"),
+            trial.number,
+            candidate.owner.study.study_name,
         )
-    return recorded
+        row = _reread_trial(
+            experiment,
+            phase,
+            trial,
+            candidate.owner.rows,
+            producing,
+            attempts,
+            launches,
+            deadline=deadline,
+            reader_generation_id=reader_generation_id,
+        )
+        _require_reread_time(experiment, phase, deadline)
+        # A trainer that failed or timed out holds no result for any reading.
+        return copy.deepcopy(trial) if row is None else row
+
+    return read
+
+
+@dataclass
+class Adoption:
+    """What adoption appended to a study: rows by kind, and outcomes a re-read changed."""
+
+    rereads: int = 0
+    changed: int = 0
+    failures: int = 0
+    interrupted: int = 0
+    #: The distinct reading settings the adopted attempts' studies recorded.
+    readings: list[object] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        """Return the number of rows appended."""
+        return self.rereads + self.failures + self.interrupted
+
+    def count(self, step: Adopt) -> None:
+        """Count one adopted row.
+
+        :param Adopt step: The row and the attempt it came from.
+        """
+        identity = _recorded_identity(step.candidate.owner.study)
+        reading = None if identity is None else identity["payload"].get(READING_KEY)
+        if reading not in self.readings:
+            self.readings.append(reading)
+        if step.candidate.rereads:
+            self.rereads += 1
+            producer = step.candidate.owner.trial
+            self.changed += (step.row.state, step.row.value) != (producer.state, producer.value)
+        elif step.candidate.terminal:
+            self.failures += 1
+        else:
+            self.interrupted += 1
+
+    def note(self, reading: JsonObject) -> str:
+        """Say what adoption did, for the run's line about the phase.
+
+        :param JsonObject reading: The phase's current reading settings.
+        :return str: The sentence.
+        """
+        return (
+            f"{self.changed_reading(reading)}{self.describe(planned=False)}; nothing was retrained."
+        )
+
+    def changed_reading(self, reading: JsonObject) -> str:
+        """Name the reading settings that changed, when every attempt comes from one reading.
+
+        :param JsonObject reading: The phase's current reading settings.
+        :return str: ``reading settings changed (<keys>): ``, or empty for several readings.
+        """
+        if len(self.readings) != 1 or not isinstance(self.readings[0], dict):
+            return ""
+        changes = format_changed_keys(_changed_payload_keys(self.readings[0], reading))
+        return f"reading settings changed ({changes}): " if changes else ""
+
+    def describe(self, *, planned: bool) -> str:
+        """Name the adopted rows by kind, which a dry run and a run both report.
+
+        :param bool planned: Whether the rows are a dry run's plan, which cannot say how many
+            re-reads change their outcome, rather than rows a run wrote.
+        :return str: The rows, joined into one clause.
+        """
+        parts = []
+        if self.rereads:
+            parts.append(
+                f"re-read {plural(self.rereads, 'kept trial')} from other reading studies"
+                + ("" if planned else f" ({self.changed} changed outcome)")
+            )
+        if self.failures:
+            keep = "keep" if planned else "kept"
+            parts.append(f"{keep} {plural(self.failures, 'trainer failure')} as recorded")
+        if self.interrupted:
+            take = "take" if planned else "took"
+            parts.append(
+                f"{take} {plural(self.interrupted, 'interrupted trial')} to continue from "
+                "its checkpoint"
+            )
+        return ", ".join(parts)
+
+
+def _write_adopted(
+    experiment: Experiment,
+    phase: Phase,
+    study: optuna.Study,
+    step: Adopt,
+    *,
+    launch_follows: bool,
+    deadline: float | None,
+) -> None:
+    """Append one adopted row to the live study, after settling the queued rerun it fills.
+
+    The failure policy exists to stop launches, and taking a kept attempt launches nothing, so a
+    row records the abort its streak trips only when the next slot needs a launch.
+
+    :param Experiment experiment: Current config.
+    :param Phase phase: The phase.
+    :param optuna.Study study: The live study.
+    :param Adopt step: The row.
+    :param bool launch_follows: Whether the slot after this row needs a launch.
+    :param float | None deadline: Absolute invocation deadline.
+    :raises PhaseTimeoutError: The deadline passed before the row was written.
+    """
+    _require_reread_time(experiment, phase, deadline)
+    if step.waiting is not None:
+        _settle_waiting(study, step.waiting.number)
+    study.add_trial(_with_abort(step) if launch_follows else step.row)
+
+
+def _with_abort(step: Adopt) -> optuna.trial.FrozenTrial:
+    """Return an adopted row carrying the abort its streak trips, for a launch to stop at.
+
+    :param Adopt step: The row and the abort its outcome trips, if any.
+    :return optuna.trial.FrozenTrial: The row, with the abort in its outcome when there is one.
+    """
+    if step.abort is None:
+        return step.row
+    row = copy.copy(step.row)
+    outcome = _parsed_trial_outcome(row.user_attrs[TRIAL_OUTCOME_ATTR])
+    assert outcome is not None
+    row.user_attrs = {
+        **row.user_attrs,
+        TRIAL_OUTCOME_ATTR: _trial_outcome_payload(
+            outcome.sequence,
+            outcome.outcome,
+            metric=outcome.metric,
+            cause=outcome.cause,
+            policy=outcome.policy,
+            abort=step.abort,
+        ),
+    }
+    return row
+
+
+def carry_partial_decision(
+    experiment: Experiment, phase: Phase, study: optuna.Study, others: Sequence[optuna.Study]
+) -> bool:
+    """Accept a compatible study's partial-timeout boundary when this study holds its attempts.
+
+    An operator who accepted a phase cut short at its deadline accepted those attempts, whatever
+    reading scored them, so a reading change launches nothing a rerun would not. The newest
+    compatible study with an accepted partial decision for the target the config still requests,
+    whose counted attempts this study all holds, gives this study the same boundary over its own
+    rows and measurements.
+
+    :param Experiment experiment: Current config.
+    :param Phase phase: The phase.
+    :param optuna.Study study: The study after adoption, live or an in-memory copy.
+    :param Sequence[optuna.Study] others: The phase's other studies.
+    :raises StudySchemaMismatchError: A compatible study's decision is malformed.
+    :return bool: Whether the study now records the boundary.
+    """
+    trials = study.get_trials(deepcopy=False)
+    finished = _finished_trial_count(trials)
+    if study.user_attrs.get(PHASE_DECISION_ATTR) is not None or finished >= phase.n_trials:
+        return False
+    state = _load_phase_policy_state(study, experiment)
+    if state.abort is not None:
+        return False
+    present = {trial.user_attrs.get(ATTEMPT_ID_ATTR) for trial in trials}
+    for other in reversed(_compatible_studies(experiment, phase, study, others)):
+        decision = _parse_accepted_partial_decision(
+            other.user_attrs.get(PHASE_DECISION_ATTR), other.study_name
+        )
+        if decision is None or decision.trial_target != phase.n_trials:
+            continue
+        counted = {
+            trial.user_attrs.get(ATTEMPT_ID_ATTR)
+            for trial in other.get_trials(deepcopy=False)
+            if isinstance(trial.user_attrs.get(ATTEMPT_ID_ATTR), str)
+            and _trial_run_state(trial) in FINISHED_TRIAL_STATES
+            and (outcome := _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR)))
+            is not None
+            and outcome.sequence <= decision.outcome_sequence
+        }
+        if not counted <= present:
+            continue
+        _record_accepted_partial_decision(
+            study,
+            phase.n_trials,
+            outcome_sequence=state.max_sequence,
+            finished_trials=finished,
+            measured_trials=_measured_trial_count(trials),
+            timeout_scope=decision.timeout_scope,
+            recovered_abort_sequence=None,
+        )
+        return True
+    return False
+
+
+def adopt_kept_attempts(
+    experiment: Experiment,
+    phase: Phase,
+    study: optuna.Study,
+    others: Sequence[optuna.Study],
+    deadline: float | None,
+    reader_generation_id: str,
+    *,
+    before_launch: bool,
+) -> Adoption:
+    """Append the kept attempts that fill the study's next slots, re-reading finished ones.
+
+    Rows are written one at a time, each once the slot after it is known, so a stop at any
+    point keeps every row written. Before the first launch, an accepted partial-timeout boundary
+    of a compatible study carries over (:func:`carry_partial_decision`).
+
+    :param Experiment experiment: Current reading and budget settings.
+    :param Phase phase: Phase whose target and failure policy apply.
+    :param optuna.Study study: The live study, with a recorded identity.
+    :param Sequence[optuna.Study] others: The phase's other studies.
+    :param float | None deadline: Absolute invocation deadline.
+    :param str reader_generation_id: Generation that owns any tracker reader.
+    :param bool before_launch: Whether the run has accepted no target yet.
+    :raises PhaseTimeoutError: The deadline stopped a read before its row was committed.
+    :raises StudySchemaMismatchError: A kept success lacks its training record.
+    :raises TrackingTargetUnavailableError: A tracker gave no answer for a finished attempt.
+    :return Adoption: What was appended.
+    """
+    adoption = Adoption()
+    if _recorded_identity(study) is None:
+        return adoption
+    pool = kept_attempts(experiment, phase, study, others)
+    state = _load_phase_policy_state(study, experiment)
+    abort = state.abort or _replayed_streak_abort(phase, study, state)
+    if pool and abort is not None:
+        # Rows past an abort are new work: only a config that retires the abort adds them, and
+        # the recovery boundary comes first, as before a launch.
+        probe = mirror_study(experiment, phase, study, study_name=study.study_name)
+        first = next(
+            walk(experiment, phase, probe, list(pool), assumed_reader(experiment, _COMPLETE)), None
+        )
+        if not _config_retires_abort(phase, study, abort) or not isinstance(first, Adopt):
+            pool = []
+        else:
+            sequence = abort["completion_sequence"]
+            assert type(sequence) is int
+            _record_recovery_boundary(study, phase, sequence)
+    if pool:
+        mirror = mirror_study(experiment, phase, study, study_name=study.study_name)
+        read = _evidence_reader(experiment, phase, study, others, deadline, reader_generation_id)
+        held: list[Adopt] = []
+
+        def flush(launch_follows: bool) -> None:
+            if held:
+                row = held.pop()
+                _write_adopted(
+                    experiment, phase, study, row, launch_follows=launch_follows, deadline=deadline
+                )
+                adoption.count(row)
+
+        def read_after_flush(candidate: _Candidate) -> optuna.trial.FrozenTrial:
+            # The walk reads only for a slot a kept attempt fills, so the held row is followed by
+            # no launch, and writing it first keeps it across a stop during this read.
+            flush(False)
+            return read(candidate)
+
+        for step in walk(experiment, phase, mirror, pool, read_after_flush):
+            if isinstance(step, Launch):
+                flush(True)
+            else:
+                held.append(step)
+        # The kept attempts ran out, so any slot left launches.
+        flush(next_slot(mirror, phase) is not None)
+    if adoption.total:
+        report.info("%s  %s", phase.name, adoption.note(reading_settings(experiment, phase)))
+    if before_launch:
+        carry_partial_decision(experiment, phase, study, others)
+    return adoption
+
+
+def launch_batch(
+    experiment: Experiment, phase: Phase, study: optuna.Study, others: Sequence[optuna.Study]
+) -> int:
+    """Bound launches before the next slot a kept attempt could fill.
+
+    Slots fill in allocation order, so launches stop at that slot and adoption runs again; with
+    no such slot the whole remaining target launches.
+
+    :param Experiment experiment: Current config.
+    :param Phase phase: Phase whose target applies.
+    :param optuna.Study study: The study about to launch trials.
+    :param Sequence[optuna.Study] others: The phase's other studies.
+    :return int: Maximum launches before checking kept attempts again.
+    """
+    remaining = max(0, phase.n_trials - _finished_trial_count(study.get_trials(deepcopy=False)))
+    pool = kept_attempts(experiment, phase, study, others)
+    if not pool:
+        return remaining
+    mirror = mirror_study(experiment, phase, study, study_name=study.study_name)
+    launches = 0
+    for step in walk(
+        experiment,
+        phase,
+        mirror,
+        pool,
+        assumed_reader(experiment, optuna.trial.TrialState.COMPLETE),
+        through_launches=True,
+    ):
+        if isinstance(step, Launch):
+            launches += 1
+        else:
+            return max(1, launches)
+    return remaining
+
+
+@dataclass(frozen=True)
+class AdoptionPlan:
+    """What adoption would do to a study, projected without reading evidence or writing."""
+
+    #: The study an empty study takes its identity from, or ``None`` for one that has one.
+    source: optuna.Study | None
+    #: Rows adopted before the first launch, by kind.
+    adoption: Adoption
+    #: The study at its first launch when every re-read measures, and when every one fails.
+    complete: optuna.Study
+    failed: optuna.Study
+    #: Fewest and most launches to reach the target, over those two assumptions.
+    launches: tuple[int, int]
+    #: Whether a compatible study's accepted partial boundary carries over.
+    partial: bool
+
+
+def _left_for_launch(
+    experiment: Experiment,
+    phase: Phase,
+    mirror: optuna.Study,
+    last: Adopt | None,
+    study_name: str,
+    upto: int | None,
+) -> optuna.Study:
+    """Copy a walked mirror as a run leaves the study before its first launch.
+
+    The run's last adopted row carries the abort its streak trips (:func:`_write_adopted`), so
+    the projection judges the same refusal.
+
+    :param Experiment experiment: Current config.
+    :param Phase phase: The phase.
+    :param optuna.Study mirror: The walked in-memory study.
+    :param Adopt | None last: The last row adopted before the launch, if any.
+    :param str study_name: The study's address.
+    :param int | None upto: Number of the trial the launch was asked on, or ``None`` for all.
+    :return optuna.Study: The projected study.
+    """
+    if last is None or last.abort is None:
+        return mirror_study(experiment, phase, mirror, study_name=study_name, upto=upto)
+    left = mirror_study(experiment, phase, mirror, study_name=study_name, upto=last.row.number)
+    left.add_trial(_with_abort(last))
+    return left
+
+
+def plan_adoption(
+    experiment: Experiment,
+    phase: Phase,
+    inherited: Mapping[str, object],
+    study: optuna.Study | None,
+    others: Sequence[optuna.Study],
+    *,
+    study_name: str,
+) -> AdoptionPlan | None:
+    """Project adoption for a read that writes nothing: dry run, preflight, ``validate``, status.
+
+    The walk is the one a run takes; only the verdicts of re-reads are unknown, so it runs once
+    assuming each measures and once assuming each fails. A launch is assumed to end the same
+    way, and the failure policy is applied to adopted rows only, so the most launches is an
+    upper bound.
+
+    :param Experiment experiment: Current config.
+    :param Phase phase: The phase.
+    :param Mapping[str, object] inherited: The parent layer the phase inherits now.
+    :param optuna.Study | None study: The addressed study as captured, or ``None`` if absent.
+    :param Sequence[optuna.Study] others: The phase's studies.
+    :param str study_name: The addressed study's name.
+    :raises StudyFingerprintMismatchError: See :func:`adoption_identity`.
+    :return AdoptionPlan | None: The projection, or ``None`` when no compatible study exists.
+    """
+    others = [other for other in others if other.study_name != study_name]
+    if not others:
+        return None
+    source = None
+    record = None if study is None else _recorded_identity(study)
+    if record is None:
+        if study is not None and study.get_trials(deepcopy=False):
+            return None
+        chosen = adoption_identity(experiment, phase, inherited, others)
+        if chosen is None:
+            return None
+        record, source = chosen
+    projections = []
+    for assumed in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.FAIL):
+        mirror = mirror_study(experiment, phase, study, study_name=study_name, record=record)
+        if not _compatible_studies(experiment, phase, mirror, others):
+            return None
+        pool = kept_attempts(experiment, phase, mirror, others)
+        adoption = Adoption()
+        first: optuna.Study | None = None
+        last: Adopt | None = None
+        abort: JsonObject | None = None
+        # Every slot is adopted or launched, so the launches are the finished trials the target
+        # still needs after the adopted ones, unless a stop comes first.
+        launches = 0
+        unfilled = phase.n_trials - _finished_trial_count(mirror.get_trials(deepcopy=False))
+        stopped = partial = False
+        for step in walk(
+            experiment,
+            phase,
+            mirror,
+            pool,
+            assumed_reader(experiment, assumed),
+            through_launches=True,
+            assumed=assumed,
+        ):
+            if isinstance(step, Adopt):
+                if first is None:
+                    adoption.count(step)
+                    last = step
+                abort = step.abort
+                unfilled -= _trial_run_state(step.row) in FINISHED_TRIAL_STATES
+                continue
+            if first is None:
+                first = _left_for_launch(experiment, phase, mirror, last, study_name, step.asked)
+                partial = carry_partial_decision(experiment, phase, first, others)
+            if partial or abort is not None:
+                stopped = True
+                break
+            launches += 1
+        if first is None:
+            launch_follows = next_slot(mirror, phase) is not None
+            first = (
+                _left_for_launch(experiment, phase, mirror, last, study_name, None)
+                if launch_follows
+                else mirror_study(experiment, phase, mirror, study_name=study_name)
+            )
+            partial = carry_partial_decision(experiment, phase, first, others)
+            stopped = partial or (abort is not None and launch_follows)
+        if not stopped:
+            launches = max(0, unfilled)
+        projections.append((first, adoption, launches, partial))
+    (complete, adoption, low, partial), (failed, _, high, _) = projections
+    return AdoptionPlan(
+        source=source,
+        adoption=adoption,
+        complete=complete,
+        failed=failed,
+        launches=(min(low, high), max(low, high)),
+        partial=partial,
+    )
 
 
 class PendingRereadNotice(PhaseSweepError):
     """A phase not started under the current reading settings, which a run re-reads, not retrains.
 
     ``status`` and ``status --trials`` print it where they report a phase's refusal, with the
-    changed values and the command that fills the study. The status payload, which MCP serves,
+    changed values and the command that runs the phase. The status payload, which MCP serves,
     carries :attr:`statement` instead: the same sentence naming only the changed settings,
     since their values are config-authored text such as file names and patterns.
     """
@@ -1294,19 +1456,24 @@ class PendingRereadNotice(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.RETRY
     #: The value-free sentence the status payload carries (:func:`_pending_notice`).
     statement: str = ""
-    #: Finished trials the fill re-reads (:attr:`FillSource.rereads`).
+    #: Finished trials the next run re-reads (:attr:`AdoptionPlan.rereads`).
     finished_trials: int = 0
 
 
 def _pending_notice(
-    source: FillSource, phase: str, unsettled: Sequence[str] = ()
+    rereads: int,
+    changes: Sequence[tuple[str, object, object]],
+    phase: str,
+    unsettled: Sequence[str] = (),
 ) -> PendingRereadNotice:
-    """Build both texts of a :class:`PendingRereadNotice` from one description of the fill.
+    """Build both texts of a :class:`PendingRereadNotice` from one description of the re-read.
 
     A parent that is itself re-read first may select another winner, and then this phase
     inherits other values and runs in another study, so the re-read here is conditional.
 
-    :param FillSource source: The study the fill would read from.
+    :param int rereads: Finished trials the next run re-reads.
+    :param Sequence[tuple[str, object, object]] changes: Each changed reading setting, with its
+        recorded and current value.
     :param str phase: The phase's name.
     :param Sequence[str] unsettled: Parents whose winner the next run selects again first,
         defaults to none.
@@ -1314,8 +1481,8 @@ def _pending_notice(
         :attr:`PendingRereadNotice.statement` for the status payload.
     """
     opening = f"Phase {phase!r} has not started under the current reading settings"
-    trials = plural(source.rereads, "finished trial")
-    settings = ", ".join(path for path, _old, _new in source.changes) or "reading settings"
+    trials = plural(rereads, "finished trial")
+    settings = ", ".join(path for path, _old, _new in changes) or "reading settings"
     if unsettled:
         names = " and ".join(repr(name) for name in unsettled)
         keeps = "keeps its winner" if len(unsettled) == 1 else "keep their winners"
@@ -1337,10 +1504,11 @@ def _pending_notice(
             "and retrains nothing."
         )
     notice = PendingRereadNotice(
-        f"{opening} ({source.change_description}).", remediation=remediation
+        f"{opening} ({format_changed_keys(changes) or 'reading settings'}).",
+        remediation=remediation,
     )
     notice.statement = statement
-    notice.finished_trials = source.rereads
+    notice.finished_trials = rereads
     return notice
 
 
@@ -1352,10 +1520,11 @@ def pending_reread(
     *,
     unsettled: Sequence[str] = (),
 ) -> PendingRereadNotice | None:
-    """Say that a phase's addressed study waits for its fill, for a read that writes nothing.
+    """Say that a phase's addressed study holds no rows yet and would re-read kept attempts.
 
     The inherited values the address stands for are the ones a study of the phase recorded
-    whose values, read under the current settings, give that address.
+    whose values, read under the current settings, give that address. A study that already holds
+    rows reports them instead.
 
     :param Experiment experiment: Current config.
     :param Phase phase: The phase.
@@ -1364,47 +1533,28 @@ def pending_reread(
     :param Sequence[str] unsettled: Parents whose winner the next run selects again before this
         phase, so the address holds only if they keep it; defaults to none.
     :raises StudyFingerprintMismatchError: A study with these inherited values has another
-        training identity (:func:`fill_source`).
-    :return PendingRereadNotice | None: The notice, or ``None`` when the addressed study is
-        filled or no study holds trials to re-read.
+        training identity (:func:`adoption_identity`).
+    :return PendingRereadNotice | None: The notice, or ``None`` when the addressed study holds
+        rows or no study holds trials to re-read.
     """
     addressed = next((study for study in studies if study.study_name == study_name), None)
-    if addressed is not None and _recorded_identity(addressed) is not None:
+    if addressed is not None and addressed.get_trials(deepcopy=False):
         return None
-    others = [study for study in studies if study.study_name != study_name]
-    pinned = _fill_source_name(addressed)
-    for study in _fill_candidates(pinned, others):
+    for study in reversed(studies):
         record = _recorded_identity(study)
-        if record is None:
+        if study is addressed or record is None:
             continue
         inherited = _recorded_inheritance(record)
-        if phase_study_name(experiment, phase, inherited) == study_name:
-            source = fill_source(experiment, phase, inherited, others, target=addressed)
-            return None if source is None else _pending_notice(source, phase.name, unsettled)
-    if pinned is not None:
-        raise StudySchemaMismatchError(
-            f"Saved fill source {pinned!r} does not address study {study_name!r}."
+        if phase_study_name(experiment, phase, inherited) != study_name:
+            continue
+        plan = plan_adoption(
+            experiment, phase, inherited, addressed, studies, study_name=study_name
         )
+        if plan is None or not plan.adoption.total:
+            return None
+        recorded = record["payload"].get(READING_KEY)
+        changes = _changed_payload_keys(
+            recorded if isinstance(recorded, dict) else {}, reading_settings(experiment, phase)
+        )
+        return _pending_notice(plan.adoption.rereads, tuple(changes), phase.name, unsettled)
     return None
-
-
-def fill_note(source: FillSource, result: FillResult) -> str:
-    """Say what a fill did, for the run's line about the phase.
-
-    :param FillSource source: The study the fill read from.
-    :param FillResult result: What it wrote.
-    :return str: The sentence.
-    """
-    unread = result.copied - result.rereads
-    copied = f", {plural(unread, 'unfinished trial')} copied as recorded" if unread else ""
-    adjustment = ""
-    if result.adjusted_target is not None:
-        previous, accepted = result.adjusted_target
-        adjustment = (
-            f" The re-read results reduce the accepted trial target from {previous} to {accepted}."
-        )
-    return (
-        f"reading settings changed ({source.change_description}): re-read "
-        f"{plural(result.rereads, 'finished trial')} from kept evidence, {result.changed} "
-        f"changed outcome{copied}; nothing was retrained.{adjustment}"
-    )

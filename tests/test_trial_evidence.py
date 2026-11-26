@@ -592,7 +592,10 @@ def test_reread_checks_losing_candidates_before_publication(tmp_path: Path) -> N
     )
 
     with (
-        patch("phasesweep.engine.reread._stamp_identity", side_effect=RuntimeError("after rows")),
+        patch(
+            "phasesweep.engine.reread.carry_partial_decision",
+            side_effect=RuntimeError("after rows"),
+        ),
         pytest.raises(RuntimeError, match="after rows"),
     ):
         run_experiment(reread)

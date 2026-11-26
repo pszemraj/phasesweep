@@ -210,10 +210,9 @@ ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
 # space the study has run under with the draw position each took effect at. One attr, so a
 # crash cannot leave a fingerprint beside a payload or history it does not describe.
 PHASE_IDENTITY_ATTR = "phasesweep_phase_identity"
-REREAD_FILL_ATTR = "phasesweep_reread_fill"
 PHASE_IDENTITY_SCHEMA_VERSION = 4
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 24
+STUDY_SCHEMA_VERSION = 25
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The
@@ -230,7 +229,9 @@ TRIAL_OUTCOME_ABORT_KEY = "abort"
 # The outcome's ``cause`` says which.
 _TRIAL_OUTCOMES = frozenset({"success", "failure", "interrupted", "fatal"})
 # On an interrupted rerun or failed grid-cell retry: the source's trial number,
-# written in the new attempt's creation record. It takes its source's draw position.
+# written in the new attempt's creation record. It takes its source's draw position. On a row
+# adopted from another study of the phase it names the row of this study the adopted attempt
+# reruns, never a row of the study that launched it.
 RERUN_OF_ATTR = "phasesweep_rerun_of"
 # Durable boundary established when the operator explicitly raises n_trials
 # after an abort. Outcomes through this sequence belong to the aborted attempt;
@@ -339,7 +340,7 @@ def _recorded_identity(study: Study) -> PhaseIdentityRecord | None:
 
 
 def _parsed_phase_identity(value: object, study_name: str) -> PhaseIdentityRecord | None:
-    """Parse a study's identity, including the source identity saved by an incomplete fill.
+    """Parse a study's recorded identity.
 
     :param object value: Stored identity record, or None.
     :param str study_name: Study named in a schema refusal.

@@ -135,9 +135,13 @@ def test_an_aborted_phase_with_an_unreadable_objective_gives_steps_that_work(
     run_experiment(corrected)
     assert states_of(corrected) == ["COMPLETE"] * 4
 
+    # The other branch, in an experiment whose only study is the aborted one.
+    unfixed = experiment("u", "lossz", 4)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(unfixed)
     _write_result_trainer(tmp_path, keys=["loss", "lossz"])
-    run_experiment(experiment("t", "lossz", 6))
-    states = states_of(wrong)
+    run_experiment(experiment("u", "lossz", 6))
+    states = states_of(unfixed)
     assert states.count("FAIL") == 2
     assert states.count("COMPLETE") == 4
 

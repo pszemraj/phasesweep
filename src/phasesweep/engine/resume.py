@@ -243,7 +243,7 @@ def _preflight_reached_fingerprint(
         used to resolve the reached phase's inherited values and so its study.
     :param Mapping[str, Sequence[optuna.Study]] existing_studies: Every existing study of each
         phase, keyed by phase name; a no-op if the reached phase addresses none yet, or one that
-        records no identity, which the phase's run fills from kept evidence or binds
+        records no identity, which the phase's run stamps before it adopts kept attempts
         (:mod:`phasesweep.engine.reread`).
     :raises StudyFingerprintMismatchError: The reached study's stored
         fingerprint does not match the current config.

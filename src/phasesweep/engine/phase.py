@@ -8,7 +8,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
 from uuid import uuid4
@@ -65,11 +65,10 @@ from phasesweep.engine.progress import (
 )
 from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.reread import (
-    fill_note,
-    fill_source,
-    fill_study,
-    reread_sibling_trials,
-    sibling_launch_batch,
+    Adoption,
+    adopt_kept_attempts,
+    launch_batch,
+    stamp_adoption_identity,
 )
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
@@ -87,7 +86,6 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     OVERRIDES_ATTR,
     PHASE_DECISION_ATTR,
-    PHASE_DECISION_SCHEMA_VERSION,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
     TRAINER_ENV_ATTR,
@@ -99,7 +97,6 @@ from phasesweep.engine.state import (
     WinnerSource,
     _completed_trainer_duration,
     _parsed_trial_outcome,
-    _recorded_identity,
     _trial_attempt_dir,
     _trial_lifecycle,
     _trial_outcome_payload,
@@ -115,6 +112,7 @@ from phasesweep.engine.study_policy import (
     _next_consecutive_failures,
     _pending_rerun_count,
     _PhasePolicyState,
+    _record_accepted_partial_decision,
     _record_allocation_context,
     _record_recovery_boundary,
     _record_reruns,
@@ -122,7 +120,6 @@ from phasesweep.engine.study_policy import (
     _recovery_action,
     _recovery_advice,
     _replayed_streak_abort,
-    _streak_at_reduced_target,
     _streak_trials_all_infeasible,
     _validate_study_direction,
     _validate_trial_target,
@@ -404,11 +401,12 @@ def _resume_phase(
     phase: Phase,
     inherited_winners: dict[str, Winner],
     study: optuna.Study,
+    adopt: Callable[[], object],
 ) -> _PhaseResume | Winner:
     """Validate a live phase's durable state and replay what it already decided.
 
-    Reaps stale trials, replays the failure policy from the durable outcomes,
-    and verifies the phase fingerprint and trial target. An accepted
+    Reaps stale trials, verifies the phase fingerprint, lets ``adopt`` append kept attempts,
+    then judges the failure policy and trial target over the result. An accepted
     partial-timeout decision at the current target replays as the phase's
     winner while the current config still accepts incomplete results. An abort
     recorded in the outcome ledger, or a replayed streak that meets the current
@@ -421,6 +419,7 @@ def _resume_phase(
     :param dict[str, Winner] inherited_winners: Winners loaded for phases
         earlier in the chain.
     :param optuna.Study study: The phase's live study.
+    :param Callable[[], object] adopt: Appends kept attempts once the study is verified.
     :raises StudySchemaMismatchError: The study's schema is unsupported; what
         the recorded state contradicts is listed with
         :func:`_judge_recorded_phase`, whose other refusals also propagate.
@@ -433,14 +432,15 @@ def _resume_phase(
     """
     _initialize_study_schema(study)
     _reap_stale_trials(study, experiment, phase.name, confirm=True)
-    policy_state = _load_phase_policy_state(study, experiment)
+    _load_phase_policy_state(study, experiment)
     phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
+    adopt()
     return _judge_recorded_phase(
         experiment,
         phase,
         inherited_winners,
         study,
-        policy_state=policy_state,
+        policy_state=_load_phase_policy_state(study, experiment),
         phase_fingerprint=phase_fingerprint,
         verify_evidence=True,
     )
@@ -1515,18 +1515,15 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
             recorded_abort["completion_sequence"] if recorded_abort is not None else None
         )
         # Persist the frozen timeout boundary before selection; retries replay it without launch.
-        study.set_user_attr(
-            PHASE_DECISION_ATTR,
-            {
-                "schema_version": PHASE_DECISION_SCHEMA_VERSION,
-                "decision": "accepted_partial_timeout",
-                "trial_target": phase.n_trials,
-                "outcome_sequence": current_policy_state.max_sequence,
-                "finished_trials": finished_after,
-                "measured_trials": measured_after,
-                "timeout_scope": run.timeout_source,
-                "recovered_abort_sequence": recovered_abort_sequence,
-            },
+        assert run.timeout_source is not None  # Only a deadline accepts a partial result.
+        _record_accepted_partial_decision(
+            study,
+            phase.n_trials,
+            outcome_sequence=current_policy_state.max_sequence,
+            finished_trials=finished_after,
+            measured_trials=measured_after,
+            timeout_scope=run.timeout_source,
+            recovered_abort_sequence=recovered_abort_sequence,
         )
     if recorded_abort is not None and timed_out_incomplete:
         # Consume the abort before timeout handling so a larger timeout can resume refused work.
@@ -1578,8 +1575,8 @@ def _run_phase(
 ) -> Winner:
     """Execute one phase end-to-end (sampler, study.optimize, winner selection).
 
-    Fill the study addressed by the parents' winners and reading settings, or resume it
-    from its kept evidence and any matching runs a sibling already finished. Validate
+    Open the study addressed by the parents' winners and reading settings, and let it take the
+    kept attempts other studies of the phase trained for its slots (:mod:`.reread`). Validate
     the target and failure policy before adopting results. Claim the generation for new
     launches only after their checks pass.
 
@@ -1629,34 +1626,31 @@ def _run_phase(
     ]
     study = open_phase_study(ledger, phase, study_name)
     _validate_study_direction(study, experiment.metric.goal)
-    # Preflight checks root studies before their rows can change and before child
-    # addresses are known.
-    recheck_evidence = bool(phase.inherits)
-    if _recorded_identity(study) is None:
-        source = fill_source(experiment, phase, inherited, others, target=study)
-        if source is not None:
-            filled = fill_study(
-                experiment, phase, study, source, others, run_deadline, generation.generation_id
-            )
-            recheck_evidence = True
-            report.info("%s  %s", phase.name, fill_note(source, filled))
-    if not study.get_trials(deepcopy=False):
-        note = new_study_note(phase, inherited, others)
-        if note is not None:
-            report.info("%s  %s", phase.name, note)
-    resumed = _resume_phase(experiment, phase, inherited_winners, study)
-    if not isinstance(resumed, Winner) and reread_sibling_trials(
+    stamp_adoption_identity(experiment, phase, inherited, study, others)
+    adopt = functools.partial(
+        adopt_kept_attempts,
         experiment,
         phase,
         study,
         others,
         run_deadline,
         generation.generation_id,
-        recovery_abort=resumed.recovery_abort,
-    ):
-        recheck_evidence = True
-        resumed = _resume_phase(experiment, phase, inherited_winners, study)
-    if recheck_evidence:
+    )
+    adopted: list[Adoption] = []
+    resumed = _resume_phase(
+        experiment,
+        phase,
+        inherited_winners,
+        study,
+        lambda: adopted.append(adopt(before_launch=True)),
+    )
+    if not study.get_trials(deepcopy=False):
+        note = new_study_note(phase, inherited, others)
+        if note is not None:
+            report.info("%s  %s", phase.name, note)
+    # Preflight checks root studies before their rows can change and before child
+    # addresses are known.
+    if phase.inherits or any(adoption.total for adoption in adopted):
         _validate_selection_evidence(experiment, {phase.name: study})
     if others:
         # Recovery refreshes trials.csv from each study it settles, which can leave it showing
@@ -1762,7 +1756,7 @@ def _run_phase(
                 while True:
                     _log_reruns(experiment, phase, study, recorded_reruns)
                     finished_before = _finished_trial_count(study.get_trials(deepcopy=False))
-                    batch = sibling_launch_batch(experiment, phase, study, others)
+                    batch = launch_batch(experiment, phase, study, others)
                     bounded = batch < remaining
                     study.optimize(
                         functools.partial(_objective, run),
@@ -1792,13 +1786,19 @@ def _run_phase(
                             break
                     if bounded:
                         try:
-                            adopted = reread_sibling_trials(
-                                experiment, phase, study, others, budget.deadline, generation_id
+                            between = adopt_kept_attempts(
+                                experiment,
+                                phase,
+                                study,
+                                others,
+                                budget.deadline,
+                                generation_id,
+                                before_launch=False,
                             )
                         except PhaseTimeoutError:
                             run.stop_for_deadline()
                             break
-                        if adopted:
+                        if between.total:
                             _validate_selection_evidence(experiment, {phase.name: study})
                             state = _load_phase_policy_state(study, experiment)
                             run.resume_from(state)
@@ -1863,8 +1863,7 @@ def _replay_met_target(
 
     The winner is selected from the recorded trials again. Replay must neither
     require launch resources (GPU discovery on a CPU-only host) nor mutate the
-    durable accepted target. A higher failure limit can acknowledge an inherited
-    streak after a reread reduced the accepted target, so no recovery trial is needed.
+    durable accepted target.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase whose recorded trials meet its target.
@@ -1881,9 +1880,7 @@ def _replay_met_target(
         altered; only when ``verify_evidence`` is set.
     :return Winner: The winner the recorded trials select.
     """
-    if resume.recovery_abort is not None and not _streak_at_reduced_target(
-        study, resume.recovery_abort
-    ):
+    if resume.recovery_abort is not None:
         raise StudySchemaMismatchError(
             f"Phase {phase.name!r} accepted an abort recovery target but has no "
             "remaining trial slots."

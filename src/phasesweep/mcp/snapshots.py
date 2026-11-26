@@ -112,7 +112,7 @@ class PhaseStatusSnapshot(_SnapshotModel):
     Known counts carry a list, empty when no row is RUNNING or the study is absent.
     """
     reread_pending: RereadPendingSnapshot | None = None
-    """Set while the phase's counts are empty because its fill from kept evidence is pending."""
+    """Set while the phase's counts are empty because its re-read of kept attempts is pending."""
 
 
 class StatusSnapshot(_SnapshotModel):

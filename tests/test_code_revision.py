@@ -412,10 +412,12 @@ def test_ranked_revision_sources_include_sibling_checkpoint_writers(
         sampler=Sampler(type="grid"),
         search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
     )
+    # Returning to the first reading adopts the sibling's retry, which that reading cannot
+    # measure, so a fourth trial retries the cell from the sibling's checkpoint.
     for revision, key, target, expected in (
         ("1", "first", 2, 0.9),
         ("2", "second", 3, 0.1),
-        ("3", "first", 3, 0.2),
+        ("3", "first", 4, 0.2),
     ):
         stage.write_text(revision)
         with monkeypatch.context() as patch:

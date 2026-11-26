@@ -151,8 +151,8 @@ def test_returning_grid_reuses_finished_draws_without_launch_resources(
     caplog.set_level(logging.INFO)
 
     run_experiment(target, dry_run=True)
-    assert "would re-read 2 finished trials from a sibling study" in caplog.text
-    assert "may need to launch up to 2 trials depending on the re-read results" in caplog.text
+    assert "would re-read 2 kept trials from other reading studies" in caplog.text
+    assert "target met (3 of 3 trials recorded): would select from the re-read" in caplog.text
     run_experiment(target)
     rows = addressed_phase_study(target).trials
 
@@ -237,8 +237,7 @@ def test_grown_grid_reuses_a_later_donor_between_parallel_launches(
     caplog.set_level(logging.INFO)
 
     run_experiment(target, dry_run=True)
-    assert "would launch at least 2 trials to fill the target" in caplog.text
-    assert "may need to launch up to 3 trials depending on the re-read results" in caplog.text
+    assert "DRY RUN phase=p would launch 2 trials" in caplog.text
     assert _launches(launches) == 2
     run_experiment(target)
 
@@ -249,8 +248,8 @@ def test_grown_grid_reuses_a_later_donor_between_parallel_launches(
     assert read_status(target)["publication_integrity"] == "ok"
 
 
-def test_adaptive_reuse_checks_the_next_proposal_after_each_read(tmp_path: Path) -> None:
-    """Reversing the objective order does not import the sibling's different TPE proposal."""
+def test_returning_tpe_study_adopts_every_sibling_draw(tmp_path: Path) -> None:
+    """A returning TPE study adopts every draw a sibling trained, whatever order it ranks them in."""
     trainer, launches = _trainer(tmp_path)
     phase = _phase("tpe", 1)
     run_experiment(_config(tmp_path, trainer, phase))
@@ -263,10 +262,10 @@ def test_adaptive_reuse_checks_the_next_proposal_after_each_read(tmp_path: Path)
     run_experiment(target)
 
     rows = addressed_phase_study(target).trials
-    assert rows[1].user_attrs[ATTEMPT_ID_ATTR] == donors[1].user_attrs[ATTEMPT_ID_ATTR]
-    assert rows[2].params != donors[2].params
-    assert rows[2].user_attrs[ATTEMPT_ID_ATTR] != donors[2].user_attrs[ATTEMPT_ID_ATTR]
-    assert _launches(launches) == 4
+    assert [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows] == [
+        row.user_attrs[ATTEMPT_ID_ATTR] for row in donors
+    ]
+    assert _launches(launches) == 3
 
 
 def test_stochastic_preview_stops_after_the_final_possible_donor(tmp_path: Path) -> None:
@@ -347,7 +346,7 @@ def test_fill_preview_counts_donors_outside_its_source(
     )
     if interrupted_fill:
         with patch.object(reread_ops, "_reread_trial", wraps=reread_ops._reread_trial) as read:
-            read.side_effect = [DEFAULT, reread_ops._fill_timeout(target, target.phases[0])]
+            read.side_effect = [DEFAULT, reread_ops._reread_timeout(target, target.phases[0])]
             with pytest.raises(PhaseTimeoutError):
                 run_experiment(target)
         assert len(addressed_phase_study(target).trials) == 1
@@ -358,7 +357,7 @@ def test_fill_preview_counts_donors_outside_its_source(
 
     run_experiment(target, dry_run=True)
 
-    assert "may need to launch up to 1 trial depending on the re-read results" in caplog.text
+    assert "target met (3 of 3 trials recorded): would select from the re-read" in caplog.text
     sparse = _config(
         tmp_path, trainer, grown.model_copy(update={"n_trials": 4}), "loss", "maximize"
     )
@@ -376,10 +375,10 @@ def test_fill_preview_counts_donors_outside_its_source(
     assert read_status(target)["publication_integrity"] == "ok"
 
 
-def test_fill_preview_counts_the_rerun_that_sibling_draws_cannot_cover(
+def test_stopped_adoption_takes_the_siblings_continuation_of_an_interrupted_draw(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A partially filled study still forecasts an interrupted draw's definite rerun."""
+    """An adoption stopped part-way keeps its rows; the next run takes the continuation, not a rerun."""
     stage = tmp_path / "stage"
     launches = tmp_path / "launches"
     trainer = write_trainer(
@@ -415,24 +414,29 @@ def test_fill_preview_counts_the_rerun_that_sibling_draws_cannot_cover(
     target = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 4}), goal="maximize")
     with (
         patch.object(
-            reread_ops, "_stamp_identity", side_effect=RuntimeError("pause before sealing")
+            reread_ops,
+            "_write_adopted",
+            wraps=reread_ops._write_adopted,
+            side_effect=[DEFAULT, DEFAULT, RuntimeError("stop after two rows")],
         ),
-        pytest.raises(RuntimeError, match="pause before sealing"),
+        pytest.raises(RuntimeError, match="stop after two rows"),
     ):
         run_experiment(target)
+    assert len(addressed_phase_study(target).trials) == 2
     before = _launches(launches)
     caplog.set_level(logging.INFO)
 
     run_experiment(target, dry_run=True)
-    assert "DRY RUN total: would launch 1 trial (1 rerun) across 1 phase" in caplog.text
+    assert "target met (4 of 4 trials recorded): would select from the re-read" in caplog.text
     assert _launches(launches) == before
     run_experiment(target)
 
     rows = addressed_phase_study(target).trials
-    assert _launches(launches) == before + 1
+    assert _launches(launches) == before
+    assert RERUN_OF_ATTR not in rows[1].user_attrs
     assert rows[2].user_attrs[RERUN_OF_ATTR] == 1
-    assert [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows[3:]] == [
-        row.user_attrs[ATTEMPT_ID_ATTR] for row in addressed_phase_study(sibling).trials[2:4]
+    assert [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows[2:]] == [
+        row.user_attrs[ATTEMPT_ID_ATTR] for row in addressed_phase_study(sibling).trials[2:5]
     ]
 
 
@@ -503,7 +507,7 @@ def test_mid_phase_adoption_deadline_preserves_new_training_on_restart(tmp_path:
     target = _config(tmp_path, trainer, grown)
     with (
         patch.object(
-            reread_ops, "_reread_trial", side_effect=reread_ops._fill_timeout(target, grown)
+            reread_ops, "_reread_trial", side_effect=reread_ops._reread_timeout(target, grown)
         ),
         pytest.raises(PhaseTimeoutError, match="phase guard after 2/4"),
     ):

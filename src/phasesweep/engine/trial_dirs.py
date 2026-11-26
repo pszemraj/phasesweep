@@ -13,7 +13,7 @@ from optuna.trial import FrozenTrial, TrialState
 
 from phasesweep.config.models import Experiment
 from phasesweep.engine.attempts import _attempt_process_resolution
-from phasesweep.engine.errors import StudySchemaMismatchError, WinnerIntegrityError
+from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.fingerprints import _recorded_inheritance, phase_study_name
 from phasesweep.engine.optuna import _draw_positions
 from phasesweep.engine.paths import (
@@ -28,7 +28,6 @@ from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
-    REREAD_FILL_ATTR,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
     TRIAL_DIR_ATTR,
@@ -41,39 +40,8 @@ from phasesweep.engine.state import (
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.evidence.baseline import read_evidence_baseline
 from phasesweep.runtime.files import broken_symlink_detail
-from phasesweep.runtime.json import json_object
 from phasesweep.runtime.process import read_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
-
-REREAD_FILL_SCHEMA_VERSION = 3
-_FILL_FIELDS = frozenset({"schema_version", "study_name"})
-
-
-def _fill_source_name(target: Study | None) -> str | None:
-    """Read the source study a filled study explicitly names.
-
-    :param Study | None target: Study whose copy provenance to read.
-    :raises StudySchemaMismatchError: The saved source record is malformed.
-    :return str | None: Source study name, or None when no copy started.
-    """
-    if target is None or (raw := target.user_attrs.get(REREAD_FILL_ATTR)) is None:
-        return None
-    try:
-        record = json_object(raw)
-        name = record["study_name"]
-        if (
-            record.keys() != _FILL_FIELDS
-            or type(record.get("schema_version")) is not int
-            or record["schema_version"] != REREAD_FILL_SCHEMA_VERSION
-            or not isinstance(name, str)
-            or not name
-        ):
-            raise ValueError("invalid source name or schema version")
-    except (KeyError, ValueError) as exc:
-        raise StudySchemaMismatchError(
-            f"Study {target.study_name!r} has a malformed {REREAD_FILL_ATTR!r} record: {exc}."
-        ) from exc
-    return name
 
 
 class ProducingAttempt(NamedTuple):
@@ -88,15 +56,13 @@ class ProducingAttempt(NamedTuple):
 def producing_attempts(studies: Sequence[Study]) -> dict[str, ProducingAttempt]:
     """Resolve physical attempts by identity across all studies of a phase.
 
-    Each fill pins its source, and never changes the attempt IDs it copies. A row whose
-    direct source contains its ID is a copy, even if its source was itself filled.
-    Later trials can have the same number in siblings, so numbers cannot identify copies.
-    A study can also import a sibling's finished continuation. It does not copy that sibling's
-    allocation context. The context and, where needed, the frozen generation's study address
-    distinguish the physical launch from those later copies.
+    An attempt belongs to the study that launched it. A study that adopts another's attempt
+    keeps its attempt ID but never copies its allocation context, so a row whose generation is
+    not among its own study's allocation contexts is a copy. Where those contexts cannot tell,
+    the frozen generation's study address does. Trial numbers never identify copies, since
+    studies of a phase number their rows independently.
 
     :param Sequence[Study] studies: Studies of the phase from one ledger or live run.
-    :raises StudySchemaMismatchError: A study's fill provenance is malformed.
     :return dict[str, ProducingAttempt]: Unambiguous producing rows by attempt ID.
     """
     from phasesweep.engine.study_policy import _allocation_contexts
@@ -114,7 +80,6 @@ def producing_attempts(studies: Sequence[Study]) -> dict[str, ProducingAttempt]:
         for study in studies
     }
     owners: dict[str, list[ProducingAttempt]] = defaultdict(list)
-    occurrences: dict[str, list[ProducingAttempt]] = defaultdict(list)
     snapshots: dict[tuple[Path, str], Experiment | None] = {}
     generations = {
         study.study_name: {record["generation_id"] for record in _allocation_contexts(study)}
@@ -122,10 +87,7 @@ def producing_attempts(studies: Sequence[Study]) -> dict[str, ProducingAttempt]:
     }
     have_allocations = any(generations.values())
     for study in studies:
-        source_name = _fill_source_name(study)
-        source = None if source_name is None else rows.get(source_name)
         for attempt_id, trial in rows[study.study_name].items():
-            item = ProducingAttempt(study, trial, numbered[study.study_name])
             generation = trial.user_attrs.get(GENERATION_ID_ATTR)
             if (
                 have_allocations
@@ -133,26 +95,9 @@ def producing_attempts(studies: Sequence[Study]) -> dict[str, ProducingAttempt]:
                 and generation not in generations[study.study_name]
             ):
                 continue
-            occurrences[attempt_id].append(item)
-            if (
-                source_name is None
-                or (
-                    source is not None
-                    and (
-                        attempt_id not in source
-                        or (
-                            isinstance(generation, str)
-                            and generation in generations[study.study_name]
-                            and generation not in generations[source_name]
-                        )
-                    )
-                )
-                or source is None
-                and _generation_addresses(study, trial, snapshots)
-            ):
-                owners[attempt_id].append(item)
-    for attempt_id, matches in occurrences.items():
-        if len(matches) > 1 and len(owners.get(attempt_id, ())) != 1:
+            owners[attempt_id].append(ProducingAttempt(study, trial, numbered[study.study_name]))
+    for attempt_id, matches in owners.items():
+        if len(matches) > 1:
             launched = [
                 item for item in matches if _generation_addresses(item.study, item.trial, snapshots)
             ]

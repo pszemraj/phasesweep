@@ -57,7 +57,6 @@ from phasesweep.engine.state import (
     PHASE_DECISION_SCHEMA_VERSION,
     PHASE_RECOVERY_ATTR,
     PHASE_RECOVERY_SCHEMA_VERSION,
-    REREAD_FILL_ATTR,
     RERUN_OF_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
@@ -324,10 +323,45 @@ def _load_accepted_partial_decision(
     )
 
 
+def _record_accepted_partial_decision(
+    study: optuna.Study,
+    trial_target: int,
+    *,
+    outcome_sequence: int,
+    finished_trials: int,
+    measured_trials: int,
+    timeout_scope: str,
+    recovered_abort_sequence: int | None,
+) -> None:
+    """Write the accepted timeout boundary a replay selects from without launching.
+
+    :param optuna.Study study: The study accepting the boundary.
+    :param int trial_target: The ``n_trials`` the boundary was accepted at.
+    :param int outcome_sequence: The last completion sequence inside the boundary.
+    :param int finished_trials: Finished trials inside the boundary.
+    :param int measured_trials: COMPLETE trials inside the boundary.
+    :param str timeout_scope: ``"phase"`` or ``"run"``, the deadline that stopped the phase.
+    :param int | None recovered_abort_sequence: Sequence of the abort the run recovered from.
+    """
+    study.set_user_attr(
+        PHASE_DECISION_ATTR,
+        {
+            "schema_version": PHASE_DECISION_SCHEMA_VERSION,
+            "decision": "accepted_partial_timeout",
+            "trial_target": trial_target,
+            "outcome_sequence": outcome_sequence,
+            "finished_trials": finished_trials,
+            "measured_trials": measured_trials,
+            "timeout_scope": timeout_scope,
+            "recovered_abort_sequence": recovered_abort_sequence,
+        },
+    )
+
+
 def _parse_accepted_partial_decision(
     raw: object, study_name: str
 ) -> _AcceptedPartialDecision | None:
-    """Decode the accepted timeout boundary of a study or the source pinned by a fill.
+    """Decode a study's accepted timeout boundary.
 
     :param object raw: Stored decision, or None.
     :param str study_name: Study named in a schema refusal.
@@ -896,8 +930,6 @@ def _validate_grown_grid_target(
     study: optuna.Study,
     phase: Phase,
     trials: Sequence[optuna.trial.FrozenTrial],
-    *,
-    pending_reruns: int | None = None,
 ) -> None:
     """Require enough trial slots for every cell of an enlarged full grid.
 
@@ -907,16 +939,13 @@ def _validate_grown_grid_target(
     :param optuna.Study study: Study whose first search space defines its original grid.
     :param Phase phase: Phase whose current target is checked.
     :param Sequence[optuna.trial.FrozenTrial] trials: Existing attempts.
-    :param int | None pending_reruns: Minimum pending reruns when a fill previews
-        unresolved verdicts, defaults to the study's actual count.
     :raises TrialTargetRefusedError: The target leaves too few slots for the undrawn cells.
     """
     undrawn = _undrawn_grown_grid_cells(study, phase, trials)
     if not undrawn:
         return
     running = sum(trial.state == optuna.trial.TrialState.RUNNING for trial in trials)
-    reruns = _pending_rerun_count(study) if pending_reruns is None else pending_reruns
-    minimum = _finished_trial_count(trials) + running + reruns + undrawn
+    minimum = _finished_trial_count(trials) + running + _pending_rerun_count(study) + undrawn
     if phase.n_trials < minimum:
         raise TrialTargetRefusedError(
             f"Phase {phase.name!r}: n_trials={phase.n_trials} leaves too few trials for "
@@ -1048,11 +1077,9 @@ def _config_retires_abort(phase: Phase, study: optuna.Study, abort: JsonObject) 
 
     A raised ``n_trials`` retires any abort. A ``max_consecutive_failures`` above the
     count a streak abort recorded retires it while the target still leaves trials to run.
-    It also retires an inherited streak when rereading reduced the accepted target below
-    the target at the abort, even if the corrected study has reached its ceiling.
 
     :param Phase phase: Phase whose current ``n_trials`` and limit are judged.
-    :param optuna.Study study: The phase's study whose accepted target and attempts are judged.
+    :param optuna.Study study: The phase's study whose finished trials are counted.
     :param JsonObject abort: The abort recorded after the recovery boundary.
     :return bool: Whether the run writes the recovery boundary before any new work.
     """
@@ -1063,25 +1090,7 @@ def _config_retires_abort(phase: Phase, study: optuna.Study, abort: JsonObject) 
     return (
         streak is not None
         and phase.max_consecutive_failures > streak
-        and (
-            _finished_trial_count(study.get_trials(deepcopy=False)) < phase.n_trials
-            or _streak_at_reduced_target(study, abort)
-        )
-    )
-
-
-def _streak_at_reduced_target(study: optuna.Study, abort: Mapping[str, object]) -> bool:
-    """Check whether the reread retry ceiling reduced the target of an inherited streak.
-
-    :param optuna.Study study: The study whose accepted target is compared.
-    :param Mapping[str, object] abort: The recorded abort and its original target.
-    :return bool: Whether this is a streak abort from a higher accepted target.
-    """
-    trial_target = abort["trial_target"]
-    return (
-        _tripped_streak(abort) is not None
-        and isinstance(trial_target, int)
-        and _accepted_trial_target(study) < trial_target
+        and _finished_trial_count(study.get_trials(deepcopy=False)) < phase.n_trials
     )
 
 
@@ -1211,8 +1220,7 @@ def _recovery_remedies(
     it. Otherwise the step is a raised ``n_trials``, which retires any abort, a grid or fixed
     configuration raising it only as far as its retry ceiling allows. At that ceiling a
     streak abort with trials left is retired by a ``max_consecutive_failures`` above the
-    recorded count instead. The same limit can acknowledge a streak inherited from a source
-    whose target was reduced after rereading, even when all admissible work has finished.
+    recorded count instead.
 
     :param Experiment experiment: Config whose bounds judge the recorded trials.
     :param Phase phase: Phase that aborted.
@@ -1239,11 +1247,6 @@ def _recovery_remedies(
         step = (
             f"raise phases[{name}].max_consecutive_failures above {streak} and rerun to run the "
             f"{plural(target - finished, 'trial')} still left."
-        )
-    if step is None and streak is not None and _streak_at_reduced_target(study, abort):
-        step = (
-            f"raise phases[{name}].max_consecutive_failures above {streak} "
-            "and rerun to select from its recorded trials."
         )
     if step is not None:
         return f"{lead_in}{step}"
@@ -1805,7 +1808,8 @@ def _reached_study_refusals(
         already past its direction and schema checks.
     :return list[Exception]: The refusals in phase order; empty when every study passes.
     """
-    from phasesweep.engine.reread import pending_sibling_trials
+    from phasesweep.engine.fingerprints import _recorded_inheritance
+    from phasesweep.engine.reread import AdoptionPlan, plan_adoption
 
     for item in reached:
         try:
@@ -1815,17 +1819,29 @@ def _reached_study_refusals(
     errors: list[Exception] = []
     for item in reached:
         phase, study = item.phase, item.study
+        plan: AdoptionPlan | None = None
         try:
-            if REREAD_FILL_ATTR in study.user_attrs and _recorded_identity(study) is None:
-                # The phase checks its target and launchability after importing the source policy.
-                continue
             if item.predicted is None:
-                _validate_trial_target(study, phase)
-                partial = _load_accepted_partial_decision(study)
-                finished = _finished_trial_count(study.get_trials(deepcopy=False))
+                record = _recorded_identity(study)
+                # The run judges the study once it adopts kept attempts: a re-read assumed to
+                # fail checks the target, and one assumed to measure decides the launch.
+                plan = plan_adoption(
+                    experiment,
+                    phase,
+                    {} if record is None else _recorded_inheritance(record),
+                    study,
+                    item.siblings,
+                    study_name=study.study_name,
+                )
+                judged = study if plan is None else plan.failed
+                _validate_trial_target(judged, phase)
+                partial = _load_accepted_partial_decision(judged)
+                finished = _finished_trial_count(judged.get_trials(deepcopy=False))
                 needs_new_trials = phase.n_trials > finished and not _at_accepted_partial_target(
                     partial, phase
                 )
+                if plan is not None:
+                    needs_new_trials = plan.launches[0] > 0
             else:
                 # Recovery keeps each RUNNING attempt's environment, so the snapshot's cohort
                 # is the one a launch checks after recovering them.
@@ -1836,11 +1852,7 @@ def _reached_study_refusals(
             # Preflight a definite launch. A kept result may cover a budgeted retry, but
             # if its read cannot measure the trial, the reached phase preflights before launching.
             if needs_new_trials:
-                plan = pending_sibling_trials(
-                    experiment, phase, study, item.siblings, forecast=True
-                )
-                if phase.n_trials > finished + plan.capacity:
-                    _launch_preflight(experiment, phase.name, study)
+                _launch_preflight(experiment, phase.name, study if plan is None else plan.complete)
             _validate_selection_evidence(experiment, {phase.name: study})
         except Exception as exc:
             errors.append(exc)

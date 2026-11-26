@@ -227,9 +227,10 @@ def _phase_status_payloads(
     """Build path-free per-phase status from one trial and publication capture.
 
     ``winners_present`` must refer to the caller's single represented-generation
-    resolution. CLI callers add their paths separately. A phase whose study waits to be filled
-    from kept evidence counts no trials yet, so its ``reread_pending`` says what the next run
-    re-reads, in words free of config values (:attr:`PendingRereadNotice.statement`).
+    resolution. CLI callers add their paths separately. A phase whose addressed study holds no
+    rows while other reading studies hold kept attempts for it counts no trials yet, so its
+    ``reread_pending`` says what the next run re-reads, in words free of config values
+    (:attr:`PendingRereadNotice.statement`).
 
     :param Experiment experiment: Parsed experiment whose phase study counts are reported.
     :param Mapping[str, _PhaseTrialStats] phase_stats: Counts, availability and
@@ -950,7 +951,7 @@ def _read_status(
         generation name.
     :return tuple[EngineStatus, PublicationPointer, dict[str, optuna.Study], dict[str, PhaseRefusal], dict[str, tuple[optuna.Study, ...]]]:
         The status payload, its pointer resolution, the study each phase's counts were read
-        from (:func:`~phasesweep.engine.preview.replay_study_names`), any pending fill or refusal
+        from (:func:`~phasesweep.engine.preview.replay_study_names`), any pending re-read or refusal
         (:func:`_pending_study_notices`), and every study captured for those phases.
     """
     ledger = validate_ledger(experiment) if ledger is None else ledger
@@ -1122,7 +1123,7 @@ def _read_status(
 def _unsettled_trial_count(phase_studies: Iterable[Sequence[optuna.Study]]) -> int:
     """Count trials that a rerun would settle, including those in other reading studies.
 
-    A fill never copies RUNNING rows. Recovery inspects every study of each configured phase.
+    Adoption never copies RUNNING rows. Recovery inspects every study of each configured phase.
 
     :param Iterable[Sequence[optuna.Study]] phase_studies: All available studies per phase.
     :return int: Number of trials still recorded RUNNING.
@@ -1293,7 +1294,7 @@ def _cli_phase_payloads(
                 **{
                     key: value
                     for key, value in phase.items()
-                    # The CLI prints a pending fill as the phase's refusal, with values.
+                    # The CLI prints a pending re-read as the phase's refusal, with values.
                     if key not in {"phase", "winner_present", "running_attempts", "reread_pending"}
                 },
                 "winner": None if winner_path is None else str(winner_path),
@@ -1424,8 +1425,8 @@ def _phase_refusals(
 ) -> tuple[dict[str, PhaseRefusal], dict[str, tuple[int, ...]]]:
     """Give the refusal a run would meet at each phase, in the study it would address.
 
-    A phase whose addressed study waits to be filled from kept evidence under changed reading
-    settings reports that, with the command that fills it (:mod:`phasesweep.engine.reread`).
+    A phase whose addressed study holds no rows yet and would re-read the kept evidence of its
+    other studies reports that, with the command that runs it (:mod:`phasesweep.engine.reread`).
     Otherwise a phase's recorded failure policy is judged first, as a run's preflight does,
     then a populated study is judged against its recorded identity, whose inherited values and
     reading settings are the ones that address it, so only a change to what was trained
@@ -1569,7 +1570,7 @@ def _experiment_status(
     :param ValidatedLedger | None ledger: Handle the caller already validated, or ``None``.
     :return tuple[JsonObject, dict[str, optuna.Study], dict[str, PhaseRefusal], int]: The payload, the study
         each phase's counts were read from, by phase name, from the same pointer resolution,
-        the phases waiting to be filled from kept evidence (:func:`_pending_study_notices`), and
+        the phases waiting to re-read kept attempts (:func:`_pending_study_notices`), and
         the count of unsettled trials across configured phases.
     """
     require_study(experiment)
