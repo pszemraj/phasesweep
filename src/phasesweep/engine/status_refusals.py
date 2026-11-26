@@ -10,6 +10,7 @@ from typing import TypeAlias
 import optuna
 
 from phasesweep.config.models import Experiment, Phase
+from phasesweep.engine.cleanup import project_stale_trials
 from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -105,6 +106,12 @@ def _study_diagnostics(
     """
     try:
         _verify_recorded_identity(study, experiment, phase)
+        recovery = project_stale_trials(experiment, phase.name, phase_studies_for(study))
+        if recovery.evidence_pending:
+            return None, ()
+        study = next(
+            candidate for candidate in recovery.studies if candidate.study_name == study.study_name
+        )
         # The run judges the target after adoption, so status judges the projection whose
         # re-reads all fail, the one a launch preflight checks (study_policy._reached_study_refusals).
         record = _recorded_identity(study)
@@ -113,7 +120,7 @@ def _study_diagnostics(
             phase,
             {} if record is None else _recorded_inheritance(record),
             study,
-            phase_studies_for(study),
+            recovery.studies,
             study_name=study.study_name,
         )
         _validate_trial_target(study if plan is None else plan.failed, phase)
@@ -165,9 +172,15 @@ def _pending_study_notices(
             waiting.parents = parents
             pending[phase.name] = waiting
         try:
-            notice = pending_reread(
-                experiment, phase, name, every.get(phase.name, []), unsettled=parents
-            )
+            studies = every.get(phase.name, [])
+            if any(
+                study.study_name == name and study.get_trials(deepcopy=False) for study in studies
+            ):
+                continue
+            recovery = project_stale_trials(experiment, phase.name, studies)
+            if recovery.evidence_pending:
+                continue
+            notice = pending_reread(experiment, phase, name, recovery.studies, unsettled=parents)
         except (StudyFingerprintMismatchError, StudySchemaMismatchError) as exc:
             if not parents:
                 pending[phase.name] = exc

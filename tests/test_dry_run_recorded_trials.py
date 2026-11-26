@@ -9,6 +9,7 @@ what it read, in the run's order.
 from __future__ import annotations
 
 import logging
+import shlex
 from pathlib import Path
 
 import optuna
@@ -16,10 +17,11 @@ import pytest
 
 import phasesweep.engine.ledger as ledger_module
 from phasesweep import run_experiment
-from phasesweep.config.models import ExecutionContext, Experiment, Phase
+from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
+    PhaseTimeoutError,
     PublicationIntegrityError,
     PublishedStudyMissingError,
     ResumeWinnerMissingError,
@@ -42,6 +44,7 @@ from phasesweep.engine.preview import _placeholder_winner, validate_trial_target
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    RERUN_OF_ATTR,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRIAL_DIR_ATTR,
@@ -49,10 +52,13 @@ from phasesweep.engine.state import (
     TRIAL_TARGET_ATTR,
     Winner,
 )
+from phasesweep.engine.study_policy import _record_reruns
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import PhaseSweepError
+from phasesweep.evidence.models import JsonExtractor
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
+    addressed_phase_study,
     bounded_metric,
     invoke_cli_boundary,
     make_experiment,
@@ -65,6 +71,7 @@ from tests.conftest import (
     trial_outcome,
     write_experiment_config,
     write_flaky_trainer,
+    write_trainer,
     write_trial_zero_trainer,
 )
 from tests.ledger_fixtures import forbid_file_backed_storage, tree_changes, tree_snapshot
@@ -87,9 +94,8 @@ _LEDGER_REFUSED = (
 _PLACEHOLDERS = "placeholders until 'a' publishes a winner: a_x"
 
 _RUNNING_WARNING = (
-    "DRY RUN warning: phase={name} has 1 RUNNING attempt, counted the way a real run recovers "
-    "RUNNING attempts (failed if the trial recorded a failure, otherwise interrupted and "
-    "rerun); its accepted target, abort state and partial decision are not checked"
+    "DRY RUN warning: phase={name} has 1 RUNNING attempt; the preview projects recovery "
+    "before planning its trials"
 )
 
 
@@ -436,7 +442,7 @@ def test_dry_run_counts_a_failed_attempt_as_spent(
     ]
 
 
-def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
+def test_running_attempt_is_noted_and_its_phase_previews_after_recovery(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A real run recovers a RUNNING attempt first, so the dry run counts it as recovery will and says so."""
@@ -459,6 +465,64 @@ def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
     assert "DRY RUN warning: another operation is active" in caplog.text
     assert "In-flight trials can still finish without a rerun" in caplog.text
     assert "DRY RUN hypothetical restart total:" in caplog.text
+
+
+@pytest.mark.integration
+def test_a_stale_queued_rerun_uses_its_siblings_finished_trial_without_a_program(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A queued slot interrupted during adoption still costs zero launches to fill."""
+    trainer = write_trainer(
+        tmp_path / "trainer",
+        """
+        import argparse
+        import time
+        from pathlib import Path
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", type=Path)
+        args = parser.parse_args()
+        checkpoint = args.out.with_name("checkpoint")
+        if not checkpoint.exists():
+            checkpoint.touch()
+            time.sleep(30)
+        args.out.write_text('{"loss": 1, "acc": 2}')
+        """,
+    )
+    phase = _phase("a", 1, fixed=True)
+    objective = JsonExtractor(type="json", path="r.json", key="loss")
+    metric = Metric(name="score", goal="minimize", extractor=objective)
+    original = make_experiment(
+        persistent=tmp_path,
+        trial_command=f"{shlex.quote(str(trainer))} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=metric,
+        phases=[phase.model_copy(update={"timeout_seconds_per_phase": 2.0})],
+    )
+    with pytest.raises(PhaseTimeoutError):
+        run_experiment(original)
+    study = phase_study(original, "a")
+    _record_reruns(study, phase)
+    queued = study.get_trials(deepcopy=False)[-1]
+    assert queued.state == _STATE.WAITING
+    other = objective.model_copy(update={"key": "acc"})
+    sibling = original.model_copy(update={"metric": metric.model_copy(update={"extractor": other})})
+    run_experiment(sibling)
+    donor = addressed_phase_study(sibling, "a").get_trials(deepcopy=False)[-1]
+    # The transient state between the queue's WAITING claim and its interrupted verdict.
+    study._storage.set_trial_state_values(queued._trial_id, _STATE.RUNNING)
+    trainer.chmod(0o600)
+    before = tree_snapshot(tmp_path)
+
+    caplog.set_level(logging.INFO)
+    run_experiment(original, dry_run=True)
+    assert "would launch 0 trials" in caplog.text
+    assert tree_changes(before, tree_snapshot(tmp_path)) == {}
+    assert run_experiment(original)["a"].metric == 1.0
+
+    adopted = study.get_trials(deepcopy=False)[-1]
+    assert adopted.user_attrs[ATTEMPT_ID_ATTR] == donor.user_attrs[ATTEMPT_ID_ATTR]
+    assert adopted.user_attrs[RERUN_OF_ATTR] == queued.number
+    assert adopted.user_attrs[TRIAL_DIR_ATTR] == donor.user_attrs[TRIAL_DIR_ATTR]
 
 
 def test_dry_run_labels_the_warning_that_it_could_not_check_for_an_active_run(

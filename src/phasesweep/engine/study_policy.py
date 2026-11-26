@@ -1784,9 +1784,6 @@ class ReachedStudy(NamedTuple):
 
     phase: Phase
     study: optuna.Study
-    #: Finished and measured counts a launch's recovery would leave, for a dry run's study whose
-    #: RUNNING attempts it has not recovered; ``None`` for a settled study, whose trials give them.
-    predicted: tuple[int, int] | None = None
     siblings: Sequence[optuna.Study] = ()
 
 
@@ -1810,7 +1807,7 @@ def _reached_study_refusals(
     :return list[Exception]: The refusals in phase order; empty when every study passes.
     """
     from phasesweep.engine.fingerprints import _recorded_inheritance
-    from phasesweep.engine.reread import AdoptionPlan, plan_adoption
+    from phasesweep.engine.reread import plan_adoption
 
     for item in reached:
         try:
@@ -1820,41 +1817,27 @@ def _reached_study_refusals(
     errors: list[Exception] = []
     for item in reached:
         phase, study = item.phase, item.study
-        plan: AdoptionPlan | None = None
         try:
-            if item.predicted is None:
-                record = _recorded_identity(study)
-                # The run judges the study once it adopts kept attempts: a re-read assumed to
-                # fail checks the target, and one assumed to measure decides the launch.
-                plan = plan_adoption(
-                    experiment,
-                    phase,
-                    {} if record is None else _recorded_inheritance(record),
-                    study,
-                    item.siblings,
-                    study_name=study.study_name,
-                )
-                judged = study if plan is None else plan.failed
-                _validate_trial_target(judged, phase)
-                partial = _load_accepted_partial_decision(judged)
-                finished = _finished_trial_count(judged.get_trials(deepcopy=False))
-                needs_new_trials = phase.n_trials > finished and not _at_accepted_partial_target(
-                    partial, phase
-                )
-                if plan is not None:
-                    needs_new_trials = plan.launches[0] > 0
-            else:
-                # Recovery keeps each RUNNING attempt's environment, so the snapshot's cohort
-                # is the one a launch checks after recovering them.
-                finished, measured = item.predicted
-                _validate_fixed_configuration_target(
-                    phase,
-                    finished=finished,
-                    measured=measured,
-                    accepted=_accepted_trial_target(study),
-                )
-                _validate_grown_grid_target(study, phase, study.get_trials(deepcopy=False))
-                needs_new_trials = phase.n_trials > finished
+            record = _recorded_identity(study)
+            # The run judges the study once it adopts kept attempts: a re-read assumed to
+            # fail checks the target, and one assumed to measure decides the launch.
+            plan = plan_adoption(
+                experiment,
+                phase,
+                {} if record is None else _recorded_inheritance(record),
+                study,
+                item.siblings,
+                study_name=study.study_name,
+            )
+            judged = study if plan is None else plan.failed
+            _validate_trial_target(judged, phase)
+            partial = _load_accepted_partial_decision(judged)
+            finished = _finished_trial_count(judged.get_trials(deepcopy=False))
+            needs_new_trials = (
+                phase.n_trials > finished and not _at_accepted_partial_target(partial, phase)
+                if plan is None
+                else plan.launches[0] > 0
+            )
             # Preflight a definite launch. A kept result may cover a budgeted retry, but
             # if its read cannot measure the trial, the reached phase preflights before launching.
             if needs_new_trials:

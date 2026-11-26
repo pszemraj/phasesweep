@@ -23,6 +23,7 @@ from phasesweep.engine.artifact_roots import (
     _artifact_root_claim_needed,
     _check_published_phase_studies,
 )
+from phasesweep.engine.cleanup import project_stale_trials
 from phasesweep.engine.errors import StudyStorageUnavailableError, TrialTargetRefusedError
 from phasesweep.engine.evidence import _validate_selection_evidence
 from phasesweep.engine.fingerprints import (
@@ -63,12 +64,7 @@ from phasesweep.engine.phase import (
 from phasesweep.engine.progress import _log_phase_header
 from phasesweep.engine.reread import AdoptionPlan, plan_adoption
 from phasesweep.engine.selection import PhaseAbortRefusedError
-from phasesweep.engine.state import (
-    RecoveredTrialState,
-    Winner,
-    _recovered_trial_state,
-    _unique_trial_outcomes,
-)
+from phasesweep.engine.state import Winner
 from phasesweep.engine.study_policy import (
     ReachedStudy,
     _accepted_trial_target,
@@ -104,17 +100,10 @@ def warn_dry_run(message: str, *args: object) -> None:
 class RecordedPhase:
     """What a ledger already holds for one phase, counted as a launch would count it."""
 
-    #: Attempts that count toward ``n_trials``: terminal ones that were not interrupted,
-    #: plus each RUNNING one whose objective recorded a failure, which a launch recovers
-    #: as failed first. Any other RUNNING attempt recovers as interrupted and reruns.
+    #: Attempts that count toward ``n_trials`` after projected recovery.
     finished: int
-    #: Draws with a COMPLETE attempt, feasible or not.
-    measured: int
-    #: How many attempts are RUNNING, which a launch recovers before it checks anything.
+    #: Attempts that were RUNNING in the capture, before projected recovery.
     running: int
-    #: Reruns already known while a study awaits recovery or re-reading. Settled studies
-    #: use their full retry policy after the phase passes preflight.
-    recovery_reruns: int
     #: The phase's study as a read-only snapshot, or ``None`` when the ledger holds none.
     study: optuna.Study | None
     #: What the study would take from the phase's other studies, when it would take anything.
@@ -160,59 +149,6 @@ def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
     return line
 
 
-def _recovered_running_states(
-    study_name: str, trials: Sequence[optuna.trial.FrozenTrial]
-) -> list[RecoveredTrialState]:
-    """Predict what a launch's recovery settles each RUNNING attempt as.
-
-    :param str study_name: Phase study being previewed.
-    :param Sequence[optuna.trial.FrozenTrial] trials: The same study's trials.
-    :return list[RecoveredTrialState]: One prediction per RUNNING trial, in trial order.
-    """
-    outcomes = _unique_trial_outcomes(study_name, trials)
-    return [
-        _recovered_trial_state(trial, outcomes.get(trial.number))
-        for trial in trials
-        if trial.state == optuna.trial.TrialState.RUNNING
-    ]
-
-
-def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
-    """Count one phase's snapshot study the way a launch counts it.
-
-    :param Phase phase: The configured phase the study belongs to.
-    :param optuna.Study | None study: The phase's snapshot study, or ``None`` when
-        the ledger holds no such study, which counts zero attempts.
-    :raises PhaseSweepError: A RUNNING attempt's completed trainer evidence awaits recovery,
-        whose extraction decides the counts.
-    :return RecordedPhase: The counts and the study.
-    """
-    if study is None:
-        return RecordedPhase(finished=0, measured=0, running=0, recovery_reruns=0, study=None)
-    trials = study.get_trials(deepcopy=False)
-    recovered = _recovered_running_states(study.study_name, trials)
-    if "EVIDENCE_PENDING" in recovered:
-        raise PhaseSweepError(
-            f"Phase {phase.name!r} has completed trainer evidence awaiting recovery, so the "
-            "dry run cannot count its trials.",
-            action=OperatorAction.RUN_RECOVER_RUN,
-            remediation=(
-                "Run `phasesweep run` with the same config, without --dry-run, to recover the "
-                f"pending trial of `{phase.name}`."
-            ),
-        )
-    recovered_as_failed = recovered.count("FAIL")
-    return RecordedPhase(
-        finished=_finished_trial_count(trials) + recovered_as_failed,
-        measured=_measured_draw_count(trials),
-        running=len(recovered),
-        recovery_reruns=(
-            _pending_rerun_count(study) + len(recovered) - recovered_as_failed if recovered else 0
-        ),
-        study=study,
-    )
-
-
 #: Every study of each phase as the ledger holds it, oldest first, by phase name.
 RecordedStudies = Mapping[str, Sequence[RecordedPhase]]
 
@@ -241,10 +177,28 @@ def _read_recorded_phases(experiment: Experiment) -> RecordedStudies | None:
             exc,
         )
         return None
-    return {
-        phase.name: [_recorded_phase(phase, study) for study in studies[phase.name]]
-        for phase in experiment.phases
-    }
+    recorded = {}
+    for phase in experiment.phases:
+        projected = project_stale_trials(experiment, phase.name, studies[phase.name])
+        if projected.evidence_pending:
+            raise PhaseSweepError(
+                f"Phase {phase.name!r} has completed trainer evidence awaiting recovery, so the "
+                "dry run cannot count its trials.",
+                action=OperatorAction.RUN_RECOVER_RUN,
+                remediation=(
+                    "Run `phasesweep run` with the same config, without --dry-run, to recover the "
+                    f"pending trial of `{phase.name}`."
+                ),
+            )
+        recorded[phase.name] = [
+            RecordedPhase(
+                _finished_trial_count(study.get_trials(deepcopy=False)),
+                projected.running.get(study.study_name, 0),
+                study,
+            )
+            for study in projected.studies
+        ]
+    return recorded
 
 
 def _addressed_record(
@@ -263,7 +217,7 @@ def _addressed_record(
         winner is a stand-in, and its record. The record is ``None`` when a stand-in prevents
         picking among recorded studies, or empty when the phase is known to have no study.
     """
-    fresh = RecordedPhase(finished=0, measured=0, running=0, recovery_reruns=0, study=None)
+    fresh = RecordedPhase(finished=0, running=0, study=None)
     stand_ins = _inherited_placeholder_keys(phase, inherited_winners)
     if stand_ins and not any(record.study is not None for record in recorded):
         # Nothing recorded to reuse, so the study it reaches is new whatever the winner.
@@ -285,21 +239,19 @@ def _addressed_record(
     if addressed is not None and addressed.study is not None:
         _validate_study_direction(addressed.study, experiment.metric.goal)
     record = fresh if addressed is None else addressed
-    if not record.running:
-        # A run recovers RUNNING attempts before it adopts, so their study keeps its counts.
-        plan = plan_adoption(
-            experiment,
-            phase,
-            inherited,
-            record.study,
-            [r.study for r in recorded if r.study is not None],
-            study_name=name,
-        )
-        remaining = max(0, phase.n_trials - record.finished)
-        if plan is not None and (
-            plan.adoption.total or plan.partial or plan.launches != (remaining, remaining)
-        ):
-            return name, replace(record, plan=plan)
+    plan = plan_adoption(
+        experiment,
+        phase,
+        inherited,
+        record.study,
+        [r.study for r in recorded if r.study is not None],
+        study_name=name,
+    )
+    remaining = max(0, phase.n_trials - record.finished)
+    if plan is not None and (
+        plan.adoption.total or plan.partial or plan.launches != (remaining, remaining)
+    ):
+        return name, replace(record, plan=plan)
     if record.study is None or not record.study.get_trials(deepcopy=False):
         note = new_study_note(
             experiment,
@@ -343,29 +295,22 @@ def validate_trial_targets(experiment: Experiment) -> None:
     if not phases:
         return
     every = read_every_phase_study(validate_ledger(experiment), [phase.name for phase in phases])
-    known = known_studies(experiment, every)
     for phase in phases:
         if phase.inherits and every[phase.name]:
             continue
-        study = known.get(phase.name)
-        trials = [] if study is None else study.get_trials(deepcopy=False)
-        recovered = [] if study is None else _recovered_running_states(study.study_name, trials)
-        if not recovered:
-            plan = plan_adoption(
-                experiment,
-                phase,
-                {},
-                study,
-                every[phase.name],
-                study_name=phase_study_name(experiment, phase, {}),
-            )
-            if plan is not None:
-                trials = plan.failed.get_trials(deepcopy=False)
+        projected = project_stale_trials(
+            experiment, phase.name, every[phase.name], assume_pending_failures=True
+        )
+        name = phase_study_name(experiment, phase, {})
+        study = next(
+            (candidate for candidate in projected.studies if candidate.study_name == name), None
+        )
+        plan = plan_adoption(experiment, phase, {}, study, projected.studies, study_name=name)
+        judged = study if plan is None else plan.failed
+        trials = [] if judged is None else judged.get_trials(deepcopy=False)
         _validate_fixed_configuration_target(
             phase,
-            finished=_finished_trial_count(trials)
-            + recovered.count("FAIL")
-            + recovered.count("EVIDENCE_PENDING"),
+            finished=_finished_trial_count(trials),
             measured=_measured_draw_count(trials),
             accepted=0 if study is None else _accepted_trial_target(study),
         )
@@ -382,8 +327,7 @@ def _refuse_as_a_launch_would(
     The reached studies get the checks a launch gives them after its recovery, from the same
     function (:func:`phasesweep.engine.study_policy._reached_study_refusals`): recorded
     identity, then target, then the launch preflight of a phase that needs new trials, then
-    the selection evidence. A RUNNING study gets the fixed-target check on predicted recovery
-    counts in place of its accepted target. Preview inspects each study's artifact-root claim
+    the selection evidence. Preview inspects each study's artifact-root claim
     without making it, and leaves the winner's digest check to the run's selection.
 
     :param Experiment experiment: Parsed experiment being previewed.
@@ -419,12 +363,6 @@ def _refuse_as_a_launch_would(
     )
     errors: list[Exception] = []
     checked: dict[str, tuple[optuna.Study, ...]] = {}
-    records = {
-        record.study.study_name: record
-        for every in recorded.values()
-        for record in every
-        if record.study is not None
-    }
     for phase in experiment.phases:
         for study in studies.get(phase.name, ()):
             try:
@@ -440,11 +378,7 @@ def _refuse_as_a_launch_would(
         known_study = known.get(phase.name)
         if known_study is None:
             continue
-        record = records[known_study.study_name]
-        predicted = (record.finished, record.measured) if record.running else None
-        reached.append(
-            ReachedStudy(phase, known_study, predicted=predicted, siblings=studies[phase.name])
-        )
+        reached.append(ReachedStudy(phase, known_study, siblings=studies[phase.name]))
     errors.extend(_reached_study_refusals(experiment, reached))
     _raise_collected_errors(errors)
     resume_ops._reject_fixed_targets_without_study(
@@ -481,9 +415,7 @@ def _preview_phase(
 
     The phase previews the study its parents' winners address, as a run would open it. A
     replay supplies its recorded winner to children. Remaining work supplies a
-    sampled placeholder. Unreadable studies and RUNNING studies needing recovery
-    also use placeholders; the latter retain predicted counts without judging
-    unrecovered state. A phase with recorded studies that still needs its inherited
+    sampled placeholder. A phase with recorded studies that still needs its inherited
     values, or whose retry capacity depends on a reread, shows an example command
     and leaves its launch count unresolved.
 
@@ -512,7 +444,7 @@ def _preview_phase(
     if recorded is not None and recorded.plan is not None:
         return _preview_adoption(experiment, phase, inherited_winners, recorded, study_name)
     finished = 0 if recorded is None else recorded.finished
-    reruns = 0 if recorded is None else recorded.recovery_reruns
+    reruns = 0
     remaining = max(0, phase.n_trials - finished)
     study: optuna.Study | None = None
     resume: _PhaseResume | None = None
@@ -537,7 +469,7 @@ def _preview_phase(
                 describe_gains(verdict.gained, sampler=phase.sampler),
                 plural(finished, "finished trial"),
             )
-    if recorded is not None and not recorded.running and recorded.study is not None:
+    if recorded is not None and recorded.study is not None:
         study = recorded.study
         reruns = _pending_rerun_count(study, phase)
         # Empty snapshots need no fingerprint stamp or comparison.
@@ -579,9 +511,7 @@ def _preview_phase(
         )
     elif recorded.running:
         warn_dry_run(
-            "phase=%s has %s, counted the way a real run recovers RUNNING attempts (failed "
-            "if the trial recorded a failure, otherwise interrupted and rerun); its accepted "
-            "target, abort state and partial decision are not checked",
+            "phase=%s has %s; the preview projects recovery before planning its trials",
             phase.name,
             plural(recorded.running, "RUNNING attempt"),
         )
@@ -593,7 +523,7 @@ def _preview_phase(
             finished,
             phase.n_trials,
         )
-        if study is None or resume is None:
+        if study is None or resume is None or (recorded is not None and recorded.running):
             winner = _placeholder_winner(experiment, phase, inherited_winners)
         else:
             winner = _replay_met_target(

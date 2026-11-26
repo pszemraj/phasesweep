@@ -19,7 +19,8 @@ import logging
 import os
 import stat
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1348,6 +1349,39 @@ def open_phase_study(ledger: ClaimedLedger, phase: Phase, study_name: str) -> op
     return study
 
 
+@contextmanager
+def _quiet_optuna_study_creation() -> Iterator[None]:
+    """Keep Optuna's study-creation announcements out of read-only output.
+
+    :yield None: Study creation with Optuna logging at WARNING or above.
+    """
+    previous = optuna.logging.get_verbosity()
+    optuna.logging.set_verbosity(max(previous, optuna.logging.WARNING))
+    try:
+        yield
+    finally:
+        optuna.logging.set_verbosity(previous)
+
+
+def copy_studies_for_recovery(studies: Iterable[optuna.Study]) -> list[optuna.Study]:
+    """Copy a phase into one memory store so projected recovery can resolve sibling attempts.
+
+    :param Iterable[optuna.Study] studies: Captured studies of the phase in allocation order.
+    :return list[optuna.Study]: Writable copies retaining their names, directions and trial numbers.
+    """
+    storage = optuna.storages.InMemoryStorage()
+    copies = []
+    with _quiet_optuna_study_creation():
+        for study in studies:
+            study_id = storage.create_new_study(study.directions, study.study_name)
+            mirror = optuna.Study(study.study_name, storage)
+            for key, value in study.user_attrs.items():
+                storage.set_study_user_attr(study_id, key, value)
+            mirror.add_trials(study.get_trials(deepcopy=False))
+            copies.append(mirror)
+    return copies
+
+
 def open_preview_study(
     experiment: Experiment, phase: Phase, *, study_name: str | None = None
 ) -> optuna.Study:
@@ -1363,17 +1397,13 @@ def open_preview_study(
     :param str | None study_name: Address when projecting a known study, defaults to the phase namespace.
     :return optuna.Study: Fresh in-memory study for the phase.
     """
-    previous = optuna.logging.get_verbosity()
-    optuna.logging.set_verbosity(max(previous, optuna.logging.WARNING))
-    try:
+    with _quiet_optuna_study_creation():
         return _build_phase_study(
             experiment,
             phase,
             None,
             study_name or _phase_namespace(experiment.experiment, phase.name),
         )
-    finally:
-        optuna.logging.set_verbosity(previous)
 
 
 def _require_replay_matches_snapshot(

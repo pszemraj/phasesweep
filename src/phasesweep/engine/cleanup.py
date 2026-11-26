@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from functools import partial
+from typing import NamedTuple
 
 import optuna
 
@@ -15,22 +17,104 @@ from phasesweep.engine.attempts import (
     _PreflightCleanupReport,
     _record_cleanup_recovery,
     _record_recovery_interruption,
+    _record_stale_trial_outcome,
+    _record_unfinished_trial_outcome,
     _require_trial_attempt,
     _resolve_attempt,
     _trial_attempt_record,
     _trial_dir_from_attr,
     _trial_requires_cleanup_recovery,
 )
+from phasesweep.engine.ledger import copy_studies_for_recovery
 from phasesweep.engine.paths import _trial_dir_for
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
     TRIAL_DIR_ATTR,
+    TRIAL_OUTCOME_ATTR,
+    _recovered_trial_state,
+    _trial_outcome_payload,
+    _unique_trial_outcomes,
 )
 from phasesweep.engine.study_policy import _restore_prelaunch_environment_identity
 from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
 
 log = logging.getLogger(__name__)
+_RUNNING = optuna.trial.TrialState.RUNNING
+
+
+class RecoveryProjection(NamedTuple):
+    """One phase's in-memory studies after predictable recovery, and its unsettled counts."""
+
+    studies: Sequence[optuna.Study]
+    running: dict[str, int]
+    evidence_pending: bool
+
+
+def project_stale_trials(
+    experiment: Experiment,
+    phase_name: str,
+    studies: Sequence[optuna.Study],
+    *,
+    assume_pending_failures: bool = False,
+) -> RecoveryProjection:
+    """Settle predictable stale rows before planning across a phase's sibling studies.
+
+    Copy the whole phase into one storage so evidence can still find a row's producing study.
+    Awaiting evidence makes the launch plan unknown. Validation alone may assume those reads
+    fail to find the highest possible retry ceiling.
+
+    :param Experiment experiment: Current configuration supplying the artifact root.
+    :param str phase_name: Phase whose studies a launch recovers.
+    :param Sequence[optuna.Study] studies: Captured sibling studies, oldest first.
+    :param bool assume_pending_failures: Whether to count unresolved reads as failures.
+    :return RecoveryProjection: Studies with their settled rows, or the original capture when
+        no settlement is needed or the launch plan awaits evidence.
+    """
+    running = {
+        study.study_name: count
+        for study in studies
+        if (count := len(study.get_trials(deepcopy=False, states=(_RUNNING,))))
+    }
+    if not running:
+        return RecoveryProjection(studies, running, False)
+
+    projected = copy_studies_for_recovery(studies)
+    evidence_pending = False
+    for mirror in projected:
+        if mirror.study_name not in running:
+            continue
+        outcomes = _unique_trial_outcomes(mirror.study_name, mirror.get_trials(deepcopy=False))
+        for trial in mirror.get_trials(deepcopy=False, states=(_RUNNING,)):
+            outcome = outcomes.get(trial.number)
+            predicted = _recovered_trial_state(trial, outcome)
+            if TRIAL_DIR_ATTR not in trial.user_attrs:
+                _restore_prelaunch_environment_identity(mirror, trial)
+            if predicted == "EVIDENCE_PENDING":
+                evidence_pending = True
+                if not assume_pending_failures:
+                    return RecoveryProjection(studies, running, True)
+                if outcome is None:
+                    _record_stale_trial_outcome(mirror, trial, "failure")
+                else:
+                    mirror._storage.set_trial_user_attr(
+                        trial._trial_id,
+                        TRIAL_OUTCOME_ATTR,
+                        _trial_outcome_payload(outcome.sequence, "failure"),
+                    )
+            elif outcome is None:
+                attempt = None
+                if predicted == "FAIL":
+                    directory = _trial_dir_from_attr(
+                        trial, f"project recovery for trial {trial.number}"
+                    )
+                    attempt = _trial_attempt_record(trial, phase_name, directory)
+                _record_unfinished_trial_outcome(
+                    mirror, trial, record=attempt, experiment=experiment
+                )
+            _record_cleanup_recovery(mirror, trial)
+            mirror._storage.set_trial_state_values(trial._trial_id, optuna.trial.TrialState.FAIL)
+    return RecoveryProjection(projected, running, evidence_pending)
 
 
 def _reap_stale_trials(
