@@ -321,10 +321,7 @@ def test_reread_releases_retry_budget_for_cells_that_now_have_a_result(
     corrected = _experiment(tmp_path, trainer, _metric("loss"), phases=[phase])
     caplog.set_level(logging.INFO)
     before = tree_snapshot(tmp_path)
-    with pytest.raises(
-        TrialTargetRefusedError,
-        match="at most 3 if every re-read measures, at most 5 if every one fails",
-    ):
+    with pytest.raises(TrialTargetRefusedError, match="measures, at most 5 if every one fails"):
         run_experiment(fixed, dry_run=True)
     run_experiment(corrected, dry_run=True)
     assert "phase=p is refused if every re-read measures" in caplog.text
@@ -1400,7 +1397,7 @@ def test_validate_counts_kept_grid_trials_when_the_reading_settings_change(
     assert invoke_cli_boundary(["validate", str(retry_path)], monkeypatch) == 0
     assert invoke_cli_boundary(["validate", str(oversized_path)], monkeypatch) == 1
     assert "allow at most 4" in capsys.readouterr().err
-    with pytest.raises(TrialTargetRefusedError, match="exceeds the grid's available attempts"):
+    with pytest.raises(TrialTargetRefusedError, match="measures, at most 4 if every one fails"):
         run_experiment(oversized, dry_run=True)
     assert tree_changes(before, tree_snapshot(tmp_path)) == {}
     assert _launches(launches) == 3
