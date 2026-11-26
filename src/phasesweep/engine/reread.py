@@ -23,7 +23,7 @@ import copy
 import heapq
 import logging
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import ClassVar, NamedTuple
 
@@ -88,6 +88,7 @@ from phasesweep.engine.state import (
     _parsed_trial_outcome,
     _recorded_identity,
     _required_trial_dir,
+    _trial_interrupted,
     _trial_outcome_payload,
     constraint_attr,
 )
@@ -563,7 +564,7 @@ class Slot(NamedTuple):
     waiting: optuna.trial.FrozenTrial | None = None
 
 
-def next_slot(study: optuna.Study, phase: Phase) -> Slot | None:
+def next_slot(study: optuna.Study, phase: Phase, launching: Collection[int] = ()) -> Slot | None:
     """Return the trial a run of the study allocates next: the one budget rule.
 
     A queued rerun runs first, then the reruns :func:`_scheduled_reruns` owes (interrupted trials,
@@ -573,11 +574,15 @@ def next_slot(study: optuna.Study, phase: Phase) -> Slot | None:
 
     :param optuna.Study study: A live study or an in-memory copy of one.
     :param Phase phase: The phase whose target applies.
-    :return Slot | None: The slot, or ``None`` when the finished trials meet the target or an
-        accepted partial result holds it.
+    :param Collection[int] launching: Rows whose rerun the run launches alongside the slots
+        still being filled; each holds one trial of the target, defaults to none.
+    :return Slot | None: The slot, or ``None`` when the finished trials and ``launching`` meet
+        the target or an accepted partial result holds it.
     """
     trials = study.get_trials(deepcopy=False)
-    if _finished_trial_count(trials) >= phase.n_trials or _at_accepted_partial_target(
+    if _finished_trial_count(trials) + len(
+        launching
+    ) >= phase.n_trials or _at_accepted_partial_target(
         _load_accepted_partial_decision(study), phase
     ):
         return None
@@ -586,8 +591,11 @@ def next_slot(study: optuna.Study, phase: Phase) -> Slot | None:
         if trial.state == optuna.trial.TrialState.WAITING and RERUN_OF_ATTR in trial.user_attrs:
             source = trial.user_attrs[RERUN_OF_ATTR]
             assert type(source) is int  # _draw_positions validated the link.
-            return Slot(by_number[source], trial)
-    scheduled = _scheduled_reruns(study, trials, phase)
+            if source not in launching:
+                return Slot(by_number[source], trial)
+    scheduled = [
+        trial for trial in _scheduled_reruns(study, trials, phase) if trial.number not in launching
+    ]
     return Slot(scheduled[0]) if scheduled else Slot(None)
 
 
@@ -735,6 +743,18 @@ def _adopted_row(
     )
 
 
+def _inside(low: float | None, high: float | None) -> float:
+    """Return a value no bound excludes.
+
+    :param float | None low: Inclusive lower bound, or ``None``.
+    :param float | None high: Inclusive upper bound, or ``None``.
+    :return float: The midpoint of two bounds, the one bound given, or zero.
+    """
+    if low is not None and high is not None:
+        return (low + high) / 2
+    return next((bound for bound in (low, high) if bound is not None), 0.0)
+
+
 def _placeholder(
     experiment: Experiment, study: optuna.Study, slot: Slot, assumed: optuna.trial.TrialState
 ) -> optuna.trial.FrozenTrial:
@@ -757,18 +777,6 @@ def _placeholder(
         system_attrs=dict(source.system_attrs),
         user_attrs={RERUN_OF_ATTR: source.number, **attrs},
     )
-
-
-def _inside(low: float | None, high: float | None) -> float:
-    """Return a value no bound excludes.
-
-    :param float | None low: Inclusive lower bound, or ``None``.
-    :param float | None high: Inclusive upper bound, or ``None``.
-    :return float: The midpoint of two bounds, the one bound given, or zero.
-    """
-    if low is not None and high is not None:
-        return (low + high) / 2
-    return next((bound for bound in (low, high) if bound is not None), 0.0)
 
 
 def _assumed_verdict(
@@ -816,6 +824,11 @@ def walk(
     interrupted attempt fills only a new draw, so the ordinary rerun continues its checkpoint and
     no slot holds two. Each filled slot is applied to ``mirror`` before it is yielded.
 
+    The rerun of an interrupted trial that no kept attempt fills does not end the walk: it
+    continues a checkpoint whatever the later slots hold, so the run launches it with the first
+    batch, beside the reruns the later slots' interrupted attempts add, and the walk holds its
+    trial of the target and goes on. Any other unfilled slot ends the walk.
+
     :param Experiment experiment: Current config.
     :param Phase phase: The phase whose target and failure policy apply.
     :param optuna.Study mirror: In-memory copy of the study, advanced as slots fill.
@@ -840,7 +853,8 @@ def walk(
                 phase_name=mirror.study_name,
             )
         )
-    while pool and (slot := next_slot(mirror, phase)) is not None:
+    launching: set[int] = set()
+    while pool and (slot := next_slot(mirror, phase, launching)) is not None:
         trials = mirror.get_trials(deepcopy=False)
         positions = _draw_positions(trials)
         asked: optuna.trial.FrozenTrial | None = None
@@ -886,6 +900,9 @@ def walk(
                 )
         if match is None:
             yield Launch(slot, None if asked is None else asked.number)
+            if slot.rerun is not None and _trial_interrupted(slot.rerun):
+                launching.add(slot.rerun.number)
+                continue
             if (
                 not through_launches
                 or (slot.rerun is None and adaptive)
@@ -1452,6 +1469,16 @@ def plan_adoption(
                     last = step
                 abort = step.abort
                 unfilled -= _trial_run_state(step.row) in FINISHED_TRIAL_STATES
+                continue
+            if (
+                first is None
+                and step.slot.rerun is not None
+                and _trial_interrupted(step.slot.rerun)
+                and abort is None
+            ):
+                # The run adopts past an interrupted trial's rerun and launches it with the
+                # first batch (:func:`walk`).
+                launches += 1
                 continue
             if first is None:
                 first = _left_for_launch(experiment, phase, mirror, last, study_name, step.asked)

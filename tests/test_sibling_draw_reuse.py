@@ -846,3 +846,47 @@ def test_projecting_adoption_prints_no_optuna_study_lines(
         optuna.logging.set_verbosity(previous)
 
     assert not [notice for notice in notices if "A new study created in memory" in notice]
+
+
+def test_adopted_interrupted_trials_rerun_together(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every interrupted attempt another reading kept is adopted, and their reruns share a batch."""
+    stage = tmp_path / "stage"
+    events = tmp_path / "events"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import sys, time
+        from pathlib import Path
+        events = Path({str(events)!r})
+        with events.open("a") as log:
+            print("start", file=log)
+        if Path({str(stage)!r}).read_text() == "interrupt":
+            time.sleep(30)
+        deadline = time.monotonic() + 5
+        while events.read_text().count("start") < 4 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        with events.open("a") as log:
+            print("end", file=log)
+        Path(sys.argv[sys.argv.index("--out") + 1]).write_text('{{"loss": 1, "acc": 2}}')
+        """,
+    )
+    phase = _phase("random", 2).model_copy(
+        update={"n_jobs": 2, "allow_no_gpu_isolation": True, "timeout_seconds_per_phase": 3}
+    )
+    stage.write_text("interrupt")
+    with pytest.raises(PhaseTimeoutError, match="timed out via phase guard"):
+        run_experiment(_config(tmp_path, trainer, phase))
+    stage.write_text("measure")
+    changed = _config(
+        tmp_path, trainer, phase.model_copy(update={"timeout_seconds_per_phase": None}), "acc"
+    )
+    caplog.set_level(logging.INFO)
+
+    run_experiment(changed, dry_run=True)
+    run_experiment(changed)
+
+    assert "would launch 2 trials, 2 of them reruns" in caplog.text
+    assert events.read_text().split() == ["start", "start", "start", "start", "end", "end"]
+    assert len(addressed_phase_study(changed).trials) == 4
