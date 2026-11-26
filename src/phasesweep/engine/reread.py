@@ -1251,6 +1251,25 @@ def _with_abort(step: Adopt) -> optuna.trial.FrozenTrial:
     return row
 
 
+def _standing_abort(
+    experiment: Experiment, phase: Phase, study: optuna.Study
+) -> tuple[JsonObject | None, bool]:
+    """Return the abort any adopted row would follow, and whether the config retires it.
+
+    Rows past an abort are new work, so adoption adds them, through the ordinary walk or a
+    sibling's partial cohort alike, only when the config retires the abort, as before a launch.
+
+    :param Experiment experiment: Current config.
+    :param Phase phase: Phase whose target and failure limit judge the abort.
+    :param optuna.Study study: The study before adoption, live or an in-memory copy.
+    :return tuple[JsonObject | None, bool]: The recorded abort or the one a replayed failure
+        streak at the current limit would record, if any, and whether rows may follow it.
+    """
+    state = _load_phase_policy_state(study, experiment)
+    abort = state.abort or _replayed_streak_abort(phase, study, state)
+    return abort, abort is None or _config_retires_abort(phase, study, abort)
+
+
 def _partial_replay(
     experiment: Experiment,
     phase: Phase,
@@ -1440,16 +1459,14 @@ def adopt_kept_attempts(
     if _recorded_identity(study) is None:
         return adoption
     pool, draws = kept_attempts(experiment, phase, study, others)
+    abort, retired = _standing_abort(experiment, phase, study)
     replay = (
         _partial_replay(experiment, phase, study, others, pool, draws)
-        if before_launch and others
+        if before_launch and others and retired
         else None
     )
-    state = _load_phase_policy_state(study, experiment)
-    abort = state.abort or _replayed_streak_abort(phase, study, state)
     if pool and abort is not None and replay is None:
-        # Rows past an abort are new work: only a config that retires the abort adds them, and
-        # the recovery boundary comes first, as before a launch.
+        # The recovery boundary comes before the first row past a retired abort.
         probe = mirror_study(experiment, phase, study, study_name=study.study_name)
         first = next(
             walk(
@@ -1462,7 +1479,7 @@ def adopt_kept_attempts(
             ),
             None,
         )
-        if not _config_retires_abort(phase, study, abort) or not isinstance(first, Adopt):
+        if not retired or not isinstance(first, Adopt):
             pool = []
         else:
             sequence = abort["completion_sequence"]
@@ -1667,9 +1684,13 @@ def plan_adoption(
         if not _compatible_studies(experiment, phase, mirror, others):
             return None
         pool, draws = kept_attempts(experiment, phase, mirror, others)
+        retired = _standing_abort(experiment, phase, mirror)[1]
+        if not retired:
+            # The run adopts nothing past an abort the config does not retire.
+            pool = []
         adoption = Adoption()
         read = assumed_reader(experiment, assumed)
-        if assumed == _COMPLETE:
+        if assumed == _COMPLETE and retired:
             replay = _partial_replay(experiment, phase, mirror, others, pool, draws)
         if replay is not None:
             asked: int | None = None

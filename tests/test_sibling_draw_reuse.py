@@ -24,7 +24,7 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.optuna import _draw_positions
 from phasesweep.engine.read import inspect_status, read_status
-from phasesweep.engine.selection import PhaseTrialsFailedError
+from phasesweep.engine.selection import PhaseAbortRefusedError, PhaseTrialsFailedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
@@ -1156,3 +1156,57 @@ def test_kept_attempts_that_reach_the_target_outrank_a_siblings_partial_result(
     assert not winner.completion["incomplete"]
     assert winner.completion["finished_trials"] == 4
     assert _launches(launches) == 5
+
+
+@pytest.mark.parametrize("partial", [True, False], ids=["partial-sibling", "ordinary"])
+def test_a_tripped_failure_streak_stops_adoption_in_the_run_and_its_preview(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, partial: bool
+) -> None:
+    """A streak at the limit refuses before any kept attempt, partial cohort or not, adds a row."""
+    launches = tmp_path / "launches"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse, json, time
+        from pathlib import Path
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", type=Path)
+        parser.add_argument("--x", type=float)
+        args = parser.parse_args()
+        with Path({str(launches)!r}).open("a") as log:
+            print(args.x, file=log)
+        launch = len(Path({str(launches)!r}).read_text().splitlines())
+        if launch == 3:
+            time.sleep(30)
+        data = {{"acc": args.x}} if launch < 3 else {{"loss": args.x, "acc": args.x}}
+        args.out.write_text(json.dumps(data))
+        """,
+    )
+    phase = _phase("random", 4).model_copy(update={"max_consecutive_failures": 10})
+    with pytest.raises(PhaseTimeoutError):
+        run_experiment(
+            _config(tmp_path, trainer, phase.model_copy(update={"timeout_seconds_per_phase": 3}))
+        )
+    sibling = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 3}), "acc")
+    run_experiment(sibling)
+    if partial:
+        record_accepted_partial_timeout(addressed_phase_study(sibling), 4)
+    returning = _config(
+        tmp_path,
+        trainer,
+        phase.model_copy(
+            update={"max_consecutive_failures": 2, "allow_incomplete_on_timeout": True}
+        ),
+    )
+    rows = addressed_phase_study(returning).trials
+    assert [row.state for row in rows[:2]] == [optuna.trial.TrialState.FAIL] * 2
+    assert _launches(launches) == 4
+    caplog.set_level(logging.INFO)
+
+    for dry_run in (True, False):
+        with pytest.raises(PhaseAbortRefusedError, match="max_consecutive_failures=2"):
+            run_experiment(returning, dry_run=dry_run)
+
+    assert "accepted a partial result" not in caplog.text
+    assert addressed_phase_study(returning).trials == rows
+    assert _launches(launches) == 4
