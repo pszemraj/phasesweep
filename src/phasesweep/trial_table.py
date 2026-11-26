@@ -545,17 +545,18 @@ def render_trial_tables(
     return "\n".join(lines)
 
 
-def unsettled_running_comment(running: int, width: int | None = None) -> str:
+def unsettled_running_comment(running: int, command: str, width: int | None = None) -> str:
     """Say that trials recorded RUNNING belong to no live run and what a rerun does with them.
 
     Such a trial was cut off, or finished with a result its run could not read. A rerun
     settles both, and stops a trainer that outlived its run, so the comment says to let
-    one finish first.
+    one finish first. The command that reruns follows on a line of its own, whole.
 
     :param int running: How many trials the ledger records as RUNNING while no run holds the locks.
+    :param str command: The shell-quoted ``phasesweep run`` command that repeats the invocation.
     :param int | None width: Terminal width to wrap to, ``# ``-prefixing each line; ``None`` keeps
-        the comment on one line.
-    :return str: The ``#`` comment.
+        the sentence on one line.
+    :return str: The ``#`` comment, its last line the command.
     """
     verb, pronoun = ("is", "it") if running == 1 else ("are", "them")
     text = (
@@ -563,6 +564,7 @@ def unsettled_running_comment(running: int, width: int | None = None) -> str:
         f"config to settle {pronoun}. A trainer still running is stopped, so let it exit first "
         "to keep its result."
     )
-    if width is None:
-        return f"# {text}"
-    return "\n".join(wrap(text, width, indent="# ", subsequent_indent="# "))
+    lines = (
+        [f"# {text}"] if width is None else wrap(text, width, indent="# ", subsequent_indent="# ")
+    )
+    return "\n".join([*lines, f"# {command}"])

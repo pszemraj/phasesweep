@@ -1448,7 +1448,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
                 ),
             )
         elif running and active is False:
-            click.echo(unsettled_running_comment(running, width))
+            click.echo(unsettled_running_comment(running, rerun_command, width))
         click.echo(
             render_trial_tables(
                 tables,
@@ -1483,7 +1483,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     if active:
         click.echo(_RUN_ACTIVE_COMMENT)
     elif running and suggest_resume:
-        click.echo(unsettled_running_comment(running))
+        click.echo(unsettled_running_comment(running, rerun_command))
     # A recorded refusal needs no idle probe: it holds whether or not a run is active, unless
     # it only asks for the run that is active.
     refusals = {

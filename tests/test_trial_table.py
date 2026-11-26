@@ -697,15 +697,14 @@ def test_the_generation_line_covers_every_publication_state(
 
 @pytest.mark.parametrize("width", [80, 60])
 def test_the_unsettled_running_comment_wraps_as_comment_lines(width: int) -> None:
-    """Wrapped lines each keep the ``# `` prefix and the words are the one-line comment's."""
-    single = unsettled_running_comment(2)
+    """Wrapped lines each keep the ``# `` prefix, the words are the one-line comment's, and the command follows whole on its own line."""
+    command = "phasesweep run " + "x" * 90 + ".yaml"
+    single, single_command = unsettled_running_comment(2, command).splitlines()
 
-    wrapped = unsettled_running_comment(2, width)
+    *lines, wrapped_command = unsettled_running_comment(2, command, width).splitlines()
 
-    assert "\n" not in single and single.startswith(
-        "# No run is active; 2 trials are recorded RUNNING."
-    )
-    lines = wrapped.splitlines()
+    assert single.startswith("# No run is active; 2 trials are recorded RUNNING.")
+    assert single_command == wrapped_command == f"# {command}"
     assert len(lines) > 1 and all(line.startswith("# ") and len(line) <= width for line in lines)
     assert " ".join(line.removeprefix("# ") for line in lines) == single.removeprefix("# ")
 
