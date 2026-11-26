@@ -1264,10 +1264,9 @@ def _target_recorded(experiment: Experiment) -> bool:
 def _delivery_generations(experiment: Experiment, scope: str | None, skip: str | None) -> list[str]:
     """Name the generations in scope that may owe MLflow records, sorted by generation ID.
 
-    They are those whose summary run is bound and every published one with tracking state, as
-    a generation that published without launching has. The publication the last-success
-    pointer names counts too when it recorded MLflow evidence, so a run stopped between that
-    commit and saving its records still has them saved.
+    Include generations whose summary run is bound and publications with tracking state.
+    An MLflow publication without a tracking directory can owe its entire mirror. Discover it
+    from the last-success pointer or its terminal lifecycle record after a newer publication.
 
     :param Experiment experiment: Configured experiment.
     :param str | None scope: One generation, or ``None`` for every generation.
@@ -1275,8 +1274,7 @@ def _delivery_generations(experiment: Experiment, scope: str | None, skip: str |
     :return list[str]: Generation IDs, without ``skip``.
     """
     from phasesweep.engine.generation import _validate_generation_publishable
-    from phasesweep.engine.paths import _last_successful_generation_path
-    from phasesweep.engine.publication_validation import _read_pointer_target
+    from phasesweep.engine.paths import _experiment_dir, _generations_dir
 
     root = tracking_root(experiment)
     bound = {
@@ -1284,25 +1282,20 @@ def _delivery_generations(experiment: Experiment, scope: str | None, skip: str |
     }
     tracked = {path.name for path in root.glob(scope or "*") if path.is_dir()} - bound
     published = {name for name in tracked if _published(experiment, name)}
-    target = _read_pointer_target(
-        _last_successful_generation_path(experiment), experiment_name=experiment.experiment
-    )
-    if (
-        target is not None
-        and scope in (None, target.generation_id)
-        and target.generation_id not in bound | tracked
-        and (root / SOURCE_FILE).is_file()
-    ):
-        try:
-            publication, _ = _validate_generation_publishable(experiment, target.generation_id)
-        except PhaseSweepError:
-            # Status reads count through here; the pointer's own readers report it.
-            publication = None
-        if (
-            publication is not None
-            and publication.metric.get("objective_evidence", {}).get("kind") == "mlflow"
-        ):
-            published.add(target.generation_id)
+    if (root / SOURCE_FILE).is_file():
+        known = bound | tracked | {skip}
+        for directory in _generations_dir(_experiment_dir(experiment)).glob(scope or "*"):
+            name = directory.name
+            if name in known or not directory.is_dir() or not _published(experiment, name):
+                continue
+            try:
+                publication, _ = _validate_generation_publishable(experiment, name)
+            except PhaseSweepError:
+                # Status also counts through here. Only a validated publication identifies
+                # the evidence source of a generation without any tracking records.
+                continue
+            if publication.metric.get("objective_evidence", {}).get("kind") == "mlflow":
+                published.add(name)
     return sorted((bound | published) - {skip})
 
 

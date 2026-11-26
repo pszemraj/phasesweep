@@ -132,7 +132,7 @@ The next normal run or a confirmed [`phasesweep mcp recover-run`](mcp.md#run-sta
 
 An unanswered search or upload stops its delivery pass. Each trial uploads independently, so its own upload can wait up to one `mlflow.timeout_seconds` during an outage. An uncertain cleanup in the pass before the first trial stops the run. An interrupted or failed upload leaves delivery pending without changing accepted scores, trial states or winners. Until delivery succeeds, MLflow can still show a run as RUNNING.
 
-The console counts unconfirmed creations it checks and records it sends. Its closing lines summarize recovered deliveries and pending work and print a retry command. CLI `status` reports `tracking_delivery` across generations, and [MCP status](mcp.md#reading-status-responses) reports it for one run. These counts cover saved uploads and unconfirmed creations. An unsaved outcome, such as the summary of a run killed outright, appears once a run, `recover-run` or `sync-tracking` saves it.
+The console counts unconfirmed creations it checks and records it sends. Its closing lines summarize recovered deliveries and pending work and print a retry command. CLI `status` reports `tracking_delivery` across generations, and [MCP status](mcp.md#reading-status-responses) reports it for one run. These counts cover saved uploads, unconfirmed creations and summary runs that still need to be created for published generations. If a run stopped after publishing and before saving the MLflow records, the next delivery pass can recover them even after a later publication. Other unsaved outcomes, such as the summary of a run killed outright before it published, appear once a run, `recover-run` or `sync-tracking` saves them.
 
 ```bash
 phasesweep sync-tracking mlflow.yaml

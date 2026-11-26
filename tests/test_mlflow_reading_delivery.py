@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from phasesweep.config.models import Experiment
+from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.runtime.json import JsonObject
 from phasesweep.tracking import mlflow as worker
@@ -255,6 +256,46 @@ def test_an_outage_leaves_a_rereads_summary_run_for_sync_tracking(tmp_path, monk
     names = [upload["name"] for upload in uploads]
     assert len(names) == 4 and {f"attempt-{attempt}", "winner-depth"} <= set(names)
     assert names[-1] == "generation"
+
+
+@pytest.mark.parametrize("scoped", [False, True], ids=["experiment", "generation"])
+def test_sync_discovers_a_superseded_publication_with_no_tracking_directory(
+    tmp_path, monkeypatch, scoped
+):
+    """A superseded MLflow publication can recover all delivery work from its lifecycle record."""
+    config, uploads, attempt = _reread_setup(tmp_path, monkeypatch)
+    reread = Experiment.model_validate(config)
+    original = deepcopy(config)
+    original["metric"]["extractor"]["metric_key"] = "eval/loss"
+    restored = Experiment.model_validate(original)
+    # A return to either initialized reading needs neither training nor capture workers.
+    run_experiment(reread)
+    run_experiment(restored)
+    earlier, later = "a" * 32, "b" * 32
+    earlier_tracking = session.tracking_root(reread) / earlier
+    with monkeypatch.context() as without_mirror:
+        without_mirror.setattr(publication, "deliver_closeout", lambda *args, **kwargs: None)
+        assert run_experiment(reread, generation_id=earlier)["depth"].attempt_id == attempt
+        assert read_status(reread)["published_generation_id"] == earlier
+        assert not earlier_tracking.exists()
+        assert run_experiment(restored, generation_id=later)["depth"].metric == 1.0
+    assert read_status(restored)["published_generation_id"] == later
+    assert publication._published(reread, earlier)
+    assert not earlier_tracking.exists()
+
+    uploads.clear()
+    assert publication.sync_tracking(restored, earlier if scoped else None)["pending"] == 0
+    delivery = earlier_tracking / "delivery"
+    reading = session.read_record(delivery / f"attempt-{attempt}.json")
+    assert reading["projection"]["metrics"]["phasesweep.objective"] == 3.0
+    [summary] = [
+        upload
+        for upload in uploads
+        if upload["name"] == "generation" and upload["binding"]["generation_id"] == earlier
+    ]
+    assert summary["finish"] == "FINISHED"
+    assert summary_binding_path(reread, earlier).is_file()
+    assert session.read_record(delivery / "winner-depth.json")["state"] == "delivered"
 
 
 @pytest.mark.parametrize("delivered", [True, False], ids=["delivered-failed", "trainer-failed"])
