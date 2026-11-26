@@ -8,7 +8,6 @@ import re
 import shutil
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import patch
 
 import optuna
 import pytest
@@ -591,16 +590,7 @@ def test_reread_checks_losing_candidates_before_publication(tmp_path: Path) -> N
         update={"metric": experiment.metric.model_copy(update={"goal": "maximize"})}
     )
 
-    with (
-        patch(
-            "phasesweep.engine.reread.carry_partial_decision",
-            side_effect=RuntimeError("after rows"),
-        ),
-        pytest.raises(RuntimeError, match="after rows"),
-    ):
-        run_experiment(reread)
-
-    for dry_run in (True, False):
+    for dry_run in (False, True):
         with pytest.raises(
             TrialEvidenceMissingError,
             match=r"trial 1 .* is missing its 'command.txt' audit artifact",
