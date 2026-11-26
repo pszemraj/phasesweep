@@ -149,6 +149,40 @@ def test_from_phase_after_a_changed_parent_names_the_step_its_storage_allows(
         )
 
 
+@pytest.mark.parametrize("training_changed", [False, True])
+def test_from_phase_names_the_skipped_phase_to_reread(
+    tmp_path: Path, training_changed: bool
+) -> None:
+    """Changing the reader alone points to the skipped phase that must re-read its trials."""
+    original = _chained_experiment(tmp_path / "runs")
+    previous = run_experiment(original)
+    changed = original.model_copy(
+        update={"metric": original.metric.model_copy(update={"goal": "maximize"})}
+    )
+    if training_changed:
+        parent = changed.phases[0].model_copy(update={"fixed_overrides": {"width": 64}})
+        changed = changed.model_copy(update={"phases": [parent, changed.phases[1]]})
+
+    for dry_run in (True, False):
+        with pytest.raises(StudyFingerprintMismatchError) as refused:
+            run_experiment(changed, from_phase="child", dry_run=dry_run)
+        message = _operational_error_text(refused.value)
+        if training_changed:
+            assert "was produced by a different config" in message
+            assert "Restore the config that produced the winner" in message
+        else:
+            assert (
+                "Skipped phase 'parent' was selected under different reading settings." in message
+            )
+            assert "Run with `--from-phase parent` to re-read the phase's kept trials." in message
+
+    if not training_changed:
+        replayed = run_experiment(changed, from_phase="parent")
+        assert {name: winner.source for name, winner in replayed.items()} == {
+            name: winner.source for name, winner in previous.items()
+        }
+
+
 def test_from_phase_names_the_phase_a_published_generation_lacks(tmp_path: Path) -> None:
     """A publication that holds other phases' winners still routes the missing one to a fix."""
     workdir = tmp_path / "runs"

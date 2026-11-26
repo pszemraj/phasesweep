@@ -47,7 +47,7 @@ class PlannedPhase(NamedTuple):
 
 
 class GenerationProvenance(NamedTuple):
-    """Selection bounds, phase layout, argparse base and code revision from provenance files."""
+    """Validated configuration and reproducibility facts from the provenance files."""
 
     bounds: JsonObject
     """Metric and constraint bounds from the configuration snapshot."""
@@ -59,6 +59,8 @@ class GenerationProvenance(NamedTuple):
     """Producing argparse base, or ``None`` when the snapshot uses another format."""
     code_revision: CodeRevision | None
     """Trainer-cwd git revision from the reproducibility record, or ``None`` when unreadable."""
+    config_snapshot: bytes
+    """Configuration bytes anchored in the validated reproducibility record."""
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,8 @@ class ValidatedPublication:
     """Producing argparse base captured from the validated snapshot bytes."""
     code_revision: CodeRevision | None
     """Trainer-cwd git revision captured from the validated reproducibility bytes, or ``None``."""
+    config_snapshot: bytes
+    """Validated configuration bytes for diagnosing skipped-winner mismatches."""
 
 
 def _parse_phase_plan(raw: object) -> tuple[PlannedPhase, ...] | None:
@@ -452,6 +456,7 @@ def _validate_generation_manifest(
         winners=winners,
         argparse_trainer_config=provenance.argparse_trainer_config,
         code_revision=provenance.code_revision,
+        config_snapshot=provenance.config_snapshot,
     )
 
 
@@ -481,8 +486,8 @@ def _validate_generation_provenance_files(
     :raises PublicationIntegrityError: Whatever ``fail`` builds, when a provenance file is
         listed without its partner, is absent, unreadable, altered,
         unparsable, or disagrees with the summary's own identity.
-    :return GenerationProvenance: The snapshot's bound settings, phase plan and configured
-        ``repeats``, the argparse base when applicable, and the recorded ``code_revision``.
+    :return GenerationProvenance: The snapshot bytes, selection bounds, phase plan and
+        configured ``repeats``, the argparse base when applicable, and the recorded code revision.
     """
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         if (generation_dir / filename).is_file() and kind not in listed_files:
@@ -601,6 +606,7 @@ def _validate_generation_provenance_files(
         repeats=repeats,
         argparse_trainer_config=argparse_trainer_config,
         code_revision=code_revision,
+        config_snapshot=contents["config_snapshot"],
     )
 
 

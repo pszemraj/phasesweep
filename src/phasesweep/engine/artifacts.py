@@ -15,6 +15,7 @@ import yaml
 
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
+from phasesweep.config.io import load_experiment_bytes
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import (
     ResumeWinnerMissingError,
@@ -354,6 +355,40 @@ def _warn_environment_drift(
     )
 
 
+def _matches_with_previous_reading(
+    experiment: Experiment,
+    phase: Phase,
+    inherited_winners: dict[str, Winner],
+    publication: ValidatedPublication,
+    stored_fingerprint: str,
+) -> bool:
+    """Test whether restoring the published reading accounts for the whole mismatch.
+
+    :param Experiment experiment: Current experiment supplying training inputs.
+    :param Phase phase: Skipped phase whose fingerprint differs.
+    :param dict[str, Winner] inherited_winners: Current parent winners.
+    :param ValidatedPublication publication: The captured publication supplying the old reading.
+    :param str stored_fingerprint: Fingerprint on the published winner.
+    :return bool: Whether the previous reading restores the fingerprint.
+    """
+    path = path_ops._generation_config_snapshot_path(
+        path_ops._experiment_dir(experiment), publication.generation_id
+    )
+    try:
+        previous = load_experiment_bytes(publication.config_snapshot, path, config_dir=path.parent)
+    except ValueError:
+        # The snapshot may support publication inspection without loading as a full config.
+        return False
+    previous_reader = experiment.model_copy(
+        update={"metric": previous.metric, "constraints": previous.constraints}
+    )
+    previous_gates = phase.model_copy(update={"gates": previous.phase(phase.name).gates})
+    return (
+        fingerprint_ops._phase_fingerprint(previous_reader, previous_gates, inherited_winners)
+        == stored_fingerprint
+    )
+
+
 def _load_winner(
     experiment: Experiment,
     phase: Phase,
@@ -404,6 +439,14 @@ def _load_winner(
     current_fp = fingerprint_ops._phase_fingerprint(experiment, phase, inherited_winners)
     stored_fp = data["phase_fingerprint"]
     if stored_fp != current_fp:
+        if experiment.persistent and _matches_with_previous_reading(
+            experiment, phase, inherited_winners, publication, stored_fp
+        ):
+            raise StudyFingerprintMismatchError(
+                f"Skipped phase {phase.name!r} was selected under different reading settings.",
+                action=OperatorAction.FIX_CONFIG,
+                remediation=f"Run with `--from-phase {phase.name}` to re-read the phase's kept trials.",
+            )
         # A winner file records only the hash, so the refusal can name no changed key. MCP shows
         # the step without the message, so the step names the winner it means.
         produced = f"the config that produced the winner of `{phase.name}`"
