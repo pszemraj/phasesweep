@@ -756,7 +756,7 @@ def _validate_accepted_trial_target(phase: Phase, accepted_target: int) -> None:
 
 
 def _validate_fixed_configuration_target(
-    phase: Phase, *, finished: int, measured: int, accepted: int = 0
+    phase: Phase, *, finished: int, measured: int, accepted: int
 ) -> None:
     """Reject a fixed configuration or grid target that would repeat measured cells.
 
@@ -772,7 +772,8 @@ def _validate_fixed_configuration_target(
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
     :param int finished: Finished attempts the phase's study holds.
     :param int measured: How many draws have a COMPLETE attempt, feasible or not.
-    :param int accepted: The study's accepted target, defaults to 0 for no study.
+    :param int accepted: The study's accepted target (:func:`_accepted_trial_target`), 0 for
+        no study; every caller passes it, so run, validate and status give one remedy.
     :raises TrialTargetRefusedError: The fixed configuration asks for more
         attempts than it may retry; the message names the largest allowed target.
     """
@@ -1846,7 +1847,12 @@ def _reached_study_refusals(
                 # Recovery keeps each RUNNING attempt's environment, so the snapshot's cohort
                 # is the one a launch checks after recovering them.
                 finished, measured = item.predicted
-                _validate_fixed_configuration_target(phase, finished=finished, measured=measured)
+                _validate_fixed_configuration_target(
+                    phase,
+                    finished=finished,
+                    measured=measured,
+                    accepted=_accepted_trial_target(study),
+                )
                 _validate_grown_grid_target(study, phase, study.get_trials(deepcopy=False))
                 needs_new_trials = phase.n_trials > finished
             # Preflight a definite launch. A kept result may cover a budgeted retry, but

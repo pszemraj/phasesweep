@@ -777,4 +777,7 @@ def test_oversized_grid_target_over_a_recorded_study_names_the_target_it_takes(
     with pytest.raises(TrialTargetRefusedError) as refused:
         run_experiment(_grid(tmp_path, trainer, 4))
     assert refused.value.remediation == "Set phases[p].n_trials to 2."
+    with pytest.raises(TrialTargetRefusedError) as validated:
+        validate_trial_targets(_grid(tmp_path, trainer, 4))
+    assert validated.value.remediation == refused.value.remediation
     assert len(calls.read_text().splitlines()) == 2

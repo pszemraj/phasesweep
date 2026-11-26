@@ -71,6 +71,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import (
     ReachedStudy,
+    _accepted_trial_target,
     _launch_preflight,
     _load_accepted_partial_decision,
     _load_phase_policy_state,
@@ -365,6 +366,7 @@ def validate_trial_targets(experiment: Experiment) -> None:
             + recovered.count("FAIL")
             + recovered.count("EVIDENCE_PENDING"),
             measured=_measured_draw_count(trials),
+            accepted=0 if study is None else _accepted_trial_target(study),
         )
 
 
@@ -675,7 +677,7 @@ def _preview_adoption(
             "DRY RUN phase=%s %swould %s; nothing would retrain",
             phase.name,
             plan.adoption.changed_reading(reading_settings(experiment, phase)),
-            plan.adoption.describe(planned=True),
+            plan.adoption.describe(planned=True, resumes=not plan.partial),
         )
     study = plan.complete
     low, high = plan.launches

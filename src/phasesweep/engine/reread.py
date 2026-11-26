@@ -1055,15 +1055,15 @@ class Adoption:
         else:
             self.interrupted += 1
 
-    def note(self, reading: JsonObject) -> str:
+    def note(self, reading: JsonObject, *, resumes: bool) -> str:
         """Say what adoption did, for the run's line about the phase.
 
         :param JsonObject reading: The phase's current reading settings.
+        :param bool resumes: Whether the run reruns the adopted interrupted trials.
         :return str: The sentence.
         """
-        return (
-            f"{self.changed_reading(reading)}{self.describe(planned=False)}; nothing was retrained."
-        )
+        described = self.describe(planned=False, resumes=resumes)
+        return f"{self.changed_reading(reading)}{described}; nothing was retrained."
 
     def changed_reading(self, reading: JsonObject) -> str:
         """Name the reading settings that changed, when every attempt comes from one reading.
@@ -1076,11 +1076,15 @@ class Adoption:
         changes = format_changed_keys(_changed_payload_keys(self.readings[0], reading))
         return f"reading settings changed ({changes}): " if changes else ""
 
-    def describe(self, *, planned: bool) -> str:
+    def describe(self, *, planned: bool, resumes: bool) -> str:
         """Name the adopted rows by kind, which a dry run and a run both report.
+
+        An interrupted trial continues from its checkpoint only when the run reruns it; an
+        accepted partial result keeps it as it stands.
 
         :param bool planned: Whether the rows are a dry run's plan, which cannot say how many
             re-reads change their outcome, rather than rows a run wrote.
+        :param bool resumes: Whether the run reruns the adopted interrupted trials.
         :return str: The rows, joined into one clause.
         """
         parts = []
@@ -1093,11 +1097,12 @@ class Adoption:
             keep = "keep" if planned else "kept"
             parts.append(f"{keep} {plural(self.failures, 'trainer failure')} as recorded")
         if self.interrupted:
-            take = "take" if planned else "took"
-            parts.append(
-                f"{take} {plural(self.interrupted, 'interrupted trial')} to continue from "
-                "its checkpoint"
-            )
+            interrupted = plural(self.interrupted, "interrupted trial")
+            if resumes:
+                take = "take" if planned else "took"
+                parts.append(f"{take} {interrupted} to continue from its checkpoint")
+            else:
+                parts.append(f"{'keep' if planned else 'kept'} {interrupted} as recorded")
         return ", ".join(parts)
 
 
@@ -1283,10 +1288,12 @@ def adopt_kept_attempts(
                 held.append(step)
         # The kept attempts ran out, so any slot left launches.
         flush(next_slot(mirror, phase) is not None)
-    if adoption.total:
-        report.info("%s  %s", phase.name, adoption.note(reading_settings(experiment, phase)))
     if before_launch:
         carry_partial_decision(experiment, phase, study, others)
+    if adoption.total:
+        resumes = next_slot(study, phase) is not None
+        note = adoption.note(reading_settings(experiment, phase), resumes=resumes)
+        report.info("%s  %s", phase.name, note)
     return adoption
 
 

@@ -890,3 +890,36 @@ def test_adopted_interrupted_trials_rerun_together(
     assert "would launch 2 trials, 2 of them reruns" in caplog.text
     assert events.read_text().split() == ["start", "start", "start", "start", "end", "end"]
     assert len(addressed_phase_study(changed).trials) == 4
+
+
+def test_an_accepted_partial_result_keeps_an_adopted_interrupted_trial_as_recorded(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An interrupted attempt an accepted partial result holds is not said to continue."""
+    launches = tmp_path / "launches"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import sys, time
+        from pathlib import Path
+        with Path({str(launches)!r}).open("a") as log:
+            print("launch", file=log)
+        if len(Path({str(launches)!r}).read_text().split()) == 3:
+            time.sleep(30)
+        Path(sys.argv[sys.argv.index("--out") + 1]).write_text('{{"loss": 1, "acc": 2}}')
+        """,
+    )
+    phase = _phase("random", 3).model_copy(
+        update={"timeout_seconds_per_phase": 3, "allow_incomplete_on_timeout": True}
+    )
+    run_experiment(_config(tmp_path, trainer, phase))
+    changed = _config(tmp_path, trainer, phase, "acc")
+    caplog.set_level(logging.INFO)
+
+    run_experiment(changed, dry_run=True)
+    run_experiment(changed)
+
+    assert "keep 1 interrupted trial as recorded" in caplog.text
+    assert "kept 1 interrupted trial as recorded" in caplog.text
+    assert "continue from its checkpoint" not in caplog.text
+    assert _launches(launches) == 3
