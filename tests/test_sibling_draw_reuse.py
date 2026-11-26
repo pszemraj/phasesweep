@@ -21,7 +21,8 @@ from phasesweep.engine.errors import (
     PhaseTimeoutError,
     TrialTargetRefusedError,
 )
-from phasesweep.engine.read import read_status
+from phasesweep.engine.ledger import validate_ledger
+from phasesweep.engine.read import inspect_status, read_status
 from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -801,3 +802,25 @@ def test_a_preview_counts_launches_when_only_failing_re_reads_would_abort(
     assert "DRY RUN phase=p would launch 2 trials" in caplog.text
     assert "previously aborted" not in caplog.text
     assert _launches(launches) == 8
+
+
+def test_status_judges_a_grown_grid_target_over_the_attempts_it_adopts(tmp_path: Path) -> None:
+    """A target only another reading's new cells and retry can fill reads as runnable, and runs."""
+    trainer, launches = _trainer(tmp_path)
+
+    def grid(n_trials: int, choices: list[int]) -> Phase:
+        space = {"x": CategoricalParam(type="categorical", choices=choices)}
+        return _phase("grid", n_trials).model_copy(update={"search_space": space})
+
+    run_experiment(_config(tmp_path, trainer, grid(2, [1, 3])))
+    run_experiment(_config(tmp_path, trainer, grid(2, [1, 3]), "acc"))
+    (tmp_path / "fail").touch()
+    run_experiment(_config(tmp_path, trainer, grid(3, [1, 3, 2])))
+    (tmp_path / "fail").unlink()
+    run_experiment(_config(tmp_path, trainer, grid(4, [1, 3, 2])))
+    grown = _config(tmp_path, trainer, grid(4, [1, 3, 2]), "acc")
+
+    assert "p" not in inspect_status(grown, validate_ledger(grown)).refusals
+    run_experiment(grown)
+    assert len(addressed_phase_study(grown).trials) == 4
+    assert _launches(launches) == 4

@@ -43,6 +43,7 @@ from phasesweep.engine.evidence import _selection_evidence
 from phasesweep.engine.fingerprints import (
     _experiment_semantic_fingerprint,
     _recorded_config_matches,
+    _recorded_inheritance,
     _verify_recorded_identity,
     addressed_study_names,
 )
@@ -51,6 +52,7 @@ from phasesweep.engine.guards import addressed_study
 from phasesweep.engine.ledger import (
     ValidatedLedger,
     log_storage_read_failure,
+    phase_studies_for,
     phase_trial_stats,
     read_every_phase_study,
     read_trial_stats,
@@ -89,7 +91,7 @@ from phasesweep.engine.repeats import (
     ranked_group,
     repeat_axis,
 )
-from phasesweep.engine.reread import PendingRereadNotice, pending_reread
+from phasesweep.engine.reread import PendingRereadNotice, pending_reread, plan_adoption
 from phasesweep.engine.selection import (
     PhaseAbortRefusedError,
     TieGroupComparison,
@@ -1371,7 +1373,18 @@ def _study_diagnostics(
     """
     try:
         _verify_recorded_identity(study, experiment, phase)
-        _validate_trial_target(study, phase)
+        # The run judges the target after adoption, so status judges the projection whose
+        # re-reads all fail, the one a launch preflight checks (study_policy._reached_study_refusals).
+        record = _recorded_identity(study)
+        plan = plan_adoption(
+            experiment,
+            phase,
+            {} if record is None else _recorded_inheritance(record),
+            study,
+            phase_studies_for(study),
+            study_name=study.study_name,
+        )
+        _validate_trial_target(study if plan is None else plan.failed, phase)
         refusal = _status_phase_refusal(experiment, phase, study)
         if refusal is not None:
             return refusal, ()
