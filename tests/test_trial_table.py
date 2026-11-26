@@ -11,13 +11,13 @@ from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Repeats, Sampler
 from phasesweep.engine.read import (
-    PhaseRefusal,
     RepeatGroupView,
     TrialTable,
     TrialTables,
     read_trial_tables,
 )
 from phasesweep.engine.selection import PhaseAbortRefusedError
+from phasesweep.engine.status_refusals import PhaseRefusal
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.trial_table import render_trial_tables, unsettled_running_comment

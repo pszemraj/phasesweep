@@ -188,6 +188,7 @@ Within `phasesweep.engine`, responsibilities map to modules as follows:
 | Growing a search space in place, and the grid cell order across its recorded spaces | `growth`, `grid_order` |
 | Advisory confound verdicts on the ranked population, frozen at selection | `confound` |
 | Publication and read-only views | `generation`, `publication`, `publication_validation`, `read` |
+| Why a recorded phase refuses a run or waits, as `status` reports it | `status_refusals` |
 
 `mcp.recovery.recover_run` implements [operator recovery](mcp.md#run-state-and-recovery); the CLI owns its arguments and rendering.
 
