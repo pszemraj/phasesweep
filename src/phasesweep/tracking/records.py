@@ -20,6 +20,7 @@ STATUS_BEFORE_DELIVERY = "phasesweep.status_before_delivery"
 OUTCOME_TAG = "phasesweep.outcome"
 # Marks the run the newest reading that names it selected as a phase winner.
 WINNER_TAG = "phasesweep.winner"
+WINNER_GENERATION_TAG_PREFIX = "phasesweep.winner_generation."
 
 
 def readable_run_state(
@@ -158,13 +159,14 @@ class FindAction(TypedDict):
 
 
 class PublishAction(TypedDict):
-    """Controller request to mirror a retained delivery record, as persisted."""
+    """Controller request to mirror a retained delivery record."""
 
     action: Literal["publish"]
     name: str
     binding: JsonObject
     projection: JsonObject
     finish: str | None
+    historical: bool
 
 
 TrackingAction: TypeAlias = ResolveAction | CreateAction | FindAction | PublishAction
@@ -218,6 +220,7 @@ class PublishRequest(TypedDict):
     binding: RunBinding
     projection: Projection
     finish: str | None
+    historical: NotRequired[bool]
 
 
 _IDENTITY_ADAPTER: TypeAdapter[RunIdentity] = TypeAdapter(RunIdentity)

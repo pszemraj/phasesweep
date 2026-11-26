@@ -29,6 +29,7 @@ from phasesweep.runtime.time import utc_now_iso
 from phasesweep.tracking.records import (
     OUTCOME_TAG,
     STATUS_BEFORE_DELIVERY,
+    WINNER_GENERATION_TAG_PREFIX,
     WINNER_TAG,
     readable_run_state,
 )
@@ -785,6 +786,8 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
     delivery set; a run the trainer itself ended unsuccessfully is never finished. An attempt
     record that does not name its run a winner drops the winner tag an earlier reading set.
     Projection-specific artifact names keep winner uploads distinct from trial summaries.
+    Historical uploads preserve metric points and generation-specific winner tags. The shared
+    artifacts, tags and status belong to the newest reading, even when an older upload retries.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param PublishRequest request: Trusted target, bound run, and projection.
@@ -797,7 +800,8 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
     binding, projection = request["binding"], request["projection"]
     run = client.get_run(binding["run_id"])
     verify_remote(run, binding)
-    finish = request.get("finish")
+    historical = request.get("historical", False)
+    finish = None if historical else request.get("finish")
     if finish and binding["run_mode"] != "managed":
         raise ValueError("Only runs PhaseSweep created may be terminated.")
     status = run.info.status
@@ -810,6 +814,14 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
     ):
         raise ValueError("MLflow run ended unsuccessfully; it cannot be finished.")
     tags = dict(projection["tags"])
+    if historical:
+        tags = {
+            key: value
+            for key, value in tags.items()
+            if key.startswith(WINNER_GENERATION_TAG_PREFIX)
+        }
+        if not projection["metrics"] and not tags:
+            return {}
     if attempt and finish in ("FAILED", "KILLED") and status in ("RUNNING", "FINISHED"):
         tags[STATUS_BEFORE_DELIVERY] = status
     client.log_batch(
@@ -817,10 +829,12 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
         metrics=[
             Metric(k, v, projection["timestamp"], 0) for k, v in projection["metrics"].items()
         ],
-        params=[Param(k, v) for k, v in projection["params"].items()],
+        params=[] if historical else [Param(k, v) for k, v in projection["params"].items()],
         tags=[RunTag(k, v) for k, v in tags.items()],
         synchronous=True,
     )
+    if historical:
+        return {}
     if attempt and WINNER_TAG not in tags and WINNER_TAG in run.data.tags:
         # The record is the run's newest reading, and that reading did not select it.
         client.delete_tag(binding["run_id"], WINNER_TAG)
@@ -939,6 +953,7 @@ def _dispatch(request: JsonObject) -> JsonObject:
                 "binding": validate_binding(request["binding"]),
                 "projection": _projection(request["projection"]),
                 "finish": json_optional_text(request, "finish"),
+                "historical": request.get("historical") is True,
             },
         )
     raise ValueError("Unknown internal MLflow operation.")

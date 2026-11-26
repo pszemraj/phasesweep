@@ -28,7 +28,12 @@ from phasesweep.runtime.json import (
 )
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, signal_handler_scope
 from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText, plural
-from phasesweep.tracking.records import OUTCOME_TAG, WINNER_TAG, validate_binding
+from phasesweep.tracking.records import (
+    OUTCOME_TAG,
+    WINNER_GENERATION_TAG_PREFIX,
+    WINNER_TAG,
+    validate_binding,
+)
 from phasesweep.tracking.session import (
     BINDING_FILE,
     DELIVERY_DIR,
@@ -103,6 +108,7 @@ def _deliver(
     environment: Mapping[str, str],
     *,
     worker_generation: str | None = None,
+    newest: Mapping[str, _Shown] | None = None,
     deadline: float | None = None,
 ) -> None:
     """Upload one persisted projection and mark its record delivered.
@@ -117,6 +123,8 @@ def _deliver(
     :param str | None worker_generation: Generation of the run sending another generation's
         record, under which its upload worker is registered; ``None`` registers it under the
         record's own generation, as for a run's own records and for sync-tracking, which is no run.
+    :param Mapping[str, _Shown] | None newest: Newest reading per attempt during a delivery
+        pass, or ``None`` when delivering one live trial on its own.
     :param float | None deadline: Absolute run deadline the upload is cut at, defaults to none.
     :raises ProcessCleanupUncertainError: The upload worker's cleanup is uncertain.
     :raises OSError: The upload or the record's update failed, MLflow's verdict or no answer.
@@ -126,12 +134,15 @@ def _deliver(
     delivery = _read_delivery(path)
     if delivery.delivered:
         return
+    attempt_id = delivery.binding.get("attempt_id")
+    reading = newest.get(attempt_id) if newest is not None and isinstance(attempt_id, str) else None
     action: PublishAction = {
         "action": "publish",
         "name": path.stem,
         "binding": delivery.binding,
         "projection": delivery.projection,
         "finish": delivery.finish,
+        "historical": reading is not None and reading.generation_id != delivery.generation_id,
     }
     call_tracking(
         experiment, worker_generation or delivery.generation_id, action, environment, deadline
@@ -207,6 +218,7 @@ def _send(
     worker_generation: str | None,
     tally: DeliveryTally,
     counted: Collection[Path] = (),
+    newest: Mapping[str, _Shown] | None = None,
     deadline: float | None = None,
 ) -> None:
     """Send records in order while the delivery is still sending.
@@ -227,6 +239,8 @@ def _send(
     :param DeliveryTally tally: The delivery this pass belongs to.
     :param Collection[Path] counted: Records whose delivery adds to ``tally.delivered``, counted
         as each is sent so a pass a shutdown interrupts still reports them, defaults to none.
+    :param Mapping[str, _Shown] | None newest: Newest reading per attempt, shared by uploads in
+        this pass.
     :param float | None deadline: Absolute run deadline every upload is cut at, defaults to
         none.
     :raises ProcessCleanupUncertainError: An upload worker's cleanup is uncertain.
@@ -240,6 +254,7 @@ def _send(
                 path,
                 environment,
                 worker_generation=worker_generation,
+                newest=newest,
                 deadline=deadline,
             )
         except ProcessCleanupUncertainError:
@@ -398,6 +413,8 @@ class _Shown(NamedTuple):
     """The record's projection without its timestamp and winner tag, and its finish."""
     winner: bool
     """The record's generation selected the attempt, so its run carries the winner tag."""
+    generation_id: str
+    delivered: bool
 
 
 def _content(projection: Mapping[str, object], finish: str | None) -> JsonObject:
@@ -453,6 +470,8 @@ def _shown_attempts(experiment: Experiment) -> dict[str, _Shown]:
                 delivery.timestamp,
                 _content(delivery.projection, delivery.finish),
                 (path.parent.parent.name, attempt_id) in selected,
+                delivery.generation_id,
+                delivery.delivered,
             )
     return shown
 
@@ -726,7 +745,8 @@ def _save_attempt_intents(
         """Save one record, delivered when its run shows it or a newer reading already.
 
         A run an earlier reading selected shows the winner tag, so a reading that does not
-        select it is sent to remove the tag even when it changes nothing else.
+        select it is sent to remove the tag even when it changes nothing else. A pending
+        older reading cannot stand in for a newer one, since the older upload will be historical.
         """
         if timestamp is not None:
             projection["timestamp"] = timestamp
@@ -737,7 +757,8 @@ def _save_attempt_intents(
             and (
                 newest.timestamp > projection["timestamp"]
                 or (
-                    newest.content == _content(projection, finish)
+                    newest.delivered
+                    and newest.content == _content(projection, finish)
                     and (not newest.winner or WINNER_TAG in projection["tags"])
                 )
             )
@@ -942,7 +963,7 @@ def _save_generation_intents(
                 **(
                     {} if bindings[phase.name]["attempt_id"] in superseded else {WINNER_TAG: "true"}
                 ),
-                f"phasesweep.winner_generation.{generation_id}": phase.name,
+                f"{WINNER_GENERATION_TAG_PREFIX}{generation_id}": phase.name,
                 **{
                     f"phasesweep.inherits.{name}": bindings[name]["run_id"]
                     for name in publication.inherits[phase.name]
@@ -1504,6 +1525,7 @@ def _deliver_outstanding(
             worker_generation=worker_generation,
             tally=tally,
             counted=set(pending),
+            newest=_shown_attempts(experiment),
             deadline=deadline,
         )
     finally:

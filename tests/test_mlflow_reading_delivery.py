@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shlex
 import sys
 from copy import deepcopy
@@ -160,8 +161,9 @@ def test_rebuilding_a_past_reading_excludes_trials_added_later(tmp_path, monkeyp
         assert record["binding"] == retained[name]["binding"]
 
 
-def test_the_winner_tag_moves_with_the_newest_reading(tmp_path, monkeypatch):
-    """A reading that selects another run removes the earlier winner's winner tag only."""
+@pytest.mark.parametrize("newest_first", [False, True], ids=["in-order", "scoped-newest-first"])
+def test_the_winner_tag_moves_with_the_newest_reading(tmp_path, monkeypatch, newest_first):
+    """The latest reading owns the winner tag and artifact even when an older upload retries."""
     pytest.importorskip("mlflow")
     config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config.update(storage="auto", phases=config["phases"][:1])
@@ -169,6 +171,7 @@ def test_the_winner_tag_moves_with_the_newest_reading(tmp_path, monkeypatch):
     readings = iter([(1.0, 3.0), (2.0, 2.0)])  # each attempt's eval/loss and cost, first seen first
     values: dict[str, tuple[float, float]] = {}
     runs: dict[str, SimpleNamespace] = {}
+    artifacts: dict[tuple[str, str], object] = {}
 
     def client(binding: JsonObject) -> SimpleNamespace:
         run = runs.setdefault(binding["run_id"], mlflow_run(binding))
@@ -177,7 +180,9 @@ def test_the_winner_tag_moves_with_the_newest_reading(tmp_path, monkeypatch):
             log_batch=lambda _, *, tags, **kwargs: run.data.tags.update(
                 {tag.key: tag.value for tag in tags}
             ),
-            log_artifact=lambda *args, **kwargs: None,
+            log_artifact=lambda run_id, path, **kwargs: artifacts.__setitem__(
+                (run_id, Path(path).name), json.loads(Path(path).read_text())
+            ),
             set_terminated=lambda _, status: setattr(run.info, "status", status),
             delete_tag=lambda _, key: run.data.tags.pop(key),
         )
@@ -197,15 +202,31 @@ def test_the_winner_tag_moves_with_the_newest_reading(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, "request_operation", tracker)
     monkeypatch.setattr(session, "request_operation", tracker)
     reports: list[TerminalReport] = []
-    first = run_experiment(Experiment.model_validate(config), terminal_callback=reports.append)
+    original = Experiment.model_validate(config)
+    first = run_experiment(original, terminal_callback=reports.append)
     config["metric"]["extractor"]["metric_key"] = "cost"
-    second = run_experiment(Experiment.model_validate(config), terminal_callback=reports.append)
+    changed = Experiment.model_validate(config)
+    if newest_first:
+        with monkeypatch.context() as outage:
+            _silent_tracker(outage)
+            second = run_experiment(changed, terminal_callback=reports.append)
+            run_experiment(original, terminal_callback=reports.append)
+        assert publication.sync_tracking(original, reports[2].generation_id)["pending"] == 0
+        newest_artifacts = dict(artifacts)
+        assert publication.sync_tracking(original)["pending"] == 0
+        # The older generation owes its own summary. The shared attempt runs keep their artifacts.
+        summary = artifacts.pop((f"run-{reports[1].generation_id}", "generation.json"))
+        assert summary["generation_id"] == reports[1].generation_id
+        assert artifacts == newest_artifacts
+    else:
+        second = run_experiment(changed, terminal_callback=reports.append)
     earlier, later = first["depth"].attempt_id, second["depth"].attempt_id
     assert earlier is not None and later is not None and earlier != later
 
     tags = {attempt: runs[f"run-{attempt}"].data.tags for attempt in (earlier, later)}
-    assert "phasesweep.winner" not in tags[earlier]
-    assert tags[later]["phasesweep.winner"] == "true"
+    winner, loser = (earlier, later) if newest_first else (later, earlier)
+    assert "phasesweep.winner" not in tags[loser]
+    assert tags[winner]["phasesweep.winner"] == "true"
     assert tags[earlier][f"phasesweep.winner_generation.{reports[0].generation_id}"] == "depth"
     assert tags[later][f"phasesweep.winner_generation.{reports[1].generation_id}"] == "depth"
 
