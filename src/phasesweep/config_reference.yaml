@@ -12,9 +12,8 @@
 # YAML scalars follow PyYAML (YAML 1.1) typing: 1e-3 and 1.0e3 load as strings, 1.0e-3, 0.001 and 1.0e+3 as floats.
 # Numeric keys accept numeric strings, reject booleans and must be finite. Bounds are inclusive, and a lower bound may not exceed its upper bound.
 # Values passed to the trainer unchanged (trainer_config, fixed_overrides, choices, repeats.values) keep their YAML type, so quote what must stay a string.
-# Every key is in the study fingerprint, which a study with trials refuses to change, except storage, workdir, observe and timeout_seconds_per_run.
-# Also outside it: execution.record_env, metric.name, the poll_seconds and timeout_seconds of mlflow and of every W&B extractor and gate, and the run-control keys listed under Phases.
-# The reading settings, metric.goal, metric.extractor, constraints and every phase's gates, address the study instead: a change re-reads the finished trials' kept evidence into a study of its own and retrains nothing: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#correct-a-reading-setting.
+# Each phase's effective inherited values and reading settings (metric.goal, metric.extractor, constraint names and extractors, and that phase's gates) select its study. A changed reading reuses eligible attempts up to the target. Returning to a reading resumes its study: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#correct-a-reading-setting.
+# Metric and constraint bounds re-judge recorded values in the same study. Metric labels, tracker polling and timeout settings, observe, execution.record_env, timeout_seconds_per_run and the run controls listed under Phases are outside the study fingerprint. Storage and workdir locate the ledger and artifact tree.
 # Notation: a `| null = null` key may be omitted, which turns its feature off unless an Unset: line says otherwise. TitleCase types are shared blocks.
 # Environment variables PhaseSweep reads: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#environment-variables. The MCP catalog is a separate file: https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md#the-catalog.
 
