@@ -14,6 +14,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
     TrackingSyncRefusedError,
     TrackingTargetUnavailableError,
+    WinnerIntegrityError,
 )
 from phasesweep.errors import (
     OperatorAction,
@@ -562,12 +563,12 @@ def _accepted_projection(
 ) -> Projection:
     """Freeze an accepted trial projection from its persisted values and attributes.
 
-    ``phasesweep.feasible`` is the bounds' verdict when the projection is written; PhaseSweep
-    never reads it back, and every PhaseSweep read judges the recorded values afresh.
+    ``phasesweep.feasible`` is the verdict of the bounds of the reading the projection delivers;
+    PhaseSweep never reads it back, and every PhaseSweep read judges the recorded values afresh.
 
     :param FrozenTrial trial: COMPLETE trial.
     :param Mapping[str, str] inherits: Native run of each parent winner the attempt inherited.
-    :param Experiment experiment: Config whose bounds give ``phasesweep.feasible``.
+    :param Experiment experiment: Config of that reading, whose bounds give the verdict.
     :return Projection: The attempt's accepted projection.
     """
     from phasesweep.engine.bounds import trial_bound_violations
@@ -754,7 +755,7 @@ def _save_attempt_intents(
     shown: Mapping[str, _Shown] | None = None,
     timestamp: int | None = None,
     winners: Collection[str] = (),
-    published: bool = False,
+    reading: Experiment | None = None,
 ) -> list[Path]:
     """Save unrecorded attempt projections according to their durable Optuna outcomes.
 
@@ -783,10 +784,10 @@ def _save_attempt_intents(
     :param int | None timestamp: Metric timestamp of a record rebuilt for an ended generation,
         from :func:`_generation_timestamp`; ``None`` stamps it now.
     :param Collection[str] winners: Attempt IDs a published generation selected, whose records
-        carry the winner tag that every other attempt record removes from its run, defaults to
-        none.
-    :param bool published: This generation published a reading of these trials, so mirror
-        failures for trainer-owned runs too.
+        carry the winner tag that every other attempt record removes from its run, and which
+        mirror failures for trainer-owned runs too; none for an unpublished generation.
+    :param Experiment | None reading: The config the generation ran with, whose bounds judge its
+        trials however the configured ones changed since; ``None`` judges by ``experiment``.
     :return list[Path]: The records saved, in attempt order.
     """
     from optuna.trial import TrialState
@@ -821,6 +822,7 @@ def _save_attempt_intents(
             experiment, generation_id, name, binding, projection, finish=finish, state=state
         )
 
+    bounds = reading or experiment
     paths: list[Path] = []
     for directory, binding in attempts:
         found = trials.get(binding["attempt_id"])
@@ -842,13 +844,13 @@ def _save_attempt_intents(
         trial = found.trial
         managed = binding["run_mode"] == "managed"
         if trial.state == TrialState.COMPLETE:
-            projection = _accepted_projection(trial, read_inherits(directory), experiment)
+            projection = _accepted_projection(trial, read_inherits(directory), bounds)
             if binding["attempt_id"] in winners:
                 projection["tags"][WINNER_TAG] = "true"
             finish = "FINISHED" if managed else None
             paths.append(save(name, binding, projection, finish))
             continue
-        if not managed and not published:
+        if not managed and not winners:
             continue
         settled = trial.state.is_finished() and (
             found.cleanup_confirmed or not _trial_requires_cleanup_recovery(trial)
@@ -938,8 +940,8 @@ def _save_reading(
     """Save what a published generation's reading sends its MLflow runs, sending nothing.
 
     Its attempts' outcomes come from its own rows, its winner references and summary from
-    its committed artifacts, under its recorded phase order and lineage even if the current
-    config differs. The summary-run record waits until the generation's summary run is
+    its committed artifacts, under its recorded phase order, lineage and bounds even if the
+    current config differs. The summary-run record waits until the generation's summary run is
     bound, which a generation that launched nothing has done only once a delivery pass
     created it. Records already present are kept.
 
@@ -951,9 +953,12 @@ def _save_reading(
     :raises PublicationCommitError: The generation summary cannot be read back.
     :raises PublicationAccessError: A manifest artifact cannot be read as the current user.
     :raises PublicationIntegrityError: A manifest-listed artifact fails validation.
+    :raises WinnerIntegrityError: The generation's config snapshot cannot be read.
     :raises OSError: A delivery record cannot be written.
     """
     from phasesweep.engine.generation import _validate_generation_publishable
+    from phasesweep.engine.paths import _experiment_dir
+    from phasesweep.engine.provenance import _load_generation_experiment
 
     publication, _ = _validate_generation_publishable(experiment, generation_id)
     bindings = {
@@ -973,7 +978,7 @@ def _save_reading(
             shown=shown,
             timestamp=timestamp,
             winners={binding["attempt_id"] for binding in bindings.values()},
-            published=True,
+            reading=_load_generation_experiment(_experiment_dir(experiment), generation_id),
         )
     # A rebuilt winner reference leaves the winner tag to a newer reading its run shows.
     superseded = {
@@ -1199,7 +1204,11 @@ def _rebuild_attempt_intents(
         errors when rebuilding across generations. Raise on the first such error by default.
     :param Mapping[str, _RecordedGeneration] | None recorded: Lifecycle states the caller already
         read, by generation, as :func:`_ended_status` takes them.
+    :raises TrackingSyncRefusedError: A record it needs is unreadable and no collector is set.
     """
+    from phasesweep.engine.paths import _experiment_dir
+    from phasesweep.engine.provenance import _load_generation_experiment
+
     unrecorded = {
         generation_id: attempts
         for generation_id in generation_ids
@@ -1211,6 +1220,21 @@ def _rebuild_attempt_intents(
     trials = _attempt_trials(ledger, phases)
     shown = _shown_attempts(experiment)
     for generation_id, attempts in unrecorded.items():
+        rows = [trials[b["attempt_id"]].trial for _, b in attempts if b["attempt_id"] in trials]
+        reading = None
+        if any(row.value is not None for row in rows):
+            try:  # Claiming the generation froze its config, which judges its measured attempts.
+                reading = _load_generation_experiment(_experiment_dir(experiment), generation_id)
+            except WinnerIntegrityError as exc:
+                error = TrackingSyncRefusedError(
+                    f"MLflow attempt outcomes are unresolved: {exc}",
+                    action=OperatorAction.RESTORE_TREE,
+                    remediation=f"Restore the config snapshot, then run {SYNC_TRACKING_STEP}.",
+                )
+                if unresolved is None:
+                    raise error from exc
+                unresolved[generation_id] = error
+                continue
         # A persistent ledger still holds the trials.
         ended = (
             None
@@ -1230,6 +1254,7 @@ def _rebuild_attempt_intents(
             ended=None if ended is None else ended[0],
             shown=shown,
             timestamp=_generation_timestamp(experiment, generation_id),
+            reading=reading,
         )
 
 

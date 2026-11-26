@@ -33,6 +33,7 @@ from phasesweep.engine.paths import (
     _generation_dir,
     _generation_record_path,
 )
+from phasesweep.engine.provenance import _write_generation_provenance
 from phasesweep.engine.read import experiment_status, read_status
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -470,9 +471,10 @@ def test_failed_invocation_leaves_a_pending_trials_managed_run_open_only_when_pe
         return
     assert [(r["binding"]["attempt_id"], r["finish"]) for r in requests] == [(generation, "FAILED")]
     assert not (delivery / f"attempt-{attempt}.json").exists()
-    # Recovery later accepts the completed training.
+    # Recovery later accepts the completed training; the claim's config snapshot judges it.
     (pending,) = study.get_trials()
     study.tell(pending.number, 0.5)
+    _write_generation_provenance(experiment, generation, caller_owned_id=True)
     publication._rebuild_attempt_intents(experiment, validate_ledger(experiment), [generation])
     record = read_record(delivery / f"attempt-{attempt}.json")
     assert record["finish"] == "FINISHED"

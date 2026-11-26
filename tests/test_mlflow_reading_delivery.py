@@ -8,10 +8,12 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from phasesweep.config.models import Experiment
+from phasesweep.engine import generation as generation_ops
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.runtime.json import JsonObject
@@ -159,6 +161,50 @@ def test_rebuilding_an_older_generations_records_keeps_the_newer_reading(tmp_pat
     assert rebuilt["state"] == "delivered"
     assert {upload["name"] for upload in uploads[before:]} == {"winner-depth", "generation"}
     assert _run_shows(uploads, attempt) == ("FINISHED", 3.0, 3.0)
+
+
+def test_a_rebuilt_reading_keeps_the_bounds_its_generation_published_under(tmp_path, monkeypatch):
+    """A sync under a tightened bound rebuilds an older reading's attempt feasible as published."""
+    config, uploads, attempt = _reread_setup(tmp_path, monkeypatch)
+    config["metric"]["max"] = 4.0
+    generation = "a" * 32
+    run_experiment(Experiment.model_validate(config), generation_id=generation)
+    delivery = session.tracking_root(Experiment.model_validate(config)) / generation / "delivery"
+    for path in delivery.iterdir():
+        path.unlink()
+    config["metric"]["max"] = 2.0
+    tightened = Experiment.model_validate(config)
+
+    assert publication.sync_tracking(tightened, generation)["pending"] == 0
+    rebuilt = session.read_record(delivery / f"attempt-{attempt}.json")
+    assert rebuilt["projection"]["metrics"]["phasesweep.objective"] == 3.0
+    assert rebuilt["projection"]["metrics"]["phasesweep.feasible"] == 1.0
+
+
+def test_a_rebuilt_unpublished_attempt_keeps_the_bounds_its_generation_ran_under(
+    tmp_path, monkeypatch
+):
+    """A sync under a tightened bound rebuilds an unpublished generation's attempt as it ran."""
+    config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config.update(storage="auto", phases=config["phases"][:1])
+    config["metric"]["max"] = 1.5
+    experiment = Experiment.model_validate(config)
+    generation = "a" * 32
+    with monkeypatch.context() as crash:
+        crash.setattr(
+            generation_ops, "_publish_generation", Mock(side_effect=RuntimeError("crashed"))
+        )
+        with pytest.raises(RuntimeError, match="crashed"):
+            run_experiment(experiment, generation_id=generation)
+    delivery = session.tracking_root(experiment) / generation / "delivery"
+    records = sorted(delivery.glob("attempt-*.json"))
+    for record in records:
+        record.unlink()
+    config["metric"]["max"] = 0.5
+
+    publication.sync_tracking(Experiment.model_validate(config), generation)
+    metrics = [session.read_record(record)["projection"]["metrics"] for record in records]
+    assert {(m["phasesweep.objective"], m["phasesweep.feasible"]) for m in metrics} == {(1.0, 1.0)}
 
 
 def test_rebuilding_a_past_reading_excludes_trials_added_later(tmp_path, monkeypatch):
