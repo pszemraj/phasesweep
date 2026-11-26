@@ -796,8 +796,9 @@ def test_a_preview_counts_launches_when_only_failing_re_reads_would_abort(
     """A streak only all-failing re-reads reach is one conditional line beside the launch count."""
     trainer, launches = _trainer(tmp_path)
     phase = _phase("random", 6).model_copy(update={"max_consecutive_failures": 5})
-    run_experiment(_config(tmp_path, trainer, phase))
-    raised = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 8}), "acc")
+    run_experiment(_config(tmp_path, trainer, phase, "acc"))
+    raised = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 8}))
+    raised = raised.model_copy(update={"metric": raised.metric.model_copy(update={"max": 10})})
     caplog.set_level(logging.INFO)
 
     run_experiment(raised, dry_run=True)

@@ -948,7 +948,7 @@ def walk(
 def assumed_reader(experiment: Experiment, assumed: optuna.trial.TrialState) -> Reader:
     """Read every attempt as a projection must: re-reads end in ``assumed``, the rest as recorded.
 
-    A re-read assumed to measure keeps the producer's measurement when it has one.
+    A projected measurement satisfies the current reading's bounds.
 
     :param Experiment experiment: Config whose bounds a stand-in measurement satisfies.
     :param optuna.trial.TrialState assumed: COMPLETE or FAIL.
@@ -957,7 +957,7 @@ def assumed_reader(experiment: Experiment, assumed: optuna.trial.TrialState) -> 
 
     def read(candidate: _Candidate) -> optuna.trial.FrozenTrial:
         trial = copy.deepcopy(candidate.owner.trial)
-        if candidate.rereads and trial.state != assumed:
+        if candidate.rereads:
             value, attrs = _assumed_verdict(experiment, candidate.owner.study, assumed)
             trial.state, trial.value = assumed, value
             trial.user_attrs.update(attrs)
