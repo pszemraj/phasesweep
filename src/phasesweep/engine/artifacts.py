@@ -278,6 +278,7 @@ def _winner_payload(experiment: Experiment, phase_name: str, winner: Winner) -> 
         **_winner_common_payload(winner),
         "phase_fingerprint": winner.phase_fingerprint,
         "study_name": winner.study_name,
+        "study_outcome_sequence": winner.study_outcome_sequence,
         "objective_provenance": winner.objective_provenance,
         "trainer_env_digest": winner.trainer_env_digest,
     }
@@ -483,7 +484,8 @@ def _load_winner(
             gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
             completion=dict(completion),
             phase_fingerprint=stored_fp,
-            study_name=data["study_name"],
+            study_name=validated.study_name,
+            study_outcome_sequence=validated.study_outcome_sequence,
             generation_id=data["generation_id"],
             attempt_id=data["attempt_id"],
             trial_dir=_valid_trial_dir_name(data["trial_dir"], label="winner trial_dir"),

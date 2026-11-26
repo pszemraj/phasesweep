@@ -72,6 +72,7 @@ class ValidatedWinner:
     payload: Mapping[str, Any]
     """The mapping decoded from ``content``."""
     study_name: str
+    study_outcome_sequence: int
     metric: float
     source: WinnerSource
     confound: ConfoundBlock
@@ -392,6 +393,9 @@ def _validate_generation_manifest(
             study_name, summary["experiment"], name
         ):
             raise _fail(f"winner for phase {name!r} has no valid study_name")
+        study_outcome_sequence = payload.get("study_outcome_sequence")
+        if type(study_outcome_sequence) is not int or study_outcome_sequence < 1:
+            raise _fail(f"winner for phase {name!r} has no valid study_outcome_sequence")
         try:
             parsed_source = _parse_winner_source(payload.get("winner_source"), expected_phase=name)
         except ValueError as exc:
@@ -431,6 +435,7 @@ def _validate_generation_manifest(
             content=content,
             payload=payload,
             study_name=study_name,
+            study_outcome_sequence=study_outcome_sequence,
             metric=metric_value,
             source=parsed_source,
             confound=confound,

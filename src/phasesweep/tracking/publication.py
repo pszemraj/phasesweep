@@ -798,10 +798,10 @@ def _reading_attempts(
 ) -> tuple[list[tuple[Path, RunBinding]], dict[str, _AttemptTrial]]:
     """Find the bound attempts a published generation read, with the rows it read them from.
 
-    Each phase's rows are those of the study its winner was selected from, wherever the
-    attempts were launched, so a generation that reread or adopted attempts delivers its own
-    reading of them. A study the ledger no longer holds, as without persistent storage, yields
-    nothing.
+    Each phase's rows are the outcomes recorded in the selecting study through its winner's
+    frozen completion sequence, wherever the attempts were launched. A generation that reread
+    or adopted attempts delivers its own reading of them, even if the study later grows.
+    A study the ledger no longer holds, as without persistent storage, yields nothing.
 
     :param Experiment experiment: Configured experiment.
     :param ValidatedLedger ledger: The experiment's ledger.
@@ -813,7 +813,7 @@ def _reading_attempts(
     """
     from phasesweep.engine.attempts import _cleanup_recovered_trial_numbers
     from phasesweep.engine.ledger import read_every_phase_study
-    from phasesweep.engine.state import ATTEMPT_ID_ATTR
+    from phasesweep.engine.state import ATTEMPT_ID_ATTR, TRIAL_OUTCOME_ATTR, _parsed_trial_outcome
 
     generation_id = publication.generation_id
     bound = {
@@ -835,6 +835,9 @@ def _reading_attempts(
         for trial in study.get_trials(deepcopy=False):
             attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
             if not isinstance(attempt_id, str) or attempt_id not in bound or attempt_id in trials:
+                continue
+            outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+            if outcome is None or outcome.sequence > winner.study_outcome_sequence:
                 continue
             trials[attempt_id] = _AttemptTrial(trial, trial.number in recovered)
             if delivery_record_path(experiment, generation_id, f"attempt-{attempt_id}").exists():

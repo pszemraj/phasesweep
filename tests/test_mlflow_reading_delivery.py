@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shlex
+import sys
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -116,6 +118,45 @@ def test_rebuilding_an_older_generations_records_keeps_the_newer_reading(tmp_pat
     assert rebuilt["state"] == "delivered"
     assert {upload["name"] for upload in uploads[before:]} == {"winner-depth", "generation"}
     assert _run_shows(uploads, attempt) == ("FINISHED", 3.0, 3.0)
+
+
+def test_rebuilding_a_past_reading_excludes_trials_added_later(tmp_path, monkeypatch):
+    """An older reading rebuilds its own failed and measured attempts after its study grows."""
+    config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config.update(storage="auto", phases=config["phases"][:1])
+    phase = config["phases"][0]
+    phase["allow_partial_grid"] = True
+    phase["search_space"]["model.depth"]["choices"] = [1, 2, 3]
+    marker = tmp_path / "trainer-launched"
+    trainer = (
+        f"from pathlib import Path; marker = Path({str(marker)!r}); "
+        "launched = marker.exists(); marker.touch(); raise SystemExit(0 if launched else 7)"
+    )
+    config["trial_command"] = (
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(trainer)} {{config_path}}"
+    )
+    original_id, historical_id, grown_id = (digit * 32 for digit in "123")
+    run_experiment(Experiment.model_validate(config), generation_id=original_id)
+    config["metric"]["extractor"]["metric_key"] = "cost"
+    experiment = Experiment.model_validate(config)
+    run_experiment(experiment, generation_id=historical_id)
+    history = session.tracking_root(experiment) / historical_id / "delivery"
+    retained = {path.name: session.read_record(path) for path in history.glob("attempt-*.json")}
+    assert {record["finish"] for record in retained.values()} == {"FAILED", "FINISHED"}
+    assert {record["binding"]["generation_id"] for record in retained.values()} == {original_id}
+
+    phase["n_trials"] = 3
+    grown = Experiment.model_validate(config)
+    run_experiment(grown, generation_id=grown_id)
+    for path in history.glob("attempt-*.json"):
+        path.unlink()
+
+    assert publication.sync_tracking(grown, historical_id)["pending"] == 0
+    rebuilt = {path.name: session.read_record(path) for path in history.glob("attempt-*.json")}
+    assert rebuilt.keys() == retained.keys()
+    for name, record in rebuilt.items():
+        assert record["finish"] == retained[name]["finish"]
+        assert record["binding"] == retained[name]["binding"]
 
 
 def test_the_winner_tag_moves_with_the_newest_reading(tmp_path, monkeypatch):

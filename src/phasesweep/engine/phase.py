@@ -526,6 +526,7 @@ def _judge_recorded_phase(
                 study,
                 phase_fingerprint=phase_fingerprint,
                 completion=completion,
+                study_outcome_sequence=policy_state.max_sequence,
                 verify_evidence=verify_evidence,
                 emit_advisories=emit_advisories,
             )
@@ -1554,6 +1555,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
                 reason="timeout" if accepted_partial_timeout else None,
                 timeout_scope=run.timeout_source if accepted_partial_timeout else None,
             ),
+            study_outcome_sequence=current_policy_state.max_sequence,
         )
     except NoFeasibleTrialError as exc:
         if run.deadline_exhausted:
@@ -1901,6 +1903,7 @@ def _replay_met_target(
                 reason=None,
                 timeout_scope=None,
             ),
+            study_outcome_sequence=resume.policy_state.max_sequence,
             verify_evidence=verify_evidence,
             emit_advisories=False,
         )
@@ -1920,6 +1923,7 @@ def _select_phase_winner(
     *,
     phase_fingerprint: str,
     completion: dict[str, Any],
+    study_outcome_sequence: int,
     verify_evidence: bool = True,
     emit_advisories: bool = True,
 ) -> Winner:
@@ -1931,6 +1935,7 @@ def _select_phase_winner(
     :param optuna.Study study: Study whose completed trials supply the winner.
     :param str phase_fingerprint: Verified semantic fingerprint for the phase.
     :param dict[str, Any] completion: Completion metadata persisted with the winner.
+    :param int study_outcome_sequence: Last durable outcome sequence that stood at selection.
     :param bool verify_evidence: Whether to verify the selected trial against its
         frozen evidence and warn if its environment differs from the current run.
     :param bool emit_advisories: Whether to log fresh selection diagnostics instead of silently replaying them.
@@ -1966,6 +1971,7 @@ def _select_phase_winner(
         completion=completion,
         phase_fingerprint=phase_fingerprint,
         study_name=study.study_name,
+        study_outcome_sequence=study_outcome_sequence,
         generation_id=selected.generation_id,
         attempt_id=selected.attempt_id,
         trial_dir=selected.trial_dir,

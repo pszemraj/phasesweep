@@ -133,6 +133,8 @@ class Winner:
     phase_fingerprint: str | None = None
     # Address of the study that selected this winner, including its reading settings.
     study_name: str | None = None
+    # Highest terminal outcome sequence when this study selected the winner.
+    study_outcome_sequence: int | None = None
     generation_id: str | None = None
     attempt_id: str | None = None
     # Name of the trial directory inside its phase that the source attempt ran in.
@@ -788,7 +790,7 @@ def _required_trial_dir(trial: FrozenTrial | Trial) -> Path:
     return Path(stored)
 
 
-GENERATION_SUMMARY_SCHEMA_VERSION = 9
+GENERATION_SUMMARY_SCHEMA_VERSION = 10
 PUBLICATION_POINTER_SCHEMA_VERSION = 2
 # Configuration and reproducibility files frozen into every generation namespace at claim time.
 GENERATION_CONFIG_SNAPSHOT_FILENAME = "config.snapshot.yaml"
