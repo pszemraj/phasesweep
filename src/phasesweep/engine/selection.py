@@ -794,11 +794,12 @@ def _untried_grid_cells(
 ) -> list[dict[str, object]]:
     """Return the cells of a grid that reached its target covering every cell, yet no trial ran.
 
-    Raising a grid's target after failures schedules the failed cells' retries ahead of the
-    cells it never reached, so a finished target can leave cells nobody tried, and nothing
-    else reports them. A target below the grid's size leaves cells out by design, and a
-    phase cut short by an accepted timeout reports its shortfall in the completion record,
-    so neither counts. The repeat axis counts as a grid axis.
+    A grid retries a failed cell only once every cell is drawn
+    (:func:`~phasesweep.engine.study_policy._scheduled_reruns`), so a finished target that
+    covers the grid has no untried cell; one is reported only if that rule is broken. A target
+    below the grid's size leaves cells out by design, and a phase cut short by an accepted
+    timeout reports its shortfall in the completion record, so neither counts. The repeat axis
+    counts as a grid axis.
 
     :param Phase | None phase: The phase, or ``None`` when selection has none.
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.

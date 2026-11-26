@@ -1816,7 +1816,7 @@ def _run_phase(
                                 break
                         if budget.deadline is not None:
                             timeout = max(0.0, budget.deadline - time.monotonic())
-                    recorded_reruns = _record_reruns(study)
+                    recorded_reruns = _record_reruns(study, phase)
                     if not recorded_reruns and not bounded:
                         break
             except BaseException as exc:

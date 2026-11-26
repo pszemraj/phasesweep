@@ -106,6 +106,7 @@ from phasesweep.engine.study_policy import (
     _recorded_outcome_sequence,
     _replayed_streak_abort,
     _scheduled_reruns,
+    _undrawn_grid_cells,
 )
 from phasesweep.engine.trial import TrialResult, _failed_trial, record_trial_result
 from phasesweep.engine.trial_dirs import (
@@ -665,7 +666,7 @@ def next_slot(study: optuna.Study, phase: Phase, launching: Collection[int] = ()
             if source not in launching:
                 return Slot(by_number[source], trial)
     scheduled = [
-        trial for trial in _scheduled_reruns(study, trials, phase) if trial.number not in launching
+        trial for trial in _scheduled_reruns(trials, phase) if trial.number not in launching
     ]
     return Slot(scheduled[0]) if scheduled else Slot(None)
 
@@ -1533,7 +1534,9 @@ def launch_batch(
     """Bound launches before the next slot a kept attempt could fill.
 
     Slots fill in allocation order, so launches stop at that slot and adoption runs again; with
-    no such slot the whole remaining target launches.
+    no such slot the whole remaining target launches. A grid with undrawn cells also stops once
+    its queued reruns and those cells have launched, since its failed-cell retries are queued
+    only after the last cell is drawn (:func:`~phasesweep.engine.study_policy._scheduled_reruns`).
 
     :param Experiment experiment: Current config.
     :param Phase phase: Phase whose target applies.
@@ -1541,7 +1544,11 @@ def launch_batch(
     :param Sequence[optuna.Study] others: The phase's other studies.
     :return int: Maximum launches before checking kept attempts again.
     """
-    remaining = max(0, phase.n_trials - _finished_trial_count(study.get_trials(deepcopy=False)))
+    trials = study.get_trials(deepcopy=False)
+    remaining = max(0, phase.n_trials - _finished_trial_count(trials))
+    if undrawn := _undrawn_grid_cells(phase, trials):
+        waiting = sum(trial.state == optuna.trial.TrialState.WAITING for trial in trials)
+        remaining = min(remaining, waiting + undrawn)
     pool, draws = kept_attempts(experiment, phase, study, others)
     if not pool:
         return remaining
@@ -1559,7 +1566,7 @@ def launch_batch(
         if isinstance(step, Launch):
             launches += 1
         else:
-            return max(1, launches)
+            return min(max(1, launches), remaining)
     return remaining
 
 

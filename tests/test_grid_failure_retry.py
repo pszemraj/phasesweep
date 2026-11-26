@@ -23,7 +23,7 @@ from phasesweep.engine.selection import (
     PhaseAbortRefusedError,
     _streak_at_limit_error,
 )
-from phasesweep.engine.state import PHASE_RECOVERY_ATTR
+from phasesweep.engine.state import PHASE_RECOVERY_ATTR, RERUN_OF_ATTR
 from phasesweep.engine.study_policy import _failure_policy_abort_record, _load_phase_policy_state
 from phasesweep.errors import REJUDGE_BOUNDS_STEP
 from phasesweep.evidence.models import LogRegexExtractor
@@ -50,11 +50,14 @@ def _grid(
     repeats: bool = False,
     cells: int = 2,
     metric: Metric | None = None,
+    n_jobs: int = 1,
 ) -> Experiment:
     """Build a persistent grid of ``cells`` cells, or two with the repeat axis."""
     phase = Phase(
         name="p",
         n_trials=target,
+        n_jobs=n_jobs,
+        allow_no_gpu_isolation=n_jobs > 1,
         max_consecutive_failures=2,
         sampler=Sampler(type="grid", seed=0),
         search_space={"x": IntParam(type="int", low=1, high=1 if repeats else cells)},
@@ -617,34 +620,33 @@ def test_winner_from_a_partly_failed_grid_names_the_cell_that_never_succeeded(
     assert _survivorship_warnings(caplog) == []
 
 
-def test_grid_winner_counts_the_cell_a_raised_target_never_reached(
+def test_a_raised_grid_target_draws_every_unvisited_cell_before_a_retry(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Failed-cell retries run before unvisited cells, so a finished target can skip a cell."""
+    """A grid stopped partway draws its last cell, then retries, though one parallel batch fits both."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=2)
     with pytest.raises(NoFeasibleTrialError):
-        run_experiment(_grid(tmp_path, trainer, 4, cells=4))
-    raised = _grid(tmp_path, trainer, 5, cells=4)
+        run_experiment(_grid(tmp_path, trainer, 3, cells=3))
+    raised = _grid(tmp_path, trainer, 4, cells=3, n_jobs=2)
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
         assert run_experiment(raised)["p"].metric == 1.0
     trials = phase_trials(raised)
-    assert [trial.state.name for trial in trials] == ["FAIL", "FAIL", *["COMPLETE"] * 3]
-    (missing,) = {1, 2, 3, 4} - {trial.params["x"] for trial in trials}
-    assert published_survivorship(raised) == {
-        "verdict": "heterogeneous",
-        "detail": {"ranked": 3, "infeasible": 0, "failed": 0, "untried": 1, "failed_trials": []},
-    }
+    assert [trial.state.name for trial in trials] == ["FAIL", "FAIL", "COMPLETE", "COMPLETE"]
+    assert RERUN_OF_ATTR not in trials[2].user_attrs
+    assert trials[3].user_attrs[RERUN_OF_ATTR] == 0
+    assert published_survivorship(raised)["detail"]["untried"] == 0
     (warning,) = _survivorship_warnings(caplog)
-    assert f"survivorship: 1 of 4 configurations has no result (x={missing} was never tried)" in (
-        warning
-    )
+    assert (
+        f"survivorship: 1 of 3 configurations has no result (trial 1 x={trials[1].params['x']} "
+        "failed)"
+    ) in warning
 
-    # The documented retry runs the cell that was never tried, and nothing flags afterwards.
+    # The next raise retries the cell still without a result, and nothing flags afterwards.
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
-        assert run_experiment(_grid(tmp_path, trainer, 6, cells=4))["p"].metric == 1.0
-    assert {trial.params["x"] for trial in phase_trials(raised)} == {1, 2, 3, 4}
+        assert run_experiment(_grid(tmp_path, trainer, 5, cells=3))["p"].metric == 1.0
+    assert {trial.params["x"] for trial in phase_trials(raised)} == {1, 2, 3}
     assert _survivorship_warnings(caplog) == []
 
 
