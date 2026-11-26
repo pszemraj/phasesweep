@@ -50,6 +50,7 @@ from phasesweep.engine.fingerprints import (
     _identity_payload,
     _identity_record,
     _inherited_values,
+    _judge_identity,
     _judge_record,
     _payload_search_space,
     _recorded_inheritance,
@@ -1352,6 +1353,34 @@ def _left_for_launch(
     return left
 
 
+def _identity_after_growth(
+    experiment: Experiment,
+    phase: Phase,
+    inherited: Mapping[str, object],
+    study: optuna.Study,
+    record: PhaseIdentityRecord,
+) -> PhaseIdentityRecord:
+    """Return the identity a run binds the study to before it adopts, growth included.
+
+    The run's fingerprint check records a grown search space before adoption
+    (:func:`~phasesweep.engine.fingerprints._judge_identity`), so a projection walks the cells and
+    draws the grown space adds. A config the study cannot continue under keeps the recorded
+    identity; the ordinary fingerprint check reports that refusal.
+
+    :param Experiment experiment: Current config.
+    :param Phase phase: The phase.
+    :param Mapping[str, object] inherited: The parent layer the phase inherits now.
+    :param optuna.Study study: The addressed study.
+    :param PhaseIdentityRecord record: Its recorded identity.
+    :return PhaseIdentityRecord: The identity the run would hold when it adopts.
+    """
+    try:
+        verdict = _judge_identity(study, experiment, phase, inherited)
+    except StudyFingerprintMismatchError:
+        return record
+    return record if verdict.record is None else verdict.record
+
+
 def plan_adoption(
     experiment: Experiment,
     phase: Phase,
@@ -1389,6 +1418,8 @@ def plan_adoption(
         if chosen is None:
             return None
         record, source = chosen
+    elif study is not None:
+        record = _identity_after_growth(experiment, phase, inherited, study, record)
     projections = []
     for assumed in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.FAIL):
         mirror = mirror_study(experiment, phase, study, study_name=study_name, record=record)

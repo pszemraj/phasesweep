@@ -751,3 +751,34 @@ def test_an_accepted_partial_result_replays_until_its_target_rises(
     run_experiment(raised)
     assert len(addressed_phase_study(raised).trials) == 8
     assert _launches(launches) == 8
+
+
+def test_a_grown_grid_is_judged_with_the_cells_its_growth_adds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Growth and adoption cover a grown grid, so neither the preview nor preflight needs a trainer."""
+    trainer, launches = _trainer(tmp_path)
+
+    def grid(n_trials: int, top: int) -> Phase:
+        space = {"x": CategoricalParam(type="categorical", choices=list(range(1, top + 1)))}
+        return _phase("grid", n_trials).model_copy(update={"search_space": space})
+
+    run_experiment(_config(tmp_path, trainer, grid(3, 3)))
+    run_experiment(_config(tmp_path, trainer, grid(6, 6), "acc"))
+    trainer.unlink()
+    grown = _config(tmp_path, trainer, grid(6, 6))
+    caplog.set_level(logging.INFO)
+
+    run_experiment(grown, dry_run=True)
+    run_experiment(grown)
+
+    assert "target met (6 of 6 trials recorded)" in caplog.text
+    assert sorted(row.params["x"] for row in addressed_phase_study(grown).trials) == [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+    ]
+    assert _launches(launches) == 6
