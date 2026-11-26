@@ -184,7 +184,7 @@ Within `phasesweep.engine`, responsibilities map to modules as follows:
 | Root ownership and retained evidence checks | `artifact_roots`, `evidence` |
 | Paths, state records, and fingerprints | `paths`, `state`, `fingerprints` |
 | Trial directory reuse, physical attempt lineage and the shared-evidence cutoff | `trial_dirs` |
-| Filling a study under changed reading settings and reusing sibling attempts | `reread` |
+| Re-reading the kept attempts of other reading studies into the addressed study | `reread` |
 | Growing a search space in place, and the grid cell order across its recorded spaces | `growth`, `grid_order` |
 | Advisory confound verdicts on the ranked population, frozen at selection | `confound` |
 | Publication and read-only views | `generation`, `publication`, `publication_validation`, `read` |
@@ -200,7 +200,7 @@ flowchart TD
     cli["CLI or detached MCP runner"] --> run["run.run_experiment"]
     run --> preflight["take experiment lock, check and bind artifact root and ledger, preflight attempts"]
     preflight --> phase["phase._run_phase"]
-    phase --> retained["fill from retained evidence and reuse sibling attempts when available"]
+    phase --> retained["re-read kept attempts of other reading studies when available"]
     retained --> work{"trials to launch?"}
     work -->|yes| claim["pass launch checks and claim the generation once"]
     work -->|no| select
