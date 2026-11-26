@@ -1354,19 +1354,26 @@ def open_preview_study(
     """Create a fresh in-memory study for a dry run without resolving configured storage.
 
     Its draws depend on the phase's namespace alone, so it samples what any study of the
-    phase would.
+    phase would. Optuna announces each new study at INFO, which no reader of a projection
+    should see, so its logging stays at WARNING or above while the study is built, whatever
+    console setup the caller has.
 
     :param Experiment experiment: Parsed experiment supplying direction and study name.
     :param Phase phase: Phase whose sampler and search space the preview uses.
     :param str | None study_name: Address when projecting a known study, defaults to the phase namespace.
     :return optuna.Study: Fresh in-memory study for the phase.
     """
-    return _build_phase_study(
-        experiment,
-        phase,
-        None,
-        study_name or _phase_namespace(experiment.experiment, phase.name),
-    )
+    previous = optuna.logging.get_verbosity()
+    optuna.logging.set_verbosity(max(previous, optuna.logging.WARNING))
+    try:
+        return _build_phase_study(
+            experiment,
+            phase,
+            None,
+            study_name or _phase_namespace(experiment.experiment, phase.name),
+        )
+    finally:
+        optuna.logging.set_verbosity(previous)
 
 
 def _require_replay_matches_snapshot(

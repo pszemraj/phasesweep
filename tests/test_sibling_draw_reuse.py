@@ -824,3 +824,25 @@ def test_status_judges_a_grown_grid_target_over_the_attempts_it_adopts(tmp_path:
     run_experiment(grown)
     assert len(addressed_phase_study(grown).trials) == 4
     assert _launches(launches) == 4
+
+
+def test_projecting_adoption_prints_no_optuna_study_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Status of a phase other readings hold kept attempts for stays free of Optuna's notices."""
+    trainer, _ = _trainer(tmp_path)
+    run_experiment(_config(tmp_path, trainer, _phase("random", 3)))
+    changed = _config(tmp_path, trainer, _phase("random", 4), "acc")
+    previous = optuna.logging.get_verbosity()
+    optuna.logging.set_verbosity(optuna.logging.INFO)
+    notices: list[str] = []
+    handler = logging.Handler()
+    monkeypatch.setattr(handler, "emit", lambda record: notices.append(record.getMessage()))
+    logging.getLogger("optuna").addHandler(handler)
+    try:
+        inspect_status(changed, validate_ledger(changed))
+    finally:
+        logging.getLogger("optuna").removeHandler(handler)
+        optuna.logging.set_verbosity(previous)
+
+    assert not [notice for notice in notices if "A new study created in memory" in notice]
