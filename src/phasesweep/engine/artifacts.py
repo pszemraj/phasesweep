@@ -380,12 +380,9 @@ def _matches_with_previous_reading(
     except ValueError:
         # The snapshot may support publication inspection without loading as a full config.
         return False
-    previous_reader = experiment.model_copy(
-        update={"metric": previous.metric, "constraints": previous.constraints}
-    )
-    previous_gates = phase.model_copy(update={"gates": previous.phase(phase.name).gates})
+    previous_reader, previous_phase = fingerprint_ops.with_reading_of(experiment, phase, previous)
     return (
-        fingerprint_ops._phase_fingerprint(previous_reader, previous_gates, inherited_winners)
+        fingerprint_ops._phase_fingerprint(previous_reader, previous_phase, inherited_winners)
         == stored_fingerprint
     )
 

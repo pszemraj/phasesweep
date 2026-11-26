@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import optuna
+from pydantic.main import IncEx
 
 from phasesweep.config.common import TRACKER_READ_CONTROLS
 from phasesweep.config.models import Experiment, Phase, _wandb_query
@@ -59,7 +60,8 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_partial_grid",
     }
 )
-#: Where W&B read controls sit inside a dumped phase: a summary-presence gate carries them.
+#: The phase's reading settings, each with where W&B read controls sit inside it: a
+#: summary-presence gate carries them, and every dump of a phase leaves them out.
 _PHASE_READ_CONTROLS = {"gates": {"__all__": set(TRACKER_READ_CONTROLS)}}
 # Increment the schema versions when their fingerprint payloads change.
 FINGERPRINT_SCHEMA_VERSION = 14
@@ -122,29 +124,32 @@ def _trainer_core(experiment: Experiment) -> JsonObject:
     return json_object(json.loads(json.dumps(core, default=str)))
 
 
+_EXTRACTOR_EXCLUDE: dict[str, IncEx | bool] = {
+    **dict.fromkeys(_BOUND_KEYS, True),
+    "extractor": set(TRACKER_READ_CONTROLS),
+}
+#: The experiment's reading settings, each with what its dump leaves out. The metric's name
+#: only labels output, since every extractor reads by its own key, and a tracker's read
+#: controls only bound the read, so neither is part of any identity. The bounds
+#: (:data:`_BOUND_KEYS`) judge what was read (:mod:`phasesweep.engine.bounds`):
+#: :func:`_experiment_semantic_fingerprint` adds them back for a published result.
+_EXPERIMENT_READING: dict[str, IncEx | bool] = {
+    "metric": {"name": True, **_EXTRACTOR_EXCLUDE},
+    "constraints": {"__all__": _EXTRACTOR_EXCLUDE},
+}
+
+
 def _experiment_reading(experiment: Experiment) -> JsonObject:
     """Return the experiment-level settings that say how a finished trainer's output is read.
 
-    The metric's name only labels output, since every extractor reads by its own key, and a
-    tracker's read controls only bound the read, so neither is part of any identity. The
-    bounds (:data:`_BOUND_KEYS`) judge what was read (:mod:`phasesweep.engine.bounds`):
-    :func:`_experiment_semantic_fingerprint` adds them back for a published result.
-
-    :param Experiment experiment: Experiment whose metric and constraints are read.
+    :param Experiment experiment: Experiment whose reading settings
+        (:data:`_EXPERIMENT_READING`) are read.
     :return JsonObject: The metric's goal and extractor and each constraint's name and
         extractor.
     """
-    extractor_exclude = {"extractor": set(TRACKER_READ_CONTROLS)}
-    bound_exclude = dict.fromkeys(_BOUND_KEYS, True)
-    reading = {
-        "metric": experiment.metric.model_dump(
-            mode="json", exclude={"name": True, **bound_exclude, **extractor_exclude}
-        ),
-        "constraints": [
-            c.model_dump(mode="json", exclude={**bound_exclude, **extractor_exclude})
-            for c in experiment.constraints
-        ],
-    }
+    reading = experiment.model_dump(
+        mode="json", include=set(_EXPERIMENT_READING), exclude=_EXPERIMENT_READING
+    )
     return json_object(json.loads(json.dumps(reading, default=str)))
 
 
@@ -170,8 +175,30 @@ def reading_settings(experiment: Experiment, phase: Phase) -> JsonObject:
     :param Phase phase: Phase supplying the gates.
     :return JsonObject: The settings, normalized to the JSON representation being hashed.
     """
-    gates = phase.model_dump(mode="json", include={"gates"}, exclude=_PHASE_READ_CONTROLS)
+    gates = phase.model_dump(
+        mode="json", include=set(_PHASE_READ_CONTROLS), exclude=_PHASE_READ_CONTROLS
+    )
     return {**_experiment_reading(experiment), **json_object(gates)}
+
+
+def with_reading_of(
+    experiment: Experiment, phase: Phase, source: Experiment
+) -> tuple[Experiment, Phase]:
+    """Return copies of an experiment and phase carrying another config's reading settings.
+
+    The fields copied are the ones :func:`reading_settings` reads, so the copy differs from
+    ``source`` in nothing a reading setting covers and from ``experiment`` in nothing else.
+
+    :param Experiment experiment: Experiment supplying every setting but the reading.
+    :param Phase phase: Phase of ``experiment`` supplying every setting but the gates.
+    :param Experiment source: Config supplying the reading, holding a phase of the same name.
+    :return tuple[Experiment, Phase]: The experiment and phase under ``source``'s reading.
+    """
+    source_phase = source.phase(phase.name)
+    return (
+        experiment.model_copy(update={k: getattr(source, k) for k in _EXPERIMENT_READING}),
+        phase.model_copy(update={k: getattr(source_phase, k) for k in _PHASE_READ_CONTROLS}),
+    )
 
 
 def _experiment_semantic_fingerprint(
