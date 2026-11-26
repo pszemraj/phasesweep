@@ -142,12 +142,20 @@ def _deliver(
         "binding": delivery.binding,
         "projection": delivery.projection,
         "finish": delivery.finish,
-        "historical": reading is not None and reading.generation_id != delivery.generation_id,
+        "historical": False,
     }
+    if reading is not None and reading.generation_id != delivery.generation_id:
+        if path.stem.startswith("attempt-") and reading.content == _content(
+            delivery.projection, delivery.finish
+        ):
+            # One pending upload covers both readings. Apply the newest winner verdict.
+            action["current_winner"] = reading.winner
+        else:
+            action["historical"] = True
     call_tracking(
         experiment, worker_generation or delivery.generation_id, action, environment, deadline
     )
-    # A lost acknowledgement resends the same projection on the next sync.
+    # The record keeps its original reading for retries and history.
     write_record(path, {**delivery.record, "state": "delivered"})
 
 
@@ -338,7 +346,7 @@ def _records(experiment: Experiment, scope: str | None, *, skip: str | None = No
 
 
 def _pending_records(
-    experiment: Experiment, scope: str | None, *, skip: str | None = None
+    experiment: Experiment, scope: str | None, *, skip: str | None = None, shared: bool = False
 ) -> list[Path]:
     """List the delivery records in scope that are still to be sent, in sending order.
 
@@ -349,6 +357,8 @@ def _pending_records(
     :param Experiment experiment: Configured experiment.
     :param str | None scope: One generation, or ``None`` for every generation.
     :param str | None skip: Generation left out, a live invocation's own.
+    :param bool shared: Include an earlier pending upload that supplies a coalesced reading
+        in a scoped delivery or count.
     :raises OSError: A record cannot be read.
     :raises ValueError: A record is malformed.
     :return list[Path]: Undelivered records, each generation's as :func:`_records` orders them.
@@ -357,14 +367,56 @@ def _pending_records(
     pending: list[Path] = []
     for path in _records(experiment, scope, skip=skip):
         delivery = _read_delivery(path)
-        if not delivery.delivered:
-            generation_id = path.parent.parent.name
-            oldest[generation_id] = min(
-                oldest.get(generation_id, delivery.timestamp), delivery.timestamp
-            )
-            pending.append(path)
+        if delivery.delivered:
+            if not shared or scope is None or not path.stem.startswith("attempt-"):
+                continue
+            earlier = _shared_pending_attempt(experiment, path, delivery)
+            if earlier is None:
+                continue
+            path, delivery = earlier
+        generation_id = path.parent.parent.name
+        oldest[generation_id] = min(
+            oldest.get(generation_id, delivery.timestamp), delivery.timestamp
+        )
+        pending.append(path)
     # A stable sort keeps each generation's records in the order _records gives them.
     return sorted(pending, key=lambda path: oldest[path.parent.parent.name])
+
+
+def _shared_pending_attempt(
+    experiment: Experiment, path: Path, delivery: _Delivery
+) -> tuple[Path, _Delivery] | None:
+    """Find the pending upload a scoped attempt may share through equivalent readings.
+
+    The first different reading ends the chain. The active scope can send its equivalent
+    predecessor while leaving that generation's independent uploads pending.
+
+    :param Experiment experiment: Configured experiment.
+    :param Path path: Attempt record in the scope.
+    :param _Delivery delivery: Its saved reading.
+    :raises OSError: An earlier record cannot be read.
+    :raises ValueError: An earlier record is malformed.
+    :return tuple[Path, _Delivery] | None: The shared upload and its reading, if pending.
+    """
+    previous: list[tuple[Path, _Delivery]] = []
+    for candidate in tracking_root(experiment).glob(f"*/{DELIVERY_DIR}/{path.name}"):
+        if candidate == path:
+            continue
+        reading = _read_delivery(candidate)
+        if (
+            reading.timestamp < delivery.timestamp
+            and reading.binding == delivery.binding
+            and reading.source == delivery.source
+            and reading.generation_id == candidate.parent.parent.name
+        ):
+            previous.append((candidate, reading))
+    content = _content(delivery.projection, delivery.finish)
+    for candidate, reading in sorted(previous, key=lambda item: item[1].timestamp, reverse=True):
+        if _content(reading.projection, reading.finish) != content:
+            break
+        if not reading.delivered:
+            return candidate, reading
+    return None
 
 
 def _save_intent(
@@ -414,7 +466,6 @@ class _Shown(NamedTuple):
     winner: bool
     """The record's generation selected the attempt, so its run carries the winner tag."""
     generation_id: str
-    delivered: bool
 
 
 def _content(projection: Mapping[str, object], finish: str | None) -> JsonObject:
@@ -471,7 +522,6 @@ def _shown_attempts(experiment: Experiment) -> dict[str, _Shown]:
                 _content(delivery.projection, delivery.finish),
                 (path.parent.parent.name, attempt_id) in selected,
                 delivery.generation_id,
-                delivery.delivered,
             )
     return shown
 
@@ -749,8 +799,8 @@ def _save_attempt_intents(
         """Save one record, delivered when its run shows it or a newer reading already.
 
         A run an earlier reading selected shows the winner tag, so a reading that does not
-        select it is sent to remove the tag even when it changes nothing else. A pending
-        older reading cannot stand in for a newer one, since the older upload will be historical.
+        select it is sent to remove the tag even when it changes nothing else. An equivalent
+        pending upload applies the newest verdict on retry.
         """
         if timestamp is not None:
             projection["timestamp"] = timestamp
@@ -761,8 +811,7 @@ def _save_attempt_intents(
             and (
                 newest.timestamp > projection["timestamp"]
                 or (
-                    newest.delivered
-                    and newest.content == _content(projection, finish)
+                    newest.content == _content(projection, finish)
                     and (not newest.winner or WINNER_TAG in projection["tags"])
                 )
             )
@@ -1469,7 +1518,7 @@ def _deliver_outstanding(
             experiment, [*generations, *([skip] if skip is not None and own is not None else [])]
         )
         own_pending = [path for path in own or [] if not _read_delivery(path).delivered]
-        pending = _pending_records(experiment, scope, skip=skip)
+        pending = _pending_records(experiment, scope, skip=skip, shared=True)
         if not tally.sending or not (creations or unbound or pending or own_pending):
             return
         environment = _environment_identity(experiment, experiment.phases[0].name).values
@@ -1525,7 +1574,7 @@ def _deliver_outstanding(
             )
             if skip is not None and skip in unbound:
                 own_pending = _save_published(experiment, ledger, skip)
-            pending = _pending_records(experiment, scope, skip=skip)
+            pending = _pending_records(experiment, scope, skip=skip, shared=True)
             if tally.sending and (pending or own_pending):
                 _report_sending(pending, own_pending)
         _send(
@@ -1772,37 +1821,43 @@ class DeliveryCounts(NamedTuple):
         return self.records + self.creations
 
 
-def delivery_counts(experiment: Experiment, generation_id: str | None = None) -> DeliveryCounts:
+def delivery_counts(
+    experiment: Experiment, generation_id: str | None = None, *, shared: bool = False
+) -> DeliveryCounts:
     """Count pending run creations and delivery records without importing the tracking SDK.
 
     :param Experiment experiment: Local namespace.
     :param str | None generation_id: Optional generation filter.
+    :param bool shared: Count the earlier uploads that a scoped sync also retries.
     :raises OSError: A record cannot be read.
     :raises ValueError: A record is malformed.
     :return DeliveryCounts: Pending records and creations, and delivered records.
     """
-    records = delivered = 0
-    for path in _records(experiment, generation_id):
-        if _read_delivery(path).delivered:
-            delivered += 1
-        else:
-            records += 1
+    paths = _records(experiment, generation_id)
+    records = (
+        len(_pending_records(experiment, generation_id, shared=True))
+        if shared and generation_id is not None
+        else sum(not _read_delivery(path).delivered for path in paths)
+    )
     # A published generation's summary run still to be created counts as an unconfirmed creation.
     unbound = _unbound_summaries(experiment, _delivery_generations(experiment, generation_id, None))
     creations = len(pending_creation_records(experiment, generation_id)) + len(unbound)
-    return DeliveryCounts(records, creations, delivered)
+    return DeliveryCounts(records, creations, len(paths) - records)
 
 
-def delivery_status(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
+def delivery_status(
+    experiment: Experiment, generation_id: str | None = None, *, shared: bool = False
+) -> dict[str, int]:
     """Count what is pending and delivered, for the status surfaces that report both.
 
     :param Experiment experiment: Local namespace.
     :param str | None generation_id: Optional generation filter.
+    :param bool shared: Count the earlier uploads that a scoped sync also retries.
     :raises OSError: A record cannot be read.
     :raises ValueError: A record is malformed.
     :return dict[str, int]: Path-free pending and delivered counts.
     """
-    counts = delivery_counts(experiment, generation_id)
+    counts = delivery_counts(experiment, generation_id, shared=shared)
     return {"pending": counts.pending, "delivered": counts.delivered}
 
 
@@ -1895,7 +1950,7 @@ def sync_tracking(
                     "experiment has saved an MLflow record yet."
                 ),
             )
-        counts = delivery_status(experiment, generation_id)
+        counts = delivery_status(experiment, generation_id, shared=True)
         if errors:
             detail = "\n".join(str(error) for error in errors)
             raise TrackingSyncRefusedError.rewrap(

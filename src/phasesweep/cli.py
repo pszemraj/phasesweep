@@ -1639,7 +1639,7 @@ def _sync_stopped_text(config: Experiment, generation_id: str | None, command: s
     from phasesweep.tracking.session import count_text
 
     try:
-        counts = delivery_counts(config, generation_id)
+        counts = delivery_counts(config, generation_id, shared=True)
     except (OSError, ValueError) as exc:
         stopped = f"phasesweep: stopped; what stays pending could not be counted ({exc})."
     else:

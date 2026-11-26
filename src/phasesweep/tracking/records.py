@@ -167,6 +167,7 @@ class PublishAction(TypedDict):
     projection: JsonObject
     finish: str | None
     historical: bool
+    current_winner: NotRequired[bool]
 
 
 TrackingAction: TypeAlias = ResolveAction | CreateAction | FindAction | PublishAction
@@ -221,6 +222,7 @@ class PublishRequest(TypedDict):
     projection: Projection
     finish: str | None
     historical: NotRequired[bool]
+    current_winner: NotRequired[bool | None]
 
 
 _IDENTITY_ADAPTER: TypeAdapter[RunIdentity] = TypeAdapter(RunIdentity)

@@ -789,6 +789,7 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
     Projection-specific artifact names keep winner uploads distinct from trial summaries.
     Historical uploads preserve metric points and generation-specific winner tags. The shared
     artifacts, tags and status belong to the newest reading, even when an older upload retries.
+    An upload shared by equivalent attempts takes the newest reading's winner verdict.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param PublishRequest request: Trusted target, bound run, and projection.
@@ -815,6 +816,11 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
     ):
         raise ValueError("MLflow run ended unsuccessfully; it cannot be finished.")
     tags = dict(projection["tags"])
+    current_winner = request.get("current_winner")
+    if current_winner is True:
+        tags[WINNER_TAG] = "true"
+    elif current_winner is False:
+        tags.pop(WINNER_TAG, None)
     if historical:
         tags = {
             key: value
@@ -945,6 +951,7 @@ def _dispatch(request: JsonObject) -> JsonObject:
         )
         return json_object(captured)
     if action == "publish":
+        current_winner = request.get("current_winner")
         return _publish(
             client,
             {
@@ -955,6 +962,7 @@ def _dispatch(request: JsonObject) -> JsonObject:
                 "projection": _projection(request["projection"]),
                 "finish": json_optional_text(request, "finish"),
                 "historical": request.get("historical") is True,
+                "current_winner": current_winner if isinstance(current_winner, bool) else None,
             },
         )
     raise ValueError("Unknown internal MLflow operation.")

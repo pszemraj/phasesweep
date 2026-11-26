@@ -98,6 +98,35 @@ def test_a_run_ends_on_the_newest_of_two_pending_readings(tmp_path, monkeypatch)
     assert f"phasesweep.winner_generation.{newer}" in winners[-1]["projection"]["tags"]
 
 
+def test_scoped_sync_delivers_an_equivalent_older_pending_attempt(tmp_path, monkeypatch):
+    """The newest scope includes the pending attempt upload its reading shares."""
+    config, uploads, attempt = _reread_setup(tmp_path, monkeypatch)
+    experiment = Experiment.model_validate(config)
+    newer_config = deepcopy(config)
+    newer_config["metric"]["goal"] = "maximize"
+    newest = Experiment.model_validate(newer_config)
+    older, newer = "f" * 32, "0" * 32
+    with monkeypatch.context() as outage:
+        _silent_tracker(outage)
+        assert run_experiment(experiment, generation_id=older)["depth"].metric == 3.0
+        assert run_experiment(newest, generation_id=newer)["depth"].metric == 3.0
+    name = f"attempt-{attempt}"
+    earlier_path = session.delivery_record_path(experiment, older, name)
+    later_path = session.delivery_record_path(experiment, newer, name)
+    before = session.read_record(earlier_path)
+    assert before["state"] == "pending"
+    assert session.read_record(later_path)["state"] == "delivered"
+    assert _run_shows(uploads, attempt) == ("FINISHED", 1.0, 1.0)
+    assert publication.delivery_counts(newest, newer, shared=True).records == 3
+
+    assert publication.sync_tracking(newest, newer)["pending"] == 0
+    assert _run_shows(uploads, attempt) == ("FINISHED", 3.0, 3.0)
+    assert session.read_record(earlier_path) == {**before, "state": "delivered"}
+    attempts_sent = sum(request["name"] == name for request in uploads)
+    assert publication.sync_tracking(newest)["pending"] == 0
+    assert sum(request["name"] == name for request in uploads) == attempts_sent
+
+
 def test_rebuilding_an_older_generations_records_keeps_the_newer_reading(tmp_path, monkeypatch):
     """Records rebuilt for a generation that has none left take its lifecycle record's time."""
     config, uploads, attempt = _reread_setup(tmp_path, monkeypatch)
@@ -161,14 +190,20 @@ def test_rebuilding_a_past_reading_excludes_trials_added_later(tmp_path, monkeyp
         assert record["binding"] == retained[name]["binding"]
 
 
-@pytest.mark.parametrize("newest_first", [False, True], ids=["in-order", "scoped-newest-first"])
-def test_the_winner_tag_moves_with_the_newest_reading(tmp_path, monkeypatch, newest_first):
+@pytest.mark.parametrize(
+    "newest_first, same_values",
+    [(False, False), (True, False), (True, True)],
+    ids=["in-order", "scoped-newest-first", "scoped-coalesced"],
+)
+def test_the_winner_tag_moves_with_the_newest_reading(
+    tmp_path, monkeypatch, newest_first, same_values
+):
     """The latest reading owns the winner tag and artifact even when an older upload retries."""
     pytest.importorskip("mlflow")
     config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config.update(storage="auto", phases=config["phases"][:1])
     respond = worker.request_operation
-    readings = iter([(1.0, 3.0), (2.0, 2.0)])  # each attempt's eval/loss and cost, first seen first
+    readings = iter([(1.0, 1.0), (2.0, 2.0)] if same_values else [(1.0, 3.0), (2.0, 2.0)])
     values: dict[str, tuple[float, float]] = {}
     runs: dict[str, SimpleNamespace] = {}
     artifacts: dict[tuple[str, str], object] = {}
@@ -205,12 +240,25 @@ def test_the_winner_tag_moves_with_the_newest_reading(tmp_path, monkeypatch, new
     original = Experiment.model_validate(config)
     first = run_experiment(original, terminal_callback=reports.append)
     config["metric"]["extractor"]["metric_key"] = "cost"
+    if same_values:
+        config["metric"]["goal"] = "maximize"
     changed = Experiment.model_validate(config)
     if newest_first:
         with monkeypatch.context() as outage:
             _silent_tracker(outage)
             second = run_experiment(changed, terminal_callback=reports.append)
             run_experiment(original, terminal_callback=reports.append)
+        if same_values:
+            first_name = f"attempt-{first['depth'].attempt_id}"
+            older_path = session.delivery_record_path(
+                original, reports[1].generation_id, first_name
+            )
+            newer_path = session.delivery_record_path(
+                original, reports[2].generation_id, first_name
+            )
+            older_record = session.read_record(older_path)
+            assert older_record["state"] == "pending"
+            assert session.read_record(newer_path)["state"] == "delivered"
         assert publication.sync_tracking(original, reports[2].generation_id)["pending"] == 0
         newest_artifacts = dict(artifacts)
         assert publication.sync_tracking(original)["pending"] == 0
@@ -218,6 +266,8 @@ def test_the_winner_tag_moves_with_the_newest_reading(tmp_path, monkeypatch, new
         summary = artifacts.pop((f"run-{reports[1].generation_id}", "generation.json"))
         assert summary["generation_id"] == reports[1].generation_id
         assert artifacts == newest_artifacts
+        if same_values:
+            assert session.read_record(older_path) == {**older_record, "state": "delivered"}
     else:
         second = run_experiment(changed, terminal_callback=reports.append)
     earlier, later = first["depth"].attempt_id, second["depth"].attempt_id
