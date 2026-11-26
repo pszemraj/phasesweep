@@ -1645,7 +1645,7 @@ def _run_phase(
         lambda: adopted.append(adopt(before_launch=True)),
     )
     if not study.get_trials(deepcopy=False):
-        note = new_study_note(phase, inherited, others)
+        note = new_study_note(experiment, phase, inherited, others)
         if note is not None:
             report.info("%s  %s", phase.name, note)
     # Preflight checks root studies before their rows can change and before child

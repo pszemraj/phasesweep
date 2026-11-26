@@ -13,6 +13,7 @@ from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Sampler
 from phasesweep.engine.fingerprints import phase_study_name
 from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.errors import PhaseSweepError
 from phasesweep.evidence.models import JsonExtractor
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import make_experiment, write_trainer
@@ -232,6 +233,38 @@ def test_a_changed_parent_winner_runs_the_child_in_a_new_study_and_a_reverted_on
     assert run_experiment(reverted)["child"].effective_overrides["x"] == 3
     assert sorted(_calls(calls)[before:]) == ["3,0", "5,0"]
     assert sorted(len(trials) for trials in _child_studies(reverted).values()) == [2, 2]
+
+
+@pytest.mark.integration
+def test_the_new_study_note_names_the_published_inherited_value_as_its_old_one(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With three readings of the parent, the note's old value is the one the last-success publication ran under, not the one the newest study holds."""
+    trainer = write_trainer(
+        tmp_path / "failing_trainer.py",
+        """
+        import argparse
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out")
+        ap.add_argument("--x", type=int, default=0)
+        ap.add_argument("--y", type=int)
+        args, _ = ap.parse_known_args()
+        if args.y is not None and args.x == 1:
+            raise SystemExit(3)
+        print(f"x={args.x + (args.y or 0)}")
+        """,
+    )
+    run_experiment(_plan(tmp_path, trainer, [3, 5]))
+    with pytest.raises(PhaseSweepError):
+        run_experiment(_plan(tmp_path, trainer, [3, 5, 1]))
+    assert len(_child_studies(_plan(tmp_path, trainer, [3, 5]))) == 2
+
+    with caplog.at_level(logging.INFO, logger="phasesweep"):
+        winners = run_experiment(_plan(tmp_path, trainer, [3, 5, 1, 0]))
+
+    assert winners["child"].effective_overrides["x"] == 0
+    assert "child  inherits x: 3 -> 0, so it starts a new study;" in caplog.text
+    assert "x: 1 -> 0" not in caplog.text
 
 
 @pytest.mark.integration

@@ -612,30 +612,60 @@ def restore_or_rename_step(phase: Phase, *, recorded: str) -> str:
     return f"Restore {recorded}, or {rename_step(phase.name)}."
 
 
+def _published_inheritance(experiment: Experiment, phase: Phase, keys: Sequence[str]) -> JsonObject:
+    """Read the values the phase's published winner ran under for the given inherited keys.
+
+    :param Experiment experiment: The experiment whose last-success pointer is resolved.
+    :param Phase phase: The phase whose published winner is read.
+    :param Sequence[str] keys: The inherited keys to read.
+    :return JsonObject: The published values by key; empty when no validated publication holds
+        a winner of the phase.
+    """
+    from phasesweep.engine.publication import _resolve_publication_pointer
+
+    published = _resolve_publication_pointer(experiment).validated
+    winner = None if published is None else published.winners.get(phase.name)
+    effective = None if winner is None else winner.payload.get("effective_overrides")
+    if not isinstance(effective, dict):
+        return {}
+    return json_object({key: effective[key] for key in keys if key in effective})
+
+
 def new_study_note(
+    experiment: Experiment,
     phase: Phase,
     inherited: Mapping[str, object],
     others: Sequence[optuna.Study],
 ) -> str | None:
     """Say why a phase starts a new study beside the ones it already has, and that they stay.
 
+    The old values are the ones the last-success publication's winner of this phase ran under,
+    which the operator last saw; with no such winner the line gives the new values alone.
+
+    :param Experiment experiment: The experiment whose publication names the old values.
     :param Phase phase: The phase whose addressed study holds no trials yet.
     :param Mapping[str, object] inherited: The parent layer it now inherits.
     :param Sequence[optuna.Study] others: The phase's other studies, oldest first.
-    :raises StudySchemaMismatchError: The most recent populated study's identity is malformed.
     :return str | None: The sentence, or None when no other study holds a trial.
     """
-    populated = [(study, study.get_trials(deepcopy=False)) for study in others]
-    populated = [(study, trials) for study, trials in populated if trials]
+    populated = [study.get_trials(deepcopy=False) for study in others]
+    populated = [trials for trials in populated if trials]
     if not populated:
         return None
-    latest, trials = populated[-1]
-    record = _recorded_identity(latest)
-    recorded = None if record is None else record["payload"].get("inherited_effective_overrides")
     current = _inherited_values(phase, inherited)
-    changes = _changed_payload_keys(recorded if isinstance(recorded, dict) else {}, current)
-    change = f"inherits {format_changed_keys(changes) or 'different values'}"
-    return f"{change}, so it starts a new study; the earlier study keeps its {plural(len(trials), 'trial')}."
+    published = _published_inheritance(experiment, phase, list(current))
+    changes = _changed_payload_keys(published, current)
+    if published or not changes:
+        change = format_changed_keys(changes) or "different values"
+    else:
+        shown = [f"{path}: {_render_value(new)}" for path, _old, new in changes]
+        change = "; ".join(shown[:_MAX_REPORTED_CHANGES])
+        if len(shown) > _MAX_REPORTED_CHANGES:
+            change += f"; and {len(shown) - _MAX_REPORTED_CHANGES} more"
+    return (
+        f"inherits {change}, so it starts a new study; "
+        f"the earlier study keeps its {plural(len(populated[-1]), 'trial')}."
+    )
 
 
 def _identity_record(

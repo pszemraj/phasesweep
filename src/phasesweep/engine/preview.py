@@ -302,6 +302,7 @@ def _addressed_record(
             return name, replace(record, plan=plan)
     if record.study is None or not record.study.get_trials(deepcopy=False):
         note = new_study_note(
+            experiment,
             phase,
             inherited,
             [r.study for r in recorded if r.study is not None and r.study.study_name != name],
