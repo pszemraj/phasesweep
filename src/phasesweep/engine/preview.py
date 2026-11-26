@@ -672,6 +672,9 @@ def _preview_adoption(
                 retries = retry_target_ceiling(phase, finished=0, measured=0) is not None
                 high_or_unknown = None if retries else low
         for outcome, judged in zip(("measures", "fails"), verdicts, strict=True):
+            if isinstance(judged, ReplayWithoutFeasibleTrialError) and len(refusals) == 1:
+                # Every changed reading of a finished phase has this outcome if no read measures.
+                continue
             if isinstance(judged, PhaseAbortRefusedError):
                 warn_dry_run(
                     "phase=%s aborts if every re-read %s (max_consecutive_failures=%d)",

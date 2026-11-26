@@ -1363,7 +1363,7 @@ def test_a_dry_run_says_it_would_re_read_and_writes_nothing(
         "evidence and launch no trials"
     ) in messages
     assert "DRY RUN total: would launch 0 trials across 0 phases" in caplog.text
-    assert "phase replays" not in caplog.text
+    assert "phase replays" not in caplog.text and "DRY RUN warning" not in caplog.text
 
 
 def test_validate_counts_kept_grid_trials_when_the_reading_settings_change(
