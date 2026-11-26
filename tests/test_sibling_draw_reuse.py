@@ -22,6 +22,7 @@ from phasesweep.engine.errors import (
     TrialTargetRefusedError,
 )
 from phasesweep.engine.ledger import validate_ledger
+from phasesweep.engine.optuna import _draw_positions
 from phasesweep.engine.read import inspect_status, read_status
 from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import (
@@ -938,3 +939,192 @@ def test_an_accepted_partial_result_keeps_an_adopted_interrupted_trial_as_record
     assert "kept 1 interrupted trial as recorded" in caplog.text
     assert "continue from its checkpoint" not in caplog.text
     assert _launches(launches) == 3
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("case", ["restart", "full-union", "interrupted-retry"])
+def test_partial_boundary_replays_past_an_unrelated_grid_retry(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    case: Literal["restart", "full-union", "interrupted-retry"],
+) -> None:
+    """Keep the accepted cohort and retry ancestry across a stopped re-read and a later top-up."""
+    (tmp_path / "case").write_text(case)
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import argparse, json, time
+        from pathlib import Path
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", type=Path)
+        parser.add_argument("--x", type=int)
+        args = parser.parse_args()
+        count = Path(__file__).with_name("count")
+        launch = int(count.read_text()) + 1 if count.exists() else 1
+        count.write_text(str(launch))
+        checkpoint = args.out.with_name("checkpoint")
+        previous = checkpoint.read_text() if checkpoint.exists() else "fresh"
+        with Path(__file__).with_name("starts").open("a") as starts:
+            print(args.out.parent, previous, file=starts)
+        checkpoint.write_text(str(launch))
+        interrupted_retry = Path(__file__).with_name("case").read_text() == "interrupted-retry"
+        if launch == (3 if interrupted_retry else 4):
+            time.sleep(60)
+        data = {"loss": args.x, "acc": args.x}
+        if launch == 1:
+            del data["loss"]
+        if launch == (1 if interrupted_retry else 2):
+            del data["acc"]
+        args.out.write_text(json.dumps(data))
+        """,
+    )
+    original = _phase("grid", 2).model_copy(
+        update={
+            "sampler": Sampler(type="grid", seed=19),
+            "search_space": {"x": CategoricalParam(type="categorical", choices=[1, 2, 3, 4])},
+            "allow_incomplete_on_timeout": True,
+        },
+    )
+    target = original.model_copy(update={"n_trials": 5})
+    returning = _config(tmp_path, trainer, target)
+    donor = _config(
+        tmp_path, trainer, target.model_copy(update={"timeout_seconds_per_phase": 3}), "acc"
+    )
+    run_experiment(_config(tmp_path, trainer, original))
+    run_experiment(_config(tmp_path, trainer, original, "acc"))
+    donor_finished = 2 if case == "interrupted-retry" else 3
+    assert run_experiment(donor)["p"].completion["finished_trials"] == donor_finished
+    donor_rows = addressed_phase_study(donor).trials
+    caplog.set_level(logging.INFO)
+
+    if case == "full-union":
+        earlier = _config(tmp_path, trainer, target.model_copy(update={"n_trials": 4}))
+        run_experiment(earlier)
+        original_rows = addressed_phase_study(earlier).trials
+        run_experiment(returning, dry_run=True)
+        assert "target met (5 of 5 trials recorded)" in caplog.text
+        assert "would launch 0 trials" in caplog.text
+        assert not run_experiment(returning)["p"].completion["incomplete"]
+        assert trainer.with_name("count").read_text() == "6"
+        rows = addressed_phase_study(returning).trials
+        assert rows[:-1] == original_rows
+        assert rows[-1].user_attrs[ATTEMPT_ID_ATTR] == donor_rows[2].user_attrs[ATTEMPT_ID_ATTR]
+        assert rows[-1].user_attrs[RERUN_OF_ATTR] == 1
+        return
+
+    run_experiment(returning, dry_run=True)
+    assert f"accepted a partial result at {donor_finished} of 5 trials" in caplog.text
+    assert "would launch 0 trials" in caplog.text
+    if case == "interrupted-retry":
+        assert run_experiment(returning)["p"].completion["incomplete"]
+        rows = addressed_phase_study(returning).trials
+        assert len(rows) == 2
+        assert donor_rows[2].user_attrs[RERUN_OF_ATTR] == 0
+        assert all(
+            row.user_attrs[ATTEMPT_ID_ATTR] != donor_rows[2].user_attrs[ATTEMPT_ID_ATTR]
+            for row in rows
+        )
+        widened = target.model_copy(
+            update={
+                "n_trials": 6,
+                "search_space": {
+                    "x": CategoricalParam(type="categorical", choices=[1, 2, 3, 4, 5])
+                },
+            }
+        )
+        run_experiment(_config(tmp_path, trainer, widened))
+        starts = trainer.with_name("starts").read_text().splitlines()
+        interrupted_dir, previous = starts[2].rsplit(" ", 1)
+        assert previous == "1"
+        assert starts[3] == f"{interrupted_dir} 3"
+        assert len(starts) == 7
+        return
+
+    assert _draw_positions(donor_rows) == {0: 0, 1: 1, 2: 1, 3: 2}
+    with (
+        patch.object(
+            reread_ops,
+            "_write_adopted",
+            wraps=reread_ops._write_adopted,
+            side_effect=[DEFAULT, RuntimeError("stop after the first accepted row")],
+        ),
+        pytest.raises(RuntimeError, match="stop after the first accepted row"),
+    ):
+        run_experiment(returning)
+    rows = addressed_phase_study(returning).trials
+    assert len(rows) == 3
+    assert rows[-1].user_attrs[ATTEMPT_ID_ATTR] == donor_rows[2].user_attrs[ATTEMPT_ID_ATTR]
+
+    with patch.object(
+        reread_ops, "_reread_trial", side_effect=AssertionError("row is already read")
+    ):
+        winner = run_experiment(returning)["p"]
+    assert winner.completion["incomplete"]
+    assert (winner.completion["finished_trials"], winner.completion["measured_trials"]) == (3, 2)
+    assert trainer.with_name("count").read_text() == "4"
+    rows = addressed_phase_study(returning).trials
+    assert _draw_positions(rows) == _draw_positions(donor_rows)
+    assert [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in rows] == [
+        trial.user_attrs[ATTEMPT_ID_ATTR] for trial in donor_rows
+    ]
+    assert rows[2].user_attrs[RERUN_OF_ATTR] == 1
+
+    raised = _config(tmp_path, trainer, target.model_copy(update={"n_trials": 6}))
+    run_experiment(raised)
+    rows = addressed_phase_study(raised).trials
+    assert trainer.with_name("count").read_text() == "7"
+    assert _draw_positions(rows) == {0: 0, 1: 1, 2: 1, 3: 2, 4: 2, 5: 0, 6: 3}
+    assert rows[4].user_attrs[TRIAL_DIR_ATTR] == rows[3].user_attrs[TRIAL_DIR_ATTR]
+
+
+@pytest.mark.integration
+def test_a_raised_target_replaces_an_older_partial_decision(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Replay the accepted sibling target after the original study accepted a smaller one."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import argparse, json, time
+        from pathlib import Path
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", type=Path)
+        parser.add_argument("--x", type=float)
+        args = parser.parse_args()
+        count = Path(__file__).with_name("count")
+        launch = int(count.read_text()) + 1 if count.exists() else 1
+        count.write_text(str(launch))
+        if launch in (2, 4):
+            time.sleep(60)
+        args.out.write_text(json.dumps({"loss": args.x, "acc": 100 + args.x}))
+        """,
+    )
+    original = _phase("random", 3).model_copy(
+        update={"allow_incomplete_on_timeout": True, "timeout_seconds_per_phase": 3}
+    )
+    target = original.model_copy(update={"n_trials": 4})
+    donor = _config(tmp_path, trainer, target, "acc")
+    returning = _config(
+        tmp_path, trainer, target.model_copy(update={"timeout_seconds_per_phase": None})
+    )
+    assert (
+        run_experiment(_config(tmp_path, trainer, original))["p"].completion["finished_trials"] == 1
+    )
+    assert run_experiment(donor)["p"].completion["finished_trials"] == 2
+    caplog.set_level(logging.INFO)
+
+    run_experiment(returning, dry_run=True)
+    assert "accepted a partial result at 2 of 4 trials" in caplog.text
+    assert "would launch 0 trials" in caplog.text
+    for _ in range(2):
+        winner = run_experiment(returning)["p"]
+        assert winner.completion["incomplete"]
+        assert winner.completion["finished_trials"] == 2
+    assert trainer.with_name("count").read_text() == "4"
+    rows = addressed_phase_study(returning).trials
+    donor_rows = addressed_phase_study(donor).trials
+    assert [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows] == [
+        row.user_attrs[ATTEMPT_ID_ATTR] for row in donor_rows
+    ]

@@ -79,7 +79,6 @@ from phasesweep.engine.state import (
     FAILURE_REASON_ATTR,
     FINISHED_TRIAL_STATES,
     OVERRIDES_ATTR,
-    PHASE_DECISION_ATTR,
     RERUN_OF_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRIAL_OUTCOME_ATTR,
@@ -94,13 +93,13 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import (
     _abort_decision,
+    _AcceptedPartialDecision,
     _at_accepted_partial_target,
     _config_retires_abort,
     _counted_outcome,
     _initialize_study_schema,
     _load_accepted_partial_decision,
     _load_phase_policy_state,
-    _parse_accepted_partial_decision,
     _prelaunch_trial_environment,
     _record_accepted_partial_decision,
     _record_recovery_boundary,
@@ -598,6 +597,44 @@ class Slot(NamedTuple):
     waiting: optuna.trial.FrozenTrial | None = None
 
 
+class _PartialReplay(NamedTuple):
+    """The accepted boundary and the missing attempts in the order the sibling allocated them."""
+
+    decision: _AcceptedPartialDecision
+    attempts: list[_Candidate]
+    retry_sources: dict[str, str]
+
+
+def _replay_slot(
+    candidate: _Candidate,
+    trials: Sequence[optuna.trial.FrozenTrial],
+    replay: _PartialReplay,
+) -> Slot | None:
+    """Map a sibling's retry to the local row of its physical predecessor.
+
+    :param _Candidate candidate: An attempt the adopted boundary holds.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Local rows, including earlier replayed ones.
+    :param _PartialReplay replay: Donor retry sources keyed by physical attempt ID.
+    :return Slot | None: A new draw or a verified rerun slot, or none if it cannot be placed.
+    """
+    attempt_id = candidate.owner.trial.user_attrs[ATTEMPT_ID_ATTR]
+    source_id = replay.retry_sources.get(attempt_id)
+    if source_id is None:
+        return Slot(None)
+    source = next((row for row in trials if row.user_attrs.get(ATTEMPT_ID_ATTR) == source_id), None)
+    if source is None:
+        return None
+    for row in trials:
+        if row.user_attrs.get(RERUN_OF_ATTR) != source.number:
+            continue
+        if row.state == optuna.trial.TrialState.WAITING:
+            return Slot(source, row)
+        if _trial_interrupted(row) and row.user_attrs.get(ATTEMPT_ID_ATTR) is None:
+            # A restart can have settled the queued slot before committing its kept attempt.
+            source = row
+    return Slot(source)
+
+
 def next_slot(study: optuna.Study, phase: Phase, launching: Collection[int] = ()) -> Slot | None:
     """Return the trial a run of the study allocates next: the one budget rule.
 
@@ -850,6 +887,7 @@ def walk(
     draws: Mapping[str, str],
     through_launches: bool = False,
     assumed: optuna.trial.TrialState = optuna.trial.TrialState.COMPLETE,
+    replay: _PartialReplay | None = None,
 ) -> Iterator[Adopt | Launch]:
     """Walk a study's next slots, filling each with the oldest kept attempt that trained it.
 
@@ -874,6 +912,8 @@ def walk(
     :param bool through_launches: Keep projecting past unfilled slots, assuming each launch ends
         in ``assumed``, until no kept attempt can fill a later slot; otherwise stop at the first.
     :param optuna.trial.TrialState assumed: State a projected launch ends in.
+    :param _PartialReplay | None replay: Replay already allocated slots at a sibling's accepted
+        boundary in its recorded order, without scheduling slots beyond that boundary.
     :return Iterator[Adopt | Launch]: The slots in allocation order.
     """
     adaptive = phase.sampler.type in _ADAPTIVE_SAMPLERS
@@ -901,8 +941,15 @@ def walk(
             )
         )
     launching: set[int] = set()
-    while pool and (slot := next_slot(mirror, phase, launching)) is not None:
+    while pool:
         trials = mirror.get_trials(deepcopy=False)
+        if replay is None:
+            slot = next_slot(mirror, phase, launching)
+        else:
+            slot = _replay_slot(pool[0], trials, replay)
+        if slot is None:
+            return
+        candidates = pool if replay is None else pool[:1]
         positions = _draw_positions(trials)
         asked: optuna.trial.FrozenTrial | None = None
         if slot.rerun is not None:
@@ -910,10 +957,10 @@ def walk(
             params = slot.rerun.params
             eligible = (
                 candidate
-                for candidate in pool
+                for candidate in candidates
                 if candidate.terminal
                 and _same_value(candidate.owner.trial.params, params)
-                and (not positioned or candidate.position == at)
+                and (replay is not None or not positioned or candidate.position == at)
             )
             attempt_id = slot.rerun.user_attrs.get(ATTEMPT_ID_ATTR)
             draw = draws.get(attempt_id) if isinstance(attempt_id, str) else None
@@ -925,21 +972,31 @@ def walk(
             if cells is not None and at >= cells:
                 return
             if adaptive:
-                match = next((candidate for candidate in pool if candidate.draw not in held), None)
+                match = next(
+                    (candidate for candidate in candidates if candidate.draw not in held), None
+                )
             else:
-                trial = mirror.ask()
+                # A replayed draw was already allocated. A queued local retry would otherwise
+                # take the proposal at this position before the accepted cohort can be replayed.
+                trial = (
+                    mirror.ask()
+                    if replay is None
+                    else optuna.Trial(mirror, mirror._storage.create_new_trial(mirror._study_id))
+                )
                 _suggest_all(trial, phase)
                 asked = mirror._storage.get_trial(trial._trial_id)
                 match = next(
                     (
                         candidate
-                        for candidate in pool
+                        for candidate in candidates
                         if _same_value(candidate.owner.trial.params, asked.params)
                         and (not positioned or candidate.position == at)
                     ),
                     None,
                 )
         if match is None:
+            if replay is not None:
+                return
             yield Launch(slot, None if asked is None else asked.number)
             if slot.rerun is not None and _trial_interrupted(slot.rerun):
                 launching.add(slot.rerun.number)
@@ -1194,60 +1251,120 @@ def _with_abort(step: Adopt) -> optuna.trial.FrozenTrial:
     return row
 
 
-def carry_partial_decision(
-    experiment: Experiment, phase: Phase, study: optuna.Study, others: Sequence[optuna.Study]
-) -> bool:
-    """Accept a compatible study's partial-timeout boundary when this study holds its attempts.
-
-    An operator who accepted a phase cut short at its deadline accepted those attempts, whatever
-    reading scored them, so a reading change launches nothing a rerun would not. The newest
-    compatible study with an accepted partial decision for the target the config still requests,
-    whose counted attempts this study all holds, gives this study the same boundary over its own
-    rows and measurements.
+def _partial_replay(
+    experiment: Experiment,
+    phase: Phase,
+    study: optuna.Study,
+    others: Sequence[optuna.Study],
+    pool: Sequence[_Candidate],
+    draws: Mapping[str, str],
+) -> _PartialReplay | None:
+    """Find the newest compatible accepted boundary the study can replay without allocating work.
 
     :param Experiment experiment: Current config.
-    :param Phase phase: The phase.
-    :param optuna.Study study: The study after adoption, live or an in-memory copy.
+    :param Phase phase: Phase whose requested target governs the boundary.
+    :param optuna.Study study: The addressed study before adoption.
     :param Sequence[optuna.Study] others: The phase's other studies.
-    :raises StudySchemaMismatchError: A compatible study's decision is malformed.
-    :return bool: Whether the study now records the boundary.
+    :param Sequence[_Candidate] pool: Kept attempts missing from the addressed study.
+    :param Mapping[str, str] draws: Physical draw identities for adaptive attempts.
+    :return _PartialReplay | None: Proof the accepted cohort fits the study, or none.
     """
     trials = study.get_trials(deepcopy=False)
     finished = _finished_trial_count(trials)
-    if study.user_attrs.get(PHASE_DECISION_ATTR) is not None or finished >= phase.n_trials:
-        return False
-    state = _load_phase_policy_state(study, experiment)
-    if state.abort is not None:
-        return False
+    current = _load_accepted_partial_decision(study)
+    if (
+        (current is not None and current.trial_target >= phase.n_trials)
+        or finished >= phase.n_trials
+        or _load_phase_policy_state(study, experiment).abort is not None
+    ):
+        return None
     present = {trial.user_attrs.get(ATTEMPT_ID_ATTR) for trial in trials}
+    available = {item.owner.trial.user_attrs[ATTEMPT_ID_ATTR]: item for item in pool}
     for other in reversed(_compatible_studies(experiment, phase, study, others)):
-        decision = _parse_accepted_partial_decision(
-            other.user_attrs.get(PHASE_DECISION_ATTR), other.study_name
-        )
-        if decision is None or decision.trial_target != phase.n_trials:
+        decision = _load_accepted_partial_decision(other)
+        if not _at_accepted_partial_target(decision, phase):
             continue
-        counted = {
-            trial.user_attrs.get(ATTEMPT_ID_ATTR)
-            for trial in other.get_trials(deepcopy=False)
-            if isinstance(trial.user_attrs.get(ATTEMPT_ID_ATTR), str)
-            and _trial_run_state(trial) in FINISHED_TRIAL_STATES
+        donor_trials = {trial.number: trial for trial in other.get_trials(deepcopy=False)}
+        admitted = {
+            attempt_id: trial
+            for trial in donor_trials.values()
+            if isinstance(attempt_id := trial.user_attrs.get(ATTEMPT_ID_ATTR), str)
             and (outcome := _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR)))
             is not None
             and outcome.sequence <= decision.outcome_sequence
         }
-        if not counted <= present:
+        counted = {
+            attempt_id
+            for attempt_id, trial in admitted.items()
+            if _trial_run_state(trial) in FINISHED_TRIAL_STATES
+        }
+        roots = {
+            attempt_id
+            for attempt_id, trial in admitted.items()
+            if RERUN_OF_ATTR not in trial.user_attrs
+        }
+        required = counted - present
+        if (
+            len(counted) != decision.finished_trials
+            or finished + len(required) > phase.n_trials
+            or not required <= available.keys()
+        ):
             continue
-        _record_accepted_partial_decision(
-            study,
-            phase.n_trials,
-            outcome_sequence=state.max_sequence,
-            finished_trials=finished,
-            measured_trials=_measured_trial_count(trials),
-            timeout_scope=decision.timeout_scope,
-            recovered_abort_sequence=None,
-        )
-        return True
-    return False
+        missing = required | ((roots - present) & available.keys())
+        represented = present | missing
+        retry_sources: dict[str, str] = {}
+        for attempt_id in missing:
+            ancestors = _rerun_chain(donor_trials, admitted[attempt_id])
+            next(ancestors)
+            # An uncounted retry stays in directory history. Only a represented ancestor
+            # can hold the local retry link.
+            for parent in ancestors:
+                predecessor = parent.user_attrs.get(ATTEMPT_ID_ATTR)
+                if isinstance(predecessor, str) and predecessor in represented:
+                    retry_sources[attempt_id] = predecessor
+                    break
+        attempts = [available[attempt_id] for attempt_id in admitted if attempt_id in missing]
+        replay = _PartialReplay(decision, attempts, retry_sources)
+        probe = mirror_study(experiment, phase, study, study_name=study.study_name)
+        placed = [
+            step.candidate
+            for step in walk(
+                experiment,
+                phase,
+                probe,
+                list(attempts),
+                assumed_reader(experiment, _COMPLETE),
+                draws=draws,
+                replay=replay,
+            )
+            if isinstance(step, Adopt)
+        ]
+        if required <= {item.owner.trial.user_attrs[ATTEMPT_ID_ATTR] for item in placed}:
+            return replay._replace(attempts=placed)
+    return None
+
+
+def carry_partial_decision(study: optuna.Study, replay: _PartialReplay) -> bool:
+    """Accept the sibling's timeout boundary with this study's durable counts.
+
+    :param optuna.Study study: The study holding the whole accepted cohort.
+    :param _PartialReplay replay: The sibling decision whose timeout scope carries.
+    :return bool: Whether the combined cohort is partial, so its boundary was written.
+    """
+    trials = study.get_trials(deepcopy=False)
+    finished = _finished_trial_count(trials)
+    if finished == replay.decision.trial_target:
+        return False
+    _record_accepted_partial_decision(
+        study,
+        replay.decision.trial_target,
+        outcome_sequence=_recorded_outcome_sequence(study),
+        finished_trials=finished,
+        measured_trials=_measured_trial_count(trials),
+        timeout_scope=replay.decision.timeout_scope,
+        recovered_abort_sequence=None,
+    )
+    return True
 
 
 def adopt_kept_attempts(
@@ -1282,9 +1399,16 @@ def adopt_kept_attempts(
     if _recorded_identity(study) is None:
         return adoption
     pool, draws = kept_attempts(experiment, phase, study, others)
+    replay = (
+        _partial_replay(experiment, phase, study, others, pool, draws)
+        if before_launch and others
+        else None
+    )
+    if replay is not None:
+        pool = list(replay.attempts)
     state = _load_phase_policy_state(study, experiment)
     abort = state.abort or _replayed_streak_abort(phase, study, state)
-    if pool and abort is not None:
+    if pool and abort is not None and replay is None:
         # Rows past an abort are new work: only a config that retires the abort adds them, and
         # the recovery boundary comes first, as before a launch.
         probe = mirror_study(experiment, phase, study, study_name=study.study_name)
@@ -1324,15 +1448,17 @@ def adopt_kept_attempts(
             flush(False)
             return read(candidate)
 
-        for step in walk(experiment, phase, mirror, pool, read_after_flush, draws=draws):
+        for step in walk(
+            experiment, phase, mirror, pool, read_after_flush, draws=draws, replay=replay
+        ):
             if isinstance(step, Launch):
                 flush(True)
             else:
                 held.append(step)
         # The kept attempts ran out, so any slot left launches.
-        flush(next_slot(mirror, phase) is not None)
-    if before_launch:
-        carry_partial_decision(experiment, phase, study, others)
+        flush(replay is None and next_slot(mirror, phase) is not None)
+    if replay is not None:
+        carry_partial_decision(study, replay)
     if adoption.total:
         note = adoption.note(reading_settings(experiment, phase))
         report.info("%s  %s", phase.name, note)
@@ -1490,12 +1616,25 @@ def plan_adoption(
     elif study is not None:
         record = _identity_after_growth(experiment, phase, inherited, study, record)
     projections = []
+    replay = None
     for assumed in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.FAIL):
         mirror = mirror_study(experiment, phase, study, study_name=study_name, record=record)
         if not _compatible_studies(experiment, phase, mirror, others):
             return None
         pool, draws = kept_attempts(experiment, phase, mirror, others)
         adoption = Adoption()
+        read = assumed_reader(experiment, assumed)
+        if assumed == _COMPLETE:
+            replay = _partial_replay(experiment, phase, mirror, others, pool, draws)
+        if replay is not None:
+            for step in walk(
+                experiment, phase, mirror, list(replay.attempts), read, draws=draws, replay=replay
+            ):
+                assert isinstance(step, Adopt)
+                adoption.count(step)
+            partial = carry_partial_decision(mirror, replay)
+            projections.append((mirror, adoption, 0, partial))
+            continue
         first: optuna.Study | None = None
         last: Adopt | None = None
         abort: JsonObject | None = None
@@ -1503,13 +1642,13 @@ def plan_adoption(
         # still needs after the adopted ones, unless a stop comes first.
         launches = 0
         unfilled = phase.n_trials - _finished_trial_count(mirror.get_trials(deepcopy=False))
-        stopped = partial = False
+        stopped = False
         for step in walk(
             experiment,
             phase,
             mirror,
             pool,
-            assumed_reader(experiment, assumed),
+            read,
             draws=draws,
             through_launches=True,
             assumed=assumed,
@@ -1533,8 +1672,7 @@ def plan_adoption(
                 continue
             if first is None:
                 first = _left_for_launch(experiment, phase, mirror, last, study_name, step.asked)
-                partial = carry_partial_decision(experiment, phase, first, others)
-            if partial or abort is not None:
+            if abort is not None:
                 stopped = True
                 break
             launches += 1
@@ -1545,11 +1683,10 @@ def plan_adoption(
                 if launch_follows
                 else mirror_study(experiment, phase, mirror, study_name=study_name)
             )
-            partial = carry_partial_decision(experiment, phase, first, others)
-            stopped = partial or (abort is not None and launch_follows)
+            stopped = abort is not None and launch_follows
         if not stopped:
             launches = max(0, unfilled)
-        projections.append((first, adoption, launches, partial))
+        projections.append((first, adoption, launches, False))
     (complete, adoption, low, partial), (failed, _, high, _) = projections
     return AdoptionPlan(
         source=source,
