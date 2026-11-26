@@ -25,10 +25,14 @@ from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    GENERATION_ID_ATTR,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_TARGET_ATTR,
 )
+from phasesweep.engine.study_policy import _allocation_contexts
+from phasesweep.engine.trial_dirs import producing_attempts
 from phasesweep.evidence.models import JsonExtractor
 from tests.conftest import addressed_phase_study, make_experiment, write_trainer
 
@@ -516,3 +520,202 @@ def test_mid_phase_adoption_deadline_preserves_new_training_on_restart(tmp_path:
     run_experiment(target)
     assert sorted(row.params["x"] for row in addressed_phase_study(target).trials) == [1, 2, 3, 4]
     assert _launches(launches) == 4
+
+
+def test_returning_study_continues_a_siblings_interrupted_attempt_in_place(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A draw a sibling's deadline interrupted reruns from its checkpoint, unwarned, in its directory."""
+    launches = tmp_path / "launches"
+    slow = tmp_path / "slow"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse, json, time
+        from pathlib import Path
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        ap.add_argument("--x", type=float, default=1)
+        args = ap.parse_args()
+        step = Path(args.out).with_name("step")
+        start = int(step.read_text()) if step.exists() else 0
+        with Path({str(launches)!r}).open("a") as handle:
+            print(args.x, start, file=handle)
+        for done in range(start, 4):
+            if Path({str(slow)!r}).exists():
+                time.sleep(1)
+            step.write_text(str(done + 1))
+        Path(args.out).write_text(json.dumps({{"loss": args.x, "acc": 100 + args.x}}))
+        """,
+    )
+    phase = _phase("grid", 1)
+    run_experiment(_config(tmp_path, trainer, phase))
+    slow.touch()
+    timed = phase.model_copy(update={"n_trials": 2, "timeout_seconds_per_phase": 2})
+    with pytest.raises(PhaseTimeoutError):
+        run_experiment(_config(tmp_path, trainer, timed, "acc"))
+    slow.unlink()
+    interrupted = addressed_phase_study(_config(tmp_path, trainer, timed, "acc")).trials[1]
+    target = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 2}))
+    caplog.set_level(logging.INFO)
+
+    run_experiment(target)
+
+    assert "model can be overwritten" not in caplog.text
+    rows = addressed_phase_study(target).trials
+    resumed = launches.read_text().splitlines()[-1].split()
+    assert len(launches.read_text().splitlines()) == 3
+    assert int(resumed[1]) > 0
+    assert rows[1].user_attrs[ATTEMPT_ID_ATTR] == interrupted.user_attrs[ATTEMPT_ID_ATTR]
+    assert rows[2].user_attrs[RERUN_OF_ATTR] == 1
+    assert rows[2].user_attrs[TRIAL_DIR_ATTR] == interrupted.user_attrs[TRIAL_DIR_ATTR]
+
+
+def _failed_retry_sibling(tmp_path: Path) -> tuple[Path, Path, Phase]:
+    """Run a grid cell, then a sibling whose x=2 trainer exits 7 and whose retry succeeds."""
+    trainer, launches = _trainer(tmp_path)
+    phase = _phase("grid", 1)
+    run_experiment(_config(tmp_path, trainer, phase))
+    (tmp_path / "fail").touch()
+    run_experiment(_config(tmp_path, trainer, phase.model_copy(update={"n_trials": 3}), "acc"))
+    (tmp_path / "fail").unlink()
+    run_experiment(_config(tmp_path, trainer, phase.model_copy(update={"n_trials": 4}), "acc"))
+    return trainer, launches, phase
+
+
+def test_returning_and_fresh_readings_reach_one_verdict_over_a_kept_retry(tmp_path: Path) -> None:
+    """A returning study and a new reading both adopt a failed cell and its retry, launching nothing."""
+    trainer, launches, phase = _failed_retry_sibling(tmp_path)
+    four = phase.model_copy(update={"n_trials": 4})
+    for config in (
+        _config(tmp_path, trainer, four),
+        _config(tmp_path, trainer, four, "loss", "maximize"),
+    ):
+        run_experiment(config)
+        rows = addressed_phase_study(config).trials
+        assert sorted(row.params["x"] for row in rows) == [1, 2, 2, 3]
+        assert sum(RERUN_OF_ATTR in row.user_attrs for row in rows) == 1
+    assert _launches(launches) == 4
+
+
+def test_the_run_names_a_kept_trainer_failure_as_one(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A copied nonzero trainer exit is reported as a trainer failure, apart from the re-reads."""
+    trainer, launches, phase = _failed_retry_sibling(tmp_path)
+    caplog.set_level(logging.INFO)
+
+    run_experiment(_config(tmp_path, trainer, phase.model_copy(update={"n_trials": 4})))
+
+    assert (
+        'p  reading settings changed (metric.extractor.key: "acc" -> "loss"): re-read 2 kept '
+        "trials from other reading studies (2 changed outcome), kept 1 trainer failure as "
+        "recorded; nothing was retrained." in caplog.text
+    )
+    assert "unfinished" not in caplog.text
+    assert _launches(launches) == 4
+
+
+def test_a_child_never_adopts_a_draw_trained_under_another_parent_value(tmp_path: Path) -> None:
+    """Only studies whose inherited values match the child's own give it kept attempts."""
+    launches = tmp_path / "launches"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse, json
+        from pathlib import Path
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        ap.add_argument("--x", type=float, default=1)
+        ap.add_argument("--y", type=float, default=0)
+        args = ap.parse_args()
+        with Path({str(launches)!r}).open("a") as handle:
+            print(args.x, args.y, file=handle)
+        Path(args.out).write_text(json.dumps({{"loss": args.x + args.y, "alt": args.y - args.x}}))
+        """,
+    )
+    parent = Phase(
+        name="parent",
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
+    )
+    child = Phase(
+        name="child",
+        inherits=["parent"],
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="random", seed=3),
+        search_space={"y": FloatParam(type="float", low=0, high=1)},
+    )
+
+    def config(key: str, goal: str) -> Experiment:
+        experiment = _config(tmp_path, trainer, parent, key, goal)
+        return experiment.model_copy(update={"phases": [parent, child]})
+
+    run_experiment(config("loss", "minimize"))
+    winners = run_experiment(config("alt", "minimize"))
+
+    assert winners["parent"].params == {"x": 2}
+    assert winners["child"].metric == pytest.approx(
+        min(y - 2 for x, y in _child_launches(launches) if x == 2)
+    )
+    assert sorted({x for x, _ in _child_launches(launches)}) == [1, 2]
+    assert len(_child_launches(launches)) == 4
+
+
+def _child_launches(launches: Path) -> list[tuple[float, float]]:
+    """Read the (x, y) of every child launch, which is any launch with a nonzero y."""
+    rows = [tuple(map(float, line.split())) for line in launches.read_text().splitlines()]
+    return [(x, y) for x, y in rows if y != 0]
+
+
+def test_a_partly_adopted_study_reports_its_rows_not_a_pending_re_read(tmp_path: Path) -> None:
+    """Status counts the rows an interrupted adoption wrote and names no pending re-read."""
+    trainer, _ = _trainer(tmp_path)
+    phase = _phase("grid", 3)
+    run_experiment(_config(tmp_path, trainer, phase))
+    target = _config(tmp_path, trainer, phase, "loss", "maximize")
+    with (
+        patch.object(
+            reread_ops,
+            "_write_adopted",
+            wraps=reread_ops._write_adopted,
+            side_effect=[DEFAULT, RuntimeError("stop after one row")],
+        ),
+        pytest.raises(RuntimeError, match="stop after one row"),
+    ):
+        run_experiment(target)
+
+    status = read_status(target)["phases"][0]
+
+    assert status["reread_pending"] is None
+    assert status["trials"]["COMPLETE"] == 1
+
+
+def test_an_adopted_attempt_belongs_to_the_study_that_launched_it(tmp_path: Path) -> None:
+    """Adoption copies no allocation context, so each attempt resolves to its launching study."""
+    trainer, _ = _trainer(tmp_path)
+    phase = _phase("grid", 1)
+    first = _config(tmp_path, trainer, phase)
+    run_experiment(first)
+    second = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 2}), "acc")
+    run_experiment(second)
+    run_experiment(_config(tmp_path, trainer, phase.model_copy(update={"n_trials": 2})))
+    launched_by = {
+        study.study_name: {
+            row.user_attrs[ATTEMPT_ID_ATTR]
+            for row in study.trials
+            if row.user_attrs[GENERATION_ID_ATTR]
+            in {record["generation_id"] for record in _allocation_contexts(study)}
+        }
+        for study in (addressed_phase_study(first), addressed_phase_study(second))
+    }
+
+    owners = producing_attempts((addressed_phase_study(first), addressed_phase_study(second)))
+
+    assert all(len(attempts) == 1 for attempts in launched_by.values())
+    assert {attempt_id: owner.study.study_name for attempt_id, owner in owners.items()} == {
+        attempt_id: name for name, ids in launched_by.items() for attempt_id in ids
+    }
