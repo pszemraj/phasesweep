@@ -1367,6 +1367,45 @@ def carry_partial_decision(study: optuna.Study, replay: _PartialReplay) -> bool:
     return True
 
 
+def _replay_walk(
+    experiment: Experiment,
+    phase: Phase,
+    mirror: optuna.Study,
+    pool: Sequence[_Candidate],
+    read: Reader,
+    *,
+    draws: Mapping[str, str],
+    replay: _PartialReplay,
+) -> Iterator[Adopt | Launch]:
+    """Place a sibling's accepted cohort, then fill the slots after it with other kept attempts.
+
+    A carried boundary is accepted only while the study is short of its target, so kept attempts
+    the cohort does not hold fill the following slots first, through the ordinary walk. Nothing
+    launches before a carried boundary, so the first slot none fills ends the walk; it is yielded
+    last, for a projection to leave its asked trial out.
+
+    :param Experiment experiment: Current config.
+    :param Phase phase: The phase.
+    :param optuna.Study mirror: In-memory copy of the study, advanced as slots fill.
+    :param Sequence[_Candidate] pool: Every kept attempt the study is missing.
+    :param Reader read: Gives each taken attempt's content under the current settings.
+    :param Mapping[str, str] draws: Physical draw identities for adaptive attempts.
+    :param _PartialReplay replay: The accepted cohort and its retry links.
+    :return Iterator[Adopt | Launch]: The adopted slots, then the unfilled slot if one ends it.
+    """
+    rest = list(pool)
+    for step in walk(
+        experiment, phase, mirror, list(replay.attempts), read, draws=draws, replay=replay
+    ):
+        assert isinstance(step, Adopt)  # A replay ends at a slot it cannot fill.
+        rest.remove(step.candidate)
+        yield step
+    for step in walk(experiment, phase, mirror, rest, read, draws=draws):
+        yield step
+        if isinstance(step, Launch):
+            return
+
+
 def adopt_kept_attempts(
     experiment: Experiment,
     phase: Phase,
@@ -1380,8 +1419,10 @@ def adopt_kept_attempts(
     """Append the kept attempts that fill the study's next slots, re-reading finished ones.
 
     Rows are written one at a time, each once the slot after it is known, so a stop at any
-    point keeps every row written. Before the first launch, an accepted partial-timeout boundary
-    of a compatible study carries over (:func:`carry_partial_decision`).
+    point keeps every row written. Before the first launch, a compatible study's accepted
+    partial-timeout cohort is placed first and other kept attempts fill the slots after it
+    (:func:`_replay_walk`); the boundary carries over only if the study is still short of its
+    target (:func:`carry_partial_decision`).
 
     :param Experiment experiment: Current reading and budget settings.
     :param Phase phase: Phase whose target and failure policy apply.
@@ -1404,8 +1445,6 @@ def adopt_kept_attempts(
         if before_launch and others
         else None
     )
-    if replay is not None:
-        pool = list(replay.attempts)
     state = _load_phase_policy_state(study, experiment)
     abort = state.abort or _replayed_streak_abort(phase, study, state)
     if pool and abort is not None and replay is None:
@@ -1448,11 +1487,17 @@ def adopt_kept_attempts(
             flush(False)
             return read(candidate)
 
-        for step in walk(
-            experiment, phase, mirror, pool, read_after_flush, draws=draws, replay=replay
-        ):
+        steps = (
+            walk(experiment, phase, mirror, pool, read_after_flush, draws=draws)
+            if replay is None
+            else _replay_walk(
+                experiment, phase, mirror, pool, read_after_flush, draws=draws, replay=replay
+            )
+        )
+        for step in steps:
             if isinstance(step, Launch):
-                flush(True)
+                # No launch follows rows adopted before a carried boundary.
+                flush(replay is None)
             else:
                 held.append(step)
         # The kept attempts ran out, so any slot left launches.
@@ -1627,13 +1672,17 @@ def plan_adoption(
         if assumed == _COMPLETE:
             replay = _partial_replay(experiment, phase, mirror, others, pool, draws)
         if replay is not None:
-            for step in walk(
-                experiment, phase, mirror, list(replay.attempts), read, draws=draws, replay=replay
+            asked: int | None = None
+            for step in _replay_walk(
+                experiment, phase, mirror, pool, read, draws=draws, replay=replay
             ):
-                assert isinstance(step, Adopt)
-                adoption.count(step)
-            partial = carry_partial_decision(mirror, replay)
-            projections.append((mirror, adoption, 0, partial))
+                if isinstance(step, Launch):
+                    asked = step.asked
+                else:
+                    adoption.count(step)
+            left = mirror_study(experiment, phase, mirror, study_name=study_name, upto=asked)
+            partial = carry_partial_decision(left, replay)
+            projections.append((left, adoption, 0, partial))
             continue
         first: optuna.Study | None = None
         last: Adopt | None = None

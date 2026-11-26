@@ -1128,3 +1128,31 @@ def test_a_raised_target_replaces_an_older_partial_decision(
     assert [row.user_attrs[ATTEMPT_ID_ATTR] for row in rows] == [
         row.user_attrs[ATTEMPT_ID_ATTR] for row in donor_rows
     ]
+
+
+def test_kept_attempts_that_reach_the_target_outrank_a_siblings_partial_result(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A sibling's partial cohort is placed first, and a third study's draws then fill the target."""
+    trainer, launches = _trainer(tmp_path)
+    phase = _phase("random", 4).model_copy(update={"allow_incomplete_on_timeout": True})
+    returning = _config(tmp_path, trainer, phase)
+    run_experiment(_config(tmp_path, trainer, phase.model_copy(update={"n_trials": 1})))
+    partial = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 2}), "acc")
+    run_experiment(partial)
+    record_accepted_partial_timeout(addressed_phase_study(partial), 4)
+    run_experiment(
+        _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 5}), goal="maximize")
+    )
+    assert _launches(launches) == 5
+    caplog.set_level(logging.INFO)
+
+    run_experiment(returning, dry_run=True)
+    winner = run_experiment(returning)["p"]
+
+    assert "target met (4 of 4 trials recorded)" in caplog.text
+    assert "would launch 0 trials" in caplog.text
+    assert "accepted a partial result" not in caplog.text
+    assert not winner.completion["incomplete"]
+    assert winner.completion["finished_trials"] == 4
+    assert _launches(launches) == 5
