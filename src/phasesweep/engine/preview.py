@@ -605,7 +605,7 @@ def _preview_adoption(
     assert plan is not None
     if plan.adoption.total:
         log.info(
-            "DRY RUN phase=%s %swould %s; nothing would retrain",
+            "DRY RUN phase=%s %swould %s; no kept trial would retrain",
             phase.name,
             plan.adoption.changed_reading(reading_settings(experiment, phase)),
             plan.adoption.describe(planned=True),

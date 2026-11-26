@@ -1,4 +1,4 @@
-"""A changed reading setting re-reads the kept evidence of finished trials and retrains nothing."""
+"""A changed reading setting re-reads the kept evidence of finished trials without retraining them."""
 
 from __future__ import annotations
 
@@ -1356,7 +1356,7 @@ def test_a_dry_run_says_it_would_re_read_and_writes_nothing(
     messages = [record.getMessage() for record in caplog.records]
     assert (
         'DRY RUN phase=p reading settings changed (metric.extractor.key: "loss" -> "acc"): '
-        "would re-read 3 kept trials from other reading studies; nothing would retrain"
+        "would re-read 3 kept trials from other reading studies; no kept trial would retrain"
     ) in messages
     assert (
         "DRY RUN phase=p target met (3 of 3 trials recorded): would select from the re-read "

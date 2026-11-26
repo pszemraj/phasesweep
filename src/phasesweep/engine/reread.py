@@ -1162,7 +1162,7 @@ class Adoption:
         :return str: The sentence.
         """
         described = self.describe(planned=False)
-        return f"{self.changed_reading(reading)}{described}; nothing was retrained."
+        return f"{self.changed_reading(reading)}{described}; no kept trial was retrained."
 
     def changed_reading(self, reading: JsonObject) -> str:
         """Name the reading settings that changed, when every attempt comes from one reading.
@@ -1828,7 +1828,7 @@ def _pending_notice(
         )
         statement = (
             f"{opening} ({settings} changed); the next run re-reads {trials} from kept evidence "
-            "and retrains nothing."
+            "without retraining them."
         )
     notice = PendingRereadNotice(
         f"{opening} ({format_changed_keys(changes) or 'reading settings'}).",

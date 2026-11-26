@@ -631,7 +631,7 @@ def test_the_run_names_a_kept_trainer_failure_as_one(
     assert (
         'p  reading settings changed (metric.extractor.key: "acc" -> "loss"): re-read 2 kept '
         "trials from other reading studies (2 changed outcome), kept 1 trainer failure as "
-        "recorded; nothing was retrained." in caplog.text
+        "recorded; no kept trial was retrained." in caplog.text
     )
     assert "unfinished" not in caplog.text
     assert _launches(launches) == 4

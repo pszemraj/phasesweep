@@ -173,7 +173,7 @@ def unreadable_objective_step(*, persistent: bool) -> str:
     """Say what to fix when a trainer ran but its objective could not be read.
 
     The cause is the trainer's output or the config's ``metric`` settings. Corrected settings
-    in a persistent study re-read every finished trainer's kept evidence and retrain nothing
+    in a persistent study re-read every finished trainer's kept evidence without retraining it
     (:mod:`phasesweep.engine.reread`); a fixed trainer output retries in place, by the retry
     step that follows this sentence in a persistent study.
 

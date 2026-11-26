@@ -299,7 +299,7 @@ def test_run_status_says_a_phase_with_no_trials_waits_to_re_read_its_kept_eviden
     assert phase.reread_pending.finished_trials == 1
     assert phase.reread_pending.statement == (
         "Phase 'p' has not started under the current reading settings (metric.goal changed); "
-        "the next run re-reads 1 finished trial from kept evidence and retrains nothing."
+        "the next run re-reads 1 finished trial from kept evidence without retraining them."
     )
 
 
