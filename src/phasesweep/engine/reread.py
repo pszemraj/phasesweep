@@ -1321,6 +1321,8 @@ class AdoptionPlan:
     failed: optuna.Study
     #: Fewest and most launches to reach the target, over those two assumptions.
     launches: tuple[int, int]
+    #: Launches when every re-read measures, and when every one fails.
+    by_verdict: tuple[int, int]
     #: Whether a compatible study's accepted partial boundary carries over.
     partial: bool
 
@@ -1477,6 +1479,7 @@ def plan_adoption(
         complete=complete,
         failed=failed,
         launches=(min(low, high), max(low, high)),
+        by_verdict=(low, high),
         partial=partial,
     )
 

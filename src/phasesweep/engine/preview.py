@@ -23,7 +23,7 @@ from phasesweep.engine.artifact_roots import (
     _artifact_root_claim_needed,
     _check_published_phase_studies,
 )
-from phasesweep.engine.errors import StudyStorageUnavailableError
+from phasesweep.engine.errors import StudyStorageUnavailableError, TrialTargetRefusedError
 from phasesweep.engine.evidence import _validate_selection_evidence
 from phasesweep.engine.fingerprints import (
     CarriesOverrides,
@@ -62,6 +62,7 @@ from phasesweep.engine.phase import (
 )
 from phasesweep.engine.progress import _log_phase_header
 from phasesweep.engine.reread import AdoptionPlan, plan_adoption
+from phasesweep.engine.selection import PhaseAbortRefusedError
 from phasesweep.engine.state import (
     RecoveredTrialState,
     Winner,
@@ -606,6 +607,44 @@ def _preview_phase(
     return _preview_launches(experiment, phase, inherited_winners, remaining, reruns)
 
 
+def _refusal_over_both_verdicts(
+    phase: Phase, plan: AdoptionPlan, refusal: PhaseSweepError
+) -> PhaseSweepError:
+    """Name both retry ceilings when every verdict of the re-reads refuses the target.
+
+    Which kept attempts measure decides how many retries a fixed configuration or grid has
+    left, so the run's ceiling lies between the two projections'.
+
+    :param Phase phase: The phase.
+    :param AdoptionPlan plan: The projections.
+    :param PhaseSweepError refusal: The refusal when every re-read measures.
+    :return PhaseSweepError: A refusal naming both ceilings, or ``refusal`` when they agree or
+        it is not a ceiling refusal.
+    """
+    ceilings = [
+        retry_target_ceiling(
+            phase,
+            finished=_finished_trial_count(trials := projected.get_trials(deepcopy=False)),
+            measured=_measured_draw_count(trials),
+        )
+        for projected in (plan.complete, plan.failed)
+    ]
+    measured, failed = ceilings
+    if (
+        not isinstance(refusal, TrialTargetRefusedError)
+        or measured is None
+        or failed is None
+        or measured == failed
+        or max(measured, failed) >= phase.n_trials
+    ):
+        return refusal
+    return TrialTargetRefusedError(
+        f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds what its kept attempts allow: "
+        f"at most {measured} if every re-read measures, at most {failed} if every one fails.",
+        remediation=f"Set phases[{phase.name}].n_trials to at most {min(measured, failed)}.",
+    )
+
+
 def _preview_adoption(
     experiment: Experiment,
     phase: Phase,
@@ -639,7 +678,8 @@ def _preview_adoption(
             plan.adoption.describe(planned=True),
         )
     study = plan.complete
-    finished = _finished_trial_count(study.get_trials(deepcopy=False))
+    low, high = plan.launches
+    high_or_unknown: int | None = high
     placeholder = plan.adoption.rereads > 0
     if plan.partial:
         decision = _load_accepted_partial_decision(study)
@@ -665,19 +705,35 @@ def _preview_adoption(
                 verdicts.append(exc)
         refusals = [verdict for verdict in verdicts if isinstance(verdict, PhaseSweepError)]
         if len(refusals) == len(verdicts):
-            raise refusals[0]
+            raise _refusal_over_both_verdicts(phase, plan, refusals[0])
         if refusals:
-            warn_dry_run(
-                "phase=%s may be refused depending on the re-read results: %s",
-                phase.name,
-                refusals[0],
-            )
-            winner = _preview_trial_command(experiment, phase, inherited_winners)
-            return PhasePreview(winner=winner, launches=None, reruns=0)
+            # Mixed verdicts land between the projections. All failing reads give the most
+            # launches, all measuring ones the fewest; a failure adds retries only to a fixed
+            # configuration or a grid, so elsewhere the measured count is the run's.
+            kept = 1 if isinstance(verdicts[0], PhaseSweepError) else 0
+            study = (plan.complete, plan.failed)[kept]
+            if kept:
+                low, high_or_unknown = 0, plan.by_verdict[1]
+            else:
+                low = plan.by_verdict[0]
+                retries = retry_target_ceiling(phase, finished=0, measured=0) is not None
+                high_or_unknown = None if retries else low
+            outcome = "measures" if kept else "fails"
+            if isinstance(refusals[0], PhaseAbortRefusedError):
+                warn_dry_run(
+                    "phase=%s aborts if every re-read %s (max_consecutive_failures=%d)",
+                    phase.name,
+                    outcome,
+                    phase.max_consecutive_failures,
+                )
+            else:
+                warn_dry_run(
+                    "phase=%s is refused if every re-read %s: %s", phase.name, outcome, refusals[0]
+                )
+    finished = _finished_trial_count(study.get_trials(deepcopy=False))
     if recorded.study is not None and recorded.study.get_trials(deepcopy=False):
         _validate_selection_evidence(experiment, {phase.name: recorded.study})
-    low, high = plan.launches
-    if plan.partial or high == 0:
+    if plan.partial or high_or_unknown == 0:
         log.info(
             "DRY RUN phase=%s %s: would select from the %s evidence and launch no trials",
             phase.name,
@@ -692,7 +748,7 @@ def _preview_adoption(
         if phase.inherits or recorded.study is None:
             _launch_preflight(experiment, phase.name, study)
         GpuPool.for_phase(phase, cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"))
-    if low == high:
+    if low == high_or_unknown:
         reruns = min(low, _pending_rerun_count(study, phase))
         _log_phase_header(
             phase,
@@ -709,11 +765,12 @@ def _preview_adoption(
             phase.name,
             plural(low, "trial"),
         )
-    warn_dry_run(
-        "phase=%s may need to launch up to %s depending on the re-read results",
-        phase.name,
-        plural(high, "trial"),
-    )
+    if high_or_unknown is not None:
+        warn_dry_run(
+            "phase=%s may need to launch up to %s depending on the re-read results",
+            phase.name,
+            plural(high_or_unknown, "trial"),
+        )
     winner = _preview_trial_command(experiment, phase, inherited_winners)
     return PhasePreview(winner=winner, launches=None, reruns=0)
 

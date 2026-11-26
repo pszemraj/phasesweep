@@ -782,3 +782,22 @@ def test_a_grown_grid_is_judged_with_the_cells_its_growth_adds(
         6,
     ]
     assert _launches(launches) == 6
+
+
+def test_a_preview_counts_launches_when_only_failing_re_reads_would_abort(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A streak only all-failing re-reads reach is one conditional line beside the launch count."""
+    trainer, launches = _trainer(tmp_path)
+    phase = _phase("random", 6).model_copy(update={"max_consecutive_failures": 5})
+    run_experiment(_config(tmp_path, trainer, phase))
+    raised = _config(tmp_path, trainer, phase.model_copy(update={"n_trials": 8}), "acc")
+    caplog.set_level(logging.INFO)
+
+    run_experiment(raised, dry_run=True)
+    run_experiment(raised)
+
+    assert "phase=p aborts if every re-read fails (max_consecutive_failures=5)" in caplog.text
+    assert "DRY RUN phase=p would launch 2 trials" in caplog.text
+    assert "previously aborted" not in caplog.text
+    assert _launches(launches) == 8
