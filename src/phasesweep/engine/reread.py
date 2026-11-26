@@ -743,18 +743,6 @@ def _adopted_row(
     )
 
 
-def _inside(low: float | None, high: float | None) -> float:
-    """Return a value no bound excludes.
-
-    :param float | None low: Inclusive lower bound, or ``None``.
-    :param float | None high: Inclusive upper bound, or ``None``.
-    :return float: The midpoint of two bounds, the one bound given, or zero.
-    """
-    if low is not None and high is not None:
-        return (low + high) / 2
-    return next((bound for bound in (low, high) if bound is not None), 0.0)
-
-
 def _placeholder(
     experiment: Experiment, study: optuna.Study, slot: Slot, assumed: optuna.trial.TrialState
 ) -> optuna.trial.FrozenTrial:
@@ -777,6 +765,18 @@ def _placeholder(
         system_attrs=dict(source.system_attrs),
         user_attrs={RERUN_OF_ATTR: source.number, **attrs},
     )
+
+
+def _inside(low: float | None, high: float | None) -> float:
+    """Return a value no bound excludes.
+
+    :param float | None low: Inclusive lower bound, or ``None``.
+    :param float | None high: Inclusive upper bound, or ``None``.
+    :return float: The midpoint of two bounds, the one bound given, or zero.
+    """
+    if low is not None and high is not None:
+        return (low + high) / 2
+    return next((bound for bound in (low, high) if bound is not None), 0.0)
 
 
 def _assumed_verdict(
