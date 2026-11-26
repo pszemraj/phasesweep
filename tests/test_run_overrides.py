@@ -647,7 +647,7 @@ def test_malformed_phase_policy_keeps_status_yaml_and_other_refusals(
     config = write_experiment_config(tmp_path / "config.yaml", changed)
     study = phase_study(experiment)
     if attribute == PHASE_DECISION_ATTR:
-        record_accepted_partial_timeout(study, 2)
+        record_accepted_partial_timeout(study, experiment.phases[0].n_trials)
         study.set_user_attr(attribute, {**study.user_attrs[attribute], "timeout_scope": []})
         diagnostic = f"Study '{study.study_name}' has malformed '{attribute}' fields"
     else:
