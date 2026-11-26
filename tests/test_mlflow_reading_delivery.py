@@ -20,6 +20,8 @@ from phasesweep.tracking import publication, session
 from phasesweep.tracking.mlflow import OperationUnavailableError, _publish
 from phasesweep.tracking.records import OUTCOME_TAG, STATUS_BEFORE_DELIVERY
 from phasesweep.tracking.session import summary_binding_path
+from tests.conftest import write_experiment_config
+from tests.mcp_helpers import make_mcp_app, stage_dead_run, write_run_status, write_srv_catalog
 from tests.tracking_helpers import mlflow_binding, mlflow_run, remote_mlflow_example
 
 
@@ -99,7 +101,7 @@ def test_a_run_ends_on_the_newest_of_two_pending_readings(tmp_path, monkeypatch)
 
 
 def test_scoped_sync_delivers_an_equivalent_older_pending_attempt(tmp_path, monkeypatch):
-    """The newest scope includes the pending attempt upload its reading shares."""
+    """The newest scope, in its sync and its MCP status, includes the pending upload it shares."""
     config, uploads, attempt = _reread_setup(tmp_path, monkeypatch)
     experiment = Experiment.model_validate(config)
     newer_config = deepcopy(config)
@@ -117,7 +119,15 @@ def test_scoped_sync_delivers_an_equivalent_older_pending_attempt(tmp_path, monk
     assert before["state"] == "pending"
     assert session.read_record(later_path)["state"] == "delivered"
     assert _run_shows(uploads, attempt) == ("FINISHED", 1.0, 1.0)
-    assert publication.delivery_counts(newest, newer, shared=True).records == 3
+    scoped = publication.delivery_counts(newest, newer, shared=True)
+    assert scoped.records == 3
+    path = write_experiment_config(tmp_path / "newest.yaml", newest)
+    app, registry, store = make_mcp_app(write_srv_catalog(tmp_path, path))
+    stage_dead_run(store, newer, path, registry.get("srv").id, cleanup_uncertain=False)
+    write_run_status(store, newer, returncode=0)
+    delivery = app.status(newer)["tracking_delivery"]
+    assert (delivery["pending"], delivery["delivered"]) == (scoped.pending, scoped.delivered)
+    assert f"--generation {newer}" in delivery["remedy"]
 
     assert publication.sync_tracking(newest, newer)["pending"] == 0
     assert _run_shows(uploads, attempt) == ("FINISHED", 3.0, 3.0)

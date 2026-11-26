@@ -885,7 +885,7 @@ class PhaseSweepMCP:
     def _tracking_delivery(
         self, handle: RunHandle, experiment: Experiment | None
     ) -> dict[str, int] | None:
-        """Count this run's own MLflow creation and delivery records from its launch config.
+        """Count this run's MLflow creations and records, and an older pending upload it shares.
 
         Delivery records are mutable, so only status reads them; frozen result
         reads never depend on them. A terminal read loads the run's config
@@ -905,7 +905,7 @@ class PhaseSweepMCP:
             return None
         from phasesweep.tracking.publication import delivery_counts
 
-        return delivery_counts(experiment, handle.run_id)._asdict()
+        return delivery_counts(experiment, handle.run_id, shared=True)._asdict()
 
     def _catalog_comparison_experiment(self, experiment_id: str) -> Experiment | None:
         """Return the config a future catalog launch would execute, if available.
