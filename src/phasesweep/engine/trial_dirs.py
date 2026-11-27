@@ -37,6 +37,7 @@ from phasesweep.engine.state import (
     _trial_lifecycle,
     _unreplaced_attempts,
 )
+from phasesweep.engine.trial import RESULT_NOT_RESTATED_ATTR
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.evidence.baseline import read_evidence_baseline
 from phasesweep.runtime.files import broken_symlink_detail
@@ -441,6 +442,9 @@ def _rerun_directory_sources(
 ) -> Iterator[FrozenTrial]:
     """Yield earlier attempts in the same directory, through its physical opener.
 
+    A source whose trainer did not restate its result in the directory it continued ends the
+    walk before it, so its rerun opens a fresh directory instead of meeting the same file.
+
     :param Mapping[int, FrozenTrial] trials: The study's trials by number.
     :param FrozenTrial trial: A trial about to launch or one that recorded its directory.
     :param Mapping[str, ProducingAttempt] | None attempts: Producers to follow for aliases.
@@ -448,6 +452,8 @@ def _rerun_directory_sources(
     :return Iterator[FrozenTrial]: Directory sources, from the most recent to the opener.
     """
     for index, current in enumerate(_rerun_chain(trials, trial, attempts=attempts)):
+        if index and current.user_attrs.get(RESULT_NOT_RESTATED_ATTR) is True:
+            return
         try:
             recorded = _recorded_trial_dir(current)
         except ValueError as exc:
@@ -573,7 +579,15 @@ def _trial_dir_for_attempt(
     sources = list(_rerun_directory_sources(trials, trial))
     if not sources:
         path = _trial_dir_for(experiment, phase_name, trial.number, attempt_id=attempt_id)
-        return TrialDirectory(path, trial.number, attempt_id)
+        number = trial.user_attrs.get(RERUN_OF_ATTR)
+        rerun_of = trials.get(number) if type(number) is int else None
+        restart = (
+            f"trial {number}'s trainer exited without rewriting its result in the directory "
+            "it continued"
+            if rerun_of is not None and rerun_of.user_attrs.get(RESULT_NOT_RESTATED_ATTR) is True
+            else None
+        )
+        return TrialDirectory(path, trial.number, attempt_id, restart)
     phase_dir = _phase_dir(experiment, phase_name)
     source = sources[0]
     source_attempt = source.user_attrs.get(ATTEMPT_ID_ATTR)

@@ -937,7 +937,7 @@ def test_retry_keeps_the_measured_evidence_of_a_sibling_reading_study(
 
 
 def test_reread_unrecorded_path_refuses_a_predecessors_file(tmp_path: Path) -> None:
-    """A path that was not checked before a retry needs launch-time evidence of a write."""
+    """A re-read without launch-time evidence of a write fails the row and owes no rerun."""
     trainer = write_trainer(
         tmp_path / "trainer.py",
         """
@@ -969,15 +969,14 @@ def test_reread_unrecorded_path_refuses_a_predecessors_file(tmp_path: Path) -> N
     with pytest.raises(NoFeasibleTrialError, match="No completed trials"):
         run_experiment(corrected)
     copied = addressed_phase_study(corrected).trials[1]
-    assert copied.value is None
-    assert "trainer exited without writing it" in copied.user_attrs[FAILURE_REASON_ATTR]
+    reason = copied.user_attrs[FAILURE_REASON_ATTR]
+    assert copied.state == optuna.trial.TrialState.FAIL
+    assert trial_ops.RESULT_NOT_RESTATED_ATTR not in copied.user_attrs
+    assert "trainer exited without writing it" in reason and "rerun" not in reason
 
 
 def test_reread_refuses_an_older_file_reached_through_a_retargeted_link(tmp_path: Path) -> None:
-    """A redirected result path gives no score even when its new target predates the retry.
-
-    :param Path tmp_path: Scratch directory for the experiment and trainer.
-    """
+    """A retry's redirect to an older file scores nothing; its fresh rerun's own file scores."""
     trainer = write_trainer(
         tmp_path / "trainer.py",
         """
@@ -1000,15 +999,15 @@ def test_reread_refuses_an_older_file_reached_through_a_retargeted_link(tmp_path
     first = Phase(name="p", n_trials=1, gpu_policy="none")
     retried = first.model_copy(update={"n_trials": 2})
     for phase in (first, retried):
+        typo = _experiment(tmp_path, trainer, _metric("typo"), phases=[phase])
         with pytest.raises(NoFeasibleTrialError):
-            run_experiment(_experiment(tmp_path, trainer, _metric("typo"), phases=[phase]))
-
+            run_experiment(typo)
+    redirected = addressed_phase_study(typo).get_trials()[1]
+    assert "last changed before this attempt started" in redirected.user_attrs[FAILURE_REASON_ATTR]
     corrected = _experiment(tmp_path, trainer, _metric("loss"), phases=[retried])
-    with pytest.raises(NoFeasibleTrialError):
-        run_experiment(corrected)
-    older, retry = addressed_phase_study(corrected).get_trials()
+    assert run_experiment(corrected)["p"].metric == 0.1
+    older, _ = addressed_phase_study(corrected).get_trials()
     assert "changed after this attempt finished" in older.user_attrs[FAILURE_REASON_ATTR]
-    assert "last changed before this attempt started" in retry.user_attrs[FAILURE_REASON_ATTR]
 
 
 @pytest.mark.integration
@@ -1016,9 +1015,9 @@ def test_reread_refuses_an_older_file_reached_through_a_retargeted_link(tmp_path
 def test_reread_uses_the_next_launch_instead_of_local_times(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The middle of three attempts owns the shared file it rewrote, across time zones.
+    """The middle of three attempts in one directory owns the file it rewrote, across time zones.
 
-    Its measurement fills the fixed configuration's one retry, so a third slot is refused.
+    Its measurement fills the one retry, so a third slot is refused; the empty third reran fresh.
 
     :param Path tmp_path: Scratch directory for the experiment and trainer.
     :param pytest.MonkeyPatch monkeypatch: Controller's local time zone for each run.
@@ -1067,7 +1066,7 @@ def test_reread_uses_the_next_launch_instead_of_local_times(
     assert first.user_attrs[TRIAL_DIR_ATTR] == middle.user_attrs[TRIAL_DIR_ATTR]
     assert [trial.value for trial in (first, middle)] == [None, 2]
     assert "changed after this attempt finished" in first.user_attrs[FAILURE_REASON_ATTR]
-    assert _launches(launches) == 3
+    assert _launches(launches) == 4
 
 
 @pytest.mark.integration

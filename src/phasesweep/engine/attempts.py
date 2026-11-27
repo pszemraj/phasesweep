@@ -1332,7 +1332,9 @@ def _recover_completed_trial(
     bound violation may still commit as COMPLETE and infeasible. Evidence that answers
     with a failure commits FAIL with that failure as the trial's outcome, as the live path
     records it, so finished training is never trained again. Either verdict counts toward the
-    producing phase's failure limit as a live one does. Only a ledger study reaches recovery,
+    producing phase's failure limit as a live one does. Value evidence in a reused directory that
+    the attempt did not write commits an interruption instead, whose rerun opens a fresh
+    directory, as the live path records it. Only a ledger study reaches recovery,
     so training it defers stays retained for a later pass.
 
     :param optuna.Study study: Owning study whose trial is still RUNNING.
@@ -1342,7 +1344,7 @@ def _recover_completed_trial(
     :param _PreflightCleanupReport | None report: Collector for newly recovered completed
         results and for evidence the tracker gave no answer about.
     :return bool | None: True once the finished trainer's evidence settled the trial as
-        COMPLETE or as a failure, False without proof the trainer finished, or None when
+        COMPLETE, a failure or an interruption, False without proof the trainer finished, or None when
         shutdown or an unreadable tracker leaves extraction pending.
     :raises WinnerIntegrityError: The producing configuration snapshot is unavailable or invalid.
     :raises StudySchemaMismatchError: The study's recorded outcomes cannot be replayed to
@@ -1357,7 +1359,7 @@ def _recover_completed_trial(
     """
     from phasesweep.engine.evidence import _earlier_attempts
     from phasesweep.engine.ledger import phase_studies_for
-    from phasesweep.engine.trial import record_trial_result
+    from phasesweep.engine.trial import _fresh_rerun_reason, record_trial_result
     from phasesweep.engine.trial_dirs import (
         DirectoryHistory,
         directory_history,
@@ -1457,21 +1459,29 @@ def _recover_completed_trial(
             record.attempt_id, record.phase_name, trial.number, persistent=True
         )
         return None
-    if result.failure_reason is None:
+    cause = result.failure_reason
+    if cause is None:
         assert result.metric is not None
+    elif result.evidence_not_restated:
+        cause = _fresh_rerun_reason(cause)
     try:
         record_trial_result(active_trial, result, overrides_json=overrides_json)
         _record_stale_trial_outcome(
             study,
             trial,
-            "failure" if result.failure_reason is not None else "success",
+            # Unrestated evidence in a reused directory is owed a fresh rerun, as live.
+            "success"
+            if cause is None
+            else "interrupted"
+            if result.evidence_not_restated
+            else "failure",
             # Only a success carries its measurement, as a live trial's outcome does.
-            metric=result.metric if result.failure_reason is None else None,
-            cause=result.failure_reason,
+            metric=result.metric if cause is None else None,
+            cause=cause,
             policy=(phase, experiment),
         )
-        if result.failure_reason is not None:
-            active_trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
+        if cause is not None:
+            active_trial.set_user_attr(FAILURE_REASON_ATTR, cause)
     except StudySchemaMismatchError:
         raise
     except Exception as exc:

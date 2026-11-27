@@ -33,6 +33,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     _parsed_trial_outcome,
 )
+from phasesweep.engine.trial import RESULT_NOT_RESTATED_ATTR
 from phasesweep.engine.trial_dirs import (
     TrialDirectory,
     _expected_trial_dir_name,
@@ -270,10 +271,10 @@ def _trainer(tmp_path: Path, first_body: str, rerun_body: str) -> str:
 
 
 @pytest.mark.integration
-def test_a_rerun_that_rewrites_no_result_fails_as_not_written_by_this_attempt(
+def test_a_rerun_that_rewrites_no_result_is_never_scored_and_fails_in_a_fresh_directory(
     tmp_path: Path,
 ) -> None:
-    """A rerun in its trial's directory that exits 0 without writing a result fails instead of scoring the earlier attempt's."""
+    """A rerun in its trial's directory that exits 0 without writing a result is never scored on the earlier attempt's file: it is interrupted, and its rerun in a fresh directory, writing nothing either, fails like a first attempt and is not rerun again."""
     body = _trainer(
         tmp_path,
         '    (trial / "r.json").write_text(json.dumps({"loss": 0.1}))',
@@ -284,13 +285,79 @@ def test_a_rerun_that_rewrites_no_result_fails_as_not_written_by_this_attempt(
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(experiment)
 
-    first, rerun = phase_trials(experiment)
-    assert rerun.user_attrs[RERUN_OF_ATTR] == 0
-    assert rerun.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
-    outcome = _parsed_trial_outcome(rerun.user_attrs[TRIAL_OUTCOME_ATTR])
-    assert outcome is not None and outcome.outcome == "failure"
+    first, in_place, fresh = phase_trials(experiment)
+    assert in_place.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
+    outcome = _parsed_trial_outcome(in_place.user_attrs[TRIAL_OUTCOME_ATTR])
+    assert outcome is not None and outcome.outcome == "interrupted"
     assert f"{first.user_attrs[TRIAL_DIR_ATTR]}/r.json" in str(outcome.cause)
     assert "was not written by this attempt" in str(outcome.cause)
+    assert fresh.user_attrs[RERUN_OF_ATTR] == in_place.number
+    assert (
+        Path(fresh.user_attrs[TRIAL_DIR_ATTR]).name
+        == _trial_dir_for(
+            experiment, "p", fresh.number, attempt_id=fresh.user_attrs[ATTEMPT_ID_ATTR]
+        ).name
+    )
+    outcome = _parsed_trial_outcome(fresh.user_attrs[TRIAL_OUTCOME_ATTR])
+    assert outcome is not None and outcome.outcome == "failure"
+    assert "JSON file not found" in str(outcome.cause)
+    assert RESULT_NOT_RESTATED_ATTR not in fresh.user_attrs
+
+
+_SKIPS_WHEN_DONE = """
+if (trial / "ckpt.txt").exists() and (trial / "ckpt.txt").read_text() == "5":
+    sys.exit(0)
+for step in range(5):
+    (trial / "ckpt.txt").write_text(str(step + 1))
+(trial / "r.json").write_text(json.dumps({"loss": 0.5}))
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("killed_before_evaluation", [False, True], ids=["live", "recovered"])
+def test_a_trainer_that_skips_finished_training_reruns_in_a_fresh_directory(
+    tmp_path: Path, killed_before_evaluation: bool
+) -> None:
+    """A trainer that exits 0 at once over its final checkpoint, leaving the earlier attempt's result, leaves its attempt interrupted and owed a rerun, not failed, whether the run evaluates it or recovery does after the runner died before evaluation; the rerun retrains in a fresh directory and wins."""
+    first_body = _CHECKPOINTING + '    (trial / "r.json").write_text(json.dumps({"loss": 0.5}))'
+    experiment = _interrupt_first_attempt(
+        tmp_path, _trainer(tmp_path, first_body, _SKIPS_WHEN_DONE), _JSON_METRIC
+    )
+    if killed_before_evaluation:
+        program = """
+import os, signal, sys
+from phasesweep import run_experiment
+from phasesweep.config.io import load_experiment
+from phasesweep.engine import phase
+
+def die(*args, **kwargs):
+    os.kill(os.getpid(), signal.SIGKILL)
+
+phase.extract_trial_result = die
+run_experiment(load_experiment(sys.argv[1]))
+"""
+        config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+        runner = subprocess.run(
+            [sys.executable, "-c", program, str(config)],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert runner.returncode == -signal.SIGKILL, runner.stderr.decode()
+        assert phase_trials(experiment)[1].state == optuna.trial.TrialState.RUNNING
+
+    winner = run_experiment(experiment)["p"]
+    first, in_place, fresh = phase_trials(experiment)
+    assert in_place.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
+    assert in_place.user_attrs[RESULT_NOT_RESTATED_ATTR] is True
+    outcome = _parsed_trial_outcome(in_place.user_attrs[TRIAL_OUTCOME_ATTR])
+    assert outcome is not None and outcome.outcome == "interrupted"
+    assert "its rerun starts from step 0 in a fresh directory" in str(outcome.cause)
+    assert fresh.user_attrs[RERUN_OF_ATTR] == in_place.number
+    assert fresh.user_attrs[TRIAL_DIR_ATTR] != first.user_attrs[TRIAL_DIR_ATTR]
+    assert winner.trial_number == fresh.number and winner.metric == 0.5
+    assert (Path(fresh.user_attrs[TRIAL_DIR_ATTR]) / "ckpt.txt").read_text() == "5"
+    _verify_winner_evidence(experiment, experiment.phases[0], winner)
 
 
 @pytest.mark.integration

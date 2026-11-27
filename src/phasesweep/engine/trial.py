@@ -48,6 +48,7 @@ from phasesweep.evidence.baseline import (
 )
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
+    EvidenceNotRestatedError,
     EvidenceUnreadableError,
     ExtractorError,
     GateResult,
@@ -144,6 +145,32 @@ class TrialResult:
     # Report-only values read after acceptance, by observation name. A name
     # whose extraction failed or came out non-finite is absent.
     observed: dict[str, float] = field(default_factory=dict)
+    # True only when every failure is value evidence in a reused directory that this
+    # attempt's trainer did not write: the attempt is interrupted and reruns in a fresh one.
+    evidence_not_restated: bool = False
+
+
+# Ledger attr, ``True`` on a trial whose trainer exited 0 in a directory an earlier attempt
+# used without rewriting its value evidence there. The trial's rerun opens a fresh directory
+# (:func:`phasesweep.engine.trial_dirs._rerun_directory_sources`), where nothing predates the
+# attempt, so the freshness check cannot refuse it again.
+RESULT_NOT_RESTATED_ATTR = "phasesweep_result_not_restated"
+
+
+def _fresh_rerun_reason(reason: str) -> str:
+    """Add what follows from an unrestated result to the reason the console and status print.
+
+    Only a launch or its recovery owes the rerun, so they add this where they record the
+    interruption. A re-read of a kept attempt launches nothing and keeps the plain reason.
+
+    :param str reason: Why the value evidence was refused.
+    :return str: The reason, then that the attempt is unscored and its rerun starts afresh.
+    """
+    return (
+        f"{reason} The trainer exited 0 in a directory an earlier attempt used without "
+        "rewriting it, so this attempt is not scored and its rerun starts from step 0 in a "
+        "fresh directory."
+    )
 
 
 class UserAttrSink(Protocol):
@@ -199,10 +226,12 @@ def record_trial_result(trial: UserAttrSink, result: TrialResult, *, overrides_j
             {constraint_attr(name): value for name, value in result.constraints.items()}
         )
         optional.update({observed_attr(name): value for name, value in result.observed.items()})
+    if result.evidence_not_restated:
+        optional[RESULT_NOT_RESTATED_ATTR] = True
     for key, value in previous.items():
         if (
             (
-                key in {OBJECTIVE_PROVENANCE_ATTR, GATES_ATTR}
+                key in {OBJECTIVE_PROVENANCE_ATTR, GATES_ATTR, RESULT_NOT_RESTATED_ATTR}
                 or key.startswith((CONSTRAINT_PREFIX, OBSERVED_PREFIX))
             )
             and key not in optional
@@ -676,6 +705,7 @@ def _failed_trial(
     gate_results: list[GateResult] | None = None,
     deadline_exhausted: bool = False,
     evidence_unreadable: bool = False,
+    evidence_not_restated: bool = False,
     objective_provenance: dict[str, Any] | None = None,
 ) -> TrialResult:
     """Build a ``TrialResult`` representing a failed trial.
@@ -692,6 +722,8 @@ def _failed_trial(
         failure, if any.
     :param bool deadline_exhausted: Whether the phase/run deadline caused the failure.
     :param bool evidence_unreadable: Whether every failure is a tracker that gave no answer.
+    :param bool evidence_not_restated: Whether every failure is value evidence in a reused
+        directory that this attempt did not write.
     :param dict[str, object] | None objective_provenance: Frozen evidence already captured
         before a later gate failed.
     :return TrialResult: A result with ``metric=None``.
@@ -705,6 +737,7 @@ def _failed_trial(
         gate_results=gate_results,
         deadline_exhausted=deadline_exhausted,
         evidence_unreadable=evidence_unreadable,
+        evidence_not_restated=evidence_not_restated,
         objective_provenance=objective_provenance,
     )
 
@@ -1105,6 +1138,7 @@ def extract_trial_result(
                 constraints=constraint_values,
                 deadline_exhausted=exhausted,
                 evidence_unreadable=unreadable,
+                evidence_not_restated=isinstance(exc, EvidenceNotRestatedError),
             )
         if not math.isfinite(value):
             # The failed trial's ``reason:`` says the same on the console.
@@ -1197,6 +1231,7 @@ def extract_trial_result(
             deadline_exhausted=any(gate.deadline_exhausted for gate in failed_gates),
             # A definite gate failure fails the trial whatever the tracker would answer.
             evidence_unreadable=unreadable,
+            evidence_not_restated=all(gate.evidence_not_restated for gate in failed_gates),
         )
 
     expired = _deadline_failure("the trial result could be accepted")

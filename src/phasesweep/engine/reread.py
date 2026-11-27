@@ -24,7 +24,7 @@ import heapq
 import logging
 import time
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import ClassVar, NamedTuple
 
 import optuna
@@ -276,6 +276,9 @@ def _reread_trial(
     if result.evidence_unreadable and result.failure_reason is not None:
         raise _pending_evidence_refusal({record.attempt_id: result.failure_reason})
     sheet = _AttrSheet(dict(trial.user_attrs))
+    # A re-read launches nothing, so evidence the attempt did not write fails the row and
+    # owes no rerun; a later retry continues the directory, where the trainer can restate it.
+    result = replace(result, evidence_not_restated=False)
     record_trial_result(sheet, result, overrides_json=overrides_json)
     failure = result.failure_reason
     if failure is None:

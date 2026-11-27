@@ -120,6 +120,7 @@ from phasesweep.engine.study_policy import (
     _recovery_action,
     _recovery_advice,
     _replayed_streak_abort,
+    _settled_trial_count,
     _streak_trials_all_infeasible,
     _validate_study_direction,
     _validate_trial_target,
@@ -128,6 +129,7 @@ from phasesweep.engine.trial import (
     _STOPPED_BY_PHASESWEEP,
     EnvironmentIdentity,
     TrialExecutionError,
+    _fresh_rerun_reason,
     _trainer_failure_reason,
     extract_trial_result,
     launch_trial,
@@ -262,7 +264,7 @@ class _UnlaunchedAbortError(TrialExecutionError):
 
 
 class _InterruptedTrialError(TrialExecutionError):
-    """Raised when a shutdown stopped a trial's trainer, or kept it from starting.
+    """Raised for a trial owed a rerun: stopped or unstarted trainer, or an unrestated result.
 
     A trainer that ended by itself keeps its own verdict even while a shutdown is serviced.
     """
@@ -1227,12 +1229,13 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             trial, result, overrides_json=json.dumps(overrides, default=str, sort_keys=True)
         )
 
-    # Process/extractor failures -> Optuna FAIL state, not COMPLETE with inf.
-    if result.failure_reason:
+    if result.failure_reason:  # Optuna FAIL state; unrestated evidence is owed a fresh rerun.
         if result.deadline_exhausted:
             with _persist_trial_evidence(run, trial):
                 trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
             raise _DeadlineTrialExecutionError(result.failure_reason)
+        if result.evidence_not_restated:
+            raise _InterruptedTrialError(_fresh_rerun_reason(result.failure_reason))
         raise TrialExecutionError(result.failure_reason)
 
     assert result.metric is not None  # guaranteed when failure_reason is None
@@ -1757,7 +1760,7 @@ def _run_phase(
             try:
                 while True:
                     _log_reruns(experiment, phase, study, recorded_reruns)
-                    finished_before = _finished_trial_count(study.get_trials(deepcopy=False))
+                    settled_before = _settled_trial_count(study)
                     batch = launch_batch(experiment, phase, study, others)
                     bounded = batch < remaining
                     study.optimize(
@@ -1769,14 +1772,13 @@ def _run_phase(
                         callbacks=[functools.partial(_after_trial, run)],
                         catch=(TrialExecutionError,),
                     )
-                    # A trainer PhaseSweep stopped while the run went on, as after its guardian
-                    # died, is interrupted; it reruns in its directory in this invocation while
-                    # each pass still finishes trials, and otherwise in the next one.
+                    # An interrupted trial (a stopped trainer, an unrestated result) reruns in
+                    # this invocation while each pass settles trials, otherwise in the next one.
                     finished_after = _finished_trial_count(study.get_trials(deepcopy=False))
                     remaining = phase.n_trials - finished_after
                     if (
                         remaining <= 0
-                        or finished_after == finished_before
+                        or _settled_trial_count(study) == settled_before
                         or run.aborted
                         or run.deadline_exhausted
                         or run.fatal_error is not None

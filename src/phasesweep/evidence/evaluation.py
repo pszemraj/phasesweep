@@ -109,6 +109,14 @@ class StaleEvidenceError(OSError):
     """The evidence cannot be attributed to the current attempt."""
 
 
+class UnwrittenEvidenceError(StaleEvidenceError):
+    """A value file in a reused directory that this attempt's trainer did not write.
+
+    The trainer exited 0 without restating its result there, which says nothing about the
+    configuration, so the attempt is owed a rerun in a fresh directory instead of failing.
+    """
+
+
 def _link_refusal(owner: Path, relative: str | Path, *, directory: bool) -> str | None:
     """Name a link in a configured path whose target is missing or not the kind required.
 
@@ -308,8 +316,10 @@ def _require_fresh(
     :param Path target: Current location of evidence after containment checks.
     :param float | str | None evidence_before: Unix time the shared value file must predate,
         or the reason it cannot be attributed to the attempt, defaults to None.
-    :raises StaleEvidenceError: The file was not written by this attempt, or its state at
-        launch could not be inspected.
+    :raises UnwrittenEvidenceError: The file in the reused directory was not written by this
+        attempt.
+    :raises StaleEvidenceError: The file changed after a later launch, or its state at launch
+        could not be inspected.
     :raises OSError: The current file or the baseline record could not be inspected.
     """
     if is_captured_stream(relative):
@@ -330,7 +340,7 @@ def _require_fresh(
     prior = next((s for s in recorded if isinstance(s, FileStamp) and s.path == current), None)
     if prior is not None:
         if prior.unchanged(info):
-            raise StaleEvidenceError(
+            raise UnwrittenEvidenceError(
                 f"`{target}` was not written by this attempt: its metadata shows no fresh "
                 "write since launch."
             )
@@ -340,7 +350,7 @@ def _require_fresh(
     launch_stamp = (attempt_dir / EVIDENCE_BASELINE_FILE).stat().st_mtime_ns
     if info.st_mtime_ns > launch_stamp or info.st_ctime_ns >= launch_stamp:
         return
-    raise StaleEvidenceError(
+    raise UnwrittenEvidenceError(
         f"`{target}` now resolves to `{resolved}`, which last changed before this "
         "attempt started, so the trainer exited without writing it."
     )
@@ -490,6 +500,25 @@ class EvidenceUnreadableError(ExtractorError):
     """
 
 
+class EvidenceNotRestatedError(ExtractorError):
+    """Raised for a value file in a reused directory that this attempt did not write.
+
+    See :class:`UnwrittenEvidenceError`: the attempt is owed a rerun in a fresh directory.
+    """
+
+
+def _stale_extractor_error(exc: StaleEvidenceError) -> ExtractorError:
+    """Translate a file-level attribution refusal into the extractor error it implies.
+
+    :param StaleEvidenceError exc: The refusal.
+    :return ExtractorError: :class:`EvidenceNotRestatedError` for a file this attempt did not
+        write, otherwise a plain :class:`ExtractorError`, both carrying the refusal's text.
+    """
+    if isinstance(exc, UnwrittenEvidenceError):
+        return EvidenceNotRestatedError(str(exc))
+    return ExtractorError(str(exc))
+
+
 class MlflowObjectiveMissingError(ExtractorError):
     """Raised when a finished managed MLflow run lacks the configured objective metric."""
 
@@ -503,17 +532,25 @@ def _non_finite_text(constant: str) -> str:
     return f"holds {constant}, which is not a finite number; a diverged run writes it"
 
 
-def _gate_unavailable(path: str, key: str, exc: Exception) -> str:
-    """Describe a JSON gate whose value could not be read.
+def _gate_unavailable(gate_type: str, path: str, key: str, exc: Exception) -> GateResult:
+    """Fail a JSON gate whose value could not be read.
 
+    :param str gate_type: The gate's configured type.
     :param str path: Trial-relative file the gate reads.
     :param str key: Dotted key the gate reads.
     :param Exception exc: Failure raised while reading it.
-    :return str: The gate result's detail.
+    :return GateResult: The failed result, marked when this attempt did not write the file.
     """
     if isinstance(exc, NonFiniteJsonConstantError):
-        return f"{path}:{key} unavailable: the file {_non_finite_text(exc.constant)}"
-    return f"{path}:{key} unavailable: {exc}"
+        detail = f"{path}:{key} unavailable: the file {_non_finite_text(exc.constant)}"
+    else:
+        detail = f"{path}:{key} unavailable: {exc}"
+    return GateResult(
+        gate_type,
+        False,
+        detail,
+        evidence_not_restated=isinstance(exc, UnwrittenEvidenceError),
+    )
 
 
 @contextmanager
@@ -527,12 +564,15 @@ def _trial_json_read_errors(target: Path, *, noun: str, trainer_step: str) -> It
         that exits 0 without it fails here. The path ends the diagnostic's own words, so no
         punctuation sticks to it when a reader copies it.
     :raises ExtractorError: The file is missing, unreadable, malformed, or outside the
-        attempt; the last carries the refusal's own text as the trial's failure reason.
+        attempt; the last carries the refusal's own text as the trial's failure reason, as an
+        :class:`EvidenceNotRestatedError` when a reused directory's file was not rewritten.
     :return Iterator[None]: Context covering the read and parse of the same bytes.
     """
     try:
         yield
-    except (TrialPathError, StaleEvidenceError) as exc:
+    except StaleEvidenceError as exc:
+        raise _stale_extractor_error(exc) from exc
+    except TrialPathError as exc:
         raise ExtractorError(str(exc)) from exc
     except FileNotFoundError as exc:
         missing = (
@@ -897,7 +937,7 @@ def _extract_log_regex(
     except UnicodeError as exc:
         raise ExtractorError(f"Log file is not valid UTF-8 at {target}: {exc}") from exc
     except StaleEvidenceError as exc:
-        raise ExtractorError(str(exc)) from exc
+        raise _stale_extractor_error(exc) from exc
     except OSError as exc:
         raise ExtractorError(f"Could not read log file at {target}: {exc}") from exc
 
@@ -1377,6 +1417,8 @@ class GateResult:
     deadline_exhausted: bool = False
     # The tracker gave no answer about the evidence this gate reads; never persisted.
     evidence_unreadable: bool = False
+    # The value file sits in a reused directory and this attempt did not write it.
+    evidence_not_restated: bool = False
 
 
 def _required_file(ctx: TrialContext, gate: RequiredFileGate) -> GateResult:
@@ -1414,7 +1456,7 @@ def _json_equals(ctx: TrialContext, gate: JsonEqualsGate) -> GateResult:
             evidence_before=ctx.evidence_before,
         )
     except Exception as exc:
-        return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
+        return _gate_unavailable(gate.type, gate.path, gate.key, exc)
     if type(actual) is type(gate.value) and actual == gate.value:
         return GateResult(gate.type, True, f"{gate.key} == {gate.value!r}")
     return GateResult(
@@ -1443,7 +1485,7 @@ def _json_scalar_bound(ctx: TrialContext, gate: JsonScalarBoundGate) -> GateResu
         )
         value = json_float(raw_value, label=gate.key)
     except Exception as exc:
-        return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
+        return _gate_unavailable(gate.type, gate.path, gate.key, exc)
     if not math.isfinite(value):
         return GateResult(gate.type, False, f"{gate.key} was non-finite: {value!r}")
     if gate.min is not None and value < gate.min:
@@ -1532,7 +1574,7 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
                 evidence_before=ctx.evidence_before,
             )
         except Exception as exc:
-            return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
+            return _gate_unavailable(gate.type, gate.path, gate.key, exc)
         if not isinstance(raw_size, int) or isinstance(raw_size, bool):
             return GateResult(gate.type, False, f"{gate.key} was not an integer byte count")
         if raw_size < 0:
