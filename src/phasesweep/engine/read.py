@@ -27,7 +27,7 @@ from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import Experiment, Phase, _metric_semantics_payload
 from phasesweep.engine.artifact_roots import _artifact_path_mode
 from phasesweep.engine.artifacts import read_yaml_or_none
-from phasesweep.engine.bounds import infeasible_reason
+from phasesweep.engine.bounds import measured_reason
 from phasesweep.engine.confound import (
     _confound_summary,
     _validate_confound_block,
@@ -1429,11 +1429,11 @@ def _recorded_count(value: object) -> int | None:
 
 
 def _trial_reason(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> str | None:
-    """Read the recorded execution failure or outcome cause for a trial, or judge its bounds.
+    """Read the recorded execution failure or outcome cause for a trial, or describe its measurement.
 
     :param optuna.trial.FrozenTrial trial: Trial whose diagnostic is displayed.
     :param Experiment experiment: Config whose bounds judge a measured trial.
-    :return str | None: Recorded cause, else the bounds a measured trial violates, else None.
+    :return str | None: Recorded cause, else :func:`~phasesweep.engine.bounds.measured_reason`.
     """
     failure = trial.user_attrs.get(FAILURE_REASON_ATTR)
     if isinstance(failure, str) and failure:
@@ -1441,7 +1441,7 @@ def _trial_reason(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> st
     outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
     if outcome is not None and outcome.cause is not None:
         return outcome.cause
-    return infeasible_reason(trial, experiment)
+    return measured_reason(trial, experiment)
 
 
 def _trial_dir_text(trial: optuna.trial.FrozenTrial) -> str | None:

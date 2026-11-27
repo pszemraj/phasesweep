@@ -1,4 +1,4 @@
-"""A rerun continues in its trial's directory and is scored only from files its own attempt wrote."""
+"""A rerun continues in its trial's directory, whose value files are the trial's result whichever attempt wrote them."""
 
 from __future__ import annotations
 
@@ -16,8 +16,10 @@ from types import SimpleNamespace
 
 import optuna
 import pytest
+from click.testing import CliRunner
 
 from phasesweep import run_experiment
+from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Metric, Observation
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _earlier_attempts, _verify_winner_evidence
@@ -26,14 +28,15 @@ from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trial_dir_for
 from phasesweep.engine.selection import NoFeasibleTrialError, _ranked_revision_sources
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    EARLIER_ATTEMPT_RESULT_ATTR,
     GENERATION_ID_ATTR,
+    LEFT_NOTHING_TO_SCORE_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     RERUN_OF_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     _parsed_trial_outcome,
 )
-from phasesweep.engine.trial import RESULT_NOT_RESTATED_ATTR
 from phasesweep.engine.trial_dirs import (
     TrialDirectory,
     _expected_trial_dir_name,
@@ -45,9 +48,19 @@ from phasesweep.evidence.baseline import (
     read_evidence_baseline,
     write_evidence_baseline,
 )
-from phasesweep.evidence.evaluation import ExtractorError, TrialContext, run_extractor
+from phasesweep.evidence.evaluation import (
+    ExtractorError,
+    NothingToScoreError,
+    TrialContext,
+    run_extractor,
+)
 from phasesweep.evidence.mlflow import observation_id
-from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor, MlflowExtractor
+from phasesweep.evidence.models import (
+    JsonEnvelopeExtractor,
+    JsonExtractor,
+    LogRegexExtractor,
+    MlflowExtractor,
+)
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
 from phasesweep.tracking import mlflow as mlflow_worker
@@ -57,6 +70,7 @@ from tests.conftest import (
     make_trial_context,
     phase_trials,
     reaped_pid,
+    run_log_text,
     study_name,
     trial_outcome,
     write_experiment_config,
@@ -103,11 +117,22 @@ def _resumed_context(
     )
 
 
+def _read(ctx: TrialContext, extractor: JsonExtractor | LogRegexExtractor) -> tuple[float, bool]:
+    """Read a value as a fresh extraction of the attempt would.
+
+    :param TrialContext ctx: The rerun's context.
+    :param JsonExtractor | LogRegexExtractor extractor: The metric extractor.
+    :return tuple[float, bool]: The value, and whether an earlier attempt wrote its file.
+    """
+    ctx = dataclasses.replace(ctx, earlier_files=[])
+    return run_extractor(ctx, extractor), bool(ctx.earlier_files)
+
+
 @pytest.mark.parametrize("touch_only", [False, True], ids=["rewrite", "touch"])
-def test_a_rewritten_value_file_is_fresh_and_an_untouched_one_is_stale(
+def test_an_untouched_value_file_scores_as_an_earlier_attempts(
     tmp_path: Path, touch_only: bool
 ) -> None:
-    """Score an identical rewrite or touch while refusing untouched and relinked results.
+    """An untouched or relinked result in a reused directory scores as an earlier attempt's, and an identical rewrite or a touch scores as the attempt's own.
 
     :param Path tmp_path: Scratch directory for the trial and attempt.
     :param bool touch_only: Update the file timestamps without writing its bytes.
@@ -116,21 +141,40 @@ def test_a_rewritten_value_file_is_fresh_and_an_untouched_one_is_stale(
     result = tmp_path / "trial" / "r.json"
     result.write_text('{"loss": 0.1}', encoding="utf-8")
     trial_dir, ctx = _resumed_context(tmp_path, _JSON_METRIC.extractor)
-    stale = "was not written by this attempt: its metadata shows no fresh write"
-    with pytest.raises(ExtractorError, match=stale):
-        run_extractor(ctx, _JSON_METRIC.extractor)
+    assert _read(ctx, _JSON_METRIC.extractor) == (0.1, True)
 
     os.link(result, trial_dir / "r.bak")
     result.unlink()
     os.link(trial_dir / "r.bak", result)
-    with pytest.raises(ExtractorError, match=stale):
-        run_extractor(ctx, _JSON_METRIC.extractor)
+    assert _read(ctx, _JSON_METRIC.extractor) == (0.1, True)
 
     if touch_only:
         result.touch()
     else:
         result.write_text('{"loss": 0.1}', encoding="utf-8")
-    assert run_extractor(ctx, _JSON_METRIC.extractor) == 0.1
+    assert _read(ctx, _JSON_METRIC.extractor) == (0.1, False)
+
+
+@pytest.mark.parametrize(
+    ("content", "unscored"),
+    [(None, True), ('{"loss": 0.', True), ('{"typo": 0.1}', False), ('{"loss": NaN}', False)],
+    ids=["missing", "truncated", "key-missing", "non-finite"],
+)
+def test_a_reused_directory_without_a_readable_value_leaves_nothing_to_score(
+    tmp_path: Path, content: str | None, unscored: bool
+) -> None:
+    """A missing result or an earlier attempt's file that does not parse leaves nothing to score, while a file that parses fails as evidence in a reused directory, and every failure is ordinary in a fresh one."""
+    (tmp_path / "trial").mkdir()
+    if content is not None:
+        (tmp_path / "trial" / "r.json").write_text(content, encoding="utf-8")
+    _, ctx = _resumed_context(tmp_path, _JSON_METRIC.extractor)
+    with pytest.raises(ExtractorError) as raised:
+        _read(ctx, _JSON_METRIC.extractor)
+    assert isinstance(raised.value, NothingToScoreError) is unscored
+    fresh = dataclasses.replace(ctx, baseline=ctx.baseline._replace(reused=False))
+    with pytest.raises(ExtractorError) as raised:
+        _read(fresh, _JSON_METRIC.extractor)
+    assert not isinstance(raised.value, NothingToScoreError)
 
 
 def test_a_same_size_copy_preserving_mtime_is_fresh(tmp_path: Path) -> None:
@@ -154,7 +198,7 @@ def test_a_same_size_copy_preserving_mtime_is_fresh(tmp_path: Path) -> None:
 
 
 def test_a_resumed_log_is_scored_from_every_line(tmp_path: Path) -> None:
-    """A trainer log kept across attempts selects over the earlier attempt's lines too once the rerun appends, and fails as not written by this attempt while untouched."""
+    """A trainer log kept across attempts selects over the earlier attempt's lines too once the rerun appends, and scores as the earlier attempt's while untouched."""
     extractor = LogRegexExtractor(
         type="log_regex", file="train.log", pattern=r"x=(?P<value>[0-9.]+)", select="min"
     )
@@ -162,8 +206,7 @@ def test_a_resumed_log_is_scored_from_every_line(tmp_path: Path) -> None:
     log = tmp_path / "trial" / "train.log"
     log.write_text("x=0.5\nx=0.1\n", encoding="utf-8")
     _, ctx = _resumed_context(tmp_path, extractor)
-    with pytest.raises(ExtractorError, match="was not written by this attempt"):
-        run_extractor(ctx, extractor)
+    assert _read(ctx, extractor) == (0.1, True)
 
     with log.open("a", encoding="utf-8") as stream:
         stream.write("x=0.7\n")
@@ -182,7 +225,7 @@ def test_a_resumed_log_is_scored_from_every_line(tmp_path: Path) -> None:
 def test_a_retargeted_link_uses_change_time_when_modification_time_is_inconclusive(
     tmp_path: Path,
 ) -> None:
-    """An unfamiliar target can share the launch tick if its change time reaches that tick.
+    """A retargeted link's unfamiliar target is an earlier attempt's unless its change time reaches the launch tick.
 
     :param Path tmp_path: Scratch directory for the trial and attempt.
     """
@@ -204,8 +247,7 @@ def test_a_retargeted_link_uses_change_time_when_modification_time_is_inconclusi
     os.utime(result, ns=(launch_stamp, launch_stamp))
     old_target = result.stat()
     assert old_target.st_ctime_ns < old_target.st_mtime_ns == baseline_path.stat().st_mtime_ns
-    with pytest.raises(ExtractorError, match="last changed before this attempt started"):
-        run_extractor(ctx, extractor)
+    assert _read(ctx, extractor) == (0.25, True)
 
     source = tmp_path / "source.json"
     source.write_text('{"loss": 0.75}', encoding="utf-8")
@@ -214,7 +256,7 @@ def test_a_retargeted_link_uses_change_time_when_modification_time_is_inconclusi
     copied = result.stat()
     os.utime(baseline_path, ns=(copied.st_ctime_ns, copied.st_ctime_ns))
     assert copied.st_mtime_ns < baseline_path.stat().st_mtime_ns == copied.st_ctime_ns
-    assert run_extractor(ctx, extractor) == 0.75
+    assert _read(ctx, extractor) == (0.75, False)
 
 
 def _interrupt_first_attempt(
@@ -270,41 +312,9 @@ def _trainer(tmp_path: Path, first_body: str, rerun_body: str) -> str:
     )
 
 
-@pytest.mark.integration
-def test_a_rerun_that_rewrites_no_result_is_never_scored_and_fails_in_a_fresh_directory(
-    tmp_path: Path,
-) -> None:
-    """A rerun in its trial's directory that exits 0 without writing a result is never scored on the earlier attempt's file: it is interrupted, and its rerun in a fresh directory, writing nothing either, fails like a first attempt and is not rerun again."""
-    body = _trainer(
-        tmp_path,
-        '    (trial / "r.json").write_text(json.dumps({"loss": 0.1}))',
-        "sys.exit(0)",
-    )
-    experiment = _interrupt_first_attempt(tmp_path, body, _JSON_METRIC)
-
-    with pytest.raises(NoFeasibleTrialError):
-        run_experiment(experiment)
-
-    first, in_place, fresh = phase_trials(experiment)
-    assert in_place.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
-    outcome = _parsed_trial_outcome(in_place.user_attrs[TRIAL_OUTCOME_ATTR])
-    assert outcome is not None and outcome.outcome == "interrupted"
-    assert f"{first.user_attrs[TRIAL_DIR_ATTR]}/r.json" in str(outcome.cause)
-    assert "was not written by this attempt" in str(outcome.cause)
-    assert fresh.user_attrs[RERUN_OF_ATTR] == in_place.number
-    assert (
-        Path(fresh.user_attrs[TRIAL_DIR_ATTR]).name
-        == _trial_dir_for(
-            experiment, "p", fresh.number, attempt_id=fresh.user_attrs[ATTEMPT_ID_ATTR]
-        ).name
-    )
-    outcome = _parsed_trial_outcome(fresh.user_attrs[TRIAL_OUTCOME_ATTR])
-    assert outcome is not None and outcome.outcome == "failure"
-    assert "JSON file not found" in str(outcome.cause)
-    assert RESULT_NOT_RESTATED_ATTR not in fresh.user_attrs
-
-
 _SKIPS_WHEN_DONE = """
+with first.with_name("launches.txt").open("a") as launches:
+    launches.write("launch\\n")
 if (trial / "ckpt.txt").exists() and (trial / "ckpt.txt").read_text() == "5":
     sys.exit(0)
 for step in range(5):
@@ -314,15 +324,77 @@ for step in range(5):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("killed_before_evaluation", [False, True], ids=["live", "recovered"])
-def test_a_trainer_that_skips_finished_training_reruns_in_a_fresh_directory(
-    tmp_path: Path, killed_before_evaluation: bool
+@pytest.mark.parametrize("fresh_rerun", ["trains", "writes nothing"])
+def test_a_rerun_that_leaves_nothing_to_score_reruns_once_in_a_fresh_directory(
+    tmp_path: Path, fresh_rerun: str
 ) -> None:
-    """A trainer that exits 0 at once over its final checkpoint, leaving the earlier attempt's result, leaves its attempt interrupted and owed a rerun, not failed, whether the run evaluates it or recovery does after the runner died before evaluation; the rerun retrains in a fresh directory and wins."""
-    first_body = _CHECKPOINTING + '    (trial / "r.json").write_text(json.dumps({"loss": 0.5}))'
+    """A rerun in its trial's directory that exits 0 over the checkpoint an interrupted attempt left, with no result file, is interrupted and reruns from step 0 in a fresh directory; that rerun completes when it trains, and when it writes nothing either it fails like a first attempt and is not rerun again."""
+    rerun_body = _SKIPS_WHEN_DONE if fresh_rerun == "trains" else "sys.exit(0)"
     experiment = _interrupt_first_attempt(
-        tmp_path, _trainer(tmp_path, first_body, _SKIPS_WHEN_DONE), _JSON_METRIC
+        tmp_path, _trainer(tmp_path, _CHECKPOINTING, rerun_body), _JSON_METRIC
     )
+
+    if fresh_rerun == "trains":
+        winner = run_experiment(experiment)["p"]
+    else:
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(experiment)
+
+    first, in_place, fresh = phase_trials(experiment)
+    assert in_place.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
+    assert in_place.user_attrs[LEFT_NOTHING_TO_SCORE_ATTR] is True
+    outcome = _parsed_trial_outcome(in_place.user_attrs[TRIAL_OUTCOME_ATTR])
+    assert outcome is not None and outcome.outcome == "interrupted"
+    assert f"{first.user_attrs[TRIAL_DIR_ATTR]}/r.json" in str(outcome.cause)
+    assert "its rerun starts from step 0 in a fresh directory" in str(outcome.cause)
+    assert fresh.user_attrs[RERUN_OF_ATTR] == in_place.number
+    assert (
+        Path(fresh.user_attrs[TRIAL_DIR_ATTR]).name
+        == _trial_dir_for(
+            experiment, "p", fresh.number, attempt_id=fresh.user_attrs[ATTEMPT_ID_ATTR]
+        ).name
+    )
+    assert LEFT_NOTHING_TO_SCORE_ATTR not in fresh.user_attrs
+    outcome = _parsed_trial_outcome(fresh.user_attrs[TRIAL_OUTCOME_ATTR])
+    assert outcome is not None
+    if fresh_rerun == "trains":
+        assert outcome.outcome == "success"
+        assert winner.trial_number == fresh.number and winner.metric == 0.5
+        assert (Path(fresh.user_attrs[TRIAL_DIR_ATTR]) / "ckpt.txt").read_text() == "5"
+        assert EARLIER_ATTEMPT_RESULT_ATTR not in fresh.user_attrs
+    else:
+        assert outcome.outcome == "failure"
+        assert "JSON file not found" in str(outcome.cause)
+
+
+_ENVELOPE_METRIC = Metric(
+    name="loss",
+    extractor=JsonEnvelopeExtractor(
+        type="json_envelope", objective_name="loss", split="validation", policy="synthetic"
+    ),
+)
+_REPORTS_ENVELOPE = """
+    from phasesweep.reporting import report_objective
+    report_objective(0.5, name="loss", split="validation", policy="synthetic", checkpoint="c", step=5)
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("objective", ["json", "envelope"])
+@pytest.mark.parametrize("killed_before_evaluation", [False, True], ids=["live", "recovered"])
+def test_a_rerun_that_skips_finished_training_scores_the_earlier_attempts_result(
+    tmp_path: Path, killed_before_evaluation: bool, objective: str
+) -> None:
+    """An attempt interrupted after writing its final checkpoint and result, a JSON file or a result envelope naming that attempt, leaves its trial's result: the rerun that exits 0 at once over that checkpoint completes with it, with one launch and no retraining, whether the run evaluates the rerun or recovery does after the runner died before evaluation; ``run`` and ``status --trials`` say an earlier attempt wrote it, and the next run replays the winner, verifying it."""
+    if objective == "json":
+        metric = _JSON_METRIC
+        first_body = _CHECKPOINTING + '    (trial / "r.json").write_text(json.dumps({"loss": 0.5}))'
+    else:
+        metric, first_body = _ENVELOPE_METRIC, _CHECKPOINTING + _REPORTS_ENVELOPE
+    experiment = _interrupt_first_attempt(
+        tmp_path, _trainer(tmp_path, first_body, _SKIPS_WHEN_DONE), metric
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
     if killed_before_evaluation:
         program = """
 import os, signal, sys
@@ -336,7 +408,6 @@ def die(*args, **kwargs):
 phase.extract_trial_result = die
 run_experiment(load_experiment(sys.argv[1]))
 """
-        config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
         runner = subprocess.run(
             [sys.executable, "-c", program, str(config)],
             capture_output=True,
@@ -347,17 +418,25 @@ run_experiment(load_experiment(sys.argv[1]))
         assert phase_trials(experiment)[1].state == optuna.trial.TrialState.RUNNING
 
     winner = run_experiment(experiment)["p"]
-    first, in_place, fresh = phase_trials(experiment)
-    assert in_place.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
-    assert in_place.user_attrs[RESULT_NOT_RESTATED_ATTR] is True
-    outcome = _parsed_trial_outcome(in_place.user_attrs[TRIAL_OUTCOME_ATTR])
-    assert outcome is not None and outcome.outcome == "interrupted"
-    assert "its rerun starts from step 0 in a fresh directory" in str(outcome.cause)
-    assert fresh.user_attrs[RERUN_OF_ATTR] == in_place.number
-    assert fresh.user_attrs[TRIAL_DIR_ATTR] != first.user_attrs[TRIAL_DIR_ATTR]
-    assert winner.trial_number == fresh.number and winner.metric == 0.5
-    assert (Path(fresh.user_attrs[TRIAL_DIR_ATTR]) / "ckpt.txt").read_text() == "5"
+    first, rerun = phase_trials(experiment)
+    assert rerun.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
+    assert rerun.user_attrs[EARLIER_ATTEMPT_RESULT_ATTR] is True
+    assert winner.trial_number == rerun.number and winner.metric == 0.5
+    assert (tmp_path / "launches.txt").read_text() == "launch\n"
     _verify_winner_evidence(experiment, experiment.phases[0], winner)
+    note = "scored from a result an earlier attempt of this trial wrote"
+    (line,) = [
+        line for line in run_log_text(experiment).splitlines() if "trial 1  COMPLETE" in line
+    ]
+    assert f"reason: {note}" in line
+    shown = CliRunner().invoke(cli, ["status", str(config), "--trials"])
+    assert shown.exit_code == 0, shown.output
+    assert " ".join(shown.output.split()).count(note) == 1
+    shown = CliRunner().invoke(cli, ["show-winners", str(config)])
+    assert shown.exit_code == 0, shown.output
+    replayed = run_experiment(experiment)["p"]
+    assert (replayed.trial_number, replayed.metric) == (rerun.number, 0.5)
+    assert (tmp_path / "launches.txt").read_text() == "launch\n"
 
 
 @pytest.mark.integration
@@ -422,14 +501,16 @@ for step in range(start, 8):
 def test_a_killed_runs_trial_resumes_its_checkpoint_in_the_next_run(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """After a runner SIGKILL, the next run reruns the trial in its own directory without a checkpoint warning, the trainer resumes its checkpoint, and each attempt keeps its own records."""
+    """After a runner SIGKILL, the next run reruns the trial in its own directory without a checkpoint warning, the trainer resumes its checkpoint and rewrites the interrupted attempt's result, which scores as its own, and each attempt keeps its own records."""
+    first_body = _CHECKPOINTING + '    (trial / "r.json").write_text(json.dumps({"loss": 9.0}))'
     experiment = _interrupt_first_attempt(
-        tmp_path, _trainer(tmp_path, _CHECKPOINTING, _RESUMING), _JSON_METRIC
+        tmp_path, _trainer(tmp_path, first_body, _RESUMING), _JSON_METRIC
     )
 
     winner = run_experiment(experiment)["p"]
     assert not [message for message in caplog.messages if "overwrit" in message]
     first, rerun = phase_trials(experiment)
+    assert EARLIER_ATTEMPT_RESULT_ATTR not in rerun.user_attrs
     # The rerun started from step 5, the checkpoint the stopped attempt left.
     assert winner.metric == 5.0 and winner.trial_number == rerun.number == 1
     assert rerun.user_attrs[RERUN_OF_ATTR] == first.number == 0

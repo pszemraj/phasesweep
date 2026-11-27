@@ -1332,8 +1332,8 @@ def _recover_completed_trial(
     bound violation may still commit as COMPLETE and infeasible. Evidence that answers
     with a failure commits FAIL with that failure as the trial's outcome, as the live path
     records it, so finished training is never trained again. Either verdict counts toward the
-    producing phase's failure limit as a live one does. Value evidence in a reused directory that
-    the attempt did not write commits an interruption instead, whose rerun opens a fresh
+    producing phase's failure limit as a live one does. An attempt that left nothing to score in a
+    reused directory commits an interruption instead, whose rerun opens a fresh
     directory, as the live path records it. Only a ledger study reaches recovery,
     so training it defers stays retained for a later pass.
 
@@ -1462,19 +1462,15 @@ def _recover_completed_trial(
     cause = result.failure_reason
     if cause is None:
         assert result.metric is not None
-    elif result.evidence_not_restated:
+    elif result.nothing_to_score:
         cause = _fresh_rerun_reason(cause)
     try:
         record_trial_result(active_trial, result, overrides_json=overrides_json)
         _record_stale_trial_outcome(
             study,
             trial,
-            # Unrestated evidence in a reused directory is owed a fresh rerun, as live.
-            "success"
-            if cause is None
-            else "interrupted"
-            if result.evidence_not_restated
-            else "failure",
+            # An attempt that left nothing to score is owed a fresh rerun, as live.
+            "success" if cause is None else "interrupted" if result.nothing_to_score else "failure",
             # Only a success carries its measurement, as a live trial's outcome does.
             metric=result.metric if cause is None else None,
             cause=cause,

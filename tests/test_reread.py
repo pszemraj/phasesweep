@@ -39,6 +39,7 @@ from phasesweep.engine.read import inspect_status, read_status, read_trial_table
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    EARLIER_ATTEMPT_RESULT_ATTR,
     FAILURE_REASON_ATTR,
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
@@ -245,7 +246,7 @@ def test_reread_keeps_a_repeat_measurement_before_an_unsuccessful_retry(tmp_path
     winner = run_experiment(fixed)["p"]
 
     assert winner.metric == 1.5
-    assert _launches(counter) == 3
+    assert _launches(counter) == 4  # the in-place retry found no r.json and reran fresh once
     assert [trial.state.name for trial in addressed_phase_study(fixed).trials] == [
         "COMPLETE",
         "COMPLETE",
@@ -936,8 +937,8 @@ def test_retry_keeps_the_measured_evidence_of_a_sibling_reading_study(
     assert _launches(launches) == 2
 
 
-def test_reread_unrecorded_path_refuses_a_predecessors_file(tmp_path: Path) -> None:
-    """A re-read without launch-time evidence of a write fails the row and owes no rerun."""
+def test_reread_scores_a_file_an_earlier_attempt_of_the_trial_wrote(tmp_path: Path) -> None:
+    """A re-read reading a path its attempt never wrote scores the file an earlier attempt of the trial left, says so, and launches nothing."""
     trainer = write_trainer(
         tmp_path / "trainer.py",
         """
@@ -966,17 +967,14 @@ def test_reread_unrecorded_path_refuses_a_predecessors_file(tmp_path: Path) -> N
         extractor=JsonExtractor(type="json", path="alternate.json", key="loss")
     )
     corrected = _experiment(tmp_path, trainer, corrected_metric, phases=[retry])
-    with pytest.raises(NoFeasibleTrialError, match="No completed trials"):
-        run_experiment(corrected)
-    copied = addressed_phase_study(corrected).trials[1]
-    reason = copied.user_attrs[FAILURE_REASON_ATTR]
-    assert copied.state == optuna.trial.TrialState.FAIL
-    assert trial_ops.RESULT_NOT_RESTATED_ATTR not in copied.user_attrs
-    assert "trainer exited without writing it" in reason and "rerun" not in reason
+    assert run_experiment(corrected)["p"].metric == 0.01
+    first, copied = addressed_phase_study(corrected).trials
+    assert first.state == optuna.trial.TrialState.FAIL and copied.value == 0.01
+    assert copied.user_attrs[EARLIER_ATTEMPT_RESULT_ATTR] is True
 
 
-def test_reread_refuses_an_older_file_reached_through_a_retargeted_link(tmp_path: Path) -> None:
-    """A retry's redirect to an older file scores nothing; its fresh rerun's own file scores."""
+def test_reread_scores_a_retried_link_to_an_earlier_attempts_file(tmp_path: Path) -> None:
+    """A retry's redirect to a file an earlier attempt wrote is the trial's result, and a re-read scores it, while the earlier attempt's own read refuses the path that changed after the retry launched."""
     trainer = write_trainer(
         tmp_path / "trainer.py",
         """
@@ -1003,11 +1001,12 @@ def test_reread_refuses_an_older_file_reached_through_a_retargeted_link(tmp_path
         with pytest.raises(NoFeasibleTrialError):
             run_experiment(typo)
     redirected = addressed_phase_study(typo).get_trials()[1]
-    assert "last changed before this attempt started" in redirected.user_attrs[FAILURE_REASON_ATTR]
+    assert "Key 'typo' not found" in redirected.user_attrs[FAILURE_REASON_ATTR]
     corrected = _experiment(tmp_path, trainer, _metric("loss"), phases=[retried])
-    assert run_experiment(corrected)["p"].metric == 0.1
-    older, _ = addressed_phase_study(corrected).get_trials()
+    assert run_experiment(corrected)["p"].metric == 0.2
+    older, retry = addressed_phase_study(corrected).get_trials()
     assert "changed after this attempt finished" in older.user_attrs[FAILURE_REASON_ATTR]
+    assert retry.user_attrs[EARLIER_ATTEMPT_RESULT_ATTR] is True
 
 
 @pytest.mark.integration
@@ -1017,7 +1016,7 @@ def test_reread_uses_the_next_launch_instead_of_local_times(
 ) -> None:
     """The middle of three attempts in one directory owns the file it rewrote, across time zones.
 
-    Its measurement fills the one retry, so a third slot is refused; the empty third reran fresh.
+    Its measurement fills the fixed configuration's one retry, so a third slot is refused.
 
     :param Path tmp_path: Scratch directory for the experiment and trainer.
     :param pytest.MonkeyPatch monkeypatch: Controller's local time zone for each run.
@@ -1066,7 +1065,7 @@ def test_reread_uses_the_next_launch_instead_of_local_times(
     assert first.user_attrs[TRIAL_DIR_ATTR] == middle.user_attrs[TRIAL_DIR_ATTR]
     assert [trial.value for trial in (first, middle)] == [None, 2]
     assert "changed after this attempt finished" in first.user_attrs[FAILURE_REASON_ATTR]
-    assert _launches(launches) == 4
+    assert _launches(launches) == 3
 
 
 @pytest.mark.integration

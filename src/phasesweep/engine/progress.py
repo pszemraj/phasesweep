@@ -13,7 +13,7 @@ from collections.abc import Hashable, Mapping, Sequence
 import optuna
 
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.engine.bounds import infeasible_reason
+from phasesweep.engine.bounds import measured_reason
 from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.state import (
@@ -221,15 +221,15 @@ def _log_trial_start(
 
 
 def _first_cause_line(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> str | None:
-    """Return the first line of a trial's recorded outcome cause, or of its bound violations.
+    """Return the first line of a trial's recorded outcome cause, or of its measurement's notes.
 
     :param optuna.trial.FrozenTrial trial: Trial whose outcome record is read.
     :param Experiment experiment: Config whose bounds judge a measured trial.
-    :return str | None: The cause's first nonblank line, else the bounds a measured trial
-        violates, else None.
+    :return str | None: The cause's first nonblank line, else
+        :func:`~phasesweep.engine.bounds.measured_reason`, else None.
     """
     parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
-    cause = parsed.cause if parsed and parsed.cause else infeasible_reason(trial, experiment)
+    cause = parsed.cause if parsed and parsed.cause else measured_reason(trial, experiment)
     lines = cause.strip().splitlines() if cause else []
     return lines[0] if lines else None
 

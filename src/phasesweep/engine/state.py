@@ -270,6 +270,14 @@ OVERRIDES_ATTR = "phasesweep_overrides"
 CLEANUP_CONFIRMED_ATTR = "phasesweep_cleanup_confirmed"
 CLEANUP_RECOVERED_TRIALS_ATTR = "phasesweep_cleanup_recovered_trials"
 FAILURE_REASON_ATTR = "phasesweep_failure_reason"
+# ``True`` on an interrupted trial whose trainer exited 0 in a directory an earlier attempt
+# used and left nothing to score there. Its rerun opens a fresh directory
+# (:func:`phasesweep.engine.trial_dirs._rerun_directory_sources`), where nothing predates the
+# attempt, so the same verdict cannot recur.
+LEFT_NOTHING_TO_SCORE_ATTR = "phasesweep_left_nothing_to_score"
+# ``True`` on a measured trial whose value evidence includes a file an earlier attempt of the
+# trial wrote and the measured attempt did not rewrite; its reason line says so.
+EARLIER_ATTEMPT_RESULT_ATTR = "phasesweep_earlier_attempt_result"
 # How the metric extractor names itself in a failed trial's reason: ``<label>: <cause>`` when
 # the objective could not be read. The producer and the remedy that recognizes the reason
 # share this one string.

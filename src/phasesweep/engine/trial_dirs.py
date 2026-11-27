@@ -28,6 +28,7 @@ from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
+    LEFT_NOTHING_TO_SCORE_ATTR,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
     TRIAL_DIR_ATTR,
@@ -37,7 +38,6 @@ from phasesweep.engine.state import (
     _trial_lifecycle,
     _unreplaced_attempts,
 )
-from phasesweep.engine.trial import RESULT_NOT_RESTATED_ATTR
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.evidence.baseline import read_evidence_baseline
 from phasesweep.runtime.files import broken_symlink_detail
@@ -442,8 +442,8 @@ def _rerun_directory_sources(
 ) -> Iterator[FrozenTrial]:
     """Yield earlier attempts in the same directory, through its physical opener.
 
-    A source whose trainer did not restate its result in the directory it continued ends the
-    walk before it, so its rerun opens a fresh directory instead of meeting the same file.
+    A source whose trainer left nothing to score in the directory it continued ends the walk
+    before it, so its rerun opens a fresh directory instead of meeting the same verdict.
 
     :param Mapping[int, FrozenTrial] trials: The study's trials by number.
     :param FrozenTrial trial: A trial about to launch or one that recorded its directory.
@@ -452,7 +452,7 @@ def _rerun_directory_sources(
     :return Iterator[FrozenTrial]: Directory sources, from the most recent to the opener.
     """
     for index, current in enumerate(_rerun_chain(trials, trial, attempts=attempts)):
-        if index and current.user_attrs.get(RESULT_NOT_RESTATED_ATTR) is True:
+        if index and current.user_attrs.get(LEFT_NOTHING_TO_SCORE_ATTR) is True:
             return
         try:
             recorded = _recorded_trial_dir(current)
@@ -582,9 +582,9 @@ def _trial_dir_for_attempt(
         number = trial.user_attrs.get(RERUN_OF_ATTR)
         rerun_of = trials.get(number) if type(number) is int else None
         restart = (
-            f"trial {number}'s trainer exited without rewriting its result in the directory "
+            f"trial {number}'s trainer exited 0 and left nothing to score in the directory "
             "it continued"
-            if rerun_of is not None and rerun_of.user_attrs.get(RESULT_NOT_RESTATED_ATTR) is True
+            if rerun_of is not None and rerun_of.user_attrs.get(LEFT_NOTHING_TO_SCORE_ATTR) is True
             else None
         )
         return TrialDirectory(path, trial.number, attempt_id, restart)

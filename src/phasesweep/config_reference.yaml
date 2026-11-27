@@ -25,6 +25,7 @@
 experiment: string (required)
 
 # Shell command template that runs one trainer attempt under /bin/sh -c in execution.cwd, with the trainer environment rather than the shell's. It must exit 0 and leave nothing it started running.
+# Warning: an attempt that exits 0 is scored from the value files in its trial directory, even ones an earlier attempt of the trial wrote, so never exit 0 while a value file holds an unfinished result.
 # {trial_dir} is the absolute trial directory, {trial_id} the trial's number in its phase study (a phase that inherits starts a new study, numbered from 0, when its inherited values change; {trial_dir} and {run_name} stay unique), {phase} its name, {run_name} <experiment>-<phase>-<trial_id>-<attempt ID>; a rerun of an interrupted or failed trial keeps all four, those of the attempt that opened the directory.
 # {config_path}, {overrides} or {overrides_path} carries the trainer input, as override_format says, for example python train.py --config {config_path}.
 # PhaseSweep shell-quotes every placeholder but {trial_id}. Write {{ and }} for literal braces and $VAR or ${{VAR}} for a shell variable.
@@ -78,7 +79,7 @@ phases: list[object] (required)
   - name: string (required)
 
     # Target number of finished attempts, an integer >= 1. COMPLETE, INFEASIBLE and FAIL attempts count, and interrupted ones do not.
-    # A finished sibling attempt with the required parameters can fill a queued rerun. If the trainer must run again, it gets the same command and trial directory so it can resume its checkpoint and write fresh results.
+    # A finished sibling attempt with the required parameters can fill a queued rerun. If the trainer must run again, it gets the same command and trial directory so it can resume its checkpoint.
     # When the target is reached with no eligible feasible attempt, the phase fails.
     # With persistent storage, raising the target continues the same study and uses eligible kept attempts before launching more. Lowering the target is refused.
     # A parent top-up keeps its trials and selects its winner first. Each child reuses or starts the study for its inherited values.

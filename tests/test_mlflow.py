@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import importlib
 import json
@@ -1273,21 +1274,30 @@ def test_item_logged_before_finishing_is_accepted_without_polling(clock):
     assert clock.sleeps == []
 
 
+@pytest.mark.parametrize("reused", [False, True], ids=["own-directory", "reused-directory"])
 def test_finished_without_a_required_metric_reaches_the_trial_as_the_extractor_error(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, reused
 ):
-    """The worker's report crosses the real entry point and response reader unchanged."""
+    """The worker's report crosses the real entry point and response reader unchanged, and in a directory an earlier attempt used it leaves nothing to score, so the attempt reruns with a fresh run instead of failing."""
     import mlflow
 
-    from phasesweep.evidence.evaluation import MlflowObjectiveMissingError, _capture_mlflow
+    from phasesweep.evidence.baseline import EvidenceBaseline
+    from phasesweep.evidence.evaluation import (
+        MlflowObjectiveMissingError,
+        NothingToScoreError,
+        _capture_mlflow,
+    )
 
     binding, ctx = bind_mlflow_attempt(tmp_path)
+    if reused:
+        ctx = dataclasses.replace(ctx, baseline=EvidenceBaseline(True, {}, 1.0))
     run = mlflow_run(binding, metrics={"cost": 1.0, "accuracy": 0.9})
     monkeypatch.setattr(
         mlflow, "MlflowClient", lambda tracking_uri: SimpleNamespace(get_run=lambda _: run)
     )
     run_mlflow_worker_in_process(monkeypatch)
-    with pytest.raises(MlflowObjectiveMissingError) as failure:
+    expected = NothingToScoreError if reused else MlflowObjectiveMissingError
+    with pytest.raises(expected) as failure:
         _capture_mlflow(ctx, deadline=None)
     assert str(failure.value) == (
         "MLflow run finished without metric 'eval/loss'; "

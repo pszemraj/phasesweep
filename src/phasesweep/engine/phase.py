@@ -264,7 +264,7 @@ class _UnlaunchedAbortError(TrialExecutionError):
 
 
 class _InterruptedTrialError(TrialExecutionError):
-    """Raised for a trial owed a rerun: stopped or unstarted trainer, or an unrestated result.
+    """Raised for a trial owed a rerun: stopped or unstarted trainer, or nothing to score.
 
     A trainer that ended by itself keeps its own verdict even while a shutdown is serviced.
     """
@@ -1229,12 +1229,12 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             trial, result, overrides_json=json.dumps(overrides, default=str, sort_keys=True)
         )
 
-    if result.failure_reason:  # Optuna FAIL state; unrestated evidence is owed a fresh rerun.
+    if result.failure_reason:  # Optuna FAIL state; nothing to score is owed a fresh rerun.
         if result.deadline_exhausted:
             with _persist_trial_evidence(run, trial):
                 trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
             raise _DeadlineTrialExecutionError(result.failure_reason)
-        if result.evidence_not_restated:
+        if result.nothing_to_score:
             raise _InterruptedTrialError(_fresh_rerun_reason(result.failure_reason))
         raise TrialExecutionError(result.failure_reason)
 
@@ -1772,7 +1772,7 @@ def _run_phase(
                         callbacks=[functools.partial(_after_trial, run)],
                         catch=(TrialExecutionError,),
                     )
-                    # An interrupted trial (a stopped trainer, an unrestated result) reruns in
+                    # An interrupted trial (a stopped trainer, nothing to score) reruns in
                     # this invocation while each pass settles trials, otherwise in the next one.
                     finished_after = _finished_trial_count(study.get_trials(deepcopy=False))
                     remaining = phase.n_trials - finished_after

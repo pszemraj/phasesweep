@@ -280,9 +280,9 @@ def _reread_trial(
     if result.evidence_unreadable and result.failure_reason is not None:
         raise _pending_evidence_refusal({record.attempt_id: result.failure_reason})
     sheet = _AttrSheet(dict(trial.user_attrs))
-    # A re-read launches nothing, so evidence the attempt did not write fails the row and
-    # owes no rerun; a later retry continues the directory, where the trainer can restate it.
-    result = replace(result, evidence_not_restated=False)
+    # A re-read launches nothing, so a row whose wanted evidence does not exist fails and owes
+    # no rerun; a later retry continues the directory, where the trainer can write it.
+    result = replace(result, nothing_to_score=False)
     record_trial_result(sheet, result, overrides_json=overrides_json)
     failure = result.failure_reason
     if failure is None:

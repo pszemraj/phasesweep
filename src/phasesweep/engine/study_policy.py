@@ -52,6 +52,7 @@ from phasesweep.engine.optuna import (
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
+    LEFT_NOTHING_TO_SCORE_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
     PHASE_RECOVERY_ATTR,
@@ -71,7 +72,6 @@ from phasesweep.engine.state import (
     _unreplaced_attempts,
 )
 from phasesweep.engine.trial import (
-    RESULT_NOT_RESTATED_ATTR,
     EnvironmentIdentity,
     _environment_identity,
     _is_search_path,
@@ -1041,17 +1041,17 @@ def _pending_rerun_count(study: optuna.Study, phase: Phase | None = None) -> int
 def _settled_trial_count(study: optuna.Study) -> int:
     """Count the trials a launch pass settled: finished, or owed a rerun in a fresh directory.
 
-    A trial whose trainer exited 0 without restating its result in a reused directory is
-    interrupted, but its rerun opens a fresh directory, where that refusal cannot recur. A pass
+    A trial whose trainer exited 0 and left nothing to score in a reused directory is
+    interrupted, but its rerun opens a fresh directory, where that verdict cannot recur. A pass
     that leaves such a trial has made progress, so the run goes on to rerun it.
 
     :param optuna.Study study: Study holding the trials.
     :return int: Finished trials plus trials marked
-        :data:`~phasesweep.engine.trial.RESULT_NOT_RESTATED_ATTR`.
+        :data:`~phasesweep.engine.state.LEFT_NOTHING_TO_SCORE_ATTR`.
     """
     trials = study.get_trials(deepcopy=False)
     return _finished_trial_count(trials) + sum(
-        trial.user_attrs.get(RESULT_NOT_RESTATED_ATTR) is True for trial in trials
+        trial.user_attrs.get(LEFT_NOTHING_TO_SCORE_ATTR) is True for trial in trials
     )
 
 

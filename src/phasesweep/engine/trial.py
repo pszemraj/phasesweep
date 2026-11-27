@@ -30,8 +30,10 @@ from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.state import (
     CONSTRAINT_PREFIX,
     DURATION_ATTR,
+    EARLIER_ATTEMPT_RESULT_ATTR,
     FAILURE_REASON_ATTR,
     GATES_ATTR,
+    LEFT_NOTHING_TO_SCORE_ATTR,
     METRIC_EXTRACTOR_LABEL,
     OBJECTIVE_PROVENANCE_ATTR,
     OBSERVED_PREFIX,
@@ -48,11 +50,11 @@ from phasesweep.evidence.baseline import (
 )
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
-    EvidenceNotRestatedError,
     EvidenceUnreadableError,
     ExtractorError,
     GateResult,
     MlflowObjectiveMissingError,
+    NothingToScoreError,
     TrialContext,
     evaluate_gates,
     locate_objective_position,
@@ -145,31 +147,27 @@ class TrialResult:
     # Report-only values read after acceptance, by observation name. A name
     # whose extraction failed or came out non-finite is absent.
     observed: dict[str, float] = field(default_factory=dict)
-    # True only when every failure is value evidence in a reused directory that this
-    # attempt's trainer did not write: the attempt is interrupted and reruns in a fresh one.
-    evidence_not_restated: bool = False
-
-
-# Ledger attr, ``True`` on a trial whose trainer exited 0 in a directory an earlier attempt
-# used without rewriting its value evidence there. The trial's rerun opens a fresh directory
-# (:func:`phasesweep.engine.trial_dirs._rerun_directory_sources`), where nothing predates the
-# attempt, so the freshness check cannot refuse it again.
-RESULT_NOT_RESTATED_ATTR = "phasesweep_result_not_restated"
+    # True only when every failure is a :class:`NothingToScoreError` or a gate marked
+    # ``nothing_to_score``: the attempt is interrupted and reruns in a fresh directory.
+    nothing_to_score: bool = False
+    # True on a measured result whose objective, constraints or gates read a file an earlier
+    # attempt of the trial wrote and this one did not rewrite.
+    earlier_attempt_result: bool = False
 
 
 def _fresh_rerun_reason(reason: str) -> str:
-    """Add what follows from an unrestated result to the reason the console and status print.
+    """Add what follows from an attempt that left nothing to score to its printed reason.
 
     Only a launch or its recovery owes the rerun, so they add this where they record the
     interruption. A re-read of a kept attempt launches nothing and keeps the plain reason.
 
-    :param str reason: Why the value evidence was refused.
+    :param str reason: Why no value could be read.
     :return str: The reason, then that the attempt is unscored and its rerun starts afresh.
     """
     return (
-        f"{reason} The trainer exited 0 in a directory an earlier attempt used without "
-        "rewriting it, so this attempt is not scored and its rerun starts from step 0 in a "
-        "fresh directory."
+        f"{reason.removesuffix('.')}; the trainer exited 0 in a directory an earlier attempt "
+        "used and left nothing to score there, so its rerun starts from step 0 in a fresh "
+        "directory."
     )
 
 
@@ -226,12 +224,20 @@ def record_trial_result(trial: UserAttrSink, result: TrialResult, *, overrides_j
             {constraint_attr(name): value for name, value in result.constraints.items()}
         )
         optional.update({observed_attr(name): value for name, value in result.observed.items()})
-    if result.evidence_not_restated:
-        optional[RESULT_NOT_RESTATED_ATTR] = True
+        if result.earlier_attempt_result:
+            optional[EARLIER_ATTEMPT_RESULT_ATTR] = True
+    if result.nothing_to_score:
+        optional[LEFT_NOTHING_TO_SCORE_ATTR] = True
     for key, value in previous.items():
         if (
             (
-                key in {OBJECTIVE_PROVENANCE_ATTR, GATES_ATTR, RESULT_NOT_RESTATED_ATTR}
+                key
+                in {
+                    OBJECTIVE_PROVENANCE_ATTR,
+                    GATES_ATTR,
+                    LEFT_NOTHING_TO_SCORE_ATTR,
+                    EARLIER_ATTEMPT_RESULT_ATTR,
+                }
                 or key.startswith((CONSTRAINT_PREFIX, OBSERVED_PREFIX))
             )
             and key not in optional
@@ -705,7 +711,7 @@ def _failed_trial(
     gate_results: list[GateResult] | None = None,
     deadline_exhausted: bool = False,
     evidence_unreadable: bool = False,
-    evidence_not_restated: bool = False,
+    nothing_to_score: bool = False,
     objective_provenance: dict[str, Any] | None = None,
 ) -> TrialResult:
     """Build a ``TrialResult`` representing a failed trial.
@@ -722,8 +728,8 @@ def _failed_trial(
         failure, if any.
     :param bool deadline_exhausted: Whether the phase/run deadline caused the failure.
     :param bool evidence_unreadable: Whether every failure is a tracker that gave no answer.
-    :param bool evidence_not_restated: Whether every failure is value evidence in a reused
-        directory that this attempt did not write.
+    :param bool nothing_to_score: Whether every failure shows the attempt left nothing to
+        score in a directory an earlier attempt used.
     :param dict[str, object] | None objective_provenance: Frozen evidence already captured
         before a later gate failed.
     :return TrialResult: A result with ``metric=None``.
@@ -737,7 +743,7 @@ def _failed_trial(
         gate_results=gate_results,
         deadline_exhausted=deadline_exhausted,
         evidence_unreadable=evidence_unreadable,
-        evidence_not_restated=evidence_not_restated,
+        nothing_to_score=nothing_to_score,
         objective_provenance=objective_provenance,
     )
 
@@ -1032,7 +1038,10 @@ def extract_trial_result(
     :return TrialResult: Finite metric and feasibility, or no metric and a failure reason.
     """
     executed = replace(
-        executed, ctx=replace(executed.ctx, wandb_query=_wandb_query(experiment, gates or []))
+        executed,
+        ctx=replace(
+            executed.ctx, wandb_query=_wandb_query(experiment, gates or []), earlier_files=[]
+        ),
     )
     rc = executed.process.return_code
     duration = executed.process.duration_seconds
@@ -1138,7 +1147,7 @@ def extract_trial_result(
                 constraints=constraint_values,
                 deadline_exhausted=exhausted,
                 evidence_unreadable=unreadable,
-                evidence_not_restated=isinstance(exc, EvidenceNotRestatedError),
+                nothing_to_score=isinstance(exc, NothingToScoreError),
             )
         if not math.isfinite(value):
             # The failed trial's ``reason:`` says the same on the console.
@@ -1231,7 +1240,7 @@ def extract_trial_result(
             deadline_exhausted=any(gate.deadline_exhausted for gate in failed_gates),
             # A definite gate failure fails the trial whatever the tracker would answer.
             evidence_unreadable=unreadable,
-            evidence_not_restated=all(gate.evidence_not_restated for gate in failed_gates),
+            nothing_to_score=all(gate.nothing_to_score for gate in failed_gates),
         )
 
     expired = _deadline_failure("the trial result could be accepted")
@@ -1241,7 +1250,9 @@ def extract_trial_result(
         return expired
 
     # Accepted. Where the objective was logged is advisory, so it is read
-    # only now and can never spend the budget acceptance needed.
+    # only now and can never spend the budget acceptance needed. Report-only observations
+    # read afterwards never mark the result as an earlier attempt's.
+    earlier = bool(executed.ctx.earlier_files)
     locate_objective_position(
         executed.ctx, experiment.metric.extractor, objective_provenance, deadline=deadline
     )
@@ -1255,6 +1266,7 @@ def extract_trial_result(
         gate_results=gate_results,
         objective_provenance=objective_provenance or None,
         observed=observed,
+        earlier_attempt_result=earlier,
     )
 
 

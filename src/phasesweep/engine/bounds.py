@@ -14,7 +14,7 @@ from collections.abc import Iterable, Mapping
 import optuna
 
 from phasesweep.config.models import Constraint, Experiment, Metric
-from phasesweep.engine.state import constraint_attr
+from phasesweep.engine.state import EARLIER_ATTEMPT_RESULT_ATTR, constraint_attr
 from phasesweep.runtime.json import JsonObject
 
 
@@ -112,17 +112,25 @@ def trial_bound_violations(trial: optuna.trial.FrozenTrial, experiment: Experime
     return bound_violations(trial.value, recorded_constraints(trial, experiment), experiment)
 
 
-def infeasible_reason(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> str | None:
-    """State why a measured trial is infeasible under the current bounds, for its reason line.
+def measured_reason(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> str | None:
+    """State what a measured trial's reason line says, in ``run`` and ``status --trials`` alike.
+
+    That is why it is infeasible under the current bounds, and that it was scored from a
+    result an earlier attempt of the trial wrote, which the measured attempt did not rewrite.
 
     :param optuna.trial.FrozenTrial trial: Trial to describe.
     :param Experiment experiment: Config supplying the current bounds.
-    :return str | None: The violations, or ``None`` for a trial that is not ``COMPLETE`` or
-        satisfies every bound.
+    :return str | None: The statements, or ``None`` for a trial that is not ``COMPLETE`` or
+        has neither to state.
     """
     if trial.state != optuna.trial.TrialState.COMPLETE:
         return None
-    violations = trial_bound_violations(trial, experiment)
-    if not violations:
-        return None
-    return f"outside the metric bounds or constraints: {'; '.join(violations)}"
+    notes = []
+    if violations := trial_bound_violations(trial, experiment):
+        notes.append(f"outside the metric bounds or constraints: {'; '.join(violations)}")
+    if trial.user_attrs.get(EARLIER_ATTEMPT_RESULT_ATTR) is True:
+        notes.append(
+            "scored from a result an earlier attempt of this trial wrote; this attempt exited 0 "
+            "without rewriting it"
+        )
+    return "; ".join(notes) or None
