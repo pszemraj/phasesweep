@@ -26,6 +26,7 @@ from phasesweep.engine.read import (
 from phasesweep.engine.reread import PendingRereadNotice
 from phasesweep.engine.state import OBSERVED_PREFIX
 from phasesweep.errors import operator_step
+from phasesweep.run_report import INTERRUPTED_LABEL, interrupted_clause
 from phasesweep.runtime.json import JsonObject, JsonValue, json_integer
 from phasesweep.runtime.terminal import (
     GAP,
@@ -436,8 +437,9 @@ def _phase_lines(
     count toward the target, by state, then the configured metric name and the direction of its
     goal, which addresses the study the rows come from. A phase a run would refuse prints that
     refusal and its fix before any other note. Each search-space growth the study recorded then
-    gets a note naming the draw position it took effect at and the values it added, and finished
-    trials whose directory is gone get one naming them.
+    gets a note naming the draw position it took effect at and the values it added, results that
+    reran an interrupted trial get an ``interrupted:`` note counting them, and finished trials
+    whose directory is gone get one naming them.
 
     :param TrialTable table: The phase's trials.
     :param Phase phase: The configured phase.
@@ -464,6 +466,8 @@ def _phase_lines(
         if table.uncounted:
             others = ", ".join(f"{rows} {state.lower()}" for state, rows in table.uncounted)
             count = f"{count} ({others})"
+        if (interrupted := interrupted_clause(table.reruns)) is not None:
+            notes.append(f"{INTERRUPTED_LABEL} {interrupted}")
     lines = wrap(
         f"{table.phase}: {count}, {experiment.metric.name} "
         f"({_direction(experiment.metric.goal)} is better)",

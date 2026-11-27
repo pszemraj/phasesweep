@@ -20,6 +20,7 @@ from phasesweep.cli import cli as cli_main
 from phasesweep.config.io import load_experiment
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.attempts import _register_active_attempt
+from phasesweep.engine.fingerprints import _fresh_identity, _stamp_identity
 from phasesweep.engine.paths import _attempt_dir, _experiment_dir, _trial_dir_for
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
@@ -33,7 +34,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.mcp.recovery import _RecoveryNeeds
-from phasesweep.runtime.process import _write_process_identity
+from phasesweep.runtime.process import _write_process_identity, write_attempt_lifecycle
 from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
@@ -49,6 +50,7 @@ from tests.conftest import (
     make_experiment,
     new_phase_study,
     reaped_pid,
+    write_constant_trainer,
     write_experiment_config,
     write_trainer,
 )
@@ -145,6 +147,29 @@ def fabricate_stale_trial(
         trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
     return StaleTrial(study, trial_dir, trial.number, attempt_dir)
+
+
+def stale_trial_rerun_config(tmp_path: Path, *, name: str = "t") -> tuple[Experiment, Path]:
+    """Leave a two-trial phase whose first trial a crashed run left RUNNING, and its config.
+
+    The next run records that trial interrupted and reruns it as trial 1; trial 2 runs
+    untouched. The constant trainer ties them, so the rerun, the earlier of the two, wins.
+
+    :param Path tmp_path: Directory receiving the ledger, trainer and config.
+    :param str name: The experiment's name, defaults to ``t``.
+    :return tuple[Experiment, Path]: The experiment and its config file.
+    """
+    experiment = make_experiment(
+        experiment=name,
+        persistent=tmp_path,
+        trainer=write_constant_trainer(tmp_path),
+        n_trials=2,
+        gpu_policy="none",
+    )
+    stale = fabricate_stale_trial(experiment, "p", attempt_id="killed-attempt")
+    _stamp_identity(stale.study, _fresh_identity(experiment, experiment.phases[0], {}))
+    write_attempt_lifecycle(stale.attempt_dir, attempt_id="killed-attempt", state="allocated")
+    return experiment, write_experiment_config(tmp_path / "experiment.yaml", experiment)
 
 
 def fabricate_registered_attempt(

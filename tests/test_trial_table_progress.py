@@ -125,7 +125,7 @@ def test_an_interrupted_trial_is_named_beside_the_progress_it_does_not_add_to(
 
 
 def test_an_interrupted_trial_its_rerun_replaced_is_not_named_as_pending() -> None:
-    """The rerun counts and the trial it replaced stays a row, but the heading names no pending interruption."""
+    """The rerun counts and the trial it replaced stays a row; the heading names no pending interruption, and the line under it counts the result that came from the rerun."""
     lines = _heading_and_rows(
         [_interrupted(5), _complete(5, 0.4, **{RERUN_OF_ATTR: 0}), _complete(4, 0.3)],
         80,
@@ -134,6 +134,7 @@ def test_an_interrupted_trial_its_rerun_replaced_is_not_named_as_pending() -> No
 
     assert lines == [
         "learning_rate: 2 of 2 trials, eval_loss (lower is better)",
+        "  interrupted: 1 of 2 results came from a rerun",
         "          trial  eval_loss  x  state        time  rerun of",
         "              2        0.3  4  COMPLETE     0.5s         -",
         "              0          -  5  INTERRUPTED  0.5s         -",

@@ -170,6 +170,23 @@ class Winner:
 
 
 @dataclass(frozen=True)
+class InterruptedReruns:
+    """How far a phase's results lean on reruns of interrupted trials (:func:`_interrupted_reruns`).
+
+    ``results`` counts the trials in a state of :data:`FINISHED_TRIAL_STATES`, ``reruns`` those
+    of them whose :data:`RERUN_OF_ATTR` chain reaches an interrupted trial, ``earlier_attempt``
+    those reruns scored from a value an earlier attempt wrote
+    (:data:`EARLIER_ATTEMPT_RESULT_ATTR`), and ``winner`` whether a trial the winner stands on
+    is among the reruns. Computed from the ledger at read time and never saved.
+    """
+
+    results: int = 0
+    reruns: int = 0
+    earlier_attempt: int = 0
+    winner: bool = False
+
+
+@dataclass(frozen=True)
 class PhaseCounts:
     """A phase's trials by recorded state when the phase ended, as the run's summary reports them.
 
@@ -177,7 +194,8 @@ class PhaseCounts:
     recorded, so it is a part of :attr:`counted`. ``winner_dirs`` holds the trial directory of
     each trial the phase's winner stands on, in trial order, leaving out one that recorded none;
     it is read for the summary and never saved. ``interrupted`` counts the interrupted trials
-    still waiting for a rerun (:func:`_unreplaced_attempts`), as the status heading does.
+    still waiting for a rerun (:func:`_unreplaced_attempts`), as the status heading does, and
+    ``reruns`` the results that reran one.
     """
 
     complete: int = 0
@@ -186,6 +204,7 @@ class PhaseCounts:
     interrupted: int = 0
     earlier: int = 0
     winner_dirs: tuple[Path, ...] = ()
+    reruns: InterruptedReruns = InterruptedReruns()
 
     @property
     def counted(self) -> int:
@@ -731,6 +750,47 @@ def _unreplaced_attempts(trials: Iterable[FrozenTrial], *, interrupted: bool) ->
         for trial in trials
         if trial.number not in named and _trial_interrupted(trial) is interrupted
     ]
+
+
+def _interrupted_reruns(
+    trials: Iterable[FrozenTrial], standing: Mapping[int, str | None] | None = None
+) -> InterruptedReruns:
+    """Count a phase's results that rerun an interrupted trial, the one rule every report uses.
+
+    A result is a trial that counts toward ``n_trials``. It reran an interrupted trial when
+    any attempt its :data:`RERUN_OF_ATTR` chain names was interrupted, so a failed grid cell's
+    retry of an interrupted cell counts too.
+
+    :param Iterable[FrozenTrial] trials: Every trial of one study.
+    :param Mapping[int, str | None] | None standing: The winner's trials
+        (:func:`_winning_trials`), or ``None`` where the caller has no winner, defaults to None.
+    :return InterruptedReruns: The counts, all zero for a phase no interruption touched.
+    """
+    by_number = {trial.number: trial for trial in trials}
+    results = [
+        trial
+        for trial in by_number.values()
+        if trial.state.name in FINISHED_TRIAL_STATES and not _trial_interrupted(trial)
+    ]
+    reruns = []
+    for trial in results:
+        current = trial
+        # A rerun always names an earlier trial, so the walk ends.
+        while (source := by_number.get(current.user_attrs.get(RERUN_OF_ATTR, -1))) is not None:
+            if source.number >= current.number or _trial_interrupted(source):
+                break
+            current = source
+        if source is not None and _trial_interrupted(source):
+            reruns.append(trial)
+    return InterruptedReruns(
+        results=len(results),
+        reruns=len(reruns),
+        earlier_attempt=sum(
+            1 for trial in reruns if trial.user_attrs.get(EARLIER_ATTEMPT_RESULT_ATTR) is True
+        ),
+        winner=standing is not None
+        and any(_stands_under_winner(trial, standing) for trial in reruns),
+    )
 
 
 def _winning_trials(

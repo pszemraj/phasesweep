@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import phase_draws
 from phasesweep.engine.confound import _flagged_checks
-from phasesweep.engine.state import PhaseCounts, Winner
+from phasesweep.engine.state import InterruptedReruns, PhaseCounts, Winner
 from phasesweep.evidence.models import WandbExtractor
 from phasesweep.runtime.terminal import (
     GAP,
@@ -608,6 +608,31 @@ class SummaryPhase:
     winner_dirs: tuple[str, ...] = ()
     #: Confound checks the winner's selection flagged, in report order.
     flagged: tuple[str, ...] = ()
+    #: :func:`interrupted_clause` of the phase's results, ``None`` when no result reran.
+    interrupted: str | None = None
+
+
+#: The label of the line that says how many of a phase's results reran an interrupted trial.
+INTERRUPTED_LABEL = "interrupted:"
+
+
+def interrupted_clause(reruns: InterruptedReruns) -> str | None:
+    """Say how many of a phase's results reran an interrupted trial, as every report words it.
+
+    It is a fact, not a warning: a rerun continues its source's work by design.
+
+    :param InterruptedReruns reruns: The phase's counts (:func:`_interrupted_reruns`).
+    :return str | None: Such as ``2 of 13 results came from a rerun, the winner among them; 1
+        scored from an earlier attempt's result``, or ``None`` when no result reran.
+    """
+    if not reruns.reruns:
+        return None
+    text = f"{reruns.reruns} of {plural(reruns.results, 'result')} came from a rerun"
+    if reruns.winner:
+        text += ", the winner among them"
+    if reruns.earlier_attempt:
+        text += f"; {reruns.earlier_attempt} scored from an earlier attempt's result"
+    return text
 
 
 def _next_line(command: str, *, color: bool) -> str:
@@ -659,6 +684,11 @@ class Summary:
                 drawn[0] = paint_word(drawn[0], _WINNER_WORD, "winner", start=len(pad), color=color)
                 lines.extend(drawn)
                 lines.extend(self._flagged_lines(phase, pad, width, color=color))
+                if phase.interrupted is not None:
+                    indent = pad + " " * len(f"{_WINNER_WORD}{GAP}")
+                    drawn = wrap_labeled(INTERRUPTED_LABEL, phase.interrupted, width - len(indent))
+                    drawn[0] = paint_word(drawn[0], INTERRUPTED_LABEL, "label", color=color)
+                    lines.extend(indent + line for line in drawn)
                 lines.extend(
                     pad + line
                     for line in directory_lines(
@@ -842,6 +872,11 @@ def summary(
         facts: tuple[str, ...] = ()
         directories: tuple[str, ...] = ()
         flagged: tuple[str, ...] = ()
+        interrupted = (
+            interrupted_clause(counts[phase.name].reruns)
+            if phase.name in reached and phase.name in counts
+            else None
+        )
         if winner is not None:
             head, tail = winner_facts(winner, experiment.metric.name)
             facts = (*head, *tail)
@@ -849,7 +884,7 @@ def summary(
                 flagged = tuple(_flagged_checks(winner.confound))
             if phase.name in counts:
                 directories = tuple(display_path(path) for path in counts[phase.name].winner_dirs)
-        phases.append(SummaryPhase(phase.name, clauses, facts, directories, flagged))
+        phases.append(SummaryPhase(phase.name, clauses, facts, directories, flagged, interrupted))
     headline = f"Finished in {duration_text(elapsed)}: {run_totals(counts)}"
     if launch_free_generation_id is not None:
         headline += (

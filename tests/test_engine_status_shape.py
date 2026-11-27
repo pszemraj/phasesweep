@@ -84,6 +84,8 @@ PHASE_STATUS_KEYS = {
     "generation_trials",
     "published_study_unavailable",
     "trial_data_available",
+    "interrupted_reruns",
+    "interrupted_reruns_earlier_attempt",
     "name",
     "winner",
 }

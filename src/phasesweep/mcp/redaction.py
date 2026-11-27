@@ -188,6 +188,9 @@ def winners_payload(
                     "operator can inspect show-winners for which one."
                 ),
                 "edge_advisory_status": view.edge_advisory_status,
+                "interrupted_reruns": view.interrupted_reruns,
+                "interrupted_reruns_earlier_attempt": view.interrupted_reruns_earlier_attempt,
+                "winner_interrupted_rerun": view.winner_interrupted_rerun,
             }
         )
     return {
@@ -285,6 +288,10 @@ def status_payload(
                 ),
                 "target_already_satisfied": (
                     finished_trials_before_run >= target_finished_trials if available else None
+                ),
+                "interrupted_reruns": phase.interrupted_reruns if available else None,
+                "interrupted_reruns_earlier_attempt": (
+                    phase.interrupted_reruns_earlier_attempt if available else None
                 ),
                 "winner_present": phase.winner_present,
                 "trial_data_available": available,

@@ -48,6 +48,7 @@ from phasesweep.engine.state import (
     METRIC_EXTRACTOR_LABEL,
     RERUN_OF_ATTR,
     TRIAL_STATE_NAMES,
+    InterruptedReruns,
     RecoveredTrialState,
     SearchSpaceEntry,
     TrialStateName,
@@ -108,6 +109,8 @@ class _PhaseTrialStats:
     running_attempts: list[_TrialRef] | None
     published_trial_available: bool = False
     studies: tuple[optuna.Study, ...] = ()
+    #: The addressed study's results that reran an interrupted trial.
+    reruns: InterruptedReruns = InterruptedReruns()
 
 
 def _trial_run_state(trial: optuna.trial.FrozenTrial) -> TrialStateName:

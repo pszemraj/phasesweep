@@ -29,6 +29,7 @@ from tests.conftest import (
     terminal_stream,
     write_constant_trainer,
 )
+from tests.recovery_helpers import stale_trial_rerun_config
 
 GENERATION = "6413d5c1edd5475998cfadd4d3b59980"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -867,3 +868,21 @@ def test_status_trials_styles_the_winner_on_a_terminal_unless_no_color_is_set(
     assert "\x1b" not in shown["1"]
     assert "\x1b" not in shown[""]
     assert ANSI.sub("", shown[None]) == shown["1"] == shown[""]
+
+
+def test_status_trials_says_how_many_results_reran_an_interrupted_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The heading of a phase whose winner reran an interrupted trial is followed by the run summary's interrupted line."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    experiment, _config = stale_trial_rerun_config(tmp_path)
+    run_experiment(experiment)
+
+    tables = read_trial_tables(experiment, latest=True)
+    lines = render_trial_tables(tables, experiment, csv_root=None, width=80, color=False)
+    lines = lines.splitlines()
+
+    heading = lines.index("p: 2 of 2 trials, objective (lower is better)")
+    assert lines[heading + 1] == (
+        "  interrupted: 1 of 2 results came from a rerun, the winner among them"
+    )

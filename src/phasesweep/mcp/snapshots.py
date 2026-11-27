@@ -47,7 +47,7 @@ NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 McpPublicationState = PublicationState | Literal["unknown"]
 """Engine publication verdict plus the MCP snapshot-unavailable state."""
 
-RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[7] = 7
+RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[8] = 8
 
 
 class _SnapshotModel(BaseModel):
@@ -102,6 +102,8 @@ class PhaseStatusSnapshot(_SnapshotModel):
     trials: dict[str, NonNegativeInt]
     n_trials: NonNegativeInt
     generation_trials: dict[str, NonNegativeInt]
+    interrupted_reruns: NonNegativeInt
+    interrupted_reruns_earlier_attempt: NonNegativeInt
     winner_present: bool
     trial_data_available: bool
     published_study_unavailable: bool | None = None
@@ -396,6 +398,9 @@ class WinnerSnapshot(_SnapshotModel):
     tie_groups: list[TieGroupSnapshot] | None
     edge_advisory: str | None
     edge_advisory_status: EdgeAdvisoryStatus
+    interrupted_reruns: NonNegativeInt
+    interrupted_reruns_earlier_attempt: NonNegativeInt
+    winner_interrupted_rerun: bool
 
 
 def _engine_winner_view(
@@ -454,6 +459,7 @@ def _engine_winner_view(
         tie_groups=advisories.tie_groups,
         edge_advisory=advisories.edge_advisory,
         edge_advisory_status=advisories.edge_advisory_status,
+        reruns=advisories.reruns,
     )
 
 
@@ -496,13 +502,16 @@ def winner_snapshot(view: PhaseWinnerView) -> WinnerSnapshot:
         ),
         edge_advisory=view.edge_advisory,
         edge_advisory_status=view.edge_advisory_status,
+        interrupted_reruns=view.reruns.reruns,
+        interrupted_reruns_earlier_attempt=view.reruns.earlier_attempt,
+        winner_interrupted_rerun=view.reruns.winner,
     )
 
 
 class RunResultSnapshot(_SnapshotModel):
     """Terminal status and winners frozen for one MCP run id."""
 
-    schema_version: Literal[7]
+    schema_version: Literal[8]
     status: StatusSnapshot
     winners: list[WinnerSnapshot]
     represented_config_fingerprint: str | None = None
@@ -532,6 +541,8 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> RunResultS
                     trials=dict(zero_counts),
                     n_trials=phase.n_trials,
                     generation_trials={},
+                    interrupted_reruns=0,
+                    interrupted_reruns_earlier_attempt=0,
                     winner_present=False,
                     trial_data_available=False,
                 )

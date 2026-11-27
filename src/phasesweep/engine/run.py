@@ -52,6 +52,7 @@ from phasesweep.engine.state import (
     GENERATION_SUMMARY_SCHEMA_VERSION,
     PhaseCounts,
     Winner,
+    _interrupted_reruns,
     _recorded_trial_dir,
     _stands_under_winner,
     _unreplaced_attempts,
@@ -637,8 +638,8 @@ def _phase_counts(
 ) -> PhaseCounts | None:
     """Count a finished phase's trials by recorded state, and the counted ones an earlier run recorded.
 
-    The counts also carry the attempt directory of each trial the phase's winner stands on, so
-    the summary names them from the same read. Reporting never fails a run whose result is
+    The counts also carry the attempt directory of each trial the phase's winner stands on and
+    the results that reran an interrupted trial, so the summary names them from the same read. Reporting never fails a run whose result is
     already decided, so a ledger that cannot be read back here costs the summary its counts for
     the phase and nothing else.
 
@@ -675,6 +676,7 @@ def _phase_counts(
             trial for trial in trials if trial.user_attrs.get(GENERATION_ID_ATTR) != generation_id
         ),
         winner_dirs=tuple(directory for directory in standing_dirs if directory is not None),
+        reruns=_interrupted_reruns(trials, standing),
     )
 
 

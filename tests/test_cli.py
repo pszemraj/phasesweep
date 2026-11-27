@@ -67,7 +67,7 @@ from tests.conftest import (
 )
 from tests.experiments import write_experiment
 from tests.ledger_fixtures import materialize, published_generation_id
-from tests.recovery_helpers import recover_run_cli
+from tests.recovery_helpers import recover_run_cli, stale_trial_rerun_config
 
 
 @pytest.fixture(autouse=True)
@@ -1000,6 +1000,22 @@ def test_show_winners_rejects_a_foreign_storage_ledger(tmp_path: Path) -> None:
     assert isinstance(result.exception, ArtifactRootConflictError)
     assert "different storage ledger" in str(result.exception)
     assert "trial_number" not in result.output
+
+
+def test_show_winners_says_how_many_results_reran_an_interrupted_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A winner that reran an interrupted trial carries the run summary's interrupted line among its comments."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    experiment, config = stale_trial_rerun_config(tmp_path)
+    run_experiment(experiment)
+
+    result = CliRunner().invoke(cli_main, ["show-winners", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "\n# interrupted: 1 of 2 results came from a rerun, the winner among them\n" in (
+        result.output
+    )
 
 
 def test_dry_run_does_not_launch(tmp_path, caplog, monkeypatch):

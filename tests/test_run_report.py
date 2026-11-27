@@ -22,13 +22,14 @@ from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Repeats, Sampler
 from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import _phase_dir
-from phasesweep.engine.read import read_trial_tables
+from phasesweep.engine.read import read_result, read_trial_tables
 from phasesweep.engine.run import _phase_counts
 from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     RERUN_OF_ATTR,
     TRIAL_OUTCOME_ATTR,
+    InterruptedReruns,
     Winner,
 )
 from phasesweep.errors import UnsafeProcessCleanupError, operator_step
@@ -36,6 +37,7 @@ from phasesweep.evidence.models import RequiredFileGate, WandbExtractor
 from phasesweep.run_report import (
     LogLine,
     banner,
+    interrupted_clause,
     phase_start,
     rerun_line,
     skipped_line,
@@ -63,6 +65,7 @@ from tests.conftest import (
     write_experiment_config,
     write_param_echo_trainer,
 )
+from tests.recovery_helpers import stale_trial_rerun_config
 
 STAMP = "12:00:00  "
 OOM = "non-zero exit code 1; stderr: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB"
@@ -1607,3 +1610,45 @@ def test_phase_counts_name_no_interrupted_trial_that_a_rerun_replaced(
 
     assert counts is not None
     assert (counts.complete, counts.interrupted) == (3, 0)
+
+
+def test_the_summary_says_how_many_results_reran_an_interrupted_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A phase whose winner reran an interrupted trial says so under the winner's flagged line, as a fact without a remedy; each zero or false clause is left out."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("COLUMNS", "500")
+    _experiment, config = stale_trial_rerun_config(tmp_path)
+
+    assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 0
+
+    lines = capsys.readouterr().err.splitlines()
+    details = next(i for i, line in enumerate(lines) if line.lstrip().startswith("details: "))
+    assert lines[details + 1] == (
+        "             interrupted: 1 of 2 results came from a rerun, the winner among them"
+    )
+    assert sum("interrupted:" in line for line in lines) == 1
+    assert interrupted_clause(InterruptedReruns(results=13, reruns=2, earlier_attempt=1)) == (
+        "2 of 13 results came from a rerun; 1 scored from an earlier attempt's result"
+    )
+
+
+def test_a_phase_no_interruption_touched_prints_no_interrupted_line_and_counts_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without a rerun, ``run``, ``status --trials`` and ``show-winners`` print no interrupted line, and the status and result reads MCP serves count zero."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=write_constant_trainer(tmp_path), n_trials=2, gpu_policy="none"
+    )
+    config = write_experiment_config(tmp_path / "plain.yaml", experiment)
+
+    for command in (["run"], ["status", "--trials"], ["show-winners"]):
+        assert invoke_cli_boundary([command[0], str(config), *command[1:]], monkeypatch) == 0
+
+    captured = capsys.readouterr()
+    assert "interrupted:" not in captured.out + captured.err
+    status, (winner,) = read_result(experiment)
+    (phase,) = status["phases"]
+    assert (phase["interrupted_reruns"], phase["interrupted_reruns_earlier_attempt"]) == (0, 0)
+    assert winner.reruns == InterruptedReruns(results=2)

@@ -100,8 +100,10 @@ from phasesweep.engine.state import (
     RERUN_OF_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_STATE_NAMES,
+    InterruptedReruns,
     PublicationState,
     WinnerSource,
+    _interrupted_reruns,
     _parse_winner_source,
     _parsed_trial_outcome,
     _recorded_identity,
@@ -205,6 +207,8 @@ class PhaseWinnerView:
     # Finished trials the phase held at selection (``completion.finished_trials``); later
     # trials have higher numbers, so the first this many finished ones are the ones it saw.
     finished_trials: int | None = None
+    # The phase's results that reran an interrupted trial, read from the ledger.
+    reruns: InterruptedReruns = InterruptedReruns()
 
 
 def _phase_status_payloads(
@@ -254,6 +258,8 @@ def _phase_status_payloads(
                 and not _published_trial_history_available(stats, published_trials[phase.name])
             ),
             "phase": phase.name,
+            "interrupted_reruns": stats.reruns.reruns,
+            "interrupted_reruns_earlier_attempt": stats.reruns.earlier_attempt,
             "winner_present": phase.name in winners_present,
             "running_attempts": (
                 None
@@ -507,6 +513,7 @@ def _represented_winners(
                     edge_advisory=advisories.edge_advisory,
                     edge_advisory_status=advisories.edge_advisory_status,
                     checkpoint_warnings=advisories.checkpoint_warnings,
+                    reruns=advisories.reruns,
                 )
             )
     return chosen
@@ -569,6 +576,7 @@ class WinnerAdvisories(typing.NamedTuple):
     edge_advisory: str | None
     edge_advisory_status: EdgeAdvisoryStatus
     checkpoint_warnings: tuple[str, ...] = ()
+    reruns: InterruptedReruns = InterruptedReruns()
 
 
 def winner_advisories(
@@ -587,6 +595,7 @@ def winner_advisories(
     Cost and edge advice also read the phase's config (its ``cost_key``, its search space), so
     they are computed only when ``experiment`` is the config that produced the winner, and are
     otherwise ``None`` with status ``unavailable``, as they are when the trials cannot be read.
+    The same read counts every result of the study that reran an interrupted trial.
 
     :param Experiment experiment: Display config locating the retained phase ledger.
     :param PhaseWinnerView winner: Winner whose recorded population anchors the comparisons.
@@ -605,6 +614,11 @@ def winner_advisories(
             studies = read_every_phase_study(ledger, [winner.phase])[winner.phase]
     study = next((item for item in studies if item.study_name == winner.study_name), None)
     trials = None if study is None else study.get_trials(deepcopy=False)
+    standing = _winning_trials(
+        winner.trial_number,
+        None if winner.source is None else winner.source.attempt_id,
+        winner.repeats_detail,
+    )
     ranking = _winner_ranked_groups(winner, trials)
     tie_groups = (
         []
@@ -649,14 +663,8 @@ def winner_advisories(
         tie_groups=tie_groups,
         edge_advisory=edge,
         edge_advisory_status=edge_status,
-        checkpoint_warnings=reused_checkpoint_warnings(
-            studies,
-            _winning_trials(
-                winner.trial_number,
-                None if winner.source is None else winner.source.attempt_id,
-                winner.repeats_detail,
-            ),
-        ),
+        checkpoint_warnings=reused_checkpoint_warnings(studies, standing),
+        reruns=_interrupted_reruns(trials or (), standing),
     )
 
 
@@ -1234,6 +1242,8 @@ class TrialTable:
     #: Finished trials whose directory is gone, which rank by their recorded values.
     pruned: tuple[int, ...] = ()
     checkpoint_warnings: tuple[str, ...] = ()
+    #: The rows that reran an interrupted trial, the winner's marks deciding ``winner``.
+    reruns: InterruptedReruns = InterruptedReruns()
 
 
 @dataclass(frozen=True)
@@ -1559,6 +1569,7 @@ def _trial_table(
         growth=growth,
         pruned=pruned,
         checkpoint_warnings=() if winner is None else winner.checkpoint_warnings,
+        reruns=_interrupted_reruns(trials, standing),
     )
 
 

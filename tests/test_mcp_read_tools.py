@@ -78,6 +78,7 @@ from tests.mcp_helpers import (
     write_srv_config,
     write_unsafe_cleanup_status,
 )
+from tests.recovery_helpers import stale_trial_rerun_config
 
 
 def _record_published_run_snapshot(
@@ -106,6 +107,41 @@ def _record_published_run_snapshot(
         result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
     )
     return run_id, trainer, config, catalog
+
+
+def test_run_status_and_results_count_the_results_that_reran_an_interrupted_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A frozen run snapshot of a phase whose winner reran an interrupted trial counts that rerun in status and results, and says the winner is among them."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    experiment, config = stale_trial_rerun_config(tmp_path, name="srv")
+    app, registry, store = make_mcp_app(write_srv_catalog(tmp_path, config))
+    run_id = "srv-rerun-winner"
+    stage_dead_run(store, run_id, config, registry.get("srv").id, cleanup_uncertain=False)
+    run_experiment(experiment, generation_id=run_id)
+    write_run_status(
+        store,
+        run_id,
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot_state="complete",
+        result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
+    )
+
+    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
+
+    assert status.result_source == results.result_source == "frozen_run_snapshot"
+    (phase,) = status.phases
+    assert (phase.interrupted_reruns, phase.interrupted_reruns_earlier_attempt) == (1, 0)
+    (winner,) = results.phases
+    assert winner.winner_source.trial_number == 1
+    assert (
+        winner.interrupted_reruns,
+        winner.interrupted_reruns_earlier_attempt,
+        winner.winner_interrupted_rerun,
+    ) == (1, 0, True)
 
 
 def _published_run_terminal(

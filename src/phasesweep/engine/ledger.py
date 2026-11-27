@@ -67,6 +67,7 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    _interrupted_reruns,
     _recovered_trial_state,
     _study_schema_supported,
     _unique_trial_outcomes,
@@ -811,7 +812,14 @@ def phase_trial_stats(
             state = _trial_count_state(trial, experiment)
             states = generation_counts.setdefault(generation_id, {})
             states[state] = states.get(state, 0) + 1
-    return _PhaseTrialStats(counts, True, generation_counts, running_attempts, studies=studies)
+    return _PhaseTrialStats(
+        counts,
+        True,
+        generation_counts,
+        running_attempts,
+        studies=studies,
+        reruns=_interrupted_reruns(trials),
+    )
 
 
 def resolved_ledger_path(experiment: Experiment) -> Path | None:

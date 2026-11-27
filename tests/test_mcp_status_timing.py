@@ -87,6 +87,8 @@ def _status_payload(phase_counts: dict[str, dict[str, int]]) -> JsonObject:
                 "phase": "p",
                 "n_trials": 3,
                 **phase_counts,
+                "interrupted_reruns": 0,
+                "interrupted_reruns_earlier_attempt": 0,
                 "winner_present": False,
                 "trial_data_available": True,
             }

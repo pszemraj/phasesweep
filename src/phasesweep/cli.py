@@ -107,11 +107,13 @@ from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.tool_names import TOOL_NAMES
 from phasesweep.reporting import _progress_values, report_objective
 from phasesweep.run_report import (
+    INTERRUPTED_LABEL,
     Banner,
     LogLine,
     NothingToRun,
     Summary,
     banner,
+    interrupted_clause,
     nothing_to_run,
     summary,
 )
@@ -1286,6 +1288,8 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
             _render_phase_comment(comment, prefix="# ")
             for warning in winner.checkpoint_warnings:
                 click.echo(f"# WARNING: {warning}")
+            if (interrupted := interrupted_clause(winner.reruns)) is not None:
+                click.echo(f"# {INTERRUPTED_LABEL} {interrupted}")
             if winner.repeats is not None:
                 repeats = winner.repeats
                 click.echo(f"# metric is the {repeats['reduce']} over {repeats['n']} repeats.")
