@@ -364,10 +364,11 @@ def test_fill_preview_counts_donors_outside_its_source(
     )
     if interrupted_fill:
         with patch.object(reread_ops, "_reread_trial", wraps=reread_ops._reread_trial) as read:
-            read.side_effect = [DEFAULT, reread_ops._reread_timeout(target, target.phases[0])]
+            read.side_effect = [reread_ops._reread_timeout(target, target.phases[0])]
             with pytest.raises(PhaseTimeoutError):
                 run_experiment(target)
-        # The x=4 donor extracted the loss as the target does, so it is kept unread.
+        # Other studies recorded x=3 and x=4 under the loss extraction, so both are kept
+        # unread; the x=2 re-read times out.
         assert [row.params["x"] for row in addressed_phase_study(target).trials] == [3, 4]
     trainer.unlink()
     journal = tmp_path / "studies.journal"

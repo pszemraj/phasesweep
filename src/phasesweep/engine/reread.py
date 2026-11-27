@@ -11,9 +11,9 @@ read that writes nothing (dry run, preflight, ``validate`` and ``status``): :fun
 the study's next slots in the order a run fills them (:func:`next_slot`) and gives each slot the
 oldest compatible attempt that trained it. A terminal attempt is read again under the current
 settings through the one path recovery reads a finished attempt by
-(:func:`phasesweep.engine.attempts.read_finished_attempt`), unless its study extracted it as the
-current settings would and differs only in the metric's goal
-(:func:`phasesweep.engine.fingerprints.extracted_reading`): then its recorded result stands, as
+(:func:`phasesweep.engine.attempts.read_finished_attempt`), unless a compatible study already
+recorded it under the current extraction, differing at most in the metric's goal
+(:func:`phasesweep.engine.fingerprints.extracted_reading`): then that recorded result stands, as
 in a replay, and selection verifies the winner's evidence. An interrupted one is copied as
 interrupted, so the ordinary rerun continues it from its checkpoint. The walk stops at the first
 slot no kept attempt fills, where the run launches. A run writes each adopted row in one storage
@@ -43,10 +43,11 @@ from phasesweep.engine.attempts import (
 from phasesweep.engine.errors import (
     PhaseTimeoutError,
     StudyFingerprintMismatchError,
+    TrialEvidenceMissingError,
     WinnerIntegrityError,
     phase_timeout,
 )
-from phasesweep.engine.evidence import _earlier_attempts
+from phasesweep.engine.evidence import _earlier_attempts, _selection_evidence
 from phasesweep.engine.fingerprints import (
     READING_KEY,
     _changed_payload_keys,
@@ -418,9 +419,15 @@ class _Candidate(NamedTuple):
     terminal: bool
     #: Physical opener of an adaptive draw, shared by its reruns.
     draw: str | None
-    #: Whether its study extracted it as the current reading would, differing at most in what
-    #: ranks the values (:func:`extracted_reading`), so its recorded result stands.
-    carried: bool
+    #: The study and row that recorded its result under the current extraction, differing at
+    #: most in what ranks the values (:func:`extracted_reading`), so that result stands; the
+    #: producing row still gives lineage and the draw position. ``None`` when none did.
+    recorded: tuple[optuna.Study, optuna.trial.FrozenTrial] | None
+
+    @property
+    def content(self) -> optuna.trial.FrozenTrial:
+        """Return the row whose result a slot takes when the attempt is not read again."""
+        return self.owner.trial if self.recorded is None else self.recorded[1]
 
     @property
     def measured(self) -> bool:
@@ -431,10 +438,10 @@ class _Candidate(NamedTuple):
     def rereads(self) -> bool:
         """Say whether taking the attempt reads its evidence again under the current settings.
 
-        A carried attempt's recorded values, provenance and gate verdicts were read and verified
-        when it was measured; selection verifies the winner's evidence as for any replay.
+        A recorded attempt's values, provenance and gate verdicts were read and verified when it
+        was measured; selection verifies the winner's evidence as for any replay.
         """
-        return self.measured and not self.carried
+        return self.measured and self.recorded is None
 
 
 def _compatible_studies(
@@ -567,7 +574,19 @@ def kept_attempts(
     present = {trial.user_attrs.get(ATTEMPT_ID_ATTR) for trial in study.get_trials(deepcopy=False)}
     domain = _domain(phase)
     extraction = extracted_reading(reading_settings(experiment, phase))
-    carried: dict[str, bool] = {}
+    # A row's values were read under its own study's reading (its address), so a study whose
+    # extraction matches holds the attempt's current result whether it launched, re-read or
+    # carried it. Two such studies hold the same measurement, so taking the newest is right.
+    recorded: dict[str, tuple[optuna.Study, optuna.trial.FrozenTrial]] = {}
+    for other in compatible:
+        identity = _recorded_identity(other)
+        reading = None if identity is None else identity["payload"].get(READING_KEY)
+        if isinstance(reading, dict) and _same_value(extracted_reading(reading), extraction):
+            for trial in other.get_trials(deepcopy=False):
+                outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+                attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+                if isinstance(attempt_id, str) and outcome and outcome.outcome in _REREAD_OUTCOMES:
+                    recorded[attempt_id] = other, trial
     positions: dict[str, dict[int, int]] = {}
     pool = []
     owners = producing_attempts((study, *compatible))
@@ -599,19 +618,18 @@ def kept_attempts(
         name = owner.study.study_name
         if name not in positions:
             positions[name] = _draw_positions(owner.rows.values())
-            # A row's values were read under its own study's reading (the study's address).
-            identity = _recorded_identity(owner.study)
-            recorded = None if identity is None else identity["payload"].get(READING_KEY)
-            carried[name] = isinstance(recorded, dict) and _same_value(
-                extracted_reading(recorded), extraction
-            )
+        kept = recorded.get(attempt_id)
+        if kept is not None and kept[1].state != _COMPLETE and kept[0].study_name != name:
+            # A failure another study's re-read recorded is no measurement: the evidence is
+            # read again, so a directory restored since then is scored.
+            kept = None
         pool.append(
             _Candidate(
                 owner,
                 positions[name][owner.trial.number],
                 outcome.outcome != "interrupted",
                 draws.get(attempt_id),
-                carried[name],
+                kept,
             )
         )
     return _allocation_order(pool), draws
@@ -1085,7 +1103,7 @@ def assumed_reader(experiment: Experiment, assumed: optuna.trial.TrialState) -> 
     """
 
     def read(candidate: _Candidate) -> optuna.trial.FrozenTrial:
-        trial = copy.deepcopy(candidate.owner.trial)
+        trial = copy.deepcopy(candidate.content)
         if candidate.rereads:
             value, attrs = _assumed_verdict(experiment, candidate.owner.study, assumed)
             trial.state, trial.value = assumed, value
@@ -1121,10 +1139,8 @@ def _evidence_reader(
 
     def read(candidate: _Candidate) -> optuna.trial.FrozenTrial:
         trial = candidate.owner.trial
-        if not candidate.terminal:
-            return copy.deepcopy(trial)
         if not candidate.rereads:
-            return copy.deepcopy(trial)
+            return copy.deepcopy(candidate.content)
         _require_reread_time(experiment, phase, deadline)
         log.info(
             "Phase %s re-reading trial %d of study %s.",
@@ -1156,7 +1172,7 @@ class Adoption:
 
     rereads: int = 0
     changed: int = 0
-    #: Finished trainers whose recorded results stand (:attr:`_Candidate.carried`).
+    #: Finished trainers whose recorded results stand (:attr:`_Candidate.recorded`).
     carried: int = 0
     failures: int = 0
     interrupted: int = 0
@@ -1173,7 +1189,9 @@ class Adoption:
 
         :param Adopt step: The row and the attempt it came from.
         """
-        identity = _recorded_identity(step.candidate.owner.study)
+        candidate = step.candidate
+        study = candidate.owner.study if candidate.recorded is None else candidate.recorded[0]
+        identity = _recorded_identity(study)
         reading = None if identity is None else identity["payload"].get(READING_KEY)
         if reading not in self.readings:
             self.readings.append(reading)
@@ -1888,7 +1906,7 @@ def pending_reread(
     studies: Sequence[optuna.Study],
     *,
     unsettled: Sequence[str] = (),
-) -> PendingRereadNotice | None:
+) -> PendingRereadNotice | TrialEvidenceMissingError | None:
     """Say that a phase's addressed study holds no rows yet and would re-read kept attempts.
 
     The inherited values the address stands for are the ones a study of the phase recorded
@@ -1903,8 +1921,9 @@ def pending_reread(
         phase, so the address holds only if they keep it; defaults to none.
     :raises StudyFingerprintMismatchError: A study with these inherited values has another
         training identity (:func:`adoption_identity`).
-    :return PendingRereadNotice | None: The notice, or ``None`` when the addressed study holds
-        rows or no study holds trials to re-read.
+    :return PendingRereadNotice | TrialEvidenceMissingError | None: The notice, the run's refusal
+        when every score is recorded and the winner's evidence is gone or changed, or ``None``
+        when the addressed study holds rows or no study holds trials to re-read.
     """
     addressed = next((study for study in studies if study.study_name == study_name), None)
     if addressed is not None and addressed.get_trials(deepcopy=False):
@@ -1921,6 +1940,13 @@ def pending_reread(
         )
         if plan is None or not plan.adoption.total:
             return None
+        if not plan.adoption.rereads and not unsettled:
+            # Every score is recorded, so the run selects from the carried rows and refuses as
+            # ``run --dry-run`` does when the winner's evidence is gone or changed.
+            try:
+                _selection_evidence(experiment, phase, plan.failed)
+            except TrialEvidenceMissingError as exc:
+                return exc
         recorded = record["payload"].get(READING_KEY)
         changes = _changed_payload_keys(
             recorded if isinstance(recorded, dict) else {}, reading_settings(experiment, phase)
