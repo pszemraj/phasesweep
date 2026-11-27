@@ -14,6 +14,7 @@ import time
 from bisect import bisect_left
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -783,7 +784,8 @@ def _poll_wandb_summary(
     history row, passes ``logged_after``, the state and summary are the earlier attempt's,
     so neither a terminal state nor a finished summary decides anything; a run that still
     shows nothing newer at the deadline is unread, like one whose summary is still empty, and
-    leaves the trial pending. A trainer axis can
+    leaves the trial pending. A run created at or after ``logged_after`` holds no earlier
+    attempt's data, so that wait does not apply to it. A trainer axis can
     show where a rerun re-logged progress, letting min/max exclude the replaced history.
 
     :param str base_url: Normalized W&B API endpoint.
@@ -864,7 +866,11 @@ def _poll_wandb_summary(
                 reached = True
                 missing = []
                 summary = run.summary_metrics
-                stale = logged_after is not None and not _logged_since(summary, logged_after)
+                stale = (
+                    logged_after is not None
+                    and not _logged_since(summary, logged_after)
+                    and not _created_since(run, logged_after)
+                )
                 if run.state == "finished" and not _summary_matches_history(run, summary):
                     reached = False
                     last_error = RuntimeError(
@@ -979,6 +985,32 @@ def _logged_since(summary: Mapping[str, object], logged_after: float) -> bool:
     """
     stamp = finite_nonnegative(summary.get("_timestamp"))
     return stamp is not None and stamp > logged_after
+
+
+def _created_since(run: object, logged_after: float) -> bool:
+    """Say whether a run was created at or after a rerun launched.
+
+    Such a run cannot hold an earlier attempt's summary, so a summary without a
+    ``_timestamp`` (an objective set on ``run.summary`` and never logged) is the rerun's own.
+    The comparison assumes the service's clock, which stamps the run's ``created_at``, agrees
+    with this machine's, which stamped the launch; a skew can only misjudge a run created
+    within that skew of the launch. W&B serves ``created_at`` as an ISO-8601 string in UTC,
+    with a trailing ``Z`` or no offset.
+
+    :param object run: Public-API run.
+    :param float logged_after: Unix time the rerun launched at.
+    :return bool: Whether ``created_at`` parses and is not before ``logged_after``.
+    """
+    created = getattr(run, "created_at", None)
+    if not isinstance(created, str):
+        return False
+    try:
+        moment = datetime.fromisoformat(created)
+    except ValueError:
+        return False
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.timestamp() >= logged_after
 
 
 def _locate_wandb_position(

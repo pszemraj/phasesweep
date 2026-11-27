@@ -184,6 +184,7 @@ def _serve(
     *,
     rows: tuple[Mapping[str, object], ...] = (),
     on_scan: Callable[[list[str]], None] | None = None,
+    created_at: str | None = None,
 ) -> tuple[ManualClock, list[str]]:
     """Answer each zero-based run lookup with ``answers(read)`` on a manual clock.
 
@@ -193,6 +194,7 @@ def _serve(
     :param Callable[[int], Answer] answers: State, summary and last history step per read.
     :param tuple[Mapping[str, object], ...] rows: Rows available in unsampled history.
     :param Callable[[list[str]], None] | None on_scan: Callback for each history read.
+    :param str | None created_at: The run's ISO ``created_at``, defaults to None for a run that serves none.
     :return tuple[ManualClock, list[str]]: The clock and the paths looked up.
     """
     public = pytest.importorskip("wandb.apis.public")
@@ -223,6 +225,7 @@ def _serve(
                 summary_metrics=summary,
                 history_keys=_history_index(last_step),
                 scan_history=scan_history,
+                **({} if created_at is None else {"created_at": created_at}),
             )
 
     monkeypatch.setattr(public, "Api", Api)
@@ -414,6 +417,41 @@ def test_a_reruns_run_that_never_moves_is_unanswered_at_the_deadline(
 
     left = {"_step": 5, _KEY: 0.5, "_timestamp": _LAUNCHED_AT - 60}
     clock, _ = _serve(monkeypatch, lambda read: ("finished", left, 5))
+    with pytest.raises(WandbPollTimeout) as caught:
+        _poll(logged_after=_LAUNCHED_AT)
+    assert not caught.value.reached
+    assert "earlier attempt's summary" in str(caught.value.last_error)
+    assert clock.now == 240
+
+
+@pytest.mark.parametrize("created_at", ["1970-01-01T00:16:41Z", "1970-01-01T00:16:41"])
+def test_a_summary_only_objective_on_a_run_created_after_the_launch_is_read(
+    monkeypatch: pytest.MonkeyPatch, created_at: str
+) -> None:
+    """A finished run created after the rerun launched, whose summary was set directly and has no ``_timestamp``, is read at once.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
+    :param str created_at: The run's creation time as W&B serves it, with and without an offset.
+    """
+    clock, paths = _serve(
+        monkeypatch, lambda _: ("finished", {_KEY: 0.25}, None), created_at=created_at
+    )
+    assert _poll(logged_after=_LAUNCHED_AT)["values"] == {_KEY: 0.25}
+    assert len(paths) == 1
+    assert clock.now == 0
+
+
+def test_a_summary_only_objective_on_a_run_created_before_the_launch_still_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finished summary without a ``_timestamp`` on a run that predates the rerun may be the earlier attempt's, so the read waits and stays unanswered."""
+    from phasesweep.evidence.wandb import WandbPollTimeout
+
+    clock, _ = _serve(
+        monkeypatch,
+        lambda _: ("finished", {_KEY: 0.25}, None),
+        created_at="1970-01-01T00:16:39Z",
+    )
     with pytest.raises(WandbPollTimeout) as caught:
         _poll(logged_after=_LAUNCHED_AT)
     assert not caught.value.reached
