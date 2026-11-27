@@ -35,6 +35,14 @@ _HISTORY_SAMPLES = 10_000
 # still in flight at the polling deadline ends within about a second of it, and the report
 # follows in what remains.
 _REPORT_SECONDS = 2.0
+# The launch stamp's budget, and how long and how often it reads a run that is still
+# ``running`` again: a trainer ended by a signal closes its session, and sends its last rows,
+# a few seconds after its process exits.
+_STAMP_SECONDS = 30.0
+_STAMP_SETTLE_SECONDS = 10.0
+_STAMP_RETRY_SECONDS = 2.0
+# States only a closed session leaves, so the run holds every row the session logged.
+_CLOSED_STATES = frozenset({"finished", "failed", "killed", "preempted"})
 
 
 @dataclass(eq=False)
@@ -71,6 +79,17 @@ class WandbRunSupersededError(RuntimeError):
     """A later attempt reused the run, so its current summary is not the one being re-read."""
 
     run_id: str
+
+
+@dataclass(eq=False)
+class WandbNothingToScoreError(RuntimeError):
+    """At the poll deadline a rerun's run shows no row since its launch and no result to score.
+
+    ``cause`` is a predicate for the run, saying what it shows instead.
+    """
+
+    run_id: str
+    cause: str
 
 
 @dataclass(eq=False)
@@ -226,10 +245,15 @@ def poll_wandb_summary(
     logged_before: float | None = None,
     earlier_launches: tuple[float, ...] = (),
     resume_axis: str = "_step",
+    launch_rows: int | None = None,
+    launch_state: str | None = None,
     environment: Mapping[str, str] | None = None,
     deadline: float | None = None,
 ) -> dict[str, Any]:
     """Capture requested evidence after confirmed trainer cleanup.
+
+    The capture carries ``earlier_attempt`` when the summary is one an earlier attempt of the
+    trial left and the rerun added nothing to (:func:`_poll_wandb_summary`).
 
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
@@ -248,6 +272,8 @@ def poll_wandb_summary(
         attempt reused the run, defaults to None.
     :param tuple[float, ...] earlier_launches: Launch times of earlier reruns in this run.
     :param str resume_axis: Trainer progress key shared by native min/max aggregates.
+    :param int | None launch_rows: The run's row count when a rerun launched, defaults to None.
+    :param str | None launch_state: The run's state when a rerun launched, defaults to None.
     :param Mapping[str, str] | None environment: Actual composed trainer environment.
     :param float | None deadline: Absolute deadline including worker startup.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
@@ -256,6 +282,8 @@ def poll_wandb_summary(
         that still shows only an earlier attempt's rows is not such an answer.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
     :raises WandbRunSupersededError: A newer attempt replaced the retained summary.
+    :raises WandbNothingToScoreError: At the deadline a rerun's run shows no row since its
+        launch and no finished summary that is the trial's result.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
     :raises WandbMissingKeysError: At the deadline the finished run's summary still lacked
@@ -283,6 +311,8 @@ def poll_wandb_summary(
             "logged_before": logged_before,
             "earlier_launches": earlier_launches,
             "resume_axis": resume_axis,
+            "launch_rows": launch_rows,
+            "launch_state": launch_state,
             "deadline": deadline,
         },
         Path(__file__).resolve(),
@@ -298,6 +328,7 @@ def poll_wandb_summary(
                 "timeout",
                 "run_missing",
                 "superseded",
+                "nothing_to_score",
             }
         ),
         run_id=attempt_id,
@@ -314,6 +345,8 @@ def poll_wandb_summary(
         raise WandbRunMissingError(run_id)
     if response.get("status") == "superseded":
         raise WandbRunSupersededError(run_id)
+    if response.get("status") == "nothing_to_score":
+        raise WandbNothingToScoreError(run_id, json_text(response, "cause"))
     waited = finite_nonnegative(response.get("waited_seconds"))
     if response.get("status") == "missing_keys":
         missing = json_text_list(response.get("missing"))
@@ -349,6 +382,69 @@ def poll_wandb_summary(
             f"W&B evidence worker returned a malformed capture for attempt {attempt_id!r}."
         )
     return capture
+
+
+def read_wandb_stamp(
+    *,
+    base_url: str,
+    entity: str,
+    project: str,
+    run_id: str,
+    attempt_id: str,
+    attempt_dir: Path,
+    timeout_seconds: float,
+    environment: Mapping[str, str] | None,
+    deadline: float | None,
+) -> tuple[int | None, str | None]:
+    """Read a trial's run's row count and state before a rerun launches into it.
+
+    The stamp is the W&B run's counterpart of the value files' stamps: the poll compares the
+    count with it to tell whether the rerun logged rows. It never refuses the launch, so a
+    run that does not exist yet, a read that fails or times out, or a count that is not a
+    non-negative integer records ``None`` for both.
+
+    :param str base_url: Normalized W&B API endpoint.
+    :param str entity: W&B entity that owns the project.
+    :param str project: W&B project containing the run.
+    :param str run_id: The trial's W&B run.
+    :param str attempt_id: Registered reader whose process slot runs the worker.
+    :param Path attempt_dir: The reader's process slot.
+    :param float timeout_seconds: The source's timeout; the read uses at most 30 s of it.
+    :param Mapping[str, str] | None environment: Actual composed trainer environment.
+    :param float | None deadline: Absolute ``time.monotonic()`` phase or run deadline.
+    :return tuple[int | None, str | None]: The row count and state, or ``None`` for both.
+    :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
+    """
+    deadline = min(
+        time.monotonic() + min(timeout_seconds, _STAMP_SECONDS),
+        deadline if deadline is not None else math.inf,
+    )
+    if time.monotonic() >= deadline:
+        return None, None
+    try:
+        _, response, _ = run_worker(
+            {
+                "task": "stamp",
+                "base_url": base_url,
+                "entity": entity,
+                "project": project,
+                "run_id": run_id,
+                "deadline": deadline,
+            },
+            Path(__file__).resolve(),
+            "wandb",
+            statuses=frozenset({"stamp", "import_error"}),
+            run_id=attempt_id,
+            attempt_dir=attempt_dir,
+            environment=environment,
+            deadline=deadline,
+        )
+    except ValueError:
+        return None, None
+    rows, state = response.get("rows"), response.get("state")
+    if response.get("status") != "stamp" or type(rows) is not int or rows < 0:
+        return None, None
+    return rows, state if isinstance(state, str) else None
 
 
 def locate_wandb_position(
@@ -765,6 +861,8 @@ def _poll_wandb_summary(
     logged_before: float | None = None,
     earlier_launches: tuple[float, ...] = (),
     resume_axis: str = "_step",
+    launch_rows: int | None = None,
+    launch_state: str | None = None,
     deadline: float | None = None,
 ) -> dict[str, Any]:
     """Poll an exact run using refreshed SDK clients within the parent's deadline.
@@ -788,6 +886,18 @@ def _poll_wandb_summary(
     attempt's data, so that wait does not apply to it. A trainer axis can
     show where a rerun re-logged progress, letting min/max exclude the replaced history.
 
+    That wait lasts to the deadline, the allowance a first attempt gets for a value set on
+    ``run.summary`` without a row. The latest answered lookup's stale answer is then a verdict,
+    decided after the loop as the missing-keys verdict is, against the row count and state
+    recorded at launch (:func:`read_wandb_stamp`), since ``historyLineCount`` is
+    current within a second while the summary lags. A count that grew means W&B has rows it
+    has not summarized yet, so the read stays pending. An unchanged count over a run whose
+    earlier session had closed, now finished with a summary that matches its index, means the
+    rerun added nothing to a run holding all its earlier rows: the summary is read as a
+    summary is otherwise read and the capture carries ``earlier_attempt``. A session that
+    never closed can be missing its last row, so any other answer leaves the attempt nothing
+    to score.
+
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
     :param str project: W&B project containing the run.
@@ -802,12 +912,16 @@ def _poll_wandb_summary(
         attempt reused the run, defaults to None.
     :param tuple[float, ...] earlier_launches: Launch times of earlier reruns in this run.
     :param str resume_axis: Trainer progress key shared by native min/max aggregates.
+    :param int | None launch_rows: The run's row count when a rerun launched, defaults to None.
+    :param str | None launch_state: The run's state when a rerun launched, defaults to None.
     :param float | None deadline: Absolute ``time.monotonic()`` deadline from the parent.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
     :raises WandbPollTimeout: The run did not finish with the required keys in time,
         reached when the last poll got a usable answer about the run.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
     :raises WandbRunSupersededError: A newer attempt replaced the retained summary.
+    :raises WandbNothingToScoreError: At the deadline a rerun's run shows no row since its
+        launch and no finished summary that is the trial's result.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
     :raises WandbMissingKeysError: At the deadline the finished run's summary still lacked
@@ -830,6 +944,12 @@ def _poll_wandb_summary(
     available: list[str] = []
     required = tuple(required_keys)
     launches = () if logged_after is None else tuple(sorted((*earlier_launches, logged_after)))
+    # What the latest lookup's stale answer decides at the deadline: the earlier attempt's
+    # capture, or why the attempt left nothing to score. Only an answered last lookup decides.
+    verdict: dict[str, object] | str | None = None
+    # The row count, summary and values an earlier attempt's capture was read from, so an
+    # unchanged run is not read through its history again on every poll.
+    read_earlier: tuple[int | None, dict[str, object], dict[str, float]] | None = None
     while time.monotonic() < deadline:
         try:
             api = Api(
@@ -841,9 +961,11 @@ def _poll_wandb_summary(
                 raise WandbSetupError(run_id, _error_detail(exc)) from exc
             last_error = RuntimeError(_error_detail(exc))
             reached = False
+            verdict = None
         else:
             if time.monotonic() >= deadline:
                 break
+            verdict = None
             try:
                 run = api.run(f"{entity}/{project}/{run_id}")
             except Exception as exc:
@@ -871,7 +993,39 @@ def _poll_wandb_summary(
                     and not _logged_since(summary, logged_after)
                     and not _created_since(run, logged_after)
                 )
-                if run.state == "finished" and not _summary_matches_history(run, summary):
+                rows = _row_count(run)
+                matched = run.state == "finished" and _summary_matches_history(run, summary)
+                logged = 0 if rows is None or launch_rows is None else rows - launch_rows
+                # A stale answer with no new row is waited out, and what it decides is kept for
+                # the deadline in case it is the last answer.
+                unlogged = stale and logged <= 0
+                earlier = (
+                    unlogged
+                    and launch_rows is not None
+                    and rows == launch_rows
+                    and launch_state in _CLOSED_STATES
+                    and matched
+                )
+                if unlogged and not earlier:
+                    verdict = "shows no row logged since the attempt launched, and " + (
+                        "no row count was recorded at the launch"
+                        if launch_rows is None
+                        else f"W&B serves {rows!r} rows against {launch_rows} at the launch"
+                        if rows != launch_rows
+                        else f"its earlier session was {launch_state!r} at the launch, so it "
+                        "may lack that session's last row"
+                        if launch_state not in _CLOSED_STATES
+                        else f"it is {run.state!r}, not finished"
+                        if run.state != "finished"
+                        else "its finished summary does not match its history"
+                    )
+                if stale and logged > 0:
+                    reached = False
+                    last_error = RuntimeError(
+                        f"W&B holds {logged} rows logged since the attempt launched that its "
+                        "summary does not show yet."
+                    )
+                elif run.state == "finished" and not matched:
                     reached = False
                     last_error = RuntimeError(
                         "The finished run's summary is still empty."
@@ -879,9 +1033,9 @@ def _poll_wandb_summary(
                         else f"The summary's _step {summary.get('_step')!r} does not match the "
                         f"history's last step {_last_history_step(run)!r}."
                     )
-                elif stale:
+                elif stale and not earlier:
                     # W&B serves the earlier attempt's run for minutes after a rerun finishes,
-                    # so an unchanged summary is a lag to wait out, never a verdict.
+                    # so an unchanged summary is a lag to wait out until the deadline.
                     reached = False
                     last_error = RuntimeError(
                         "The run still shows only an earlier attempt's summary: it records no "
@@ -903,7 +1057,13 @@ def _poll_wandb_summary(
                             values[key] = value
                         last_step = _last_history_step(run)
                         try:
-                            if launches and resume_axis != "_step" and last_step is not None:
+                            if (
+                                earlier
+                                and read_earlier is not None
+                                and read_earlier[:2] == (rows, summary)
+                            ):
+                                values = dict(read_earlier[2])
+                            elif launches and resume_axis != "_step" and last_step is not None:
                                 values.update(
                                     _resumed_extrema(
                                         run,
@@ -920,18 +1080,33 @@ def _poll_wandb_summary(
                             last_error = RuntimeError(_error_detail(exc))
                             reached = False
                         else:
-                            return {
+                            capture: dict[str, object] = {
                                 "values": values,
                                 "present_keys": sorted(
                                     key for key in presence_keys if key in summary
                                 ),
                                 "retrieved_at": utc_now_iso(timespec="microseconds"),
                             }
+                            if not earlier:
+                                return capture
+                            # The earlier attempt's summary is the result only if nothing newer
+                            # arrives before the deadline.
+                            read_earlier = (rows, dict(summary), dict(values))
+                            verdict = {**capture, "earlier_attempt": True}
+                            reached = False
+                            last_error = RuntimeError(
+                                "The run still shows only an earlier attempt's summary: it "
+                                "records no row logged since the attempt launched."
+                            )
                     else:
                         missing = sorted(key for key in required if key not in summary)
                         available = sorted(summary)
         time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
     waited = time.monotonic() - started
+    if isinstance(verdict, dict):
+        return verdict
+    if isinstance(verdict, str):
+        raise WandbNothingToScoreError(run_id, verdict)
     if isinstance(last_error, WandbRunMissingError):
         raise last_error
     if reached and missing:
@@ -1011,6 +1186,61 @@ def _created_since(run: object, logged_after: float) -> bool:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=UTC)
     return moment.timestamp() >= logged_after
+
+
+def _row_count(run: object) -> int | None:
+    """Return the number of history rows the service holds for a run.
+
+    ``historyLineCount`` arrives in the same ``Api.run`` answer as the state and summary and
+    is exact, also with sparse explicit steps, within a second of a trainer's exit, while the
+    summary and history index can take half a minute.
+
+    :param object run: Public-API run.
+    :return int | None: The count, or ``None`` when it is not a non-negative integer.
+    """
+    rows = getattr(run, "historyLineCount", None)
+    return rows if type(rows) is int and rows >= 0 else None
+
+
+def _read_wandb_stamp(
+    *, base_url: str, entity: str, project: str, run_id: str, deadline: float
+) -> dict[str, int | str | None]:
+    """Read a run's row count and state, again while it is still ``running``.
+
+    A trainer ended by a signal closes its session a few seconds after its process exits,
+    with its count still short and its state ``running`` until then, so a ``running`` run is
+    read every ``_STAMP_RETRY_SECONDS`` for up to ``_STAMP_SETTLE_SECONDS`` and the last answer
+    is kept. A session killed outright stays ``running`` and costs that wait.
+
+    :param str base_url: Normalized W&B API endpoint.
+    :param str entity: W&B entity that owns the project.
+    :param str project: W&B project containing the run.
+    :param str run_id: Exact W&B run ID to read.
+    :param float deadline: Absolute ``time.monotonic()`` deadline from the parent.
+    :return dict[str, int | str | None]: ``rows`` and ``state``, both ``None`` when a lookup
+        failed before any answer or the count is unusable.
+    """
+    from wandb.apis.public import Api
+
+    settle = min(deadline, time.monotonic() + _STAMP_SETTLE_SECONDS)
+    stamp: dict[str, int | str | None] = {"rows": None, "state": None}
+    while time.monotonic() < deadline:
+        try:
+            api = Api(
+                overrides={"base_url": base_url},
+                timeout=max(1, math.ceil(deadline - time.monotonic())),
+            )
+            run = api.run(f"{entity}/{project}/{run_id}")
+        except Exception:
+            return stamp
+        rows, state = _row_count(run), getattr(run, "state", None)
+        if rows is None:
+            return {"rows": None, "state": None}
+        stamp = {"rows": rows, "state": state if isinstance(state, str) else None}
+        if state != "running" or time.monotonic() + _STAMP_RETRY_SECONDS > settle:
+            return stamp
+        time.sleep(_STAMP_RETRY_SECONDS)
+    return stamp
 
 
 def _locate_wandb_position(
@@ -1102,7 +1332,10 @@ def main(argv: list[str] | None = None) -> int:
             # missing keys or a timeout finish before the supervisor's deadline.
             remaining = max(0.0, request["deadline"] - time.monotonic())
             request["deadline"] -= report_reserve(remaining, _REPORT_SECONDS)
-            response = {"status": "summary", "capture": _poll_wandb_summary(**request)}
+            if task == "stamp":
+                response = {"status": "stamp", **_read_wandb_stamp(**request)}
+            else:
+                response = {"status": "summary", "capture": _poll_wandb_summary(**request)}
     except ImportError:
         response = {"status": "import_error"}
     except WandbSetupError as exc:
@@ -1120,6 +1353,8 @@ def main(argv: list[str] | None = None) -> int:
         response = {"status": "run_missing"}
     except WandbRunSupersededError:
         response = {"status": "superseded"}
+    except WandbNothingToScoreError as exc:
+        response = {"status": "nothing_to_score", "cause": exc.cause}
     except WandbPollTimeout as exc:
         response = {
             "status": "timeout",

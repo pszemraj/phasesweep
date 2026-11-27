@@ -27,6 +27,7 @@ from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
     EvidenceUnreadableError,
     ExtractorError,
+    NothingToScoreError,
     run_extractor,
 )
 from phasesweep.evidence.mlflow import merge_histories, select_observation
@@ -185,6 +186,7 @@ def _serve(
     rows: tuple[Mapping[str, object], ...] = (),
     on_scan: Callable[[list[str]], None] | None = None,
     created_at: str | None = None,
+    line_count: Callable[[int], int | None] = lambda _: None,
 ) -> tuple[ManualClock, list[str]]:
     """Answer each zero-based run lookup with ``answers(read)`` on a manual clock.
 
@@ -195,6 +197,8 @@ def _serve(
     :param tuple[Mapping[str, object], ...] rows: Rows available in unsampled history.
     :param Callable[[list[str]], None] | None on_scan: Callback for each history read.
     :param str | None created_at: The run's ISO ``created_at``, defaults to None for a run that serves none.
+    :param Callable[[int], int | None] line_count: The run's ``historyLineCount`` per read,
+        ``None`` for a run that serves none, defaults to none.
     :return tuple[ManualClock, list[str]]: The clock and the paths looked up.
     """
     public = pytest.importorskip("wandb.apis.public")
@@ -220,12 +224,14 @@ def _serve(
             self.used = True
             paths.append(path)
             state, summary, last_step = answers(len(paths) - 1)
+            count = line_count(len(paths) - 1)
             return SimpleNamespace(
                 state=state,
                 summary_metrics=summary,
                 history_keys=_history_index(last_step),
                 scan_history=scan_history,
                 **({} if created_at is None else {"created_at": created_at}),
+                **({} if count is None else {"historyLineCount": count}),
             )
 
     monkeypatch.setattr(public, "Api", Api)
@@ -304,16 +310,6 @@ def test_a_gate_only_read_waits_for_the_summary_to_reach_the_history(
     )
     assert _poll(required=(), presence_keys=["complete"])["present_keys"] == ["complete"]
     assert clock.now == 10
-
-
-def test_a_finished_summary_behind_its_history_stays_unreadable_on_a_rerun(monkeypatch) -> None:
-    """A partially ingested summary at the deadline cannot establish which attempt logged."""
-    from phasesweep.evidence.wandb import WandbPollTimeout
-
-    _serve(monkeypatch, lambda _: ("finished", {"_step": 1, "_timestamp": 1.0, _KEY: 0.1}, 2))
-    with pytest.raises(WandbPollTimeout) as caught:
-        _poll(logged_after=_LAUNCHED_AT)
-    assert not caught.value.reached
 
 
 def test_a_finished_summary_missing_a_key_fails_only_at_the_deadline(
@@ -409,19 +405,120 @@ def test_a_reruns_read_waits_out_the_state_its_earlier_attempt_left(
     assert clock.now == 10
 
 
-def test_a_reruns_run_that_never_moves_is_unanswered_at_the_deadline(
+@pytest.mark.parametrize(
+    ("launch", "state", "last_step", "cause"),
+    [
+        ((None, None), "finished", 5, "no row count was recorded at the launch"),
+        ((5, "running"), "finished", 5, "its earlier session was 'running' at the launch"),
+        ((5, "killed"), "crashed", 5, "it is 'crashed', not finished"),
+        ((5, "killed"), "finished", 4, "its finished summary does not match its history"),
+    ],
+    ids=["no-launch-count", "session-open-at-launch", "not-finished", "unmatched-index"],
+)
+def test_a_reruns_run_that_never_moves_leaves_nothing_to_score_at_the_deadline(
     monkeypatch: pytest.MonkeyPatch,
+    launch: tuple[int | None, str | None],
+    state: str,
+    last_step: int,
+    cause: str,
 ) -> None:
-    """A run whose summary never passes the rerun's launch gives no usable answer, only at the deadline."""
-    from phasesweep.evidence.wandb import WandbPollTimeout
+    """A run whose summary never passes the rerun's launch and whose row count did not grow is waited out to the deadline; then, unless its earlier session had closed and it is finished with a summary matching its history index, the attempt left nothing to score, saying which.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
+    :param tuple[int | None, str | None] launch: Row count and state recorded at the launch.
+    :param str state: The run's state at every poll.
+    :param int last_step: The history index's last step.
+    :param str cause: What the verdict names.
+    """
+    from phasesweep.evidence.wandb import WandbNothingToScoreError
 
     left = {"_step": 5, _KEY: 0.5, "_timestamp": _LAUNCHED_AT - 60}
-    clock, _ = _serve(monkeypatch, lambda read: ("finished", left, 5))
-    with pytest.raises(WandbPollTimeout) as caught:
-        _poll(logged_after=_LAUNCHED_AT)
-    assert not caught.value.reached
-    assert "earlier attempt's summary" in str(caught.value.last_error)
+    clock, _ = _serve(monkeypatch, lambda _: (state, left, last_step), line_count=lambda _: 5)
+    with pytest.raises(WandbNothingToScoreError) as caught:
+        _poll(logged_after=_LAUNCHED_AT, launch_rows=launch[0], launch_state=launch[1])
+    assert caught.value.cause.startswith(
+        f"shows no row logged since the attempt launched, and {cause}"
+    )
     assert clock.now == 240
+
+
+@pytest.mark.parametrize("launch_state", ["killed", "running"], ids=["earlier", "nothing"])
+def test_a_reruns_verdict_stands_when_no_lookup_completes_near_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, launch_state: str
+) -> None:
+    """The latest answered lookup decides a rerun's verdict at the deadline even when it came long before it, because the next client took past the deadline to build: the earlier attempt's summary is captured, or the attempt left nothing to score.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
+    :param str launch_state: The run's state at the launch, closed or not.
+    """
+    from phasesweep.evidence.wandb import WandbNothingToScoreError
+
+    public = pytest.importorskip("wandb.apis.public")
+    left = {"_step": 5, _KEY: 0.5, "_timestamp": _LAUNCHED_AT - 60}
+    clock, paths = _serve(monkeypatch, lambda _: ("finished", left, 5), line_count=lambda _: 5)
+    served = public.Api
+    built: list[object] = []
+
+    def slow_second_client(**kwargs: object) -> object:
+        client = served(**kwargs)
+        built.append(client)
+        if len(built) == 2:
+            clock.now += 1_000
+        return client
+
+    monkeypatch.setattr(public, "Api", slow_second_client)
+    options = {"logged_after": _LAUNCHED_AT, "launch_rows": 5, "launch_state": launch_state}
+    if launch_state == "killed":
+        capture = _poll(**options)
+        assert capture["values"] == {_KEY: 0.5} and capture["earlier_attempt"] is True
+    else:
+        with pytest.raises(WandbNothingToScoreError):
+            _poll(**options)
+    assert len(paths) == 1
+
+
+def test_a_waiting_earlier_summary_reads_its_history_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rerun's unchanged run whose summary is the earlier attempt's is read through its retained history on the first poll only, while the read waits for the deadline."""
+    rows = (
+        {"_step": 0, "_timestamp": 990.0, "eval/step": 10, "eval/loss": 0.1},
+        {"_step": 1, "_timestamp": 995.0, "eval/step": 20, "eval/loss": 0.2},
+    )
+    summary = {"_step": 1, "_timestamp": 995.0, _KEY: 0.1}
+    scanned_at: list[float] = []
+    clock, paths = _serve(
+        monkeypatch,
+        lambda _: ("finished", summary, 1),
+        rows=rows,
+        on_scan=lambda _: scanned_at.append(clock.now),
+        line_count=lambda _: 2,
+    )
+    capture = _poll(
+        logged_after=_LAUNCHED_AT, resume_axis="eval/step", launch_rows=2, launch_state="killed"
+    )
+    assert capture["values"] == {_KEY: 0.1} and capture["earlier_attempt"] is True
+    assert len(paths) == 48
+    assert scanned_at and set(scanned_at) == {0.0}
+
+
+def test_a_launch_stamp_waits_for_a_signalled_session_to_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run still ``running`` with a short count, as a trainer ended by a signal leaves it for a few seconds, is read again until it closes, and the closed count and state are the stamp."""
+    from phasesweep.evidence.wandb import _read_wandb_stamp
+
+    clock, paths = _serve(
+        monkeypatch,
+        lambda read: ("running" if read < 2 else "killed", {}, None),
+        line_count=lambda read: 0 if read < 2 else 5,
+    )
+    stamp = _read_wandb_stamp(
+        base_url="https://example.test", entity="e", project="p", run_id="opener", deadline=28.0
+    )
+    assert stamp == {"rows": 5, "state": "killed"}
+    assert len(paths) == 3
+    assert clock.now == 4
 
 
 @pytest.mark.parametrize("created_at", ["1970-01-01T00:16:41Z", "1970-01-01T00:16:41"])
@@ -441,28 +538,26 @@ def test_a_summary_only_objective_on_a_run_created_after_the_launch_is_read(
     assert clock.now == 0
 
 
-def test_a_summary_only_objective_on_a_run_created_before_the_launch_still_waits(
+def test_a_summary_only_objective_on_a_run_created_before_the_launch_is_read_at_the_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A finished summary without a ``_timestamp`` on a run that predates the rerun may be the earlier attempt's, so the read waits and stays unanswered."""
-    from phasesweep.evidence.wandb import WandbPollTimeout
-
+    """A finished summary without a ``_timestamp`` on a run that predates the rerun may be the earlier attempt's, so the read waits to the deadline; with no row added to a run whose earlier session had closed, it is then scored as an earlier attempt's result."""
     clock, _ = _serve(
         monkeypatch,
         lambda _: ("finished", {_KEY: 0.25}, None),
         created_at="1970-01-01T00:16:39Z",
+        line_count=lambda _: 5,
     )
-    with pytest.raises(WandbPollTimeout) as caught:
-        _poll(logged_after=_LAUNCHED_AT)
-    assert not caught.value.reached
-    assert "earlier attempt's summary" in str(caught.value.last_error)
+    capture = _poll(logged_after=_LAUNCHED_AT, launch_rows=5, launch_state="killed")
+    assert capture["values"] == {_KEY: 0.25}
+    assert capture["earlier_attempt"] is True
     assert clock.now == 240
 
 
 def test_a_resumed_runs_earlier_summary_past_the_deadline_leaves_the_trial_pending(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A rerun whose run still serves the earlier attempt's summary at the deadline stays pending with what was seen, and a later read scores the rerun's summary."""
+    """A rerun whose run holds more rows than at its launch but still serves the earlier attempt's summary at the deadline stays pending with what was seen, and a later read scores the rerun's summary."""
     served = {
         "left": ({"_step": 5, _KEY: 0.5, "_timestamp": _LAUNCHED_AT - 60}, 5),
         "logged": ({"_step": 11, _KEY: 0.1, "_timestamp": _LAUNCHED_AT + 30}, 11),
@@ -473,14 +568,14 @@ def test_a_resumed_runs_earlier_summary_past_the_deadline_leaves_the_trial_pendi
         summary, last_step = served[phase[0]]
         return "finished", summary, last_step
 
-    _serve(monkeypatch, answer)
+    _serve(monkeypatch, answer, line_count=lambda _: 12)
     monkeypatch.setattr("phasesweep.evidence.wandb.run_worker", _in_process_worker(tmp_path))
     extractor = WandbExtractor(
         type="wandb", entity="e", project="p", metric_key=_KEY, poll_seconds=5, timeout_seconds=60
     )
 
     def read() -> float:
-        baseline = EvidenceBaseline(False, {}, _LAUNCHED_AT, extractor.destination)
+        baseline = EvidenceBaseline(False, {}, _LAUNCHED_AT, extractor.destination, 6, "killed")
         return run_extractor(replace(make_trial_context(tmp_path), baseline=baseline), extractor)
 
     with pytest.raises(EvidenceUnreadableError) as caught:
@@ -488,8 +583,8 @@ def test_a_resumed_runs_earlier_summary_past_the_deadline_leaves_the_trial_pendi
     assert type(caught.value) is EvidenceUnreadableError
     assert str(caught.value) == (
         "W&B gave no answer for https://api.wandb.ai/e/p/attempt-test before the evidence "
-        f"deadline; required summary keys: ({_KEY!r},). Last observation: The run still shows "
-        "only an earlier attempt's summary: it records no row logged since the attempt launched."
+        f"deadline; required summary keys: ({_KEY!r},). Last observation: W&B holds 6 rows "
+        "logged since the attempt launched that its summary does not show yet."
     )
     phase[0] = "logged"
     assert read() == 0.1
@@ -777,25 +872,38 @@ def test_the_missing_key_report_crosses_the_worker_with_its_wait(tmp_path, monke
     )
 
 
+@pytest.mark.parametrize("verdict", ["missing-keys", "nothing-to-score", "earlier-summary"])
 @pytest.mark.parametrize("capped", [False, True], ids=["source-timeout", "phase-deadline"])
 def test_a_deadline_verdict_cut_short_by_the_phase_is_an_interruption(
-    tmp_path, monkeypatch, capped: bool
+    tmp_path, monkeypatch, capped: bool, verdict: str
 ) -> None:
-    """A missing-key verdict reached at a phase deadline shorter than the source's timeout interrupts the trial instead of failing it."""
+    """A verdict reached at the poll's deadline (missing keys, a rerun that left nothing to score, or a rerun scored from the earlier attempt's summary) interrupts the trial instead when a phase deadline shorter than the source's timeout cut the poll short."""
     import time
 
     from phasesweep.evidence import wandb as wandb_evidence
 
     def poll(**kwargs: object) -> dict[str, object]:
-        raise wandb_evidence.WandbMissingKeysError("opener", [_KEY], [], 9.0)
+        if verdict == "missing-keys":
+            raise wandb_evidence.WandbMissingKeysError("opener", [_KEY], [], 9.0)
+        if verdict == "nothing-to-score":
+            raise wandb_evidence.WandbNothingToScoreError("opener", "shows no row")
+        return {"values": {_KEY: 0.5}, "present_keys": [], "earlier_attempt": True}
 
     monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", poll)
     extractor = WandbExtractor(type="wandb", entity="e", project="p", metric_key=_KEY)
     deadline = time.monotonic() + 10 if capped else None
+    context = make_trial_context(tmp_path)
+    if verdict == "earlier-summary" and not capped:
+        assert run_extractor(context, extractor, deadline=deadline) == 0.5
+        assert context.earlier_files == ["wandb:attempt-test"]
+        assert "earlier_attempt" not in context.wandb_capture
+        return
     with pytest.raises(ExtractorError) as caught:
-        run_extractor(make_trial_context(tmp_path), extractor, deadline=deadline)
-    assert type(caught.value) is (DeadlineExceededError if capped else ExtractorError)
-    assert re.search(r"after 9 s", str(caught.value))
+        run_extractor(context, extractor, deadline=deadline)
+    unscored = NothingToScoreError if verdict == "nothing-to-score" else ExtractorError
+    assert type(caught.value) is (DeadlineExceededError if capped else unscored)
+    if verdict == "missing-keys":
+        assert re.search(r"after 9 s", str(caught.value))
 
 
 def test_a_missing_run_names_the_project_the_attempt_logged_to(

@@ -46,6 +46,7 @@ from phasesweep.evidence.models import (
 from phasesweep.evidence.wandb import (
     WANDB_SDK_MISSING,
     WandbMissingKeysError,
+    WandbNothingToScoreError,
     WandbPollTimeout,
     WandbRunMissingError,
     WandbRunSupersededError,
@@ -487,7 +488,9 @@ class NothingToScoreError(ExtractorError):
     """Raised when an attempt in a directory an earlier attempt used left nothing to score there.
 
     The trainer exited 0, but the value file is missing, or an earlier attempt of the trial
-    wrote it and it does not parse, or the attempt's own captured stream has no match. Such
+    wrote it and it does not parse, or the attempt's own captured stream has no match, or the
+    trial's resumed W&B run shows at the deadline no row since the launch and no finished
+    summary that is the trial's result. Such
     an attempt can never succeed in that directory, which says nothing about the
     configuration, so it is owed a rerun in a fresh directory instead of failing.
     """
@@ -632,7 +635,8 @@ class TrialContext:
     mlflow_capture: JsonObject = field(default_factory=dict, compare=False)
     # Value paths and file stamps recorded before the attempt ran.
     baseline: EvidenceBaseline | None = field(default=None, compare=False)
-    # Configured value paths read so far from a file an earlier attempt of the trial wrote.
+    # Configured value paths read so far from a file an earlier attempt of the trial wrote, and
+    # ``wandb:<run id>`` once the W&B capture is a summary an earlier attempt left.
     earlier_files: list[str] = field(default_factory=list, compare=False)
     # End of the attributable period for mutable evidence in a directory another attempt reused.
     evidence_before: float | str | None = None
@@ -1015,7 +1019,11 @@ def _capture_wandb(
         earlier attempt's summary.
     :raises ExtractorError: The run is missing, ended unsuccessfully or never finished, was
         reused by a later attempt, the finished summary lacks required keys, or evidence is
-        invalid.
+        invalid; a :class:`NothingToScoreError` when at the deadline a rerun's resumed run
+        shows no row since its launch and no finished summary that is the trial's result. A
+        summary judged the trial's result that way is captured and lists the run in
+        ``ctx.earlier_files``; either verdict is a :class:`DeadlineExceededError` when the
+        execution deadline cut the poll short.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     :return dict: Finished run identity, numeric values, present keys, and retrieval time.
     """
@@ -1078,9 +1086,18 @@ def _capture_wandb(
                 logged_before=evidence_before,
                 earlier_launches=tuple(earlier_launches),
                 resume_axis=resume_axis,
+                launch_rows=None if ctx.baseline is None else ctx.baseline.wandb_rows,
+                launch_state=None if ctx.baseline is None else ctx.baseline.wandb_state,
                 environment=ctx.wandb_environment,
                 deadline=poll_deadline,
             )
+            # A rerun's run judged at the deadline, so an execution deadline that was the
+            # binding limit cut the wait short instead.
+            if capped and capture.get("earlier_attempt") is True:
+                raise DeadlineExceededError(
+                    f"W&B run {target} still showed only an earlier attempt's summary when the "
+                    "phase or run deadline ended its evidence read."
+                )
         except (WandbPollTimeout, WandbRunMissingError) as exc:
             unanswered = isinstance(exc, WandbPollTimeout) and not exc.reached
             # The worker stops polling a reserve before its deadline so that its report arrives
@@ -1125,6 +1142,10 @@ def _capture_wandb(
             ) from exc
         # A verdict reached only at the deadline, so an execution deadline that was the binding
         # limit cut the wait short instead.
+        except WandbNothingToScoreError as exc:
+            raise (DeadlineExceededError if capped else NothingToScoreError)(
+                f"W&B run {target} {exc.cause}."
+            ) from exc
         except WandbMissingKeysError as exc:
             raise (DeadlineExceededError if capped else ExtractorError)(
                 f"W&B run {target} finished without required summary key(s) {exc.missing!r} "
@@ -1143,6 +1164,10 @@ def _capture_wandb(
     except ExtractorError as exc:
         ctx.wandb_capture_failure.append(exc)
         raise
+    # The worker's mark that the summary is an earlier attempt's discloses the trial's result
+    # the way an earlier attempt's value file does, and is not part of the stored capture.
+    if capture.pop("earlier_attempt", None) is True:
+        ctx.earlier_files.append(f"wandb:{run_id}")
     ctx.wandb_capture.update(
         {
             "kind": "wandb",
@@ -1719,6 +1744,7 @@ def _wandb_summary_required(
             False,
             str(exc),
             evidence_unreadable=isinstance(exc, EvidenceUnreadableError),
+            nothing_to_score=isinstance(exc, NothingToScoreError),
         )
     missing = sorted(set(gate.keys) - set(capture["present_keys"]))
     return GateResult(

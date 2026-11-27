@@ -14,7 +14,7 @@ Use `golden_publication` from [`ledger_fixtures.py`](../../ledger_fixtures.py) f
 
 | Fixture | Backend | Modes | Binding schema | tree verdict | ledger-only verdict |
 | --- | --- | --- | --- | --- | --- |
-| `current-journal` | journal | tree, ledger-only | 34 | ok | ok |
+| `current-journal` | journal | tree, ledger-only | 35 | ok | ok |
 
 `tree` reads the fixture's own artifact root, so the artifact-root binding is validated first. `ledger-only` points the same ledger at a workdir that has never existed, testing the ledger format scan without a binding. The table reports direct-reader format verdicts; CLI `status`, `status --trials` and `show-winners` instead refuse the missing study directory, which the read-path matrix classifies as `study-absent`.
 

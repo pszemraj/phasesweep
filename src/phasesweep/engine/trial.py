@@ -959,6 +959,25 @@ def launch_trial(
         gpu_lease_fds=gpu_lease_fds,
     )
     _record_trainer_environment(experiment, environment_identity, env, attempt_dir)
+    wandb_stamp: tuple[int | None, str | None] = (None, None)
+    if wandb_query is not None and wandb_destination is not None and opener_attempt != attempt_id:
+        from phasesweep.evidence import wandb as wandb_evidence
+        from phasesweep.tracking.session import tracking_operation
+
+        # A registered reader slot, never the attempt's own: the guardian records a worker
+        # that exits by itself as a trainer exit, which recovery would accept as training.
+        with tracking_operation(experiment, generation_id) as (reader_id, reader_dir):
+            wandb_stamp = wandb_evidence.read_wandb_stamp(
+                base_url=wandb_destination.base_url,
+                entity=wandb_destination.entity,
+                project=wandb_destination.project,
+                run_id=opener_attempt,
+                attempt_id=reader_id,
+                attempt_dir=reader_dir,
+                timeout_seconds=wandb_query.source.timeout_seconds,
+                environment=env,
+                deadline=wallclock_deadline,
+            )
     # Before the trainer starts: what an earlier attempt left in this directory is refused.
     baseline = write_evidence_baseline(
         experiment,
@@ -967,6 +986,7 @@ def launch_trial(
         attempt_dir,
         reused=opener_attempt != attempt_id,
         wandb_destination=wandb_destination,
+        wandb_stamp=wandb_stamp,
     )
 
     log.info("[%s/trial_%d] %s", phase_name, trial_id, cmd)

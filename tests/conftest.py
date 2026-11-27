@@ -1235,6 +1235,22 @@ def make_trial_context(
     )
 
 
+@pytest.fixture(autouse=True)
+def unread_wandb_launch_stamp(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    """Record no W&B row count or state at a rerun's launch, so no launch reads a real service.
+
+    A test opts into the real launch read by requesting ``wandb_worker_sdk``, whose fake SDK
+    answers it, in this process and in any runner it starts. Live-marked tests opt out too.
+    """
+    if "wandb_worker_sdk" in request.fixturenames or request.node.get_closest_marker("live"):
+        return
+    monkeypatch.setattr(
+        "phasesweep.evidence.wandb.read_wandb_stamp", lambda **_: (None, None), raising=True
+    )
+
+
 @pytest.fixture
 def wandb_worker_sdk(tmp_path, monkeypatch):
     """Supply controlled API responses to the real supervised evidence worker."""
