@@ -43,11 +43,7 @@ from phasesweep.engine.state import (
     constraint_attr,
     observed_attr,
 )
-from phasesweep.evidence.baseline import (
-    EVIDENCE_BASELINE_FILE,
-    read_evidence_baseline,
-    write_evidence_baseline,
-)
+from phasesweep.evidence.baseline import write_evidence_baseline
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
     EvidenceUnreadableError,
@@ -892,21 +888,14 @@ def launch_trial(
     phase = experiment.phase(phase_name)
     wandb_query = _wandb_query(experiment, phase.gates)
     wandb_destination = None
-    # Every attempt of the trial logs to one run, named by the attempt that opened its
-    # directory, so W&B keeps the history steps and summary aggregates of the whole trial.
-    # Without a W&B query, the trainer keeps its own WANDB_RUN_ID.
+    # Every attempt logs to a new run of its own, a rerun from its trial's checkpoint
+    # included; the reader assembles a rerun's result from its trial's runs. Without a W&B
+    # query, the trainer keeps its own WANDB_RUN_ID.
     if wandb_query is not None:
         wandb_destination = wandb_query.source.destination
-        for _, prior_id in earlier_attempts:
-            prior = attempt_dir.with_name(prior_id)
-            if (prior / EVIDENCE_BASELINE_FILE).is_file():
-                recorded = read_evidence_baseline(prior).wandb_destination
-                if recorded is not None:
-                    wandb_destination = recorded
-                    break
         env.update(wandb_destination.environment())
-        env["WANDB_RUN_ID"] = opener_attempt
-        env["WANDB_RESUME"] = "never" if opener_attempt == attempt_id else "allow"
+        env["WANDB_RUN_ID"] = attempt_id
+        env["WANDB_RESUME"] = "never"
     if experiment.mlflow is not None:
         from phasesweep.runtime.json import json_text
         from phasesweep.tracking.session import (
@@ -959,25 +948,6 @@ def launch_trial(
         gpu_lease_fds=gpu_lease_fds,
     )
     _record_trainer_environment(experiment, environment_identity, env, attempt_dir)
-    wandb_stamp: tuple[int | None, str | None] = (None, None)
-    if wandb_query is not None and wandb_destination is not None and opener_attempt != attempt_id:
-        from phasesweep.evidence import wandb as wandb_evidence
-        from phasesweep.tracking.session import tracking_operation
-
-        # A registered reader slot, never the attempt's own: the guardian records a worker
-        # that exits by itself as a trainer exit, which recovery would accept as training.
-        with tracking_operation(experiment, generation_id) as (reader_id, reader_dir):
-            wandb_stamp = wandb_evidence.read_wandb_stamp(
-                base_url=wandb_destination.base_url,
-                entity=wandb_destination.entity,
-                project=wandb_destination.project,
-                run_id=opener_attempt,
-                attempt_id=reader_id,
-                attempt_dir=reader_dir,
-                timeout_seconds=wandb_query.source.timeout_seconds,
-                environment=env,
-                deadline=wallclock_deadline,
-            )
     # Before the trainer starts: what an earlier attempt left in this directory is refused.
     baseline = write_evidence_baseline(
         experiment,
@@ -986,7 +956,6 @@ def launch_trial(
         attempt_dir,
         reused=opener_attempt != attempt_id,
         wandb_destination=wandb_destination,
-        wandb_stamp=wandb_stamp,
     )
 
     log.info("[%s/trial_%d] %s", phase_name, trial_id, cmd)
@@ -1021,7 +990,6 @@ def launch_trial(
         return_code=proc_result.return_code,
         duration_seconds=proc_result.duration_seconds,
         wandb_environment=env if wandb_query is not None else None,
-        wandb_run_id=opener_attempt,
         wandb_query=wandb_query,
         mlflow_settings=None if experiment.mlflow is None else experiment.mlflow.target(),
         mlflow_query=compile_mlflow_query(experiment, phase.gates),

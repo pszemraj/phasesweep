@@ -10,7 +10,7 @@ import shlex
 import sys
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -138,7 +138,6 @@ def mlflow_trial_context(tmp_path: Path) -> TrialContext:
         run_name="test",
         return_code=0,
         duration_seconds=1,
-        wandb_run_id="b" * 32,
         mlflow_settings=experiment.mlflow.model_dump(),
         mlflow_query=compile_query(experiment, []),
     )
@@ -511,6 +510,70 @@ def killed_sweep(
     state = TrialState.RUNNING if in_flight else TrialState.COMPLETE
     assert [trial.state for trial in trials] == [state] * n_jobs
     return experiment, uploads, [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials]
+
+
+def wandb_run(
+    state: str,
+    summary: dict[str, object],
+    rows: tuple[Mapping[str, object], ...] = (),
+    on_read: Callable[[list[str]], None] | None = None,
+) -> object:
+    """Build a public-API run that serves its summary, history index, row count and history.
+
+    :param str state: The run's state.
+    :param dict[str, object] summary: Its summary.
+    :param tuple[Mapping[str, object], ...] rows: Its history rows, each with an int ``_step``.
+    :param Callable[[list[str]], None] | None on_read: Called with the keys of each history
+        read, which it may fail.
+    :return object: The run.
+    """
+
+    def read(*, keys: list[str], **_: object) -> list[Mapping[str, object]]:
+        if on_read is not None:
+            on_read(keys)
+        return [row for row in rows if all(key in row for key in keys)]
+
+    last = max((row["_step"] for row in rows if isinstance(row["_step"], int)), default=None)
+    return SimpleNamespace(
+        state=state,
+        summary_metrics=summary,
+        history_keys=None if last is None else {"lastStep": last, "keys": {"_step": {}}},
+        historyLineCount=len(rows),
+        history=read,
+        scan_history=read,
+    )
+
+
+def serve_wandb_runs(
+    monkeypatch: pytest.MonkeyPatch, runs: Mapping[str, object]
+) -> tuple[ManualClock, list[str]]:
+    """Answer each lookup of ``<entity>/<project>/<id>`` with ``runs[id]`` on a manual clock.
+
+    An ID not in ``runs`` gets W&B's missing-run answer.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
+    :param Mapping[str, object] runs: The runs W&B holds, by run ID.
+    :return tuple[ManualClock, list[str]]: The clock and the paths looked up.
+    """
+    public = pytest.importorskip("wandb.apis.public")
+    clock = ManualClock()
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.sleep", clock.sleep)
+    paths: list[str] = []
+
+    class Api:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def run(self, path: str) -> object:
+            paths.append(path)
+            run_id = path.rsplit("/", 1)[-1]
+            if run_id not in runs:
+                raise ValueError(f"Could not find run {path}")
+            return runs[run_id]
+
+    monkeypatch.setattr(public, "Api", Api)
+    return clock, paths
 
 
 def attach_wandb_transport(api: object, transport: object) -> None:

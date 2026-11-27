@@ -7,7 +7,7 @@ current W&B credentials may write to::
         pytest -m live tests/test_wandb_live.py
 
 ``PHASESWEEP_WANDB_BASE_URL`` selects another W&B server. The sweep test makes four
-sequential CPU trainer runs, each a few seconds, and waits about a minute per run for W&B to serve the finished run's summary. The resume test interrupts one trial after its first attempt's rows reach W&B and resumes it in a second run, a few minutes in all.
+sequential CPU trainer runs, each a few seconds, and waits about a minute per run for W&B to serve the finished run's summary. The rerun test interrupts one trial after its first attempt's rows reach W&B and reruns it from its checkpoint in a second run, a few minutes in all.
 """
 
 from __future__ import annotations
@@ -29,16 +29,15 @@ from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.read import read_result
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    EARLIER_ATTEMPT_RESULT_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     RERUN_OF_ATTR,
     TRIAL_DIR_ATTR,
-    _trial_attempt_dir,
 )
-from phasesweep.evidence.baseline import read_evidence_baseline
 from phasesweep.evidence.models import WandbExtractor
 from tests.conftest import phase_trials, write_experiment_config
 from tests.recovery_helpers import runner_once
-from tests.wandb_live_trainer import CURVE_STEPS, curve_loss
+from tests.wandb_live_trainer import CURVE_STEPS, INTERRUPT_STEP, curve_loss
 
 pytestmark = pytest.mark.live
 
@@ -138,7 +137,6 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
             provenance = json.loads(trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR])
             capture = provenance["remote_capture"]
             assert capture["run_id"] == trial.user_attrs[ATTEMPT_ID_ATTR]
-            assert capture["run_state"] == "finished"
             assert capture["values"]["eval/loss.min"] == trial.value
             # Loss falls monotonically, so the min is the last evaluation.
             assert provenance["source"]["evaluation"] == {
@@ -184,12 +182,14 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
         assert [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials] == attempts[phase.name]
 
 
-def test_a_resumed_trial_logs_every_attempt_to_its_one_wandb_run(tmp_path: Path) -> None:
-    """An interrupted trial's rerun resumes the trial's W&B run, so its history and min summary span both attempts.
+def test_a_rerun_from_a_checkpoint_logs_its_own_run_and_is_scored_over_both(
+    tmp_path: Path,
+) -> None:
+    """An interrupted trial's rerun logs to a new W&B run of its own, and its native min is reduced over both attempts' runs merged by the evaluation axis.
 
     The first attempt logs steps 1 to 6 of a curve whose minimum is at step 3, waits until
     W&B serves those rows, and is killed with its runner; the next run reruns the trial,
-    whose trainer resumes from its checkpoint and logs steps 7 to 12 into the same run.
+    whose trainer continues from its checkpoint and logs steps 7 to 12 to its own run.
     """
     import wandb
 
@@ -202,7 +202,7 @@ def test_a_resumed_trial_logs_every_attempt_to_its_one_wandb_run(tmp_path: Path)
         project=project,
         metric_key="eval/loss.min",
         evaluation_axis="eval/step",
-        # A resumed run served the earlier attempt's summary for minutes after the rerun ended.
+        # W&B can serve a finished run's summary minutes after the run ends.
         timeout_seconds=600,
         poll_seconds=2,
     )
@@ -240,31 +240,38 @@ def test_a_resumed_trial_logs_every_attempt_to_its_one_wandb_run(tmp_path: Path)
 
     winner = run_experiment(experiment)["resume"]
     first, rerun = phase_trials(experiment, "resume")
-    opener = first.user_attrs[ATTEMPT_ID_ATTR]
+    opener, rerun_id = first.user_attrs[ATTEMPT_ID_ATTR], rerun.user_attrs[ATTEMPT_ID_ATTR]
     api = wandb.Api(overrides={"base_url": base_url}, timeout=60)
-    run = api.run(f"{entity}/{project}/{opener}")
-    history = list(run.scan_history(keys=["_step", "eval/step", "eval/loss"]))
-    details = (
+    runs = {attempt: api.run(f"{entity}/{project}/{attempt}") for attempt in (opener, rerun_id)}
+    histories = {
+        attempt: list(run.scan_history(keys=["_step", "eval/step", "eval/loss"]))
+        for attempt, run in runs.items()
+    }
+    details = "; ".join(
         f"W&B run {run.url}: state {run.state!r}, summary {dict(run.summary_metrics)!r}, "
-        f"history {history!r}"
+        f"history {histories[attempt]!r}"
+        for attempt, run in runs.items()
     )
     assert rerun.user_attrs[RERUN_OF_ATTR] == first.number, details
     assert winner.trial_number == rerun.number, details
-    assert run.state == "finished", details
-    with pytest.raises(wandb.errors.CommError, match="Could not find run"):
-        api.run(f"{entity}/{project}/{rerun.user_attrs[ATTEMPT_ID_ATTR]}")
-    # Every step once, and W&B's own step continuing across the resume.
-    assert [row["eval/step"] for row in history] == list(range(1, CURVE_STEPS + 1)), details
-    assert [row["_step"] for row in history] == list(range(CURVE_STEPS)), details
-    # The rerun's row is what made its read count.
-    rerun_dir = _trial_attempt_dir(rerun)
-    assert rerun_dir is not None
-    launched_at = read_evidence_baseline(rerun_dir).launched_at
-    assert launched_at is not None and run.summary_metrics["_timestamp"] > launched_at, details
+    assert runs[rerun_id].state == "finished", details
+    # Each attempt's steps in its own run, and W&B's own step restarting in the rerun's.
+    split = INTERRUPT_STEP + 1
+    assert [row["eval/step"] for row in histories[opener]] == list(range(1, split)), details
+    assert [row["eval/step"] for row in histories[rerun_id]] == list(
+        range(split, CURVE_STEPS + 1)
+    ), details
+    assert [row["_step"] for row in histories[rerun_id]] == list(
+        range(CURVE_STEPS - INTERRUPT_STEP)
+    )
+    # The rerun's own summary holds only its own minimum; the trial's comes from both runs.
+    own_min = runs[rerun_id].summary_metrics["eval/loss.min"]
+    assert own_min == pytest.approx(curve_loss(split)), details
     expected = min(curve_loss(step) for step in range(1, CURVE_STEPS + 1))
     provenance = json.loads(rerun.user_attrs[OBJECTIVE_PROVENANCE_ATTR])
     capture = provenance["remote_capture"]
-    assert capture["run_id"] == opener, details
+    assert capture["run_id"] == provenance["source"]["run_id"] == rerun_id, details
+    assert EARLIER_ATTEMPT_RESULT_ATTR not in rerun.user_attrs, details
     assert rerun.value == capture["values"]["eval/loss.min"] == expected, details
     assert provenance["source"]["evaluation"] == {
         "progress": {"axis": "eval/step", "value": CURVE_STEPS}

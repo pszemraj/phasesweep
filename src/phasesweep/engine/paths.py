@@ -79,7 +79,7 @@ def _valid_trial_dir_name(value: object, *, label: str) -> str:
 
 
 def _trial_dir_opener(trial_dir: Path) -> str:
-    """Return the attempt that opened a trial directory, which also names the trial's W&B run.
+    """Return the attempt that opened a trial directory.
 
     :param Path trial_dir: A trial directory :func:`_trial_dir_for` built.
     :raises ValueError: Its name is not one :func:`_trial_dir_name` builds.

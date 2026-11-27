@@ -1,7 +1,7 @@
 """Fit one weight to ``y = 2x``, or log a resumable curve, reporting only through W&B.
 
 Run as a trial subprocess by ``tests/test_wandb_live.py``. W&B takes the target
-project, the trial's run ID and the resume policy from the environment
+project, the attempt's run ID and the resume policy from the environment
 PhaseSweep composes, so the trainer sets none of them itself. The SDK is imported where
 it is used, so the test module can import the curve without it.
 """
@@ -70,11 +70,12 @@ def _wait_until_uploaded(run_path: str, step: int) -> None:
 
 
 def _resumable(interrupt_marker: Path) -> None:
-    """Log :func:`curve_loss` once per step, resuming from the trial directory's checkpoint.
+    """Log :func:`curve_loss` once per step, continuing from the trial directory's checkpoint.
 
     The attempt that starts from step 0 stops at :data:`INTERRUPT_STEP`, once W&B holds its
     rows: it touches ``interrupt_marker`` and sleeps until the test kills its runner and
-    the next run's recovery stops it. A rerun continues from the checkpoint.
+    the next run's recovery stops it. A rerun continues from the checkpoint, logging the
+    remaining steps to a new run of its own.
 
     :param Path interrupt_marker: File the first attempt touches when it may be killed.
     """

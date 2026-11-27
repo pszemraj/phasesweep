@@ -574,10 +574,10 @@ def test_reread_never_queries_an_unbound_wandb_run(
     assert _launches(launches) == 1
 
 
-def test_wandb_retry_keeps_the_checkpoint_runs_bound_project(
+def test_wandb_retry_logs_its_own_run_and_reads_the_checkpoint_run_where_it_was_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An attempt reusing a checkpoint continues the original W&B run after a project change."""
+    """A rerun reusing a checkpoint after a project change logs a new run of its own to the new project, and its read names the checkpoint attempt's run in the original project as the earlier run."""
     trainer = write_trainer(
         tmp_path / "trainer.py",
         """
@@ -606,10 +606,10 @@ def test_wandb_retry_keeps_the_checkpoint_runs_bound_project(
             tmp_path, trainer, metric, phases=[phase.model_copy(update={"n_trials": trials})]
         )
 
-    paths: list[tuple[str, str]] = []
+    paths: list[tuple[str, str, list[tuple[str, str]]]] = []
 
-    def summary(*, project: str, run_id: str, **_: object) -> dict[str, object]:
-        paths.append((project, run_id))
+    def summary(*, project: str, run_id: str, earlier: list[dict[str, str]], **_: object) -> dict:
+        paths.append((project, run_id, [(run["project"], run["run_id"]) for run in earlier]))
         return {
             "values": {"score": 0.25},
             "present_keys": [],
@@ -625,14 +625,14 @@ def test_wandb_retry_keeps_the_checkpoint_runs_bound_project(
     changed = config("new-project", 2)
     assert run_experiment(changed)["p"].metric == 0.25
     opener, retry = addressed_phase_study(changed).trials
-    opener_id = opener.user_attrs[ATTEMPT_ID_ATTR]
+    opener_id, retry_id = opener.user_attrs[ATTEMPT_ID_ATTR], retry.user_attrs[ATTEMPT_ID_ATTR]
     assert opener.user_attrs[TRIAL_DIR_ATTR] == retry.user_attrs[TRIAL_DIR_ATTR]
     launches = Path(retry.user_attrs[TRIAL_DIR_ATTR], "runs.jsonl").read_text().splitlines()
     assert [json.loads(line) for line in launches] == [
         ["original", opener_id, "never"],
-        ["original", opener_id, "allow"],
+        ["new-project", retry_id, "never"],
     ]
-    assert paths == [("original", opener_id)]
+    assert paths == [("new-project", retry_id, [("original", opener_id)])]
 
 
 def test_published_reread_history_belongs_to_the_selecting_study(tmp_path: Path) -> None:

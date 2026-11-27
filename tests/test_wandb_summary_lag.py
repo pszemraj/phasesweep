@@ -1,8 +1,7 @@
 """W&B serves a finished run's summary late; the reader waits for it until the deadline and never reads a half-ingested one.
 
 The sequences follow what the public API served on a live project: a run reported ``finished``
-with its whole history at once and its summary a minute later, and a resumed run that kept
-the earlier attempt's summary for minutes after the rerun finished.
+with its whole history at once and its summary a minute later.
 """
 
 from __future__ import annotations
@@ -10,7 +9,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,7 +24,6 @@ from phasesweep.engine.state import ATTEMPT_ID_ATTR
 from phasesweep.evidence.baseline import EvidenceBaseline
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
-    EvidenceUnreadableError,
     ExtractorError,
     NothingToScoreError,
     run_extractor,
@@ -36,36 +34,36 @@ from tests.conftest import make_experiment, make_trial_context, phase_trials, wr
 from tests.tracking_helpers import (
     ManualClock,
     attach_wandb_transport,
+    serve_wandb_runs,
     switchable_wandb,
     wandb_objective_experiment,
+    wandb_run,
 )
 
-_LAUNCHED_AT = 1_000.0
 _KEY = "eval/loss.min"
 
 
 def test_sibling_retry_replaces_tracker_history_before_recovery_and_reread(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An attempt uses every earlier checkpoint writer's history across reading studies."""
+    """A rerun's read names every earlier checkpoint writer's run across reading studies, and its native min merges their histories, in the live read, in recovery and in a re-read."""
     from phasesweep.evidence import evaluation, wandb
 
     launches, history = tmp_path / "launches", tmp_path / "history"
+    history.mkdir()
     trainer = write_trainer(
         tmp_path / "trainer.py",
         f"""
-        import json, os, time
+        import json, os
         from pathlib import Path
         launches, history = Path({str(launches)!r}), Path({str(history)!r})
         attempt = len(launches.read_text().splitlines()) if launches.exists() else 0
         with launches.open("a") as log:
             log.write(os.environ["WANDB_RUN_ID"] + "\\n")
-        rows = json.loads(history.read_text()) if history.exists() else []
         points = [[(100, 0.20), (300, 0.01)], [(200, 0.40)], [(400, 0.90)]][attempt]
-        for progress, loss in points:
-            rows.append({{"_step": len(rows), "_timestamp": time.time(), "eval/step": progress,
-                          "eval/loss": loss}})
-        history.write_text(json.dumps(rows))
+        rows = [{{"_step": step, "eval/step": progress, "eval/loss": loss}}
+                for step, (progress, loss) in enumerate(points)]
+        (history / (os.environ["WANDB_RUN_ID"] + ".json")).write_text(json.dumps(rows))
         raise SystemExit(1 if attempt < 2 else 0)
         """,
     )
@@ -100,26 +98,31 @@ def test_sibling_retry_replaces_tracker_history_before_recovery_and_reread(
     earlier_counts: list[int] = []
 
     def capture(**options: object) -> dict[str, object]:
-        epochs = options["earlier_launches"]
-        assert isinstance(epochs, tuple)
-        earlier_counts.append(len(epochs))
+        earlier, run_id = options["earlier"], options["run_id"]
+        assert isinstance(earlier, list) and isinstance(run_id, str)
+        earlier_counts.append(len(earlier))
         if len(earlier_counts) == 1:
-            run_id = options["run_id"]
-            assert isinstance(run_id, str)
             raise wandb.WandbPollTimeout(run_id, 2, reached=False)
-        rows = tuple(json.loads(history.read_text()))
-        last = len(rows) - 1
-        summary = {"_step": last, "_timestamp": rows[-1]["_timestamp"], _KEY: 0.01}
-        after = options["logged_after"]
-        assert isinstance(after, float)
+        runs = {}
+        for path in history.glob("*.json"):
+            rows = tuple(json.loads(path.read_text()))
+            losses = [row["eval/loss"] for row in rows]
+            summary = {"_step": len(rows) - 1, _KEY: min(losses), "eval/loss.max": max(losses)}
+            runs[path.stem] = wandb_run("finished", summary, rows)
         with monkeypatch.context() as sdk:
-            _serve(sdk, lambda _: ("finished", summary, last), rows=rows)
-            return _poll(
-                logged_after=after,
-                logged_before=options.get("logged_before"),
+            serve_wandb_runs(sdk, runs)
+            return wandb._poll_wandb_summary(
+                base_url="https://example.test",
+                entity="e",
+                project="p",
+                run_id=run_id,
+                poll_seconds=5,
+                timeout_seconds=240,
+                required_keys=options["required_keys"],
                 presence_keys=options.get("presence_keys", ()),
-                earlier_launches=epochs,
-                resume_axis="eval/step",
+                objective_key=_KEY,
+                earlier=earlier,
+                evaluation_axis="eval/step",
             )
 
     monkeypatch.setattr(evaluation, "poll_wandb_summary", capture)
@@ -130,9 +133,8 @@ def test_sibling_retry_replaces_tracker_history_before_recovery_and_reread(
         run_experiment(returned)
     assert run_experiment(returned)["p"].metric == pytest.approx(0.20)
     assert run_experiment(config(_KEY, 3, gated=True))["p"].metric == pytest.approx(0.20)
-    assert earlier_counts == [1, 1, 1]
-    assert len(launches.read_text().splitlines()) == 3
-    assert len(set(launches.read_text().splitlines())) == 1
+    assert earlier_counts == [2, 2, 2]
+    assert len(set(launches.read_text().splitlines())) == 3
 
 
 Answer = tuple[str, dict[str, object], int | None]
@@ -154,12 +156,9 @@ def _history_index(last_step: int | None) -> dict[str, object] | None:
     return {"lastStep": last_step, "keys": keys}
 
 
-def _poll(
-    *, logged_after: float | None = None, required: tuple[str, ...] = (_KEY,), **kwargs: object
-) -> dict[str, object]:
-    """Run the in-process summary poll every 5 s with a 240 s budget.
+def _poll(*, required: tuple[str, ...] = (_KEY,), **kwargs: object) -> dict[str, object]:
+    """Run the in-process summary poll of a first attempt every 5 s with a 240 s budget.
 
-    :param float | None logged_after: A rerun's launch time, defaults to None.
     :param tuple[str, ...] required: Required numeric keys, defaults to the objective.
     :param object kwargs: Further poll arguments.
     :return dict[str, object]: The capture.
@@ -170,23 +169,30 @@ def _poll(
         base_url="https://example.test",
         entity="e",
         project="p",
-        run_id="opener",
+        run_id="rerun",
         poll_seconds=5,
         timeout_seconds=240,
         required_keys=required,
-        logged_after=logged_after,
         **kwargs,
     )
 
 
+def _poll_rerun(*earlier: str, **kwargs: object) -> dict[str, object]:
+    """Poll the rerun's run ``e/p/rerun`` with its trial's earlier runs, oldest first.
+
+    :param str earlier: The earlier runs' IDs.
+    :param object kwargs: Further poll arguments.
+    :return dict[str, object]: The capture.
+    """
+    addresses = [
+        {"base_url": "https://example.test", "entity": "e", "project": "p", "run_id": run_id}
+        for run_id in earlier
+    ]
+    return _poll(objective_key=_KEY, earlier=addresses, **kwargs)
+
+
 def _serve(
-    monkeypatch: pytest.MonkeyPatch,
-    answers: Callable[[int], Answer],
-    *,
-    rows: tuple[Mapping[str, object], ...] = (),
-    on_scan: Callable[[list[str]], None] | None = None,
-    created_at: str | None = None,
-    line_count: Callable[[int], int | None] = lambda _: None,
+    monkeypatch: pytest.MonkeyPatch, answers: Callable[[int], Answer]
 ) -> tuple[ManualClock, list[str]]:
     """Answer each zero-based run lookup with ``answers(read)`` on a manual clock.
 
@@ -194,12 +200,6 @@ def _serve(
 
     :param pytest.MonkeyPatch monkeypatch: Fixture that replaces the SDK client and clock.
     :param Callable[[int], Answer] answers: State, summary and last history step per read.
-    :param tuple[Mapping[str, object], ...] rows: Rows available in sampled and unsampled
-        history, every one of them below the sample cap.
-    :param Callable[[list[str]], None] | None on_scan: Callback for each history read.
-    :param str | None created_at: The run's ISO ``created_at``, defaults to None for a run that serves none.
-    :param Callable[[int], int | None] line_count: The run's ``historyLineCount`` per read,
-        ``None`` for a run that serves none, defaults to none.
     :return tuple[ManualClock, list[str]]: The clock and the paths looked up.
     """
     public = pytest.importorskip("wandb.apis.public")
@@ -207,20 +207,6 @@ def _serve(
     monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", clock.monotonic)
     monkeypatch.setattr("phasesweep.evidence.wandb.time.sleep", clock.sleep)
     paths: list[str] = []
-
-    def scan_history(
-        *, keys: list[str], page_size: int, use_cache: bool
-    ) -> list[Mapping[str, object]]:
-        assert page_size > 0 and not use_cache
-        if on_scan is not None:
-            on_scan(keys)
-        return [row for row in rows if all(key in row for key in keys)]
-
-    def history(*, keys: list[str], samples: int, pandas: bool) -> list[Mapping[str, object]]:
-        assert samples > len(rows) and not pandas
-        if on_scan is not None:
-            on_scan(keys)
-        return [row for row in rows if all(key in row for key in keys)]
 
     class Api:
         def __init__(self, **kwargs: object) -> None:
@@ -231,15 +217,12 @@ def _serve(
             self.used = True
             paths.append(path)
             state, summary, last_step = answers(len(paths) - 1)
-            count = line_count(len(paths) - 1)
             return SimpleNamespace(
                 state=state,
                 summary_metrics=summary,
                 history_keys=_history_index(last_step),
-                history=history,
-                scan_history=scan_history,
-                **({} if created_at is None else {"created_at": created_at}),
-                **({} if count is None else {"historyLineCount": count}),
+                history=lambda **_: [],
+                scan_history=lambda **_: [],
             )
 
     monkeypatch.setattr(public, "Api", Api)
@@ -262,21 +245,6 @@ def test_a_finished_runs_summary_served_a_minute_late_is_read_once_served(
     assert _poll()["values"] == {_KEY: 0.1}
     assert len(paths) == 13
     assert clock.now == 60
-
-
-def test_reread_only_accepts_a_shared_summary_logged_during_the_attempt(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A finished run can still supply an earlier attempt's summary if it predates the cutoff.
-
-    :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
-    """
-    from phasesweep.evidence.wandb import WandbRunSupersededError
-
-    _serve(monkeypatch, lambda _: ("finished", {"_step": 3, _KEY: 0.1, "_timestamp": 50.0}, 3))
-    assert _poll(logged_before=51.0)["values"] == {_KEY: 0.1}
-    with pytest.raises(WandbRunSupersededError):
-        _poll(logged_before=50.0)
 
 
 @pytest.mark.parametrize("unindexed", [-1, None], ids=["no-keys", "null"])
@@ -381,91 +349,20 @@ def test_an_outage_after_an_incomplete_summary_proves_nothing_missing(
         assert clock.now == 240
 
 
-def test_a_resumed_runs_earlier_summary_is_waited_out_for_minutes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A resumed run that keeps the earlier attempt's finished summary and history for three minutes, then the new ones, is scored from the new summary."""
-    left = {"_step": 5, _KEY: 0.4, "_timestamp": _LAUNCHED_AT - 60}
-    logged = {"_step": 11, _KEY: 0.1, "_timestamp": _LAUNCHED_AT + 30}
-
-    def answer(read: int) -> Answer:
-        if read < 36:
-            return "finished", left, 5
-        if read < 40:
-            return "finished", left, 11
-        return "finished", logged, 11
-
-    clock, paths = _serve(monkeypatch, answer)
-    assert _poll(logged_after=_LAUNCHED_AT)["values"] == {_KEY: 0.1}
-    assert paths == ["e/p/opener"] * 41
-    assert clock.now == 200
-
-
-def test_a_reruns_read_waits_out_the_state_its_earlier_attempt_left(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A run still crashed, then finished, as the earlier attempt left it is neither failed nor scored; the rerun's own finished summary is."""
-    left = {"_step": 5, _KEY: 0.5, "_timestamp": _LAUNCHED_AT - 60}
-    logged = {"_step": 11, _KEY: 0.25, "_timestamp": _LAUNCHED_AT + 5}
-    answers: list[Answer] = [("crashed", left, 5), ("finished", left, 5), ("finished", logged, 11)]
-    clock, _ = _serve(monkeypatch, lambda read: answers[min(read, 2)])
-    assert _poll(logged_after=_LAUNCHED_AT)["values"] == {_KEY: 0.25}
-    assert clock.now == 10
-
-
-@pytest.mark.parametrize(
-    ("launch", "state", "last_step", "cause"),
-    [
-        ((None, None), "finished", 5, "no row count was recorded at the launch"),
-        ((5, "running"), "finished", 5, "its earlier session was 'running' at the launch"),
-        ((5, "killed"), "crashed", 5, "it is 'crashed', not finished"),
-        ((5, "killed"), "finished", 4, "its finished summary does not match its history"),
-    ],
-    ids=["no-launch-count", "session-open-at-launch", "not-finished", "unmatched-index"],
-)
-def test_a_reruns_run_that_never_moves_leaves_nothing_to_score_at_the_deadline(
-    monkeypatch: pytest.MonkeyPatch,
-    launch: tuple[int | None, str | None],
-    state: str,
-    last_step: int,
-    cause: str,
-) -> None:
-    """A run whose summary never passes the rerun's launch and whose row count did not grow is waited out to the deadline; then, unless its earlier session had closed and it is finished with a summary matching its history index, the attempt left nothing to score, saying which.
-
-    :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
-    :param tuple[int | None, str | None] launch: Row count and state recorded at the launch.
-    :param str state: The run's state at every poll.
-    :param int last_step: The history index's last step.
-    :param str cause: What the verdict names.
-    """
-    from phasesweep.evidence.wandb import WandbNothingToScoreError
-
-    left = {"_step": 5, _KEY: 0.5, "_timestamp": _LAUNCHED_AT - 60}
-    clock, _ = _serve(
-        monkeypatch, lambda _: (state, left, last_step), rows=_history(5), line_count=lambda _: 5
-    )
-    with pytest.raises(WandbNothingToScoreError) as caught:
-        _poll(logged_after=_LAUNCHED_AT, launch_rows=launch[0], launch_state=launch[1])
-    assert caught.value.cause.startswith(
-        f"shows no row logged since the attempt launched, and {cause}"
-    )
-    assert clock.now == 240
-
-
-@pytest.mark.parametrize("launch_state", ["killed", "running"], ids=["earlier", "nothing"])
+@pytest.mark.parametrize("state", ["killed", "running"], ids=["closed", "open"])
 def test_a_reruns_verdict_stands_when_no_lookup_completes_near_the_deadline(
-    monkeypatch: pytest.MonkeyPatch, launch_state: str
+    monkeypatch: pytest.MonkeyPatch, state: str
 ) -> None:
-    """The latest answered lookup decides a rerun's verdict at the deadline even when it came long before it, because the next client took past the deadline to build: the earlier attempt's summary is captured, or the attempt left nothing to score.
+    """The latest answered poll decides a rerun's verdict at the deadline even when it came long before it, because the next client took past the deadline to build: the earlier run's summary is captured, or the attempt left nothing to score.
 
     :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
-    :param str launch_state: The run's state at the launch, closed or not.
+    :param str state: The earlier run's state, closed or not.
     """
     from phasesweep.evidence.wandb import WandbNothingToScoreError
 
     public = pytest.importorskip("wandb.apis.public")
-    left = {"_step": 5, _KEY: 0.5, "_timestamp": _LAUNCHED_AT - 60}
-    clock, paths = _serve(monkeypatch, lambda _: ("finished", left, 5), line_count=lambda _: 5)
+    opener = wandb_run(state, {"_step": 0, _KEY: 0.5}, ({"_step": 0, "eval/loss": 0.5},))
+    clock, paths = serve_wandb_runs(monkeypatch, {"opener": opener})
     served = public.Api
     built: list[object] = []
 
@@ -477,238 +374,100 @@ def test_a_reruns_verdict_stands_when_no_lookup_completes_near_the_deadline(
         return client
 
     monkeypatch.setattr(public, "Api", slow_second_client)
-    options = {"logged_after": _LAUNCHED_AT, "launch_rows": 5, "launch_state": launch_state}
-    if launch_state == "killed":
-        capture = _poll(**options)
-        assert capture["values"] == {_KEY: 0.5} and capture["earlier_attempt"] is True
+    if state == "killed":
+        capture = _poll_rerun("opener")
+        assert capture["values"] == {_KEY: 0.5} and capture["earlier_attempt"] == "opener"
     else:
         with pytest.raises(WandbNothingToScoreError):
-            _poll(**options)
-    assert len(paths) == 1
+            _poll_rerun("opener")
+    assert paths == ["e/p/rerun", "e/p/opener"]
 
 
-def test_a_waiting_earlier_summary_reads_its_history_once(
+def test_a_waiting_verdict_reads_the_earlier_histories_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A rerun's unchanged run whose summary is the earlier attempt's is read through its retained history on the first poll only, while the read waits for the deadline."""
-    rows = (
-        {"_step": 0, "_timestamp": 990.0, "eval/step": 10, "eval/loss": 0.1},
-        {"_step": 1, "_timestamp": 995.0, "eval/step": 20, "eval/loss": 0.2},
-    )
-    summary = {"_step": 1, "_timestamp": 995.0, _KEY: 0.1}
+    """A rerun that logged nothing is scored from its trial's newest earlier run merged with the one before it, whose histories are read on the first poll only while the read waits for the deadline."""
     scanned_at: list[float] = []
-    clock, paths = _serve(
-        monkeypatch,
-        lambda _: ("finished", summary, 1),
-        rows=rows,
-        on_scan=lambda _: scanned_at.append(clock.now),
-        line_count=lambda _: 2,
-    )
-    capture = _poll(
-        logged_after=_LAUNCHED_AT, resume_axis="eval/step", launch_rows=2, launch_state="killed"
-    )
-    assert capture["values"] == {_KEY: 0.1} and capture["earlier_attempt"] is True
-    assert len(paths) == 48
+
+    def record(_keys: list[str]) -> None:
+        scanned_at.append(clock.now)
+
+    runs = {
+        "opener": wandb_run(
+            "crashed",
+            {"_step": 1, _KEY: 0.05},
+            (
+                {"_step": 0, "eval/step": 10, "eval/loss": 0.3},
+                {"_step": 1, "eval/step": 20, "eval/loss": 0.05},
+            ),
+            record,
+        ),
+        "second": wandb_run(
+            "killed",
+            {"_step": 0, _KEY: 0.2},
+            ({"_step": 0, "eval/step": 15, "eval/loss": 0.2},),
+            record,
+        ),
+    }
+    clock, paths = serve_wandb_runs(monkeypatch, runs)
+    capture = _poll_rerun("opener", "second", evaluation_axis="eval/step")
+    assert capture["values"] == {_KEY: 0.2} and capture["earlier_attempt"] == "second"
+    assert len(paths) == 48 * 3
     assert scanned_at and set(scanned_at) == {0.0}
 
 
-def _history(before: int, after: int = 0) -> tuple[dict[str, object], ...]:
-    """Build a run's served history: rows logged before the rerun's launch, then after it.
-
-    :param int before: Rows stamped before the launch.
-    :param int after: Rows stamped after the launch, defaults to 0.
-    :return tuple[dict[str, object], ...]: The rows, each with ``_step`` and ``_timestamp``.
-    """
-    stamps = [_LAUNCHED_AT - 60 + row for row in range(before)]
-    stamps += [_LAUNCHED_AT + 20 + row for row in range(after)]
-    return tuple({"_step": step, "_timestamp": stamp} for step, stamp in enumerate(stamps))
-
-
-def test_a_recorded_launch_count_decides_without_reading_history(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """With a row count recorded at the launch, an unchanged count proves the rerun appended nothing, so the earlier attempt's summary is scored at the deadline without any history read."""
-    left = {"_step": 4, _KEY: 0.12, "_timestamp": _LAUNCHED_AT - 56}
-    reads: list[list[str]] = []
-    _serve(
-        monkeypatch,
-        lambda _: ("finished", left, 4),
-        rows=_history(5),
-        on_scan=reads.append,
-        line_count=lambda _: 5,
-    )
-    capture = _poll(logged_after=_LAUNCHED_AT, launch_rows=5, launch_state="killed")
-    assert capture["values"] == {_KEY: 0.12} and capture["earlier_attempt"] is True
-    assert reads == []
-
-
-@pytest.mark.parametrize(
-    ("served", "cause"),
-    [
-        (_history(5), "W&B counts 8 rows but its history serves 5 so far"),
-        (_history(5, 3), "W&B history holds a row logged since the attempt launched"),
-        (_history(8), None),
-    ],
-    ids=["history-behind-count", "rows-since-launch", "complete-and-silent"],
-)
-def test_a_rerun_without_a_launch_count_is_judged_by_its_served_history(
-    monkeypatch: pytest.MonkeyPatch, served: tuple[dict[str, object], ...], cause: str | None
-) -> None:
-    """A rerun whose launch recorded no row count, on a run W&B counts 8 rows for while the summary is the earlier attempt's, stays pending while the served history has fewer rows than the count or holds a row stamped since the launch; only a history serving all 8 rows, none since the launch, leaves nothing to score.
-
-    :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
-    :param tuple[dict[str, object], ...] served: The history rows W&B serves.
-    :param str | None cause: The pending message's start, ``None`` for the verdict.
-    """
-    from phasesweep.evidence.wandb import WandbNothingToScoreError, WandbPollTimeout
-
-    left = {"_step": 4, _KEY: 0.12, "_timestamp": _LAUNCHED_AT - 56}
-    _serve(monkeypatch, lambda _: ("finished", left, 4), rows=served, line_count=lambda _: 8)
-    if cause is None:
-        with pytest.raises(WandbNothingToScoreError) as verdict:
-            _poll(logged_after=_LAUNCHED_AT)
-        assert verdict.value.cause == (
-            "shows no row logged since the attempt launched, and no row count was recorded at "
-            "the launch, and its history serves all 8 rows, none since then"
-        )
-        return
-    with pytest.raises(WandbPollTimeout) as caught:
-        _poll(logged_after=_LAUNCHED_AT)
-    assert not caught.value.reached
-    assert str(caught.value.last_error).startswith(cause)
-
-
-def test_an_unreadable_history_keeps_a_reruns_verdict_pending_until_it_is_read(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When a rerun's launch recorded no row count and the history read that stands in for it fails at every poll, the read stays pending, saying so; once a later read gets a complete history with no row since the launch, the attempt leaves nothing to score, its history read once."""
-    from phasesweep.evidence.wandb import WandbNothingToScoreError, WandbPollTimeout
-
-    left = {"_step": 4, _KEY: 0.12, "_timestamp": _LAUNCHED_AT - 56}
-    reads: list[float] = []
-    outage = [True]
-
-    def read_history(_keys: list[str]) -> None:
-        reads.append(clock.now)
-        if outage[0]:
-            raise ConnectionError("history offline")
-
-    clock, _ = _serve(
-        monkeypatch,
-        lambda _: ("finished", left, 4),
-        rows=_history(5),
-        on_scan=read_history,
-        line_count=lambda _: 5,
-    )
-    with pytest.raises(WandbPollTimeout) as caught:
-        _poll(logged_after=_LAUNCHED_AT)
-    assert not caught.value.reached
-    assert str(caught.value.last_error) == (
-        "W&B history could not be read to tell whether the attempt logged since its launch: "
-        "ConnectionError."
-    )
-    outage[0], reads[:], clock.now = False, [], 0.0
-    with pytest.raises(WandbNothingToScoreError):
-        _poll(logged_after=_LAUNCHED_AT)
-    assert reads == [0.0]
-
-
-def test_a_launch_stamp_waits_for_a_signalled_session_to_close(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A run still ``running`` with a short count, as a trainer ended by a signal leaves it for a few seconds, is read again until it closes, and the closed count and state are the stamp."""
-    from phasesweep.evidence.wandb import _read_wandb_stamp
-
-    clock, paths = _serve(
-        monkeypatch,
-        lambda read: ("running" if read < 2 else "killed", {}, None),
-        line_count=lambda read: 0 if read < 2 else 5,
-    )
-    stamp = _read_wandb_stamp(
-        base_url="https://example.test", entity="e", project="p", run_id="opener", deadline=28.0
-    )
-    assert stamp == {"rows": 5, "state": "killed"}
-    assert len(paths) == 3
-    assert clock.now == 4
-
-
-@pytest.mark.parametrize("created_at", ["1970-01-01T00:16:41Z", "1970-01-01T00:16:41"])
-def test_a_summary_only_objective_on_a_run_created_after_the_launch_is_read(
-    monkeypatch: pytest.MonkeyPatch, created_at: str
-) -> None:
-    """A finished run created after the rerun launched, whose summary was set directly and has no ``_timestamp``, is read at once.
-
-    :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
-    :param str created_at: The run's creation time as W&B serves it, with and without an offset.
-    """
-    clock, paths = _serve(
-        monkeypatch, lambda _: ("finished", {_KEY: 0.25}, None), created_at=created_at
-    )
-    assert _poll(logged_after=_LAUNCHED_AT)["values"] == {_KEY: 0.25}
-    assert len(paths) == 1
-    assert clock.now == 0
-
-
-def test_a_summary_only_objective_on_a_run_created_before_the_launch_is_read_at_the_deadline(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A finished summary without a ``_timestamp`` on a run that predates the rerun may be the earlier attempt's, so the read waits to the deadline; with no row added to a run whose earlier session had closed, it is then scored as an earlier attempt's result."""
-    clock, _ = _serve(
-        monkeypatch,
-        lambda _: ("finished", {_KEY: 0.25}, None),
-        created_at="1970-01-01T00:16:39Z",
-        line_count=lambda _: 5,
-    )
-    capture = _poll(logged_after=_LAUNCHED_AT, launch_rows=5, launch_state="killed")
-    assert capture["values"] == {_KEY: 0.25}
-    assert capture["earlier_attempt"] is True
-    assert clock.now == 240
-
-
-def test_a_resumed_runs_earlier_summary_past_the_deadline_leaves_the_trial_pending(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A rerun whose run holds more rows than at its launch but still serves the earlier attempt's summary at the deadline stays pending with what was seen, and a later read scores the rerun's summary."""
-    served = {
-        "left": ({"_step": 5, _KEY: 0.5, "_timestamp": _LAUNCHED_AT - 60}, 5),
-        "logged": ({"_step": 11, _KEY: 0.1, "_timestamp": _LAUNCHED_AT + 30}, 11),
-    }
-    phase = ["left"]
-
-    def answer(_read: int) -> Answer:
-        summary, last_step = served[phase[0]]
-        return "finished", summary, last_step
-
-    _serve(monkeypatch, answer, line_count=lambda _: 12)
-    monkeypatch.setattr("phasesweep.evidence.wandb.run_worker", _in_process_worker(tmp_path))
-    extractor = WandbExtractor(
-        type="wandb", entity="e", project="p", metric_key=_KEY, poll_seconds=5, timeout_seconds=60
-    )
-
-    def read() -> float:
-        baseline = EvidenceBaseline(False, {}, _LAUNCHED_AT, extractor.destination, 6, "killed")
-        return run_extractor(replace(make_trial_context(tmp_path), baseline=baseline), extractor)
-
-    with pytest.raises(EvidenceUnreadableError) as caught:
-        read()
-    assert type(caught.value) is EvidenceUnreadableError
-    assert str(caught.value) == (
-        "W&B gave no answer for https://api.wandb.ai/e/p/attempt-test before the evidence "
-        f"deadline; required summary keys: ({_KEY!r},). Last observation: W&B holds 6 rows "
-        "logged since the attempt launched that its summary does not show yet."
-    )
-    phase[0] = "logged"
-    assert read() == 0.1
-
-
 def test_a_reruns_own_crash_fails_the_read(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A run that crashed after the rerun logged to it is the rerun's own failure."""
+    """A rerun's own run that crashed is its own failure, whatever its trial's earlier runs hold."""
     from phasesweep.evidence.wandb import WandbRunTerminalError
 
-    logged = {"_step": 11, _KEY: 0.25, "_timestamp": _LAUNCHED_AT + 5}
-    _serve(monkeypatch, lambda read: ("crashed", logged, 11))
+    runs = {
+        "opener": wandb_run("finished", {"_step": 0, _KEY: 0.5}, ({"_step": 0},)),
+        "rerun": wandb_run("crashed", {"_step": 0, _KEY: 0.25}, ({"_step": 0},)),
+    }
+    serve_wandb_runs(monkeypatch, runs)
     with pytest.raises(WandbRunTerminalError):
-        _poll(logged_after=_LAUNCHED_AT)
+        _poll_rerun("opener")
+
+
+def _extrema_runs(mode: str, on_read: Callable[[list[str]], None]) -> dict[str, object]:
+    """Build an opener, a second attempt and a rerun from their checkpoints, logging ``eval/loss``.
+
+    The second attempt resumed at eval step 30 and the rerun at 50, so merged by the axis the
+    trial keeps the opener's 0.4 and 0.2, the second's 0.3, 0.9 and 0.02, and the rerun's 0.4
+    and 0.35, while the runs' summaries also cover the opener's abandoned 0.01 and 0.99.
+
+    :param str mode: ``native``, ``rounded-summary``, ``literal``, ``summary-only`` or
+        ``missing-axis``.
+    :param Callable[[list[str]], None] on_read: Called with the keys of each history read.
+    :return dict[str, object]: The runs by ID.
+    """
+    series = {
+        "opener": [(10, 0.4), (20, 0.2), (30, 0.01), (30, 0.99)],
+        "second": [(30, 0.3), (40, 0.9), (40, 0.02)],
+        "rerun": [(50, 0.4), (60, 0.35)],
+    }
+    runs: dict[str, object] = {}
+    for run_id, points in series.items():
+        rows: list[dict[str, object]] = [
+            {"_step": step, "eval/step": progress, "eval/loss": loss}
+            for step, (progress, loss) in enumerate(points)
+        ]
+        losses = [loss for _, loss in points]
+        native = (min(losses), max(losses))
+        if run_id == "rerun":
+            if mode == "literal":
+                rows.append({"_step": len(rows), _KEY: 0.01, "eval/loss.max": 0.99})
+                native = (0.01, 0.99)
+            elif mode == "summary-only":
+                native = (0.11, 0.88)
+            elif mode == "rounded-summary":
+                native = (math.nextafter(native[0], 0), math.nextafter(native[1], 1))
+        if run_id == "opener" and mode == "missing-axis":
+            rows[0].pop("eval/step")
+        summary = {"_step": len(rows) - 1, _KEY: native[0], "eval/loss.max": native[1]}
+        state = "crashed" if run_id != "rerun" else "finished"
+        runs[run_id] = wandb_run(state, summary, tuple(rows), on_read)
+    return runs
 
 
 @pytest.mark.parametrize(
@@ -723,40 +482,16 @@ def test_a_reruns_own_crash_fails_the_read(monkeypatch: pytest.MonkeyPatch) -> N
         ("eval/step", "history-outage", (0.02, 0.9)),
     ],
 )
-def test_a_rerun_replaces_the_observed_training_suffix_for_native_extrema(
+def test_native_extrema_exclude_the_history_a_rerun_replaced(
     monkeypatch: pytest.MonkeyPatch, axis: str, mode: str, expected: tuple[float, float]
 ) -> None:
-    """Native min and max exclude overwritten points while preserving earlier valid history."""
-    series = [
-        (975.0, 10, 0.4),
-        (985.0, 20, 0.2),
-        (990.0, 30, 0.01),
-        (995.0, 30, 0.99),
-        (1005.0, 30, 0.3),
-        (1010.0, 40, 0.9),
-        (1015.0, 40, 0.02),
-        (1025.0, 50, 0.4),
-        (1030.0, 60, 0.35),
-    ]
-    rows: list[dict[str, object]] = [
-        {"_step": index, "_timestamp": stamp, "eval/step": step, "eval/loss": loss}
-        for index, (stamp, step, loss) in enumerate(series)
-    ]
-    if mode == "literal":
-        rows.append({"_step": len(rows), "_timestamp": 1031.0, _KEY: 0.01, "eval/loss.max": 0.99})
-    if mode == "missing-axis":
-        rows[0].pop("eval/step")
-    native = (0.11, 0.88) if mode == "summary-only" else (0.01, 0.99)
-    if mode == "rounded-summary":
-        native = (math.nextafter(native[0], 0), math.nextafter(native[1], 1))
-    last_step = len(rows) - 1
-    summary = {
-        "_step": last_step,
-        "_timestamp": 1031.0,
-        _KEY: native[0],
-        "eval/loss.max": native[1],
-        "eval/loss": 0.35,
-    }
+    """With the axis, native min and max reduce over the trial's runs merged by it, keeping earlier valid history and excluding what a later attempt replaced; without it they reduce over the runs' summaries. A literal dotted series and a summary value the rerun's rows do not reproduce keep the summary, a row without the axis sits at its run's progress, and a history outage is read again.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
+    :param str axis: The evaluation axis.
+    :param str mode: How the runs log.
+    :param tuple[float, float] expected: The min and max.
+    """
     readings: list[list[str]] = []
 
     def on_scan(keys: list[str]) -> None:
@@ -764,18 +499,14 @@ def test_a_rerun_replaces_the_observed_training_suffix_for_native_extrema(
         if mode == "history-outage" and len(readings) == 1:
             raise ConnectionError("history temporarily unavailable")
 
-    clock, _ = _serve(
-        monkeypatch, lambda _: ("finished", summary, last_step), rows=tuple(rows), on_scan=on_scan
-    )
+    runs = _extrema_runs("native" if mode == "history-outage" else mode, on_scan)
+    clock, _ = serve_wandb_runs(monkeypatch, runs)
     keys = (_KEY, "eval/loss.max")
-    assert _poll(
-        logged_after=1020.0,
-        earlier_launches=(1000.0,),
-        resume_axis=axis,
-        required=(*keys, "eval/loss"),
-    )["values"] == {**dict(zip(keys, expected, strict=True)), "eval/loss": 0.35}
+    assert _poll_rerun("opener", "second", required=keys, evaluation_axis=axis)["values"] == dict(
+        zip(keys, expected, strict=True)
+    )
     if axis == "_step":
-        assert not readings
+        assert {tuple(keys) for keys in readings} == {(_KEY, "_step"), ("eval/loss.max", "_step")}
     if mode == "history-outage":
         assert clock.now == 5
 
@@ -783,93 +514,62 @@ def test_a_rerun_replaces_the_observed_training_suffix_for_native_extrema(
 def test_a_rerun_replaces_only_the_history_of_the_metric_it_logs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A checkpoint loss survives an unrelated row while accuracy is reduced on its own steps."""
-    rows = (
-        {"_step": 0, "_timestamp": 990.0, "eval/step": 200, "eval/loss": 0.1, "eval/acc": 0.6},
-        {"_step": 1, "_timestamp": 995.0, "eval/step": 250, "eval/acc": 0.99},
-        {"_step": 2, "_timestamp": 996.0, "eval/step": 260, "eval/acc": 0.2},
-        {"_step": 3, "_timestamp": 1010.0, "eval/step": 200, "train_runtime": 1.0},
-        {"_step": 4, "_timestamp": 1015.0, "eval/step": 220, "eval/acc": 0.7},
-        {"_step": 5, "_timestamp": 1020.0, "eval/step": 300, "eval/loss": 0.35},
+    """A checkpoint loss survives the rerun's unrelated row while accuracy is merged on its own positions."""
+    opener = wandb_run(
+        "crashed",
+        {"_step": 2, _KEY: 0.1, "eval/acc.min": 0.2, "eval/acc.max": 0.99},
+        (
+            {"_step": 0, "eval/step": 200, "eval/loss": 0.1, "eval/acc": 0.6},
+            {"_step": 1, "eval/step": 250, "eval/acc": 0.99},
+            {"_step": 2, "eval/step": 260, "eval/acc": 0.2},
+        ),
     )
-    summary = {
-        "_step": 5,
-        "_timestamp": 1020.0,
-        _KEY: 0.1,
-        "eval/acc.min": 0.2,
-        "eval/acc.max": 0.99,
-    }
-    readings: list[list[str]] = []
-
-    def on_scan(keys: list[str]) -> None:
-        readings.append(keys)
-        clock.sleep(0.7)
-
-    clock, _ = _serve(monkeypatch, lambda _: ("finished", summary, 5), rows=rows, on_scan=on_scan)
-    assert _poll(
-        logged_after=_LAUNCHED_AT,
-        resume_axis="eval/step",
-        required=(_KEY, "eval/acc.min", "eval/acc.max"),
-        deadline=5.0,
+    rerun = wandb_run(
+        "finished",
+        {"_step": 2, _KEY: 0.35, "eval/acc.min": 0.7, "eval/acc.max": 0.7},
+        (
+            {"_step": 0, "eval/step": 200, "train_runtime": 1.0},
+            {"_step": 1, "eval/step": 220, "eval/acc": 0.7},
+            {"_step": 2, "eval/step": 300, "eval/loss": 0.35},
+        ),
+    )
+    serve_wandb_runs(monkeypatch, {"opener": opener, "rerun": rerun})
+    assert _poll_rerun(
+        "opener", required=(_KEY, "eval/acc.min", "eval/acc.max"), evaluation_axis="eval/step"
     )["values"] == {_KEY: 0.1, "eval/acc.min": 0.6, "eval/acc.max": 0.7}
-    assert len(readings) == 7
 
 
-def test_a_rerun_that_only_logs_teardown_keeps_the_final_loss(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Ending a retry at the final checkpoint keeps the objective already measured there."""
-    rows = (
-        {"_step": 0, "_timestamp": 990.0, "eval/step": 10, "eval/loss": 0.1},
-        {"_step": 1, "_timestamp": 1010.0, "eval/step": 10, "train_runtime": 1.0},
-    )
-    summary = {"_step": 1, "_timestamp": 1010.0, _KEY: 0.1}
-    _serve(monkeypatch, lambda _: ("finished", summary, 1), rows=rows)
-    assert _poll(logged_after=_LAUNCHED_AT, resume_axis="eval/step")["values"] == {_KEY: 0.1}
-
-
-def test_a_rerun_that_replaces_every_finite_observation_fails_the_read(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A nonfinite remeasurement cannot win with the finite observation it replaced."""
-    rows = (
-        {"_step": 0, "_timestamp": 990.0, "eval/step": 10, "eval/loss": 0.1},
-        {"_step": 1, "_timestamp": 1010.0, "eval/step": 5, "eval/loss": float("nan")},
-    )
-    summary = {"_step": 1, "_timestamp": 1010.0, _KEY: 0.1}
-    _serve(monkeypatch, lambda _: ("finished", summary, 1), rows=rows)
-    with pytest.raises(ValueError, match="no finite observation in the retained history"):
-        _poll(logged_after=_LAUNCHED_AT, resume_axis="eval/step")
-
-
-def test_a_measurement_without_the_axis_sits_at_its_attempts_last_progress(
+def test_a_measurement_without_the_axis_sits_at_its_runs_last_progress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An abandoned measurement logged without the axis is replaced, and the rerun's own is kept."""
-    rows = (
-        {"_step": 0, "_timestamp": 990.0, "eval/step": 100, "eval/loss": 0.5},
-        {"_step": 1, "_timestamp": 991.0, "eval/step": 250, "train/loss": 0.3},
-        {"_step": 2, "_timestamp": 992.0, "eval/loss": 0.05},
-        {"_step": 3, "_timestamp": 1010.0, "eval/step": 200, "eval/loss": 0.4},
-        {"_step": 4, "_timestamp": 1011.0, "eval/loss": 0.45},
+    opener = wandb_run(
+        "crashed",
+        {"_step": 2, _KEY: 0.05},
+        (
+            {"_step": 0, "eval/step": 100, "eval/loss": 0.5},
+            {"_step": 1, "eval/step": 250, "train/loss": 0.3},
+            {"_step": 2, "eval/loss": 0.05},
+        ),
     )
-    summary = {"_step": 4, "_timestamp": 1011.0, _KEY: 0.05}
-    _serve(monkeypatch, lambda _: ("finished", summary, 4), rows=rows)
-    assert _poll(logged_after=_LAUNCHED_AT, resume_axis="eval/step")["values"] == {_KEY: 0.4}
+    rerun = wandb_run(
+        "finished",
+        {"_step": 1, _KEY: 0.4},
+        ({"_step": 0, "eval/step": 200, "eval/loss": 0.4}, {"_step": 1, "eval/loss": 0.45}),
+    )
+    serve_wandb_runs(monkeypatch, {"opener": opener, "rerun": rerun})
+    assert _poll_rerun("opener", evaluation_axis="eval/step")["values"] == {_KEY: 0.4}
 
 
-def test_an_attempt_that_never_logs_the_axis_fails_the_read(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Without any progress in an attempt, its measurements cannot be retained or replaced."""
-    rows = (
-        {"_step": 0, "_timestamp": 990.0, "eval/loss": 0.05},
-        {"_step": 1, "_timestamp": 1010.0, "eval/step": 5, "eval/loss": 0.4},
+def test_a_run_that_never_logs_the_axis_fails_the_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without any progress in a run, its measurements cannot be retained or replaced."""
+    opener = wandb_run("crashed", {"_step": 0, _KEY: 0.05}, ({"_step": 0, "eval/loss": 0.05},))
+    rerun = wandb_run(
+        "finished", {"_step": 0, _KEY: 0.4}, ({"_step": 0, "eval/step": 5, "eval/loss": 0.4},)
     )
-    summary = {"_step": 1, "_timestamp": 1010.0, _KEY: 0.05}
-    _serve(monkeypatch, lambda _: ("finished", summary, 1), rows=rows)
+    serve_wandb_runs(monkeypatch, {"opener": opener, "rerun": rerun})
     with pytest.raises(ValueError, match="never logged 'eval/step'"):
-        _poll(logged_after=_LAUNCHED_AT, resume_axis="eval/step")
+        _poll_rerun("opener", evaluation_axis="eval/step")
 
 
 def test_wandb_and_mlflow_retain_the_same_history(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -884,14 +584,19 @@ def test_wandb_and_mlflow_retain_the_same_history(monkeypatch: pytest.MonkeyPatc
     expected = select_observation(
         mlflow_history, MlflowExtractor(type="mlflow", metric_key="eval/loss", select="min")
     )["value"]
-    rows = tuple(
-        {"_step": 2 * n + i, "_timestamp": 990.0 + 20 * n + i, "eval/step": step, "eval/loss": v}
-        for n, a in enumerate(attempts)
-        for i, (step, v) in enumerate(a)
-    )
-    summary = {"_step": 3, "_timestamp": 1011.0, _KEY: 0.1}
-    _serve(monkeypatch, lambda _: ("finished", summary, 3), rows=rows)
-    assert _poll(logged_after=_LAUNCHED_AT, resume_axis="eval/step")["values"] == {_KEY: expected}
+    runs = {
+        run_id: wandb_run(
+            "finished",
+            {"_step": 1, _KEY: min(v for _, v in points)},
+            tuple(
+                {"_step": i, "eval/step": step, "eval/loss": v}
+                for i, (step, v) in enumerate(points)
+            ),
+        )
+        for run_id, points in zip(("opener", "rerun"), attempts, strict=True)
+    }
+    serve_wandb_runs(monkeypatch, runs)
+    assert _poll_rerun("opener", evaluation_axis="eval/step")["values"] == {_KEY: expected}
     assert expected == 0.3
 
 
@@ -978,36 +683,40 @@ def test_the_missing_key_report_crosses_the_worker_with_its_wait(tmp_path, monke
     assert type(caught.value) is ExtractorError
     # The worker keeps its reporting reserve, so it polled 238 of the 240 seconds.
     assert str(caught.value) == (
-        f"W&B run https://api.wandb.ai/e/p/{ctx.wandb_run_id} finished without required "
+        f"W&B run https://api.wandb.ai/e/p/{ctx.attempt_id} finished without required "
         f"summary key(s) ['{_KEY}'] after 238 s; available summary keys: ['_step', 'eval/loss']."
     )
 
 
-@pytest.mark.parametrize("verdict", ["missing-keys", "nothing-to-score", "earlier-summary"])
+@pytest.mark.parametrize(
+    "verdict", ["missing-keys", "nothing-to-score", "earlier-run", "borrowed-key"]
+)
 @pytest.mark.parametrize("capped", [False, True], ids=["source-timeout", "phase-deadline"])
 def test_a_deadline_verdict_cut_short_by_the_phase_is_an_interruption(
     tmp_path, monkeypatch, capped: bool, verdict: str
 ) -> None:
-    """A verdict reached at the poll's deadline (missing keys, a rerun that left nothing to score, or a rerun scored from the earlier attempt's summary) interrupts the trial instead when a phase deadline shorter than the source's timeout cut the poll short."""
+    """A verdict reached at the poll's deadline (missing keys, a rerun that left nothing to score, a rerun scored from an earlier run, or a key taken from an earlier run) interrupts the trial instead when a phase deadline shorter than the source's timeout cut the poll short."""
     import time
 
     from phasesweep.evidence import wandb as wandb_evidence
 
     def poll(**kwargs: object) -> dict[str, object]:
         if verdict == "missing-keys":
-            raise wandb_evidence.WandbMissingKeysError("opener", [_KEY], [], 9.0)
+            raise wandb_evidence.WandbMissingKeysError("rerun", [_KEY], [], 9.0)
         if verdict == "nothing-to-score":
-            raise wandb_evidence.WandbNothingToScoreError("opener", "shows no row")
-        return {"values": {_KEY: 0.5}, "present_keys": [], "earlier_attempt": True}
+            raise wandb_evidence.WandbNothingToScoreError("rerun", "was not found")
+        source = {"earlier_attempt": "opener"} if verdict == "earlier-run" else {}
+        return {"values": {_KEY: 0.5}, "present_keys": [], "deadline_verdict": True, **source}
 
     monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", poll)
     extractor = WandbExtractor(type="wandb", entity="e", project="p", metric_key=_KEY)
     deadline = time.monotonic() + 10 if capped else None
     context = make_trial_context(tmp_path)
-    if verdict == "earlier-summary" and not capped:
+    if verdict in {"earlier-run", "borrowed-key"} and not capped:
         assert run_extractor(context, extractor, deadline=deadline) == 0.5
-        assert context.earlier_files == ["wandb:attempt-test"]
-        assert "earlier_attempt" not in context.wandb_capture
+        earlier = ["wandb:opener"] if verdict == "earlier-run" else []
+        assert context.earlier_files == earlier
+        assert not {"earlier_attempt", "deadline_verdict"} & set(context.wandb_capture)
         return
     with pytest.raises(ExtractorError) as caught:
         run_extractor(context, extractor, deadline=deadline)
@@ -1025,7 +734,7 @@ def test_a_missing_run_names_the_project_the_attempt_logged_to(
 
     def poll(**kwargs: object) -> dict[str, object]:
         assert kwargs["project"] == "recorded"
-        raise wandb_evidence.WandbRunMissingError("opener")
+        raise wandb_evidence.WandbRunMissingError("attempt-test")
 
     monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", poll)
     extractor = WandbExtractor(type="wandb", entity="e", project="configured", metric_key=_KEY)

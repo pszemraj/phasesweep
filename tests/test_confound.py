@@ -136,7 +136,6 @@ def _wandb(value: float | None = 1000, axis: str = "eval/step") -> dict[str, Any
             "entity": "e",
             "project": "p",
             "run_id": "attempt",
-            "run_state": "finished",
             "retrieved_at": "2026-01-01T00:00:00+00:00",
             "values": {"eval/loss": 0.5},
             "present_keys": [],

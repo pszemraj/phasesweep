@@ -12,14 +12,13 @@ import json
 import math
 import time
 from bisect import bisect_left
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Literal, NamedTuple, Protocol, TypedDict
 
 from phasesweep.evidence.history import merge_attempt_histories
-from phasesweep.runtime.json import finite_nonnegative, json_text, json_text_list
+from phasesweep.runtime.json import JsonObject, finite_nonnegative, json_text, json_text_list
 from phasesweep.runtime.remote_worker import report_reserve, run_worker
 
 _HistoryRead = Literal["settled", "lagging", "retry"]
@@ -35,14 +34,17 @@ _HISTORY_SAMPLES = 10_000
 # still in flight at the polling deadline ends within about a second of it, and the report
 # follows in what remains.
 _REPORT_SECONDS = 2.0
-# The launch stamp's budget, and how long and how often it reads a run that is still
-# ``running`` again: a trainer ended by a signal closes its session, and sends its last rows,
-# a few seconds after its process exits.
-_STAMP_SECONDS = 30.0
-_STAMP_SETTLE_SECONDS = 10.0
-_STAMP_RETRY_SECONDS = 2.0
 # States only a closed session leaves, so the run holds every row the session logged.
 _CLOSED_STATES = frozenset({"finished", "failed", "killed", "preempted"})
+
+
+class WandbRunAddress(TypedDict):
+    """An earlier attempt's W&B run: the destination that attempt recorded, and its ID."""
+
+    base_url: str
+    entity: str
+    project: str
+    run_id: str
 
 
 @dataclass(eq=False)
@@ -75,17 +77,10 @@ class WandbRunTerminalError(RuntimeError):
 
 
 @dataclass(eq=False)
-class WandbRunSupersededError(RuntimeError):
-    """A later attempt reused the run, so its current summary is not the one being re-read."""
-
-    run_id: str
-
-
-@dataclass(eq=False)
 class WandbNothingToScoreError(RuntimeError):
-    """At the poll deadline a rerun's run shows no row since its launch and no result to score.
+    """At the poll deadline a rerun's run and its trial's earlier runs leave no result to score.
 
-    ``cause`` is a predicate for the run, saying what it shows instead.
+    ``cause`` is a predicate for the rerun's run, saying what it and the earlier runs show.
     """
 
     run_id: str
@@ -111,7 +106,15 @@ class WandbMissingKeysError(RuntimeError):
 
 
 class _RetainedHistoryError(ValueError):
-    """An observed rollback left a native aggregate with no history it can be scored on."""
+    """A run's series rows cannot be placed on the trainer's evaluation axis."""
+
+
+class _NoAnswer(RuntimeError):
+    """A lookup failed transiently, so the poll got no answer about the run."""
+
+
+class _PastDeadline(Exception):
+    """The polling deadline passed before a lookup could start."""
 
 
 WANDB_SDK_MISSING = 'W&B evidence requires the optional SDK: pip install "phasesweep[wandb]".'
@@ -241,49 +244,41 @@ def poll_wandb_summary(
     timeout_seconds: float,
     required_keys: Iterable[str] = (),
     presence_keys: Iterable[str] = (),
-    logged_after: float | None = None,
-    logged_before: float | None = None,
-    earlier_launches: tuple[float, ...] = (),
-    resume_axis: str = "_step",
-    launch_rows: int | None = None,
-    launch_state: str | None = None,
+    objective_key: str | None = None,
+    earlier: Sequence[WandbRunAddress] = (),
+    evaluation_axis: str = "_step",
     environment: Mapping[str, str] | None = None,
     deadline: float | None = None,
-) -> dict[str, Any]:
+) -> JsonObject:
     """Capture requested evidence after confirmed trainer cleanup.
 
-    The capture carries ``earlier_attempt`` when the summary is one an earlier attempt of the
-    trial left and the rerun added nothing to (:func:`_poll_wandb_summary`).
+    The capture is assembled from the attempt's run and its trial's earlier runs by the rules
+    of :func:`_poll_wandb_summary`. It carries ``deadline_verdict`` when it was decided at the
+    poll's deadline, and ``earlier_attempt``, the run ID, when an earlier run scored it.
 
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
     :param str project: W&B project containing the run.
-    :param str run_id: The trial's W&B run, which every attempt of the trial logs to.
+    :param str run_id: The attempt's own W&B run.
     :param str attempt_id: Attempt whose process slot runs the reader.
     :param Path attempt_dir: Existing attempt directory and durable process slot.
     :param float poll_seconds: Delay between summary polls.
     :param float timeout_seconds: Visibility budget for the whole capture.
     :param Iterable[str] required_keys: Numeric keys required before accepting a capture.
     :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
-    :param float | None logged_after: Unix time a rerun launched at, which the summary's
-        ``_timestamp`` must pass before the run counts as this attempt's; ``None`` for an
-        attempt whose run is its own, defaults to None.
-    :param float | None logged_before: Unix time the summary must predate when a later
-        attempt reused the run, defaults to None.
-    :param tuple[float, ...] earlier_launches: Launch times of earlier reruns in this run.
-    :param str resume_axis: Trainer progress key shared by native min/max aggregates.
-    :param int | None launch_rows: The run's row count when a rerun launched, defaults to None.
-    :param str | None launch_state: The run's state when a rerun launched, defaults to None.
+    :param str | None objective_key: The objective's summary key when W&B supplies the
+        objective, defaults to None.
+    :param Sequence[WandbRunAddress] earlier: The runs of the earlier attempts that trained
+        in the attempt's directory, oldest first; empty for a first attempt.
+    :param str evaluation_axis: Trainer progress key shared by native min/max aggregates.
     :param Mapping[str, str] | None environment: Actual composed trainer environment.
     :param float | None deadline: Absolute deadline including worker startup.
-    :return dict[str, Any]: Numeric values, present keys, and retrieval time.
+    :return JsonObject: Numeric values, present keys, and retrieval time.
     :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget; it was
-        reached only when the worker reports that its last poll got a usable answer. A run
-        that still shows only an earlier attempt's rows is not such an answer.
+        reached only when the worker reports that its last poll got a usable answer.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
-    :raises WandbRunSupersededError: A newer attempt replaced the retained summary.
-    :raises WandbNothingToScoreError: At the deadline a rerun's run shows no row since its
-        launch and no finished summary that is the trial's result.
+    :raises WandbNothingToScoreError: At the deadline a rerun's run and its trial's earlier
+        runs leave no result to score.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
     :raises WandbMissingKeysError: At the deadline the finished run's summary still lacked
@@ -307,12 +302,9 @@ def poll_wandb_summary(
             "timeout_seconds": timeout_seconds,
             "required_keys": list(required_keys),
             "presence_keys": list(presence_keys),
-            "logged_after": logged_after,
-            "logged_before": logged_before,
-            "earlier_launches": earlier_launches,
-            "resume_axis": resume_axis,
-            "launch_rows": launch_rows,
-            "launch_state": launch_state,
+            "objective_key": objective_key,
+            "earlier": [dict(address) for address in earlier],
+            "evaluation_axis": evaluation_axis,
             "deadline": deadline,
         },
         Path(__file__).resolve(),
@@ -327,7 +319,6 @@ def poll_wandb_summary(
                 "import_error",
                 "timeout",
                 "run_missing",
-                "superseded",
                 "nothing_to_score",
             }
         ),
@@ -343,8 +334,6 @@ def poll_wandb_summary(
         raise WandbRunTerminalError(run_id, json_text(response, "state"))
     if response.get("status") == "run_missing":
         raise WandbRunMissingError(run_id)
-    if response.get("status") == "superseded":
-        raise WandbRunSupersededError(run_id)
     if response.get("status") == "nothing_to_score":
         raise WandbNothingToScoreError(run_id, json_text(response, "cause"))
     waited = finite_nonnegative(response.get("waited_seconds"))
@@ -384,69 +373,6 @@ def poll_wandb_summary(
     return capture
 
 
-def read_wandb_stamp(
-    *,
-    base_url: str,
-    entity: str,
-    project: str,
-    run_id: str,
-    attempt_id: str,
-    attempt_dir: Path,
-    timeout_seconds: float,
-    environment: Mapping[str, str] | None,
-    deadline: float | None,
-) -> tuple[int | None, str | None]:
-    """Read a trial's run's row count and state before a rerun launches into it.
-
-    The stamp is the W&B run's counterpart of the value files' stamps: the poll compares the
-    count with it to tell whether the rerun logged rows. It never refuses the launch, so a
-    run that does not exist yet, a read that fails or times out, or a count that is not a
-    non-negative integer records ``None`` for both.
-
-    :param str base_url: Normalized W&B API endpoint.
-    :param str entity: W&B entity that owns the project.
-    :param str project: W&B project containing the run.
-    :param str run_id: The trial's W&B run.
-    :param str attempt_id: Registered reader whose process slot runs the worker.
-    :param Path attempt_dir: The reader's process slot.
-    :param float timeout_seconds: The source's timeout; the read uses at most 30 s of it.
-    :param Mapping[str, str] | None environment: Actual composed trainer environment.
-    :param float | None deadline: Absolute ``time.monotonic()`` phase or run deadline.
-    :return tuple[int | None, str | None]: The row count and state, or ``None`` for both.
-    :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
-    """
-    deadline = min(
-        time.monotonic() + min(timeout_seconds, _STAMP_SECONDS),
-        deadline if deadline is not None else math.inf,
-    )
-    if time.monotonic() >= deadline:
-        return None, None
-    try:
-        _, response, _ = run_worker(
-            {
-                "task": "stamp",
-                "base_url": base_url,
-                "entity": entity,
-                "project": project,
-                "run_id": run_id,
-                "deadline": deadline,
-            },
-            Path(__file__).resolve(),
-            "wandb",
-            statuses=frozenset({"stamp", "import_error"}),
-            run_id=attempt_id,
-            attempt_dir=attempt_dir,
-            environment=environment,
-            deadline=deadline,
-        )
-    except ValueError:
-        return None, None
-    rows, state = response.get("rows"), response.get("state")
-    if response.get("status") != "stamp" or type(rows) is not int or rows < 0:
-        return None, None
-    return rows, state if isinstance(state, str) else None
-
-
 def locate_wandb_position(
     *,
     base_url: str,
@@ -470,7 +396,7 @@ def locate_wandb_position(
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
     :param str project: W&B project containing the run.
-    :param str run_id: The trial's W&B run, which every attempt of the trial logs to.
+    :param str run_id: The W&B run whose summary supplied the objective.
     :param str attempt_id: Attempt whose process slot runs the reader.
     :param Path attempt_dir: Existing attempt directory and durable process slot.
     :param float poll_seconds: Summary poll interval, the delay between
@@ -517,7 +443,7 @@ def locate_wandb_position(
 
 
 def _history_position(
-    run: Any,
+    run: _LoadableRun,
     *,
     metric_key: str,
     axis: str,
@@ -544,7 +470,7 @@ def _history_position(
     no position at once. Transient read failures and deadline expiry request retry;
     other failures settle with no position. The captured objective is never changed.
 
-    :param Any run: Finished public-API run.
+    :param _LoadableRun run: Finished public-API run.
     :param str metric_key: Configured objective summary key.
     :param str axis: History key marking where the metric was measured.
     :param float value: Captured objective value.
@@ -568,8 +494,10 @@ def _history_position(
         indexed = _last_history_step(run)
         if indexed is None or indexed < last_step:
             return "lagging", None
-        logged_keys = run.history_keys["keys"]
-        if axis not in logged_keys:
+        # _last_history_step found an index whose keys are a mapping.
+        index = getattr(run, "history_keys", None)
+        logged_keys = index.get("keys") if isinstance(index, Mapping) else None
+        if not isinstance(logged_keys, Mapping) or axis not in logged_keys:
             return "settled", None
         candidates = [metric_key]
         if dot and aggregation in {"min", "max", "mean", "last", "first"}:
@@ -697,154 +625,347 @@ def _contains_series(
     return None if rows is None else any(row.get(key) is not None for row in rows)
 
 
-def _resumed_extrema(
-    run: _HistoryReader,
+class _Run(_HistoryReader, Protocol):
+    """The public-API run fields the summary reader uses."""
+
+    @property
+    def state(self) -> str:
+        """Return the run's state, such as ``running`` or ``finished``."""
+        ...
+
+    @property
+    def summary_metrics(self) -> Mapping[str, object]:
+        """Return the run's decoded summary."""
+        ...
+
+
+class _LoadableRun(_Run, Protocol):
+    """A public-API run that can fetch its state, summary and history index again."""
+
+    def load(self, force: bool = False) -> object:
+        """Fetch the run's attributes from the service again."""
+        ...
+
+
+class _Api(Protocol):
+    """The public-API client's exact run lookup."""
+
+    def run(self, path: str) -> _Run:
+        """Return the run at ``entity/project/run_id``."""
+        ...
+
+
+class _Scored(NamedTuple):
+    """What a scoring run and the trial's runs before it supply."""
+
+    values: dict[str, float]
+    present: list[str]
+    # Required keys no run holds, and keys taken from an earlier run's summary.
+    missing: list[str]
+    borrowed: list[str]
+    # Whether a consulted run's summary or history may not be fully served yet.
+    unsettled: bool
+
+
+def _summary_number(run: _Run, key: str) -> float | None:
+    """Return a run's finite summary value for a key, if it holds one.
+
+    :param _Run run: Public-API run.
+    :param str key: Summary key.
+    :return float | None: The value, or ``None`` when the summary lacks it or it is not finite.
+    """
+    from phasesweep.evidence.evaluation import json_float
+
+    if key not in run.summary_metrics:
+        return None
+    try:
+        value = json_float(run.summary_metrics[key], label=key)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _attempt_series(
+    run: _HistoryReader, series: str, *, axis: str, deadline: float
+) -> list[tuple[int | float, float]]:
+    """Read one run's measurements of a series at the trainer progress each was logged at.
+
+    A row without the axis sits at the progress the run logged last before it, where W&B's
+    ``define_metric(step_sync=True)`` records it, or first after it when the run had logged
+    none yet. Reading the series with and without the axis finds those rows, and the run's
+    whole axis is read only when there are some.
+
+    :param _HistoryReader run: Public-API run, in any state.
+    :param str series: History key underlying a native min or max.
+    :param str axis: Trainer's progress key.
+    :param float deadline: Monotonic deadline for history queries.
+    :return list[tuple[int | float, float]]: Progress and value of each measurement, in
+        logging order.
+    :raises TimeoutError: History could not be read before the deadline.
+    :raises _RetainedHistoryError: The run logged the series but never the axis.
+    """
+    from phasesweep.evidence.evaluation import json_float
+
+    def scan(keys: list[str]) -> list[Mapping[str, object]]:
+        rows = _read_series(run, keys, last_step=0, deadline=deadline, scan=True)
+        if rows is None:
+            raise TimeoutError("W&B history read expired.")
+        return rows
+
+    def measurement(row: Mapping[str, object]) -> tuple[int | float, float] | None:
+        step = finite_nonnegative(row.get("_step"))
+        try:
+            metric = json_float(row[series], label=series)
+        except ValueError:
+            return None
+        return None if step is None else (step, metric)
+
+    points: dict[int | float, tuple[int | float, float]] = {}
+    for row in scan([series, axis, "_step"]):
+        found, progress = measurement(row), finite_nonnegative(row.get(axis))
+        if found is not None and progress is not None:
+            points[found[0]] = (progress, found[1])
+    unplaced: dict[int | float, float] = {}
+    for row in scan([series, "_step"]):
+        found = measurement(row)
+        if found is not None and found[0] not in points:
+            unplaced[found[0]] = found[1]
+    if unplaced:
+        track: list[tuple[int | float, int | float]] = []
+        for row in scan([axis, "_step"]):
+            step, progress = finite_nonnegative(row.get("_step")), finite_nonnegative(row.get(axis))
+            if step is not None and progress is not None:
+                track.append((step, progress))
+        if not track:
+            raise _RetainedHistoryError(
+                f"W&B metric {series!r} has rows in a run that never logged {axis!r}, so the "
+                "attempts' histories cannot be merged. Set metric.extractor.evaluation_axis to "
+                "a key every attempt logs."
+            )
+        track.sort()
+        for step, metric in unplaced.items():
+            index = bisect_left(track, step, key=lambda entry: entry[0])
+            points[step] = (track[max(index - 1, 0)][1], metric)
+    return [points[step] for step in sorted(points)]
+
+
+def _merged_extrema(
+    scoring: _Run,
+    older: Sequence[_Run],
     values: Mapping[str, float],
     *,
     axis: str,
-    launches: tuple[float, ...],
-    last_step: int | float,
     deadline: float,
-) -> dict[str, float]:
-    """Reduce required native aggregates, sharing the reads of their underlying series.
+) -> tuple[dict[str, float], bool]:
+    """Reduce required native aggregates over a trial's runs, sharing reads of each series.
 
-    A literal dotted metric, a series whose rows carrying the axis show no replacement, and a
-    separately supplied summary scalar keep their summary value.
+    With an evaluation axis, each run's rows are its attempt's history, and the reduction runs
+    over the series :func:`merge_attempt_histories` retains from them, the rule MLflow
+    histories use. W&B's own ``_step`` restarts in every run, so without an axis the reduction
+    runs over the runs' summary values. A literal dotted series, and a summary value the
+    scoring run's own rows do not reproduce, keep their summary value.
 
-    :param _HistoryReader run: Finished public-API run.
-    :param Mapping[str, float] values: Finite scalar values from the summary.
-    :param str axis: Trainer's progress key, shared by the history rows being reduced.
-    :param tuple[float, ...] launches: Chronological launch times of all reruns.
-    :param int | float last_step: The summary's last W&B history step.
+    W&B serves a run's keyed history up to a minute after its summary, so with an axis a run
+    whose summary holds the aggregate but whose served rows do not reproduce it may not be
+    fully served yet: the reduction uses the rows served and reports itself unsettled. Only the
+    scoring run and closed earlier runs count: an earlier run that is not closed may never
+    receive its last rows, so it is read as W&B holds it.
+
+    :param _Run scoring: The run whose summary supplied ``values``.
+    :param Sequence[_Run] older: The trial's runs before it, oldest first.
+    :param Mapping[str, float] values: Finite values from the scoring run's summary.
+    :param str axis: Trainer's progress key, or ``_step`` for none.
     :param float deadline: Monotonic deadline for history queries.
-    :return dict[str, float]: Corrected extrema keyed by their exact summary names.
+    :return tuple[dict[str, float], bool]: Reduced extrema keyed by their exact summary
+        names, and whether a run's served rows did not reproduce its summary aggregate.
     :raises TimeoutError: History could not be read before the deadline.
-    :raises _RetainedHistoryError: The native aggregate has no retained finite row, or a
-        row's attempt never logged the axis.
+    :raises _RetainedHistoryError: A run's series rows cannot be placed on the axis.
     """
+    last_step = _last_history_step(scoring) or 0
     operations: dict[str, list[str]] = {}
     for key in values:
         series, _, operation = key.rpartition(".")
         if not series or operation not in {"min", "max"}:
             continue
-        literal = _contains_series(run, key, last_step=last_step, deadline=deadline, scan=True)
+        literal = _contains_series(scoring, key, last_step=last_step, deadline=deadline, scan=True)
         if literal is None:
             raise TimeoutError("W&B history read expired.")
         if not literal:
             operations.setdefault(series, []).append(operation)
 
-    corrected: dict[str, float] = {}
+    def reproduces(rows: Sequence[float], number: float, reduce: Callable[..., float]) -> bool:
+        # W&B can serialize the same value one binary64 step apart in summary and history.
+        return bool(rows) and math.nextafter(reduce(rows), number) == number
+
+    reduced: dict[str, float] = {}
+    unsettled = False
     for series, kinds in operations.items():
-        history = _retained_series(
-            run, series, axis=axis, launches=launches, last_step=last_step, deadline=deadline
+        runs = (*older, scoring)
+        histories = (
+            []
+            if axis == "_step"
+            else [_attempt_series(run, series, axis=axis, deadline=deadline) for run in runs]
         )
-        if history is None:
-            continue
-        all_values, kept_values = history
+        finite = [
+            [metric for _, metric in history if math.isfinite(metric)] for history in histories
+        ]
+        retained = [
+            metric for metric in merge_attempt_histories(histories) if math.isfinite(metric)
+        ]
         for operation in kinds:
             key = f"{series}.{operation}"
             reduce = min if operation == "min" else max
-            # W&B can serialize the same value one binary64 step apart in summary and history.
-            if math.nextafter(reduce(all_values), values[key]) != values[key]:
+            if axis == "_step":
+                numbers = (_summary_number(run, key) for run in older)
+                reduced[key] = reduce(values[key], *(n for n in numbers if n is not None))
                 continue
-            if not kept_values:
-                raise _RetainedHistoryError(
-                    f"W&B metric {key!r} has no finite observation in the retained history "
-                    "after checkpoint rollback."
-                )
-            corrected[key] = reduce(kept_values)
-    return corrected
+            summaries = [*(_summary_number(run, key) for run in older), values[key]]
+            unsettled |= any(
+                number is not None
+                and (run is scoring or run.state in _CLOSED_STATES)
+                and not reproduces(rows, number, reduce)
+                for run, rows, number in zip(runs, finite, summaries, strict=True)
+            )
+            if reproduces(finite[-1], values[key], reduce):
+                reduced[key] = reduce(retained)
+    return reduced, unsettled
 
 
-def _retained_series(
-    run: _HistoryReader,
-    series: str,
+def _score(
+    scoring: _Run,
+    older: Sequence[_Run],
     *,
+    required: tuple[str, ...],
+    presence: tuple[str, ...],
     axis: str,
-    launches: tuple[float, ...],
-    last_step: int | float,
     deadline: float,
-) -> tuple[list[float], list[float]] | None:
-    """Read a series whose rerun replaced part of its history.
+) -> _Scored:
+    """Read the required values from a scoring run's summary and the trial's runs before it.
 
-    Rows belong to attempts by the reruns' launch times and sit at their trainer progress,
-    and :func:`merge_attempt_histories` retains them by the rule MLflow histories use. A
-    row without the axis sits at the progress its attempt logged last before it, where
-    W&B's ``define_metric(step_sync=True)`` records it, or first after it when the attempt
-    had logged none yet. Reading the series with and without the axis finds those rows, and
-    the run's whole axis is read only when there are some.
+    A required key the scoring run's summary lacks comes from the newest earlier summary that
+    holds it, whatever that run's state: a trainer may log a value only on a fresh start. The
+    scoring is unsettled when a closed earlier run's populated summary does not match its
+    history index, as W&B serves a signalled session's first row as its summary for a minute,
+    or when :func:`_merged_extrema` finds history not yet served. An earlier run that is not
+    closed may never settle, as a session killed outright stays ``crashed`` with its first-row
+    summary and none of the rows it had not uploaded, so it is read as W&B holds it.
 
-    :param _HistoryReader run: Finished public-API run.
-    :param str series: History key underlying one or both summary extrema.
-    :param str axis: Trainer's progress key.
-    :param tuple[float, ...] launches: Chronological launch times of all reruns.
-    :param int | float last_step: The summary's last W&B history step.
+    :param _Run scoring: The run whose summary holds the objective.
+    :param Sequence[_Run] older: The trial's runs before it, oldest first.
+    :param tuple[str, ...] required: Numeric keys the capture requires.
+    :param tuple[str, ...] presence: Keys whose presence is recorded.
+    :param str axis: Trainer's progress key, or ``_step`` for none.
     :param float deadline: Monotonic deadline for history queries.
-    :return tuple[list[float], list[float]] | None: All and retained finite measurements,
-        or ``None`` when no replacement is established.
+    :return _Scored: The values, present keys, the keys missing or borrowed, and whether the
+        scoring is unsettled.
+    :raises ValueError: A required value is not a finite number, or a run's series rows
+        cannot be placed on the axis.
     :raises TimeoutError: History could not be read before the deadline.
-    :raises _RetainedHistoryError: An attempt logged the series but never the axis.
     """
     from phasesweep.evidence.evaluation import json_float
 
-    def scan(keys: list[str]) -> list[Mapping[str, object]]:
-        rows = _read_series(run, keys, last_step=last_step, deadline=deadline, scan=True)
-        if rows is None:
-            raise TimeoutError("W&B history read expired.")
-        return rows
+    summary = scoring.summary_metrics
+    values: dict[str, float] = {}
+    own: dict[str, float] = {}
+    missing: list[str] = []
+    borrowed: list[str] = []
+    for key in required:
+        holder = next(
+            (
+                run.summary_metrics
+                for run in (scoring, *reversed(older))
+                if key in run.summary_metrics
+            ),
+            None,
+        )
+        if holder is None:
+            missing.append(key)
+            continue
+        value = json_float(holder[key], label=key)
+        if not math.isfinite(value):
+            raise ValueError(f"W&B metric {key!r} is non-finite.")
+        values[key] = value
+        if key in summary:
+            own[key] = value
+        else:
+            borrowed.append(key)
+    unsettled = any(
+        run.state in _CLOSED_STATES
+        and bool(run.summary_metrics)
+        and not _summary_matches_history(run, run.summary_metrics)
+        for run in older
+    )
+    if older and not missing:
+        reduced, unserved = _merged_extrema(scoring, older, own, axis=axis, deadline=deadline)
+        values.update(reduced)
+        unsettled |= unserved
+    present = sorted(
+        key for key in presence if any(key in run.summary_metrics for run in (scoring, *older))
+    )
+    return _Scored(values, present, missing, borrowed, unsettled)
 
-    def measurement(row: Mapping[str, object]) -> tuple[int | float, int, float] | None:
-        step = finite_nonnegative(row.get("_step"))
-        timestamp = finite_nonnegative(row.get("_timestamp"))
+
+def _lookup(clients: dict[str, _Api], address: WandbRunAddress, deadline: float) -> _Run | None:
+    """Look a run up with this poll's client for its endpoint.
+
+    Every poll builds new clients, because a client keeps the run it first fetched.
+
+    :param dict[str, _Api] clients: This poll's clients by endpoint, extended in place.
+    :param WandbRunAddress address: The run's endpoint, entity, project and ID.
+    :param float deadline: ``time.monotonic()`` time after which no lookup starts.
+    :raises _PastDeadline: The deadline passed before the lookup could start.
+    :raises WandbSetupError: W&B refused authentication or the client configuration.
+    :raises _NoAnswer: Building the client or the lookup failed transiently.
+    :return _Run | None: The run, or ``None`` when W&B answered that it does not exist.
+    """
+    from wandb.apis.public import Api
+    from wandb.errors import AuthenticationError, UsageError
+
+    run_id = address["run_id"]
+    api = clients.get(address["base_url"])
+    if api is None:
+        if time.monotonic() >= deadline:
+            raise _PastDeadline
         try:
-            metric = json_float(row[series], label=series)
-        except ValueError:
+            api = Api(
+                overrides={"base_url": address["base_url"]},
+                timeout=max(1, math.ceil(deadline - time.monotonic())),
+            )
+        except Exception as exc:
+            if not _is_retryable_setup_error(exc):
+                raise WandbSetupError(run_id, _error_detail(exc)) from exc
+            raise _NoAnswer(_error_detail(exc)) from exc
+        clients[address["base_url"]] = api
+    if time.monotonic() >= deadline:
+        raise _PastDeadline
+    try:
+        return api.run(f"{address['entity']}/{address['project']}/{run_id}")
+    except Exception as exc:
+        if any(_http_status(error) in {400, 401, 403, 422} for error in _error_chain(exc)) or (
+            isinstance(exc, (AuthenticationError, UsageError))
+            and not _is_retryable_setup_error(exc)
+        ):
+            raise WandbSetupError(run_id, _error_detail(exc)) from exc
+        # "No such run" answers the lookup; any other failure leaves it unanswered.
+        if _is_missing_run_error(exc):
             return None
-        if step is None or timestamp is None:
-            return None
-        return step, bisect_left(launches, timestamp), metric
+        raise _NoAnswer(_error_detail(exc)) from exc
 
-    def retain(points: Mapping[int | float, tuple[int, int | float, float]]) -> list[float]:
-        histories: list[list[tuple[int | float, float]]] = [[] for _ in range(len(launches) + 1)]
-        for segment, progress, metric in points.values():
-            histories[segment].append((progress, metric))
-        return merge_attempt_histories(histories)
 
-    points: dict[int | float, tuple[int, int | float, float]] = {}
-    for row in scan(list(dict.fromkeys((series, axis, "_step", "_timestamp")))):
-        found, progress = measurement(row), finite_nonnegative(row.get(axis))
-        if found is not None and progress is not None:
-            points[found[0]] = (found[1], progress, found[2])
-    unplaced: dict[int | float, tuple[int, float]] = {}
-    for row in scan([series, "_step", "_timestamp"]):
-        found = measurement(row)
-        if found is not None and found[0] not in points:
-            unplaced[found[0]] = (found[1], found[2])
-    if unplaced:
-        tracks: list[list[tuple[int | float, int | float]]] = [[] for _ in range(len(launches) + 1)]
-        for row in scan([axis, "_step", "_timestamp"]):
-            step = finite_nonnegative(row.get("_step"))
-            timestamp = finite_nonnegative(row.get("_timestamp"))
-            progress = finite_nonnegative(row.get(axis))
-            if step is not None and timestamp is not None and progress is not None:
-                tracks[bisect_left(launches, timestamp)].append((step, progress))
-        for track in tracks:
-            track.sort()
-        for step, (segment, metric) in unplaced.items():
-            track = tracks[segment]
-            if not track:
-                raise _RetainedHistoryError(
-                    f"W&B metric {series!r} has rows in an attempt that never logged {axis!r}, "
-                    "so the rerun's replaced history cannot be told apart. Set "
-                    "metric.extractor.evaluation_axis to a key every attempt logs."
-                )
-            index = bisect_left(track, step, key=lambda entry: entry[0])
-            points[step] = (segment, track[max(index - 1, 0)][1], metric)
-    retained = retain(points)
-    all_values = [metric for _, _, metric in points.values() if math.isfinite(metric)]
-    if len(retained) == len(points) or not all_values:
-        return None
-    return all_values, [metric for metric in retained if math.isfinite(metric)]
+def _answer_key(runs: Sequence[_Run]) -> str:
+    """Fingerprint what lookups answered about runs, to reuse a scoring of the same answers.
+
+    :param Sequence[_Run] runs: Runs in a scoring.
+    :return str: Their states, row counts, indexed steps and summaries, as JSON.
+    """
+    return json.dumps(
+        [
+            [run.state, _row_count(run), _last_history_step(run), dict(run.summary_metrics)]
+            for run in runs
+        ],
+        sort_keys=True,
+        default=str,
+    )
 
 
 def _poll_wandb_summary(
@@ -857,86 +978,75 @@ def _poll_wandb_summary(
     timeout_seconds: float,
     required_keys: Iterable[str] = (),
     presence_keys: Iterable[str] = (),
-    logged_after: float | None = None,
-    logged_before: float | None = None,
-    earlier_launches: tuple[float, ...] = (),
-    resume_axis: str = "_step",
-    launch_rows: int | None = None,
-    launch_state: str | None = None,
+    objective_key: str | None = None,
+    earlier: Sequence[WandbRunAddress] = (),
+    evaluation_axis: str = "_step",
     deadline: float | None = None,
-) -> dict[str, Any]:
-    """Poll an exact run using refreshed SDK clients within the parent's deadline.
+) -> dict[str, object]:
+    """Poll an attempt's run, and its trial's earlier runs, within the parent's deadline.
 
-    No lookup starts after the deadline, but the answer to one in flight is used. Every poll
-    builds a new client, because a client keeps the run it first fetched.
+    No lookup starts after the deadline, but the answer to one in flight is used. The public
+    API can report a run ``finished`` before it serves the history index or the summary, and
+    the summary may take minutes to arrive, so nothing short of the deadline establishes that
+    a finished summary lacks a key. A summary counts only once it is as far as the history the
+    same answer reports (:func:`_summary_matches_history`), so a half-ingested one is never
+    captured.
 
-    The public API can report a run ``finished`` before it serves the history index
-    or the summary. The summary may take minutes to arrive: first empty, or
-    for a resumed run still the earlier attempt's. So nothing short of the deadline
-    establishes that a finished summary lacks a key. A summary counts only once it is as
-    far as the history the same answer reports (:func:`_summary_matches_history`), so a
-    half-ingested one is never captured.
+    Every attempt logs to a run of its own. A rerun continues its trial's earlier attempts
+    from their checkpoint in the same directory, so its result is assembled from its run and
+    their runs (``earlier``, oldest first, skipping any W&B does not hold):
 
-    A rerun resumes the run an earlier attempt of its trial left, in whatever state that
-    attempt's end left it. Until the summary's ``_timestamp``, the time of the last logged
-    history row, passes ``logged_after``, the state and summary are the earlier attempt's,
-    so neither a terminal state nor a finished summary decides anything; a run that still
-    shows nothing newer at the deadline is unread, like one whose summary is still empty, and
-    leaves the trial pending. A run created at or after ``logged_after`` holds no earlier
-    attempt's data, so that wait does not apply to it. A trainer axis can
-    show where a rerun re-logged progress, letting min/max exclude the replaced history.
+    1. The rerun's finished run, its summary matching its history and holding the objective,
+       scores the trial. A required key that summary still lacks at the deadline comes from
+       the newest earlier summary that holds it (:func:`_score`).
+    2. A native ``.min`` or ``.max`` key is reduced over the trial's runs
+       (:func:`_merged_extrema`).
+    3. A rerun's run that is missing at the deadline, or finished with no row and no
+       objective, logged nothing: its trainer found the training finished. The newest earlier
+       run then scores the trial by rules 1 and 2 over the earlier runs alone, if its session
+       closed and its summary matches its history and holds the objective, and the capture
+       carries ``earlier_attempt``. Otherwise nothing is scored, saying why. An earlier run
+       that closed with no row and no objective logged nothing either and is skipped as a
+       missing one is. A row-less run that is ``running`` or ``crashed`` is not skipped: W&B
+       never receives what a session killed outright had not uploaded, so it cannot say
+       whether that session trained.
+    4. A rerun's finished run whose summary matches its history but lacks the objective at the
+       deadline ran without reporting it, so no earlier run scores it.
 
-    That wait lasts to the deadline, the allowance a first attempt gets for a value set on
-    ``run.summary`` without a row. The latest answered lookup's stale answer is then a verdict,
-    decided after the loop as the missing-keys verdict is, against the row count and state
-    recorded at launch (:func:`read_wandb_stamp`), since ``historyLineCount`` is
-    current within a second while the summary lags. A count that grew means W&B has rows it
-    has not summarized yet, so the read stays pending. W&B refuses a rewind together with the
-    ``WANDB_RESUME`` every attempt gets, so an unchanged count proves the rerun appended
-    nothing. With no count recorded at the launch, the served history stands in for it
-    (:func:`_served_history`): while it serves fewer rows than the count, holds a row stamped
-    at or after ``logged_after``, or cannot be read, the read stays pending. An unchanged
-    count over a run whose
-    earlier session had closed, now finished with a summary that matches its index, means the
-    rerun added nothing to a run holding all its earlier rows: the summary is read as a
-    summary is otherwise read and the capture carries ``earlier_attempt``. A session that
-    never closed can be missing its last row, so any other answer leaves the attempt nothing
-    to score.
+    Rules 3 and 4, a key taken from an earlier run, and a scoring that read a summary or
+    history W&B may not have finished serving (:func:`_score`), are verdicts the latest
+    answered poll decides, returned or raised after the deadline as a missing key is; such a
+    capture carries ``deadline_verdict``. Only the scoring run and closed earlier runs can
+    leave a scoring unsettled; an earlier run that is not closed is read as W&B holds it,
+    since a session killed outright stays ``crashed`` with its first-row summary and never
+    receives the rows it had not uploaded. A rerun whose own summary holds every required key and no native aggregate
+    reads no earlier run and returns at once. A first attempt has no earlier runs and only
+    rule 1 applies.
 
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
     :param str project: W&B project containing the run.
-    :param str run_id: Exact W&B run ID to read.
+    :param str run_id: The attempt's own W&B run.
     :param float poll_seconds: Delay between summary polls.
     :param float timeout_seconds: Budget used when no ``deadline`` is given.
     :param Iterable[str] required_keys: Numeric keys required before accepting a capture.
     :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
-    :param float | None logged_after: Unix time a rerun launched at; ``None`` for an
-        attempt whose run is its own, defaults to None.
-    :param float | None logged_before: Unix time the summary must predate when a later
-        attempt reused the run, defaults to None.
-    :param tuple[float, ...] earlier_launches: Launch times of earlier reruns in this run.
-    :param str resume_axis: Trainer progress key shared by native min/max aggregates.
-    :param int | None launch_rows: The run's row count when a rerun launched, defaults to None.
-    :param str | None launch_state: The run's state when a rerun launched, defaults to None.
+    :param str | None objective_key: The objective's summary key when W&B supplies the
+        objective, defaults to None.
+    :param Sequence[WandbRunAddress] earlier: The trial's earlier runs, oldest first.
+    :param str evaluation_axis: Trainer progress key shared by native min/max aggregates.
     :param float | None deadline: Absolute ``time.monotonic()`` deadline from the parent.
-    :return dict[str, Any]: Numeric values, present keys, and retrieval time.
+    :return dict[str, object]: Numeric values, present keys, and retrieval time.
     :raises WandbPollTimeout: The run did not finish with the required keys in time,
         reached when the last poll got a usable answer about the run.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
-    :raises WandbRunSupersededError: A newer attempt replaced the retained summary.
-    :raises WandbNothingToScoreError: At the deadline a rerun's run shows no row since its
-        launch and no finished summary that is the trial's result.
+    :raises WandbNothingToScoreError: At the deadline a rerun's run and its trial's earlier
+        runs leave no result to score.
     :raises WandbSetupError: Authentication or setup was denied.
-    :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
-    :raises WandbMissingKeysError: At the deadline the finished run's summary still lacked
-        required keys.
-    :raises ValueError: A requested scalar is invalid or a native aggregate has no retained row.
+    :raises WandbRunTerminalError: The attempt's run terminated unsuccessfully.
+    :raises WandbMissingKeysError: At the deadline no run's summary held a required key.
+    :raises ValueError: A requested scalar is invalid or a series cannot be placed on the axis.
     """
-    from wandb.apis.public import Api
-    from wandb.errors import AuthenticationError, UsageError
-
-    from phasesweep.evidence.evaluation import json_float
     from phasesweep.runtime.time import utc_now_iso
 
     started = time.monotonic()
@@ -944,222 +1054,169 @@ def _poll_wandb_summary(
     last_error: Exception | None = None
     # Whether the latest poll got an answer that can settle the trial at the deadline.
     reached = False
-    # The keys the latest answered poll's finished summary lacked, and the keys it had.
+    # What the latest answered poll decides at the deadline: the keys no run held and the
+    # keys the scoring summary had, or a capture or the reason nothing is scored.
     missing: list[str] = []
     available: list[str] = []
-    required = tuple(required_keys)
-    launches = () if logged_after is None else tuple(sorted((*earlier_launches, logged_after)))
-    # What the latest lookup's stale answer decides at the deadline: the earlier attempt's
-    # capture, or why the attempt left nothing to score. Only an answered last lookup decides.
     verdict: dict[str, object] | str | None = None
-    # The row count, summary and values an earlier attempt's capture was read from, so an
-    # unchanged run is not read through its history again on every poll.
-    read_earlier: tuple[int | None, dict[str, object], dict[str, float]] | None = None
-    # The answer whose history was last read complete and its latest row stamp, so a complete
-    # history is read once per answer that could decide a verdict, not once per poll.
-    read_history: tuple[tuple[int | None, str, dict[str, object]], float | None] | None = None
-    while time.monotonic() < deadline:
-        try:
-            api = Api(
-                overrides={"base_url": base_url},
-                timeout=max(1, math.ceil(deadline - time.monotonic())),
+    required = tuple(required_keys)
+    presence = tuple(presence_keys)
+    own: WandbRunAddress = {
+        "base_url": base_url,
+        "entity": entity,
+        "project": project,
+        "run_id": run_id,
+    }
+    # The latest settled scoring and the answers it read, so unchanged runs waited on to the
+    # deadline are not read through their histories again on every poll. An unsettled one
+    # is read again, since history W&B serves late changes no answer the key sees.
+    cache: list[tuple[str, _Scored]] = []
+
+    def score(scoring: _Run, older: Sequence[_Run]) -> _Scored:
+        key = _answer_key((*older, scoring))
+        if cache and cache[0][0] == key:
+            return cache[0][1]
+        scored = _score(
+            scoring,
+            older,
+            required=required,
+            presence=presence,
+            axis=evaluation_axis,
+            deadline=deadline,
+        )
+        cache[:] = [] if scored.unsettled else [(key, scored)]
+        return scored
+
+    def capture(scored: _Scored) -> dict[str, object]:
+        return {
+            "values": dict(scored.values),
+            "present_keys": list(scored.present),
+            "retrieved_at": utc_now_iso(timespec="microseconds"),
+        }
+
+    def earlier_runs(clients: dict[str, _Api]) -> list[tuple[WandbRunAddress, _Run]]:
+        found = ((address, _lookup(clients, address, deadline)) for address in earlier)
+        return [(address, prior) for address, prior in found if prior is not None]
+
+    def judge_earlier(
+        clients: dict[str, _Api], subject: str
+    ) -> tuple[dict[str, object] | str | None, list[str], list[str]]:
+        runs = [
+            (address, run)
+            for address, run in earlier_runs(clients)
+            if not (
+                run.state in _CLOSED_STATES
+                and _row_count(run) == 0
+                and (objective_key is None or objective_key not in run.summary_metrics)
             )
-        except Exception as exc:
-            if not _is_retryable_setup_error(exc):
-                raise WandbSetupError(run_id, _error_detail(exc)) from exc
-            last_error = RuntimeError(_error_detail(exc))
-            reached = False
-            verdict = None
-        else:
-            if time.monotonic() >= deadline:
-                break
-            verdict = None
-            try:
-                run = api.run(f"{entity}/{project}/{run_id}")
-            except Exception as exc:
-                if any(
-                    _http_status(error) in {400, 401, 403, 422} for error in _error_chain(exc)
-                ) or (
-                    isinstance(exc, (AuthenticationError, UsageError))
-                    and not _is_retryable_setup_error(exc)
-                ):
-                    raise WandbSetupError(run_id, _error_detail(exc)) from exc
-                # "No such run" answers the lookup; any other failure leaves it unanswered.
-                reached = _is_missing_run_error(exc)
-                last_error = (
-                    WandbRunMissingError(run_id) if reached else RuntimeError(_error_detail(exc))
-                )
+        ]
+        if not runs:
+            return f"{subject}, and no earlier attempt of its trial logged to a W&B run", [], []
+        address, newest = runs[-1]
+        name = f"{address['entity']}/{address['project']}/{address['run_id']}"
+        summary = newest.summary_metrics
+        if newest.state not in _CLOSED_STATES:
+            return (
+                f"{subject}, and its trial's newest earlier run {name} is {newest.state!r}, so "
+                "it may lack its session's last row",
+                [],
+                [],
+            )
+        if not _summary_matches_history(newest, summary):
+            return (
+                f"{subject}, and the summary of its trial's newest earlier run {name} does not "
+                "match its history",
+                [],
+                [],
+            )
+        if objective_key is not None and objective_key not in summary:
+            return (
+                f"{subject}, and its trial's newest earlier run {name} does not hold "
+                f"{objective_key!r}",
+                [],
+                [],
+            )
+        scored = score(newest, [prior for _, prior in runs[:-1]])
+        if scored.missing:
+            return None, scored.missing, sorted(summary)
+        found = {**capture(scored), "deadline_verdict": True, "earlier_attempt": address["run_id"]}
+        return found, [], []
+
+    while time.monotonic() < deadline:
+        clients: dict[str, _Api] = {}
+        poll_error: Exception | None = None
+        poll_verdict: dict[str, object] | str | None = None
+        poll_missing: list[str] = []
+        poll_available: list[str] = []
+        try:
+            run = _lookup(clients, own, deadline)
+            if run is None:
+                poll_error = WandbRunMissingError(run_id)
+                if earlier:
+                    poll_verdict, poll_missing, poll_available = judge_earlier(
+                        clients, "was not found"
+                    )
             else:
-                # An answer in hand is used even when it arrived after the polling deadline:
-                # the reserve before the supervisor's deadline exists to report it.
-                last_error = None
-                reached = True
-                missing = []
                 summary = run.summary_metrics
-                stale = (
-                    logged_after is not None
-                    and not _logged_since(summary, logged_after)
-                    and not _created_since(run, logged_after)
-                )
-                rows = _row_count(run)
-                matched = run.state == "finished" and _summary_matches_history(run, summary)
-                logged = 0 if rows is None or launch_rows is None else rows - launch_rows
-                # A stale answer with no new row is waited out, and what it decides is kept for
-                # the deadline in case it is the last answer.
-                unlogged = stale and logged <= 0
-                # With no count recorded at the launch, the history W&B serves stands in for it
-                # once it serves every counted row; it lags the count and the summary, so until
-                # it does, or while a read fails, no verdict is drawn.
-                written: str | None = None
-                if unlogged and logged_after is not None and launch_rows is None:
-                    answer = (rows, str(run.state), dict(summary))
-                    if rows is not None and (read_history is None or read_history[0] != answer):
-                        try:
-                            served, stamp = _served_history(run, rows, deadline)
-                        except Exception as exc:
-                            written = (
-                                "W&B history could not be read to tell whether the attempt "
-                                f"logged since its launch: {_error_detail(exc)}."
-                            )
-                        else:
-                            if served < rows:
-                                written = (
-                                    f"W&B counts {rows} rows but its history serves {served} so "
-                                    "far, so it cannot yet show whether the attempt logged since "
-                                    "its launch."
-                                )
-                            else:
-                                # A complete append-only history cannot change while the count
-                                # does not.
-                                read_history = (answer, stamp)
-                    if written is None and read_history is not None and read_history[0] == answer:
-                        stamp = read_history[1]
-                        if stamp is not None and stamp >= logged_after:
-                            written = (
-                                "W&B history holds a row logged since the attempt launched "
-                                "that its summary does not show yet."
-                            )
-                    unlogged = written is None
-                earlier = (
-                    unlogged
-                    and launch_rows is not None
-                    and rows == launch_rows
-                    and launch_state in _CLOSED_STATES
-                    and matched
-                )
-                if unlogged and not earlier:
-                    verdict = "shows no row logged since the attempt launched, and " + (
-                        "no row count was recorded at the launch"
-                        + (
-                            ""
-                            if rows is None
-                            else f", and its history serves all {rows} rows, none since then"
-                        )
-                        if launch_rows is None
-                        else f"W&B serves {rows!r} rows against {launch_rows} at the launch"
-                        if rows != launch_rows
-                        else f"its earlier session was {launch_state!r} at the launch, so it "
-                        "may lack that session's last row"
-                        if launch_state not in _CLOSED_STATES
-                        else f"it is {run.state!r}, not finished"
-                        if run.state != "finished"
-                        else "its finished summary does not match its history"
+                finished = run.state == "finished"
+                unreported = objective_key is not None and objective_key not in summary
+                if earlier and finished and unreported and _row_count(run) == 0:
+                    poll_verdict, poll_missing, poll_available = judge_earlier(
+                        clients, f"finished without a row or {objective_key!r}"
                     )
-                if stale and logged > 0:
-                    reached = False
-                    last_error = RuntimeError(
-                        f"W&B holds {logged} rows logged since the attempt launched that its "
-                        "summary does not show yet."
-                    )
-                elif written is not None:
-                    reached = False
-                    last_error = RuntimeError(written)
-                elif run.state == "finished" and not matched:
-                    reached = False
-                    last_error = RuntimeError(
+                elif finished and not _summary_matches_history(run, summary):
+                    raise _NoAnswer(
                         "The finished run's summary is still empty."
                         if not summary
                         else f"The summary's _step {summary.get('_step')!r} does not match the "
                         f"history's last step {_last_history_step(run)!r}."
                     )
-                elif stale and not earlier:
-                    # W&B serves the earlier attempt's run for minutes after a rerun finishes,
-                    # so an unchanged summary is a lag to wait out until the deadline.
-                    reached = False
-                    last_error = RuntimeError(
-                        "The run still shows only an earlier attempt's summary: it records no "
-                        "row logged since the attempt launched."
-                    )
                 elif run.state in {"failed", "crashed", "killed", "preempted"}:
                     raise WandbRunTerminalError(run_id, run.state)
-                elif run.state == "finished":
-                    if logged_before is not None:
-                        stamp = finite_nonnegative(summary.get("_timestamp"))
-                        if stamp is None or stamp >= logged_before:
-                            raise WandbRunSupersededError(run_id)
-                    if all(key in summary for key in required):
-                        values = {}
-                        for key in required:
-                            value = json_float(summary[key], label=key)
-                            if not math.isfinite(value):
-                                raise ValueError(f"W&B metric {key!r} is non-finite.")
-                            values[key] = value
-                        last_step = _last_history_step(run)
-                        try:
-                            if (
-                                earlier
-                                and read_earlier is not None
-                                and read_earlier[:2] == (rows, summary)
-                            ):
-                                values = dict(read_earlier[2])
-                            elif launches and resume_axis != "_step" and last_step is not None:
-                                values.update(
-                                    _resumed_extrema(
-                                        run,
-                                        values,
-                                        axis=resume_axis,
-                                        launches=launches,
-                                        last_step=last_step,
-                                        deadline=deadline,
-                                    )
-                                )
-                        except Exception as exc:
-                            if not _is_retryable_setup_error(exc):
-                                raise
-                            last_error = RuntimeError(_error_detail(exc))
-                            reached = False
-                        else:
-                            capture: dict[str, object] = {
-                                "values": values,
-                                "present_keys": sorted(
-                                    key for key in presence_keys if key in summary
-                                ),
-                                "retrieved_at": utc_now_iso(timespec="microseconds"),
-                            }
-                            if not earlier:
-                                return capture
-                            # The earlier attempt's summary is the result only if nothing newer
-                            # arrives before the deadline.
-                            read_earlier = (rows, dict(summary), dict(values))
-                            verdict = {**capture, "earlier_attempt": True}
-                            reached = False
-                            last_error = RuntimeError(
-                                "The run still shows only an earlier attempt's summary: it "
-                                "records no row logged since the attempt launched."
-                            )
+                elif finished and earlier and unreported:
+                    poll_verdict = (
+                        f"finished with logged rows but without {objective_key!r}, so its "
+                        "trial's earlier runs do not score it"
+                    )
+                elif finished:
+                    needs_earlier = any(
+                        key not in summary or key.endswith((".min", ".max")) for key in required
+                    ) or any(key not in summary for key in presence)
+                    older = [prior for _, prior in earlier_runs(clients)] if needs_earlier else []
+                    scored = score(run, older)
+                    if scored.missing:
+                        poll_missing, poll_available = scored.missing, sorted(summary)
+                    elif not scored.borrowed and not scored.unsettled:
+                        return capture(scored)
                     else:
-                        missing = sorted(key for key in required if key not in summary)
-                        available = sorted(summary)
+                        poll_verdict = {**capture(scored), "deadline_verdict": True}
+        except _PastDeadline:
+            # The latest answered poll still decides.
+            break
+        except (WandbSetupError, WandbRunTerminalError):
+            raise
+        except Exception as exc:
+            if not isinstance(exc, _NoAnswer) and not _is_retryable_setup_error(exc):
+                raise
+            reached, verdict, missing = False, None, []
+            last_error = RuntimeError(
+                str(exc) if isinstance(exc, _NoAnswer) else _error_detail(exc)
+            )
+        else:
+            # An answer in hand is used even when it arrived after the polling deadline: the
+            # reserve before the supervisor's deadline exists to report it.
+            reached, last_error, verdict = True, poll_error, poll_verdict
+            missing, available = poll_missing, poll_available
         time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
     waited = time.monotonic() - started
     if isinstance(verdict, dict):
         return verdict
     if isinstance(verdict, str):
         raise WandbNothingToScoreError(run_id, verdict)
-    if isinstance(last_error, WandbRunMissingError):
-        raise last_error
     if reached and missing:
         raise WandbMissingKeysError(run_id, missing, available, waited)
+    if isinstance(last_error, WandbRunMissingError):
+        raise last_error
     raise WandbPollTimeout(run_id, timeout_seconds, reached=reached, last_error=last_error)
 
 
@@ -1197,124 +1254,18 @@ def _summary_matches_history(run: object, summary: Mapping[str, object]) -> bool
     return bool(summary) and finite_nonnegative(summary.get("_step")) == _last_history_step(run)
 
 
-def _logged_since(summary: Mapping[str, object], logged_after: float) -> bool:
-    """Say whether a run's summary records a history row logged after a rerun launched.
-
-    W&B stamps every logged row with the logging host's clock and keeps the last stamp as
-    the summary's ``_timestamp``; the trainer and PhaseSweep share that host's clock.
-
-    :param Mapping[str, object] summary: The run's decoded summary.
-    :param float logged_after: Unix time the rerun launched at.
-    :return bool: Whether ``_timestamp`` is a finite number later than ``logged_after``.
-    """
-    stamp = finite_nonnegative(summary.get("_timestamp"))
-    return stamp is not None and stamp > logged_after
-
-
-def _created_since(run: object, logged_after: float) -> bool:
-    """Say whether a run was created at or after a rerun launched.
-
-    Such a run cannot hold an earlier attempt's summary, so a summary without a
-    ``_timestamp`` (an objective set on ``run.summary`` and never logged) is the rerun's own.
-    The comparison assumes the service's clock, which stamps the run's ``created_at``, agrees
-    with this machine's, which stamped the launch; a skew can only misjudge a run created
-    within that skew of the launch. W&B serves ``created_at`` as an ISO-8601 string in UTC,
-    with a trailing ``Z`` or no offset.
-
-    :param object run: Public-API run.
-    :param float logged_after: Unix time the rerun launched at.
-    :return bool: Whether ``created_at`` parses and is not before ``logged_after``.
-    """
-    created = getattr(run, "created_at", None)
-    if not isinstance(created, str):
-        return False
-    try:
-        moment = datetime.fromisoformat(created)
-    except ValueError:
-        return False
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=UTC)
-    return moment.timestamp() >= logged_after
-
-
 def _row_count(run: object) -> int | None:
     """Return the number of history rows the service holds for a run.
 
     ``historyLineCount`` arrives in the same ``Api.run`` answer as the state and summary and
-    is exact, also with sparse explicit steps, within a second of a trainer's exit, while the
-    summary and history index can take half a minute.
+    is exact within a second of a trainer's exit, while the summary and history index can
+    take half a minute, so it tells a run that logged no row from one still being ingested.
 
     :param object run: Public-API run.
     :return int | None: The count, or ``None`` when it is not a non-negative integer.
     """
     rows = getattr(run, "historyLineCount", None)
     return rows if type(rows) is int and rows >= 0 else None
-
-
-def _served_history(run: _HistoryReader, rows: int, deadline: float) -> tuple[int, float | None]:
-    """Count the history rows W&B serves for a run and find their latest ``_timestamp``.
-
-    Every logged row carries the logging host's ``_timestamp``. W&B serves history rows up to
-    a minute after ``historyLineCount`` counts them and after the summary shows them, so the
-    served rows say whether a rerun logged only once they number ``rows``. A history below
-    the sample cap is read sampled, which serves every row W&B has; a longer one is scanned,
-    and the scan stops at the history index's last step, which lags too.
-
-    :param _HistoryReader run: Public-API run.
-    :param int rows: The run's row count in the same answer.
-    :param float deadline: ``time.monotonic()`` time after which no read starts.
-    :return tuple[int, float | None]: The served row count and their latest stamp, ``None``
-        when no served row carries one.
-    :raises TimeoutError: The deadline passed before or during the read.
-    """
-    if time.monotonic() >= deadline:
-        raise TimeoutError("W&B history read expired.")
-    read = _read_series(run, ["_timestamp", "_step"], last_step=rows - 1, deadline=deadline)
-    if read is None:
-        raise TimeoutError("W&B history read expired.")
-    stamps = (finite_nonnegative(row.get("_timestamp")) for row in read)
-    return len(read), max((stamp for stamp in stamps if stamp is not None), default=None)
-
-
-def _read_wandb_stamp(
-    *, base_url: str, entity: str, project: str, run_id: str, deadline: float
-) -> dict[str, int | str | None]:
-    """Read a run's row count and state, again while it is still ``running``.
-
-    A trainer ended by a signal closes its session a few seconds after its process exits,
-    with its count still short and its state ``running`` until then, so a ``running`` run is
-    read every ``_STAMP_RETRY_SECONDS`` for up to ``_STAMP_SETTLE_SECONDS`` and the last answer
-    is kept. A session killed outright stays ``running`` and costs that wait.
-
-    :param str base_url: Normalized W&B API endpoint.
-    :param str entity: W&B entity that owns the project.
-    :param str project: W&B project containing the run.
-    :param str run_id: Exact W&B run ID to read.
-    :param float deadline: Absolute ``time.monotonic()`` deadline from the parent.
-    :return dict[str, int | str | None]: ``rows`` and ``state``, both ``None`` when a lookup
-        failed before any answer or the count is unusable.
-    """
-    from wandb.apis.public import Api
-
-    settle = min(deadline, time.monotonic() + _STAMP_SETTLE_SECONDS)
-    stamp: dict[str, int | str | None] = {"rows": None, "state": None}
-    while time.monotonic() < deadline:
-        try:
-            api = Api(
-                overrides={"base_url": base_url},
-                timeout=max(1, math.ceil(deadline - time.monotonic())),
-            )
-            run = api.run(f"{entity}/{project}/{run_id}")
-        except Exception:
-            return stamp
-        rows, state = _row_count(run), getattr(run, "state", None)
-        if rows is None:
-            return {"rows": None, "state": None}
-        stamp = {"rows": rows, "state": state if isinstance(state, str) else None}
-        if state != "running" or time.monotonic() + _STAMP_RETRY_SECONDS > settle:
-            return stamp
-        time.sleep(_STAMP_RETRY_SECONDS)
-    return stamp
 
 
 def _locate_wandb_position(
@@ -1351,7 +1302,7 @@ def _locate_wandb_position(
     from wandb.apis.public import Api
 
     interval = min(poll_seconds, _HISTORY_RETRY_SECONDS)
-    run: Any = None
+    run: _LoadableRun | None = None
     while True:
         read: _HistoryRead = "retry"
         try:
@@ -1397,7 +1348,7 @@ def main(argv: list[str] | None = None) -> int:
     request = json.loads(args.request.read_text(encoding="utf-8"))
     task = request.pop("task")
 
-    response: dict[str, Any]
+    response: dict[str, object]
     try:
         if task == "position":
             response = {"status": "position", "value": _locate_wandb_position(**request)}
@@ -1406,10 +1357,7 @@ def main(argv: list[str] | None = None) -> int:
             # missing keys or a timeout finish before the supervisor's deadline.
             remaining = max(0.0, request["deadline"] - time.monotonic())
             request["deadline"] -= report_reserve(remaining, _REPORT_SECONDS)
-            if task == "stamp":
-                response = {"status": "stamp", **_read_wandb_stamp(**request)}
-            else:
-                response = {"status": "summary", "capture": _poll_wandb_summary(**request)}
+            response = {"status": "summary", "capture": _poll_wandb_summary(**request)}
     except ImportError:
         response = {"status": "import_error"}
     except WandbSetupError as exc:
@@ -1425,8 +1373,6 @@ def main(argv: list[str] | None = None) -> int:
         }
     except WandbRunMissingError:
         response = {"status": "run_missing"}
-    except WandbRunSupersededError:
-        response = {"status": "superseded"}
     except WandbNothingToScoreError as exc:
         response = {"status": "nothing_to_score", "cause": exc.cause}
     except WandbPollTimeout as exc:

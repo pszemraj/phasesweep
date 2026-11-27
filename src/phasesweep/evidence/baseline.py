@@ -70,14 +70,11 @@ class EvidenceBaseline(NamedTuple):
     # A path string records a resolved target with no regular file before launch. None
     # records a target whose prior state could not be inspected.
     files: Mapping[str, FileStamp | str | None]
-    # Unix time just before a rerun's trainer started, which the trial's W&B run must show
-    # a row logged after; None in a directory of the attempt's own, whose run is its own.
+    # Unix time just before a rerun's trainer started, which orders the launches sharing a
+    # directory; None in a directory of the attempt's own.
     launched_at: float | None = None
+    # Where the attempt's own W&B run lives; None for an attempt with no managed W&B run.
     wandb_destination: WandbDestination | None = None
-    # The trial's W&B run's history row count and state just before a rerun's trainer
-    # started (:func:`phasesweep.evidence.wandb.read_wandb_stamp`); None when unread.
-    wandb_rows: int | None = None
-    wandb_state: str | None = None
 
 
 def _extractor_value_path(extractor: ObjectiveExtractor) -> str | None:
@@ -148,15 +145,13 @@ def write_evidence_baseline(
     *,
     reused: bool = False,
     wandb_destination: WandbDestination | None = None,
-    wandb_stamp: tuple[int | None, str | None] = (None, None),
 ) -> EvidenceBaseline:
     """Record where each value path resolves and the stamp of any file there before launch.
 
     Only a directory an earlier attempt used can hold a value file this attempt did not
     write, so a fresh directory records no paths. An I/O error that leaves a file's prior
     state uncertain is recorded for the individual reader to handle after the trainer runs.
-    A reused directory also records the current time, which the W&B run the attempt resumes
-    must log past, and that run's row count and state.
+    A reused directory also records the current time, which orders the launches sharing it.
 
     :param Experiment experiment: Metric, constraints and observations.
     :param Phase phase: Gates of the phase the attempt runs in.
@@ -164,8 +159,6 @@ def write_evidence_baseline(
     :param Path attempt_dir: The attempt's directory, which receives the record.
     :param bool reused: The trial directory already held an interrupted attempt, defaults to False.
     :param WandbDestination | None wandb_destination: Managed tracker location set for the trainer.
-    :param tuple[int | None, str | None] wandb_stamp: The resumed W&B run's row count and
-        state, defaults to unread.
     :raises OSError: The record could not be written, so no trainer may start.
     :return EvidenceBaseline: The baseline, for the attempt's own extraction.
     """
@@ -203,11 +196,9 @@ def write_evidence_baseline(
         },
         "launched_at": launched_at,
         "wandb_destination": None if wandb_destination is None else wandb_destination._asdict(),
-        "wandb_rows": wandb_stamp[0],
-        "wandb_state": wandb_stamp[1],
     }
     atomic_write_text(attempt_dir / EVIDENCE_BASELINE_FILE, json.dumps(payload) + "\n")
-    return EvidenceBaseline(reused, files, launched_at, wandb_destination, *wandb_stamp)
+    return EvidenceBaseline(reused, files, launched_at, wandb_destination)
 
 
 def read_evidence_baseline(attempt_dir: Path) -> EvidenceBaseline:
@@ -230,14 +221,10 @@ def read_evidence_baseline(attempt_dir: Path) -> EvidenceBaseline:
         raise ValueError(f"Evidence baseline {path} is malformed or in another format.")
     reused, files = payload.get("reused"), payload.get("files")
     launched_at = payload.get("launched_at")
-    rows, state = payload.get("wandb_rows"), payload.get("wandb_state")
     if (
         type(reused) is not bool
         or not isinstance(files, dict)
         or "wandb_destination" not in payload
-        or not {"wandb_rows", "wandb_state"} <= payload.keys()
-        or not (rows is None or (type(rows) is int and rows >= 0))
-        or not (state is None or isinstance(state, str))
         or (launched_at is None) == reused
         or not (launched_at is None or (type(launched_at) is float and launched_at > 0))
     ):
@@ -276,11 +263,4 @@ def read_evidence_baseline(attempt_dir: Path) -> EvidenceBaseline:
             raise ValueError(
                 f"Evidence baseline {path} records a malformed W&B destination."
             ) from exc
-    return EvidenceBaseline(
-        reused,
-        baseline,
-        launched_at,
-        destination,
-        rows if type(rows) is int else None,
-        state if isinstance(state, str) else None,
-    )
+    return EvidenceBaseline(reused, baseline, launched_at, destination)

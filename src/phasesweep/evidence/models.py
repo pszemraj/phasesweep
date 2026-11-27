@@ -211,8 +211,8 @@ class _WandbSummarySource(_Frozen):
     entity: str = Field(min_length=1, pattern=r"^[^/\s]+$")
     project: str = Field(min_length=1, pattern=r"^[^/\s]+$")
     poll_seconds: ConfigFloat = Field(default=2.0, gt=0, allow_inf_nan=False)
-    # W&B can serve a finished run's summary minutes after the run finished, longest for a
-    # resumed run, so the default rides out that lag.
+    # W&B can serve a finished run's summary minutes after the run finished, so the default
+    # rides out that lag.
     timeout_seconds: ConfigFloat = Field(default=600.0, ge=1, allow_inf_nan=False)
 
     @property
@@ -521,6 +521,9 @@ class WandbQuery:
     presence_keys: tuple[str, ...]
     constraint_keys: tuple[tuple[str, str], ...] = ()
     gate_keys: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # The objective's summary key when W&B supplies the objective; a rerun's result is
+    # assembled around it from its trial's runs.
+    objective_key: str | None = None
 
 
 def compose_wandb_environment(
@@ -532,8 +535,8 @@ def compose_wandb_environment(
 ) -> dict[str, str]:
     """Bind remote evidence before environment identity, preserving other settings.
 
-    The run ID and resume policy are the attempt's, bound at launch: an attempt that opens
-    its trial directory starts the trial's run, and a rerun in that directory resumes it.
+    The run ID and resume policy are the attempt's, bound at launch: every attempt, a rerun
+    from its trial's checkpoint included, starts a new run named by its attempt ID.
 
     :param WandbQuery query: Phase's agreed target and evidence requirements.
     :param Mapping[str, str] configured: Explicit experiment environment entries.
@@ -554,14 +557,12 @@ def compose_wandb_environment(
                 )
     if "WANDB_RUN_ID" in configured:
         raise ValueError(
-            "env.WANDB_RUN_ID conflicts with the W&B run PhaseSweep sets per trial; remove it."
+            "env.WANDB_RUN_ID conflicts with the W&B run ID PhaseSweep sets per attempt; remove it."
         )
-    # No one value matches both policies: never for the attempt that starts the trial's
-    # run, allow for a rerun that resumes it.
     if "WANDB_RESUME" in configured:
         raise ValueError(
-            "env.WANDB_RESUME conflicts with the resume policy PhaseSweep sets per attempt; "
-            "remove it."
+            "env.WANDB_RESUME conflicts with the resume policy PhaseSweep sets: every attempt "
+            "starts a new W&B run; remove it."
         )
     if require_online and (
         environment.get("WANDB_MODE", "online").lower() in {"offline", "dryrun", "disabled"}

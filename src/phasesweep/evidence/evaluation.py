@@ -48,8 +48,8 @@ from phasesweep.evidence.wandb import (
     WandbMissingKeysError,
     WandbNothingToScoreError,
     WandbPollTimeout,
+    WandbRunAddress,
     WandbRunMissingError,
-    WandbRunSupersededError,
     WandbRunTerminalError,
     WandbSetupError,
     locate_wandb_position,
@@ -488,10 +488,9 @@ class NothingToScoreError(ExtractorError):
     """Raised when an attempt in a directory an earlier attempt used left nothing to score there.
 
     The trainer exited 0, but the value file is missing, or an earlier attempt of the trial
-    wrote it and it does not parse, or the attempt's own captured stream has no match, or the
-    trial's resumed W&B run shows at the deadline no row since the launch and no finished
-    summary that is the trial's result. Such
-    an attempt can never succeed in that directory, which says nothing about the
+    wrote it and it does not parse, or the attempt's own captured stream has no match, or at
+    the deadline its W&B run and its trial's earlier runs leave no result to score. Such an
+    attempt can never succeed in that directory, which says nothing about the
     configuration, so it is owed a rerun in a fresh directory instead of failing.
     """
 
@@ -621,9 +620,6 @@ class TrialContext:
     run_name: str  # "{experiment}-{phase}-{trial_id}-{attempt_id}"
     return_code: int
     duration_seconds: float
-    # The trial's W&B run, which every attempt in trial_dir logs to: the attempt that opened
-    # the directory.
-    wandb_run_id: str
     wandb_environment: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
     wandb_query: WandbQuery | None = None
     wandb_capture: dict[str, Any] = field(default_factory=dict, compare=False)
@@ -636,7 +632,7 @@ class TrialContext:
     # Value paths and file stamps recorded before the attempt ran.
     baseline: EvidenceBaseline | None = field(default=None, compare=False)
     # Configured value paths read so far from a file an earlier attempt of the trial wrote, and
-    # ``wandb:<run id>`` once the W&B capture is a summary an earlier attempt left.
+    # ``wandb:<run id>`` once an earlier attempt's W&B run scored the capture.
     earlier_files: list[str] = field(default_factory=list, compare=False)
     # End of the attributable period for mutable evidence in a directory another attempt reused.
     evidence_before: float | str | None = None
@@ -1012,26 +1008,60 @@ def _extract_log_regex(
     return result
 
 
+def _earlier_wandb_runs(ctx: TrialContext) -> list[WandbRunAddress]:
+    """Name the W&B runs of the earlier attempts that trained in the trial's directory.
+
+    Each attempt logs to a run named by its attempt ID, at the destination its launch
+    recorded. An earlier attempt that recorded no managed destination logged no run to read.
+
+    :param TrialContext ctx: Attempt naming its earlier attempts, oldest first.
+    :raises ExtractorError: An earlier attempt's launch record is unreadable.
+    :return list[WandbRunAddress]: The earlier runs, oldest first.
+    """
+    runs: list[WandbRunAddress] = []
+    for _, attempt_id in ctx.earlier_attempts:
+        directory = ctx.attempt_dir.with_name(attempt_id)
+        if not (directory / EVIDENCE_BASELINE_FILE).is_file():
+            continue
+        try:
+            recorded = read_evidence_baseline(directory).wandb_destination
+        except ValueError as exc:
+            raise ExtractorError(
+                f"The W&B run of earlier attempt {attempt_id} cannot be located: {exc}"
+            ) from exc
+        if recorded is not None:
+            runs.append(
+                {
+                    "base_url": recorded.base_url,
+                    "entity": recorded.entity,
+                    "project": recorded.project,
+                    "run_id": attempt_id,
+                }
+            )
+    return runs
+
+
 def _capture_wandb(
     ctx: TrialContext, cfg: _WandbSummarySource, *, deadline: float | None = None
 ) -> dict[str, Any]:
     """Share one W&B capture or capture failure between the attempt's consumers.
 
+    The attempt's own run is the capture's identity. A rerun's capture is assembled from that
+    run and the runs of its trial's earlier attempts (:func:`poll_wandb_summary`); one an
+    earlier run scored lists that run in ``ctx.earlier_files``.
+
     :param TrialContext ctx: Trial identity and optional shared query/capture.
     :param _WandbSummarySource cfg: Source for a one-off query if needed.
     :param float | None deadline: Absolute monotonic deadline, also bounded by the source timeout.
-    :raises DeadlineExceededError: The execution deadline prevents capture.
+    :raises DeadlineExceededError: The execution deadline prevents capture, or cut short the
+        poll that a deadline verdict needs.
     :raises EvidenceUnreadableError: W&B gave no answer: authentication or setup failed, the
-        SDK is missing, the reader worker failed, or the last poll failed in transport, found
-        a finished summary still being ingested, or found a rerun's run still showing only an
-        earlier attempt's summary.
-    :raises ExtractorError: The run is missing, ended unsuccessfully or never finished, was
-        reused by a later attempt, the finished summary lacks required keys, or evidence is
-        invalid; a :class:`NothingToScoreError` when at the deadline a rerun's resumed run
-        shows no row since its launch and no finished summary that is the trial's result. A
-        summary judged the trial's result that way is captured and lists the run in
-        ``ctx.earlier_files``; either verdict is a :class:`DeadlineExceededError` when the
-        execution deadline cut the poll short.
+        SDK is missing, the reader worker failed, or the last poll failed in transport or found
+        a finished summary still being ingested.
+    :raises ExtractorError: The run is missing, ended unsuccessfully or never finished, no
+        run's summary holds a required key, or evidence is invalid; a
+        :class:`NothingToScoreError` when at the deadline a rerun's run and its trial's earlier
+        runs leave no result to score.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     :return dict: Finished run identity, numeric values, present keys, and retrieval time.
     """
@@ -1043,14 +1073,14 @@ def _capture_wandb(
         cfg,
         (cfg.metric_key,) if isinstance(cfg, WandbExtractor) else (),
         tuple(cfg.keys) if isinstance(cfg, WandbSummaryRequiredGate) else (),
+        objective_key=cfg.metric_key if isinstance(cfg, WandbExtractor) else None,
     )
     source = query.source
-    run_id = ctx.wandb_run_id
+    run_id = ctx.attempt_id
     poll_deadline = time.monotonic() + source.timeout_seconds
     capped = deadline is not None and deadline <= poll_deadline
     if deadline is not None:
         poll_deadline = min(poll_deadline, deadline)
-    evidence_before = ctx.evidence_before
     try:
         destination = source.destination if ctx.baseline is None else ctx.baseline.wandb_destination
         if destination is None:
@@ -1058,26 +1088,7 @@ def _capture_wandb(
                 f"Attempt {ctx.attempt_id!r} had no managed W&B destination at launch."
             )
         target = f"{destination.base_url}/{destination.entity}/{destination.project}/{run_id}"
-        if isinstance(evidence_before, str):
-            raise ExtractorError(
-                f"W&B run {target} cannot be attributed to this attempt: {evidence_before}."
-            )
         try:
-            logged_after = None if ctx.baseline is None else ctx.baseline.launched_at
-            resume_axis = source.evaluation_axis if isinstance(source, WandbExtractor) else "_step"
-            earlier_launches: list[float] = []
-            if (
-                logged_after is not None
-                and resume_axis != "_step"
-                and any(key.endswith((".min", ".max")) for key in query.numeric_keys)
-            ):
-                for _, attempt_id in ctx.earlier_attempts:
-                    directory = ctx.attempt_dir.with_name(attempt_id)
-                    if attempt_id == run_id or not (directory / EVIDENCE_BASELINE_FILE).is_file():
-                        continue
-                    launched_at = read_evidence_baseline(directory).launched_at
-                    if launched_at is not None:
-                        earlier_launches.append(launched_at)
             worker_id, worker_dir = ctx.process_slot
             capture = poll_wandb_summary(
                 base_url=destination.base_url,
@@ -1090,21 +1101,21 @@ def _capture_wandb(
                 timeout_seconds=source.timeout_seconds,
                 required_keys=query.numeric_keys,
                 presence_keys=query.presence_keys,
-                logged_after=logged_after,
-                logged_before=evidence_before,
-                earlier_launches=tuple(earlier_launches),
-                resume_axis=resume_axis,
-                launch_rows=None if ctx.baseline is None else ctx.baseline.wandb_rows,
-                launch_state=None if ctx.baseline is None else ctx.baseline.wandb_state,
+                objective_key=query.objective_key,
+                earlier=_earlier_wandb_runs(ctx),
+                evaluation_axis=(
+                    source.evaluation_axis if isinstance(source, WandbExtractor) else "_step"
+                ),
                 environment=ctx.wandb_environment,
                 deadline=poll_deadline,
             )
-            # A rerun's run judged at the deadline, so an execution deadline that was the
-            # binding limit cut the wait short instead.
-            if capped and capture.get("earlier_attempt") is True:
+            # The worker's marks are not part of the stored capture. A capture decided at the
+            # poll's deadline, when an execution deadline was the binding limit, was cut short.
+            deadline_verdict = capture.pop("deadline_verdict", None) is True
+            if capped and deadline_verdict:
                 raise DeadlineExceededError(
-                    f"W&B run {target} still showed only an earlier attempt's summary when the "
-                    "phase or run deadline ended its evidence read."
+                    f"W&B run {target} had not settled its trial's result when the phase or run "
+                    "deadline ended its evidence read."
                 )
         except (WandbPollTimeout, WandbRunMissingError) as exc:
             unanswered = isinstance(exc, WandbPollTimeout) and not exc.reached
@@ -1143,11 +1154,6 @@ def _capture_wandb(
             raise ExtractorError(
                 f"W&B run {target} ended in {exc.state!r}; only finished runs can provide evidence."
             ) from exc
-        except WandbRunSupersededError as exc:
-            raise ExtractorError(
-                f"W&B run {target} was reused by another attempt and its current summary "
-                "cannot be attributed to this attempt."
-            ) from exc
         # A verdict reached only at the deadline, so an execution deadline that was the binding
         # limit cut the wait short instead.
         except WandbNothingToScoreError as exc:
@@ -1172,16 +1178,16 @@ def _capture_wandb(
     except ExtractorError as exc:
         ctx.wandb_capture_failure.append(exc)
         raise
-    # The worker's mark that the summary is an earlier attempt's discloses the trial's result
-    # the way an earlier attempt's value file does, and is not part of the stored capture.
-    if capture.pop("earlier_attempt", None) is True:
-        ctx.earlier_files.append(f"wandb:{run_id}")
+    # An earlier run that scored the capture discloses the trial's result the way an earlier
+    # attempt's value file does.
+    source_run = capture.pop("earlier_attempt", None)
+    if isinstance(source_run, str):
+        ctx.earlier_files.append(f"wandb:{source_run}")
     ctx.wandb_capture.update(
         {
             "kind": "wandb",
             **destination._asdict(),
             "run_id": run_id,
-            "run_state": "finished",
             "constraint_keys": dict(query.constraint_keys),
             "gate_keys": {identity: list(keys) for identity, keys in query.gate_keys},
             **capture,
@@ -1217,9 +1223,13 @@ def _extract_wandb(
     if not math.isfinite(value):
         raise ExtractorError(f"W&B key {cfg.metric_key!r} is non-finite.")
     if provenance is not None:
+        # Only the objective records provenance; the run that supplied it is the attempt's own
+        # unless an earlier attempt's run scored the capture.
+        marks = [mark for mark in ctx.earlier_files if mark.startswith("wandb:")]
         provenance["source"] = {
             "kind": "wandb",
             "metric_key": cfg.metric_key,
+            "run_id": marks[0].removeprefix("wandb:") if marks else capture["run_id"],
             "evaluation": {"progress": {"axis": cfg.evaluation_axis, "value": None}},
         }
         provenance["remote_capture"] = dict(capture)
@@ -1249,12 +1259,18 @@ def locate_objective_position(
         return
     progress = provenance["source"]["evaluation"]["progress"]
     capture = provenance["remote_capture"]
+    # The position is read in the run whose summary supplied the objective.
+    source_run = provenance["source"]["run_id"]
+    location = next(
+        (run for run in _earlier_wandb_runs(ctx) if run["run_id"] == source_run),
+        capture,
+    )
     worker_id, worker_dir = ctx.process_slot
     progress["value"] = locate_wandb_position(
-        base_url=capture["base_url"],
-        entity=capture["entity"],
-        project=capture["project"],
-        run_id=ctx.wandb_run_id,
+        base_url=location["base_url"],
+        entity=location["entity"],
+        project=location["project"],
+        run_id=source_run,
         attempt_id=worker_id,
         attempt_dir=worker_dir,
         poll_seconds=cfg.poll_seconds,

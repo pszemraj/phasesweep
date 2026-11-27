@@ -233,7 +233,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
         winner = winners[phase.name]
         capture = winner.objective_provenance["remote_capture"]
         assert capture["run_id"] == winner.attempt_id
-        assert capture["run_state"] == "finished"
+        assert "run_state" not in capture
         assert "secret" not in json.dumps(capture)
         if consumers in {"primary", "combined"}:
             assert winner.objective_provenance["source"]["evaluation"] == {

@@ -1899,4 +1899,9 @@ def _wandb_query(
             for gate in gates
             if isinstance(gate, WandbSummaryRequiredGate)
         ),
+        objective_key=(
+            experiment.metric.extractor.metric_key
+            if isinstance(experiment.metric.extractor, WandbExtractor)
+            else None
+        ),
     )

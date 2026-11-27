@@ -25,7 +25,7 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.ledger import open_registry_study
 from phasesweep.engine.optuna import _finished_trial_count
-from phasesweep.engine.paths import _attempt_dir, _attempts_dir, _experiment_dir, _trial_dir_opener
+from phasesweep.engine.paths import _attempt_dir, _attempts_dir, _experiment_dir
 from phasesweep.engine.progress import _log_recovered_trial, _warn_deferred_extraction
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.state import (
@@ -1223,8 +1223,6 @@ def read_finished_attempt(
     :param float | None deadline: Absolute deadline for evidence extraction, defaults to None.
     :param str | None reader_generation_id: Generation re-reading a terminal trial, which
         registers its own remote reader. Recovery of a RUNNING trial already owns the attempt slot.
-    :raises ProcessCleanupUncertainError: The attempt records an unusable trial directory, so
-        the run its trial logs to cannot be named.
     :raises StudyStorageUnavailableError: The trial lacks its recorded trainer input or overrides.
     :return tuple[TrialResult, str]: The extraction result and the trial's recorded overrides.
     """
@@ -1245,14 +1243,6 @@ def read_finished_attempt(
         raise StudyStorageUnavailableError(
             f"Attempt {record.attempt_id} records no trial directory or generation to read."
         )
-    try:
-        wandb_run_id = _trial_dir_opener(record.trial_dir)
-    except ValueError as exc:
-        raise ProcessCleanupUncertainError(
-            f"Attempt {record.attempt_id} records an unusable trial directory, so the run its "
-            f"trial logs to cannot be named: {exc}.",
-            action=OperatorAction.RESTORE_LEDGER,
-        ) from exc
     environment = _environment_identity(
         producing, record.phase_name, require_wandb_online=False
     ).values
@@ -1282,7 +1272,6 @@ def read_finished_attempt(
         run_name=trial_run_name(producing, record.phase_name, trial.number, record.attempt_id),
         return_code=0,
         duration_seconds=trainer_duration,
-        wandb_run_id=wandb_run_id,
         mlflow_settings=(
             None if producing.mlflow is None else producing.mlflow.target(polling=current.mlflow)
         ),
@@ -1355,8 +1344,7 @@ def _recover_completed_trial(
     :raises TrackingTargetUnavailableError: The tracker gave no answer and no report
         collects the pending attempt for a refusal after the pass.
     :raises ProcessCleanupUncertainError: The attempt or a source the rerun continued records
-        a malformed directory, so the trial's W&B run or the attempts whose histories it
-        continues cannot be named.
+        a malformed directory, so the attempts whose histories it continues cannot be named.
     """
     from phasesweep.engine.evidence import _earlier_attempts
     from phasesweep.engine.ledger import phase_studies_for
