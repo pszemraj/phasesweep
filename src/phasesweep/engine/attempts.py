@@ -104,9 +104,10 @@ class _PreflightCleanupReport:
     """Completed attempts left RUNNING because their tracker gave no answer, each with its
     failure."""
     unreadable_tracker: str | None = None
-    """First reason a tracker could not be read in this pass, from an extraction or the run
-    that just stopped on it. Once set, later extractions in the pass skip their read, so an
-    outage costs one read."""
+    """First reason a tracker cannot be read in this pass: an extraction's failure, or the run
+    that just stopped on an unreadable tracker or a spent wallclock budget. Once set, later
+    extractions in the pass skip their read, so an outage costs one read and a spent budget
+    none."""
     error: BaseException | None = None
     process_actions: dict[_AttemptRecord, bool] = field(default_factory=dict)
     """Inspected attempts mapped to whether their live group needs termination."""
@@ -1383,8 +1384,8 @@ def _recover_completed_trial(
         )
         return None
     if report is not None and report.unreadable_tracker is not None:
-        # This pass already found a tracker unreadable; keep the training without
-        # spending another read's timeout on it.
+        # This pass already found a tracker unreadable or the run's budget spent; keep the
+        # training without spending another read's timeout on it.
         report.unreadable_evidence.setdefault(record.attempt_id, report.unreadable_tracker)
         _warn_deferred_extraction(
             record.attempt_id, record.phase_name, trial.number, persistent=True

@@ -33,6 +33,7 @@ from phasesweep.config.models import (
 from phasesweep.engine.artifact_roots import _artifact_path_mode
 from phasesweep.engine.errors import (
     IncompleteJournalRecordError,
+    PhaseTimeoutError,
     StudyStorageUnavailableError,
     TrackingTargetUnavailableError,
 )
@@ -426,9 +427,10 @@ def _run_experiment_outcome(
             if generation.claimed:
                 # Only a claimed generation launched work whose studies need reconciling.
                 reconciliation = attempt_ops._PreflightCleanupReport()
-                if isinstance(exc, TrackingTargetUnavailableError):
-                    # The run just found its tracker unreadable; keep pending training
-                    # without spending another read's timeout before reporting it.
+                if isinstance(exc, (TrackingTargetUnavailableError, PhaseTimeoutError)):
+                    # The run just found its tracker unreadable or spent its budget; keep
+                    # pending training for the next run's read instead of spending another
+                    # read's timeout here, so the close confirms process cleanup only.
                     reconciliation.unreadable_tracker = str(exc)
                 try:
                     guard_ops._reconcile_existing_studies(
