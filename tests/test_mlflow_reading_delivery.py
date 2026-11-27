@@ -64,10 +64,12 @@ def _run_shows(uploads: list[JsonObject], attempt: str) -> tuple[object, object,
     """
     sent = [upload for upload in uploads if upload["binding"]["attempt_id"] == attempt]
     readings = [upload for upload in sent if upload["name"] == f"attempt-{attempt}"]
-    status = [upload["finish"] for upload in readings if upload["finish"]][-1]
+    # A historical upload adds metric points only; status and artifact stay the newest reading's.
+    current = [upload for upload in readings if not upload.get("historical")]
+    status = [upload["finish"] for upload in current if upload["finish"]][-1]
     newest = max(readings, key=lambda upload: upload["projection"]["timestamp"])
     objective = newest["projection"]["metrics"]["phasesweep.objective"]
-    return status, objective, readings[-1]["projection"]["summary"]["metric"]
+    return status, objective, current[-1]["projection"]["summary"]["metric"]
 
 
 def _silent_tracker(outage: pytest.MonkeyPatch) -> None:
@@ -140,7 +142,11 @@ def test_scoped_sync_delivers_an_equivalent_older_pending_attempt(tmp_path, monk
 
 
 def test_rebuilding_an_older_generations_records_keeps_the_newer_reading(tmp_path, monkeypatch):
-    """Records rebuilt for a generation that has none left take its lifecycle record's time."""
+    """Records rebuilt for a generation that has none left take its lifecycle record's time.
+
+    Nothing on disk shows that their older, distinct readings reached the runs, so they go as
+    metric history, which leaves each run showing the newer reading.
+    """
     config, uploads, attempt = _reread_setup(tmp_path, monkeypatch)
     reports: list[TerminalReport] = []
     experiment = Experiment.model_validate(config)
@@ -159,7 +165,10 @@ def test_rebuilding_an_older_generations_records_keeps_the_newer_reading(tmp_pat
         session.tracking_root(experiment) / first / "delivery" / f"attempt-{attempt}.json"
     )
     assert rebuilt["state"] == "delivered"
-    assert {upload["name"] for upload in uploads[before:]} == {"winner-depth", "generation"}
+    sent = uploads[before:]
+    assert {upload["name"] for upload in sent} >= {"winner-depth", "generation"}
+    assert all(upload["historical"] for upload in sent if upload["name"].startswith("attempt-"))
+    assert f"attempt-{attempt}" in {upload["name"] for upload in sent}
     assert _run_shows(uploads, attempt) == ("FINISHED", 3.0, 3.0)
 
 
@@ -423,6 +432,34 @@ def test_sync_discovers_a_superseded_publication_with_no_tracking_directory(
     assert summary["finish"] == "FINISHED"
     assert summary_binding_path(reread, earlier).is_file()
     assert session.read_record(delivery / "winner-depth.json")["state"] == "delivered"
+
+
+def test_an_older_distinct_reading_lost_to_a_kill_reaches_the_runs_metric_history(
+    tmp_path, monkeypatch
+):
+    """Sync sends an older reading with another objective as history; a second sync sends nothing."""
+    config, uploads, attempt = _reread_setup(tmp_path, monkeypatch)
+    original = deepcopy(config)
+    original["metric"]["extractor"]["metric_key"] = "eval/loss"
+    reread, restored = Experiment.model_validate(config), Experiment.model_validate(original)
+    older, newer = "f" * 32, "0" * 32  # sync saves the newer generation's records first
+    with monkeypatch.context() as killed:
+        killed.setattr(publication, "deliver_closeout", lambda *args, **kwargs: None)
+        assert run_experiment(reread, generation_id=older)["depth"].metric == 3.0
+        assert run_experiment(restored, generation_id=newer)["depth"].metric == 1.0
+    uploads.clear()
+
+    assert publication.sync_tracking(restored)["pending"] == 0
+    record = session.read_record(session.delivery_record_path(reread, older, f"attempt-{attempt}"))
+    history = [
+        (upload["historical"], upload["projection"]["metrics"]["phasesweep.objective"])
+        for upload in uploads
+        if upload["name"] == f"attempt-{attempt}"
+    ]
+    assert (record["state"], history) == ("delivered", [(True, 3.0)])
+    sent = len(uploads)
+    assert publication.sync_tracking(restored)["pending"] == 0
+    assert len(uploads) == sent
 
 
 @pytest.mark.parametrize("delivered", [True, False], ids=["delivered-failed", "trainer-failed"])

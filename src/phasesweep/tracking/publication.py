@@ -766,7 +766,7 @@ def _save_attempt_intents(
     native status to the trainer. Unreadable trials and uncertain cleanup remain unresolved, as
     do RUNNING trials of a persistent study, whose outcome recovery has yet to record, and
     attempts whose trial a persistent ledger does not hold. A record whose run already shows
-    its content, or a newer reading, is saved delivered and never sent.
+    its content, or an older one adding no metric history, is saved delivered and never sent.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Generation whose rows ``trials`` holds.
@@ -800,22 +800,19 @@ def _save_attempt_intents(
         """Save one record, delivered when its run shows it or a newer reading already.
 
         A run an earlier reading selected shows the winner tag, so a reading that does not
-        select it is sent to remove the tag even when it changes nothing else. An equivalent
-        pending upload applies the newest verdict on retry.
+        select it is sent to remove the tag even when it changes nothing else. A reading older
+        than its run's newest sends only its metrics, as history, so it is sent unless it has
+        none or repeats that reading. An equivalent pending upload applies the newest verdict.
         """
         if timestamp is not None:
             projection["timestamp"] = timestamp
         newest = None if shown is None else shown.get(binding["attempt_id"])
+        older = newest is not None and newest.timestamp > projection["timestamp"]
+        same = newest is not None and newest.content == _content(projection, finish)
+        tagged = newest is None or not newest.winner or WINNER_TAG in projection["tags"]
         state: Literal["pending", "delivered"] = (
             "delivered"
-            if newest is not None
-            and (
-                newest.timestamp > projection["timestamp"]
-                or (
-                    newest.content == _content(projection, finish)
-                    and (not newest.winner or WINNER_TAG in projection["tags"])
-                )
-            )
+            if (older and (same or not projection["metrics"])) or (same and tagged)
             else "pending"
         )
         return _save_intent(

@@ -612,7 +612,7 @@ def test_sync_rebuilds_accepted_attempt_records_from_the_ledger(tmp_path, monkey
 
 @pytest.mark.integration
 def test_each_generation_delivers_its_own_reading_of_a_reread_attempt(tmp_path, monkeypatch):
-    """A reread generation sends its objective; a rebuilt older record keeps its own and is not resent."""
+    """A reread generation sends its objective; a rebuilt older record keeps its own, as history."""
     config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config.update(storage="auto", phases=config["phases"][:1])
     respond = worker.request_operation
@@ -660,7 +660,7 @@ def test_each_generation_delivers_its_own_reading_of_a_reread_attempt(tmp_path, 
     assert rebuilt["projection"]["metrics"]["phasesweep.objective"] == 1.0
     assert rebuilt["projection"]["timestamp"] < newer["projection"]["timestamp"]
     assert rebuilt["state"] == "delivered"
-    assert [upload["name"] for upload in uploads] == []
+    assert [(u["name"], u["historical"]) for u in uploads] == [(record.stem, True)]
 
 
 def test_the_run_that_confirms_an_attempts_cleanup_finishes_its_managed_run(tmp_path, monkeypatch):
