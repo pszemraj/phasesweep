@@ -151,6 +151,72 @@ def test_native_extrema_reduce_over_the_trial_runs(
     assert paths == ["e/p/rerun", "e/p/opener"]
 
 
+@pytest.mark.parametrize(("axis", "expected"), [("eval/step", (0.05, 0.8)), ("_step", (0.01, 1.0))])
+def test_borrowed_extrema_reduce_across_attempts(
+    monkeypatch: pytest.MonkeyPatch, axis: str, expected: tuple[float, float]
+) -> None:
+    """A borrowed constraint uses all retained rows on a trainer axis, or all summaries on _step."""
+    low, high = "eval/loss.min", "eval/loss.max"
+    runs = {
+        "opener": _run(
+            "killed",
+            {"_step": 3, low: 0.01, high: 1.0},
+            _rows(0.4, 0.05, 0.01, 1.0, axis=(10, 20, 30, 35)),
+        ),
+        "second": _run("killed", {"_step": 1, low: 0.2, high: 0.3}, _rows(0.2, 0.3, axis=(25, 40))),
+        "rerun": _run("finished", {"_step": 0, "x": 0.7}, _rows(0.8, axis=(35,))),
+    }
+    _serve(monkeypatch, runs)
+    capture = _poll("opener", "second", required=("x", low, high), evaluation_axis=axis)
+    assert capture["values"] == {"x": 0.7, low: expected[0], high: expected[1]}
+    assert capture["deadline_verdict"] is True
+
+
+def test_a_borrowed_literal_dotted_key_keeps_its_summary_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dotted series logged by the key's source is a literal even when the rerun omits it."""
+    key = "cost.max"
+    _serve(
+        monkeypatch,
+        {
+            "opener": _run("killed", {key: 100}),
+            "second": _run("killed", {"_step": 0, key: 30}, ({"_step": 0, key: 30},)),
+            "rerun": _run("finished", {"x": 1.0}),
+        },
+    )
+    assert _poll("opener", "second", required=("x", key))["values"] == {"x": 1.0, key: 30}
+
+
+def test_summary_extrema_with_only_one_measured_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An initial attempt with no extrema leaves the rerun's minimum and maximum intact."""
+    low, high = "eval/loss.min", "eval/loss.max"
+    _serve(
+        monkeypatch,
+        {
+            "opener": _run("killed", {"params": 3}),
+            "rerun": _run("finished", {"_step": 1, low: 0.2, high: 0.8}, _rows(0.2, 0.8)),
+        },
+    )
+    result = _poll("opener", required=(low, high), objective_key=low)
+    assert result["values"] == {low: 0.2, high: 0.8}
+    assert "deadline_verdict" not in result
+
+
+def test_borrowed_extremum_with_no_retained_finite_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A rollback replacing the whole series with NaN cannot score from the abandoned prefix."""
+    key = "eval/loss.min"
+    _serve(
+        monkeypatch,
+        {
+            "opener": _run("killed", {"_step": 0, key: 0.1}, _rows(0.1, axis=(10,))),
+            "rerun": _run("finished", {"_step": 0, "x": 0.2}, _rows(float("nan"), axis=(10,))),
+        },
+    )
+    with pytest.raises(ValueError, match="no finite observation in the retained history"):
+        _poll("opener", required=("x", key), evaluation_axis="eval/step")
+
+
 def _late_runs(
     opener_summary: dict[str, object], on_read: Callable[[list[str]], None] | None = None
 ) -> tuple[dict[str, SimpleNamespace], list[dict[str, int | float]]]:

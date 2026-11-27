@@ -750,8 +750,8 @@ def _attempt_series(
 
 
 def _merged_extrema(
-    scoring: _Run,
-    older: Sequence[_Run],
+    runs: Sequence[_Run],
+    sources: Mapping[str, int],
     values: Mapping[str, float],
     *,
     axis: str,
@@ -770,24 +770,27 @@ def _merged_extrema(
     fully served yet. A closed earlier run in that state leaves the read pending. An earlier
     run that is not closed may never receive its last rows and is read as W&B holds it.
 
-    :param _Run scoring: The run whose summary supplied ``values``.
-    :param Sequence[_Run] older: The trial's runs before it, oldest first.
-    :param Mapping[str, float] values: Finite values from the scoring run's summary.
+    :param Sequence[_Run] runs: The trial's runs through the scoring run, oldest first.
+    :param Mapping[str, int] sources: Index of the newest run holding each required value.
+    :param Mapping[str, float] values: Finite summary values from those runs.
     :param str axis: Trainer's progress key, or ``_step`` for none.
     :param float deadline: Monotonic deadline for history queries.
     :return tuple[dict[str, float], bool]: Reduced extrema keyed by their exact summary
         names, and whether a run's served rows did not reproduce its summary aggregate.
     :raises TimeoutError: History could not be read before the deadline.
-    :raises _RetainedHistoryError: A run's series rows cannot be placed on the axis.
+    :raises _RetainedHistoryError: A run's series rows cannot be placed on the axis or the
+        retained series has no finite observation.
     :raises _NoAnswer: A closed earlier run's keyed history does not reproduce its aggregate.
     """
-    last_step = _last_history_step(scoring) or 0
     operations: dict[str, list[str]] = {}
     for key in values:
         series, _, operation = key.rpartition(".")
         if not series or operation not in {"min", "max"}:
             continue
-        literal = _contains_series(scoring, key, last_step=last_step, deadline=deadline, scan=True)
+        source = runs[sources[key]]
+        literal = _contains_series(
+            source, key, last_step=_last_history_step(source) or 0, deadline=deadline, scan=True
+        )
         if literal is None:
             raise TimeoutError("W&B history read expired.")
         if not literal:
@@ -800,7 +803,6 @@ def _merged_extrema(
     reduced: dict[str, float] = {}
     unsettled = False
     for series, kinds in operations.items():
-        runs = (*older, scoring)
         histories = (
             []
             if axis == "_step"
@@ -815,11 +817,12 @@ def _merged_extrema(
         for operation in kinds:
             key = f"{series}.{operation}"
             reduce = min if operation == "min" else max
+            source_index = sources[key]
             if axis == "_step":
-                numbers = (_summary_number(run, key) for run in older)
-                reduced[key] = reduce(values[key], *(n for n in numbers if n is not None))
+                numbers = (_summary_number(run, key) for run in runs[:source_index])
+                reduced[key] = reduce([values[key], *(n for n in numbers if n is not None)])
                 continue
-            for run, rows in zip(older, finite[:-1], strict=True):
+            for run, rows in zip(runs[:-1], finite[:-1], strict=True):
                 number = _summary_number(run, key)
                 if (
                     run.state in _CLOSED_STATES
@@ -829,9 +832,13 @@ def _merged_extrema(
                     raise _NoAnswer(
                         f"A closed earlier run's history does not yet reproduce {key!r}."
                     )
-            if reproduces(finite[-1], values[key], reduce):
+            if reproduces(finite[source_index], values[key], reduce):
+                if not retained:
+                    raise _RetainedHistoryError(
+                        f"W&B metric {key!r} has no finite observation in the retained history."
+                    )
                 reduced[key] = reduce(retained)
-            else:
+            elif source_index == len(runs) - 1:
                 unsettled = True
     return reduced, unsettled
 
@@ -877,38 +884,30 @@ def _score(
             and not _summary_matches_history(run, run.summary_metrics)
         ):
             raise _NoAnswer("A closed earlier run's summary does not yet match its history index.")
-    summary = scoring.summary_metrics
+    runs = (*older, scoring)
     values: dict[str, float] = {}
-    own: dict[str, float] = {}
+    sources: dict[str, int] = {}
     missing: list[str] = []
     borrowed: list[str] = []
     for key in required:
-        holder = next(
-            (
-                run.summary_metrics
-                for run in (scoring, *reversed(older))
-                if key in run.summary_metrics
-            ),
-            None,
+        source_index = next(
+            (i for i in reversed(range(len(runs))) if key in runs[i].summary_metrics), None
         )
-        if holder is None:
+        if source_index is None:
             missing.append(key)
             continue
-        value = json_float(holder[key], label=key)
+        value = json_float(runs[source_index].summary_metrics[key], label=key)
         if not math.isfinite(value):
             raise ValueError(f"W&B metric {key!r} is non-finite.")
         values[key] = value
-        if key in summary:
-            own[key] = value
-        else:
+        sources[key] = source_index
+        if source_index < len(older):
             borrowed.append(key)
     unsettled = False
     if older and not missing:
-        reduced, unsettled = _merged_extrema(scoring, older, own, axis=axis, deadline=deadline)
+        reduced, unsettled = _merged_extrema(runs, sources, values, axis=axis, deadline=deadline)
         values.update(reduced)
-    present = sorted(
-        key for key in presence if any(key in run.summary_metrics for run in (scoring, *older))
-    )
+    present = sorted(key for key in presence if any(key in run.summary_metrics for run in runs))
     return _Scored(values, present, missing, borrowed, unsettled)
 
 
