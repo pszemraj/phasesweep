@@ -181,6 +181,21 @@ def reading_settings(experiment: Experiment, phase: Phase) -> JsonObject:
     return {**_experiment_reading(experiment), **json_object(gates)}
 
 
+def extracted_reading(reading: JsonObject) -> JsonObject:
+    """Return the part of recorded reading settings that says what a trial's evidence reads as.
+
+    The metric's goal only ranks the values read, so two readings that differ in nothing else
+    extract the same results from the same evidence (:mod:`phasesweep.engine.reread`).
+
+    :param JsonObject reading: Reading settings as :func:`reading_settings` returns them.
+    :return JsonObject: The settings without the metric's goal.
+    """
+    metric = reading.get("metric")
+    if not isinstance(metric, dict):
+        return reading
+    return {**reading, "metric": {key: value for key, value in metric.items() if key != "goal"}}
+
+
 def with_reading_of(
     experiment: Experiment, phase: Phase, source: Experiment
 ) -> tuple[Experiment, Phase]:

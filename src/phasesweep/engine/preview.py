@@ -24,7 +24,11 @@ from phasesweep.engine.artifact_roots import (
     _check_published_phase_studies,
 )
 from phasesweep.engine.cleanup import project_stale_trials
-from phasesweep.engine.errors import StudyStorageUnavailableError, TrialTargetRefusedError
+from phasesweep.engine.errors import (
+    StudyStorageUnavailableError,
+    TrialEvidenceMissingError,
+    TrialTargetRefusedError,
+)
 from phasesweep.engine.evidence import _validate_selection_evidence
 from phasesweep.engine.fingerprints import (
     CarriesOverrides,
@@ -687,7 +691,16 @@ def _preview_adoption(
                     "phase=%s is refused if every re-read %s: %s", phase.name, outcome, judged
                 )
     finished = _finished_trial_count(study.get_trials(deepcopy=False))
-    if recorded.study is not None and recorded.study.get_trials(deepcopy=False):
+    if plan.adoption.carried:
+        # Every re-read and launch fails in this projection, so its only candidates are the rows
+        # copied as recorded, which the run checks once it has adopted them.
+        try:
+            _validate_selection_evidence(experiment, {phase.name: plan.failed})
+        except TrialEvidenceMissingError as exc:
+            if not placeholder:
+                raise
+            warn_dry_run("phase=%s is refused if every re-read fails: %s", phase.name, exc)
+    elif recorded.study is not None and recorded.study.get_trials(deepcopy=False):
         _validate_selection_evidence(experiment, {phase.name: recorded.study})
     if plan.partial or high_or_unknown == 0:
         log.info(

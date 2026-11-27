@@ -30,7 +30,7 @@ from phasesweep.evidence.evaluation import (
     run_extractor,
 )
 from phasesweep.evidence.mlflow import merge_histories, select_observation
-from phasesweep.evidence.models import MlflowExtractor, WandbExtractor
+from phasesweep.evidence.models import MlflowExtractor, WandbExtractor, WandbSummaryRequiredGate
 from tests.conftest import make_experiment, make_trial_context, phase_trials, write_trainer
 from tests.tracking_helpers import (
     ManualClock,
@@ -69,26 +69,26 @@ def test_sibling_retry_replaces_tracker_history_before_recovery_and_reread(
         """,
     )
 
-    def config(key: str, target: int, *, maximize: bool = False) -> Experiment:
+    source = {"entity": "e", "project": "p", "base_url": "https://example.test"}
+    timing = {"poll_seconds": 0.01, "timeout_seconds": 2}
+
+    def config(key: str, target: int, *, gated: bool = False) -> Experiment:
+        # A gate changes what the kept attempts' evidence reads as, so a gated study re-reads.
+        gate = WandbSummaryRequiredGate(
+            type="wandb_summary_required", keys=[_KEY], **source, **timing
+        )
         return make_experiment(
             persistent=tmp_path,
             trainer=trainer,
             metric=Metric(
-                goal="maximize" if maximize else "minimize",
                 extractor=WandbExtractor(
-                    type="wandb",
-                    entity="e",
-                    project="p",
-                    base_url="https://example.test",
-                    metric_key=key,
-                    evaluation_axis="eval/step",
-                    poll_seconds=0.01,
-                    timeout_seconds=2,
+                    type="wandb", metric_key=key, evaluation_axis="eval/step", **source, **timing
                 ),
             ),
             n_trials=target,
             search_space={},
             gpu_policy="none",
+            gates=[gate] if gated else [],
         )
 
     with pytest.raises(NoFeasibleTrialError):
@@ -116,6 +116,7 @@ def test_sibling_retry_replaces_tracker_history_before_recovery_and_reread(
             return _poll(
                 logged_after=after,
                 logged_before=options.get("logged_before"),
+                presence_keys=options.get("presence_keys", ()),
                 earlier_launches=epochs,
                 resume_axis="eval/step",
             )
@@ -127,7 +128,7 @@ def test_sibling_retry_replaces_tracker_history_before_recovery_and_reread(
     with pytest.raises(TrackingTargetUnavailableError):
         run_experiment(returned)
     assert run_experiment(returned)["p"].metric == pytest.approx(0.20)
-    assert run_experiment(config(_KEY, 3, maximize=True))["p"].metric == pytest.approx(0.20)
+    assert run_experiment(config(_KEY, 3, gated=True))["p"].metric == pytest.approx(0.20)
     assert earlier_counts == [1, 1, 1]
     assert len(launches.read_text().splitlines()) == 3
     assert len(set(launches.read_text().splitlines())) == 1

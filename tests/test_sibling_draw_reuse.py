@@ -367,7 +367,8 @@ def test_fill_preview_counts_donors_outside_its_source(
             read.side_effect = [DEFAULT, reread_ops._reread_timeout(target, target.phases[0])]
             with pytest.raises(PhaseTimeoutError):
                 run_experiment(target)
-        assert len(addressed_phase_study(target).trials) == 1
+        # The x=4 donor extracted the loss as the target does, so it is kept unread.
+        assert [row.params["x"] for row in addressed_phase_study(target).trials] == [3, 4]
     trainer.unlink()
     journal = tmp_path / "studies.journal"
     before = journal.read_bytes()
@@ -1255,7 +1256,7 @@ def test_every_grid_cell_takes_a_slot_before_retries_of_a_failing_cell(
     caplog.set_level(logging.INFO)
 
     for target, forecast in (
-        (4, "would re-read 2 kept trials from other reading studies, keep 2 trainer failures"),
+        (4, "would keep 2 finished trials as recorded, keep 2 trainer failures as recorded"),
         (5, "would keep 1 trainer failure as recorded; no kept trial would retrain"),
     ):
         config = _config(

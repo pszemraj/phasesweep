@@ -11,7 +11,10 @@ read that writes nothing (dry run, preflight, ``validate`` and ``status``): :fun
 the study's next slots in the order a run fills them (:func:`next_slot`) and gives each slot the
 oldest compatible attempt that trained it. A terminal attempt is read again under the current
 settings through the one path recovery reads a finished attempt by
-(:func:`phasesweep.engine.attempts.read_finished_attempt`); an interrupted one is copied as
+(:func:`phasesweep.engine.attempts.read_finished_attempt`), unless its study extracted it as the
+current settings would and differs only in the metric's goal
+(:func:`phasesweep.engine.fingerprints.extracted_reading`): then its recorded result stands, as
+in a replay, and selection verifies the winner's evidence. An interrupted one is copied as
 interrupted, so the ordinary rerun continues it from its checkpoint. The walk stops at the first
 slot no kept attempt fills, where the run launches. A run writes each adopted row in one storage
 write, so an interruption keeps every row written and the next run continues from them.
@@ -58,6 +61,7 @@ from phasesweep.engine.fingerprints import (
     _semantic_payload_digest,
     _stamp_identity,
     _with_search_space,
+    extracted_reading,
     format_changed_keys,
     phase_study_name,
     reading_settings,
@@ -414,11 +418,23 @@ class _Candidate(NamedTuple):
     terminal: bool
     #: Physical opener of an adaptive draw, shared by its reruns.
     draw: str | None
+    #: Whether its study extracted it as the current reading would, differing at most in what
+    #: ranks the values (:func:`extracted_reading`), so its recorded result stands.
+    carried: bool
+
+    @property
+    def measured(self) -> bool:
+        """Say whether the attempt holds a finished trainer's result."""
+        return self.terminal and _trainer_seconds(self.owner.trial) is not None
 
     @property
     def rereads(self) -> bool:
-        """Say whether taking the attempt reads its evidence again under the current settings."""
-        return self.terminal and _trainer_seconds(self.owner.trial) is not None
+        """Say whether taking the attempt reads its evidence again under the current settings.
+
+        A carried attempt's recorded values, provenance and gate verdicts were read and verified
+        when it was measured; selection verifies the winner's evidence as for any replay.
+        """
+        return self.measured and not self.carried
 
 
 def _compatible_studies(
@@ -550,6 +566,8 @@ def kept_attempts(
     names = {other.study_name for other in compatible}
     present = {trial.user_attrs.get(ATTEMPT_ID_ATTR) for trial in study.get_trials(deepcopy=False)}
     domain = _domain(phase)
+    extraction = extracted_reading(reading_settings(experiment, phase))
+    carried: dict[str, bool] = {}
     positions: dict[str, dict[int, int]] = {}
     pool = []
     owners = producing_attempts((study, *compatible))
@@ -581,12 +599,19 @@ def kept_attempts(
         name = owner.study.study_name
         if name not in positions:
             positions[name] = _draw_positions(owner.rows.values())
+            # A row's values were read under its own study's reading (the study's address).
+            identity = _recorded_identity(owner.study)
+            recorded = None if identity is None else identity["payload"].get(READING_KEY)
+            carried[name] = isinstance(recorded, dict) and _same_value(
+                extracted_reading(recorded), extraction
+            )
         pool.append(
             _Candidate(
                 owner,
                 positions[name][owner.trial.number],
                 outcome.outcome != "interrupted",
                 draws.get(attempt_id),
+                carried[name],
             )
         )
     return _allocation_order(pool), draws
@@ -1131,6 +1156,8 @@ class Adoption:
 
     rereads: int = 0
     changed: int = 0
+    #: Finished trainers whose recorded results stand (:attr:`_Candidate.carried`).
+    carried: int = 0
     failures: int = 0
     interrupted: int = 0
     #: The distinct reading settings the adopted attempts' studies recorded.
@@ -1139,7 +1166,7 @@ class Adoption:
     @property
     def total(self) -> int:
         """Return the number of rows appended."""
-        return self.rereads + self.failures + self.interrupted
+        return self.rereads + self.carried + self.failures + self.interrupted
 
     def count(self, step: Adopt) -> None:
         """Count one adopted row.
@@ -1154,6 +1181,8 @@ class Adoption:
             self.rereads += 1
             producer = step.candidate.owner.trial
             self.changed += (step.row.state, step.row.value) != (producer.state, producer.value)
+        elif step.candidate.measured:
+            self.carried += 1
         elif step.candidate.terminal:
             self.failures += 1
         else:
@@ -1195,6 +1224,8 @@ class Adoption:
                 f"re-read {plural(self.rereads, 'kept trial')} from other reading studies"
                 + ("" if planned else f" ({self.changed} changed outcome)")
             )
+        if self.carried:
+            parts.append(f"{keep} {plural(self.carried, 'finished trial')} as recorded")
         if self.failures:
             parts.append(f"{keep} {plural(self.failures, 'trainer failure')} as recorded")
         if self.interrupted:
@@ -1791,7 +1822,7 @@ class PendingRereadNotice(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.RETRY
     #: The value-free sentence the status payload carries (:func:`_pending_notice`).
     statement: str = ""
-    #: Finished trials the next run re-reads (:attr:`AdoptionPlan.rereads`).
+    #: Finished trials the next run re-reads or keeps as recorded, retraining none.
     finished_trials: int = 0
     #: Parents whose next winner the re-read waits for.
     parents: tuple[str, ...] = ()
@@ -1808,7 +1839,7 @@ def _pending_notice(
     A parent that is itself re-read first may select another winner, and then this phase
     inherits other values and runs in another study, so the re-read here is conditional.
 
-    :param int rereads: Finished trials the next run re-reads.
+    :param int rereads: Finished trials the next run re-reads or keeps as recorded.
     :param Sequence[tuple[str, object, object]] changes: Each changed reading setting, with its
         recorded and current value.
     :param str phase: The phase's name.
@@ -1894,5 +1925,7 @@ def pending_reread(
         changes = _changed_payload_keys(
             recorded if isinstance(recorded, dict) else {}, reading_settings(experiment, phase)
         )
-        return _pending_notice(plan.adoption.rereads, tuple(changes), phase.name, unsettled)
+        return _pending_notice(
+            plan.adoption.rereads + plan.adoption.carried, tuple(changes), phase.name, unsettled
+        )
     return None

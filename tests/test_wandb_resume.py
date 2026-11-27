@@ -23,7 +23,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     _trial_attempt_dir,
 )
-from phasesweep.evidence.models import WandbExtractor
+from phasesweep.evidence.models import WandbExtractor, WandbSummaryRequiredGate
 from tests.conftest import make_experiment, phase_trials, write_experiment_config, write_trainer
 from tests.recovery_helpers import runner_once
 
@@ -252,7 +252,18 @@ def test_recovery_stops_the_reader_of_a_killed_reread(
     source_identity = reaper.read_stale_process_identity(
         source_slot, expected_attempt_id=trial.user_attrs[ATTEMPT_ID_ATTR]
     )
-    changed = original.model_copy(update={"metric": Metric(goal="maximize", extractor=extractor)})
+    # A new gate changes what the kept trial's evidence reads as, so the next run re-reads it.
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required",
+        base_url="https://example.test",
+        entity="e",
+        project="p",
+        keys=["x"],
+        poll_seconds=0.05,
+        timeout_seconds=30,
+    )
+    gated = original.phases[0].model_copy(update={"gates": [gate]})
+    changed = original.model_copy(update={"phases": [gated]})
     config = write_experiment_config(tmp_path / "changed.yaml", changed)
     tracker.mode.write_text("hang")
     reader = None
