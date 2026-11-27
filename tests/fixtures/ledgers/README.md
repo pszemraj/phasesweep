@@ -28,7 +28,7 @@ The fixture is regenerated, never hand-edited. From the repository root:
 python -m tests.fixtures.make_ledger_fixtures
 ```
 
-`--out DIR` writes the fixture to another directory, `--notes TEXT` replaces its manifest notes, and `-v` raises log verbosity. Generation fails if the produced bytes disagree with the expected read verdicts. A persisted record change bumps its own schema and its enclosing stamp in the same change: `STUDY_SCHEMA_VERSION` for ledger records or `ARTIFACT_ROOT_BINDING_SCHEMA_VERSION` for artifact-root records. Set `TARGET_STUDY_SCHEMA_VERSION` and `TARGET_BINDING_SCHEMA_VERSION` in [`make_ledger_fixtures.py`](../make_ledger_fixtures.py) to the matching source constants before regenerating, and update the `Binding schema` column above.
+`--out DIR` writes the fixture to another directory, `--notes TEXT` replaces its manifest notes, and `-v` raises log verbosity. Generation fails if the produced bytes disagree with the expected read verdicts. The first change on a branch to a persisted record sets its own schema and its enclosing stamp to one above `main`'s: `STUDY_SCHEMA_VERSION` for ledger records or `ARTIFACT_ROOT_BINDING_SCHEMA_VERSION` for artifact-root records. Then set `TARGET_STUDY_SCHEMA_VERSION` and `TARGET_BINDING_SCHEMA_VERSION` in [`make_ledger_fixtures.py`](../make_ledger_fixtures.py) to the matching source constants, and update the `Binding schema` column above. Later changes to a record's layout on the same branch keep those numbers; regenerate the fixture each time.
 
 The generator keeps the fixture tracked and independent of the generating host:
 
