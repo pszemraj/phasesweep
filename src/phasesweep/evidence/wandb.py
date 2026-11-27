@@ -1171,8 +1171,9 @@ def _poll_wandb_summary(
                     raise _NoAnswer(
                         "The finished run's summary is still empty."
                         if not summary
-                        else f"The summary's _step {summary.get('_step')!r} does not match the "
-                        f"history's last step {_last_history_step(run)!r}."
+                        else "W&B has not served a consistent summary and history index "
+                        f"(summary _step={summary.get('_step')!r}, indexed step={_last_history_step(run)!r}, "
+                        f"history rows={_row_count(run)!r})."
                     )
                 elif run.state in {"failed", "crashed", "killed", "preempted"}:
                     raise WandbRunTerminalError(run_id, run.state)
@@ -1248,13 +1249,18 @@ def _summary_matches_history(run: object, summary: Mapping[str, object]) -> bool
 
     W&B can serve an empty summary before either the summary or the index is visible.
     A populated summary can also arrive before or after its matching history index.
+    A positive row count guarantees there is a history step to wait for, even when both
+    the summary step and the index are still absent.
 
     :param object run: Public-API run.
     :param Mapping[str, object] summary: Its decoded summary.
     :return bool: Whether the summary is populated and its step matches the index.
         A summary written directly can have values without a history step.
     """
-    return bool(summary) and finite_nonnegative(summary.get("_step")) == _last_history_step(run)
+    last_step = _last_history_step(run)
+    if last_step is None and _row_count(run):
+        return False
+    return bool(summary) and finite_nonnegative(summary.get("_step")) == last_step
 
 
 def _row_count(run: object) -> int | None:

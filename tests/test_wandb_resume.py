@@ -278,6 +278,30 @@ def test_an_unsettled_closed_earlier_run_stays_pending_at_the_deadline(
     assert not caught.value.reached and clock.now == 240
 
 
+@pytest.mark.parametrize("state", ["killed", "crashed"])
+def test_a_positive_row_count_before_the_first_indexed_step(
+    monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    """A closed opener's counted row can change the winner, while a crashed opener may never serve it."""
+    from phasesweep.evidence.wandb import WandbPollTimeout
+
+    key = "eval/loss.min"
+    opener = _run(state, {"_wandb": {"runtime": 5}})
+    opener.historyLineCount = 1
+    runs = {
+        "opener": opener,
+        "rerun": _run("finished", {"_step": 0, key: 0.9}, _rows(0.9, axis=(8,))),
+    }
+    _serve(monkeypatch, runs)
+    if state == "killed":
+        with pytest.raises(WandbPollTimeout) as caught:
+            _poll("opener", required=(key,), objective_key=key, evaluation_axis="eval/step")
+        assert not caught.value.reached
+        runs["opener"] = _run(state, {"_step": 0, key: 0.1}, _rows(0.1, axis=(1,)))
+    capture = _poll("opener", required=(key,), objective_key=key, evaluation_axis="eval/step")
+    assert capture["values"] == {key: 0.1 if state == "killed" else 0.9}
+
+
 def test_a_closed_earlier_runs_unserved_aggregate_remains_pending_until_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
