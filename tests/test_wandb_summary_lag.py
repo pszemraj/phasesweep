@@ -30,7 +30,13 @@ from phasesweep.evidence.evaluation import (
 )
 from phasesweep.evidence.mlflow import merge_histories, select_observation
 from phasesweep.evidence.models import MlflowExtractor, WandbExtractor, WandbSummaryRequiredGate
-from tests.conftest import make_experiment, make_trial_context, phase_trials, write_trainer
+from tests.conftest import (
+    make_experiment,
+    make_trial_context,
+    phase_study,
+    phase_trials,
+    write_trainer,
+)
 from tests.tracking_helpers import (
     ManualClock,
     attach_wandb_transport,
@@ -92,6 +98,7 @@ def test_sibling_retry_replaces_tracker_history_before_recovery_and_reread(
 
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(config(_KEY, 1))
+    original_study = phase_study(config(_KEY, 1))
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(config("eval/loss.max", 2))
 
@@ -101,14 +108,15 @@ def test_sibling_retry_replaces_tracker_history_before_recovery_and_reread(
         earlier, run_id = options["earlier"], options["run_id"]
         assert isinstance(earlier, list) and isinstance(run_id, str)
         earlier_counts.append(len(earlier))
-        if len(earlier_counts) == 1:
-            raise wandb.WandbPollTimeout(run_id, 2, reached=False)
         runs = {}
         for path in history.glob("*.json"):
             rows = tuple(json.loads(path.read_text()))
             losses = [row["eval/loss"] for row in rows]
             summary = {"_step": len(rows) - 1, _KEY: min(losses), "eval/loss.max": max(losses)}
             runs[path.stem] = wandb_run("finished", summary, rows)
+        if len(earlier_counts) == 1:
+            # The index and summary have caught up, but the opener's keyed rows have not.
+            runs[earlier[0]["run_id"]].scan_history = lambda **_: []
         with monkeypatch.context() as sdk:
             serve_wandb_runs(sdk, runs)
             return wandb._poll_wandb_summary(
@@ -131,10 +139,16 @@ def test_sibling_retry_replaces_tracker_history_before_recovery_and_reread(
     returned = config(_KEY, 3)
     with pytest.raises(TrackingTargetUnavailableError):
         run_experiment(returned)
+    pending = original_study.trials[-1]
+    assert pending.state.name == "RUNNING"
+    before_recovery = launches.read_text().splitlines()
     assert run_experiment(returned)["p"].metric == pytest.approx(0.20)
+    recovered = original_study.trials[-1]
+    assert recovered.state.name == "COMPLETE"
+    assert recovered.user_attrs[ATTEMPT_ID_ATTR] == pending.user_attrs[ATTEMPT_ID_ATTR]
     assert run_experiment(config(_KEY, 3, gated=True))["p"].metric == pytest.approx(0.20)
     assert earlier_counts == [2, 2, 2]
-    assert len(set(launches.read_text().splitlines())) == 3
+    assert len(before_recovery) == 3 and launches.read_text().splitlines() == before_recovery
 
 
 Answer = tuple[str, dict[str, object], int | None]

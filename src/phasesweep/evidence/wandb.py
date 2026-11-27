@@ -663,7 +663,7 @@ class _Scored(NamedTuple):
     # Required keys no run holds, and keys taken from an earlier run's summary.
     missing: list[str]
     borrowed: list[str]
-    # Whether a consulted run's summary or history may not be fully served yet.
+    # Whether the scoring run's own history has yet to reproduce its summary.
     unsettled: bool
 
 
@@ -767,9 +767,8 @@ def _merged_extrema(
 
     W&B serves a run's keyed history up to a minute after its summary, so with an axis a run
     whose summary holds the aggregate but whose served rows do not reproduce it may not be
-    fully served yet: the reduction uses the rows served and reports itself unsettled. Only the
-    scoring run and closed earlier runs count: an earlier run that is not closed may never
-    receive its last rows, so it is read as W&B holds it.
+    fully served yet. A closed earlier run in that state leaves the read pending. An earlier
+    run that is not closed may never receive its last rows and is read as W&B holds it.
 
     :param _Run scoring: The run whose summary supplied ``values``.
     :param Sequence[_Run] older: The trial's runs before it, oldest first.
@@ -780,6 +779,7 @@ def _merged_extrema(
         names, and whether a run's served rows did not reproduce its summary aggregate.
     :raises TimeoutError: History could not be read before the deadline.
     :raises _RetainedHistoryError: A run's series rows cannot be placed on the axis.
+    :raises _NoAnswer: A closed earlier run's keyed history does not reproduce its aggregate.
     """
     last_step = _last_history_step(scoring) or 0
     operations: dict[str, list[str]] = {}
@@ -819,15 +819,20 @@ def _merged_extrema(
                 numbers = (_summary_number(run, key) for run in older)
                 reduced[key] = reduce(values[key], *(n for n in numbers if n is not None))
                 continue
-            summaries = [*(_summary_number(run, key) for run in older), values[key]]
-            unsettled |= any(
-                number is not None
-                and (run is scoring or run.state in _CLOSED_STATES)
-                and not reproduces(rows, number, reduce)
-                for run, rows, number in zip(runs, finite, summaries, strict=True)
-            )
+            for run, rows in zip(older, finite[:-1], strict=True):
+                number = _summary_number(run, key)
+                if (
+                    run.state in _CLOSED_STATES
+                    and number is not None
+                    and not reproduces(rows, number, reduce)
+                ):
+                    raise _NoAnswer(
+                        f"A closed earlier run's history does not yet reproduce {key!r}."
+                    )
             if reproduces(finite[-1], values[key], reduce):
                 reduced[key] = reduce(retained)
+            else:
+                unsettled = True
     return reduced, unsettled
 
 
@@ -844,7 +849,7 @@ def _score(
 
     A required key the scoring run's summary lacks comes from the newest earlier summary that
     holds it, whatever that run's state: a trainer may log a value only on a fresh start. The
-    scoring is unsettled when a closed earlier run's populated summary does not match its
+    read stays pending when a closed earlier run's summary does not match its
     history index, as W&B serves a signalled session's first row as its summary for a minute,
     or when :func:`_merged_extrema` finds history not yet served. An earlier run that is not
     closed may never settle, as a session killed outright stays ``crashed`` with its first-row
@@ -861,9 +866,17 @@ def _score(
     :raises ValueError: A required value is not a finite number, or a run's series rows
         cannot be placed on the axis.
     :raises TimeoutError: History could not be read before the deadline.
+    :raises _NoAnswer: A closed earlier run's summary or history is still being served.
     """
     from phasesweep.evidence.evaluation import json_float
 
+    for run in older:
+        if (
+            run.state in _CLOSED_STATES
+            and not _logged_nothing(run)
+            and not _summary_matches_history(run, run.summary_metrics)
+        ):
+            raise _NoAnswer("A closed earlier run's summary does not yet match its history index.")
     summary = scoring.summary_metrics
     values: dict[str, float] = {}
     own: dict[str, float] = {}
@@ -889,16 +902,10 @@ def _score(
             own[key] = value
         else:
             borrowed.append(key)
-    unsettled = any(
-        run.state in _CLOSED_STATES
-        and bool(run.summary_metrics)
-        and not _summary_matches_history(run, run.summary_metrics)
-        for run in older
-    )
+    unsettled = False
     if older and not missing:
-        reduced, unserved = _merged_extrema(scoring, older, own, axis=axis, deadline=deadline)
+        reduced, unsettled = _merged_extrema(scoring, older, own, axis=axis, deadline=deadline)
         values.update(reduced)
-        unsettled |= unserved
     present = sorted(
         key for key in presence if any(key in run.summary_metrics for run in (scoring, *older))
     )
@@ -1001,23 +1008,23 @@ def _poll_wandb_summary(
        the newest earlier summary that holds it (:func:`_score`).
     2. A native ``.min`` or ``.max`` key is reduced over the trial's runs
        (:func:`_merged_extrema`).
-    3. A rerun's run that is missing at the deadline, or finished with no row and no
-       objective, logged nothing: its trainer found the training finished. The newest earlier
+    3. A rerun's run that is missing at the deadline, or finished with zero rows and
+       no user summary key, logged nothing: its trainer found the training finished. The newest earlier
        run then scores the trial by rules 1 and 2 over the earlier runs alone, if its session
        closed and its summary matches its history and holds the objective, and the capture
        carries ``earlier_attempt``. Otherwise nothing is scored, saying why. An earlier run
-       that closed with no row and no objective logged nothing either and is skipped as a
+       that closed with zero rows and no user summary key is skipped as a
        missing one is. A row-less run that is ``running`` or ``crashed`` is not skipped: W&B
        never receives what a session killed outright had not uploaded, so it cannot say
        whether that session trained.
     4. A rerun's finished run whose summary matches its history but lacks the objective at the
        deadline ran without reporting it, so no earlier run scores it.
 
-    Rules 3 and 4, a key taken from an earlier run, and a scoring that read a summary or
-    history W&B may not have finished serving (:func:`_score`), are verdicts the latest
+    Rules 3 and 4, a key taken from an earlier run, and a scoring run whose own history does
+    not reproduce its summary aggregate, are verdicts the latest
     answered poll decides, returned or raised after the deadline as a missing key is; such a
-    capture carries ``deadline_verdict``. Only the scoring run and closed earlier runs can
-    leave a scoring unsettled; an earlier run that is not closed is read as W&B holds it,
+    capture carries ``deadline_verdict``. A closed earlier run whose summary or history
+    is unsettled leaves the read pending. An earlier run that is not closed is read as W&B holds it,
     since a session killed outright stays ``crashed`` with its first-row summary and never
     receives the rows it had not uploaded. A rerun whose own summary holds every required key and no native aggregate
     reads no earlier run and returns at once. A first attempt has no earlier runs and only
@@ -1104,11 +1111,7 @@ def _poll_wandb_summary(
         runs = [
             (address, run)
             for address, run in earlier_runs(clients)
-            if not (
-                run.state in _CLOSED_STATES
-                and _row_count(run) == 0
-                and (objective_key is None or objective_key not in run.summary_metrics)
-            )
+            if not (run.state in _CLOSED_STATES and _logged_nothing(run))
         ]
         if not runs:
             return f"{subject}, and no earlier attempt of its trial logged to a W&B run", [], []
@@ -1123,11 +1126,8 @@ def _poll_wandb_summary(
                 [],
             )
         if not _summary_matches_history(newest, summary):
-            return (
-                f"{subject}, and the summary of its trial's newest earlier run {name} does not "
-                "match its history",
-                [],
-                [],
+            raise _NoAnswer(
+                f"The closed earlier run {name}'s summary does not yet match its history index."
             )
         if objective_key is not None and objective_key not in summary:
             return (
@@ -1137,6 +1137,10 @@ def _poll_wandb_summary(
                 [],
             )
         scored = score(newest, [prior for _, prior in runs[:-1]])
+        if scored.unsettled:
+            raise _NoAnswer(
+                f"The closed earlier run {name}'s history does not yet reproduce its summary aggregate."
+            )
         if scored.missing:
             return None, scored.missing, sorted(summary)
         found = {**capture(scored), "deadline_verdict": True, "earlier_attempt": address["run_id"]}
@@ -1160,9 +1164,9 @@ def _poll_wandb_summary(
                 summary = run.summary_metrics
                 finished = run.state == "finished"
                 unreported = objective_key is not None and objective_key not in summary
-                if earlier and finished and unreported and _row_count(run) == 0:
+                if earlier and finished and unreported and _logged_nothing(run):
                     poll_verdict, poll_missing, poll_available = judge_earlier(
-                        clients, f"finished without a row or {objective_key!r}"
+                        clients, "finished without logging any rows or user summary keys"
                     )
                 elif finished and not _summary_matches_history(run, summary):
                     raise _NoAnswer(
@@ -1175,7 +1179,7 @@ def _poll_wandb_summary(
                     raise WandbRunTerminalError(run_id, run.state)
                 elif finished and earlier and unreported:
                     poll_verdict = (
-                        f"finished with logged rows but without {objective_key!r}, so its "
+                        f"finished with logged data but without {objective_key!r}, so its "
                         "trial's earlier runs do not score it"
                     )
                 elif finished:
@@ -1266,6 +1270,15 @@ def _row_count(run: object) -> int | None:
     """
     rows = getattr(run, "historyLineCount", None)
     return rows if type(rows) is int and rows >= 0 else None
+
+
+def _logged_nothing(run: _Run) -> bool:
+    """Return whether W&B reports zero rows and only its own underscore-prefixed summary keys.
+
+    :param _Run run: The run as served in this poll.
+    :return bool: Whether the trainer logged neither history nor a summary value.
+    """
+    return _row_count(run) == 0 and all(key.startswith("_") for key in run.summary_metrics)
 
 
 def _locate_wandb_position(

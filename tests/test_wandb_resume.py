@@ -194,16 +194,54 @@ def test_an_earlier_history_served_late_is_waited_for_and_merged(
     assert clock.now == 10
 
 
-def test_an_earlier_summary_that_never_matches_its_index_is_scored_at_the_deadline(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("empty_rerun", [False, True])
+def test_an_unsettled_closed_earlier_run_stays_pending_at_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, empty_rerun: bool
 ) -> None:
-    """An earlier run whose summary stays at its first row while its index reaches its last, as W&B serves a session a signal ended, never settles: the capture arrives at the deadline as a verdict, holding the value W&B served."""
+    """A closed run's stale summary cannot score either a measured or an empty rerun."""
+    from phasesweep.evidence.wandb import WandbPollTimeout
+
     runs, served = _late_runs({"_step": 0, "eval/loss.min": 0.4})
     served.extend(_rows(0.4, 0.05, 0.01, axis=(10, 20, 30)))
+    if empty_rerun:
+        runs["rerun"] = _run("finished", {})
     clock, _ = _serve(monkeypatch, runs)
-    capture = _poll("opener", required=("eval/loss.min",), objective_key="eval/loss.min")
-    assert capture["values"] == {"eval/loss.min": 0.1} and capture["deadline_verdict"] is True
-    assert clock.now == 240
+    with pytest.raises(WandbPollTimeout) as caught:
+        _poll("opener", required=("eval/loss.min",), objective_key="eval/loss.min")
+    assert "history index" in str(caught.value.last_error)
+    assert not caught.value.reached and clock.now == 240
+
+
+def test_a_closed_earlier_runs_unserved_aggregate_remains_pending_until_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even with matching summary and index steps, delayed keyed rows can change the winner."""
+    from phasesweep.evidence.wandb import WandbPollTimeout
+
+    runs, served = _late_runs({"_step": 2, "eval/loss.min": 0.01})
+    _serve(monkeypatch, runs)
+    key = "eval/loss.min"
+    with pytest.raises(WandbPollTimeout) as caught:
+        _poll("opener", required=(key,), objective_key=key, evaluation_axis="eval/step")
+    assert key in str(caught.value.last_error)
+    assert not caught.value.reached
+    served.extend(_rows(0.4, 0.05, 0.01, axis=(10, 20, 30)))
+    recovered = _poll("opener", required=(key,), objective_key=key, evaluation_axis="eval/step")
+    assert recovered["values"] == {key: 0.05}
+
+
+@pytest.mark.parametrize("summary_only", ["rerun", "second"])
+def test_a_summary_only_run_without_the_objective_does_not_inherit_it(
+    monkeypatch: pytest.MonkeyPatch, summary_only: str
+) -> None:
+    """A user summary key counts as logging even when W&B reports zero history rows."""
+    from phasesweep.evidence.wandb import WandbNothingToScoreError
+
+    runs = {"opener": _run("killed", {"x": 0.5}), "rerun": _run("finished", {"_wandb": {}})}
+    runs[summary_only] = _run("finished", {"_wandb": {}, "runtime": 0})
+    _serve(monkeypatch, runs)
+    with pytest.raises(WandbNothingToScoreError, match="'x'"):
+        _poll("opener", "second")
 
 
 @pytest.mark.parametrize("own", ["missing", "empty"])
@@ -211,7 +249,7 @@ def test_an_earlier_summary_that_never_matches_its_index_is_scored_at_the_deadli
 def test_a_rerun_that_logged_nothing_is_scored_from_its_newest_closed_earlier_run(
     monkeypatch: pytest.MonkeyPatch, own: str, state: str
 ) -> None:
-    """A rerun whose run is missing at the deadline, or finished with no row and no objective, is scored from the newest earlier run W&B holds when that run's session closed; one still ``running`` leaves nothing to score, saying which run and why.
+    """A rerun whose run is missing at the deadline, or finished with zero rows and no user summary keys, is scored from the newest earlier run W&B holds when that run's session closed; one still ``running`` leaves nothing to score, saying which run and why.
 
     :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
     :param str own: Whether the rerun's run is missing or empty.
@@ -226,7 +264,11 @@ def test_a_rerun_that_logged_nothing_is_scored_from_its_newest_closed_earlier_ru
     if own == "empty":
         runs["rerun"] = _run("finished", {})
     clock, _ = _serve(monkeypatch, runs)
-    subject = "was not found" if own == "missing" else "finished without a row or 'x'"
+    subject = (
+        "was not found"
+        if own == "missing"
+        else "finished without logging any rows or user summary keys"
+    )
     if state == "killed":
         capture = _poll("opener", "second", "vanished")
         assert capture["values"] == {"x": 0.5}
@@ -245,7 +287,7 @@ def test_a_rerun_that_logged_nothing_is_scored_from_its_newest_closed_earlier_ru
 def test_an_earlier_run_that_closed_without_logging_is_skipped_for_the_one_before_it(
     monkeypatch: pytest.MonkeyPatch, state: str
 ) -> None:
-    """A second attempt that found the training finished and closed with no row and no objective is passed over as a missing run is, so a third that logged nothing is scored from the opener; a row-less second run still ``running`` may have trained unseen and leaves nothing to score.
+    """A second attempt that found the training finished and closed with zero rows and no user summary keys is passed over as a missing run is, so a third that logged nothing is scored from the opener; a row-less second run still ``running`` may have trained unseen and leaves nothing to score.
 
     :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
     :param str state: The row-less second run's state.
@@ -266,7 +308,7 @@ def test_an_earlier_run_that_closed_without_logging_is_skipped_for_the_one_befor
         with pytest.raises(WandbNothingToScoreError) as caught:
             _poll("opener", "second")
         assert caught.value.cause == (
-            "finished without a row or 'x', and its trial's newest earlier run e/p/second is "
+            "finished without logging any rows or user summary keys, and its trial's newest earlier run e/p/second is "
             "'running', so it may lack its session's last row"
         )
     assert clock.now == 240
@@ -315,7 +357,7 @@ def test_a_run_that_logged_rows_without_the_objective_is_not_scored_by_an_earlie
     with pytest.raises(WandbNothingToScoreError) as caught:
         _poll("opener")
     assert caught.value.cause == (
-        "finished with logged rows but without 'x', so its trial's earlier runs do not score it"
+        "finished with logged data but without 'x', so its trial's earlier runs do not score it"
     )
 
 
