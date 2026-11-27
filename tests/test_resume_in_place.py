@@ -93,13 +93,14 @@ def _age(path: Path) -> None:
 
 
 def _resumed_context(
-    tmp_path: Path, extractor: JsonExtractor | LogRegexExtractor
+    tmp_path: Path, extractor: JsonExtractor | LogRegexExtractor | JsonEnvelopeExtractor
 ) -> tuple[Path, TrialContext]:
     """Record a reused directory's baseline over files an earlier attempt left.
 
     :param Path tmp_path: Scratch directory holding ``trial`` and ``attempt``; ``trial`` is
         already populated.
-    :param JsonExtractor | LogRegexExtractor extractor: The metric extractor.
+    :param JsonExtractor | LogRegexExtractor | JsonEnvelopeExtractor extractor: The metric
+        extractor.
     :return tuple[Path, TrialContext]: The trial directory and the rerun's context.
     """
     experiment = make_experiment(persistent=tmp_path, metric=Metric(extractor=extractor))
@@ -117,11 +118,14 @@ def _resumed_context(
     )
 
 
-def _read(ctx: TrialContext, extractor: JsonExtractor | LogRegexExtractor) -> tuple[float, bool]:
+def _read(
+    ctx: TrialContext, extractor: JsonExtractor | LogRegexExtractor | JsonEnvelopeExtractor
+) -> tuple[float, bool]:
     """Read a value as a fresh extraction of the attempt would.
 
     :param TrialContext ctx: The rerun's context.
-    :param JsonExtractor | LogRegexExtractor extractor: The metric extractor.
+    :param JsonExtractor | LogRegexExtractor | JsonEnvelopeExtractor extractor: The metric
+        extractor.
     :return tuple[float, bool]: The value, and whether an earlier attempt wrote its file.
     """
     ctx = dataclasses.replace(ctx, earlier_files=[])
@@ -174,6 +178,42 @@ def test_a_reused_directory_without_a_readable_value_leaves_nothing_to_score(
     fresh = dataclasses.replace(ctx, baseline=ctx.baseline._replace(reused=False))
     with pytest.raises(ExtractorError) as raised:
         _read(fresh, _JSON_METRIC.extractor)
+    assert not isinstance(raised.value, NothingToScoreError)
+
+
+def test_an_earlier_attempts_unreadable_envelope_leaves_nothing_to_score(tmp_path: Path) -> None:
+    """A truncated result envelope an earlier attempt left in a reused directory leaves nothing to score, as a truncated JSON file does; the readable envelope naming that attempt scores as its, and the same truncated bytes written after launch fail as the attempt's own malformed envelope.
+
+    :param Path tmp_path: Scratch directory for the trial and attempt.
+    """
+    extractor = _ENVELOPE_METRIC.extractor
+    assert isinstance(extractor, JsonEnvelopeExtractor)
+    envelope = json.dumps(
+        {
+            "schema_version": 1,
+            "status": "complete",
+            "generation_id": "generation-first",
+            "attempt_id": "attempt-first",
+            "overrides_sha256": "a" * 64,
+            "objective": {"name": "loss", "split": "validation", "value": 0.5},
+            "evaluation": {"policy": "synthetic", "checkpoint": "c", "step": 5},
+        }
+    )
+    result = tmp_path / "trial" / extractor.path
+    result.parent.mkdir()
+    result.write_text(envelope[:40], encoding="utf-8")
+    _, ctx = _resumed_context(tmp_path, extractor)
+    ctx = dataclasses.replace(ctx, earlier_attempts=(("generation-first", "attempt-first"),))
+    with pytest.raises(NothingToScoreError, match="Invalid JSON envelope"):
+        _read(ctx, extractor)
+
+    result.write_text(envelope, encoding="utf-8")
+    _age(result)
+    assert _read(ctx, extractor) == (0.5, True)
+
+    result.write_text(envelope[:40], encoding="utf-8")
+    with pytest.raises(ExtractorError, match="Invalid JSON envelope") as raised:
+        _read(ctx, extractor)
     assert not isinstance(raised.value, NothingToScoreError)
 
 
@@ -701,7 +741,7 @@ def test_a_resumed_trials_mlflow_objective_reads_its_attempts_merged_history() -
 def test_a_rerun_can_use_a_constraint_logged_once_on_the_first_attempt(
     gate_requires_metric: bool,
 ) -> None:
-    """A step-zero constraint survives a retry while a gate still requires current evidence."""
+    """A step-zero constraint, and a gate requiring the same metric, are met by the earlier attempt's run when the retry logs it no more."""
     binding = mlflow_binding()
     prior = {**binding, "attempt_id": "d" * 32, "run_id": "earlier"}
     objective = MlflowExtractor(type="mlflow", metric_key="loss", select="min")
@@ -736,18 +776,14 @@ def test_a_rerun_can_use_a_constraint_logged_once_on_the_first_attempt(
         "settings": {"timeout_seconds": 1, "poll_seconds": 0.01},
         "timeout_at": time.monotonic() + 1,
     }
-    if gate_requires_metric:
-        with pytest.raises(ValueError, match="without metric 'n_params'"):
-            mlflow_worker._capture(client, request)
-    else:
-        capture = mlflow_worker._capture(client, request)
-        assert capture["observations"][observation_id(count)] == {
-            "value": 42.0,
-            "step": 0,
-            "timestamp": 1,
-        }
-        assert capture["observations"][observation_id(objective)]["value"] == 0.2
-        assert capture["earlier_bindings"] == [prior]
+    capture = mlflow_worker._capture(client, request)
+    assert capture["observations"][observation_id(count)] == {
+        "value": 42.0,
+        "step": 0,
+        "timestamp": 1,
+    }
+    assert capture["observations"][observation_id(objective)]["value"] == 0.2
+    assert capture["earlier_bindings"] == [prior]
 
 
 def _interrupted(

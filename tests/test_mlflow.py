@@ -23,7 +23,7 @@ from phasesweep.evidence.mlflow import observation_id, select_observation
 from phasesweep.evidence.models import MlflowExtractor, MlflowRequiredGate
 from phasesweep.runtime.shutdown import ShutdownLaunchRefusedError
 from phasesweep.tracking.mlflow import (
-    ManagedObjectiveMissingError,
+    ObjectiveMissingError,
     OperationOutcomeUnknownError,
     OperationRejectedError,
     OperationUnavailableError,
@@ -1308,7 +1308,7 @@ def test_finished_without_a_required_metric_reaches_the_trial_as_the_extractor_e
 def test_managed_missing_objective_is_a_diagnostic_without_advice(clock: ManualClock) -> None:
     """A missing managed objective names the key and the keys the run has, on one line, and carries no advice."""
     client = _states_client(mlflow_binding(), "FINISHED", metrics={"other": 0.9})
-    with pytest.raises(ManagedObjectiveMissingError) as failure:
+    with pytest.raises(ObjectiveMissingError) as failure:
         _capture(client, _capture_request(mlflow_binding()))
     assert str(failure.value) == (
         "MLflow run finished without metric 'loss'; available metric keys: ['other']."
@@ -1323,7 +1323,7 @@ def test_missing_param_in_a_managed_run_that_has_its_objective_is_a_plain_failur
     client = _states_client(mlflow_binding(), "FINISHED", metrics={"loss": 0.1})
     with pytest.raises(ValueError, match="finished without param 'lr'") as failure:
         _capture(client, _capture_request(mlflow_binding(), gates=[gate]))
-    assert not isinstance(failure.value, ManagedObjectiveMissingError)
+    assert not isinstance(failure.value, ObjectiveMissingError)
 
 
 def test_trainer_owned_missing_objective_keeps_the_key_diagnostic(clock: ManualClock) -> None:
@@ -1755,7 +1755,7 @@ def test_worker_crash_names_its_preserved_diagnostic(tmp_path, monkeypatch):
             0,
             False,
             {"status": "objective_missing", "message": "no objective"},
-            ManagedObjectiveMissingError,
+            ObjectiveMissingError,
         ),
         (1, False, {}, OperationOutcomeUnknownError),
         (0, False, {"status": "other"}, OperationOutcomeUnknownError),

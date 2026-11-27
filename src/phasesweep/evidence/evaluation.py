@@ -70,7 +70,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # Objective-evidence provenance schema version.
-EVIDENCE_PROVENANCE_SCHEMA_VERSION = 8
+EVIDENCE_PROVENANCE_SCHEMA_VERSION = 9
 # Retained evidence is indexed by configured path and named by its recorded file digest.
 RETAINED_EVIDENCE_SCHEMA_VERSION = 1
 # Log-regex evaluation revision included in the extractor contract.
@@ -729,7 +729,9 @@ def _extract_json_envelope(
 
     The envelope names the attempt that wrote it: this one, or an earlier attempt that
     trained in the trial's directory, whose envelope is the trial's result and is listed in
-    ``ctx.earlier_files``. A missing envelope in a reused directory leaves nothing to score.
+    ``ctx.earlier_files``. A missing envelope in a reused directory leaves nothing to score,
+    and so does one that does not parse when its stamps show an earlier attempt wrote it
+    (:func:`_written_before_launch`), as for a JSON file.
 
     :param TrialContext ctx: Current trial identity and resolved-overrides digest.
     :param JsonEnvelopeExtractor cfg: Expected objective and evaluation policy.
@@ -753,9 +755,15 @@ def _extract_json_envelope(
         ),
     ):
         retained = retained_evidence_file(ctx.attempt_dir, path)
-        raw = (
+        source = (
             retained if retained is not None else trial_file(ctx.trial_dir, ctx.attempt_dir, path)
-        ).read_bytes()
+        )
+        # Bytes that do not parse name no attempt, so the file's stamps say whose they are.
+        if retained is None and _written_before_launch(
+            ctx.baseline, ctx.trial_dir, ctx.attempt_dir, path, source
+        ):
+            ctx.earlier_files.append(path)
+        raw = source.read_bytes()
         data = strict_json_loads(raw.decode("utf-8"))
 
     if not isinstance(data, dict):
@@ -856,7 +864,7 @@ def _extract_json_envelope(
                 "progress": {"axis": cfg.evaluation_axis, "value": position},
             },
         }
-    if earlier:
+    if earlier and path not in ctx.earlier_files:
         ctx.earlier_files.append(path)
     return value
 
@@ -1304,12 +1312,13 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
     :raises DeadlineExceededError: The execution deadline stopped the capture.
     :raises EvidenceUnreadableError: MLflow gave no answer: it was unreachable, refused
         access, lacked its SDK, timed out, or the reader's outcome is unknown.
-    :raises MlflowObjectiveMissingError: A finished managed run lacks the objective metric;
-        a :class:`NothingToScoreError` instead for an attempt in a reused directory.
+    :raises MlflowObjectiveMissingError: A finished managed run and its trial's merged history
+        lack the objective's point; a :class:`NothingToScoreError` instead for an attempt in a
+        reused directory, as for one that never bound a run.
     :raises ExtractorError: Binding or remote evidence cannot be accepted.
     """
     from phasesweep.evidence.mlflow import validate_capture
-    from phasesweep.tracking.mlflow import ManagedObjectiveMissingError, request_operation
+    from phasesweep.tracking.mlflow import ObjectiveMissingError, request_operation
     from phasesweep.tracking.session import (
         BINDING_FILE,
         EXPECTED_BINDING_FILE,
@@ -1326,13 +1335,18 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
     tracking_dir = attempt_tracking_dir(
         ctx.trial_dir.parent.parent, ctx.generation_id, ctx.attempt_id
     )
+    # Managed runs are bound before launch, so only a trainer-owned run can be missing. A
+    # rerun in a reused directory that never opened a run skipped work, so it reruns afresh.
+    unbound = not (tracking_dir / BINDING_FILE).is_file()
+    never_bound = (
+        "The trainer never bound its MLflow run; call "
+        "phasesweep.tracking.bind_mlflow_run(run_id) inside its active run."
+    )
+    if unbound and _in_reused_directory(ctx):
+        raise NothingToScoreError(never_bound)
     try:
-        # Managed runs are bound before launch, so only a trainer-owned run can be missing.
-        if not (tracking_dir / BINDING_FILE).is_file():
-            raise ValueError(
-                "The trainer never bound its MLflow run; call "
-                "phasesweep.tracking.bind_mlflow_run(run_id) inside its active run."
-            )
+        if unbound:
+            raise ValueError(never_bound)
         binding = read_binding(tracking_dir)
         expected = read_record(tracking_dir / EXPECTED_BINDING_FILE)
         if (
@@ -1359,13 +1373,17 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
             environment=ctx.mlflow_environment or {},
             deadline=min(stop, deadline) if deadline is not None else stop,
         )
+        source_run = retrieved.pop("objective_run_id", binding["run_id"])
+        if not isinstance(source_run, str):
+            raise ValueError("MLflow capture names no run for its objective.")
         capture = validate_capture(retrieved)
-    except ManagedObjectiveMissingError as exc:
-        # In a reused directory the attempt's own run is fresh and empty when its trainer
-        # skipped finished work; scoring an earlier attempt's run would move the result
-        # delivery to that run, so the attempt reruns once with a fresh run instead.
+    except ObjectiveMissingError as exc:
+        # The run lacks the objective and so does the trial's merged history: in a reused
+        # directory the trainer skipped work no earlier run recorded, so it reruns afresh.
         if _in_reused_directory(ctx):
             raise NothingToScoreError(str(exc)) from exc
+        if binding["run_mode"] != "managed":
+            raise ExtractorError(str(exc)) from exc
         raise MlflowObjectiveMissingError(str(exc)) from exc
     except (OSError, ValueError, RuntimeError) as exc:  # every NO_ANSWER error included
         if isinstance(exc, UnsafeProcessCleanupError):
@@ -1375,6 +1393,10 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
         if isinstance(exc, TimeoutError) and deadline is not None and time.monotonic() >= deadline:
             raise DeadlineExceededError(str(exc)) from exc
         raise EvidenceUnreadableError(str(exc)) from exc
+    # The objective's selected point in an earlier attempt's run discloses the trial's result
+    # the way an earlier attempt's value file does; delivery still goes to the bound run.
+    if source_run != binding["run_id"]:
+        ctx.earlier_files.append(f"mlflow:{source_run}")
     ctx.mlflow_capture.update(retrieved)
     return capture
 
@@ -1399,10 +1421,13 @@ def _extract_mlflow(
     capture = _capture_mlflow(ctx, deadline=deadline)
     point = capture["observations"][observation_id(cfg)]
     if provenance is not None:
+        # Only the objective records provenance, and only its point can be an earlier run's.
+        marks = [mark for mark in ctx.earlier_files if mark.startswith("mlflow:")]
         provenance["source"] = {
             "kind": "mlflow",
             "metric_key": cfg.metric_key,
             "selection": observation_id(cfg),
+            "run_id": marks[0].removeprefix("mlflow:") if marks else capture["binding"]["run_id"],
             "evaluation": {
                 "progress": {"axis": "step", "value": point["step"]},
                 "timestamp": point["timestamp"],
