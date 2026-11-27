@@ -30,6 +30,7 @@ from phasesweep.engine.read import (
 from phasesweep.engine.repeats import _repeats_summary
 from phasesweep.engine.state import (
     TRIAL_STATE_NAMES,
+    InterruptedReruns,
     PublicationState,
     RecoveredTrialState,
     TrialStateName,
@@ -672,11 +673,14 @@ def finalize_result_snapshot(
     confirmed_attempt_ids: Collection[str] = (),
     confirmed_attempt_locations: Mapping[str, tuple[str, int, str]] | None = None,
     confirmed_attempt_states: Mapping[str, TrialStateName] | None = None,
+    confirmed_attempt_reruns: Mapping[str, InterruptedReruns] | None = None,
 ) -> JsonObject:
     """Reconcile captured RUNNING identities without rereading shared state.
 
     Use the exact recovered terminal state for completed evidence awaiting extraction,
-    and the captured prediction for other attempts. Preserve all unrelated frozen counts.
+    and the captured prediction for other attempts. A reconciled attempt's result adds what
+    recovery read it counts toward the phase's interrupted-rerun counters. Preserve all
+    unrelated frozen counts.
 
     :param Mapping[str, object] snapshot: Raw snapshot captured under the experiment lock.
     :param Collection[str] confirmed_attempt_ids: Exact RUNNING attempts reconciled by recovery.
@@ -685,6 +689,9 @@ def finalize_result_snapshot(
         used when the frozen row was captured before its Optuna identity attrs
         were set.
     :param Mapping[str, TrialStateName] | None confirmed_attempt_states: Actual terminal states of reconciled attempts, required for captured pending evidence.
+    :param Mapping[str, InterruptedReruns] | None confirmed_attempt_reruns: Each reconciled
+        attempt's own :func:`phasesweep.engine.state._interrupted_reruns` counts, read from its
+        settled row, defaults to none.
     :return JsonObject: Validated terminal snapshot with truthful trial states.
     :raises RuntimeError: If the cleanup report names more recovered attempts
         than the snapshot counts as RUNNING, for a phase or for the represented
@@ -704,6 +711,7 @@ def finalize_result_snapshot(
         if phase.running_attempts is None:
             continue
         recovered: list[tuple[RunningAttemptSnapshot, str | None, TrialStateName]] = []
+        settled_ids: list[str] = []
         for attempt in phase.running_attempts:
             location = confirmed_by_location.get((phase.phase, attempt.trial_number))
             attempt_id = attempt.attempt_id
@@ -727,6 +735,7 @@ def finalize_result_snapshot(
             else:
                 state = attempt.recovers_as
             recovered.append((attempt, None if location is None else location[1], state))
+            settled_ids.append(attempt_id)
         if not recovered:
             continue
         running = phase.trials.get("RUNNING", 0)
@@ -735,6 +744,10 @@ def finalize_result_snapshot(
         phase.trials["RUNNING"] = running - len(recovered)
         for _attempt, _generation_id, state in recovered:
             phase.trials[state] = phase.trials.get(state, 0) + 1
+        for attempt_id in settled_ids:
+            counts = (confirmed_attempt_reruns or {}).get(attempt_id, InterruptedReruns())
+            phase.interrupted_reruns += counts.reruns
+            phase.interrupted_reruns_earlier_attempt += counts.earlier_attempt
         # Generation counts belong to represented_generation_id: a run that launched a
         # trial, and so can leave one RUNNING, represents its own generation.
         generation_id = parsed.status.represented_generation_id

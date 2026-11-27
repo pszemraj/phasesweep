@@ -47,7 +47,12 @@ from phasesweep.engine.ledger import (
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.state import GENERATION_ID_ATTR, TrialStateName
+from phasesweep.engine.state import (
+    GENERATION_ID_ATTR,
+    InterruptedReruns,
+    TrialStateName,
+    _interrupted_reruns,
+)
 from phasesweep.engine.trial_dirs import producing_attempts
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.mcp.errors import NEW_RUN_RESUMES, live_runner_step, sync_tracking_command
@@ -108,6 +113,8 @@ class _CleanupEvidence:
     reaped_attempt_locations: dict[str, tuple[str, int, str]]
     registered_recovery_attempt_ids: set[str] = field(default_factory=set)
     reaped_attempt_states: dict[str, TrialStateName] = field(default_factory=dict)
+    # What each settled attempt adds to the frozen interrupted-rerun counters, read from its row.
+    reaped_attempt_reruns: dict[str, InterruptedReruns] = field(default_factory=dict)
     reaped: int = 0
     registered_attempts_reconciled: int = 0
     cleanup_recovered: int = 0
@@ -918,26 +925,40 @@ def _recover_trial_evidence(
         evidence.terminated = sum(tracking_report.process_actions.values())
         evidence.inspection_messages = tracking_report.inspection_messages or {}
     if confirm and needs.stored_snapshot is not None:
-        pending_ids = {
-            attempt.attempt_id
+        captured = [
+            attempt
             for phase in needs.stored_snapshot.status.phases
             for attempt in phase.running_attempts or ()
+        ]
+        pending_ids = {
+            attempt.attempt_id
+            for attempt in captured
             if attempt.recovers_as == "EVIDENCE_PENDING" and attempt.attempt_id is not None
         } & evidence.reaped_attempt_ids
-        if pending_ids:
+        # Each settled result also adds what the frozen interrupted-rerun counters count of it.
+        if captured and evidence.reaped_attempt_locations:
             if not loaded_studies:
                 _ledger, loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
             for phase_name, studies in loaded_studies.items():
-                for attempt_id, owner in producing_attempts(studies).items():
+                producers = producing_attempts(studies)
+                for attempt_id, owner in producers.items():
                     trial = owner.trial
-                    if attempt_id not in pending_ids or not trial.state.is_finished():
+                    if (
+                        attempt_id not in evidence.reaped_attempt_ids
+                        or not trial.state.is_finished()
+                    ):
                         continue
                     location = evidence.reaped_attempt_locations.get(attempt_id)
                     generation = trial.user_attrs.get(GENERATION_ID_ATTR)
-                    if location == (phase_name, trial.number, generation):
+                    if location != (phase_name, trial.number, generation):
+                        continue
+                    if attempt_id in pending_ids:
                         evidence.reaped_attempt_states[attempt_id] = _trial_count_state(
                             trial, config
                         )
+                    evidence.reaped_attempt_reruns[attempt_id] = _interrupted_reruns(
+                        owner.rows.values(), producers=producers, counted={trial.number}
+                    )
     _require_cleanup_evidence(needs, evidence, inspected_studies)
     return evidence
 
@@ -1130,6 +1151,7 @@ def _finish_result_recovery(
             confirmed_attempt_ids=evidence.reaped_attempt_ids,
             confirmed_attempt_locations=evidence.reaped_attempt_locations,
             confirmed_attempt_states=evidence.reaped_attempt_states,
+            confirmed_attempt_reruns=evidence.reaped_attempt_reruns,
         )
         emit(f"Finalized stored terminal result snapshot for {run_id}.")
     elif needs.snapshot_unavailable:
@@ -1147,6 +1169,7 @@ def _finalize_stored_terminal_result_snapshot(
     confirmed_attempt_ids: set[str],
     confirmed_attempt_locations: dict[str, tuple[str, int, str]],
     confirmed_attempt_states: Mapping[str, TrialStateName] | None = None,
+    confirmed_attempt_reruns: Mapping[str, InterruptedReruns] | None = None,
 ) -> None:
     """Finalize and persist the stored snapshot without losing a completed prior view.
 
@@ -1156,6 +1179,8 @@ def _finalize_stored_terminal_result_snapshot(
     :param set[str] confirmed_attempt_ids: Exact attempts durably reconciled to terminal states.
     :param dict[str, tuple[str, int, str]] confirmed_attempt_locations: Phase, trial, and generation of reconciled attempts.
     :param Mapping[str, TrialStateName] | None confirmed_attempt_states: Actual terminal state of pending evidence.
+    :param Mapping[str, InterruptedReruns] | None confirmed_attempt_reruns: What each reconciled
+        attempt adds to the interrupted-rerun counters, defaults to nothing.
     :raises RunRecoveryError: The stored snapshot is unavailable or persistence fails.
     """
     snapshot = parse_result_snapshot(terminal_status)
@@ -1172,6 +1197,7 @@ def _finalize_stored_terminal_result_snapshot(
             confirmed_attempt_ids=confirmed_attempt_ids,
             confirmed_attempt_locations=confirmed_attempt_locations,
             confirmed_attempt_states=confirmed_attempt_states,
+            confirmed_attempt_reruns=confirmed_attempt_reruns,
         )
         terminal_status["result_snapshot_state"] = "complete"
         write_status_file(store.status_path(run_id), terminal_status)

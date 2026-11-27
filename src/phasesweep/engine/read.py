@@ -120,7 +120,11 @@ from phasesweep.engine.status_refusals import (
     _point_children_at_refused_parents,
     _study_diagnostics,
 )
-from phasesweep.engine.trial_dirs import reused_checkpoint_warnings, standing_repeat_attempts
+from phasesweep.engine.trial_dirs import (
+    producing_attempts,
+    reused_checkpoint_warnings,
+    standing_repeat_attempts,
+)
 from phasesweep.errors import (
     OperatorAction,
 )
@@ -664,7 +668,7 @@ def winner_advisories(
         edge_advisory=edge,
         edge_advisory_status=edge_status,
         checkpoint_warnings=reused_checkpoint_warnings(studies, standing),
-        reruns=_interrupted_reruns(trials or (), standing),
+        reruns=_interrupted_reruns(trials or (), standing, producers=producing_attempts(studies)),
     )
 
 
@@ -1491,11 +1495,13 @@ def _trial_table(
     refusal: PhaseRefusal | None = None,
     growth: tuple[tuple[int, str], ...] = (),
     pruned: tuple[int, ...] = (),
+    studies: Sequence[optuna.Study] = (),
 ) -> TrialTable:
     """Build one phase's table from its trials and the winner the publication holds for it.
 
     A ``rerun_of`` column, naming the interrupted trial or failed grid cell each rerun
-    reran, appears once the phase holds a rerun.
+    reran, appears once the phase holds a rerun. The phase's other studies tell which adopted
+    rows reran an interrupted trial where the study that launched them did.
 
     :param Experiment experiment: Current metric and constraint eligibility bounds.
     :param Phase phase: The configured phase the trials belong to.
@@ -1507,6 +1513,8 @@ def _trial_table(
     :param tuple[tuple[int, str], ...] growth: The search-space growths the study recorded,
         defaults to none.
     :param tuple[int, ...] pruned: Finished trials whose directory is gone, defaults to none.
+    :param Sequence[optuna.Study] studies: Every study of the phase from the same capture as
+        ``trials``, defaults to none.
     :return TrialTable: The rows and the columns they carry.
     """
     axis = repeat_axis(phase)
@@ -1569,7 +1577,7 @@ def _trial_table(
         growth=growth,
         pruned=pruned,
         checkpoint_warnings=() if winner is None else winner.checkpoint_warnings,
-        reruns=_interrupted_reruns(trials, standing),
+        reruns=_interrupted_reruns(trials, standing, producers=producing_attempts(studies)),
     )
 
 
@@ -1743,6 +1751,7 @@ def read_trial_tables(
                 refusal=refusal,
                 growth=() if identity is None else recorded_growth(identity),
                 pruned=pruned,
+                studies=every[phase.name],
             )
         )
     return TrialTables(

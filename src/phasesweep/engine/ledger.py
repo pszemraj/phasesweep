@@ -803,7 +803,8 @@ def phase_trial_stats(
                 recovers_as=_recovered_trial_state(trial, outcomes.get(trial.number)),
             )
         )
-    owned = [owner.trial for owner in producing_attempts(studies).values()]
+    producers = producing_attempts(studies)
+    owned = [owner.trial for owner in producers.values()]
     # A live allocation stamps its generation before its attempt ID.
     owned.extend(trial for trial in trials if ATTEMPT_ID_ATTR not in trial.user_attrs)
     for trial in owned:
@@ -818,7 +819,7 @@ def phase_trial_stats(
         generation_counts,
         running_attempts,
         studies=studies,
-        reruns=_interrupted_reruns(trials),
+        reruns=_interrupted_reruns(trials, producers=producers),
     )
 
 

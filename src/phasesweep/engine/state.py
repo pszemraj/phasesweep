@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Container, Iterable, Mapping
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, get_args
 
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
 
     from phasesweep.engine.confound import ConfoundBlock
     from phasesweep.engine.repeats import RepeatsRecord
+    from phasesweep.engine.trial_dirs import ProducingAttempt
     from phasesweep.runtime.process import AttemptLifecycle
 
 WinnerSourceKind = Literal["phase_trial"]
@@ -174,7 +176,8 @@ class InterruptedReruns:
     """How far a phase's results lean on reruns of interrupted trials (:func:`_interrupted_reruns`).
 
     ``results`` counts the trials in a state of :data:`FINISHED_TRIAL_STATES`, ``reruns`` those
-    of them whose :data:`RERUN_OF_ATTR` chain reaches an interrupted trial, ``earlier_attempt``
+    of them whose :data:`RERUN_OF_ATTR` chain, followed through the study that launched each
+    attempt, reaches an interrupted trial, ``earlier_attempt``
     those reruns scored from a value an earlier attempt wrote
     (:data:`EARLIER_ATTEMPT_RESULT_ATTR`), and ``winner`` whether a trial the winner stands on
     is among the reruns. Computed from the ledger at read time and never saved.
@@ -753,35 +756,49 @@ def _unreplaced_attempts(trials: Iterable[FrozenTrial], *, interrupted: bool) ->
 
 
 def _interrupted_reruns(
-    trials: Iterable[FrozenTrial], standing: Mapping[int, str | None] | None = None
+    trials: Iterable[FrozenTrial],
+    standing: Mapping[int, str | None] | None = None,
+    *,
+    producers: Mapping[str, ProducingAttempt],
+    counted: Container[int] | None = None,
 ) -> InterruptedReruns:
     """Count a phase's results that rerun an interrupted trial, the one rule every report uses.
 
     A result is a trial that counts toward ``n_trials``. It reran an interrupted trial when
-    any attempt its :data:`RERUN_OF_ATTR` chain names was interrupted, so a failed grid cell's
-    retry of an interrupted cell counts too.
+    any attempt its physical :data:`RERUN_OF_ATTR` chain names was interrupted
+    (:func:`phasesweep.engine.trial_dirs._rerun_chain`), so a failed grid cell's retry of an
+    interrupted cell counts too, and so does an attempt another reading of the phase adopted
+    into a slot that names no rerun. A frozen MCP result that recovery settles adds what its
+    settled trials count here (``counted``).
 
     :param Iterable[FrozenTrial] trials: Every trial of one study.
     :param Mapping[int, str | None] | None standing: The winner's trials
         (:func:`_winning_trials`), or ``None`` where the caller has no winner, defaults to None.
+    :param Mapping[str, ProducingAttempt] producers: The phase's launching rows by attempt ID
+        (:func:`phasesweep.engine.trial_dirs.producing_attempts`), from the same capture as
+        ``trials``.
+    :param Container[int] | None counted: The trial numbers to count, defaults to every result.
+    :raises ProcessCleanupUncertainError: A rerun link does not name an earlier trial.
     :return InterruptedReruns: The counts, all zero for a phase no interruption touched.
     """
+    from phasesweep.engine.trial_dirs import _rerun_chain
+
     by_number = {trial.number: trial for trial in trials}
     results = [
         trial
         for trial in by_number.values()
-        if trial.state.name in FINISHED_TRIAL_STATES and not _trial_interrupted(trial)
+        if trial.state.name in FINISHED_TRIAL_STATES
+        and not _trial_interrupted(trial)
+        and (counted is None or trial.number in counted)
     ]
-    reruns = []
-    for trial in results:
-        current = trial
-        # A rerun always names an earlier trial, so the walk ends.
-        while (source := by_number.get(current.user_attrs.get(RERUN_OF_ATTR, -1))) is not None:
-            if source.number >= current.number or _trial_interrupted(source):
-                break
-            current = source
-        if source is not None and _trial_interrupted(source):
-            reruns.append(trial)
+    reruns = [
+        trial
+        for trial in results
+        if any(
+            _trial_interrupted(source)
+            for source in islice(_rerun_chain(by_number, trial, attempts=producers), 1, None)
+        )
+    ]
     return InterruptedReruns(
         results=len(results),
         reruns=len(reruns),

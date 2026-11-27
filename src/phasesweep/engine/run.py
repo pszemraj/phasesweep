@@ -59,7 +59,7 @@ from phasesweep.engine.state import (
     _unreplaced_attempts,
     _winning_trials,
 )
-from phasesweep.engine.trial_dirs import reused_checkpoint_warnings
+from phasesweep.engine.trial_dirs import producing_attempts, reused_checkpoint_warnings
 from phasesweep.errors import (
     OperatorAction,
     PhaseSweepError,
@@ -657,6 +657,7 @@ def _phase_counts(
         studies = ledger_ops.read_every_phase_study(ledger, [phase.name])[phase.name]
         study = next((item for item in studies if item.study_name == study_name), None)
         standing = _winning_trials(winner.trial_number, winner.attempt_id, winner.repeats)
+        producers = producing_attempts(studies)
         for warning in reused_checkpoint_warnings(studies, standing):
             log.warning("[%s] %s", phase.name, warning)
     except (PhaseSweepError, OSError) as exc:
@@ -678,7 +679,7 @@ def _phase_counts(
             trial for trial in trials if trial.user_attrs.get(GENERATION_ID_ATTR) != generation_id
         ),
         winner_dirs=tuple(directory for directory in standing_dirs if directory is not None),
-        reruns=_interrupted_reruns(trials, standing),
+        reruns=_interrupted_reruns(trials, standing, producers=producers),
     )
 
 
