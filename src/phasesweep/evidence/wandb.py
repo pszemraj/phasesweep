@@ -891,7 +891,12 @@ def _poll_wandb_summary(
     decided after the loop as the missing-keys verdict is, against the row count and state
     recorded at launch (:func:`read_wandb_stamp`), since ``historyLineCount`` is
     current within a second while the summary lags. A count that grew means W&B has rows it
-    has not summarized yet, so the read stays pending. An unchanged count over a run whose
+    has not summarized yet, so the read stays pending. W&B refuses a rewind together with the
+    ``WANDB_RESUME`` every attempt gets, so an unchanged count proves the rerun appended
+    nothing. With no count recorded at the launch, the served history stands in for it
+    (:func:`_served_history`): while it serves fewer rows than the count, holds a row stamped
+    at or after ``logged_after``, or cannot be read, the read stays pending. An unchanged
+    count over a run whose
     earlier session had closed, now finished with a summary that matches its index, means the
     rerun added nothing to a run holding all its earlier rows: the summary is read as a
     summary is otherwise read and the capture carries ``earlier_attempt``. A session that
@@ -950,6 +955,9 @@ def _poll_wandb_summary(
     # The row count, summary and values an earlier attempt's capture was read from, so an
     # unchanged run is not read through its history again on every poll.
     read_earlier: tuple[int | None, dict[str, object], dict[str, float]] | None = None
+    # The answer whose history was last read complete and its latest row stamp, so a complete
+    # history is read once per answer that could decide a verdict, not once per poll.
+    read_history: tuple[tuple[int | None, str, dict[str, object]], float | None] | None = None
     while time.monotonic() < deadline:
         try:
             api = Api(
@@ -999,6 +1007,39 @@ def _poll_wandb_summary(
                 # A stale answer with no new row is waited out, and what it decides is kept for
                 # the deadline in case it is the last answer.
                 unlogged = stale and logged <= 0
+                # With no count recorded at the launch, the history W&B serves stands in for it
+                # once it serves every counted row; it lags the count and the summary, so until
+                # it does, or while a read fails, no verdict is drawn.
+                written: str | None = None
+                if unlogged and logged_after is not None and launch_rows is None:
+                    answer = (rows, str(run.state), dict(summary))
+                    if rows is not None and (read_history is None or read_history[0] != answer):
+                        try:
+                            served, stamp = _served_history(run, rows, deadline)
+                        except Exception as exc:
+                            written = (
+                                "W&B history could not be read to tell whether the attempt "
+                                f"logged since its launch: {_error_detail(exc)}."
+                            )
+                        else:
+                            if served < rows:
+                                written = (
+                                    f"W&B counts {rows} rows but its history serves {served} so "
+                                    "far, so it cannot yet show whether the attempt logged since "
+                                    "its launch."
+                                )
+                            else:
+                                # A complete append-only history cannot change while the count
+                                # does not.
+                                read_history = (answer, stamp)
+                    if written is None and read_history is not None and read_history[0] == answer:
+                        stamp = read_history[1]
+                        if stamp is not None and stamp >= logged_after:
+                            written = (
+                                "W&B history holds a row logged since the attempt launched "
+                                "that its summary does not show yet."
+                            )
+                    unlogged = written is None
                 earlier = (
                     unlogged
                     and launch_rows is not None
@@ -1009,6 +1050,11 @@ def _poll_wandb_summary(
                 if unlogged and not earlier:
                     verdict = "shows no row logged since the attempt launched, and " + (
                         "no row count was recorded at the launch"
+                        + (
+                            ""
+                            if rows is None
+                            else f", and its history serves all {rows} rows, none since then"
+                        )
                         if launch_rows is None
                         else f"W&B serves {rows!r} rows against {launch_rows} at the launch"
                         if rows != launch_rows
@@ -1025,6 +1071,9 @@ def _poll_wandb_summary(
                         f"W&B holds {logged} rows logged since the attempt launched that its "
                         "summary does not show yet."
                     )
+                elif written is not None:
+                    reached = False
+                    last_error = RuntimeError(written)
                 elif run.state == "finished" and not matched:
                     reached = False
                     last_error = RuntimeError(
@@ -1200,6 +1249,31 @@ def _row_count(run: object) -> int | None:
     """
     rows = getattr(run, "historyLineCount", None)
     return rows if type(rows) is int and rows >= 0 else None
+
+
+def _served_history(run: _HistoryReader, rows: int, deadline: float) -> tuple[int, float | None]:
+    """Count the history rows W&B serves for a run and find their latest ``_timestamp``.
+
+    Every logged row carries the logging host's ``_timestamp``. W&B serves history rows up to
+    a minute after ``historyLineCount`` counts them and after the summary shows them, so the
+    served rows say whether a rerun logged only once they number ``rows``. A history below
+    the sample cap is read sampled, which serves every row W&B has; a longer one is scanned,
+    and the scan stops at the history index's last step, which lags too.
+
+    :param _HistoryReader run: Public-API run.
+    :param int rows: The run's row count in the same answer.
+    :param float deadline: ``time.monotonic()`` time after which no read starts.
+    :return tuple[int, float | None]: The served row count and their latest stamp, ``None``
+        when no served row carries one.
+    :raises TimeoutError: The deadline passed before or during the read.
+    """
+    if time.monotonic() >= deadline:
+        raise TimeoutError("W&B history read expired.")
+    read = _read_series(run, ["_timestamp", "_step"], last_step=rows - 1, deadline=deadline)
+    if read is None:
+        raise TimeoutError("W&B history read expired.")
+    stamps = (finite_nonnegative(row.get("_timestamp")) for row in read)
+    return len(read), max((stamp for stamp in stamps if stamp is not None), default=None)
 
 
 def _read_wandb_stamp(

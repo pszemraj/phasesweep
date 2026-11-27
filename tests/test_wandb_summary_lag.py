@@ -194,7 +194,8 @@ def _serve(
 
     :param pytest.MonkeyPatch monkeypatch: Fixture that replaces the SDK client and clock.
     :param Callable[[int], Answer] answers: State, summary and last history step per read.
-    :param tuple[Mapping[str, object], ...] rows: Rows available in unsampled history.
+    :param tuple[Mapping[str, object], ...] rows: Rows available in sampled and unsampled
+        history, every one of them below the sample cap.
     :param Callable[[list[str]], None] | None on_scan: Callback for each history read.
     :param str | None created_at: The run's ISO ``created_at``, defaults to None for a run that serves none.
     :param Callable[[int], int | None] line_count: The run's ``historyLineCount`` per read,
@@ -215,6 +216,12 @@ def _serve(
             on_scan(keys)
         return [row for row in rows if all(key in row for key in keys)]
 
+    def history(*, keys: list[str], samples: int, pandas: bool) -> list[Mapping[str, object]]:
+        assert samples > len(rows) and not pandas
+        if on_scan is not None:
+            on_scan(keys)
+        return [row for row in rows if all(key in row for key in keys)]
+
     class Api:
         def __init__(self, **kwargs: object) -> None:
             self.used = False
@@ -229,6 +236,7 @@ def _serve(
                 state=state,
                 summary_metrics=summary,
                 history_keys=_history_index(last_step),
+                history=history,
                 scan_history=scan_history,
                 **({} if created_at is None else {"created_at": created_at}),
                 **({} if count is None else {"historyLineCount": count}),
@@ -433,7 +441,9 @@ def test_a_reruns_run_that_never_moves_leaves_nothing_to_score_at_the_deadline(
     from phasesweep.evidence.wandb import WandbNothingToScoreError
 
     left = {"_step": 5, _KEY: 0.5, "_timestamp": _LAUNCHED_AT - 60}
-    clock, _ = _serve(monkeypatch, lambda _: (state, left, last_step), line_count=lambda _: 5)
+    clock, _ = _serve(
+        monkeypatch, lambda _: (state, left, last_step), rows=_history(5), line_count=lambda _: 5
+    )
     with pytest.raises(WandbNothingToScoreError) as caught:
         _poll(logged_after=_LAUNCHED_AT, launch_rows=launch[0], launch_state=launch[1])
     assert caught.value.cause.startswith(
@@ -500,6 +510,107 @@ def test_a_waiting_earlier_summary_reads_its_history_once(
     assert capture["values"] == {_KEY: 0.1} and capture["earlier_attempt"] is True
     assert len(paths) == 48
     assert scanned_at and set(scanned_at) == {0.0}
+
+
+def _history(before: int, after: int = 0) -> tuple[dict[str, object], ...]:
+    """Build a run's served history: rows logged before the rerun's launch, then after it.
+
+    :param int before: Rows stamped before the launch.
+    :param int after: Rows stamped after the launch, defaults to 0.
+    :return tuple[dict[str, object], ...]: The rows, each with ``_step`` and ``_timestamp``.
+    """
+    stamps = [_LAUNCHED_AT - 60 + row for row in range(before)]
+    stamps += [_LAUNCHED_AT + 20 + row for row in range(after)]
+    return tuple({"_step": step, "_timestamp": stamp} for step, stamp in enumerate(stamps))
+
+
+def test_a_recorded_launch_count_decides_without_reading_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a row count recorded at the launch, an unchanged count proves the rerun appended nothing, so the earlier attempt's summary is scored at the deadline without any history read."""
+    left = {"_step": 4, _KEY: 0.12, "_timestamp": _LAUNCHED_AT - 56}
+    reads: list[list[str]] = []
+    _serve(
+        monkeypatch,
+        lambda _: ("finished", left, 4),
+        rows=_history(5),
+        on_scan=reads.append,
+        line_count=lambda _: 5,
+    )
+    capture = _poll(logged_after=_LAUNCHED_AT, launch_rows=5, launch_state="killed")
+    assert capture["values"] == {_KEY: 0.12} and capture["earlier_attempt"] is True
+    assert reads == []
+
+
+@pytest.mark.parametrize(
+    ("served", "cause"),
+    [
+        (_history(5), "W&B counts 8 rows but its history serves 5 so far"),
+        (_history(5, 3), "W&B history holds a row logged since the attempt launched"),
+        (_history(8), None),
+    ],
+    ids=["history-behind-count", "rows-since-launch", "complete-and-silent"],
+)
+def test_a_rerun_without_a_launch_count_is_judged_by_its_served_history(
+    monkeypatch: pytest.MonkeyPatch, served: tuple[dict[str, object], ...], cause: str | None
+) -> None:
+    """A rerun whose launch recorded no row count, on a run W&B counts 8 rows for while the summary is the earlier attempt's, stays pending while the served history has fewer rows than the count or holds a row stamped since the launch; only a history serving all 8 rows, none since the launch, leaves nothing to score.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
+    :param tuple[dict[str, object], ...] served: The history rows W&B serves.
+    :param str | None cause: The pending message's start, ``None`` for the verdict.
+    """
+    from phasesweep.evidence.wandb import WandbNothingToScoreError, WandbPollTimeout
+
+    left = {"_step": 4, _KEY: 0.12, "_timestamp": _LAUNCHED_AT - 56}
+    _serve(monkeypatch, lambda _: ("finished", left, 4), rows=served, line_count=lambda _: 8)
+    if cause is None:
+        with pytest.raises(WandbNothingToScoreError) as verdict:
+            _poll(logged_after=_LAUNCHED_AT)
+        assert verdict.value.cause == (
+            "shows no row logged since the attempt launched, and no row count was recorded at "
+            "the launch, and its history serves all 8 rows, none since then"
+        )
+        return
+    with pytest.raises(WandbPollTimeout) as caught:
+        _poll(logged_after=_LAUNCHED_AT)
+    assert not caught.value.reached
+    assert str(caught.value.last_error).startswith(cause)
+
+
+def test_an_unreadable_history_keeps_a_reruns_verdict_pending_until_it_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a rerun's launch recorded no row count and the history read that stands in for it fails at every poll, the read stays pending, saying so; once a later read gets a complete history with no row since the launch, the attempt leaves nothing to score, its history read once."""
+    from phasesweep.evidence.wandb import WandbNothingToScoreError, WandbPollTimeout
+
+    left = {"_step": 4, _KEY: 0.12, "_timestamp": _LAUNCHED_AT - 56}
+    reads: list[float] = []
+    outage = [True]
+
+    def read_history(_keys: list[str]) -> None:
+        reads.append(clock.now)
+        if outage[0]:
+            raise ConnectionError("history offline")
+
+    clock, _ = _serve(
+        monkeypatch,
+        lambda _: ("finished", left, 4),
+        rows=_history(5),
+        on_scan=read_history,
+        line_count=lambda _: 5,
+    )
+    with pytest.raises(WandbPollTimeout) as caught:
+        _poll(logged_after=_LAUNCHED_AT)
+    assert not caught.value.reached
+    assert str(caught.value.last_error) == (
+        "W&B history could not be read to tell whether the attempt logged since its launch: "
+        "ConnectionError."
+    )
+    outage[0], reads[:], clock.now = False, [], 0.0
+    with pytest.raises(WandbNothingToScoreError):
+        _poll(logged_after=_LAUNCHED_AT)
+    assert reads == [0.0]
 
 
 def test_a_launch_stamp_waits_for_a_signalled_session_to_close(
