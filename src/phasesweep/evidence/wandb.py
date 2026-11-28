@@ -663,23 +663,21 @@ class _Scored(NamedTuple):
     # Required keys no run holds, and keys taken from an earlier run's summary.
     missing: list[str]
     borrowed: list[str]
-    # Whether the scoring run's own history has yet to reproduce its summary.
-    unsettled: bool
 
 
-def _summary_number(run: _Run, key: str) -> float | None:
-    """Return a run's finite summary value for a key, if it holds one.
+def _finite_metric(metrics: Mapping[str, object], key: str) -> float | None:
+    """Return a finite numeric metric from a summary or a history row.
 
-    :param _Run run: Public-API run.
-    :param str key: Summary key.
-    :return float | None: The value, or ``None`` when the summary lacks it or it is not finite.
+    :param Mapping[str, object] metrics: W&B summary or history row.
+    :param str key: Metric key.
+    :return float | None: The value when it exists and is a finite number.
     """
     from phasesweep.evidence.evaluation import json_float
 
-    if key not in run.summary_metrics:
+    if key not in metrics:
         return None
     try:
-        value = json_float(run.summary_metrics[key], label=key)
+        value = json_float(metrics[key], label=key)
     except ValueError:
         return None
     return value if math.isfinite(value) else None
@@ -749,6 +747,16 @@ def _attempt_series(
     return [points[step] for step in sorted(points)]
 
 
+def _matches_extremum(observed: float, summary: float) -> bool:
+    """Allow for W&B serializing a history extremum and its summary one binary64 step apart.
+
+    :param float observed: Finite extremum from history.
+    :param float summary: Finite summary value.
+    :return bool: Whether they agree to tracker precision.
+    """
+    return math.nextafter(observed, summary) == summary
+
+
 def _merged_extrema(
     runs: Sequence[_Run],
     sources: Mapping[str, int],
@@ -756,18 +764,18 @@ def _merged_extrema(
     *,
     axis: str,
     deadline: float,
-) -> tuple[dict[str, float], bool]:
+) -> dict[str, float]:
     """Reduce required native aggregates over a trial's runs, sharing reads of each series.
 
     With an evaluation axis, each run's rows are its attempt's history, and the reduction runs
     over the series :func:`merge_attempt_histories` retains from them, the rule MLflow
     histories use. W&B's own ``_step`` restarts in every run, so without an axis the reduction
     runs over the runs' summary values. A literal dotted series, and a summary value the
-    scoring run's own rows do not reproduce, keep their summary value.
+    scoring run's complete history does not reproduce, keep their summary value.
 
     W&B serves a run's keyed history up to a minute after its summary, so with an axis a run
     whose summary holds the aggregate but whose served rows do not reproduce it may not be
-    fully served yet. A closed earlier run in that state leaves the read pending. An earlier
+    fully served yet. A closed run with outstanding evidence leaves the read pending. An earlier
     run that is not closed may never receive its last rows and is read as W&B holds it.
 
     :param Sequence[_Run] runs: The trial's runs through the scoring run, oldest first.
@@ -775,12 +783,11 @@ def _merged_extrema(
     :param Mapping[str, float] values: Finite summary values from those runs.
     :param str axis: Trainer's progress key, or ``_step`` for none.
     :param float deadline: Monotonic deadline for history queries.
-    :return tuple[dict[str, float], bool]: Reduced extrema keyed by their exact summary
-        names, and whether a run's served rows did not reproduce its summary aggregate.
+    :return dict[str, float]: Reduced extrema keyed by their exact summary names.
     :raises TimeoutError: History could not be read before the deadline.
     :raises _RetainedHistoryError: A run's series rows cannot be placed on the axis or the
         retained series has no finite observation.
-    :raises _NoAnswer: A closed earlier run's keyed history does not reproduce its aggregate.
+    :raises _NoAnswer: A closed run's history is still being served.
     """
     operations: dict[str, list[str]] = {}
     for key in values:
@@ -797,11 +804,10 @@ def _merged_extrema(
             operations.setdefault(series, []).append(operation)
 
     def reproduces(rows: Sequence[float], number: float, reduce: Callable[..., float]) -> bool:
-        # W&B can serialize the same value one binary64 step apart in summary and history.
-        return bool(rows) and math.nextafter(reduce(rows), number) == number
+        return bool(rows) and _matches_extremum(reduce(rows), number)
 
     reduced: dict[str, float] = {}
-    unsettled = False
+    unconfirmed: dict[str, float] = {}
     for series, kinds in operations.items():
         histories = (
             []
@@ -819,11 +825,11 @@ def _merged_extrema(
             reduce = min if operation == "min" else max
             source_index = sources[key]
             if axis == "_step":
-                numbers = (_summary_number(run, key) for run in runs[:source_index])
+                numbers = (_finite_metric(run.summary_metrics, key) for run in runs[:source_index])
                 reduced[key] = reduce([values[key], *(n for n in numbers if n is not None)])
                 continue
             for run, rows in zip(runs[:-1], finite[:-1], strict=True):
-                number = _summary_number(run, key)
+                number = _finite_metric(run.summary_metrics, key)
                 if (
                     run.state in _CLOSED_STATES
                     and number is not None
@@ -838,9 +844,61 @@ def _merged_extrema(
                         f"W&B metric {key!r} has no finite observation in the retained history."
                     )
                 reduced[key] = reduce(retained)
-            elif source_index == len(runs) - 1:
-                unsettled = True
-    return reduced, unsettled
+            elif source_index == len(runs) - 1 and len(histories[source_index]) != _row_count(
+                runs[-1]
+            ):
+                # If every counted row measured the series, the keyed scan is already complete.
+                unconfirmed[key] = values[key]
+    if unconfirmed:
+        _confirm_summary_only(runs[-1], unconfirmed, deadline=deadline)
+    return reduced
+
+
+def _confirm_summary_only(run: _Run, values: Mapping[str, float], *, deadline: float) -> None:
+    """Confirm that complete history distinguishes a direct summary scalar from a late native extremum.
+
+    A keyed scan omits rows that logged other metrics. Only this ambiguous case needs an
+    unfiltered scan. Count the rows and reduce their values from that same read, since history
+    can catch up between requests.
+
+    :param _Run run: The scoring run.
+    :param Mapping[str, float] values: Summary extrema its keyed reads did not reproduce.
+    :param float deadline: Monotonic deadline for history queries.
+    :raises _NoAnswer: The history is incomplete or the keyed read missed a native extremum.
+    :raises TimeoutError: History could not be read before the deadline.
+    """
+    expected: int | float | None = _row_count(run)
+    if expected is None:
+        last_step = _last_history_step(run)
+        if last_step is None:
+            raise _NoAnswer(
+                "W&B has not reported the scoring run's history row count or last step."
+            )
+        # Without a count, only a row at every possible step proves the scan is complete.
+        expected = last_step + 1
+    operations = {key: key.rsplit(".", 1) for key in values}
+    extrema: dict[str, float] = {}
+    served = 0
+    if time.monotonic() >= deadline:
+        raise TimeoutError("W&B history read expired.")
+    for row in run.scan_history(keys=[], page_size=_HISTORY_SAMPLES, use_cache=False):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("W&B history read expired.")
+        served += 1
+        for key, (series, operation) in operations.items():
+            metric = _finite_metric(row, series)
+            if metric is not None:
+                reduce = min if operation == "min" else max
+                extrema[key] = reduce(extrema.get(key, metric), metric)
+    if time.monotonic() >= deadline:
+        raise TimeoutError("W&B history read expired.")
+    if served != expected:
+        raise _NoAnswer(
+            f"W&B serves {served} history rows for the scoring run; {expected} are needed to confirm the summary value."
+        )
+    for key, extremum in extrema.items():
+        if _matches_extremum(extremum, values[key]):
+            raise _NoAnswer(f"The scoring run's keyed history has yet to reproduce {key!r}.")
 
 
 def _score(
@@ -868,8 +926,7 @@ def _score(
     :param tuple[str, ...] presence: Keys whose presence is recorded.
     :param str axis: Trainer's progress key, or ``_step`` for none.
     :param float deadline: Monotonic deadline for history queries.
-    :return _Scored: The values, present keys, the keys missing or borrowed, and whether the
-        scoring is unsettled.
+    :return _Scored: The values, present keys, and keys missing or borrowed.
     :raises ValueError: A required value is not a finite number, or a run's series rows
         cannot be placed on the axis.
     :raises TimeoutError: History could not be read before the deadline.
@@ -903,12 +960,10 @@ def _score(
         sources[key] = source_index
         if source_index < len(older):
             borrowed.append(key)
-    unsettled = False
     if older and not missing:
-        reduced, unsettled = _merged_extrema(runs, sources, values, axis=axis, deadline=deadline)
-        values.update(reduced)
+        values.update(_merged_extrema(runs, sources, values, axis=axis, deadline=deadline))
     present = sorted(key for key in presence if any(key in run.summary_metrics for run in runs))
-    return _Scored(values, present, missing, borrowed, unsettled)
+    return _Scored(values, present, missing, borrowed)
 
 
 def _lookup(clients: dict[str, _Api], address: WandbRunAddress, deadline: float) -> _Run | None:
@@ -1019,15 +1074,13 @@ def _poll_wandb_summary(
     4. A rerun's finished run whose summary matches its history but lacks the objective at the
        deadline ran without reporting it, so no earlier run scores it.
 
-    Rules 3 and 4, a key taken from an earlier run, and a scoring run whose own history does
-    not reproduce its summary aggregate, are verdicts the latest
-    answered poll decides, returned or raised after the deadline as a missing key is; such a
-    capture carries ``deadline_verdict``. A closed earlier run whose summary or history
-    is unsettled leaves the read pending. An earlier run that is not closed is read as W&B holds it,
-    since a session killed outright stays ``crashed`` with its first-row summary and never
-    receives the rows it had not uploaded. A rerun whose own summary holds every required key and no native aggregate
-    reads no earlier run and returns at once. A first attempt has no earlier runs and only
-    rule 1 applies.
+    Rules 3 and 4 and a key taken from an earlier run are verdicts the latest answered poll
+    decides at the deadline. Such a capture carries ``deadline_verdict``. A closed run whose
+    summary or history is unsettled leaves the read pending. An earlier run that is not
+    closed is read as W&B holds it, since a session killed outright stays ``crashed`` and
+    never uploads its remaining rows. A rerun whose own summary holds every required key
+    and no native aggregate reads no earlier run and returns at once. A first attempt has no
+    earlier runs and only rule 1 applies.
 
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
@@ -1090,7 +1143,7 @@ def _poll_wandb_summary(
             axis=evaluation_axis,
             deadline=deadline,
         )
-        cache[:] = [] if scored.unsettled else [(key, scored)]
+        cache[:] = [(key, scored)]
         return scored
 
     def capture(scored: _Scored) -> dict[str, object]:
@@ -1136,10 +1189,6 @@ def _poll_wandb_summary(
                 [],
             )
         scored = score(newest, [prior for _, prior in runs[:-1]])
-        if scored.unsettled:
-            raise _NoAnswer(
-                f"The closed earlier run {name}'s history does not yet reproduce its summary aggregate."
-            )
         if scored.missing:
             return None, scored.missing, sorted(summary)
         found = {**capture(scored), "deadline_verdict": True, "earlier_attempt": address["run_id"]}
@@ -1190,7 +1239,7 @@ def _poll_wandb_summary(
                     scored = score(run, older)
                     if scored.missing:
                         poll_missing, poll_available = scored.missing, sorted(summary)
-                    elif not scored.borrowed and not scored.unsettled:
+                    elif not scored.borrowed:
                         return capture(scored)
                     else:
                         poll_verdict = {**capture(scored), "deadline_verdict": True}

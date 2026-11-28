@@ -345,6 +345,26 @@ def test_matching_summary_and_index_must_account_for_the_counted_rows(
     assert capture["values"] == {key: 0.1}
 
 
+def test_a_complete_history_that_reproduces_the_retry_extremum_is_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If history catches up during a poll, the retry still has to merge its native minimum."""
+    key = "eval/loss.min"
+    opener = _run("killed", {"_step": 0, key: 0.1}, _rows(0.1, axis=(1,)))
+    retry = _run("finished", {"_step": 1, key: 0.8}, _rows(0.9, 0.8, axis=(8, 9)))
+    clock, _ = _serve(monkeypatch, {"opener": opener, "rerun": retry})
+    read = retry.scan_history
+
+    def scan(*, keys: list[str], **kwargs: object) -> list[dict[str, object]]:
+        rows = read(keys=keys, **kwargs)
+        return rows[:1] if keys and clock.now == 0 else rows
+
+    retry.scan_history = scan
+    capture = _poll("opener", required=(key,), objective_key=key, evaluation_axis="eval/step")
+    assert capture["values"] == {key: 0.1}
+    assert "deadline_verdict" not in capture
+
+
 @pytest.mark.parametrize("summary_only", ["rerun", "second"])
 def test_a_summary_only_run_without_the_objective_does_not_inherit_it(
     monkeypatch: pytest.MonkeyPatch, summary_only: str

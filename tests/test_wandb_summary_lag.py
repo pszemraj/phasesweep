@@ -49,8 +49,9 @@ from tests.tracking_helpers import (
 _KEY = "eval/loss.min"
 
 
+@pytest.mark.parametrize("delayed_run", ["opener", "retry"])
 def test_sibling_retry_replaces_tracker_history_before_recovery_and_reread(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delayed_run: str
 ) -> None:
     """A rerun's read names every earlier checkpoint writer's run across reading studies, and its native min merges their histories, in the live read, in recovery and in a re-read."""
     from phasesweep.evidence import evaluation, wandb
@@ -115,8 +116,9 @@ def test_sibling_retry_replaces_tracker_history_before_recovery_and_reread(
             summary = {"_step": len(rows) - 1, _KEY: min(losses), "eval/loss.max": max(losses)}
             runs[path.stem] = wandb_run("finished", summary, rows)
         if len(earlier_counts) == 1:
-            # The index and summary have caught up, but the opener's keyed rows have not.
-            runs[earlier[0]["run_id"]].scan_history = lambda **_: []
+            # The run's summary and index are visible before its history rows.
+            delayed_id = earlier[0]["run_id"] if delayed_run == "opener" else run_id
+            runs[delayed_id].scan_history = lambda **_: []
         with monkeypatch.context() as sdk:
             serve_wandb_runs(sdk, runs)
             return wandb._poll_wandb_summary(
@@ -142,10 +144,12 @@ def test_sibling_retry_replaces_tracker_history_before_recovery_and_reread(
     pending = original_study.trials[-1]
     assert pending.state.name == "RUNNING"
     before_recovery = launches.read_text().splitlines()
-    assert run_experiment(returned)["p"].metric == pytest.approx(0.20)
+    winner = run_experiment(returned)["p"]
+    assert winner.metric == pytest.approx(0.20)
     recovered = original_study.trials[-1]
     assert recovered.state.name == "COMPLETE"
     assert recovered.user_attrs[ATTEMPT_ID_ATTR] == pending.user_attrs[ATTEMPT_ID_ATTR]
+    assert run_experiment(returned)["p"] == winner
     assert run_experiment(config(_KEY, 3, gated=True))["p"].metric == pytest.approx(0.20)
     assert earlier_counts == [2, 2, 2]
     assert len(before_recovery) == 3 and launches.read_text().splitlines() == before_recovery
@@ -450,8 +454,7 @@ def _extrema_runs(mode: str, on_read: Callable[[list[str]], None]) -> dict[str, 
     trial keeps the opener's 0.4 and 0.2, the second's 0.3, 0.9 and 0.02, and the rerun's 0.4
     and 0.35, while the runs' summaries also cover the opener's abandoned 0.01 and 0.99.
 
-    :param str mode: ``native``, ``rounded-summary``, ``literal``, ``summary-only`` or
-        ``missing-axis``.
+    :param str mode: How the run logs its extrema, axis, and row count.
     :param Callable[[list[str]], None] on_read: Called with the keys of each history read.
     :return dict[str, object]: The runs by ID.
     """
@@ -472,7 +475,8 @@ def _extrema_runs(mode: str, on_read: Callable[[list[str]], None]) -> dict[str, 
             if mode == "literal":
                 rows.append({"_step": len(rows), _KEY: 0.01, "eval/loss.max": 0.99})
                 native = (0.01, 0.99)
-            elif mode == "summary-only":
+            elif mode in {"summary-only", "summary-only-no-count"}:
+                rows.append({"_step": len(rows), "train/iterations": 100})
                 native = (0.11, 0.88)
             elif mode == "rounded-summary":
                 native = (math.nextafter(native[0], 0), math.nextafter(native[1], 1))
@@ -481,6 +485,8 @@ def _extrema_runs(mode: str, on_read: Callable[[list[str]], None]) -> dict[str, 
         summary = {"_step": len(rows) - 1, _KEY: native[0], "eval/loss.max": native[1]}
         state = "crashed" if run_id != "rerun" else "finished"
         runs[run_id] = wandb_run(state, summary, tuple(rows), on_read)
+        if mode == "summary-only-no-count" and run_id == "rerun":
+            del runs[run_id].historyLineCount
     return runs
 
 
@@ -492,6 +498,7 @@ def _extrema_runs(mode: str, on_read: Callable[[list[str]], None]) -> dict[str, 
         ("_step", "native", (0.01, 0.99)),
         ("eval/step", "literal", (0.01, 0.99)),
         ("eval/step", "summary-only", (0.11, 0.88)),
+        ("eval/step", "summary-only-no-count", (0.11, 0.88)),
         ("eval/step", "missing-axis", (0.02, 0.9)),
         ("eval/step", "history-outage", (0.02, 0.9)),
     ],
