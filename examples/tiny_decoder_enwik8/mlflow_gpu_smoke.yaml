@@ -6,7 +6,7 @@ workdir: /tmp/phasesweep-tiny-decoder-enwik8-mlflow-gpu-smoke
 provenance:
   trainer: "run-trial-mlflow-v1+decoder-template@9c90a551"
   data: "enwik8-template-download"
-  tracking: "mlflow-3.17"
+  tracking: "mlflow-3.x"
 trial_command: "python examples/tiny_decoder_enwik8/run_trial.py --mlflow --template-root examples/tiny_decoder_enwik8/upstream --config {config_path}"
 trainer_config:
   run_dir: "{trial_dir}/trainer"

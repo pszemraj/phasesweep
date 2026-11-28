@@ -11,6 +11,7 @@ import yaml
 
 from phasesweep import report_objective
 from phasesweep.engine.confound import _assess_population, _confound_summary
+from phasesweep.engine.state import GENERATION_ID_ATTR
 from phasesweep.evidence.evaluation import run_extractor
 from phasesweep.evidence.models import JsonEnvelopeExtractor
 from tests.conftest import make_trial_context
@@ -113,10 +114,13 @@ def test_training_length_recipe_preserves_evaluation_and_mcp_verdicts(
                 distributions={
                     "max_steps": optuna.distributions.CategoricalDistribution([100, 200])
                 },
+                user_attrs={GENERATION_ID_ATTR: "generation"},
             )
         )
     trials = study.get_trials(deepcopy=False)
-    block = _assess_population(trials, trials, trials[1], provenance=provenance)
+    block = _assess_population(
+        trials, trials, trials[1], provenance=provenance, revisions={}, revision_sources={}
+    )
 
     assert block["checks"]["evaluation_point"]["verdict"] == expected_verdict
     summary = _confound_summary(

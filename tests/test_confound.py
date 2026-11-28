@@ -21,6 +21,7 @@ from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.confound import (
     CONFOUND_CHECKS,
     CONFOUND_VERDICTS,
+    RevisionRead,
     _assess_population,
     _confound_summary,
     _describe_flagged,
@@ -29,7 +30,7 @@ from phasesweep.engine.confound import (
     _noise_remedy,
     _validate_confound_block,
 )
-from phasesweep.engine.errors import StudyContextConflictError, TrialEvidenceMissingError
+from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _validate_objective_provenance
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.paths import _generation_winner_path
@@ -42,12 +43,12 @@ from phasesweep.engine.selection import (
 )
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
-    FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     RERUN_OF_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
+    TRIAL_DIR_ATTR,
     Winner,
 )
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
@@ -135,7 +136,6 @@ def _wandb(value: float | None = 1000, axis: str = "eval/step") -> dict[str, Any
             "entity": "e",
             "project": "p",
             "run_id": "attempt",
-            "run_state": "finished",
             "retrieved_at": "2026-01-01T00:00:00+00:00",
             "values": {"eval/loss": 0.5},
             "present_keys": [],
@@ -177,6 +177,7 @@ def _trials(
                 value=value,
                 params=params,
                 distributions=distributions,
+                user_attrs={GENERATION_ID_ATTR: "generation"},
             )
         )
     return study.get_trials(deepcopy=False)
@@ -187,11 +188,150 @@ def _assess(
     ranked: list[Any],
     *,
     provenance: dict[int, dict[str, Any]] | None = None,
+    revisions: dict[str, RevisionRead] | None = None,
 ) -> dict[str, Any]:
     """Assess ``ranked`` with the lowest value winning, as minimize selection does."""
     winner = min(ranked, key=lambda trial: (trial.value, trial.number))
     records = provenance or {trial.number: log_regex_provenance() for trial in ranked}
-    return _assess_population(trials, ranked, winner, provenance=records)
+    return _assess_population(
+        trials, ranked, winner, provenance=records, revisions=revisions or {}, revision_sources={}
+    )
+
+
+def _generation_trials(*generations: str) -> list[optuna.trial.FrozenTrial]:
+    """Build one COMPLETE trial per entry, each ran in the named generation."""
+    study = optuna.create_study()
+    for number, generation in enumerate(generations):
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=_COMPLETE,
+                value=0.5 - number / 100,
+                params={"x": number},
+                distributions={"x": optuna.distributions.IntDistribution(0, 100)},
+                user_attrs={GENERATION_ID_ATTR: generation},
+            )
+        )
+    return study.get_trials(deepcopy=False)
+
+
+_COMMIT_A = "a" * 40
+_COMMIT_B = "b" * 40
+
+
+def test_code_revision_never_flags_one_generation_or_an_identical_clean_commit() -> None:
+    """One generation is one recorded code state; two generations at one clean commit agree."""
+    single = _generation_trials("g1", "g1", "g1")
+    block = _assess(single, single, revisions={"g1": {"commit": _COMMIT_A, "dirty": True}})
+    assert block["checks"]["code_revision"]["verdict"] == "ok"
+    assert _flagged_checks(block) == []
+
+    pair = _generation_trials("g1", "g2")
+    same = {
+        "g1": {"commit": _COMMIT_A, "dirty": False},
+        "g2": {"commit": _COMMIT_A, "dirty": False},
+    }
+    check = _assess(pair, pair, revisions=same)["checks"]["code_revision"]
+    assert check["verdict"] == "ok"
+    assert [entry["trials"] for entry in check["detail"]["generations"]] == [[0], [1]]
+
+    one = _generation_trials("g1")
+    assert _assess(one, one)["checks"]["code_revision"] == {
+        "verdict": "n/a",
+        "reason": "only one trial was ranked",
+    }
+
+
+def test_code_revision_flags_what_cannot_be_shown_equal_and_never_raises() -> None:
+    """Another commit, a dirty tree, an unknown revision and an unreadable record each flag the check."""
+    trials = _generation_trials("g1", "g1", "g2", "g3", "g4")
+    revisions = {
+        "g1": {"commit": _COMMIT_A, "dirty": False},
+        "g2": {"commit": _COMMIT_A, "dirty": True},
+        "g3": "unknown",
+    }
+    block = _assess(trials, trials, revisions=revisions)
+
+    check = block["checks"]["code_revision"]
+    assert check["verdict"] == "heterogeneous"
+    assert [(entry["record"], entry["trials"]) for entry in check["detail"]["generations"]] == [
+        ("recorded", [0, 1]),
+        ("recorded", [2]),
+        ("unknown", [3]),
+        ("unreadable", [4]),
+    ]
+    (line,) = _describe_flagged(block, winner_trial=4)
+    assert line == (
+        "code_revision: ranked trials span 4 generations with 4 distinct trainer revisions "
+        f"whose code may differ: {_COMMIT_A[:12]} (trials 0, 1), {_COMMIT_A[:12]} dirty "
+        "(trial 2), unknown (trial 3), unreadable (trial 4)"
+    )
+    assert _validate_confound_block(block, winner_trial=4) == block
+    summary = _confound_summary(
+        block, winner_trial=4, extractor_kind="json_envelope", persistent=True
+    )["code_revision"]
+    assert summary["verdict"] == "heterogeneous"
+    assert (summary["generations"], summary["commits"], summary["dirty"], summary["unknown"]) == (
+        4,
+        1,
+        1,
+        2,
+    )
+    assert "rename" not in summary["remedy"] and "retrain" not in summary["remedy"]
+
+    commits = _generation_trials("g1", "g2")
+    split = {
+        "g1": {"commit": _COMMIT_A, "dirty": False},
+        "g2": {"commit": _COMMIT_B, "dirty": False},
+    }
+    assert _assess(commits, commits, revisions=split)["checks"]["code_revision"]["verdict"] == (
+        "heterogeneous"
+    )
+
+
+def test_code_revision_warning_lists_each_distinct_revision_once_with_its_trials() -> None:
+    """Generations at one commit read as one revision with its trial ranges, so the commit that differs stays listed."""
+    trials = _generation_trials("g1", "g1", "g2", "g2", "g2", "g3", "g4", "g5")
+    clean_a = {"commit": _COMMIT_A, "dirty": False}
+    revisions = {
+        "g1": clean_a,
+        "g2": clean_a,
+        "g3": {"commit": _COMMIT_B, "dirty": False},
+        "g4": {"commit": _COMMIT_B, "dirty": False},
+        "g5": clean_a,
+    }
+    block = _assess(trials, trials, revisions=revisions)
+
+    (line,) = _describe_flagged(block, winner_trial=0)
+    assert line == (
+        "code_revision: ranked trials span 5 generations with 2 distinct trainer revisions "
+        f"whose code may differ: {_COMMIT_A[:12]} (trials 0-4, 7), {_COMMIT_B[:12]} (trials 5, 6)"
+    )
+
+
+def test_code_revision_is_unjudged_when_no_generation_recorded_a_revision() -> None:
+    """Generations that all recorded no revision leave nothing to compare, so the check is ``n/a`` with them listed."""
+    pair = _generation_trials("g1", "g2")
+    block = _assess(pair, pair, revisions={"g1": "unknown", "g2": "unknown"})
+
+    check = block["checks"]["code_revision"]
+    assert check["verdict"] == "n/a"
+    assert [(entry["record"], entry["trials"]) for entry in check["detail"]["generations"]] == [
+        ("unknown", [0]),
+        ("unknown", [1]),
+    ]
+    assert _flagged_checks(block) == []
+    assert _validate_confound_block(block, winner_trial=1) == block
+    summary = _confound_summary(
+        block, winner_trial=1, extractor_kind="json_envelope", persistent=True
+    )["code_revision"]
+    assert (summary["verdict"], summary["generations"], summary["unknown"]) == ("n/a", 2, 2)
+
+    mixed = _assess(
+        pair, pair, revisions={"g1": "unknown", "g2": {"commit": _COMMIT_A, "dirty": False}}
+    )
+    assert mixed["checks"]["code_revision"]["verdict"] == "heterogeneous"
+    unreadable = _assess(pair, pair, revisions={"g1": "unknown"})
+    assert unreadable["checks"]["code_revision"]["verdict"] == "heterogeneous"
 
 
 def test_verdicts_are_three_distinct_values_and_not_checked_is_never_ok() -> None:
@@ -462,6 +602,8 @@ def test_survivorship_warning_names_each_failed_configuration() -> None:
         trials[:1],
         trials[0],
         provenance={0: log_regex_provenance()},
+        revisions={},
+        revision_sources={},
         untried_cells=[{"x": 99}],
     )
 
@@ -481,6 +623,8 @@ def test_survivorship_counts_a_grid_cell_no_trial_reached() -> None:
         trials,
         trials[1],
         provenance={trial.number: log_regex_provenance() for trial in trials},
+        revisions={},
+        revision_sources={},
         untried_cells=[{"x": 3}],
     )
     assert plain["checks"]["survivorship"] == {
@@ -579,6 +723,8 @@ def _assess_groups(
         ranked,
         by_number[best.representative],
         provenance={trial.number: log_regex_provenance() for trial in ranked},
+        revisions={},
+        revision_sources={},
         axis=RepeatAxis(key="seed", values=(0, 1, 2), reduce=reduce, slot_size=None),
         groups=ranked_groups,
         incomplete_group=incomplete,
@@ -1068,6 +1214,14 @@ def test_summary_exposes_the_evaluation_axis_without_checkpoint_paths() -> None:
             "pooled_sd": None,
             "df": None,
         },
+        "code_revision": {
+            "verdict": "ok",
+            "remedy": None,
+            "generations": 1,
+            "commits": 0,
+            "dirty": 0,
+            "unknown": 1,
+        },
     }
     rendered = json.dumps(summary)
     assert "/abs/ckpt.pt" not in rendered
@@ -1087,9 +1241,10 @@ def test_summary_exposes_the_evaluation_axis_without_checkpoint_paths() -> None:
             2,
             True,
             ("child",),
-            "Raise the phase's n_trials and rerun to run its untried cells. Before rerunning, "
-            "if any phase that inherits this one already has trials, give `child` a new `name`, "
-            "which runs it again from scratch.",
+            "Raise the phase's n_trials and rerun to run its untried cells. "
+            "Dependent studies keep their trials if their inherited values still match. "
+            "If those values change, the run keeps the top-up and names the phase that "
+            "needs a new study.",
         ),
         (
             1,
@@ -1130,10 +1285,10 @@ def test_survivorship_remedy_follows_the_configurations_left_and_the_storage(
 
 
 @pytest.mark.integration
-def test_published_survivorship_remedy_names_the_phases_that_must_be_renamed(
+def test_published_survivorship_remedy_keeps_compatible_dependent_studies(
     tmp_path: Path,
 ) -> None:
-    """The CLI and MCP remedy explains how a top-up can keep the upstream trials."""
+    """Following the CLI and MCP remedy reuses every study whose inherited values still match."""
     ready = tmp_path / "ready"
     trainer = write_trainer(
         tmp_path,
@@ -1163,7 +1318,7 @@ def test_published_survivorship_remedy_names_the_phases_that_must_be_renamed(
     winners = run_experiment(experiment)
     assert list(winners) == ["parent", "child", "grandchild"]
     assert winners["parent"].params == {"x": 1}
-    remedy_part = "give `child` and `grandchild` new names and update the `inherits` that name them"
+    remedy_part = "Dependent studies keep their trials if their inherited values still match."
 
     config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
     shown = CliRunner().invoke(cli, ["show-winners", str(config)])
@@ -1179,17 +1334,9 @@ def test_published_survivorship_remedy_names_the_phases_that_must_be_renamed(
     ready.touch()
     enlarged = parent.model_copy(update={"n_trials": 3})
     topup = experiment.model_copy(update={"phases": [enlarged, child, grandchild]})
-    with pytest.raises(StudyContextConflictError, match="bound to its published winner"):
-        run_experiment(topup)
-
-    next_child = child.model_copy(update={"name": "child_retry"})
-    next_grandchild = grandchild.model_copy(
-        update={"name": "grandchild_retry", "inherits": ["child_retry"]}
-    )
-    result = run_experiment(
-        experiment.model_copy(update={"phases": [enlarged, next_child, next_grandchild]})
-    )
-    assert list(result) == ["parent", "child_retry", "grandchild_retry"]
+    result = run_experiment(topup)
+    assert result["child"].source == winners["child"].source
+    assert result["grandchild"].source == winners["grandchild"].source
     trials = phase_study(experiment, "parent").trials
     assert len(trials) == 3
     assert trials[-1].state == _COMPLETE
@@ -1260,9 +1407,9 @@ def test_confound_block_never_moves_a_downstream_fingerprint() -> None:
 def _candidate_attrs(number: int, provenance: dict[str, Any]) -> dict[str, Any]:
     """Return the user attrs a selection candidate carries."""
     return {
-        FEASIBLE_ATTR: True,
         GENERATION_ID_ATTR: "generation-test",
         ATTEMPT_ID_ATTR: f"attempt-{number}",
+        TRIAL_DIR_ATTR: f"/runs/p/trial_{number:05d}__attempt-{number}",
         OBJECTIVE_PROVENANCE_ATTR: json.dumps(provenance),
         TRAINER_ENV_DIGEST_ATTR: "a" * 64,
         TRAINER_INPUT_ATTR: {"schema_version": 1},
@@ -1315,7 +1462,9 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
     ]
     # The failed trials at x=5 and x=6 count as tried, so the winner's x=0 is the lowest of four.
     assert warnings[1:] == [
-        "[p] no trial ran below the winner's x=0 (tried 0..6, at the configured lower bound)"
+        "[p] no trial ran below the winner's x=0 (tried 0..6, at the configured lower bound); "
+        "extend search_space beyond the bound and rerun; "
+        "storage: null keeps no completed trials between runs"
     ]
     # One warning per phase: each flagged check's sentence, stating the fact alone.
     assert warnings[0] == (

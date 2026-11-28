@@ -9,7 +9,9 @@ import os
 import shlex
 import sys
 import threading
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,11 +32,13 @@ from phasesweep.engine.state import ATTEMPT_ID_ATTR, CLEANUP_CONFIRMED_ATTR
 from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 from phasesweep.evidence.evaluation import TrialContext
 from phasesweep.evidence.mlflow import compile_query
-from phasesweep.runtime import process
+from phasesweep.runtime import process, shutdown
 from phasesweep.runtime.json import JsonObject
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
 from phasesweep.tracking.mlflow import OperationOutcomeUnknownError, _capture
+from phasesweep.tracking.records import RunBinding, RunIdentity
+from tests.conftest import study_name
 
 
 class ManualClock:
@@ -94,7 +98,7 @@ def delivery_record(generation_id, *, state="pending", **fields):
         "state": state,
         "source": {},
         "binding": {},
-        "projection": {},
+        "projection": {"timestamp": 0},
         "finish": None,
         **fields,
     }
@@ -116,7 +120,7 @@ def native_experiment(tmp_path, *, storage=None):
 
 
 def mlflow_trial_context(tmp_path: Path) -> TrialContext:
-    """Build the context of the native example's one attempt, with its directory at ``tmp_path``.
+    """Build the context of the native example's attempt in a scratch artifact tree.
 
     :param Path tmp_path: The attempt directory, also the example's workdir.
     :return TrialContext: Context carrying the MLflow settings and compiled query of a capture.
@@ -129,7 +133,8 @@ def mlflow_trial_context(tmp_path: Path) -> TrialContext:
         generation_id="a" * 32,
         attempt_id="b" * 32,
         overrides_sha256="c" * 64,
-        trial_dir=tmp_path,
+        trial_dir=tmp_path / "p" / "trial_00000__test",
+        attempt_dir=tmp_path,
         run_name="test",
         return_code=0,
         duration_seconds=1,
@@ -145,11 +150,14 @@ def bind_mlflow_attempt(tmp_path: Path) -> tuple[dict[str, str | int], TrialCont
     :return tuple[dict[str, str | int], TrialContext]: The binding and the attempt's context.
     """
     binding = mlflow_binding()
+    ctx = mlflow_trial_context(tmp_path)
+    directory = session.attempt_tracking_dir(tmp_path, ctx.generation_id, ctx.attempt_id)
     session.write_record(
-        tmp_path / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
+        directory / session.EXPECTED_BINDING_FILE,
+        {k: v for k, v in binding.items() if k != "run_id"},
     )
-    session.write_record(tmp_path / "mlflow-binding.json", binding)
-    return binding, mlflow_trial_context(tmp_path)
+    session.write_record(directory / session.BINDING_FILE, binding)
+    return binding, ctx
 
 
 def run_mlflow_worker_in_process(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -174,26 +182,35 @@ def scripted_response(script, request):
     return response() if callable(response) else response
 
 
-def mlflow_binder(tmp_path, slot, *, experiment=None, identity=None, directory=None):
-    """Return the binding path and a ``_create_bound`` call for one attempt or generation binding."""
+def mlflow_binder(
+    tmp_path: Path,
+    slot: str,
+    *,
+    experiment: Experiment | None = None,
+    identity: RunIdentity | None = None,
+) -> tuple[partial[RunBinding], Path]:
+    """Prepare a binding call at the location used by creation and reconciliation.
+
+    :param Path tmp_path: Scratch root for the default experiment.
+    :param str slot: Attempt or generation binding.
+    :param Experiment | None experiment: Experiment that owns the binding.
+    :param RunIdentity | None identity: Identity for the run to create.
+    :return tuple[partial[RunBinding], Path]: Binding call and record destination.
+    """
     experiment = experiment or native_experiment(tmp_path)
     identity = identity or attempt_identity()
     if slot == "attempt":
-        path = (directory or tmp_path) / "mlflow-binding.json"
+        directory = session.attempt_tracking_dir(
+            _experiment_dir(experiment), identity["generation_id"], identity["attempt_id"]
+        )
+        path = directory / session.BINDING_FILE
     else:
-        path = (
-            session.tracking_root(experiment)
-            / identity["generation_id"]
-            / "generation-binding.json"
-        )
-        path.parent.mkdir(parents=True)
+        path = session.summary_binding_path(experiment, identity["generation_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    def bind(deadline=None):
-        return session._create_bound(
-            experiment, identity, path, {}, run_name="r", deadline=deadline
-        )
-
-    return bind, path
+    return partial(
+        session._create_bound, experiment, identity, path, {}, run_name="r", deadline=None
+    ), path
 
 
 class FakeWorkerProcess:
@@ -266,7 +283,7 @@ def leave_cleanup_uncertain_attempt(experiment, monkeypatch, **run_kwargs):
         patch.setattr(cleanup_module, "_resolve_attempt", unproven)
         with pytest.raises(UnsafeProcessCleanupError):
             run_experiment(experiment, **run_kwargs)
-    read = read_phase_trials(validate_ledger(experiment), "depth")
+    read = read_phase_trials(validate_ledger(experiment), study_name(experiment, "depth"))
     [trial] = read.trials
     assert trial.state == TrialState.FAIL
     assert trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
@@ -296,7 +313,11 @@ def remote_mlflow_example(tmp_path, monkeypatch):
             run.data.params = {"depth": "1", "rate": "0"}
             run.data.tags["trainer"] = "none"
             point = SimpleNamespace(value=1.0, step=1, timestamp=1)
-            client = SimpleNamespace(get_run=lambda _: run, get_metric_history=lambda *_: [point])
+            earlier = {prior["run_id"]: mlflow_run(prior) for prior in request["earlier"]}
+            client = SimpleNamespace(
+                get_run=lambda run_id: earlier.get(run_id, run),
+                get_metric_history=lambda *_: [point],
+            )
             return _capture(client, request)
         uploads.append(request)
         return {}
@@ -341,14 +362,14 @@ def leak_tracking_worker(monkeypatch, *, action="publish", name=None):
                 stdout=sink,
                 stderr=sink,
                 timeout=10,
-                trial_dir=directory,
+                attempt_dir=directory,
                 attempt_id=operation_id,
             )
         process.write_attempt_lifecycle(
             directory,
             attempt_id=operation_id,
             state="terminating",
-            return_code=-15,
+            ended_by="cancelled",
             cleanup_confirmed=False,
         )
         raise UnsafeProcessCleanupError(
@@ -358,6 +379,24 @@ def leak_tracking_worker(monkeypatch, *, action="publish", name=None):
     monkeypatch.setattr(session, "request_operation", leaky)
     monkeypatch.setattr(worker, "request_operation", leaky)
     return leaked
+
+
+def signal_when_uploads_start(
+    started: list[str], signum: int, *, count: int = 1
+) -> threading.Thread:
+    """Signal the test process once its upload workers register, or after 30 seconds to unblock it."""
+
+    def send() -> None:
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if len(started) >= count and len(shutdown._active_children) >= count:
+                break
+            time.sleep(0.02)
+        os.kill(os.getpid(), signum)
+
+    sender = threading.Thread(target=send, daemon=True)
+    sender.start()
+    return sender
 
 
 def hang_uploads_until_killed(monkeypatch: pytest.MonkeyPatch, started: list[str]) -> None:
@@ -396,7 +435,7 @@ def hang_uploads_until_killed(monkeypatch: pytest.MonkeyPatch, started: list[str
                 stdout=sink,
                 stderr=sink,
                 timeout=60,
-                trial_dir=directory,
+                attempt_dir=directory,
                 attempt_id=operation_id,
                 label="MLflow request",
             )
@@ -464,13 +503,87 @@ def killed_sweep(
             run_experiment(experiment, generation_id=generation_id)
     assert not any(session.tracking_root(experiment).glob("*/delivery/generation.json"))
     if not persistent:
-        bindings = sorted(_experiment_dir(experiment).glob(f"*/trial_*/{session.BINDING_FILE}"))
+        bindings = session.attempt_tracking_records(experiment, session.BINDING_FILE, generation_id)
         assert len(bindings) == n_jobs
         return experiment, uploads, [session.read_binding(b.parent)["attempt_id"] for b in bindings]
-    trials = read_phase_trials(validate_ledger(experiment), "depth").trials
+    trials = read_phase_trials(validate_ledger(experiment), study_name(experiment, "depth")).trials
     state = TrialState.RUNNING if in_flight else TrialState.COMPLETE
     assert [trial.state for trial in trials] == [state] * n_jobs
     return experiment, uploads, [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials]
+
+
+def wandb_run(
+    state: str,
+    summary: dict[str, object],
+    rows: tuple[Mapping[str, object], ...] = (),
+    on_read: Callable[[list[str]], None] | None = None,
+) -> object:
+    """Build a public-API run that serves its summary, history index, row count and history.
+
+    :param str state: The run's state.
+    :param dict[str, object] summary: Its summary.
+    :param tuple[Mapping[str, object], ...] rows: Its history rows, each with an int ``_step``.
+    :param Callable[[list[str]], None] | None on_read: Called with the keys of each history
+        read, which it may fail.
+    :return object: The run.
+    """
+
+    def read(*, keys: list[str], **_: object) -> list[Mapping[str, object]]:
+        if on_read is not None:
+            on_read(keys)
+        return [row for row in rows if all(key in row for key in keys)]
+
+    last = max((row["_step"] for row in rows if isinstance(row["_step"], int)), default=None)
+    return SimpleNamespace(
+        state=state,
+        summary_metrics=summary,
+        history_keys=None
+        if last is None
+        else {
+            "lastStep": last,
+            "keys": {"_step": {"typeCounts": [{"type": "number", "count": len(rows)}]}},
+        },
+        historyLineCount=len(rows),
+        history=read,
+        scan_history=read,
+    )
+
+
+def serve_wandb_runs(
+    monkeypatch: pytest.MonkeyPatch, runs: Mapping[str, object]
+) -> tuple[ManualClock, list[str]]:
+    """Answer each lookup of ``<entity>/<project>/<id>`` with ``runs[id]`` on a manual clock.
+
+    An ID not in ``runs`` gets W&B's missing-run answer.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture replacing the SDK client and clock.
+    :param Mapping[str, object] runs: The runs W&B holds, by run ID.
+    :return tuple[ManualClock, list[str]]: The clock and the paths looked up.
+    """
+    public = pytest.importorskip("wandb.apis.public")
+    clock = ManualClock()
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.sleep", clock.sleep)
+    paths: list[str] = []
+
+    class Api:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def run(self, path: str) -> object:
+            paths.append(path)
+            run_id = path.rsplit("/", 1)[-1]
+            if run_id not in runs:
+                raise ValueError(f"Could not find run {path}")
+            return runs[run_id]
+
+    monkeypatch.setattr(public, "Api", Api)
+    return clock, paths
+
+
+def attach_wandb_transport(api: object, transport: object) -> None:
+    """Initialize the real SDK client's instance fields for a test transport without authenticating."""
+    vars(api).update(_runs={}, _service_api=transport, api_key=None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -489,7 +602,7 @@ class SwitchableWandb:
     def switch(self, mode: str) -> None:
         """Answer every later run lookup in ``mode``.
 
-        :param str mode: ``up``, ``crashed``, ``denied`` or ``hang``.
+        :param str mode: ``up``, ``empty`` (summary still unpublished), ``crashed``, ``denied`` or ``hang``.
         """
         self.mode.write_text(mode)
 
@@ -536,7 +649,8 @@ def switchable_wandb(install_sdk, tmp_path: Path) -> SwitchableWandb:
                 if mode == "denied":
                     raise _Denied("credentials rejected")
                 state = "crashed" if mode == "crashed" else "finished"
-                return type("Run", (), {{"state": state, "summary_metrics": {{"x": 1.0}}}})()
+                summary = {{}} if mode == "empty" else {{"x": 1.0}}
+                return type("Run", (), {{"state": state, "summary_metrics": summary}})()
     """)
     return tracker
 
@@ -549,6 +663,7 @@ def wandb_objective_experiment(
     switch_at_launch: tuple[SwitchableWandb, int, str] | None = None,
     max_consecutive_failures: int = 5,
     metric_max: float | None = None,
+    timeout_seconds: float = 30,
 ) -> tuple[Experiment, Path]:
     """Build a persistent sweep whose objective W&B reports once its trainer exits cleanly.
 
@@ -563,6 +678,7 @@ def wandb_objective_experiment(
         its own evidence and every later lookup see it.
     :param int max_consecutive_failures: The phase's failure limit.
     :param float | None metric_max: Upper bound above which the objective is infeasible.
+    :param float timeout_seconds: One W&B capture's polling budget, defaults to 30.
     :return tuple[Experiment, Path]: The experiment and its trainer launch log.
     """
     from phasesweep.config.models import Metric
@@ -598,7 +714,7 @@ def wandb_objective_experiment(
         project="p",
         metric_key="x",
         poll_seconds=0.01,
-        timeout_seconds=30,
+        timeout_seconds=timeout_seconds,
     )
     experiment = make_experiment(
         persistent=tmp_path,

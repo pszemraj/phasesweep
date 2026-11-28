@@ -6,8 +6,6 @@ import os
 import re
 import shlex
 import signal
-import threading
-import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -18,7 +16,7 @@ from phasesweep.config.models import Experiment
 from phasesweep.engine.attempts import _retire_active_attempt
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
 from phasesweep.engine.paths import _attempts_dir
-from phasesweep.engine.state import CLEANUP_CONFIRMED_ATTR, TRIAL_DIR_ATTR
+from phasesweep.engine.state import CLEANUP_CONFIRMED_ATTR
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
@@ -30,7 +28,7 @@ from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
 from phasesweep.tracking.mlflow import OperationRejectedError, OperationUnavailableError
 from phasesweep.tracking.session import read_record, tracking_root
-from tests.conftest import invoke_cli_boundary, write_experiment_config
+from tests.conftest import invoke_cli_boundary, study_name, write_experiment_config
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     make_mcp_app,
@@ -47,6 +45,7 @@ from tests.tracking_helpers import (
     leak_tracking_worker,
     leave_cleanup_uncertain_attempt,
     remote_mlflow_example,
+    signal_when_uploads_start,
 )
 
 _RUN_ID = "mcp-recovered-run"
@@ -272,7 +271,7 @@ def test_recover_run_finishes_the_mlflow_run_of_each_trial_it_settles(
 
     assert requests == ["resolve"] + ["publish"] * sends
     assert (run.sent(), run.summaries()) == ([finish], [finish])
-    read = read_phase_trials(validate_ledger(run.experiment), "depth")
+    read = read_phase_trials(validate_ledger(run.experiment), study_name(run.experiment, "depth"))
     [trial] = read.trials
     assert read.cleanup_recovered == {trial.number}
     if source != "running":
@@ -311,10 +310,9 @@ def test_recover_run_distinguishes_a_creation_miss_from_an_upload_failure(
 ) -> None:
     """An answering tracker can have no run for a recently interrupted creation."""
     run = _killed_run(tmp_path, monkeypatch)
-    [trial] = read_phase_trials(validate_ledger(run.experiment), "depth").trials
-    bound = Path(trial.user_attrs[TRIAL_DIR_ATTR]) / session.BINDING_FILE
+    (bound,) = session.attempt_tracking_records(run.experiment, session.BINDING_FILE, None)
     identity = session.read_binding(bound.parent)
-    pending = bound.with_suffix(".pending.json")
+    pending = bound.with_name(session.PENDING_ATTEMPT_BINDING_FILE)
     session.write_record(
         pending,
         {
@@ -559,12 +557,6 @@ def test_a_shutdown_signal_during_recover_run_stops_its_worker_and_prints_the_co
     run.uploads.clear()
     uploading: list[str] = []
 
-    def signal_once_the_upload_runs() -> None:
-        deadline = time.monotonic() + 30.0
-        while (not uploading or not shutdown._active_children) and time.monotonic() < deadline:
-            time.sleep(0.02)
-        os.kill(os.getpid(), signum)
-
     command = shlex.join(
         [
             "phasesweep",
@@ -580,8 +572,7 @@ def test_a_shutdown_signal_during_recover_run_stops_its_worker_and_prints_the_co
     with monkeypatch.context() as patch:
         hang_uploads_until_killed(patch, uploading)
         capsys.readouterr()
-        sender = threading.Thread(target=signal_once_the_upload_runs, daemon=True)
-        sender.start()
+        sender = signal_when_uploads_start(uploading, signum)
         status = invoke_cli_boundary(shlex.split(command)[1:], monkeypatch)
         sender.join(timeout=5)
 

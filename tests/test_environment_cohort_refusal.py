@@ -22,7 +22,6 @@ from phasesweep.config.models import ExecutionContext, Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.artifacts import _write_trials_csv
 from phasesweep.engine.errors import StudyFingerprintMismatchError, TrialTargetRefusedError
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _generation_winner_path, _phase_dir
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import TRAINER_ENV_ATTR, TRAINER_ENV_DIGEST_ATTR
@@ -40,7 +39,9 @@ from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import WandbSummaryRequiredGate
 from phasesweep.tracking.models import MlflowSettings
 from tests.conftest import (
+    addressed_phase_study,
     make_experiment,
+    phase_study,
     stamped_environment_attrs,
     study_with_stamped_environment,
     write_constant_trainer,
@@ -115,7 +116,8 @@ def _refusal(study: optuna.Study, current: EnvironmentIdentity) -> str:
             {},
             {"PATH": "/usr/bin:/opt/first/bin"},
             [],
-            "Compared with trial 0: PATH: the same entries in another order.",
+            "Compared with trial 0: PATH: the same entries in another order "
+            '(recorded "/opt/first/bin:/usr/bin").',
             id="reordered-path",
         ),
         pytest.param(
@@ -472,9 +474,9 @@ def test_inherit_all_has_the_cohort_of_inherit_none(monkeypatch: pytest.MonkeyPa
 
     assert all_identity.digest == none_identity.digest
     assert all_identity.tracked == none_identity.tracked
-    assert {"CONFIGURED", "WANDB_ENTITY", "WANDB_PROJECT", "MLFLOW_TRACKING_URI"} <= set(
-        all_identity.tracked
-    )
+    assert {"CONFIGURED", "MLFLOW_TRACKING_URI"} <= set(all_identity.tracked)
+    assert {"WANDB_ENTITY", "WANDB_PROJECT"} <= set(all_identity.values)
+    assert not {"WANDB_ENTITY", "WANDB_PROJECT"} & set(all_identity.tracked)
     assert {"HF_HOME", "SHLVL", "WANDB_MODE"} <= set(all_identity.values)
     assert not {"HF_HOME", "SHLVL", "WANDB_MODE"} & set(all_identity.tracked)
 
@@ -485,7 +487,7 @@ def test_trials_csv_carries_the_digest_but_not_the_mapping(tmp_path: Path) -> No
     study = study_with_stamped_environment(identity)
     destination = tmp_path / "trials.csv"
 
-    _write_trials_csv(study, destination)
+    _write_trials_csv(study, destination, make_experiment())
 
     header, row = destination.read_text(encoding="utf-8").splitlines()
     columns = header.split(",")
@@ -528,7 +530,7 @@ def test_winner_and_trial_attrs_record_trainer_environment_identity(
     assert winner["trainer_env_digest"] == identity.digest
     assert "trainer_inherit_env" not in winner
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
+    study = addressed_phase_study(experiment)
     attrs = study.get_trials(deepcopy=False)[0].user_attrs
     assert attrs[TRAINER_ENV_DIGEST_ATTR] == identity.digest
     recorded = attrs[TRAINER_ENV_ATTR]
@@ -565,7 +567,7 @@ def test_a_real_run_records_the_mapping_and_a_changed_tz_is_refused(
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(experiment)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
+    study = addressed_phase_study(experiment)
     attrs = study.get_trials(deepcopy=False)[0].user_attrs
     assert attrs[TRAINER_ENV_ATTR] == _identity(experiment).tracked
     assert attrs[TRAINER_ENV_ATTR]["TZ"] == "Europe/Berlin"
@@ -583,9 +585,11 @@ def test_a_real_run_records_the_mapping_and_a_changed_tz_is_refused(
     assert 'Compared with trial 0: TZ "Europe/Berlin" -> "Asia/Tokyo".' in str(caught.value)
 
 
-def _two_phase_study(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Experiment:
-    """Run two phases of two trials each, and return the experiment that ran them."""
-    monkeypatch.setenv("PATH", _REAL_PATH)
+def _two_phase_study(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str = _REAL_PATH
+) -> Experiment:
+    """Run two phases of two trials each under ``PATH=path``, and return the experiment."""
+    monkeypatch.setenv("PATH", path)
     phases = [
         Phase(
             name=name,
@@ -641,3 +645,34 @@ def test_two_lowered_targets_carry_both_steps_in_a_run_and_a_dry_run(
         "Set phases[a].n_trials to at least 2. Set phases[b].n_trials to at least 2."
     )
     assert _operational_error_text(caught.value).endswith(f"\nfix: {caught.value.remediation}")
+
+
+@pytest.mark.integration
+def test_a_path_that_only_dropped_repeated_entries_continues_the_study(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A top-up under the first run's ``PATH`` without its repeated entries runs the new trial."""
+    experiment = _two_phase_study(tmp_path, monkeypatch, path=f"{_REAL_PATH}:{_REAL_PATH}")
+    monkeypatch.setenv("PATH", _REAL_PATH)
+
+    run_experiment(_with_targets(experiment, 3))
+
+    assert len(phase_study(experiment, "a").get_trials(deepcopy=False)) == 3
+    assert len(phase_study(experiment, "b").get_trials(deepcopy=False)) == 3
+
+
+def test_a_path_in_another_order_is_refused_with_the_recorded_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Order decides which entry a lookup finds first, so it stays a difference, and the message restores it."""
+    monkeypatch.setenv("PATH", "/opt/a/bin:/usr/bin:/opt/a/bin:/opt/b/bin")
+    experiment = make_experiment()
+    study = study_with_stamped_environment(_identity(experiment))
+    monkeypatch.setenv("PATH", "/usr/bin:/opt/a/bin:/opt/b/bin")
+
+    message = _refusal(study, _identity(experiment))
+
+    assert (
+        "PATH: the same entries in another order "
+        '(recorded "/opt/a/bin:/usr/bin:/opt/b/bin").' in message
+    )

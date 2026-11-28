@@ -8,22 +8,23 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
 from uuid import uuid4
 
 import optuna
 
-from phasesweep.config.models import Constraint, Experiment, Metric, Phase
-from phasesweep.config.search import sampler_search_space
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.artifacts import _warn_environment_drift, _write_trials_csv
 from phasesweep.engine.attempts import (
     _active_attempt_persistence_error,
+    _cleanup_recovered_trial_numbers,
     _register_active_attempt,
     _retire_active_attempt,
     _trial_requires_cleanup_recovery,
 )
+from phasesweep.engine.bounds import bound_violations
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
@@ -34,28 +35,47 @@ from phasesweep.engine.errors import (
     phase_timeout,
     tracker_unreadable,
 )
-from phasesweep.engine.evidence import _verify_winner_evidence
-from phasesweep.engine.fingerprints import _verify_fingerprint
+from phasesweep.engine.evidence import (
+    _preserve_shared_measurements,
+    _shared_measurements,
+    _SharedMeasurement,
+    _validate_selection_evidence,
+    _verify_winner_evidence,
+)
+from phasesweep.engine.fingerprints import (
+    _inherited_override_payload,
+    _verify_fingerprint,
+    new_study_note,
+    phase_study_name,
+)
 from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.ledger import ClaimedLedger, open_phase_study
 from phasesweep.engine.optuna import (
-    _completed_trial_count,
     _finished_trial_count,
-    _suggest,
+    _measured_trial_count,
+    _suggest_all,
+    _trial_count_state,
 )
-from phasesweep.engine.paths import _phase_dir, _trial_dir_for, _trials_csv_path
+from phasesweep.engine.paths import _attempt_dir, _phase_dir, _trials_csv_path
 from phasesweep.engine.progress import (
     _log_finished_trial,
     _log_reruns,
+    _log_trial_start,
     _warn_deferred_extraction,
 )
 from phasesweep.engine.repeats import repeat_axis
+from phasesweep.engine.reread import (
+    Adoption,
+    adopt_kept_attempts,
+    launch_batch,
+    stamp_adoption_identity,
+)
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
-    PhaseAbortRefusedError,
     PhaseTrialsFailedError,
     PhaseTrialsInfeasibleError,
     ReplayWithoutFeasibleTrialError,
+    _phase_refusal,
     select_winner,
 )
 from phasesweep.engine.state import (
@@ -66,7 +86,7 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     OVERRIDES_ATTR,
     PHASE_DECISION_ATTR,
-    PHASE_DECISION_SCHEMA_VERSION,
+    RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
@@ -77,15 +97,14 @@ from phasesweep.engine.state import (
     WinnerSource,
     _completed_trainer_duration,
     _parsed_trial_outcome,
+    _trial_attempt_dir,
     _trial_lifecycle,
     _trial_outcome_payload,
 )
 from phasesweep.engine.study_policy import (
-    _accepted_trial_target,
+    _abort_decision,
     _AcceptedPartialDecision,
-    _awaits_cleanup_recovery,
-    _config_retires_abort,
-    _consecutive_failure_threshold_tripped,
+    _at_accepted_partial_target,
     _initialize_study_schema,
     _launch_preflight,
     _load_accepted_partial_decision,
@@ -93,25 +112,32 @@ from phasesweep.engine.study_policy import (
     _next_consecutive_failures,
     _pending_rerun_count,
     _PhasePolicyState,
+    _record_accepted_partial_decision,
     _record_allocation_context,
     _record_recovery_boundary,
     _record_reruns,
     _record_trial_target,
     _recovery_action,
     _recovery_advice,
+    _replayed_streak_abort,
+    _settled_trial_count,
     _streak_trials_all_infeasible,
     _validate_study_direction,
     _validate_trial_target,
 )
 from phasesweep.engine.trial import (
+    _STOPPED_BY_PHASESWEEP,
     EnvironmentIdentity,
     TrialExecutionError,
+    _fresh_rerun_reason,
+    _trainer_failure_reason,
     extract_trial_result,
     launch_trial,
     prepare_trainer_input,
     record_trial_result,
     trial_run_name,
 )
+from phasesweep.engine.trial_dirs import _trial_dir_for_attempt, earlier_directory_launches
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import (
     ABORT_START_AGAIN_STEP,
@@ -120,6 +146,7 @@ from phasesweep.errors import (
     PhaseSweepError,
     ProcessCleanupUncertainError,
     UnsafeProcessCleanupError,
+    as_sentence,
 )
 from phasesweep.run_report import phase_start, report
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
@@ -130,10 +157,10 @@ from phasesweep.runtime.shutdown import (
     ShutdownCleanupReport,
     ShutdownLaunchRefusedError,
     interruption_cause,
-    launch_refusal_text,
     servicing_shutdown_signal,
     shutdown_raised_over,
 )
+from phasesweep.runtime.terminal import plural
 
 if TYPE_CHECKING:
     from phasesweep.tracking.session import DeliveryTally
@@ -145,7 +172,7 @@ def _winner_completion(
     *,
     requested_trials: int,
     finished_trials: int,
-    completed_trials: int,
+    measured_trials: int,
     incomplete: bool,
     reason: str | None,
     timeout_scope: str | None,
@@ -154,8 +181,8 @@ def _winner_completion(
 
     :param int requested_trials: Trial target the phase was configured to reach.
     :param int finished_trials: Finished trial count backing this completion.
-    :param int completed_trials: Completed trial count backing this completion, the
-        finished trials inside every metric bound and constraint.
+    :param int measured_trials: Finished trials that measured their values, feasible or not,
+        so that no bound edit changes the count a later read compares with a recount.
     :param bool incomplete: Whether the phase stopped short of its trial target.
     :param str | None reason: Why the phase is incomplete, or ``None`` when complete.
     :param str | None timeout_scope: Timeout guard that stopped the phase, or ``None``
@@ -165,11 +192,28 @@ def _winner_completion(
     return {
         "requested_trials": requested_trials,
         "finished_trials": finished_trials,
-        "completed_trials": completed_trials,
+        "measured_trials": measured_trials,
         "incomplete": incomplete,
         "reason": reason,
         "timeout_scope": timeout_scope,
     }
+
+
+def _require_partial_replay_allowed(phase: Phase, decision: _AcceptedPartialDecision) -> None:
+    """Check that the current phase permits replay at the accepted timeout boundary.
+
+    :param Phase phase: Phase that would replay its accepted partial result.
+    :param _AcceptedPartialDecision decision: Its recorded timeout boundary.
+    :raises WinnerIntegrityError: The current config disallows partial results.
+    """
+    if not phase.allow_incomplete_on_timeout:
+        raise WinnerIntegrityError(
+            f"Phase {phase.name!r} accepted an incomplete result at "
+            f"{decision.finished_trials}/{decision.trial_target} finished "
+            f"trials when its {decision.timeout_scope} deadline expired.",
+            action=OperatorAction.FIX_CONFIG,
+            remediation=ACCEPT_INCOMPLETE_STEP,
+        )
 
 
 def _partial_completion_for_replay(
@@ -180,7 +224,7 @@ def _partial_completion_for_replay(
 ) -> dict[str, Any]:
     """Re-prove and return the frozen completion metadata for a decision replay.
 
-    :param optuna.Study study: Study whose current finished and completed counts are verified.
+    :param optuna.Study study: Study whose current finished and measured counts are verified.
     :param _AcceptedPartialDecision decision: Persisted accepted-partial decision.
     :param int outcome_sequence: Current durable outcome sequence for the study.
     :raises StudySchemaMismatchError: Trial counts or the outcome sequence changed
@@ -191,7 +235,7 @@ def _partial_completion_for_replay(
     if (
         outcome_sequence != decision.outcome_sequence
         or _finished_trial_count(trials) != decision.finished_trials
-        or _completed_trial_count(trials) != decision.completed_trials
+        or _measured_trial_count(trials) != decision.measured_trials
     ):
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} changed after its accepted partial-timeout "
@@ -200,7 +244,7 @@ def _partial_completion_for_replay(
     return _winner_completion(
         requested_trials=decision.trial_target,
         finished_trials=decision.finished_trials,
-        completed_trials=decision.completed_trials,
+        measured_trials=decision.measured_trials,
         incomplete=True,
         reason="timeout",
         timeout_scope=decision.timeout_scope,
@@ -216,6 +260,13 @@ class _UnlaunchedAbortError(TrialExecutionError):
 
     The trial has no trainer outcome to count, so it is recorded as
     interrupted and reruns once the abort is recovered by raising ``n_trials``.
+    """
+
+
+class _InterruptedTrialError(TrialExecutionError):
+    """Raised for a trial owed a rerun: stopped or unstarted trainer, or nothing to score.
+
+    A trainer that ended by itself keeps its own verdict even while a shutdown is serviced.
     """
 
 
@@ -281,25 +332,22 @@ class CsvSnapshotThrottle:
 def _composed_overrides(
     experiment: Experiment,
     phase: Phase,
-    sampled: dict[str, Any],
+    sampled: dict[str, object],
     inherited_winners: dict[str, Winner],
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Merge inherited winners, fixed overrides, and sampled params.
 
     :param Experiment experiment: The experiment whose phase graph says which
         inherited keys an ancestor sampled.
     :param Phase phase: The phase whose ``fixed_overrides`` and inheritance list apply.
-    :param dict[str, Any] sampled: Values Optuna suggested for this trial.
+    :param dict[str, object] sampled: Values Optuna suggested for this trial.
     :param dict[str, Winner] inherited_winners: Parent-phase winners supplying
         the lowest-priority override layer.
     :raises ValueError: If the sampled parameters try to replace a value that
         an ancestor phase sampled. A sampled value replaces an inherited fixed
         one, and a repeat value replaces any inherited one.
-    :return dict[str, Any]: Fully composed overrides for the trainer command.
+    :return dict[str, object]: Fully composed overrides for the trainer command.
     """
-    inherited_overrides: dict[str, Any] = {}
-    for parent in phase.inherits:
-        inherited_overrides.update(inherited_winners[parent].effective_overrides)
     repeat_keys = set() if phase.repeats is None else {phase.repeats.key}
     resampled = experiment.sampled_locked_keys(phase.name) & (set(sampled) - repeat_keys)
     if resampled:
@@ -307,7 +355,7 @@ def _composed_overrides(
             f"Phase {phase.name!r} re-samples inherited winner key(s) {sorted(resampled)} "
             "that an ancestor sampled."
         )
-    out = dict(inherited_overrides)
+    out = _inherited_override_payload(phase, inherited_winners)
     out.update(phase.fixed_overrides)
     out.update(sampled)
     return out
@@ -331,183 +379,11 @@ def _winner_overrides(
     :param dict[str, Winner] inherited_winners: Parent-phase winners.
     :return dict[str, object]: Composed overrides without the repeat key.
     """
-    effective: dict[str, object] = _composed_overrides(
-        experiment, phase, dict(params), inherited_winners
-    )
+    sampled = {key: params[key] for key in phase.search_space if key in params}
+    effective = _composed_overrides(experiment, phase, sampled, inherited_winners)
     if phase.repeats is not None:
         effective.pop(phase.repeats.key, None)
     return effective
-
-
-def _failure_policy_abort_record(
-    phase: Phase,
-    *,
-    consecutive_failures: int,
-    completion_sequence: int,
-    trial_target: int,
-) -> JsonObject:
-    """Build a durable consecutive-failure abort record.
-
-    :param Phase phase: Phase supplying ``max_consecutive_failures`` for the
-        recorded threshold and cause message.
-    :param int consecutive_failures: Observed consecutive failure/infeasible
-        count that tripped the policy.
-    :param int completion_sequence: Orchestrator completion sequence at which
-        the trip was observed.
-    :param int trial_target: Durable accepted ``n_trials`` target to attach
-        to the record.
-    :return JsonObject: A ``schema_version=1`` abort record ready to
-        record with the tripping outcome.
-    """
-    return {
-        **_abort_record(
-            policy="max_consecutive_failures",
-            completion_sequence=completion_sequence,
-            trial_target=trial_target,
-            cause=(
-                f"{consecutive_failures} consecutive failed/infeasible trials reached "
-                f"max_consecutive_failures={phase.max_consecutive_failures}."
-            ),
-        ),
-        "threshold": phase.max_consecutive_failures,
-        "consecutive_failures": consecutive_failures,
-    }
-
-
-def _abort_record(
-    *,
-    policy: str,
-    completion_sequence: int,
-    trial_target: int,
-    cause: str,
-) -> JsonObject:
-    """Build the common fields of a durable phase abort record.
-
-    :param str policy: Policy that stopped the phase, such as
-        ``"unsafe_process_cleanup"``.
-    :param int completion_sequence: Completion sequence of the tripping outcome.
-    :param int trial_target: Durable accepted ``n_trials`` target to attach
-        to the record.
-    :param str cause: Explanation the operator reads.
-    :return JsonObject: A ``schema_version=1`` abort record ready to
-        record with the tripping outcome.
-    """
-    return {
-        "schema_version": 1,
-        "policy": policy,
-        "completion_sequence": completion_sequence,
-        "trial_target": trial_target,
-        "cause": cause,
-    }
-
-
-def _abort_decision(
-    phase: Phase,
-    trial_number: int,
-    outcome: str,
-    *,
-    completion_sequence: int,
-    consecutive_failures: int,
-    abort_recorded: bool,
-    cause: str | None = None,
-    fatal_policy: str | None = None,
-) -> JsonObject | None:
-    """Return the abort record that recording ``outcome`` after the given state would trip.
-
-    A live phase execution and stale-trial recovery both decide here, so an outcome trips the
-    same abort whichever of them records it.
-
-    :param Phase phase: Phase whose ``max_consecutive_failures`` and ``n_trials`` apply.
-    :param int trial_number: Trial whose outcome is about to be recorded.
-    :param str outcome: The terminal outcome about to be recorded.
-    :param int completion_sequence: Completion sequence of the last recorded outcome.
-    :param int consecutive_failures: Failure streak before ``outcome``.
-    :param bool abort_recorded: Whether the phase already recorded an abort.
-    :param str | None cause: The outcome's recorded cause, if any.
-    :param str | None fatal_policy: The fatal policy of a ``"fatal"`` outcome.
-    :return JsonObject | None: The abort record at the next completion sequence, or ``None``
-        when the outcome trips nothing.
-    """
-    if abort_recorded:
-        return None
-    sequence = completion_sequence + 1
-    if outcome == "fatal":
-        return _abort_record(
-            policy=fatal_policy or "fatal_trial_exception",
-            completion_sequence=sequence,
-            trial_target=phase.n_trials,
-            cause=cause or f"trial {trial_number} hit a fatal objective error",
-        )
-    streak = _next_consecutive_failures(consecutive_failures, outcome)
-    if not _consecutive_failure_threshold_tripped(streak, phase):
-        return None
-    return _failure_policy_abort_record(
-        phase,
-        consecutive_failures=streak,
-        completion_sequence=sequence,
-        trial_target=phase.n_trials,
-    )
-
-
-def _as_sentence(cause: object) -> str:
-    """End a recorded abort cause as a sentence, so the text after it starts a new one.
-
-    :param object cause: A recorded abort cause, which an exception's text may leave unpunctuated.
-    :return str: ``cause`` with a period added unless it already ends in sentence punctuation.
-    """
-    text = str(cause)
-    return text if text.rstrip().endswith((".", "!", "?")) else f"{text}."
-
-
-def _raise_prior_phase_abort(
-    phase: Phase, abort_record: JsonObject, study: optuna.Study, *, dependents: Sequence[str]
-) -> None:
-    """Refuse a phase whose recorded abort the current config does not retire.
-
-    The advice comes from :func:`~phasesweep.engine.study_policy._recovery_advice` and
-    the action from :func:`~phasesweep.engine.study_policy._recovery_action`.
-
-    :param Phase phase: Phase whose accepted trial target is quoted in the
-        message.
-    :param JsonObject abort_record: Recorded abort; supplies
-        ``trial_target`` and ``cause``.
-    :param optuna.Study study: The phase's study.
-    :param Sequence[str] dependents: The phases that inherit ``phase``.
-    :raises PhaseAbortRefusedError: Always; this function never returns
-        normally.
-    """
-    advice = _recovery_advice(phase, study, abort_record, dependents=dependents)
-    raise PhaseAbortRefusedError(
-        f"Phase {phase.name!r} previously aborted at its accepted "
-        f"n_trials={abort_record['trial_target']}: {_as_sentence(abort_record['cause'])}",
-        action=_recovery_action(study, abort_record),
-        remediation=advice,
-    )
-
-
-def _raise_streak_at_limit(
-    phase: Phase, abort_record: JsonObject, study: optuna.Study, *, dependents: Sequence[str]
-) -> None:
-    """Refuse new work while the resumed failure streak meets the current limit.
-
-    :param Phase phase: Phase whose current ``max_consecutive_failures`` the
-        streak meets.
-    :param JsonObject abort_record: The abort the streak would record, from
-        :func:`_failure_policy_abort_record`; supplies the replayed count and the
-        accepted target.
-    :param optuna.Study study: The phase's study.
-    :param Sequence[str] dependents: The phases that inherit ``phase``.
-    :raises PhaseAbortRefusedError: Always; this function never returns
-        normally.
-    """
-    advice = _recovery_advice(phase, study, abort_record, dependents=dependents)
-    raise PhaseAbortRefusedError(
-        f"Phase {phase.name!r} has {abort_record['consecutive_failures']} consecutive "
-        f"failed/infeasible trials, which meets "
-        f"max_consecutive_failures={phase.max_consecutive_failures}.",
-        action=OperatorAction.FIX_CONFIG,
-        remediation=advice,
-    )
 
 
 @dataclass(frozen=True)
@@ -527,11 +403,12 @@ def _resume_phase(
     phase: Phase,
     inherited_winners: dict[str, Winner],
     study: optuna.Study,
+    adopt: Callable[[], object],
 ) -> _PhaseResume | Winner:
     """Validate a live phase's durable state and replay what it already decided.
 
-    Reaps stale trials, replays the failure policy from the durable outcomes,
-    and verifies the phase fingerprint and trial target. An accepted
+    Reaps stale trials, verifies the phase fingerprint, lets ``adopt`` append kept attempts,
+    then judges the failure policy and trial target over the result. An accepted
     partial-timeout decision at the current target replays as the phase's
     winner while the current config still accepts incomplete results. An abort
     recorded in the outcome ledger, or a replayed streak that meets the current
@@ -544,8 +421,9 @@ def _resume_phase(
     :param dict[str, Winner] inherited_winners: Winners loaded for phases
         earlier in the chain.
     :param optuna.Study study: The phase's live study.
-    :raises StudySchemaMismatchError: The study's schema or stored direction is
-        unsupported; what the recorded state contradicts is listed with
+    :param Callable[[], object] adopt: Appends kept attempts once the study is verified.
+    :raises StudySchemaMismatchError: The study's schema is unsupported; what
+        the recorded state contradicts is listed with
         :func:`_judge_recorded_phase`, whose other refusals also propagate.
     :raises StudyFingerprintMismatchError: The study was produced by a
         different config.
@@ -554,17 +432,17 @@ def _resume_phase(
     :return _PhaseResume | Winner: The validated state, or the winner an
         accepted partial-timeout decision replays.
     """
-    _validate_study_direction(study, experiment.metric.goal)
     _initialize_study_schema(study)
     _reap_stale_trials(study, experiment, phase.name, confirm=True)
-    policy_state = _load_phase_policy_state(study)
+    _load_phase_policy_state(study, experiment)
     phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
+    adopt()
     return _judge_recorded_phase(
         experiment,
         phase,
         inherited_winners,
         study,
-        policy_state=policy_state,
+        policy_state=_load_phase_policy_state(study, experiment),
         phase_fingerprint=phase_fingerprint,
         verify_evidence=True,
     )
@@ -598,6 +476,7 @@ def _judge_recorded_phase(
     policy_state: _PhasePolicyState,
     phase_fingerprint: str,
     verify_evidence: bool,
+    emit_advisories: bool = True,
 ) -> _PhaseResume | Winner:
     """Apply the trial-target, partial-decision and abort rules to a phase's recorded study.
 
@@ -613,6 +492,7 @@ def _judge_recorded_phase(
     :param str phase_fingerprint: Fingerprint carried on a replayed winner.
     :param bool verify_evidence: Whether a replayed winner's evidence is re-proved;
         see :func:`_select_phase_winner` for everything it covers.
+    :param bool emit_advisories: Whether a replayed partial result logs selection diagnostics.
     :raises TrialTargetRefusedError: ``phase.n_trials`` is below the accepted
         target, or a fixed configuration asks for more attempts than it may retry.
     :raises PhaseAbortRefusedError: The phase aborted and the current config does not
@@ -631,19 +511,10 @@ def _judge_recorded_phase(
     :return _PhaseResume | Winner: The validated state, or the winner an
         accepted partial-timeout decision replays.
     """
-    dependents = experiment.phases_inheriting(phase.name)
     _validate_trial_target(study, phase)
     partial_decision = _load_accepted_partial_decision(study)
-    if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
-        # Replay the accepted timeout boundary only while incomplete results remain enabled.
-        if not phase.allow_incomplete_on_timeout:
-            raise WinnerIntegrityError(
-                f"Phase {phase.name!r} accepted an incomplete result at "
-                f"{partial_decision.finished_trials}/{partial_decision.trial_target} finished "
-                f"trials when its {partial_decision.timeout_scope} deadline expired.",
-                action=OperatorAction.FIX_CONFIG,
-                remediation=ACCEPT_INCOMPLETE_STEP,
-            )
+    if _at_accepted_partial_target(partial_decision, phase):
+        _require_partial_replay_allowed(phase, partial_decision)
         completion = _partial_completion_for_replay(
             study,
             partial_decision,
@@ -657,36 +528,22 @@ def _judge_recorded_phase(
                 study,
                 phase_fingerprint=phase_fingerprint,
                 completion=completion,
+                study_outcome_sequence=policy_state.max_sequence,
                 verify_evidence=verify_evidence,
+                emit_advisories=emit_advisories,
             )
         except NoFeasibleTrialError as exc:
             raise _no_feasible_before_deadline(
                 experiment, phase.name, partial_decision.timeout_scope
             ) from exc
-    # A later success or a lowered failure limit does not clear a recorded abort.
+    # A later success or a lowered failure limit does not clear a recorded abort. A live run's
+    # preflight confirms cleanup before this point; a dry run cannot.
+    refusal = _phase_refusal(experiment, phase, study, policy_state)
+    if refusal is not None:
+        raise refusal
     active_abort = policy_state.abort
-    trials = study.get_trials(deepcopy=False)
-    # A live run's preflight confirms cleanup before this point; a dry run cannot.
-    if active_abort is not None and (
-        _awaits_cleanup_recovery(study, active_abort)
-        or not _config_retires_abort(phase, trials, active_abort)
-    ):
-        _raise_prior_phase_abort(phase, active_abort, study, dependents=dependents)
-    if (
-        active_abort is None
-        and _finished_trial_count(trials) < phase.n_trials
-        and _consecutive_failure_threshold_tripped(policy_state.consecutive_failures, phase)
-    ):
-        # A replayed streak at the current limit requires a raised target for new work.
-        accepted_target = _accepted_trial_target(study)
-        active_abort = _failure_policy_abort_record(
-            phase,
-            consecutive_failures=policy_state.consecutive_failures,
-            completion_sequence=policy_state.max_sequence,
-            trial_target=accepted_target,
-        )
-        if phase.n_trials <= accepted_target:
-            _raise_streak_at_limit(phase, active_abort, study, dependents=dependents)
+    if active_abort is None:
+        active_abort = _replayed_streak_abort(phase, study, policy_state)
     return _PhaseResume(
         policy_state=policy_state,
         phase_fingerprint=phase_fingerprint,
@@ -759,6 +616,8 @@ class _PhaseExecution:
     gpu_pool: GpuPool
     optimize_deadline: float | None
     timeout_source: str | None
+    other_studies: Sequence[optuna.Study] = ()
+    shared_measurements: dict[str, set[_SharedMeasurement]] | None = None
     completion_sequence: int = 0
     consecutive_failures: int = 0
     recorded_outcomes: dict[int, str] = field(default_factory=dict)
@@ -916,12 +775,12 @@ def _refuse_launch_after_deadline(run: _PhaseExecution) -> None:
 def _refuse_launch_during_shutdown() -> None:
     """Refuse to start a trial while a shutdown signal is being serviced.
 
-    :raises TrialExecutionError: A shutdown is being serviced, so
+    :raises _InterruptedTrialError: A shutdown is being serviced, so
         :func:`_objective` records the trial as interrupted by that signal.
     """
     signum = servicing_shutdown_signal()
     if signum is not None:
-        raise TrialExecutionError(launch_refusal_text(signum))
+        raise _InterruptedTrialError(interruption_cause(signum))
 
 
 def _trial_recording_error(
@@ -942,7 +801,7 @@ def _trial_recording_error(
     if not run.experiment.persistent:
         return StudyStorageUnavailableError(
             f"{message} The trial result was lost.",
-            action=OperatorAction.RETRY,
+            action=OperatorAction.INSPECT_LOGS,
             remediation="Resolve the error and rerun.",
         )
     return StudyStorageUnavailableError(
@@ -958,6 +817,7 @@ def _record_outcome(
     metric: float | None = None,
     cause: str | None = None,
     fatal_policy: str | None = None,
+    within_bounds: bool = True,
 ) -> None:
     """Persist an outcome and its abort decision before the trial becomes terminal.
 
@@ -969,14 +829,18 @@ def _record_outcome(
     :param _PhaseExecution run: Phase execution whose counters advance after the durable write.
     :param optuna.Trial trial: Trial receiving the outcome record.
     :param str outcome: ``success``, ``failure``, ``interrupted``, or ``fatal``.
-    :param float | None metric: Accepted objective, also recorded when it violates bounds.
+    :param float | None metric: Measured objective of a ``success``, also when it violates bounds.
     :param str | None cause: Optional explanation stored in the outcome.
     :param str | None fatal_policy: Optional policy stored in the outcome and fatal abort.
+    :param bool within_bounds: Whether a ``success`` measured values inside the current bounds;
+        the failure streak counts one outside them as a failure
+        (:func:`~phasesweep.engine.study_policy._counted_outcome`), defaults to True.
     :raises _TrialLeftRunning: Retries exhausted or an outcome remains unconfirmed; leave
         the trial RUNNING and stop launches for stale-attempt recovery.
     """
     write_error: Exception | None = None
     abort_record: JsonObject | None = None
+    counted = outcome if within_bounds else "failure"
     for attempt_index in range(_OUTCOME_WRITE_ATTEMPTS):
         if attempt_index:
             time.sleep(_OUTCOME_WRITE_RETRY_DELAYS[attempt_index - 1])
@@ -986,7 +850,7 @@ def _record_outcome(
             if run.unconfirmed_outcome is not None:
                 raise _TrialLeftRunning(run.unconfirmed_outcome)
             abort_record = run.abort_decision(
-                trial.number, outcome, cause=cause, fatal_policy=fatal_policy
+                trial.number, counted, cause=cause, fatal_policy=fatal_policy
             )
             payload = _trial_outcome_payload(
                 run.completion_sequence + 1,
@@ -1026,7 +890,7 @@ def _record_outcome(
                     raise unconfirmed from exc
 
             write_error = None
-            run.advance(trial.number, outcome)
+            run.advance(trial.number, counted)
             if abort_record is None:
                 return
             run.abort_recorded = True
@@ -1100,26 +964,46 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         raise _UnlaunchedAbortError(_UNLAUNCHED_ABORT_CAUSE)
     _refuse_launch_during_shutdown()
 
-    sampled = {name: _suggest(trial, name, p) for name, p in sampler_search_space(phase).items()}
+    sampled = _suggest_all(trial, phase)
     overrides = _composed_overrides(experiment, phase, sampled, run.inherited_winners)
 
     attempt_id = uuid4().hex
-    trial_dir = _trial_dir_for(
-        experiment,
-        phase.name,
-        trial.number,
-        generation_id=run.generation_id,
-        attempt_id=attempt_id,
-    )
+    try:
+        trials = {frozen.number: frozen for frozen in run.study.get_trials(deepcopy=False)}
+        directory = _trial_dir_for_attempt(
+            experiment,
+            phase.name,
+            trials,
+            trials[trial.number],
+            attempt_id=attempt_id,
+            recovered=frozenset(_cleanup_recovered_trial_numbers(run.study)),
+            studies=(run.study, *run.other_studies),
+        )
+        reusing_directory = directory.opener_attempt_id != attempt_id
+        earlier_attempts = (
+            earlier_directory_launches(
+                (run.study, *run.other_studies), directory.path, trials, trials[trial.number]
+            )
+            if reusing_directory
+            else ()
+        )
+    except PhaseSweepError as exc:
+        # Unconfirmed cleanup or a directory that cannot be inspected stops the launch.
+        run.record_fatal(exc)
+        raise _TrialLeftRunning(exc) from exc
+    trial_dir = directory.path
+    opened_by = (directory.opener_number, directory.opener_attempt_id)
+    attempt_dir = _attempt_dir(_phase_dir(experiment, phase.name), attempt_id)
     # Persist allocated before discovery and GPU waiting; no identity then means no launch.
     try:
         trial_dir.mkdir(parents=True, exist_ok=True)
-        write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        write_attempt_lifecycle(attempt_dir, attempt_id=attempt_id, state="allocated")
     except OSError as exc:
         raise _active_attempt_persistence_error(
             "persist",
             f"the allocated lifecycle marker for trial {trial.number} (attempt {attempt_id})",
-            trial_dir,
+            attempt_dir,
             exc,
         ) from exc
     # Register before leasing or launch; retain unsafe-cleanup entries until recovery.
@@ -1130,20 +1014,36 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         study_name=run.study.study_name,
         trial_number=trial.number,
         trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         generation_id=run.generation_id,
     )
     trial.set_user_attr(GENERATION_ID_ATTR, run.generation_id)
     trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    if directory.restart_reason is not None:
+        log.warning(
+            "Trial %d reruns trial %s from step 0 with the same parameters in %s because %s.",
+            trial.number,
+            trial.user_attrs.get(RERUN_OF_ATTR),
+            trial_dir,
+            directory.restart_reason,
+        )
     trial.set_user_attr(OVERRIDES_ATTR, json.dumps(overrides, default=str, sort_keys=True))
     # GPU lease covers only subprocess lifetime, not extraction.
     try:
         _refuse_launch_after_deadline(run)
+        if reusing_directory and run.other_studies:
+            with run.outcome_lock:
+                if run.shared_measurements is None:
+                    run.shared_measurements = _shared_measurements(run.other_studies)
+                measurements = run.shared_measurements.get(trial_dir.name)
+            if measurements:
+                _preserve_shared_measurements(trial_dir, measurements)
         prepared_input = prepare_trainer_input(
             experiment=experiment,
             phase_name=phase.name,
-            trial_id=trial.number,
-            attempt_id=attempt_id,
+            trial_id=opened_by[0],
+            attempt_id=opened_by[1],
             trial_dir=trial_dir,
             overrides=overrides,
         )
@@ -1157,10 +1057,9 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     phase=phase.name,
                     generation_id=run.generation_id,
                     attempt_id=attempt_id,
-                    run_name=trial_run_name(experiment, phase.name, trial.number, attempt_id),
+                    run_name=trial_run_name(experiment, phase.name, *opened_by),
                     overrides_sha256=prepared_input.sha256,
                     inherited=run.inherited_winners,
-                    directory=trial_dir,
                     environment=run.environment_identity.values,
                     deadline=run.optimize_deadline,
                 )
@@ -1169,6 +1068,8 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                 run.record_fatal(exc)
                 raise _TrialLeftRunning(exc) from exc
             except (OSError, ValueError, RuntimeError) as exc:
+                # A shutdown stops the preparation worker too; that is no failure of the trial.
+                _refuse_launch_during_shutdown()
                 reason = f"MLflow run preparation: {exc}"
                 log.warning("[%s/trial_%d] %s", phase.name, trial.number, reason)
                 trial.set_user_attr(FAILURE_REASON_ATTR, reason)
@@ -1184,6 +1085,13 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             _refuse_launch_during_shutdown()
 
             _refuse_launch_after_deadline(run)
+            _log_trial_start(
+                experiment,
+                phase,
+                trial,
+                gpu=gpu_assignment.visible_devices,
+                in_place=reusing_directory,
+            )
             try:
                 executed = launch_trial(
                     experiment=experiment,
@@ -1192,6 +1100,9 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     generation_id=run.generation_id,
                     attempt_id=attempt_id,
                     trial_dir=trial_dir,
+                    attempt_dir=attempt_dir,
+                    opened_by=opened_by,
+                    earlier_attempts=earlier_attempts,
                     overrides=overrides,
                     timeout_seconds=phase.timeout_seconds_per_trial,
                     wallclock_deadline=run.optimize_deadline,
@@ -1202,14 +1113,14 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                 )
             except ShutdownLaunchRefusedError as exc:
                 # The shutdown began between the check above and the launch lock.
-                raise TrialExecutionError(str(exc)) from exc
+                raise _InterruptedTrialError(interruption_cause(exc.signum)) from exc
 
             # Block queued launches before releasing a GPU whose process cleanup is uncertain.
             if not executed.process.cleanup_confirmed:
                 cleanup_error = UnsafeProcessCleanupError(
                     f"Trial {trial.number} cleanup could not be confirmed: "
                     f"{executed.process.failure_reason or 'no reason was recorded'} "
-                    f"(trial_dir={trial_dir}, pid={executed.process.pid})."
+                    f"(attempt_dir={attempt_dir}, pid={executed.process.pid})."
                 )
                 run.record_fatal(cleanup_error)
 
@@ -1236,20 +1147,40 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         trial.set_user_attr(RETURN_CODE_ATTR, executed.process.return_code)
 
     def check_shutdown_after_trainer_exit() -> None:
-        """Preserve finished training and classify a stopped trainer as interrupted.
+        """Preserve finished training, keep a crash's own failure, and interrupt a stopped trainer.
 
         :raises PhaseSweepShutdown: Shutdown prevents extraction of a successful trainer's result.
-        :raises TrialExecutionError: Shutdown stopped the trainer before it finished.
+        :raises _InterruptedTrialError: Shutdown stopped the trainer before it finished.
+        :raises TrialExecutionError: The trainer failed by itself before the shutdown.
         """
         signum = servicing_shutdown_signal()
         if signum is None:
             return
         if _completed_trainer_duration(trial, None) is not None:
             raise PhaseSweepShutdown(signum, ShutdownCleanupReport(signum, True, ()))
-        raise TrialExecutionError(interruption_cause(signum))
+        try:
+            lifecycle = _trial_lifecycle(trial)
+        except ValueError:
+            lifecycle = None
+        reason = _trainer_failure_reason(trial, lifecycle, attempt_dir)
+        if reason is None:
+            raise _InterruptedTrialError(interruption_cause(signum))
+        raise TrialExecutionError(reason)
 
     # Extraction releases the GPU but still consumes the phase/run budget.
     check_shutdown_after_trainer_exit()
+    if not executed.process.timed_out:
+        # A trainer PhaseSweep stopped outside a shutdown, as after its guardian died, is
+        # interrupted by the rule recovery applies (_trainer_failure_reason), and reruns in
+        # its directory. A deadline cap is a timeout, which the extraction below reports.
+        try:
+            lifecycle = _trial_lifecycle(trial)
+        except ValueError:
+            lifecycle = None
+        if lifecycle is not None and lifecycle.ended_by in _STOPPED_BY_PHASESWEEP:
+            raise _InterruptedTrialError(
+                executed.process.failure_reason or "PhaseSweep stopped the trainer"
+            )
     try:
         result = extract_trial_result(
             experiment=experiment,
@@ -1276,45 +1207,46 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     if result.deadline_exhausted:
         # Only a deadline-caused failure counts as a timeout.
         run.stop_for_deadline()
+        if experiment.persistent and _completed_trainer_duration(trial, None) is not None:
+            # Finished training that the deadline kept from being read stays pending, as after
+            # a tracker outage: no outcome is recorded, so the run stops before any partial
+            # decision freezes the phase's counts, and recovery extracts it on the next run.
+            _warn_deferred_extraction(attempt_id, phase.name, trial.number, persistent=True)
+            left_running = _TrialLeftRunning(
+                phase_timeout(
+                    f"Phase {phase.name!r} timed out via {run.timeout_source or 'wallclock'} "
+                    f"guard while reading the evidence of trial {trial.number}, which finished "
+                    "training.",
+                    scope=run.timeout_source,
+                    experiment=experiment,
+                )
+            )
+            run.record_fatal(left_running)
+            raise left_running
 
     with _persist_trial_evidence(run, trial):
         record_trial_result(
             trial, result, overrides_json=json.dumps(overrides, default=str, sort_keys=True)
         )
 
-    # Process/extractor failures -> Optuna FAIL state, not COMPLETE with inf.
-    if result.failure_reason:
+    if result.failure_reason:  # Optuna FAIL state; nothing to score is owed a fresh rerun.
         if result.deadline_exhausted:
             with _persist_trial_evidence(run, trial):
                 trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
             raise _DeadlineTrialExecutionError(result.failure_reason)
+        if result.nothing_to_score:
+            raise _InterruptedTrialError(_fresh_rerun_reason(result.failure_reason))
         raise TrialExecutionError(result.failure_reason)
 
     assert result.metric is not None  # guaranteed when failure_reason is None
-    violations: list[str] = []
-    if not result.feasible:
-        bound_checks: list[tuple[str, float, Metric | Constraint]] = [
-            (f"metric {experiment.metric.name!r}", result.metric, experiment.metric),
-            *(
-                (f"constraint {constraint.name!r}", result.constraints[constraint.name], constraint)
-                for constraint in experiment.constraints
-            ),
-        ]
-        for label, value, bounds in bound_checks:
-            if bounds.min is not None and value < bounds.min:
-                violations.append(f"{label}={value} < min={bounds.min}")
-            if bounds.max is not None and value > bounds.max:
-                violations.append(f"{label}={value} > max={bounds.max}")
+    # A measurement is a success whatever the bounds say; only the failure streak counts it
+    # as a failure while it is outside them.
     _record_outcome(
         run,
         trial,
-        "success" if result.feasible else "failure",
+        "success",
         metric=result.metric,
-        cause=(
-            None
-            if result.feasible
-            else f"metric or evidence constraints were infeasible: {'; '.join(violations)}"
-        ),
+        within_bounds=not bound_violations(result.metric, result.constraints, experiment),
     )
 
     return result.metric
@@ -1337,17 +1269,14 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             _record_outcome(run, trial, "interrupted", cause=str(exc))
             raise
         except TrialExecutionError as exc:
-            signum = servicing_shutdown_signal()
-            cause = str(exc) if signum is None else interruption_cause(signum)
-            if signum is None:
-                _record_outcome(run, trial, "failure", cause=cause)
-            else:
-                # Under n_jobs > 1 the shutdown handler runs in the main thread and
-                # kills this worker's trainer, which ends here as a trainer error.
-                _record_outcome(run, trial, "interrupted", cause=cause)
+            # Under n_jobs > 1 the shutdown handler runs in the main thread and kills this
+            # worker's trainer; the worker's lifecycle check names that an interruption.
+            interrupted = isinstance(exc, _InterruptedTrialError)
+            cause = str(exc)
+            _record_outcome(run, trial, "interrupted" if interrupted else "failure", cause=cause)
             # An earlier diagnostic would prevent recovery from reading a finished trainer's
             # evidence if its outcome could not be committed.
-            if signum is not None or FAILURE_REASON_ATTR not in trial.user_attrs:
+            if interrupted or FAILURE_REASON_ATTR not in trial.user_attrs:
                 with _persist_trial_evidence(run, trial):
                     trial.set_user_attr(FAILURE_REASON_ATTR, cause)
             raise
@@ -1382,7 +1311,19 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             except ValueError as lifecycle_error:
                 raise exc from lifecycle_error
             if _completed_trainer_duration(trial, lifecycle) is None:
-                _record_outcome(run, trial, "interrupted", cause=interruption_cause(exc.signum))
+                directory = _trial_attempt_dir(trial)
+                reason = (
+                    None
+                    if directory is None
+                    else _trainer_failure_reason(trial, lifecycle, directory)
+                )
+                if reason is None:
+                    _record_outcome(run, trial, "interrupted", cause=interruption_cause(exc.signum))
+                else:
+                    # A trainer that crashed before the shutdown keeps its own failure.
+                    _record_outcome(run, trial, "failure", cause=reason)
+                    with contextlib.suppress(Exception):
+                        trial.set_user_attr(FAILURE_REASON_ATTR, reason)
             elif isinstance(attempt_id, str) and not (
                 run.experiment.persistent and trial.number in run.recorded_outcomes
             ):
@@ -1477,6 +1418,7 @@ def _settle_finished_trial(
                 _write_trials_csv(
                     study,
                     _trials_csv_path(run.experiment, run.phase.name),
+                    run.experiment,
                     repeats=repeat_axis(run.phase),
                 )
                 run.csv_throttle.mark_written(finished, now)
@@ -1507,7 +1449,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
     study = run.study
     trials_after = study.get_trials(deepcopy=False)
     finished_after = _finished_trial_count(trials_after)
-    completed_after = _completed_trial_count(trials_after)
+    measured_after = _measured_trial_count(trials_after)
     # An expired budget with unfinished slots takes precedence over a failure-streak abort.
     scheduler_deadline_exhausted = (
         run.optimize_deadline is not None
@@ -1522,14 +1464,12 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         phase.allow_incomplete_on_timeout and timeout_observed and finished_after < phase.n_trials
     )
     if run.aborted and not timed_out_incomplete:
-        aborted_state = _load_phase_policy_state(study)
+        aborted_state = _load_phase_policy_state(study, experiment)
         abort = aborted_state.abort
         assert abort is not None  # an aborted run recorded its abort with the tripping outcome
         # Without storage there is no study to continue, so the whole run starts again.
         advice = (
-            _recovery_advice(
-                phase, study, abort, dependents=experiment.phases_inheriting(phase.name)
-            )
+            _recovery_advice(experiment, phase, study, abort)
             if experiment.persistent
             else ABORT_START_AGAIN_STEP
         )
@@ -1537,11 +1477,11 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         evidence = (
             "The tripping trials were INFEASIBLE: outside the metric bounds or constraints."
             if all_infeasible
-            else f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
+            else f"Inspect {_phase_dir(experiment, phase.name) / 'attempts'} for stderr logs."
         )
         abort_error = PhaseTrialsInfeasibleError if all_infeasible else PhaseTrialsFailedError
         raise abort_error(
-            f"Phase {phase.name!r} aborted: {_as_sentence(abort['cause'])} {evidence}",
+            f"Phase {phase.name!r} aborted: {as_sentence(abort['cause'])} {evidence}",
             action=(
                 _recovery_action(study, abort)
                 if experiment.persistent
@@ -1554,35 +1494,48 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         and not accepted_partial_timeout
         and not timed_out_incomplete
     ):
+        interrupted = _pending_rerun_count(study)
+        if interrupted:
+            # A pass whose every trial PhaseSweep stopped finished none, so the run stops
+            # rather than rerun them without end; the next run reruns them in place.
+            raise PhaseSweepError(
+                f"Phase {phase.name!r} stopped after {finished_after}/{phase.n_trials} "
+                f"finished trials with {plural(interrupted, 'interrupted trial')} left to rerun.",
+                action=OperatorAction.RETRY,
+                remediation=(
+                    f"Inspect {_phase_dir(experiment, phase.name) / 'attempts'} and run.log, "
+                    "then run the same command again; the interrupted trials rerun in place."
+                ),
+            )
         raise RuntimeError(
             f"Phase {phase.name!r} stopped after {finished_after}/{phase.n_trials} "
             "finished trials without an accepted timeout; refusing to publish "
             "an incomplete winner."
         )
-    current_policy_state = _load_phase_policy_state(study)
+    current_policy_state = _load_phase_policy_state(study, experiment)
     recorded_abort = current_policy_state.abort
     if accepted_partial_timeout:
         recovered_abort_sequence = (
             recorded_abort["completion_sequence"] if recorded_abort is not None else None
         )
         # Persist the frozen timeout boundary before selection; retries replay it without launch.
-        study.set_user_attr(
-            PHASE_DECISION_ATTR,
-            {
-                "schema_version": PHASE_DECISION_SCHEMA_VERSION,
-                "decision": "accepted_partial_timeout",
-                "trial_target": phase.n_trials,
-                "outcome_sequence": current_policy_state.max_sequence,
-                "finished_trials": finished_after,
-                "completed_trials": completed_after,
-                "timeout_scope": run.timeout_source,
-                "recovered_abort_sequence": recovered_abort_sequence,
-            },
+        assert run.timeout_source is not None  # Only a deadline accepts a partial result.
+        _record_accepted_partial_decision(
+            study,
+            phase.n_trials,
+            outcome_sequence=current_policy_state.max_sequence,
+            finished_trials=finished_after,
+            measured_trials=measured_after,
+            timeout_scope=run.timeout_source,
+            recovered_abort_sequence=recovered_abort_sequence,
         )
     if recorded_abort is not None and timed_out_incomplete:
         # Consume the abort before timeout handling so a larger timeout can resume refused work.
         _record_recovery_boundary(study, phase, recorded_abort["completion_sequence"])
     if timed_out_incomplete and not phase.allow_incomplete_on_timeout:
+        completed_after = sum(
+            _trial_count_state(trial, experiment) == "COMPLETE" for trial in trials_after
+        )
         raise phase_timeout(
             f"Phase {phase.name!r} timed out via {run.timeout_source or 'wallclock'} guard "
             f"after {finished_after}/{phase.n_trials} finished trials "
@@ -1600,11 +1553,12 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
             completion=_winner_completion(
                 requested_trials=phase.n_trials,
                 finished_trials=finished_after,
-                completed_trials=completed_after,
+                measured_trials=measured_after,
                 incomplete=accepted_partial_timeout,
                 reason="timeout" if accepted_partial_timeout else None,
                 timeout_scope=run.timeout_source if accepted_partial_timeout else None,
             ),
+            study_outcome_sequence=current_policy_state.max_sequence,
         )
     except NoFeasibleTrialError as exc:
         if run.deadline_exhausted:
@@ -1626,11 +1580,10 @@ def _run_phase(
 ) -> Winner:
     """Execute one phase end-to-end (sampler, study.optimize, winner selection).
 
-    Validates the phase's durable state (:func:`_resume_phase`), runs Optuna's
-    optimize loop with every worker sharing one :class:`_PhaseExecution`, and
-    turns how that loop ended into the phase's winner or refusal
-    (:func:`_finish_phase`). A phase with trials to launch claims ``generation``
-    once every launch check has passed, before its first durable trial-target write.
+    Open the study addressed by the parents' winners and reading settings, and let it take the
+    kept attempts other studies of the phase trained for its slots (:mod:`.reread`). Validate
+    the target and failure policy before adopting results. Claim the generation for new
+    launches only after their checks pass.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase to execute.
@@ -1671,10 +1624,49 @@ def _run_phase(
         abort, or exception, which violates the runner invariant.
     :return Winner: The selected phase winner.
     """
-    # The live opener also claims a newly created study's publication root,
-    # before any inspection, reaping, or trial work below can run against it.
-    study = open_phase_study(ledger, phase)
-    resumed = _resume_phase(experiment, phase, inherited_winners, study)
+    inherited = _inherited_override_payload(phase, inherited_winners)
+    study_name = phase_study_name(experiment, phase, inherited)
+    others = [
+        other for other in ledger.studies.get(phase.name, ()) if other.study_name != study_name
+    ]
+    study = open_phase_study(ledger, phase, study_name)
+    _validate_study_direction(study, experiment.metric.goal)
+    stamp_adoption_identity(experiment, phase, inherited, study, others)
+    adopt = functools.partial(
+        adopt_kept_attempts,
+        experiment,
+        phase,
+        study,
+        others,
+        run_deadline,
+        generation.generation_id,
+    )
+    adopted: list[Adoption] = []
+    resumed = _resume_phase(
+        experiment,
+        phase,
+        inherited_winners,
+        study,
+        lambda: adopted.append(adopt(before_launch=True)),
+    )
+    if not study.get_trials(deepcopy=False):
+        note = new_study_note(experiment, phase, inherited, others)
+        if note is not None:
+            report.info("%s  %s", phase.name, note)
+    # Preflight checks root studies before their rows can change and before child
+    # addresses are known.
+    if phase.inherits or any(adoption.total for adoption in adopted):
+        _validate_selection_evidence(experiment, {phase.name: study})
+    if others:
+        # Recovery refreshes trials.csv from each study it settles, which can leave it showing
+        # a study this run does not address. Like every trials.csv snapshot it is best-effort.
+        with contextlib.suppress(Exception):
+            _write_trials_csv(
+                study,
+                _trials_csv_path(experiment, phase.name),
+                experiment,
+                repeats=repeat_axis(phase),
+            )
     if isinstance(resumed, Winner):
         return resumed
     resume = resumed
@@ -1682,7 +1674,7 @@ def _run_phase(
     trials = study.get_trials(deepcopy=False)
     finished = _finished_trial_count(trials)
     remaining = max(0, phase.n_trials - finished)
-    reruns = _pending_rerun_count(trials, phase)
+    reruns = _pending_rerun_count(study, phase)
     report.info(
         phase_start(experiment, phase, finished=finished, remaining=remaining, reruns=reruns)
     )
@@ -1740,6 +1732,7 @@ def _run_phase(
         gpu_pool=gpu_pool,
         optimize_deadline=budget.deadline,
         timeout_source=budget.source,
+        other_studies=others,
         finished_trials=finished,
     )
     run.resume_from(resume.policy_state)
@@ -1747,7 +1740,7 @@ def _run_phase(
     if resume.recovery_abort is not None:
         # Atomically accept the recovery target and retire the abort before updating the target attr.
         _record_recovery_boundary(study, phase, resume.recovery_abort["completion_sequence"])
-        run.resume_from(_load_phase_policy_state(study))
+        run.resume_from(_load_phase_policy_state(study, experiment))
     _record_trial_target(study, phase)
     if (
         resume.partial_decision is not None
@@ -1762,17 +1755,72 @@ def _run_phase(
                 trainer_environment=environment_identity.digest,
             )
             # WAITING reruns precede new draws and share the allocation context.
-            _log_reruns(experiment, phase, study, _record_reruns(study, phase))
+            recorded_reruns = _record_reruns(study, phase)
+            timeout = budget.timeout
             try:
-                study.optimize(
-                    functools.partial(_objective, run),
-                    n_trials=remaining,
-                    n_jobs=phase.n_jobs,
-                    timeout=budget.timeout,
-                    gc_after_trial=True,
-                    callbacks=[functools.partial(_after_trial, run)],
-                    catch=(TrialExecutionError,),
-                )
+                while True:
+                    _log_reruns(experiment, phase, study, recorded_reruns)
+                    settled_before = _settled_trial_count(study)
+                    batch = launch_batch(experiment, phase, study, others)
+                    bounded = batch < remaining
+                    study.optimize(
+                        functools.partial(_objective, run),
+                        n_trials=batch,
+                        n_jobs=phase.n_jobs,
+                        timeout=timeout,
+                        gc_after_trial=True,
+                        callbacks=[functools.partial(_after_trial, run)],
+                        catch=(TrialExecutionError,),
+                    )
+                    # An interrupted trial (a stopped trainer, nothing to score) reruns in
+                    # this invocation while each pass settles trials, otherwise in the next one.
+                    finished_after = _finished_trial_count(study.get_trials(deepcopy=False))
+                    remaining = phase.n_trials - finished_after
+                    if (
+                        remaining <= 0
+                        or _settled_trial_count(study) == settled_before
+                        or run.aborted
+                        or run.deadline_exhausted
+                        or run.fatal_error is not None
+                    ):
+                        break
+                    if budget.deadline is not None:
+                        timeout = budget.deadline - time.monotonic()
+                        if timeout <= 0:
+                            break
+                    if bounded:
+                        try:
+                            between = adopt_kept_attempts(
+                                experiment,
+                                phase,
+                                study,
+                                others,
+                                budget.deadline,
+                                generation_id,
+                                before_launch=False,
+                            )
+                        except PhaseTimeoutError:
+                            run.stop_for_deadline()
+                            break
+                        if between.total:
+                            _validate_selection_evidence(experiment, {phase.name: study})
+                            state = _load_phase_policy_state(study, experiment)
+                            run.resume_from(state)
+                            run.finished_trials = _finished_trial_count(
+                                study.get_trials(deepcopy=False)
+                            )
+                            if state.abort is not None:
+                                run.abort_recorded = True
+                                run.stop_launches()
+                                break
+                            remaining = phase.n_trials - run.finished_trials
+                            if remaining <= 0:
+                                break
+                        if budget.deadline is not None:
+                            timeout = max(0.0, budget.deadline - time.monotonic())
+                    recorded_reruns = _record_reruns(study, phase)
+                    if not recorded_reruns and not bounded:
+                        break
             except BaseException as exc:
                 # Drain workers before run reconciliation can reap their trials.
                 if phase.n_jobs > 1:
@@ -1794,6 +1842,7 @@ def _run_phase(
                 _write_trials_csv(
                     study,
                     _trials_csv_path(experiment, phase.name),
+                    experiment,
                     repeats=repeat_axis(phase),
                 )
 
@@ -1851,11 +1900,12 @@ def _replay_met_target(
             completion=_winner_completion(
                 requested_trials=phase.n_trials,
                 finished_trials=_finished_trial_count(trials),
-                completed_trials=_completed_trial_count(trials),
+                measured_trials=_measured_trial_count(trials),
                 incomplete=False,
                 reason=None,
                 timeout_scope=None,
             ),
+            study_outcome_sequence=resume.policy_state.max_sequence,
             verify_evidence=verify_evidence,
             emit_advisories=False,
         )
@@ -1875,6 +1925,7 @@ def _select_phase_winner(
     *,
     phase_fingerprint: str,
     completion: dict[str, Any],
+    study_outcome_sequence: int,
     verify_evidence: bool = True,
     emit_advisories: bool = True,
 ) -> Winner:
@@ -1886,6 +1937,7 @@ def _select_phase_winner(
     :param optuna.Study study: Study whose completed trials supply the winner.
     :param str phase_fingerprint: Verified semantic fingerprint for the phase.
     :param dict[str, Any] completion: Completion metadata persisted with the winner.
+    :param int study_outcome_sequence: Last durable outcome sequence that stood at selection.
     :param bool verify_evidence: Whether to verify the selected trial against its
         frozen evidence and warn if its environment differs from the current run.
     :param bool emit_advisories: Whether to log fresh selection diagnostics instead of silently replaying them.
@@ -1920,8 +1972,11 @@ def _select_phase_winner(
         gates=selected.gates,
         completion=completion,
         phase_fingerprint=phase_fingerprint,
+        study_name=study.study_name,
+        study_outcome_sequence=study_outcome_sequence,
         generation_id=selected.generation_id,
         attempt_id=selected.attempt_id,
+        trial_dir=selected.trial_dir,
         source=WinnerSource(
             kind="phase_trial",
             phase=phase.name,

@@ -12,7 +12,6 @@ import pytest
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import ExecutionContext, Experiment, Phase
-from phasesweep.config.reference import lookup
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.artifact_roots import (
     _check_artifact_root_binding,
@@ -20,30 +19,26 @@ from phasesweep.engine.artifact_roots import (
 )
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
-    StudyContextConflictError,
     StudyFingerprintMismatchError,
 )
 from phasesweep.engine.fingerprints import (
+    _fresh_identity,
     _phase_fingerprint,
     _phase_fingerprint_payload,
     _render_changed_values,
     _semantic_payload_digest,
+    _stamp_identity,
     _verify_fingerprint,
 )
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
-from phasesweep.engine.state import (
-    ARTIFACT_ROOT_ATTR,
-    PHASE_FINGERPRINT_ATTR,
-    PHASE_FINGERPRINT_PAYLOAD_ATTR,
-)
+from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, Winner, _recorded_identity
 from phasesweep.errors import (
     FRESH_STUDY,
     NEW_STUDY_STEP,
     OperatorAction,
-    rename_step,
 )
-from tests.conftest import make_experiment, phase_trials, write_constant_trainer
+from tests.conftest import make_experiment
 from tests.experiments import (
     anchored_phase,
     phase_payload,
@@ -73,14 +68,14 @@ def _refusal(study: optuna.Study, experiment: Experiment) -> StudyFingerprintMis
 
 @pytest.mark.integration
 def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
-    """Widening one bound refuses the study, names that key with both values, and offers the phase rename that then runs."""
+    """Narrowing one bound refuses the study, names that key with both values and what it dropped, and offers the phase rename that then runs."""
     project = project_directory(tmp_path)
     config = write_anchored_config(
         project / "exp.yaml",
         workdir="runs",
         storage="journal:///study.journal",
         execution={"cwd": "."},
-        phases=[anchored_phase(3)],
+        phases=[anchored_phase(4)],
     )
     run_experiment(load_experiment(config))
     write_anchored_config(
@@ -88,18 +83,20 @@ def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
         workdir="runs",
         storage="journal:///study.journal",
         execution={"cwd": "."},
-        phases=[anchored_phase(4)],
+        phases=[anchored_phase(3)],
     )
 
     with pytest.raises(StudyFingerprintMismatchError, match="different config") as caught:
         run_experiment(load_experiment(config))
 
-    assert "Changed: phase.search_space.x.high: 3 -> 4." in str(caught.value)
+    assert str(caught.value).endswith(
+        "Changed: phase.search_space.x.high: 4 -> 3. search_space 'x' dropped high 4; added "
+        "values alone keep the study and run only the new ones."
+    )
     assert "execution.cwd" not in str(caught.value)
     assert caught.value.action is OperatorAction.FRESH_NAMESPACE
-    assert caught.value.remediation is not None
     assert caught.value.remediation == (
-        "Restore the recorded value(s), or give `p` a new `name`, which runs it again from scratch."
+        "Put back x high 4, or give `p` a new `name`, which runs it again from scratch."
     )
 
     write_anchored_config(
@@ -107,14 +104,14 @@ def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
         workdir="runs",
         storage="journal:///study.journal",
         execution={"cwd": "."},
-        phases=[{**anchored_phase(4), "name": "wider"}],
+        phases=[{**anchored_phase(3), "name": "narrower"}],
     )
-    assert set(run_experiment(load_experiment(config))) == {"wider"}
+    assert set(run_experiment(load_experiment(config))) == {"narrower"}
 
 
 @pytest.mark.integration
-def test_refusal_for_an_inherited_phase_names_the_dependents_to_rename(tmp_path: Path) -> None:
-    """A changed phase that another inherits reruns by renaming both, and the fix line names the dependent."""
+def test_refusal_for_an_inherited_phase_names_only_that_phase_to_rename(tmp_path: Path) -> None:
+    """A changed phase that another inherits reruns by renaming it alone: the dependent keeps its name, since its study is found by the values the renamed phase passes it."""
     project = project_directory(tmp_path)
     fields: dict[str, object] = {
         "workdir": "runs",
@@ -125,26 +122,21 @@ def test_refusal_for_an_inherited_phase_names_the_dependents_to_rename(tmp_path:
         name="q", inherits=["p"], search_space={"y": {"type": "int", "low": 0, "high": 3}}
     )
     config = write_anchored_config(
-        project / "exp.yaml", phases=[anchored_phase(3), child], **fields
+        project / "exp.yaml", phases=[anchored_phase(4), child], **fields
     )
     run_experiment(load_experiment(config))
-    write_anchored_config(config, phases=[anchored_phase(4), child], **fields)
+    write_anchored_config(config, phases=[anchored_phase(3), child], **fields)
 
-    with pytest.raises(StudyFingerprintMismatchError, match="::p'") as caught:
+    with pytest.raises(StudyFingerprintMismatchError, match="::p::[0-9a-f]{16}'") as caught:
         run_experiment(load_experiment(config))
 
-    assert caught.value.remediation is not None
     assert caught.value.remediation == (
-        "Restore the recorded value(s), or give `p` and `q` new names and update the `inherits` "
-        "that name them, which runs them again from scratch."
+        "Put back x high 4, or give `p` a new `name`, which runs it again from scratch."
     )
 
-    renamed = [
-        {**anchored_phase(4), "name": "wider"},
-        {**child, "name": "after", "inherits": ["wider"]},
-    ]
+    renamed = [{**anchored_phase(3), "name": "narrower"}, {**child, "inherits": ["narrower"]}]
     write_anchored_config(config, phases=renamed, **fields)
-    assert set(run_experiment(load_experiment(config))) == {"wider", "after"}
+    assert set(run_experiment(load_experiment(config))) == {"narrower", "q"}
 
 
 def test_refusal_names_the_trainer_cwd_when_the_same_config_runs_from_another_directory(
@@ -191,12 +183,13 @@ def test_stored_payload_hashes_to_the_stored_fingerprint(tmp_path: Path) -> None
 
     fingerprint = _verify_fingerprint(study, experiment, phase, {})
 
-    stored = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage_url)).user_attrs
-    assert stored[PHASE_FINGERPRINT_ATTR] == fingerprint
-    assert _semantic_payload_digest(stored[PHASE_FINGERPRINT_PAYLOAD_ATTR]) == fingerprint
-    assert stored[PHASE_FINGERPRINT_PAYLOAD_ATTR] == _phase_fingerprint_payload(
-        experiment, phase, {}
+    stored = _recorded_identity(
+        optuna.load_study(study_name="t::p", storage=_resolve_storage(storage_url))
     )
+    assert stored is not None
+    assert stored["fingerprint"] == fingerprint
+    assert _semantic_payload_digest(stored["payload"]) == fingerprint
+    assert stored["payload"] == _phase_fingerprint_payload(experiment, phase, {})
     assert fingerprint == _phase_fingerprint(experiment, phase, {})
 
 
@@ -208,8 +201,16 @@ def test_rebinding_an_empty_study_replaces_the_stored_payload() -> None:
 
     fingerprint = _verify_fingerprint(study, wide, wide.phases[0], {})
 
-    assert study.user_attrs[PHASE_FINGERPRINT_ATTR] == fingerprint
-    assert _semantic_payload_digest(study.user_attrs[PHASE_FINGERPRINT_PAYLOAD_ATTR]) == fingerprint
+    stored = _recorded_identity(study)
+    assert stored is not None
+    assert stored["fingerprint"] == fingerprint
+    assert _semantic_payload_digest(stored["payload"]) == fingerprint
+    assert stored["search_spaces"] == [
+        {
+            "search_space": {"x": {"type": "int", "low": 0, "high": 11, "log": False, "step": 1}},
+            "first_position": 0,
+        }
+    ]
 
 
 def test_refusal_lists_ten_changed_keys_then_counts_the_rest() -> None:
@@ -250,11 +251,13 @@ def test_refusal_for_a_configured_cwd_omits_the_unset_cwd_advice() -> None:
     assert error.action is OperatorAction.FRESH_NAMESPACE
 
 
-def test_refusal_without_a_stored_payload_keeps_the_hash_only_message() -> None:
-    """A stored digest with no payload beside it still refuses, naming only the hashes."""
+def test_refusal_of_a_digest_its_payload_does_not_explain_names_only_the_hashes() -> None:
+    """A recorded digest that differs from its own unchanged payload refuses, naming only the hashes."""
     experiment = make_experiment()
     study = optuna.create_study()
-    study.set_user_attr(PHASE_FINGERPRINT_ATTR, "0" * 64)
+    _stamp_identity(
+        study, {**_fresh_identity(experiment, experiment.phases[0], {}), "fingerprint": "0" * 64}
+    )
     study.optimize(lambda trial: 0.0, n_trials=1)
 
     error = _refusal(study, experiment)
@@ -376,60 +379,37 @@ def test_a_study_bound_to_another_root_gets_a_step_that_fits(tmp_path: Path) -> 
     )
 
 
-def test_the_rename_step_is_worded_once_and_names_every_phase_it_is_given() -> None:
-    """Every site that offers the rename builds it here, and the reference's timeout entry says it with no phase named."""
-    assert rename_step(("p",)) == "give `p` a new `name`, which runs it again from scratch"
-    assert rename_step(("p", "q", "r")) == (
-        "give `p`, `q` and `r` new names and update the `inherits` that name them, which runs "
-        "them again from scratch"
-    )
-    (timeout,) = lookup("phases[].timeout_seconds_per_trial")
-    assert (
-        "give the phase, and each phase that inherits it, a new `name`, updating every "
-        "`inherits` to match, to run it under another value."
-    ) in " ".join(timeout.comments)
+def test_a_renamed_parent_that_supplies_the_same_values_keeps_the_childs_study() -> None:
+    """A child's identity holds the values its trainer inherits, not which parent supplied them, so a renamed or replaced parent with the same winner continues the child's study."""
 
+    def plan(parent_name: str) -> tuple[Experiment, Phase]:
+        parent = Phase(
+            name=parent_name,
+            n_trials=1,
+            gpu_policy="none",
+            search_space={"lr": IntParam(type="int", low=0, high=3)},
+            sampler=Sampler(type="random", seed=0),
+        )
+        child = Phase(
+            name="q",
+            n_trials=1,
+            gpu_policy="none",
+            inherits=[parent_name],
+            search_space={"wd": IntParam(type="int", low=0, high=3)},
+            sampler=Sampler(type="random", seed=0),
+        )
+        return make_experiment(phases=[parent, child]), child
 
-@pytest.mark.integration
-def test_a_raised_target_is_run_by_renaming_only_the_phases_that_inherit_it(
-    tmp_path: Path,
-) -> None:
-    """Following the refusal's step as printed keeps the enlarged phase's finished trials and reruns its dependents."""
-    trainer = write_constant_trainer(tmp_path)
+    def winner() -> Winner:
+        return Winner(trial_number=0, params={}, effective_overrides={"lr": 1}, metric=0.0)
 
-    def chain(*, a_trials: int, suffix: str) -> Experiment:
-        def phase(name: str, trials: int, parent: str | None = None) -> Phase:
-            return Phase(
-                name=name,
-                n_trials=trials,
-                inherits=[] if parent is None else [parent],
-                sampler=Sampler(type="random", seed=0),
-                gpu_policy="none",
-                search_space={name[0]: IntParam(type="int", low=0, high=9)},
-            )
+    original, child = plan("p")
+    study = optuna.create_study()
+    recorded = _verify_fingerprint(study, original, child, {"p": winner()})
+    study.optimize(lambda trial: 0.0, n_trials=1)
 
-        phases = [
-            phase("a", a_trials),
-            phase(f"b{suffix}", 2, "a"),
-            phase(f"c{suffix}", 2, f"b{suffix}"),
-        ]
-        return make_experiment(persistent=tmp_path, trainer=trainer, phases=phases)
-
-    run_experiment(chain(a_trials=2, suffix=""))
-    with pytest.raises(StudyContextConflictError) as refused:
-        run_experiment(chain(a_trials=3, suffix=""))
-    assert refused.value.remediation is not None
-    assert refused.value.remediation == (
-        "Give `b` and `c` new names and update the `inherits` that name them, which runs them "
-        "again from scratch; `a` keeps its trials and runs the rest."
-    )
-
-    renamed = chain(a_trials=3, suffix="2")
-    run_experiment(renamed)
-
-    assert [t.state.name for t in phase_trials(renamed, "a")] == ["COMPLETE"] * 3
-    assert [t.number for t in phase_trials(renamed, "a")][:2] == [0, 1]
-    assert len(phase_trials(renamed, "b2")) == len(phase_trials(renamed, "c2")) == 2
+    renamed, renamed_child = plan("p2")
+    assert _verify_fingerprint(study, renamed, renamed_child, {"p2": winner()}) == recorded
 
 
 def test_long_values_are_windowed_around_their_first_difference() -> None:

@@ -8,6 +8,7 @@ import itertools
 import pickle
 from collections.abc import Callable
 
+import cmaes
 import optuna
 import pytest
 from optuna.samplers._lazy_random_state import LazyRandomState
@@ -26,6 +27,7 @@ from phasesweep.engine.optuna import (
     _draw_positions,
     _position_seed,
     _PositionCmaEsSampler,
+    _sampling_trial_for_reread,
     _suggest,
 )
 from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_OUTCOME_ATTR
@@ -462,6 +464,133 @@ def test_cmaes_restores_the_newest_generation_not_the_highest_numbered_snapshot(
     assert sampler._restore_optimizer([plain]) is None
 
 
+def test_cmaes_reread_replays_later_batches_after_an_incomplete_one_fills() -> None:
+    """A re-read with a lost measurement fills its missing batch before reusing later ones."""
+    source = _study(_build_sampler(_CMAES, _CMA_SPACE))
+    _run(source, _CMA_SPACE, 19)
+    sampler = _PositionCmaEsSampler(seed=5)
+    reread = optuna.create_study(
+        study_name=f"{source.study_name}::reread", sampler=sampler, storage=source._storage
+    )
+    for trial in source.get_trials():
+        retained = _sampling_trial_for_reread(trial, sampler)
+        if trial.number == 8:
+            retained.state = optuna.trial.TrialState.FAIL
+            retained.value = None
+            retained.user_attrs[TRIAL_OUTCOME_ATTR] = trial_outcome(
+                trial.number + 1, "failure", cause="metric missing in kept evidence"
+            )
+        reread.add_trial(retained)
+
+    _run(reread, _CMA_SPACE, 1)
+    assert reread.trials[-1].system_attrs[sampler._attr_key_generation] == 1
+
+    resumed = _reopen(reread, _CMAES, _CMA_SPACE)
+    _run(resumed, _CMA_SPACE, 1)
+    assert resumed.trials[-1].system_attrs[sampler._attr_key_generation] == 3
+
+
+def test_cmaes_batch_replay_leaves_a_study_of_its_own_asks_unchanged() -> None:
+    """A study whose rows its own sampler asked draws what it drew before the replay ran for every study.
+
+    The trials that tell a generation are interrupted and rerun, so the newest completed snapshot
+    lags its generation; the expected draws were captured before the replay applied to such studies.
+    """
+    study = _study(_build_sampler(_CMAES, _CMA_SPACE))
+    for cut in (8, 15):
+        _run(study, _CMA_SPACE, 30, interrupt_at=frozenset({cut}))
+        _interrupt_and_rerun(study)
+        study = _reopen(study, _CMAES, _CMA_SPACE)
+    _run(study, _CMA_SPACE, 22 - len(study.get_trials()))
+    drawn = [
+        (trial.system_attrs.get("cma:generation"), *(round(v, 9) for v in trial.params.values()))
+        for trial in study.get_trials()
+    ]
+    assert drawn == [
+        (None, 0.338015138, 0.094874535),
+        (0, 0.364011665, 0.816008698),
+        (0, 0.286488237, -0.77355552),
+        (0, -0.393063841, -0.164850226),
+        (0, -0.161891305, -0.51060516),
+        (0, 0.119059413, 0.46048664),
+        (0, 0.244764865, 0.054201806),
+        (1, 0.155100571, 0.43629854),
+        (1, 0.388416049, 0.564462026),
+        (1, 0.388416049, 0.564462026),
+        (1, -0.121595945, 0.820749391),
+        (1, 0.271521873, 0.46686865),
+        (1, 0.046768141, -0.364243533),
+        (1, 0.115848461, 0.457999333),
+        (2, 0.231106423, 0.421011275),
+        (2, 0.031173059, 0.434716363),
+        (2, 0.031173059, 0.434716363),
+        (2, 0.10593717, 0.792312379),
+        (2, 0.388061132, 0.36081531),
+        (2, 0.576206315, 0.868281608),
+        (2, -0.056961132, 0.673844903),
+    ]
+
+
+def test_cmaes_refits_adopted_batches_up_to_the_last_complete_one_across_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-read rows refit every complete batch with their own values, and Optuna tells the last.
+
+    The source tells two generations with an interrupted trial each, so the re-read study holds
+    partly told generations without snapshots. Its first ask replays generation 0 and lets
+    Optuna tell generation 1, saving a snapshot; after a reopen and more adopted rows, the ask
+    restores that snapshot and tells generation 2 once it is complete.
+    """
+    told: list[tuple[int, tuple[float, ...]]] = []
+    tell = cmaes.CMA.tell
+
+    def record(self: cmaes.CMA, solutions: list[tuple[object, float]]) -> None:
+        told.append((self.generation, tuple(round(value, 6) for _, value in solutions)))
+        tell(self, solutions)
+
+    monkeypatch.setattr(cmaes.CMA, "tell", record)
+    source = _study(_build_sampler(_CMAES, _CMA_SPACE))
+    for cut in (8, 15):
+        _run(source, _CMA_SPACE, 30, interrupt_at=frozenset({cut}))
+        _interrupt_and_rerun(source)
+        source = _reopen(source, _CMAES, _CMA_SPACE)
+    _run(source, _CMA_SPACE, 21 - len(source.get_trials()))
+    reread = optuna.create_study(
+        study_name=f"{source.study_name}::reread",
+        sampler=_build_sampler(_CMAES, _CMA_SPACE),
+        storage=source._storage,
+    )
+
+    def adopt(study: optuna.Study, trials: list[optuna.trial.FrozenTrial]) -> None:
+        for trial in trials:
+            retained = _sampling_trial_for_reread(trial, study.sampler)
+            if retained.value is not None:
+                retained.value += 1
+            study.add_trial(retained)
+
+    def asked(study: optuna.Study) -> tuple[object, bool, float, float]:
+        trial = study.get_trials()[-1]
+        snapshot = any(key.startswith("cma:optimizer") for key in trial.system_attrs)
+        a, b = (round(value, 9) for value in trial.params.values())
+        return trial.system_attrs.get("cma:generation"), snapshot, a, b
+
+    adopt(reread, source.get_trials()[:16])
+    told.clear()
+    _run(reread, _CMA_SPACE, 1)
+    assert told == [
+        (0, (1.270362, 2.152704, 1.696423, 1.870424, 1.058495, 1.063468)),
+        (1, (1.039573, 1.077758, 1.448923, 1.028656, 1.505346, 1.058876)),
+    ]
+    assert asked(reread) == (2, True, 0.18760503, 0.289236476)
+
+    reread = _reopen(reread, _CMAES, _CMA_SPACE)
+    adopt(reread, source.get_trials()[16:])
+    told.clear()
+    _run(reread, _CMA_SPACE, 1)
+    assert told == [(2, (1.01939, 0.012748, 1.090416, 1.280032, 1.011453, 1.399234))]
+    assert asked(reread) == (3, True, 0.412915145, 0.436721013)
+
+
 def test_the_optuna_internals_the_position_samplers_build_on_exist() -> None:
     """Fail loudly when an Optuna release renames a private name the position samplers override."""
     tpe = optuna.samplers.TPESampler(seed=0)
@@ -477,6 +606,3 @@ def test_the_optuna_internals_the_position_samplers_build_on_exist() -> None:
         "cma:optimizer",
     )
     assert list(inspect.signature(cma._restore_optimizer).parameters) == ["completed_trials"]
-    grid = optuna.samplers.GridSampler({"x": [0, 1]}, seed=0)
-    assert grid._search_space == {"x": [0, 1]}
-    assert len(grid._all_grids) == 2

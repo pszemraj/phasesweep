@@ -49,7 +49,6 @@ from phasesweep.evidence.models import (
     POSITIONED_EXTRACTOR_KINDS,
     Gate,
     JsonEnvelopeExtractor,
-    JsonExtractor,
     LocalExtractor,
     MlflowExtractor,
     ObjectiveExtractor,
@@ -77,6 +76,7 @@ from phasesweep.runtime.files import (
     local_storage_url,
 )
 from phasesweep.runtime.json import JsonObject
+from phasesweep.runtime.terminal import ReportFields
 from phasesweep.tracking.models import MlflowSettings
 
 OverrideFormat = Literal["yaml_file", "argparse", "hydra", "json_file"]
@@ -143,26 +143,60 @@ def _metric_semantics_payload(metric: Metric) -> JsonObject:
     }
 
 
-def _metric_scoring_line(metric: Metric) -> str:
+def _field_text(value: JsonValue) -> str:
+    """Write one extractor field's value as configured, in double quotes when it needs them.
+
+    :param JsonValue value: The value of a dumped extractor field.
+    :return str: A multiline string as an escaped literal; a single-line string as is unless
+        empty or holding whitespace or a double quote, in which case double quotes enclose it
+        and its backslashes stay as written; a boolean in lower case; any other value as
+        ``str`` writes it.
+    """
+    if isinstance(value, str):
+        if value and value.splitlines() != [value]:
+            return repr(value)
+        if value and not any(char.isspace() or char == '"' for char in value):
+            return value
+        return '"' + value.replace('"', '\\"') + '"'
+    return str(value).lower() if isinstance(value, bool) else str(value)
+
+
+def _extractor_fields(extractor: _Frozen) -> tuple[str, ...]:
+    """Describe an extractor as the individual fields of its launch contract.
+
+    :param _Frozen extractor: A configured metric or observation extractor.
+    :return tuple[str, ...]: The kind followed by set ``key=value`` fields in declaration order.
+    """
+    fields = extractor.model_dump(mode="json", exclude_none=True)
+    kind = fields.pop("type")
+    return (str(kind), *(f"{key}={_field_text(value)}" for key, value in fields.items()))
+
+
+def _metric_scoring_line(metric: Metric) -> ReportFields:
     """Describe the metric's name, goal, viability bounds, and extractor config.
 
     :param Metric metric: Configured optimization metric.
-    :return str: One line naming the metric, its goal, its viability bounds when set, and
-        its extractor config.
+    :return ReportFields: A line naming the metric, its goal, its viability bounds when set, and
+        its extractor as the kind and its ``key=value`` fields.
     """
     bounds = metric.model_dump(mode="json", include={"min", "max"}, exclude_none=True)
-    return (
-        f"metric={metric.name!r} goal={metric.goal} "
-        + (f"bounds={bounds} " if bounds else "")
-        + f"extractor={metric.extractor.model_dump(mode='json', exclude_none=True)}"
+    kind, *fields = _extractor_fields(metric.extractor)
+    return ReportFields(
+        (
+            f"metric={metric.name!r}",
+            f"goal={metric.goal}",
+            *(f"{key}={value}" for key, value in bounds.items()),
+            f"extractor={kind}",
+            *fields,
+        )
     )
 
 
-def experiment_contract_lines(experiment: Experiment) -> list[str]:
+def experiment_contract_lines(experiment: Experiment) -> list[str | ReportFields]:
     """List the experiment-level contract lines that ``validate`` and ``run --dry-run`` print.
 
     :param Experiment experiment: Loaded experiment.
-    :return list[str]: One line per experiment-wide contract, in print order.
+    :return list[str | ReportFields]: One line per experiment-wide contract, in print order.
     """
     return [
         _metric_scoring_line(experiment.metric),
@@ -205,7 +239,7 @@ def experiment_warnings(experiment: Experiment) -> list[str]:
 
 def experiment_disclosures(
     experiment: Experiment,
-) -> Iterator[tuple[Phase | None, list[tuple[bool, str]]]]:
+) -> Iterator[tuple[Phase | None, list[tuple[bool, str | ReportFields]]]]:
     """Yield shared contract and warning lines in their display order.
 
     The experiment block comes first, followed by one block per configured
@@ -213,7 +247,7 @@ def experiment_disclosures(
     each line's boolean marks advisory warnings without prescribing a sink.
 
     :param Experiment experiment: Loaded experiment to describe.
-    :return Iterator[tuple[Phase | None, list[tuple[bool, str]]]]: Context and
+    :return Iterator[tuple[Phase | None, list[tuple[bool, str | ReportFields]]]]: Context and
         ordered warning/content pairs; ``None`` identifies the experiment block.
     """
     yield (
@@ -299,25 +333,20 @@ def _argparse_boolean_flags(experiment: Experiment) -> list[str]:
     return flags
 
 
-def _observation_line(observation: Observation) -> str:
+def _observation_line(observation: Observation) -> ReportFields:
     """Describe one report-only observation's name and scalar source.
 
     :param Observation observation: One configured ``observe`` entry.
-    :return str: One line with the observation's name, its source and a report-only marker.
+    :return ReportFields: A line with the observation's name, source and report-only marker.
     """
-    extractor = observation.extractor
-    if isinstance(extractor, JsonExtractor):
-        source = f"json {extractor.path} key {extractor.key}"
-    elif isinstance(extractor, JsonEnvelopeExtractor):
-        source = (
-            f"json_envelope {extractor.path} objective {extractor.objective_name} "
-            f"split {extractor.split} policy {extractor.policy}"
+    return ReportFields(
+        (
+            "observe",
+            f"{observation.name}:",
+            *_extractor_fields(observation.extractor),
+            "(report-only)",
         )
-    else:
-        source = (
-            f"log_regex {extractor.file} pattern {extractor.pattern!r} select {extractor.select}"
-        )
-    return f"observe {observation.name}: {source} (report-only)"
+    )
 
 
 def _evaluation_point_line(metric: Metric) -> str:
@@ -428,10 +457,10 @@ class _NamedExtractor(_Frozen):
 
     @model_validator(mode="after")
     def _validate_evaluation_axis_unused(self) -> Self:
-        """Reject a non-default ``evaluation_axis`` that nothing would read.
+        """Reject a non-default ``evaluation_axis`` on a named extractor.
 
-        Only the metric extractor's axis feeds selection's ``evaluation_point``
-        check, so a named extractor that sets one is a misplaced setting.
+        The objective declares the axis for its evaluation position. For W&B, that
+        axis also applies to native min/max constraints on a rerun.
 
         :raises ValueError: The extractor sets ``evaluation_axis``.
         :return Self: Self, unchanged.
@@ -440,6 +469,11 @@ class _NamedExtractor(_Frozen):
         if not isinstance(extractor, JsonEnvelopeExtractor | WandbExtractor):
             return self
         if extractor.evaluation_axis != type(extractor).model_fields["evaluation_axis"].default:
+            if isinstance(extractor, WandbExtractor):
+                raise ValueError(
+                    f"{self._label} {self.name!r} sets evaluation_axis. Configure the trainer "
+                    "progress axis on the W&B objective."
+                )
             raise ValueError(
                 f"{self._label} {self.name!r} sets evaluation_axis, which only the metric "
                 "extractor's evaluation_point check reads; remove it."
@@ -1864,5 +1898,10 @@ def _wandb_query(
             (wandb_gate_identity(gate), tuple(sorted(set(gate.keys))))
             for gate in gates
             if isinstance(gate, WandbSummaryRequiredGate)
+        ),
+        objective_key=(
+            experiment.metric.extractor.metric_key
+            if isinstance(experiment.metric.extractor, WandbExtractor)
+            else None
         ),
     )

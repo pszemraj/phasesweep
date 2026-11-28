@@ -16,7 +16,7 @@ import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
 from phasesweep._metadata import __version__
 from phasesweep.config.io import load_experiment_snapshot
-from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.state import (
     GENERATION_CONFIG_SNAPSHOT_FILENAME,
@@ -25,7 +25,7 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_VERSION,
 )
 from phasesweep.runtime.files import atomic_text_writer, file_sha256, private_atomic_write_text
-from phasesweep.runtime.json import json_object, json_text, strict_json_loads
+from phasesweep.runtime.json import JsonObject, json_object, json_text, strict_json_loads
 
 _GIT_COMMAND_TIMEOUT_SECONDS = 10
 # SHA-1 repositories name commits with 40 hex digits and SHA-256 repositories with 64.
@@ -147,19 +147,18 @@ def _parse_code_revision(record: Mapping[str, object]) -> CodeRevision | None:
     return {"commit": commit, "dirty": dirty}
 
 
-def _phase_config_fingerprint(phase: Phase) -> str:
+def _phase_config_fingerprint(phase_payload: JsonObject) -> str:
     """Hash a phase's configured semantics independently of inherited winners.
 
     This identifies phase-level config drift before execution. Winner fingerprints
     also bind inherited effective overrides.
 
-    :param Phase phase: Phase whose configured semantics are hashed.
+    :param JsonObject phase_payload: The phase's configured semantic payload.
     :return str: SHA-256 hex digest (64 characters) of the canonicalised payload.
     """
     payload = {
         "fingerprint_schema_version": fingerprint_ops.EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
-        "name": phase.name,
-        **fingerprint_ops._semantic_phase_dump(phase),
+        **phase_payload,
     }
     return fingerprint_ops._semantic_payload_digest(payload)
 
@@ -270,8 +269,8 @@ def _write_generation_provenance(
         },
         "config_fingerprint": fingerprint_ops._experiment_semantic_fingerprint(experiment),
         "phase_config_fingerprints": [
-            {"name": phase.name, "sha256": _phase_config_fingerprint(phase)}
-            for phase in experiment.phases
+            {"name": phase["name"], "sha256": _phase_config_fingerprint(phase)}
+            for phase in fingerprint_ops._semantic_phase_plan(experiment.phases)
         ],
         "provenance": dict(sorted(experiment.provenance.items())),
         "code_revision": _code_revision(Path(trainer_cwd)),

@@ -49,9 +49,10 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
+    _attempt_dir,
     _attempts_dir,
 )
-from phasesweep.engine.phase import _abort_record, _failure_policy_abort_record, _finish_phase
+from phasesweep.engine.phase import _finish_phase
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.selection import (
@@ -73,6 +74,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
 )
+from phasesweep.engine.study_policy import _abort_record, _failure_policy_abort_record
 from phasesweep.engine.trial import EnvironmentIdentity
 from phasesweep.errors import (
     ACCEPT_INCOMPLETE_STEP,
@@ -229,7 +231,6 @@ def test_no_feasible_subclasses_rewrap_with_the_donated_action():
 
 _UNMARKED_STUDY_DIAGNOSTIC_MARKERS = {
     "study schema": "has no format version; this PhaseSweep reads format",
-    "trial target": "has trial state but no",
     "environment cohort": "without a semantic trainer-environment identity",
     "phase fingerprint": "has no semantic fingerprint",
 }
@@ -239,7 +240,6 @@ _UNMARKED_STUDY_DIAGNOSTIC_MARKERS = {
     ("label", "call"),
     [
         ("study schema", lambda: study_policy._validate_study_schema(_populated_study())),
-        ("trial target", lambda: study_policy._accepted_trial_target(_populated_study())),
         (
             "environment cohort",
             lambda: study_policy._validate_environment_cohort(
@@ -408,7 +408,7 @@ def _validate_damaged(fixture: str, damage: Callable[[Path], None]) -> Trigger:
 def _run_while_discovery_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Start a run over the current golden ledger whose phase study cannot be read."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
-    monkeypatch.setattr(engine_ledger, "open_existing_study", raiser(_storage_gone()))
+    monkeypatch.setattr(engine_ledger, "open_existing_studies", raiser(_storage_gone()))
     return run_experiment(materialized.experiment)
 
 
@@ -525,7 +525,10 @@ def _preflight(
         if schema_check is not None:
             monkeypatch.setattr(guards, "_initialize_study_schema", schema_check)
         return guards._preflight_existing_studies(
-            replace(claimed, studies=MappingProxyType(dict(studies())))
+            replace(
+                claimed,
+                studies=MappingProxyType({name: (study,) for name, study in studies().items()}),
+            )
         )
 
     return trigger
@@ -571,7 +574,7 @@ _PREFLIGHT_AGGREGATE = "Experiment recovery preflight found multiple unsafe stud
 WRAP_CASES = (
     RoutingCase(
         id="claim_ledger_discovery_preserves_override",
-        trigger=_claim_while(engine_ledger, "open_existing_study", _ledger_busy),
+        trigger=_claim_while(engine_ledger, "open_existing_studies", _ledger_busy),
         raised=StudyStorageUnavailableError,
         action=OperatorAction.RETRY,
         message="Could not inspect persistent study storage for phase 'p'.",
@@ -830,9 +833,9 @@ def _locator_cleared(entry: Path) -> None:
     entry.write_text(json.dumps(payload))
 
 
-def _trial_dir_removed(entry: Path) -> None:
-    """Remove the trial directory a registry entry names."""
-    Path(json.loads(entry.read_text())["trial_dir"]).rmdir()
+def _attempt_dir_removed(entry: Path) -> None:
+    """Remove the attempt directory a registry entry names."""
+    Path(json.loads(entry.read_text())["attempt_dir"]).rmdir()
 
 
 def _tracking_kind_malformed(entry: Path) -> None:
@@ -919,7 +922,9 @@ def _reap_trial_with_foreign_lifecycle(tmp_path: Path, monkeypatch: pytest.Monke
     """Reap a RUNNING trial whose lifecycle record names another attempt."""
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
-    write_attempt_lifecycle(trial_dir, attempt_id="another", state="launching")
+    attempt_dir = _attempt_dir(trial_dir.parent, "attempt")
+    attempt_dir.mkdir(parents=True)
+    write_attempt_lifecycle(attempt_dir, attempt_id="another", state="launching")
     return _reap_running_trial(
         tmp_path, **{TRIAL_DIR_ATTR: str(trial_dir), ATTEMPT_ID_ATTR: "attempt"}
     )
@@ -1316,8 +1321,8 @@ ORIGIN_CASES = (
         message="has an unsupported or partial schema.",
     ),
     RoutingCase(
-        id="registry_entry_trial_dir_missing",
-        trigger=_scan_registry(damage=_trial_dir_removed),
+        id="registry_entry_attempt_dir_missing",
+        trigger=_scan_registry(damage=_attempt_dir_removed),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
         message="its process state cannot be verified.",
@@ -1451,14 +1456,14 @@ ORIGIN_CASES = (
         id="live_trial_tracker_unreadable",
         trigger=_run_while_tracker_unreadable,
         raised=TrackingTargetUnavailableError,
-        action=OperatorAction.FIX_CONFIG,
+        action=OperatorAction.RETRY,
         message="finished training, but the tracker could not be read",
     ),
     RoutingCase(
         id="pending_trial_tracker_unreadable",
         trigger=_resume_while_tracker_unreadable,
         raised=TrackingTargetUnavailableError,
-        action=OperatorAction.FIX_CONFIG,
+        action=OperatorAction.RETRY,
         message="1 completed trial(s) finished training, but the tracker could not be read",
     ),
     RoutingCase(

@@ -133,13 +133,13 @@ def format_cli_overrides(overrides: Mapping[str, object], fmt: _CliOverrideForma
 
     :param Mapping[str, object] overrides: Scalar/list values keyed by dotted parameter names.
     :param _CliOverrideFormat fmt: ``argparse`` prefixes keys with ``--``; Hydra uses bare keys.
-    :return str: Space-separated ``key=value`` tokens in insertion order.
+    :return str: Space-separated ``key=value`` tokens sorted by key.
     :raises TypeError: A value has no faithful representation in the selected grammar.
     """
     prefix = "--" if fmt == "argparse" else ""
     return " ".join(
         shlex.quote(f"{prefix}{key}={_render_override_value(value, fmt)}")
-        for key, value in overrides.items()
+        for key, value in sorted(overrides.items())
     )
 
 
@@ -330,8 +330,8 @@ def compose_trainer_input(
 ) -> str | dict[str, JsonValue]:
     """Compose trainer input without writing files.
 
-    File modes return serialized text; CLI modes return ordered flattened values.
-    An empty CLI base preserves override order and supported tuple values.
+    File modes return serialized text. CLI modes return flattened values for rendering.
+    An empty CLI base preserves supported tuple values.
     Placeholders expand only in base strings, before overrides apply.
 
     :param dict[str, JsonValue] trainer_config: Base trainer configuration.

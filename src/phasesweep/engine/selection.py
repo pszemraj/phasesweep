@@ -10,11 +10,11 @@ import math
 import typing
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, ClassVar
 
 import optuna
 
-from phasesweep.config.common import check_bounds
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import (
     CategoricalParam,
@@ -24,22 +24,36 @@ from phasesweep.config.search import (
     sampler_search_space,
 )
 from phasesweep.engine.artifacts import _winner_common_payload
+from phasesweep.engine.bounds import trial_bound_violations
 from phasesweep.engine.confound import (
     ConfoundBlock,
+    RevisionRead,
     _assess_population,
     _describe_flagged,
     _params_text,
 )
-from phasesweep.engine.errors import TrialEvidenceMissingError
-from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
+from phasesweep.engine.errors import TrialEvidenceMissingError, WinnerIntegrityError
+from phasesweep.engine.evidence import (
+    _earlier_attempts,
+    _selection_candidate_identity,
+    _trial_objective_provenance,
+)
+from phasesweep.engine.growth import STANDALONE_PHASE, _grid_kind
+from phasesweep.engine.ledger import phase_studies_for
 from phasesweep.engine.optuna import (
     _any_objective_unreadable,
     _any_trial_timed_out,
     _draw_positions,
     _finished_trial_count,
     _trial_count_state,
+    _trial_run_state,
 )
-from phasesweep.engine.paths import TRIALS_CSV_FILENAME, _trials_csv_path
+from phasesweep.engine.paths import (
+    TRIALS_CSV_FILENAME,
+    _experiment_dir,
+    _trials_csv_path,
+)
+from phasesweep.engine.provenance import _load_generation_code_revision
 from phasesweep.engine.repeats import (
     RankedGroup,
     RepeatAxis,
@@ -55,19 +69,39 @@ from phasesweep.engine.state import (
     GATES_ATTR,
     GENERATION_ID_ATTR,
     OBSERVED_PREFIX,
+    RERUN_OF_ATTR,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
+    TRIAL_DIR_ATTR,
     Winner,
-    _unreplaced_attempts,
+    _recorded_trial_dir,
     _validate_observed_block,
     constraint_attr,
 )
-from phasesweep.engine.study_policy import _raised_target_step
+from phasesweep.engine.study_policy import (
+    _accepted_trial_target,
+    _awaits_cleanup_recovery,
+    _config_retires_abort,
+    _PhasePolicyState,
+    _raised_target_step,
+    _recovery_action,
+    _recovery_advice,
+    _replayed_streak_abort,
+)
+from phasesweep.engine.trial_dirs import (
+    directory_history,
+    directory_launches,
+    producing_attempts,
+    standing_repeat_attempts,
+)
 from phasesweep.errors import (
-    FRESH_STUDY,
+    REJUDGE_BOUNDS_STEP,
+    STORAGE_NULL_KEEPS_NOTHING,
     OperatorAction,
     PhaseSweepError,
+    ProcessCleanupUncertainError,
+    as_sentence,
     timeout_step,
     unreadable_objective_step,
 )
@@ -166,24 +200,28 @@ def _no_feasible_remedy(
         if unreadable:
             return f"{evidence} {unreadable_objective_step(persistent=False)}"
         return f"{evidence} Fix the failure, or the metric bounds or constraints, then rerun."
-    infeasible = any(_trial_count_state(trial) == "INFEASIBLE" for trial in trials)
+    infeasible = any(_trial_count_state(trial, experiment) == "INFEASIBLE" for trial in trials)
     if infeasible:
-        return f"{evidence} To change metric.min, metric.max or constraints, {FRESH_STUDY}."
-    timeout_lead = ""
+        return f"{evidence} {REJUDGE_BOUNDS_STEP}"
+    fix = "Fix the failure"
     step: str | None = "raise the phase's n_trials and rerun."
     if phase_name is not None:
         phase = experiment.phase(phase_name)
         step = _raised_target_step(phase, trials)
         if _any_trial_timed_out(trials):
-            timeout_lead = f"{timeout_step(phase.name, experiment.phases_inheriting(phase.name))} "
-    objective_lead = f"{unreadable_objective_step(persistent=True)} " if unreadable else ""
-    fix = "For any other failure, fix it" if timeout_lead else "Fix the failure"
+            fix = f"{timeout_step(phase.name)} and fix any other failure"
     then = (
         f"{fix}, then {step}"
         if step is not None
         else f"{fix}; every configuration was measured, so no larger n_trials retries one."
     )
-    return f"{evidence} {timeout_lead}{objective_lead}{then}"
+    if unreadable:
+        # Corrected metric settings re-read every finished trial, so the retry is the
+        # alternative for a trainer-side failure, not a step after the correction.
+        then = (
+            f"{unreadable_objective_step(persistent=True)} Otherwise, {then[0].lower()}{then[1:]}"
+        )
+    return f"{evidence} {then}"
 
 
 @dataclass
@@ -198,6 +236,8 @@ class SelectedTrial:
     metric: float
     generation_id: str
     attempt_id: str
+    # Name of the trial directory inside its phase that the attempt ran in.
+    trial_dir: str
     # Frozen evidence provenance recorded when the trial's objective was
     # extracted.
     objective_provenance: dict[str, Any]
@@ -257,7 +297,7 @@ def _no_feasible_error_type(
     :return type[NoFeasibleTrialError]: :class:`PhaseTrialsFailedError` when any trial
         counts as ``FAIL``, otherwise :class:`PhaseTrialsInfeasibleError`.
     """
-    if any(_trial_count_state(trial) == "FAIL" for trial in trials):
+    if any(_trial_run_state(trial) == "FAIL" for trial in trials):
         return PhaseTrialsFailedError
     return PhaseTrialsInfeasibleError
 
@@ -266,6 +306,84 @@ class PhaseAbortRefusedError(PhaseSweepError):
     """Raised when a phase's recorded abort or failure streak stops a run before it launches a trial."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
+
+
+def _prior_phase_abort_error(
+    experiment: Experiment, phase: Phase, abort_record: JsonObject, study: optuna.Study
+) -> PhaseAbortRefusedError:
+    """Build the refusal of a phase whose recorded abort the current config does not retire.
+
+    The advice comes from :func:`~phasesweep.engine.study_policy._recovery_advice` and
+    the action from :func:`~phasesweep.engine.study_policy._recovery_action`.
+
+    :param Experiment experiment: Config whose bounds judge the recorded trials.
+    :param Phase phase: Phase whose accepted trial target is quoted in the
+        message.
+    :param JsonObject abort_record: Recorded abort; supplies
+        ``trial_target`` and ``cause``.
+    :param optuna.Study study: The phase's study.
+    :return PhaseAbortRefusedError: The refusal, for the caller to raise or report.
+    """
+    advice = _recovery_advice(experiment, phase, study, abort_record)
+    return PhaseAbortRefusedError(
+        f"Phase {phase.name!r} previously aborted at its accepted "
+        f"n_trials={abort_record['trial_target']}: {as_sentence(abort_record['cause'])}",
+        action=_recovery_action(study, abort_record),
+        remediation=advice,
+    )
+
+
+def _streak_at_limit_error(
+    experiment: Experiment, phase: Phase, abort_record: JsonObject, study: optuna.Study
+) -> PhaseAbortRefusedError:
+    """Build the refusal of new work while the resumed failure streak meets the current limit.
+
+    :param Experiment experiment: Config whose bounds judge the recorded trials.
+    :param Phase phase: Phase whose current ``max_consecutive_failures`` the
+        streak meets.
+    :param JsonObject abort_record: The abort the streak would record, from
+        :func:`~phasesweep.engine.study_policy._failure_policy_abort_record`; supplies the
+        replayed count and the accepted target.
+    :param optuna.Study study: The phase's study.
+    :return PhaseAbortRefusedError: The refusal, for the caller to raise or report.
+    """
+    advice = _recovery_advice(experiment, phase, study, abort_record)
+    return PhaseAbortRefusedError(
+        f"Phase {phase.name!r} has {abort_record['consecutive_failures']} consecutive "
+        f"failed/infeasible trials, which meets "
+        f"max_consecutive_failures={phase.max_consecutive_failures}.",
+        action=OperatorAction.FIX_CONFIG,
+        remediation=advice,
+    )
+
+
+def _phase_refusal(
+    experiment: Experiment,
+    phase: Phase,
+    study: optuna.Study,
+    policy_state: _PhasePolicyState,
+) -> PhaseAbortRefusedError | None:
+    """Return the refusal a run would raise for the phase's recorded abort or failure streak.
+
+    A recorded abort refuses until the current config retires it or its cleanup recovery runs,
+    and a replayed streak at the current limit refuses until ``n_trials`` exceeds the accepted
+    target. ``run`` raises it and ``status`` prints it, so both give one diagnosis and step.
+
+    :param Experiment experiment: Config whose bounds judge the recorded trials.
+    :param Phase phase: The phase being judged.
+    :param optuna.Study study: The phase's study.
+    :param _PhasePolicyState policy_state: The study's replayed failure-policy state.
+    :return PhaseAbortRefusedError | None: The refusal, or ``None`` when the phase may run.
+    """
+    abort = policy_state.abort
+    if abort is not None and (
+        _awaits_cleanup_recovery(study, abort) or not _config_retires_abort(phase, study, abort)
+    ):
+        return _prior_phase_abort_error(experiment, phase, abort, study)
+    streak = _replayed_streak_abort(phase, study, policy_state)
+    if streak is not None and phase.n_trials <= _accepted_trial_target(study):
+        return _streak_at_limit_error(experiment, phase, streak, study)
+    return None
 
 
 @dataclass(frozen=True)
@@ -406,11 +524,14 @@ def select_winner(
     phase = next((phase for phase in experiment.phases if phase.name == phase_name), None)
     untried_cells = _untried_grid_cells(phase, trials)
     extractor = experiment.metric.extractor
+    revision_sources = _ranked_revision_sources(study, trials, survivors)
     confound = _assess_population(
         trials,
         survivors,
         best,
         provenance=provenance,
+        revisions=_ranked_code_revisions(experiment, survivors, sources=revision_sources),
+        revision_sources=revision_sources,
         axis=repeats,
         groups=None if ranking is None else ranking.groups,
         incomplete_group=() if ranking is None else ranking.incomplete_group,
@@ -441,7 +562,12 @@ def select_winner(
         # show-winners command as typed, which prints each flagged check's counts and remedy.
         log.warning("[%s] %s", phase_name or study.study_name, "; ".join(flagged))
     if phase is not None and emit_advisories:
-        edge = _edge_advisory(phase, trials, best.params if winning is None else winning.params)
+        edge = _edge_advisory(
+            phase,
+            trials,
+            best.params if winning is None else winning.params,
+            persistent=experiment.persistent,
+        )
         if edge is not None:
             log.warning("[%s] %s", phase.name, edge)
         if winning is not None and ranking is not None and phase.cost_key is not None:
@@ -466,6 +592,7 @@ def select_winner(
         gates=gates,
         generation_id=str(best.user_attrs[GENERATION_ID_ATTR]),
         attempt_id=str(best.user_attrs[ATTEMPT_ID_ATTR]),
+        trial_dir=Path(str(best.user_attrs[TRIAL_DIR_ATTR])).name,
         objective_provenance=objective_provenance,
         # Allocation writes both before the trainer can run, so every
         # completed trial carries them.
@@ -570,7 +697,11 @@ def _at_configured_end(param: SearchParam, value: float, end: float) -> bool:
 
 
 def _edge_advisory(
-    phase: Phase, trials: Sequence[optuna.trial.FrozenTrial], params: Mapping[str, object]
+    phase: Phase,
+    trials: Sequence[optuna.trial.FrozenTrial],
+    params: Mapping[str, object],
+    *,
+    persistent: bool,
 ) -> str | None:
     """Say which searched numeric parameters no finished trial tried beyond the winner's value.
 
@@ -579,17 +710,21 @@ def _edge_advisory(
     or all-numeric categorical choices) with at least three distinct values across the trials
     that finished, COMPLETE, INFEASIBLE or FAIL, whose winning value is the lowest or highest of
     them. A failed or infeasible trial beyond the winner counts as tried, and an interrupted one
-    tried nothing. Boolean and mixed choices have no order; the repeat axis is not searched.
+    tried nothing. Choices containing booleans or strings have no numeric order. The repeat
+    axis is not searched.
 
     :param Phase phase: Configured search space.
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
     :param Mapping[str, object] params: The winning configuration's params; for a repeats
         phase, the winning group's.
+    :param bool persistent: Whether subsequent runs can keep the finished trials.
     :return str | None: One clause per such parameter, naming the values tried and whether the
-        winner sits on the configured end; ``None`` when no parameter qualifies.
+        winner sits on the configured end, then how to search past each configured end
+        reached; ``None`` when no parameter qualifies.
     """
-    finished = [trial for trial in trials if _trial_count_state(trial) in FINISHED_TRIAL_STATES]
+    finished = [trial for trial in trials if _trial_run_state(trial) in FINISHED_TRIAL_STATES]
     clauses: list[str] = []
+    remedies: dict[str, None] = {}
     for name, param in phase.search_space.items():
         value = float_or_none(params.get(name))
         tried = sorted(
@@ -605,16 +740,53 @@ def _edge_advisory(
         end = _configured_end(param, upper=upper)
         if end is None:
             continue
+        at_end = _at_configured_end(param, value, end)
         place = (
             f"at the configured {'upper' if upper else 'lower'} bound"
-            if _at_configured_end(param, value, end)
+            if at_end
             else f"configured range extends to {param_text(end)}"
         )
         clauses.append(
             f"{'above' if upper else 'below'} the winner's {name}={param_text(params.get(name))} "
             f"(tried {param_text(tried[0])}..{param_text(tried[-1])}, {place})"
         )
-    return None if not clauses else "no trial ran " + " or ".join(clauses)
+        if at_end:
+            remedies[_edge_remedy(phase, param, persistent=persistent)] = None
+    if not clauses:
+        return None
+    return "; ".join(["no trial ran " + " or ".join(clauses), *remedies])
+
+
+def _edge_remedy(phase: Phase, param: SearchParam, *, persistent: bool) -> str:
+    """Say how to search beyond the configured end the winner sits on.
+
+    A persistent grid's int or float axis and a range under random or TPE can grow in place.
+    An axis Optuna records as categorical or a CMA-ES range needs a separate phase to keep
+    the earlier trials. An in-memory run can change its original phase and starts over.
+
+    :param Phase phase: The phase whose winner sits on the end.
+    :param SearchParam param: The parameter at its configured end.
+    :param bool persistent: Whether subsequent runs can keep the finished trials.
+    :return str: The remedy clause.
+    """
+    sampler = phase.sampler.type
+    if not persistent:
+        target = " and raise n_trials to the new grid size" if sampler == "grid" else ""
+        return (
+            f"extend search_space beyond the bound{target} and rerun; {STORAGE_NULL_KEEPS_NOTHING}"
+        )
+    kept = "; the study keeps its finished trials"
+    if sampler == "grid" and _grid_kind(param) != "categorical":
+        return f"add values beyond the bound to search_space and raise n_trials to cover the enlarged grid{kept}"
+    if sampler == "cmaes":
+        return "add a seeded random or TPE phase over the wider range, " + STANDALONE_PHASE.format(
+            phase=phase.name
+        )
+    if isinstance(param, CategoricalParam):
+        return "add a phase over values beyond the bound, " + STANDALONE_PHASE.format(
+            phase=phase.name
+        )
+    return f"widen the range in search_space and raise n_trials{kept}"
 
 
 def _untried_grid_cells(
@@ -622,11 +794,12 @@ def _untried_grid_cells(
 ) -> list[dict[str, object]]:
     """Return the cells of a grid that reached its target covering every cell, yet no trial ran.
 
-    Raising a grid's target after failures schedules the failed cells' retries ahead of the
-    cells it never reached, so a finished target can leave cells nobody tried, and nothing
-    else reports them. A target below the grid's size leaves cells out by design, and a
-    phase cut short by an accepted timeout reports its shortfall in the completion record,
-    so neither counts. The repeat axis counts as a grid axis.
+    A grid retries a failed cell only once every cell is drawn
+    (:func:`~phasesweep.engine.study_policy._scheduled_reruns`), so a finished target that
+    covers the grid has no untried cell; one is reported only if that rule is broken. A target
+    below the grid's size leaves cells out by design, and a phase cut short by an accepted
+    timeout reports its shortfall in the completion record, so neither counts. The repeat axis
+    counts as a grid axis.
 
     :param Phase | None phase: The phase, or ``None`` when selection has none.
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
@@ -652,12 +825,9 @@ def _rank_groups(
     """Group a repeats phase's trials by configuration and keep the complete groups.
 
     A group is complete when it holds one trial per repeat value and every one
-    of them is eligible (:func:`_eligible`). Only the attempts that stand for
-    their cell join a group (:func:`~phasesweep.engine.state._unreplaced_attempts`):
-    an interrupted trial's rerun takes its place, in the same group because it has
-    the same draw position, and a failed grid member replaced by a retry leaves its
-    group to that replacement. Trials that never recorded the repeat param belong
-    to no group.
+    of them is eligible (:func:`_eligible`). Each draw stands in the group through its latest
+    measurement, including one recovered by re-reading an attempt before an unsuccessful retry.
+    Trials that never recorded the repeat param belong to no group.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the phase study.
     :param Experiment experiment: Parsed experiment; supplies the eligibility bounds.
@@ -667,7 +837,7 @@ def _rank_groups(
     """
     by_key: dict[str, list[optuna.trial.FrozenTrial]] = {}
     draw_positions = _draw_positions(trials)
-    for trial in _unreplaced_attempts(trials, interrupted=False):
+    for trial in standing_repeat_attempts(trials):
         if axis.key in trial.params:
             key = group_key(draw_positions[trial.number], trial.params, axis)
             by_key.setdefault(key, []).append(trial)
@@ -726,6 +896,7 @@ def _repeats_record(
                 "metric": _trial_value(t),
                 "generation_id": str(t.user_attrs[GENERATION_ID_ATTR]),
                 "attempt_id": str(t.user_attrs[ATTEMPT_ID_ATTR]),
+                "trial_dir": Path(str(t.user_attrs[TRIAL_DIR_ATTR])).name,
                 "objective_provenance": _trial_objective_provenance(t),
                 "trainer_input": dict(t.user_attrs[TRAINER_INPUT_ATTR]),
                 "constraints": {
@@ -765,6 +936,83 @@ def _observed_values(trial: optuna.trial.FrozenTrial, *, subject: str) -> dict[s
         ) from exc
 
 
+def _ranked_revision_sources(
+    study: optuna.Study,
+    trials: Sequence[optuna.trial.FrozenTrial],
+    ranked: Sequence[optuna.trial.FrozenTrial],
+) -> dict[int, list[str]]:
+    """Find the earlier generations that may have trained in each ranked trial's directory.
+
+    The physical launch order includes sibling reading studies that reused the same
+    directory and excludes launches after the ranked attempt.
+
+    :param optuna.Study study: The study that ranks the trials.
+    :param Sequence[optuna.trial.FrozenTrial] trials: The phase's full trial history.
+    :param Sequence[optuna.trial.FrozenTrial] ranked: The trials eligible for selection.
+    :return dict[int, list[str]]: Possible contributing generations per ranked trial, oldest first.
+    """
+    sources: dict[int, list[str]] = {}
+    reruns = [trial for trial in ranked if RERUN_OF_ATTR in trial.user_attrs]
+    if len(ranked) < 2 or not reruns:
+        return sources
+    by_number = {trial.number: trial for trial in trials}
+    attempts = producing_attempts(phase_studies_for(study))
+    launches = directory_launches(attempts)
+    for trial in reruns:
+        # A malformed ancestor must not turn a code revision advisory into a refusal.
+        with contextlib.suppress(ProcessCleanupUncertainError, ValueError):
+            directory = _recorded_trial_dir(trial)
+            attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+            if directory is None or not isinstance(attempt_id, str):
+                continue
+            candidates = launches.get(directory.name, ())
+            epoch = next((item.epoch for item in candidates if item.attempt_id == attempt_id), None)
+            earlier = directory_history(
+                candidates,
+                attempt_id=attempt_id,
+                launched_at=epoch,
+                ancestors=_earlier_attempts(by_number, trial, attempts=attempts),
+            ).earlier
+            if earlier:
+                sources[trial.number] = [generation for generation, _ in earlier]
+    return sources
+
+
+def _ranked_code_revisions(
+    experiment: Experiment,
+    ranked: Sequence[optuna.trial.FrozenTrial],
+    *,
+    sources: Mapping[int, Sequence[str]],
+) -> dict[str, RevisionRead]:
+    """Read each recorded trainer revision that a ranked trial may share, once per generation.
+
+    A missing or invalid record is ``unreadable`` rather than an error: the check that uses
+    these is advisory, and a trial that lost must not fail selection.
+
+    :param Experiment experiment: Parsed experiment; locates the generation records.
+    :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials; selection requires each
+        to carry a generation id (:func:`_eligible`).
+    :param Mapping[int, Sequence[str]] sources: Possible contributing generations per
+        ranked trial, before the generation that finished it.
+    :return dict[str, RevisionRead]: Each ranked generation's revision, ``unknown`` when it
+        recorded none; empty for fewer than two ranked trials, which the check does not run on.
+    """
+    revisions: dict[str, RevisionRead] = {}
+    if len(ranked) < 2:
+        return revisions
+    artifact_root = _experiment_dir(experiment)
+    generation_ids = dict.fromkeys(str(trial.user_attrs[GENERATION_ID_ATTR]) for trial in ranked)
+    generation_ids.update(dict.fromkeys(g for earlier in sources.values() for g in earlier))
+    for generation_id in generation_ids:
+        try:
+            revision = _load_generation_code_revision(artifact_root, generation_id)
+        except WinnerIntegrityError:
+            revisions[generation_id] = "unreadable"
+        else:
+            revisions[generation_id] = "unknown" if revision is None else revision
+    return revisions
+
+
 def _eligible(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> bool:
     """Require selection identity and stored metric/constraint values within current bounds.
 
@@ -774,20 +1022,7 @@ def _eligible(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> bool:
     """
     if _selection_candidate_identity(trial) is None:
         return False
-    metric = experiment.metric
-    if not check_bounds(_trial_value(trial), min_value=metric.min, max_value=metric.max):
-        return False
-    for constraint in experiment.constraints:
-        raw = trial.user_attrs.get(constraint_attr(constraint.name))
-        if raw is None:
-            return False
-        try:
-            value = float(raw)
-        except (TypeError, ValueError, OverflowError):
-            return False
-        if not check_bounds(value, min_value=constraint.min, max_value=constraint.max):
-            return False
-    return True
+    return not trial_bound_violations(trial, experiment)
 
 
 def _metric_bounds_note(trials: Sequence[optuna.trial.FrozenTrial], experiment: Experiment) -> str:

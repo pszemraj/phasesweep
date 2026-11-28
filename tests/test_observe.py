@@ -32,6 +32,7 @@ from phasesweep.engine.state import (
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
+    TRIAL_DIR_ATTR,
     constraint_attr,
     observed_attr,
 )
@@ -43,6 +44,7 @@ from tests.conftest import (
     log_regex_provenance,
     make_experiment,
     phase_trials,
+    study_name,
     write_experiment_config,
     write_trainer,
 )
@@ -65,6 +67,7 @@ def test_retry_replaces_optional_trial_results(tmp_path: Path) -> None:
         TRAINER_ENV_ATTR: {},
         TRAINER_ENV_DIGEST_ATTR: "a" * 64,
         TRAINER_INPUT_ATTR: {"schema_version": 1},
+        TRIAL_DIR_ATTR: str(tmp_path / "runs" / "retry" / "p" / "trial_00000__attempt"),
     }.items():
         trial.set_user_attr(key, value)
     original = TrialResult(
@@ -72,7 +75,6 @@ def test_retry_replaces_optional_trial_results(tmp_path: Path) -> None:
         constraints={"old": 2.0},
         return_code=0,
         duration_seconds=1.0,
-        feasible=True,
         gate_results=[GateResult("required_file", True, "present")],
         objective_provenance=log_regex_provenance(),
         observed={"old": 3.0, "kept": 4.0},
@@ -98,7 +100,7 @@ def test_retry_replaces_optional_trial_results(tmp_path: Path) -> None:
     table = _trial_table(experiment, experiment.phases[0], [completed], None)
     assert table.rows[0][observed_attr("old")] is None
     assert table.rows[0][observed_attr("kept")] == 5.0
-    projection = _accepted_projection(completed, {})
+    projection = _accepted_projection(completed, {}, experiment)
     assert projection["summary"]["observed"] == {"kept": 5.0}
     assert projection["summary"]["constraints"] == {}
     assert "phasesweep.observed.old" not in projection["metrics"]
@@ -110,7 +112,6 @@ def test_retry_replaces_optional_trial_results(tmp_path: Path) -> None:
         constraints={},
         return_code=0,
         duration_seconds=1.0,
-        feasible=False,
         failure_reason="missing evidence",
     )
     record_trial_result(failed, original, overrides_json="{}")
@@ -161,7 +162,7 @@ def test_observe_failure_records_nothing_and_keeps_trial_complete(
 
     winners = run_experiment(experiment)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
+    study = optuna.load_study(study_name=study_name(experiment), storage=_resolve_storage(storage))
     trials = study.get_trials(deepcopy=False)
     assert [t.state for t in trials] == [optuna.trial.TrialState.COMPLETE] * 3
     assert [t.user_attrs.get(observed_attr("mem")) for t in trials] == [3.0, None, 5.0]
@@ -215,14 +216,14 @@ def test_validate_and_dry_run_name_each_observation(
     config = tmp_path / "experiment.yaml"
     write_experiment_config(config, experiment)
     expected = [
-        "observe heldout_f05: json result.json key heldout_f05 (report-only)",
-        "observe mem: log_regex stdout.log pattern 'mem=(?P<value>[0-9.]+)' select last "
+        "observe heldout_f05: json path=result.json key=heldout_f05 (report-only)",
+        "observe mem: log_regex file=stdout.log pattern=mem=(?P<value>[0-9.]+) select=last "
         "(report-only)",
-        "observe envelope: json_envelope result.json objective loss split test policy final "
-        "(report-only)",
+        "observe envelope: json_envelope path=result.json objective_name=loss split=test "
+        "policy=final evaluation_axis=step (report-only)",
     ]
 
-    result = CliRunner().invoke(cli, ["validate", str(config)])
+    result = CliRunner().invoke(cli, ["validate", str(config)], env={"COLUMNS": "500"})
     assert result.exit_code == 0, result.output
     assert all(f"  {line}\n" in result.output for line in expected)
 

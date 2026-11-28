@@ -134,17 +134,20 @@ def test_guardian_terminates_a_leader_exited_descendant(
         "            break\n"
         "    time.sleep(0.02)\n"
     )
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
+    attempt_dir = tmp_path / "attempt"
+    attempt_dir.mkdir()
     try:
-        with (trial_dir / "out.log").open("w") as out, (trial_dir / "err.log").open("w") as err:
+        with (
+            (attempt_dir / "out.log").open("w") as out,
+            (attempt_dir / "err.log").open("w") as err,
+        ):
             result = run_supervised(
                 f"exec {shlex.quote(sys.executable)} -c {shlex.quote(root)}",
                 env=os.environ.copy(),
                 stdout=out,
                 stderr=err,
                 timeout=30.0,
-                trial_dir=trial_dir,
+                attempt_dir=attempt_dir,
                 attempt_id="leader-exited-descendant",
             )
 
@@ -152,7 +155,7 @@ def test_guardian_terminates_a_leader_exited_descendant(
         assert "still had live descendants 0.2s later" in result.failure_reason
         assert result.cleanup_confirmed
         lifecycle = read_attempt_lifecycle(
-            trial_dir, expected_attempt_id="leader-exited-descendant"
+            attempt_dir, expected_attempt_id="leader-exited-descendant"
         )
         assert lifecycle is not None and lifecycle.cleanup_confirmed
         descendant = int(marker.read_text())

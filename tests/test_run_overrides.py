@@ -29,12 +29,14 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.read import experiment_status, read_result
 from phasesweep.engine.run import TerminalReport
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import Winner
+from phasesweep.engine.state import PHASE_DECISION_ATTR, PHASE_RECOVERY_ATTR, Winner
 from phasesweep.errors import ABORT_START_AGAIN_STEP, START_AGAIN_STEP, operator_step
 from phasesweep.runtime.files import file_sha256
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
+    phase_study,
+    record_accepted_partial_timeout,
     requires_nonroot,
     write_experiment_config,
     write_trainer,
@@ -356,7 +358,7 @@ def test_unpublished_winner_discloses_semantic_config_drift(tmp_path: Path) -> N
     _last_successful_generation_path(materialized.experiment).unlink()
     path = materialized.config_path
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    payload["metric"]["name"] = "changed_metric"
+    payload["provenance"]["revision"] = "changed-revision"
     path.write_text(yaml.safe_dump(payload), encoding="utf-8")
 
     result = CliRunner().invoke(cli, ["show-winners", str(path)])
@@ -565,7 +567,11 @@ def test_unpublished_status_prints_the_recorded_failure_remedy_once(
         run_experiment(experiment)
     shown = CliRunner().invoke(cli, ["status", str(config)])
     assert shown.exit_code == 0, shown.output
-    assert shown.output.count("Winner retained but not published") == 1
+    # A recorded abort is a refusal, which status prints in place of the retained-winner comment.
+    assert shown.output.count("Winner retained but not published") == (0 if streak_abort else 1)
+    assert ("# Phase 'c' previously aborted at its accepted n_trials=2" in shown.output) is (
+        streak_abort
+    )
     assert f"\n# fix: {operator_step(refused.value)}\n" in shown.output
     assert "fix:" not in shown.output.replace("# fix:", "")
     assert "phases[c].n_trials" in shown.output
@@ -614,6 +620,59 @@ def test_unreadable_unpublished_ledger_keeps_status_yaml_and_exit_code(tmp_path:
     finally:
         ledger.chmod(original_mode)
     assert ledger.read_bytes() == original_bytes
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("attribute", [PHASE_RECOVERY_ATTR, PHASE_DECISION_ATTR])
+def test_malformed_phase_policy_keeps_status_yaml_and_other_refusals(
+    tmp_path: Path, attribute: str
+) -> None:
+    """A policy diagnostic leaves publication, trial counts and other phase refusals visible."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        "import os, sys\nprint('x=0.5')\nsys.exit(os.environ['PHASESWEEP_PHASE'] == 'next')",
+    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
+    run_experiment(experiment)
+    changed = experiment.model_copy(
+        update={
+            "phases": [
+                *experiment.phases,
+                Phase(name="next", n_trials=1, gpu_policy="none", max_consecutive_failures=1),
+            ]
+        }
+    )
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(changed)
+    config = write_experiment_config(tmp_path / "config.yaml", changed)
+    study = phase_study(experiment)
+    if attribute == PHASE_DECISION_ATTR:
+        record_accepted_partial_timeout(study, experiment.phases[0].n_trials)
+        study.set_user_attr(attribute, {**study.user_attrs[attribute], "timeout_scope": []})
+        diagnostic = f"Study '{study.study_name}' has malformed '{attribute}' fields"
+    else:
+        study.set_user_attr(attribute, {"malformed": True})
+        diagnostic = f"'{attribute}' has malformed fields"
+    expected = experiment_status(changed)
+    ledger = Path(str(expected["ledger_path"]))
+    original = ledger.read_bytes()
+
+    shown = CliRunner().invoke(cli, ["status", str(config)])
+
+    assert shown.exit_code == 0, shown.output
+    assert diagnostic in shown.stdout
+    assert "# Phase 'next' previously aborted at its accepted n_trials=1" in shown.stdout
+    assert yaml.safe_load(shown.stdout) == expected
+    assert expected["publication_integrity"] == "ok"
+
+    tables = CliRunner().invoke(cli, ["status", str(config), "--trials"])
+
+    assert tables.exit_code == 0, tables.output
+    assert "p: 1 of 1 trial, objective" in tables.stdout
+    assert diagnostic in " ".join(tables.stdout.split())
+    assert "next: 1 of 1 trial, objective" in tables.stdout
+    assert "Phase 'next' previously aborted at its accepted n_trials=1" in tables.stdout
+    assert ledger.read_bytes() == original
 
 
 def test_in_memory_unpublished_status_describes_a_full_restart(tmp_path: Path) -> None:

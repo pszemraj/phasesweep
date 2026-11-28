@@ -15,10 +15,12 @@ import yaml
 
 import phasesweep.engine.paths as path_ops
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
-from phasesweep.config.models import Experiment, Metric, _metric_semantics_payload
+from phasesweep.config.models import Constraint, Experiment, Metric, _metric_semantics_payload
 from phasesweep.config.search import Repeats
+from phasesweep.engine.bounds import selection_bounds
 from phasesweep.engine.confound import ConfoundBlock, _validate_confound_block
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
+from phasesweep.engine.optuna import _belongs_to_phase
 from phasesweep.engine.provenance import CodeRevision, _parse_code_revision
 from phasesweep.engine.repeats import RepeatsRecord, _check_repeats_axis, _validate_repeats_block
 from phasesweep.engine.state import (
@@ -45,8 +47,10 @@ class PlannedPhase(NamedTuple):
 
 
 class GenerationProvenance(NamedTuple):
-    """Phase layout, argparse base and code revision from a generation's provenance files."""
+    """Validated configuration and reproducibility facts from the provenance files."""
 
+    bounds: JsonObject
+    """Metric and constraint bounds from the configuration snapshot."""
     inherits: Mapping[str, tuple[str, ...]]
     """Each phase's parents, in plan order."""
     repeats: Mapping[str, Repeats | None]
@@ -55,6 +59,8 @@ class GenerationProvenance(NamedTuple):
     """Producing argparse base, or ``None`` when the snapshot uses another format."""
     code_revision: CodeRevision | None
     """Trainer-cwd git revision from the reproducibility record, or ``None`` when unreadable."""
+    config_snapshot: bytes
+    """Configuration bytes anchored in the validated reproducibility record."""
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,8 @@ class ValidatedWinner:
     """The exact bytes whose digest matched the manifest."""
     payload: Mapping[str, Any]
     """The mapping decoded from ``content``."""
+    study_name: str
+    study_outcome_sequence: int
     metric: float
     source: WinnerSource
     confound: ConfoundBlock
@@ -88,12 +96,16 @@ class ValidatedPublication:
     """Each planned phase's parents, from the validated config snapshot."""
     metric: Mapping[str, Any]
     """The summary's metric semantics, checked against the config snapshot."""
+    bounds: JsonObject
+    """The bounds under which this generation's winners were selected."""
     winners: Mapping[str, ValidatedWinner]
     """Every manifest-listed winner, keyed by the phase that exposes it."""
     argparse_trainer_config: JsonObject | None
     """Producing argparse base captured from the validated snapshot bytes."""
     code_revision: CodeRevision | None
     """Trainer-cwd git revision captured from the validated reproducibility bytes, or ``None``."""
+    config_snapshot: bytes
+    """Validated configuration bytes for diagnosing skipped-winner mismatches."""
 
 
 def _parse_phase_plan(raw: object) -> tuple[PlannedPhase, ...] | None:
@@ -346,6 +358,10 @@ def _validate_generation_manifest(
             metric_value = None
         if metric_value is None or metric_value != item.get("metric"):
             raise _fail(f"winner for phase {name!r} disagrees with the summary metric value")
+        try:
+            path_ops._valid_trial_dir_name(payload.get("trial_dir"), label="winner trial_dir")
+        except ValueError as exc:
+            raise _fail(f"winner for phase {name!r} has {exc}") from exc
         for field in (
             "params",
             "effective_overrides",
@@ -354,6 +370,7 @@ def _validate_generation_manifest(
             "completion",
             "generation_id",
             "attempt_id",
+            "trial_dir",
             "winner_source",
             "trainer_input",
         ):
@@ -371,6 +388,14 @@ def _validate_generation_manifest(
         fingerprint = payload.get("phase_fingerprint")
         if not is_sha256_hex(fingerprint):
             raise _fail(f"winner for phase {name!r} has no valid phase_fingerprint")
+        study_name = payload.get("study_name")
+        if not isinstance(study_name, str) or not _belongs_to_phase(
+            study_name, summary["experiment"], name
+        ):
+            raise _fail(f"winner for phase {name!r} has no valid study_name")
+        study_outcome_sequence = payload.get("study_outcome_sequence")
+        if type(study_outcome_sequence) is not int or study_outcome_sequence < 1:
+            raise _fail(f"winner for phase {name!r} has no valid study_outcome_sequence")
         try:
             parsed_source = _parse_winner_source(payload.get("winner_source"), expected_phase=name)
         except ValueError as exc:
@@ -409,6 +434,8 @@ def _validate_generation_manifest(
         winners[name] = ValidatedWinner(
             content=content,
             payload=payload,
+            study_name=study_name,
+            study_outcome_sequence=study_outcome_sequence,
             metric=metric_value,
             source=parsed_source,
             confound=confound,
@@ -430,9 +457,11 @@ def _validate_generation_manifest(
         phase_plan=phase_plan,
         inherits=provenance.inherits,
         metric=metric,
+        bounds=provenance.bounds,
         winners=winners,
         argparse_trainer_config=provenance.argparse_trainer_config,
         code_revision=provenance.code_revision,
+        config_snapshot=provenance.config_snapshot,
     )
 
 
@@ -462,9 +491,8 @@ def _validate_generation_provenance_files(
     :raises PublicationIntegrityError: Whatever ``fail`` builds, when a provenance file is
         listed without its partner, is absent, unreadable, altered,
         unparsable, or disagrees with the summary's own identity.
-    :return GenerationProvenance: Each snapshot phase's parents, in plan order, its
-        configured ``repeats``, the producing argparse base when applicable, and the
-        reproducibility record's ``code_revision``.
+    :return GenerationProvenance: The snapshot bytes, selection bounds, phase plan and
+        configured ``repeats``, the argparse base when applicable, and the recorded code revision.
     """
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         if (generation_dir / filename).is_file() and kind not in listed_files:
@@ -543,6 +571,13 @@ def _validate_generation_provenance_files(
         raise fail("config_snapshot artifact has malformed metric semantics") from exc
     if summary.get("metric") != _metric_semantics_payload(snapshot_metric):
         raise fail("summary metric semantics disagree with the config_snapshot artifact")
+    raw_constraints = snapshot.get("constraints", [])
+    if not isinstance(raw_constraints, list):
+        raise fail("config_snapshot artifact has malformed constraints")
+    try:
+        constraints = [Constraint.model_validate(raw) for raw in raw_constraints]
+    except ValueError as exc:
+        raise fail("config_snapshot artifact has malformed constraints") from exc
 
     # Rebuilding a generation's lineage reads this graph, never the current
     # config's, so every parent must name a phase planned before its child.
@@ -571,10 +606,12 @@ def _validate_generation_provenance_files(
         except ValueError as exc:
             raise fail("config_snapshot artifact has a malformed trainer_config") from exc
     return GenerationProvenance(
+        bounds=selection_bounds(snapshot_metric, constraints),
         inherits=inherits,
         repeats=repeats,
         argparse_trainer_config=argparse_trainer_config,
         code_revision=code_revision,
+        config_snapshot=contents["config_snapshot"],
     )
 
 

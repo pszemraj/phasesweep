@@ -62,7 +62,7 @@ def ensure_artifact_dir(path: Path) -> None:
 
 
 def file_sha256(path: Path) -> str:
-    """Return a file's SHA-256 digest without holding all bytes in memory.
+    """Return a file's SHA-256 digest with bounded reads.
 
     :param Path path: File to hash.
     :return str: 64-character hexadecimal digest.
@@ -70,9 +70,77 @@ def file_sha256(path: Path) -> str:
     """
     hasher = hashlib.sha256()
     with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        while chunk := handle.read(1024 * 1024):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def broken_symlink_detail(
+    directory: Path,
+    relative: str | Path,
+    *,
+    require_directory: bool = False,
+    require_file: bool = False,
+) -> str | None:
+    """Identify a symlink that prevents access to a named path.
+
+    :param Path directory: Directory from which to inspect the path.
+    :param str | Path relative: Relative path whose components may include a link.
+    :param bool require_directory: The final component must also be a directory.
+    :param bool require_file: The final component, if a link, must reach a regular file.
+    :return str | None: The broken link, its target and the cause, when established.
+    """
+    component = directory
+    path = directory / relative
+    for part in Path(relative).parts:
+        component /= part
+        try:
+            target = component.readlink()
+        except OSError:
+            continue
+        try:
+            info = component.stat()
+        except OSError as exc:
+            link = f"symlink {component} -> {target}"
+            if exc.errno == errno.ENOENT:
+                return f"{link} has a missing target"
+            if exc.errno == errno.ENOTDIR:
+                return f"{link} has a non-directory component in its target path"
+            if exc.errno == errno.ELOOP:
+                return f"{link} could not be followed (too many symbolic links)"
+        else:
+            if (component != path or require_directory) and not stat.S_ISDIR(info.st_mode):
+                return f"symlink {component} -> {target} does not point to a directory"
+            if component == path and require_file and not stat.S_ISREG(info.st_mode):
+                return f"symlink {component} -> {target} does not point to a regular file"
+    return None
+
+
+def resolved_file_change_ns(directory: Path, path: Path) -> int:
+    """Return the newest change time of a checked file and the links that reach it.
+
+    A link can redirect a result to an older file without updating that file's inode.
+    Include links in a link's destination path as well as in the configured path.
+
+    :param Path directory: Owner directory that the configured path must resolve within.
+    :param Path path: File already checked to resolve inside ``directory``.
+    :raises OSError: The file or a component could not be inspected.
+    :return int: Latest inode change time in Unix nanoseconds.
+    """
+    newest = path.stat().st_ctime_ns
+    checked: set[Path] = set()
+    pending = [path]
+    while pending:
+        candidate = pending.pop()
+        for component in (candidate, *candidate.parents):
+            if component == directory.parent or component in checked:
+                break
+            checked.add(component)
+            info = component.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                newest = max(newest, info.st_ctime_ns)
+                pending.append(component.parent / component.readlink())
+    return newest
 
 
 class UnsafeLockPathError(PhaseSweepError):

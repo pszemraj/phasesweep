@@ -38,7 +38,7 @@ from phasesweep.engine.ledger import (
     ValidatedLedger,
     _resolve_storage,
     claim_ledger,
-    open_existing_study,
+    open_existing_studies,
     open_phase_study,
     open_registry_study,
     repair_incomplete_journal_record,
@@ -52,7 +52,6 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.read import read_status
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
-    FEASIBLE_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
 )
@@ -74,6 +73,7 @@ from tests.conftest import (
     mark_current_format,
     phase_study,
     requires_nonroot,
+    study_name,
     temporary_umask,
     write_constant_trainer,
 )
@@ -408,7 +408,7 @@ def test_claim_ledger_creates_ledger_parent_but_validate_does_not(tmp_path: Path
     assert _artifact_root_binding_path(experiment).is_file()
     assert not ledger_file.exists()
 
-    open_phase_study(claimed, experiment.phases[0])
+    open_phase_study(claimed, experiment.phases[0], study_name(experiment))
 
     assert ledger_file.is_file()
 
@@ -463,9 +463,11 @@ def test_live_openers_reject_unvalidated_storage(tmp_path: Path, offered: str) -
     storage = f"journal:///{missing / 'study.journal'}"
     experiment = _experiment(tmp_path, storage=storage)
     handle: object = storage if offered == "storage-url" else validate_ledger(experiment)
+    # Typed loosely so the call can offer what the annotation already refuses.
+    opener: Callable[..., object] = open_phase_study
 
     with pytest.raises(TypeError, match="requires the ClaimedLedger"):
-        open_phase_study(handle, experiment.phases[0])  # type: ignore[arg-type]
+        opener(handle, experiment.phases[0], "t::p")
 
     assert not missing.exists()
     assert not _artifact_root_binding_path(experiment).exists()
@@ -493,7 +495,7 @@ def test_claim_ledger_binds_tree_then_returns_bound_handle(tmp_path: Path) -> No
     assert binding == _artifact_root_binding_payload(experiment)
     assert validate_ledger(experiment).binding_state == "bound"
 
-    study = open_phase_study(claimed, experiment.phases[0])
+    study = open_phase_study(claimed, experiment.phases[0], study_name(experiment))
 
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == claimed.artifact_root
     reclaimed = claim_ledger(validate_ledger(experiment))
@@ -532,20 +534,21 @@ def test_reopening_phase_studies_appends_no_journal_records(tmp_path: Path) -> N
         records = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
         return [r["study_name"] for r in records if r["op_code"] == JOURNAL_CREATE_STUDY]
 
+    names = [study_name(experiment, phase.name) for phase in phases]
     claimed = claim_ledger(validate_ledger(experiment))
-    for phase in phases:
-        open_phase_study(claimed, phase)
-    assert created_studies() == ["t::first", "t::second"]
+    for phase, name in zip(phases, names, strict=True):
+        open_phase_study(claimed, phase, name)
+    assert created_studies() == names
     opened = journal.read_bytes()
 
-    for phase in phases:
-        open_phase_study(claimed, phase)
+    for phase, name in zip(phases, names, strict=True):
+        open_phase_study(claimed, phase, name)
     reclaimed = claim_ledger(validate_ledger(experiment))
     assert list(reclaimed.studies) == ["first", "second"]
-    for phase in phases:
-        open_phase_study(reclaimed, phase)
+    for phase, name in zip(phases, names, strict=True):
+        open_phase_study(reclaimed, phase, name)
 
-    assert created_studies() == ["t::first", "t::second"]
+    assert created_studies() == names
     assert journal.read_bytes() == opened
 
 
@@ -567,7 +570,9 @@ def test_claim_ledger_writes_tree_binding_before_claiming_studies(
         update={"phases": [base.phases[0], base.phases[0].model_copy(update={"name": "q"})]}
     )
     for phase in experiment.phases:
-        optuna.create_study(study_name=f"t::{phase.name}", storage=_resolve_storage(storage))
+        optuna.create_study(
+            study_name=study_name(experiment, phase.name), storage=_resolve_storage(storage)
+        )
 
     class CrashBeforeStudyClaim(Exception):
         pass
@@ -584,13 +589,13 @@ def test_claim_ledger_writes_tree_binding_before_claiming_studies(
     binding = json.loads(_artifact_root_binding_path(experiment).read_text(encoding="utf-8"))
     assert binding == _artifact_root_binding_payload(experiment)
     for phase in experiment.phases:
-        study = optuna.load_study(study_name=f"t::{phase.name}", storage=_resolve_storage(storage))
+        study = phase_study(experiment, phase.name)
         assert ARTIFACT_ROOT_ATTR not in study.user_attrs
 
     reclaimed = claim_ledger(validate_ledger(experiment))
 
     assert sorted(reclaimed.studies) == ["p", "q"]
-    for study in reclaimed.studies.values():
+    for (study,) in reclaimed.studies.values():
         assert study.user_attrs[ARTIFACT_ROOT_ATTR] == reclaimed.artifact_root
 
 
@@ -608,12 +613,10 @@ def _bound_tree_with_foreign_study(tmp_path: Path, *, foreign: bool = True) -> E
     """
     storage = f"journal:///{tmp_path / 'current.journal'}"
     experiment = _experiment(tmp_path, storage=storage)
-    study = optuna.create_study(study_name="t::p", storage=_resolve_storage(storage))
-    study.add_trial(
-        optuna.trial.create_trial(
-            value=0.5, state=optuna.trial.TrialState.COMPLETE, user_attrs={FEASIBLE_ATTR: True}
-        )
+    study = optuna.create_study(
+        study_name=study_name(experiment), storage=_resolve_storage(storage)
     )
+    study.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
     study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment).resolve()))
     mark_current_format(experiment, study)
     if foreign:
@@ -686,7 +689,7 @@ def test_unverified_handle_records_the_gap_and_opens_nothing_live(
     assert ledger.binding_state == "bound"
     assert ledger.format_verified is False
     with pytest.raises(StudyStorageUnavailableError, match="briefly locked"):
-        open_existing_study(ledger, experiment.phases[0])
+        open_existing_studies(ledger, experiment.phases[0].name)
 
 
 @pytest.mark.parametrize("second_scan", ["completes", "fails-again"])
@@ -745,7 +748,7 @@ def test_startup_scans_the_ledger_format_once(
     storage = f"journal:///{tmp_path / 'current.journal'}"
     experiment = _experiment(tmp_path, storage=storage)
     real_validate = ledger._scan_ledger_format
-    real_load = ledger.open_existing_study
+    real_load = ledger.open_existing_studies
     calls = 0
 
     def counted_validate(candidate: str | None) -> None:
@@ -753,12 +756,12 @@ def test_startup_scans_the_ledger_format_once(
         calls += 1
         real_validate(candidate)
 
-    def checked_load(candidate: ValidatedLedger, phase):
+    def checked_load(candidate: ValidatedLedger, phase_name: str) -> list[optuna.Study]:
         assert calls == 1
-        return real_load(candidate, phase)
+        return real_load(candidate, phase_name)
 
     monkeypatch.setattr(ledger, "_scan_ledger_format", counted_validate)
-    monkeypatch.setattr(ledger, "open_existing_study", checked_load)
+    monkeypatch.setattr(ledger, "open_existing_studies", checked_load)
 
     run_experiment(experiment)
 
@@ -776,7 +779,7 @@ def test_empty_unstamped_phase_study_can_resume_in_current_ledger(tmp_path: Path
     resumed_phase = experiment.phases[0].model_copy(update={"name": "q"})
     resumed = experiment.model_copy(update={"phases": [experiment.phases[0], resumed_phase]})
     interrupted = optuna.create_study(
-        study_name="t::q", storage=_resolve_storage(resumed.resolved_storage)
+        study_name=study_name(resumed, "q"), storage=_resolve_storage(resumed.resolved_storage)
     )
     assert interrupted.user_attrs.get(STUDY_SCHEMA_ATTR) is None
 
@@ -827,7 +830,7 @@ def test_writers_repair_a_partial_final_journal_record(tmp_path: Path, damage: s
 
     experiment, journal, complete, damaged = freshly_damaged("registry")
     assert experiment.resolved_storage is not None
-    assert open_registry_study(experiment.resolved_storage, "t::p") is not None
+    assert open_registry_study(experiment.resolved_storage, study_name(experiment)) is not None
     assert_repaired(journal, complete, damaged)
 
     experiment, journal, complete, damaged = freshly_damaged("confirmed")
@@ -960,7 +963,7 @@ def test_repair_refuses_a_journal_lock_that_is_never_released(
         assert clock["now"] == pytest.approx(engine_ledger._JOURNAL_LOCK_WAIT_SECONDS)
         assert len(raised) == 1
         assert isinstance(raised[0], IncompleteJournalRecordError)
-        assert raised[0].action == OperatorAction.RESTORE_LEDGER
+        assert raised[0].action == OperatorAction.RETRY
         assert "Retry when the writer finishes" in str(raised[0])
         assert journal.read_bytes() == damaged
         assert holder.held()

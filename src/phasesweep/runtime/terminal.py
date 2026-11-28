@@ -158,6 +158,27 @@ def wrap_labeled(label: str, text: str, width: int, *, indent: str = "") -> list
     return lines
 
 
+def fit_lines(message: str, width: int, *, hanging: str = "") -> list[str]:
+    """Draw a message's own lines, wrapping each flush-left one that is wider than ``width``.
+
+    A wrapped line breaks at spaces and its later lines start with ``hanging``; a word wider
+    than the line, such as a path, stays whole. A line that starts with whitespace holds text
+    to copy, such as the example command, so it stays whole.
+
+    :param str message: The text, one logical line per line break.
+    :param int width: Columns available to each line, ``hanging`` included.
+    :param str hanging: Prefix of every wrapped line after the first, defaults to none.
+    :return list[str]: The lines to print, at least one.
+    """
+    lines: list[str] = []
+    for line in message.splitlines() or [""]:
+        if len(line) <= width or line[0].isspace():
+            lines.append(line)
+        else:
+            lines.extend(wrap(line, width, subsequent_indent=hanging))
+    return lines
+
+
 def hang(lead: str, lines: Sequence[str], *, visible: int | None = None) -> list[str]:
     """Put ``lead`` before the first of ``lines`` and blanks as wide as it before each later one.
 
@@ -240,7 +261,14 @@ def param_text(value: object) -> str:
     return significant(value, 4) if isinstance(value, float) else str(value)
 
 
-def pack(items: Sequence[str], width: int, *, indent: str = "", separator: str = GAP) -> list[str]:
+def pack(
+    items: Sequence[str],
+    width: int,
+    *,
+    indent: str = "",
+    subsequent_indent: str | None = None,
+    separator: str = GAP,
+) -> list[str]:
     """Fill lines of ``width`` columns with whole items joined by ``separator``.
 
     An item is never split, so ``key=value`` pairs stay readable; one wider than the line gets a
@@ -249,7 +277,8 @@ def pack(items: Sequence[str], width: int, *, indent: str = "", separator: str =
 
     :param Sequence[str] items: Texts to place, in order.
     :param int width: Maximum visible width of each line, indent included.
-    :param str indent: Prefix of every line.
+    :param str indent: Prefix of the first line.
+    :param str | None subsequent_indent: Prefix of later lines, defaults to the first prefix.
     :param str separator: Text between two items on one line.
     :return list[str]: The lines, empty when there are no items.
     """
@@ -259,6 +288,8 @@ def pack(items: Sequence[str], width: int, *, indent: str = "", separator: str =
     for item in items:
         if current and len(indent + current + separator + item + punctuation) > width:
             lines.append(indent + current + punctuation)
+            if subsequent_indent is not None:
+                indent = subsequent_indent
             current = item
         else:
             current = f"{current}{separator}{item}" if current else item
@@ -360,3 +391,27 @@ class ReportText(ReportBlock):
         :return str: The one-line text.
         """
         return self.text
+
+
+@dataclass(frozen=True)
+class ReportFields(ReportBlock):
+    """A line of configuration fields that can wrap between whole fields."""
+
+    fields: tuple[str, ...]
+
+    def render(self, width: int, *, color: bool, hanging: str = "") -> list[str]:
+        """Wrap the fields to the terminal without changing any field.
+
+        :param int width: Columns available to each line, the hanging indent included.
+        :param bool color: Unused; configuration fields carry no styling.
+        :param str hanging: Prefix of each line after the first.
+        :return list[str]: The wrapped rows.
+        """
+        return pack(self.fields, width, subsequent_indent=hanging, separator=" ")
+
+    def __str__(self) -> str:
+        """Return the fields on one unstyled line.
+
+        :return str: The fields separated by spaces.
+        """
+        return " ".join(self.fields)

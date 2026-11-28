@@ -12,7 +12,6 @@ import hashlib
 from pathlib import Path
 from unittest.mock import patch
 
-import optuna
 import pytest
 import yaml
 
@@ -20,14 +19,14 @@ from phasesweep import load_experiment, run_experiment
 from phasesweep.config.models import Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.fingerprints import _phase_fingerprint
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.phase import GpuPool
 from phasesweep.engine.read import read_result
-from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR
+from phasesweep.engine.state import _recorded_identity
 from tests.conftest import (
     REPO,
     copy_fake_train,
     make_experiment,
+    phase_study,
     write_constant_trainer,
     write_trainer,
 )
@@ -95,11 +94,10 @@ def test_full_sweep_and_replay(tmp_path):
     assert provenance is not None
     assert provenance["extractor"]["kind"] == "json_envelope"
     winner_trial_dirs = [
-        d
-        for d in (exp_dir / "depth").glob("trial_*")
-        if d.name.endswith(f"attempt_{depth_winner.attempt_id}")
+        d for d in (exp_dir / "depth").glob("trial_*") if d.name.endswith(depth_winner.attempt_id)
     ]
     assert len(winner_trial_dirs) == 1
+    assert winner_trial_dirs[0].name == depth_winner.trial_dir
     evidence = winner_trial_dirs[0] / provenance["source"]["path"]
     assert provenance["source"]["sha256"] == hashlib.sha256(evidence.read_bytes()).hexdigest()
     stored = yaml.safe_load((generation_dir / "phases/depth/winner.yaml").read_text())
@@ -143,7 +141,6 @@ def test_bound_topup_survives_child_preflight_failure_with_empty_fingerprinted_s
         search_space={},
     )
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[parent, child])
-    storage = _resolve_storage(experiment.resolved_storage)
     real_create = GpuPool.create
     calls = 0
 
@@ -160,21 +157,23 @@ def test_bound_topup_survives_child_preflight_failure_with_empty_fingerprinted_s
     ):
         run_experiment(experiment)
 
-    child_study = optuna.load_study(study_name="t::child", storage=storage)
+    child_study = phase_study(experiment, "child")
     assert child_study.get_trials(deepcopy=False) == []
-    assert isinstance(child_study.user_attrs.get(PHASE_FINGERPRINT_ATTR), str)
+    assert _recorded_identity(child_study) is not None
 
     topped_up = experiment.model_copy(
         update={"phases": [parent.model_copy(update={"n_trials": 2}), child]}
     )
     winners = run_experiment(topped_up)
 
-    parent_study = optuna.load_study(study_name="t::parent", storage=storage)
-    child_study_after = optuna.load_study(study_name="t::child", storage=storage)
+    parent_study = phase_study(topped_up, "parent")
+    child_study_after = phase_study(topped_up, "child")
     assert len(parent_study.trials) == 2
     assert child_study_after.get_trials(deepcopy=False)
     expected_fingerprint = _phase_fingerprint(topped_up, child, {"parent": winners["parent"]})
-    assert child_study_after.user_attrs[PHASE_FINGERPRINT_ATTR] == expected_fingerprint
+    recorded = _recorded_identity(child_study_after)
+    assert recorded is not None
+    assert recorded["fingerprint"] == expected_fingerprint
 
 
 def test_appended_phase_runs_alone_and_inherits_the_replayed_winner(tmp_path: Path) -> None:
@@ -228,9 +227,8 @@ def test_appended_phase_runs_alone_and_inherits_the_replayed_winner(tmp_path: Pa
     assert winners["first"].trial_number == finished["first"].trial_number
     assert winners["first"].metric == finished["first"].metric
     assert winners["later"].effective_overrides["x"] == inherited_x
-    storage = _resolve_storage(both.storage)
-    assert len(optuna.load_study(study_name="t::first", storage=storage).trials) == 3
-    assert len(optuna.load_study(study_name="t::later", storage=storage).trials) == 2
+    assert len(phase_study(both, "first").trials) == 3
+    assert len(phase_study(both, "later").trials) == 2
     _, (published,) = read_result(both, phase_names=["later"])
     assert published is not None
     assert published.params == winners["later"].params

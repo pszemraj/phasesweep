@@ -3,23 +3,22 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
 import optuna
 
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.evidence as evidence_ops
 import phasesweep.engine.fingerprints as fingerprint_ops
+import phasesweep.engine.guards as guard_ops
 import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.engine.errors import PhaseTimeoutError, StudyContextConflictError, phase_timeout
-from phasesweep.engine.optuna import _finished_trial_count
+from phasesweep.engine.bounds import selection_bounds
+from phasesweep.engine.errors import PhaseTimeoutError, ResumeBoundsChangedError, phase_timeout
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication_validation import ValidatedPublication
-from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
-from phasesweep.errors import phase_names, rename_step
-from phasesweep.runtime.terminal import plural
+from phasesweep.engine.state import Winner, _recorded_identity
 
 
 def _run_deadline_refusal(experiment: Experiment, phase_name: str) -> PhaseTimeoutError:
@@ -61,6 +60,7 @@ def _preflight_skipped_winners(
         or incomplete.
     :raises StudyFingerprintMismatchError: A skipped phase's winner fingerprint
         disagrees with the current config.
+    :raises ResumeBoundsChangedError: The current bounds require reselecting a skipped winner.
     :raises TrialEvidenceMissingError: A skipped winner's source trial evidence
         is missing or changed.
     :raises PublicationAccessError: The recorded publication cannot be read as
@@ -147,76 +147,25 @@ def _accept_skipped_winner(
         partial-result policy.
     :raises StudyFingerprintMismatchError: The winner was produced by a
         different config.
+    :raises ResumeBoundsChangedError: The current bounds require reselecting the winner.
     :raises TrialEvidenceMissingError: The winner's source trial evidence is
         missing or changed.
     :return Winner: The accepted winner.
     """
     inherited = {parent: winners[parent] for parent in phase.inherits}
     winner = artifact_io._load_winner(experiment, phase, inherited, publication=publication)
+    assert publication is not None
+    if publication.bounds != selection_bounds(experiment.metric, experiment.constraints):
+        raise ResumeBoundsChangedError(
+            f"Skipped phase {phase.name!r} was selected under different metric or constraint bounds.",
+            remediation=(
+                f"Run with `--from-phase {phase.name}` to reselect from the phase's recorded trials."
+                if experiment.persistent
+                else "Run without --from-phase to start every phase again."
+            ),
+        )
     evidence_ops._verify_winner_evidence(experiment, phase, winner)
     return winner
-
-
-def _reject_bound_descendant_topups(
-    experiment: Experiment,
-    *,
-    from_phase: str | None,
-    existing_studies: dict[str, optuna.Study],
-) -> None:
-    """Reject upstream top-ups that could invalidate a bound descendant study.
-
-    Reachability follows explicit inheritance edges. A new winner from an
-    upstream top-up changes the inherited effective overrides that every
-    transitive descendant has already hashed into its bound study.
-
-    :param Experiment experiment: Parsed experiment whose phase chain is scanned
-        from ``from_phase`` (or the start) onward.
-    :param str | None from_phase: Optional resume point; phases before it are skipped.
-    :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
-        phase name, as returned by :func:`phasesweep.engine.guards._preflight_existing_studies`.
-    :raises StudyContextConflictError: An upstream phase still has unfinished
-        top-up trials remaining while an inheriting descendant's study is bound
-        to its published winner: it holds a stored fingerprint and at least
-        one trial.
-    """
-    for _, phase in experiment.phases_from(from_phase):
-        study = existing_studies.get(phase.name)
-        if study is None:
-            continue
-        finished = _finished_trial_count(study.get_trials(deepcopy=False))
-        if finished >= phase.n_trials:
-            continue
-        partial_decision = study_policy_ops._load_accepted_partial_decision(study)
-        if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
-            # The phase has already committed a terminal accepted-timeout
-            # decision at this exact target. Identical replay performs only
-            # deterministic selection; its unused slots are not a top-up.
-            continue
-
-        # Only a populated descendant has consumed this winner. The fingerprint
-        # is stamped before resource preflight, so a child that failed
-        # preflight holds a fingerprint and no trials, and _verify_fingerprint
-        # rebinds such an empty study to the new inherited config.
-        bound = [
-            name
-            for name in sorted(experiment.phases_inheriting(phase.name))
-            if (dependent := existing_studies.get(name)) is not None
-            and isinstance(dependent.user_attrs.get(PHASE_FINGERPRINT_ATTR), str)
-            and dependent.get_trials(deepcopy=False)
-        ]
-        if bound:
-            # The target is no part of a study's identity, so the enlarged phase keeps its
-            # trials; its dependents' studies hold trials bound to its old winner.
-            rename = rename_step(experiment.phases_inheriting(phase.name))
-            raise StudyContextConflictError(
-                f"Phase {phase.name!r} has {plural(phase.n_trials - finished, 'top-up trial')} "
-                f"remaining, but {plural(len(bound), 'dependent phase')} ({phase_names(bound)}) "
-                f"{'is' if len(bound) == 1 else 'are'} bound to its published winner.",
-                remediation=(
-                    f"{rename[0].upper()}{rename[1:]}; `{phase.name}` keeps its trials and runs "
-                    "the rest."
-                ),
-            )
 
 
 def _preflight_missing_reached_phase_environments(
@@ -251,7 +200,7 @@ def _reject_fixed_targets_without_study(
     experiment: Experiment,
     *,
     from_phase: str | None,
-    existing_studies: dict[str, optuna.Study],
+    existing_studies: Mapping[str, object],
 ) -> None:
     """Reject a fixed configuration's oversized target before any phase launches.
 
@@ -265,15 +214,18 @@ def _reject_fixed_targets_without_study(
     :param Experiment experiment: Parsed experiment whose phase chain is scanned
         from ``from_phase`` (or the start) onward.
     :param str | None from_phase: Optional resume point; phases before it are skipped.
-    :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
+    :param Mapping[str, object] existing_studies: Every existing study of each phase, keyed by
         phase name, as returned by :func:`phasesweep.engine.guards._preflight_existing_studies`.
+        A phase with any study is left to the check of the study it addresses.
     :raises TrialTargetRefusedError: A reached fixed configuration without a
         study asks for more than one trial; delegated to
         :func:`phasesweep.engine.study_policy._validate_fixed_configuration_target`.
     """
     for _index, phase in experiment.phases_from(from_phase):
         if phase.name not in existing_studies:
-            study_policy_ops._validate_fixed_configuration_target(phase, finished=0, measured=0)
+            study_policy_ops._validate_fixed_configuration_target(
+                phase, finished=0, measured=0, accepted=0
+            )
 
 
 def _preflight_reached_fingerprint(
@@ -281,7 +233,7 @@ def _preflight_reached_fingerprint(
     *,
     from_phase: str | None,
     preloaded_winners: dict[str, Winner],
-    existing_studies: dict[str, optuna.Study],
+    existing_studies: Mapping[str, Sequence[optuna.Study]],
 ) -> None:
     """Verify the first reached study before any phase runs.
 
@@ -290,17 +242,25 @@ def _preflight_reached_fingerprint(
     :param str | None from_phase: Optional resume point identifying the first
         phase that will actually execute.
     :param dict[str, Winner] preloaded_winners: Validated skipped-phase winners,
-        used to resolve the reached phase's inherited context.
-    :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
-        phase name; a no-op if the reached phase has none yet.
+        used to resolve the reached phase's inherited values and so its study.
+    :param Mapping[str, Sequence[optuna.Study]] existing_studies: Every existing study of each
+        phase, keyed by phase name; a no-op if the reached phase addresses none yet, or one that
+        records no identity, which the phase's run stamps before it adopts kept attempts
+        (:mod:`phasesweep.engine.reread`).
     :raises StudyFingerprintMismatchError: The reached study's stored
         fingerprint does not match the current config.
     """
     phase = experiment.phases[0]
     if from_phase is not None:
         phase = experiment.phase(from_phase)
-    study = existing_studies.get(phase.name)
-    if study is None:
-        return
     inherited = {name: preloaded_winners[name] for name in phase.inherits}
+    study = guard_ops.addressed_study(
+        existing_studies,
+        phase.name,
+        fingerprint_ops.phase_study_name(
+            experiment, phase, fingerprint_ops._inherited_override_payload(phase, inherited)
+        ),
+    )
+    if study is None or _recorded_identity(study) is None:
+        return
     fingerprint_ops._verify_fingerprint(study, experiment, phase, inherited)

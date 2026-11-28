@@ -26,15 +26,21 @@ from phasesweep.engine.state import PHASE_DECISION_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
 from phasesweep.errors import ACCEPT_INCOMPLETE_STEP, PhaseSweepError
+from phasesweep.evidence.evaluation import TrialContext
+from phasesweep.evidence.models import ObjectiveExtractor
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import ProcessResult
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
+    addressed_phase_study,
     bounded_metric,
     make_experiment,
     make_trial_context,
     phase_study,
     phase_trials,
+    study_name,
     write_constant_trainer,
+    write_flaky_trainer,
     write_trainer,
     write_trial_zero_trainer,
 )
@@ -197,8 +203,8 @@ def test_incomplete_timeout_winner_is_accepted_only_under_current_opt_in(tmp_pat
 
     completion = winners["p"].completion
     assert completion["requested_trials"] == 10
-    assert 1 <= completion["completed_trials"] < completion["requested_trials"]
-    assert completion["completed_trials"] <= completion["finished_trials"]
+    assert 1 <= completion["measured_trials"] < completion["requested_trials"]
+    assert completion["measured_trials"] <= completion["finished_trials"]
     assert completion["finished_trials"] <= completion["requested_trials"]
     assert completion["incomplete"] is True
     assert completion["reason"] == "timeout"
@@ -285,7 +291,7 @@ def test_timeout_that_interrupts_the_last_trial_leaves_the_phase_incomplete(
         return
     completion = run_experiment(exp)["p"].completion
     assert completion["requested_trials"] == 2
-    assert completion["completed_trials"] == 1
+    assert completion["measured_trials"] == 1
     assert completion["finished_trials"] == 1
     assert completion["incomplete"] is True
 
@@ -330,27 +336,24 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
     assert winners["p"].trial_number == 0
     completion = winners["p"].completion
     assert completion["requested_trials"] == 3
-    assert 1 <= completion["completed_trials"] < completion["requested_trials"]
+    assert 1 <= completion["measured_trials"] < completion["requested_trials"]
     assert (
-        completion["completed_trials"]
+        completion["measured_trials"]
         <= completion["finished_trials"]
         < completion["requested_trials"]
     )
     assert completion["incomplete"] is True
     assert completion["reason"] == "timeout"
     assert completion["timeout_scope"] == "phase"
-    study = optuna.load_study(
-        study_name="phase_timeout_allowed_abort_counter::p",
-        storage=_resolve_storage(exp.storage),
-    )
+    study = addressed_phase_study(exp)
     deadline_trials = [
         trial
         for trial in study.trials
         if trial.user_attrs.get(TRIAL_OUTCOME_ATTR, {}).get("outcome") == "interrupted"
     ]
     assert len(deadline_trials) == 1
-    assert _load_phase_policy_state(study).abort is None
-    assert _load_phase_policy_state(study).consecutive_failures == 0
+    assert _load_phase_policy_state(study, exp).abort is None
+    assert _load_phase_policy_state(study, exp).consecutive_failures == 0
 
 
 @pytest.mark.parametrize("clock_elapses", [True, False])
@@ -445,26 +448,20 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     with pytest.raises(RuntimeError, match="simulated crash"):
         run_experiment(exp)
 
-    study = optuna.load_study(
-        study_name="phase_scheduler_deadline_with_abort::p",
-        storage=_resolve_storage(exp.storage),
-    )
+    study = addressed_phase_study(exp)
     assert study.user_attrs[PHASE_DECISION_ATTR]["decision"] == "accepted_partial_timeout"
     trial_count = len(study.trials)
 
     winners = run_experiment(exp)
 
-    study = optuna.load_study(
-        study_name="phase_scheduler_deadline_with_abort::p",
-        storage=_resolve_storage(exp.storage),
-    )
+    study = addressed_phase_study(exp)
     assert len(study.trials) == trial_count
 
     assert winners["p"].trial_number == 0
     completion = winners["p"].completion
     assert completion["requested_trials"] == 3
     assert completion["finished_trials"] == 2
-    assert completion["completed_trials"] == 1
+    assert completion["measured_trials"] == 1
     assert completion["incomplete"] is True
     assert completion["reason"] == "timeout"
     assert completion["timeout_scope"] == "phase"
@@ -606,12 +603,9 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
     with pytest.raises(TimeoutError, match="timed out via phase guard after 2/3 finished trials"):
         run_experiment(exp)
 
-    study = optuna.load_study(
-        study_name="refused_partial_timeout_abort::p",
-        storage=_resolve_storage(exp.storage),
-    )
-    assert _load_phase_policy_state(study).abort is None
-    assert _load_phase_policy_state(study).consecutive_failures == 0
+    study = addressed_phase_study(exp)
+    assert _load_phase_policy_state(study, exp).abort is None
+    assert _load_phase_policy_state(study, exp).consecutive_failures == 0
 
     # With a fresh, larger budget the remaining attempt runs; no failure abort
     # is recorded to block it at phase startup.
@@ -661,14 +655,14 @@ def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
 
     assert exc_info.value.published_result_committed is False
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
-    assert _load_phase_policy_state(study).abort is None
+    study = addressed_phase_study(exp)
+    assert _load_phase_policy_state(study, exp).abort is None
     assert study.trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "interrupted"
 
     winners = run_experiment(exp)
     assert winners["p"].metric == pytest.approx(0.5)
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
-    assert _load_phase_policy_state(study).abort is None
+    study = addressed_phase_study(exp)
+    assert _load_phase_policy_state(study, exp).abort is None
 
 
 @pytest.mark.parametrize("lease_timeout", [True, False])
@@ -758,7 +752,6 @@ def test_extraction_past_deadline_fails_the_trial(tmp_path: Path) -> None:
     )
 
     assert result.metric is None
-    assert result.feasible is False
     assert result.failure_reason is not None
     assert "wallclock deadline exceeded" in result.failure_reason
     assert result.deadline_exhausted is True
@@ -787,13 +780,13 @@ def test_slow_wandb_position_read_never_costs_an_accepted_trial(
     class Run:
         state = "finished"
         summary_metrics = {"eval/loss": 0.2, "_step": 1}
-        history_keys: dict = {}
+        history_keys = {
+            "lastStep": 1,
+            "keys": {key: {"typeCounts": [{"count": 2}]} for key in ("eval/loss", "eval/step")},
+        }
 
         def load(self, force: bool = False) -> None:
-            self.history_keys = {
-                "lastStep": 1,
-                "keys": {"eval/loss": {"typeCounts": [{"count": 1}]}},
-            }
+            pass
 
         def history(self, keys: list[str], samples: int, pandas: bool) -> list[dict]:
             clock[0] += read_seconds
@@ -929,8 +922,8 @@ def test_unrelated_launch_timeout_is_not_relabelled_as_phase_deadline(
     with pytest.raises(TimeoutError, match="injected non-deadline launch timeout"):
         run_experiment(experiment)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
-    abort = _load_phase_policy_state(study).abort
+    study = optuna.load_study(study_name=study_name(experiment), storage=_resolve_storage(storage))
+    abort = _load_phase_policy_state(study, experiment).abort
     assert abort is not None
     assert abort["policy"] == "unexpected_objective_exception"
 
@@ -972,6 +965,54 @@ def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
     assert not _last_successful_generation_path(exp).exists()
 
 
+@pytest.mark.integration
+def test_a_deadline_during_a_finished_trainers_evidence_read_keeps_its_training(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A phase deadline that cuts the evidence read of a trainer that exited 0 stops the run as a timeout with the trial pending, and the trainer never runs again."""
+    trainer, calls = write_flaky_trainer(tmp_path, failures=0)
+
+    def phase(timeout: float) -> Phase:
+        return Phase(
+            name="p",
+            n_trials=1,
+            timeout_seconds_per_phase=timeout,
+            sampler=Sampler(type="random", seed=0),
+            search_space={"x": IntParam(type="int", low=0, high=10)},
+        )
+
+    import phasesweep.engine.trial as trial_mod
+
+    real_extractor = trial_mod.run_extractor
+    slowed: list[None] = []
+
+    def slow_once(
+        ctx: TrialContext,
+        cfg: ObjectiveExtractor,
+        *,
+        deadline: float | None = None,
+        provenance: JsonObject | None = None,
+    ) -> float:
+        if not slowed:
+            slowed.append(None)
+            assert deadline is not None
+            # Outlast the phase deadline from wherever the trainer's exit left it.
+            time.sleep(max(0.0, deadline - time.monotonic()) + 0.3)
+        return real_extractor(ctx, cfg, deadline=deadline, provenance=provenance)
+
+    monkeypatch.setattr("phasesweep.engine.trial.run_extractor", slow_once)
+    short = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase(3.0)])
+    with pytest.raises(TimeoutError, match="while reading the evidence of trial 0, which finished"):
+        run_experiment(short)
+    assert len(calls.read_text().splitlines()) == 1
+
+    roomy = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase(60.0)])
+    winners = run_experiment(roomy)
+    assert winners["p"].trial_number == 0
+    assert [t.state.name for t in phase_trials(roomy)] == ["COMPLETE"]
+    assert len(calls.read_text().splitlines()) == 1
+
+
 @pytest.mark.parametrize("persistent", [False, True], ids=["memory", "persistent"])
 @pytest.mark.parametrize("scope", ["phase", "run"])
 def test_timeout_remedy_matches_storage_and_budget(
@@ -998,10 +1039,10 @@ def test_timeout_remedy_matches_storage_and_budget(
 
 
 @pytest.mark.integration
-def test_a_per_trial_timeout_abort_names_the_rename_that_the_raised_timeout_needs(
+def test_a_per_trial_timeout_abort_advises_the_raised_timeout_that_continues_the_study(
     tmp_path: Path,
 ) -> None:
-    """The supervisor's recorded timeout leads the abort advice, and that advice's rename runs."""
+    """The supervisor's recorded timeout leads the abort advice, and following it continues the study with its trials kept."""
     trainer = write_trainer(
         tmp_path,
         """
@@ -1016,29 +1057,31 @@ def test_a_per_trial_timeout_abort_names_the_rename_that_the_raised_timeout_need
         """,
     )
 
-    def phase(name: str, timeout: float) -> Phase:
+    def phase(n_trials: int, timeout: float) -> Phase:
         return Phase(
-            name=name,
-            n_trials=2,
+            name="p",
+            n_trials=n_trials,
             max_consecutive_failures=2,
             timeout_seconds_per_trial=timeout,
             sampler=Sampler(type="random", seed=0),
             search_space={"x": IntParam(type="int", low=0, high=10)},
         )
 
-    short = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase("p", 0.5)])
+    short = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase(2, 0.5)])
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(short)
     message = _operational_error_text(aborted.value)
-    assert message.index(
-        "For the timed-out trials, raise phases[p].timeout_seconds_per_trial and give `p` a new "
-        "`name`, which runs it again from scratch."
-    ) < message.index("For any other cause, fix it, then raise phases[p].n_trials")
+    assert (
+        "Raise phases[p].timeout_seconds_per_trial for the timed-out trials and fix any other "
+        "cause, then raise phases[p].n_trials"
+    ) in message
+    assert "new `name`" not in message
 
-    raised = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase("p", 5.0)])
-    with pytest.raises(PhaseSweepError, match=r"phase\.timeout_seconds_per_trial: 0\.5 -> 5\.0"):
-        run_experiment(raised, dry_run=True)
-
-    renamed = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase("p2", 5.0)])
-    run_experiment(renamed)
-    assert [trial.state.name for trial in phase_trials(renamed, "p2")] == ["COMPLETE", "COMPLETE"]
+    raised = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase(4, 5.0)])
+    run_experiment(raised)
+    assert [trial.state.name for trial in phase_trials(raised, "p")] == [
+        "FAIL",
+        "FAIL",
+        "COMPLETE",
+        "COMPLETE",
+    ]

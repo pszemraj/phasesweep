@@ -83,7 +83,7 @@ def run_worker(
     *,
     statuses: frozenset[str],
     run_id: str,
-    trial_dir: Path,
+    attempt_dir: Path,
     environment: Mapping[str, str] | None,
     deadline: float,
 ) -> tuple[ProcessResult, JsonObject, Path | None]:
@@ -95,7 +95,7 @@ def run_worker(
     :param frozenset[str] statuses: Response statuses the task can report; any
         other outcome preserves the worker's stderr for diagnosis.
     :param str run_id: Immutable attempt ID, also used by process recovery.
-    :param Path trial_dir: Existing attempt directory and durable process slot.
+    :param Path attempt_dir: Existing attempt directory and durable process slot.
     :param Mapping[str, str] | None environment: Actual composed trainer environment.
     :param float deadline: Absolute ``time.monotonic()`` time the worker is stopped at.
     :return tuple[ProcessResult, JsonObject, Path | None]: The worker's
@@ -123,7 +123,7 @@ def run_worker(
             stderr_path.open("w", encoding="utf-8") as stderr,
         ):
             # Never let a previous safe trainer identity hide a failed worker launch.
-            (trial_dir / PROCESS_IDENTITY_FILE).unlink(missing_ok=True)
+            (attempt_dir / PROCESS_IDENTITY_FILE).unlink(missing_ok=True)
             result = run_supervised(
                 shlex.join(
                     [
@@ -143,13 +143,13 @@ def run_worker(
                 stderr=stderr,
                 timeout=max(0.0, deadline - time.monotonic()),
                 wallclock_deadline=deadline,
-                trial_dir=trial_dir,
+                attempt_dir=attempt_dir,
                 attempt_id=run_id,
                 label=f"{_BACKEND_NAMES.get(backend, backend)} request",
             )
         if not result.cleanup_confirmed:
             raise UnsafeProcessCleanupError(
-                f"{backend} worker cleanup is uncertain for attempt {run_id!r}; recover {trial_dir}."
+                f"{backend} worker cleanup is uncertain for attempt {run_id!r}; recover {attempt_dir}."
             )
         response = (
             json_object(json.loads(response_path.read_text(encoding="utf-8")))
@@ -163,7 +163,7 @@ def run_worker(
         ):
             diagnostic = stderr_path.read_text(encoding="utf-8", errors="replace")
             if diagnostic:
-                diagnostic_path = trial_dir / f"{backend}-worker.stderr.log"
+                diagnostic_path = attempt_dir / f"{backend}-worker.stderr.log"
                 private_atomic_write_text(
                     diagnostic_path,
                     diagnostic,

@@ -6,13 +6,13 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.cli import _operational_error_text
-from phasesweep.config.models import Experiment, Metric, Phase
+from phasesweep.config.models import Constraint, Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import ResumeWinnerMissingError, StudyFingerprintMismatchError
 from phasesweep.engine.read import _read_generation_selection, read_result
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.errors import OperatorAction
-from phasesweep.evidence.models import LogRegexExtractor
+from phasesweep.evidence.models import LogRegexExtractor, RequiredFileGate
 from tests.conftest import after_banner, invoke_cli_boundary, make_experiment
 from tests.experiments import phase_payload, write_experiment
 
@@ -138,15 +138,72 @@ def test_from_phase_after_a_changed_parent_names_the_step_its_storage_allows(
     assert refused.value.action is OperatorAction.FIX_CONFIG
     if persistent:
         assert message.endswith(
-            "fix: Restore the config that produced the winner of `parent`, or give `parent` and "
-            "`child` new names and update the `inherits` that name them, which runs them again "
-            "from scratch."
+            "fix: Restore the config that produced the winner of `parent`, or give `parent` a "
+            "new `name`, which runs it again from scratch. If its search_space only gained "
+            "values, run from `parent` (`--from-phase parent`)."
         )
     else:
         assert message.endswith(
             "fix: Restore the config that produced the winner of `parent`, or run without "
             "--from-phase to start every phase again."
         )
+
+
+@pytest.mark.parametrize("training_changed", [False, True])
+def test_from_phase_names_the_skipped_phase_to_reread(
+    tmp_path: Path, training_changed: bool
+) -> None:
+    """Changing the reader alone points to the skipped phase that must re-read its trials."""
+    original = _chained_experiment(tmp_path / "runs")
+    previous = run_experiment(original)
+    changed = original.model_copy(
+        update={"metric": original.metric.model_copy(update={"goal": "maximize"})}
+    )
+    if training_changed:
+        parent = changed.phases[0].model_copy(update={"fixed_overrides": {"width": 64}})
+        changed = changed.model_copy(update={"phases": [parent, changed.phases[1]]})
+
+    for dry_run in (True, False):
+        with pytest.raises(StudyFingerprintMismatchError) as refused:
+            run_experiment(changed, from_phase="child", dry_run=dry_run)
+        message = _operational_error_text(refused.value)
+        if training_changed:
+            assert "was produced by a different config" in message
+            assert "Restore the config that produced the winner" in message
+        else:
+            assert (
+                "Skipped phase 'parent' was selected under different reading settings." in message
+            )
+            assert "Run with `--from-phase parent` to re-read the phase's kept trials." in message
+
+    if not training_changed:
+        replayed = run_experiment(changed, from_phase="parent")
+        assert {name: winner.source for name, winner in replayed.items()} == {
+            name: winner.source for name, winner in previous.items()
+        }
+
+
+@pytest.mark.parametrize("changed_setting", ["constraint", "gate"])
+def test_from_phase_restores_every_reading_setting_before_naming_a_reread(
+    tmp_path: Path, changed_setting: str
+) -> None:
+    """A constraint or a gate is part of the published reading, not a change to training."""
+    original = _chained_experiment(tmp_path / "runs")
+    run_experiment(original)
+    if changed_setting == "constraint":
+        constraint = Constraint(name="x", max=1, extractor=original.metric.extractor)
+        changed = original.model_copy(update={"constraints": [constraint]})
+    else:
+        gate = RequiredFileGate(type="required_file", path="done")
+        parent = original.phases[0].model_copy(update={"gates": [gate]})
+        changed = original.model_copy(update={"phases": [parent, original.phases[1]]})
+
+    for dry_run in (True, False):
+        with pytest.raises(StudyFingerprintMismatchError) as refused:
+            run_experiment(changed, from_phase="child", dry_run=dry_run)
+        message = _operational_error_text(refused.value)
+        assert "Skipped phase 'parent' was selected under different reading settings." in message
+        assert "Run with `--from-phase parent` to re-read the phase's kept trials." in message
 
 
 def test_from_phase_names_the_phase_a_published_generation_lacks(tmp_path: Path) -> None:

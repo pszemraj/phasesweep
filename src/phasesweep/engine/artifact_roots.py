@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -19,8 +19,8 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.optuna import (
-    _completed_trial_count,
     _finished_trial_count,
+    _measured_trial_count,
     _meets_published_trial_history_boundary,
     _published_phase_trial_refs,
     _published_trial_matches,
@@ -57,7 +57,7 @@ log = logging.getLogger(__name__)
 BindingState = Literal["bound", "unbound"]
 
 
-ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 18
+ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 35
 
 
 def _artifact_root_storage_key(experiment: Experiment) -> str | None:
@@ -361,7 +361,7 @@ def _bind_study_artifact_root(study: optuna.Study, experiment: Experiment) -> No
 
 def _check_published_phase_studies(
     experiment: Experiment,
-    loaded: Mapping[str, optuna.Study],
+    loaded: Mapping[str, Sequence[optuna.Study]],
     *,
     from_phase: str | None = None,
 ) -> None:
@@ -371,8 +371,12 @@ def _check_published_phase_studies(
     a publication that needs operator attention. Only persistent storage carries
     published trials to require; an in-memory ledger starts empty on every launch.
 
+    The winner records the study that selected it. A sibling study can contain the same
+    attempt identity after re-reading its results.
+
     :param Experiment experiment: Experiment whose current publication is checked.
-    :param Mapping[str, optuna.Study] loaded: Already-inspected persistent studies.
+    :param Mapping[str, Sequence[optuna.Study]] loaded: Already-inspected persistent studies,
+        every study of each phase.
     :param str | None from_phase: Resume point; earlier phases only load winners.
     :raises PublishedStudyMissingError: A reached published trial is absent,
         replaced, or its recorded history boundary is missing.
@@ -384,39 +388,47 @@ def _check_published_phase_studies(
     raise_for_unusable_publication(
         experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
     )
-    if not experiment.persistent:
+    validated = publication.validated
+    if not experiment.persistent or validated is None:
         return
-    published_trials = _published_phase_trial_refs(
-        None if publication.validated is None else publication.validated.summary
-    )
+    published_trials = _published_phase_trial_refs(validated.summary, winners=validated.winners)
     for _index, phase in experiment.phases_from(from_phase):
         phase_name = phase.name
         if phase_name not in published_trials:
             continue
-        study = loaded.get(phase_name)
         expected = published_trials[phase_name]
+        study = (
+            None
+            if expected is None
+            else next(
+                (
+                    study
+                    for study in loaded.get(phase_name, ())
+                    if study.study_name == expected.study_name
+                ),
+                None,
+            )
+        )
         missing = "is missing"
-        if study is not None:
+        if study is not None and expected is not None:
             try:
                 trials = study.get_trials(deepcopy=False)
-                matched = expected is not None and any(
-                    _published_trial_matches(trial, expected) for trial in trials
-                )
-                if matched and expected is not None:
+                matched = any(_published_trial_matches(trial, expected) for trial in trials)
+                if matched:
                     finished = _finished_trial_count(trials)
-                    completed = _completed_trial_count(trials)
-                    if _meets_published_trial_history_boundary(finished, completed, expected):
+                    measured = _measured_trial_count(trials)
+                    if _meets_published_trial_history_boundary(finished, measured, expected):
                         continue
                     boundary = ", ".join(
                         f"{count} {label}"
                         for count, label in (
                             (expected.finished_trials, "finished"),
-                            (expected.completed_trials, "completed"),
+                            (expected.measured_trials, "measured"),
                         )
                         if count is not None
                     )
                     missing = (
-                        f"has only {finished} finished and {completed} completed trials, "
+                        f"has only {finished} finished and {measured} measured trials, "
                         f"below the published completion boundary ({boundary})"
                     )
             except Exception as exc:
@@ -429,16 +441,11 @@ def _check_published_phase_studies(
                 if not trials:
                     missing = "contains no trials"
                 else:
-                    missing = "does not contain the published trial identity"
-                    if expected is not None:
-                        missing += (
-                            f" (trial {expected.trial_number}, generation {expected.generation_id!r}, "
-                            f"attempt {expected.attempt_id!r})"
-                        )
-                    else:
-                        missing += (
-                            " because the publication records no complete local trial identity"
-                        )
+                    missing = (
+                        "does not contain the published trial identity "
+                        f"(trial {expected.trial_number}, generation {expected.generation_id!r}, "
+                        f"attempt {expected.attempt_id!r})"
+                    )
         raise PublishedStudyMissingError(
             f"Published generation {publication.generation_id!r} records a selected trial for "
             f"phase {phase_name!r}, but its persistent study {missing}."

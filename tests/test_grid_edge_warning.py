@@ -24,7 +24,8 @@ from phasesweep.config.search import (
     grid_search_space,
     sampler_warnings,
 )
-from phasesweep.engine.paths import _generation_winner_path
+from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.paths import _generation_winner_path, _last_successful_generation_path
 from phasesweep.engine.read import read_result, read_trial_tables
 from phasesweep.engine.repeats import ranked_group, repeat_axis
 from phasesweep.engine.selection import (
@@ -35,11 +36,11 @@ from phasesweep.engine.selection import (
 )
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
-    FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
 )
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
@@ -47,6 +48,7 @@ from phasesweep.mcp.snapshots import RESULT_SNAPSHOT_SCHEMA_VERSION, capture_res
 from phasesweep.runtime.json import JsonValue
 from phasesweep.runtime.terminal import significant
 from tests.conftest import (
+    bounded_metric,
     log_regex_provenance,
     make_experiment,
     phase_study,
@@ -60,6 +62,16 @@ from tests.ledger_fixtures import published_generation_id
 Row = tuple[dict[str, JsonValue], float | str]
 """One trial: its params, and its metric or the state ``fail``, ``infeasible`` or ``interrupted``."""
 
+_GROW_GRID = (
+    "; add values beyond the bound to search_space and raise n_trials to cover the enlarged grid; "
+    "the study keeps its finished trials"
+)
+_WIDEN_RANGE = (
+    "; widen the range in search_space and raise n_trials; the study keeps its finished trials"
+)
+_STANDALONE = "with no `inherits` and `p`'s other values set in `fixed_overrides`"
+_INHERIT_CHOICES = f"; add a phase over values beyond the bound, {_STANDALONE}"
+
 
 def _edge_warnings(
     caplog: pytest.LogCaptureFixture,
@@ -68,6 +80,7 @@ def _edge_warnings(
     *,
     sampler_type: str = "random",
     repeats: Repeats | None = None,
+    persistent: bool = True,
 ) -> list[str]:
     """Select a winner over ``rows`` in phase ``p`` and return its untried-beyond warnings."""
     phase = Phase(
@@ -78,7 +91,10 @@ def _edge_warnings(
         repeats=repeats,
         allow_partial_grid=sampler_type == "grid" and repeats is None,
     )
-    experiment = make_experiment(phases=[phase])
+    # An "infeasible" row measures 9.0, outside this bound.
+    experiment = make_experiment(
+        phases=[phase], storage="auto" if persistent else None, metric=bounded_metric(max=8.0)
+    )
     study = optuna.create_study(direction="minimize")
     for number, (params, outcome) in enumerate(rows):
         distributions = {
@@ -86,9 +102,9 @@ def _edge_warnings(
             for name, value in params.items()
         }
         attrs: dict[str, JsonValue] = {
-            FEASIBLE_ATTR: outcome != "infeasible",
             GENERATION_ID_ATTR: "generation-a",
             ATTEMPT_ID_ATTR: f"attempt-{number}",
+            TRIAL_DIR_ATTR: f"/runs/p/trial_{number:05d}__attempt-{number}",
             OBJECTIVE_PROVENANCE_ATTR: json.dumps(log_regex_provenance()),
             TRAINER_ENV_DIGEST_ATTR: "a" * 64,
             TRAINER_INPUT_ATTR: {"schema_version": 1},
@@ -160,11 +176,184 @@ def test_edge_warning_uses_the_ordered_numeric_values_tried(
     warning: str | None,
     sampler_type: str,
 ) -> None:
-    """Every sampler gets the one rule; only numeric axes with three values tried have edges."""
+    """Every sampler gets the one rule; only numeric axes with three values tried have edges.
+
+    At the bound, a grid and a range under random or TPE grow in place, and choices under random
+    or TPE, which cannot grow, go to a phase of their own, since an inheriting phase may not
+    search a key its parent sampled.
+    """
     values = grid_search_space({"x": param})["x"]
     rows: list[Row] = [({"x": item}, 0.1 if item == value else 0.5) for item in values]
     warnings = _edge_warnings(caplog, {"x": param}, rows, sampler_type=sampler_type)
-    assert warnings == ([] if warning is None else [f"[p] no trial ran {warning}"])
+    remedy = (
+        _GROW_GRID
+        if sampler_type == "grid"
+        else _INHERIT_CHOICES
+        if isinstance(param, CategoricalParam)
+        else _WIDEN_RANGE
+    )
+    assert warnings == ([] if warning is None else [f"[p] no trial ran {warning}{remedy}"])
+
+
+@pytest.mark.parametrize(
+    ("choices", "sampler_type", "persistent", "remedy"),
+    [
+        ([1, 2.5, 3], "grid", True, _INHERIT_CHOICES),
+        (
+            [1, 2, 3],
+            "grid",
+            False,
+            "; extend search_space beyond the bound and raise n_trials to the new grid size "
+            "and rerun; storage: null keeps no completed trials between runs",
+        ),
+        (
+            [1, 2, 3],
+            "tpe",
+            False,
+            "; extend search_space beyond the bound and rerun; "
+            "storage: null keeps no completed trials between runs",
+        ),
+    ],
+)
+def test_edge_remedy_can_extend_the_axis_under_the_configured_storage(
+    caplog: pytest.LogCaptureFixture,
+    choices: list[int | float],
+    sampler_type: str,
+    persistent: bool,
+    remedy: str,
+) -> None:
+    """Mixed numeric grid choices need a new persistent phase; volatile studies start over."""
+    param = CategoricalParam(type="categorical", choices=choices)
+    rows: list[Row] = [({"x": x}, 0.1 if x == 1 else 0.5) for x in choices]
+    assert _edge_warnings(
+        caplog, {"x": param}, rows, sampler_type=sampler_type, persistent=persistent
+    ) == [
+        f"[p] no trial ran below the winner's x=1 (tried 1..3, at the configured lower bound){remedy}"
+    ]
+
+
+def test_a_cmaes_range_at_its_bound_goes_to_a_phase_of_its_own(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CMA-ES cannot widen a recorded range, so the warning names a phase with no `inherits`."""
+    space: dict[str, SearchParam] = {
+        "x": FloatParam(type="float", low=0.1, high=0.3, step=0.1),
+        "y": FloatParam(type="float", low=0.0, high=1.0),
+    }
+    rows: list[Row] = [
+        ({"x": 0.1, "y": 0.5}, 0.5),
+        ({"x": 0.2, "y": 0.4}, 0.4),
+        ({"x": 0.3, "y": 0.45}, 0.1),
+    ]
+    assert _edge_warnings(caplog, space, rows, sampler_type="cmaes") == [
+        "[p] no trial ran above the winner's x=0.3 (tried 0.1..0.3, at the configured upper "
+        f"bound); add a seeded random or TPE phase over the wider range, {_STANDALONE}"
+    ]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("winner_changes", "child_fixes_x"),
+    [(False, False), (True, False), (True, True)],
+    ids=["replay", "changed-winner", "shadowed-winner"],
+)
+def test_grown_parent_keeps_trials_and_checks_the_winner_before_child_work(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, winner_changes: bool, child_fixes_x: bool
+) -> None:
+    """A top-up replays dependents whose actual inherited values match the study."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--x", type=int, required=True)
+        args, _ = parser.parse_known_args()
+        print(f"x={{-args.x if args.x < 4 or {winner_changes!r} else 0}}")
+        """,
+    )
+    parent = Phase(
+        name="parent",
+        n_trials=3,
+        gpu_policy="none",
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"x": IntParam(type="int", low=1, high=3)},
+    )
+    child = Phase(
+        name="child",
+        inherits=["parent"],
+        n_trials=1,
+        gpu_policy="none",
+        fixed_overrides={"x": 1} if child_fixes_x else {},
+    )
+    grandchild = Phase(name="grandchild", inherits=["child"], n_trials=1, gpu_policy="none")
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=trainer, phases=[parent, child, grandchild]
+    )
+    first = run_experiment(experiment)
+    assert first["parent"].params == {"x": 3}
+    published = published_generation_id(experiment)
+    assert published is not None
+    pointer = _last_successful_generation_path(experiment)
+    before = pointer.read_bytes()
+    parent_trials = phase_trials(experiment, parent.name)
+    child_trials = phase_trials(experiment, child.name)
+    grandchild_trials = phase_trials(experiment, grandchild.name)
+    child_study = phase_study(experiment, child.name).study_name
+    grandchild_study = phase_study(experiment, grandchild.name).study_name
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    shown = CliRunner().invoke(cli, ["show-winners", str(config)])
+    assert shown.exit_code == 0, shown.output
+    assert "add values beyond the bound to search_space and raise n_trials" in " ".join(
+        shown.output.split()
+    )
+
+    grown = parent.model_copy(
+        update={"n_trials": 4, "search_space": {"x": IntParam(type="int", low=1, high=4)}}
+    )
+    edited = experiment.model_copy(update={"phases": [grown, child, grandchild]})
+    with caplog.at_level(logging.INFO, logger="phasesweep.report"):
+        run_experiment(edited, dry_run=True)
+    # A dependent with recorded studies has no launch count until its inherited values are known.
+    for phase in (child, grandchild):
+        awaits = any(
+            f"phase={phase.name} study and launch count depend on the inherited values" in message
+            for message in caplog.messages
+        )
+        assert awaits is not child_fixes_x
+    assert (
+        "DRY RUN total: would launch 1 trial across 1 phase (2 other phases replay)"
+        if child_fixes_x
+        else "DRY RUN total: would launch 1 trial across 1 phase. "
+        "Launch counts are unresolved for 2 phases"
+    ) in caplog.messages
+    assert pointer.read_bytes() == before
+    assert phase_trials(edited, parent.name) == parent_trials
+
+    changed_inherited_value = winner_changes and not child_fixes_x
+    current = run_experiment(edited)
+    assert current[parent.name].params == {"x": 4 if winner_changes else 3}
+    assert published_generation_id(edited) != published
+    if changed_inherited_value:
+        # The dependents ran again under the new value, beside the studies they had.
+        assert current[child.name].source != first[child.name].source
+        assert current[grandchild.name].effective_overrides == {"x": 4}
+        storage = _resolve_storage(experiment.resolved_storage)
+        for name, trials in ((child_study, child_trials), (grandchild_study, grandchild_trials)):
+            earlier = optuna.load_study(study_name=name, storage=storage)
+            assert earlier.get_trials(deepcopy=False) == trials
+    else:
+        assert current[child.name].source == first[child.name].source
+        assert current[grandchild.name].source == first[grandchild.name].source
+        assert current[grandchild.name].effective_overrides == {"x": 1 if child_fixes_x else 3}
+        assert phase_trials(edited, child.name) == child_trials
+        assert phase_trials(edited, grandchild.name) == grandchild_trials
+        if child_fixes_x:
+            skipped = run_experiment(edited, from_phase=grandchild.name)
+            assert skipped[child.name].source == first[child.name].source
+
+    topped_up = phase_trials(edited, parent.name)
+    assert topped_up[:-1] == parent_trials
+    assert topped_up[-1].params == {"x": 4}
 
 
 @pytest.mark.parametrize("sampler_type", ["random", "tpe", "grid"])
@@ -200,7 +389,7 @@ def test_edge_warning_reads_log_float_ranges_and_names_every_parameter_once(
     assert _edge_warnings(caplog, space, rows) == [
         "[p] no trial ran above the winner's lr=0.0081 (tried 0.0002..0.0081, configured range "
         "extends to 0.01) or below the winner's width=64 (tried 64..512, at the configured lower "
-        "bound)"
+        f"bound){_WIDEN_RANGE}"
     ]
 
 
@@ -252,7 +441,9 @@ def test_repeats_edge_warning_uses_the_winning_group_and_skips_the_repeat_axis(
         rows,
         sampler_type="grid",
         repeats=Repeats(key="seed", values=[0, 1, 2]),
-    ) == ["[p] no trial ran below the winner's x=1 (tried 1..3, at the configured lower bound)"]
+    ) == [
+        f"[p] no trial ran below the winner's x=1 (tried 1..3, at the configured lower bound){_GROW_GRID}"
+    ]
 
 
 @pytest.mark.integration
@@ -284,7 +475,7 @@ def test_edge_advisory_is_recomputed_at_read_over_the_trials_selection_saw(
     )
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     winner = run_experiment(experiment)["p"]
-    expected = "no trial ran below the winner's x=2 (tried 2..4, at the configured lower bound)"
+    expected = f"no trial ran below the winner's x=2 (tried 2..4, at the configured lower bound){_GROW_GRID}"
     path = _generation_winner_path(experiment, winner.generation_id, "p")
     assert "no trial ran" not in path.read_text(encoding="utf-8")
 

@@ -1177,7 +1177,7 @@ def test_summary_semantics_are_pointer_anchored_and_cross_checked(
         semantic_error = "config fingerprint"
     else:
         summary["phases"][0]["completion"]["finished_trials"] = 0
-        summary["phases"][0]["completion"]["completed_trials"] = 0
+        summary["phases"][0]["completion"]["measured_trials"] = 0
         semantic_error = "completion"
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
 
@@ -1231,6 +1231,8 @@ def test_unreadable_pointer_is_permission_denied_not_corruption(
     [
         ("hash", "does not match its recorded hash"),
         ("metric-overflow", "disagrees with the summary metric value"),
+        ("missing-directory", "invalid winner trial_dir"),
+        ("different-directory", "disagrees with the summary trial_dir"),
     ],
 )
 def test_corrupt_publication_is_reported_as_failed_not_absent(
@@ -1244,7 +1246,12 @@ def test_corrupt_publication_is_reported_as_failed_not_absent(
         winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
     else:
         winner = yaml.safe_load(winner_path.read_text())
-        winner["metric"][experiment.metric.name] = 10**400
+        if damage == "missing-directory":
+            del winner["trial_dir"]
+        elif damage == "different-directory":
+            winner["trial_dir"] = "trial_00099__" + "a" * 32
+        else:
+            winner["metric"][experiment.metric.name] = 10**400
         reseal_winner(experiment, generation_id, winner)
 
     pointer = _resolve_publication_pointer(experiment)

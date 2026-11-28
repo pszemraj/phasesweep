@@ -1,21 +1,28 @@
 """Engine progress lines and process-scoped warnings.
 
-A live phase reports one rerun line per rerun and one trial line per trial. A dry run previews
-its phases with the plain ``phase=… study=…`` header on the same report channel.
+A live phase reports one rerun line per rerun, and per trial a line as its trainer starts and
+one as it finishes; recovery reports the trials it settles as trial lines marked recovered. A
+dry run previews its phases with the plain ``phase=… study=…`` header on the same report channel.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Hashable, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 
 import optuna
 
 from phasesweep.config.models import Experiment, Phase
+from phasesweep.engine.bounds import measured_reason
 from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.repeats import repeat_axis
-from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_OUTCOME_ATTR, _parsed_trial_outcome
-from phasesweep.run_report import report, rerun_line, trial_line
+from phasesweep.engine.state import (
+    DURATION_ATTR,
+    RERUN_OF_ATTR,
+    TRIAL_OUTCOME_ATTR,
+    _parsed_trial_outcome,
+)
+from phasesweep.run_report import report, rerun_line, trial_line, trial_start_line
 
 # Warnings keep the phase channel that run.log readers match on.
 log = logging.getLogger("phasesweep.engine.phase")
@@ -108,37 +115,122 @@ def _log_finished_trial(
     :param int finished: Trials of the phase's study that counted toward its target when
         this trial's outcome was recorded, this one included unless it was interrupted.
     """
+    seconds = None if trial.duration is None else trial.duration.total_seconds()
+    _report_trial(experiment, phase, trial, finished, seconds=seconds, recovered=False)
+
+
+def _log_recovered_trial(
+    experiment: Experiment, phase: Phase, trial: optuna.trial.FrozenTrial, finished: int
+) -> None:
+    """Report a trial a later run's recovery settled, as its own run would have, marked recovered.
+
+    The seconds are the trainer's recorded duration: Optuna's own spans the recovery too.
+
+    :param Experiment experiment: The producing configuration of the trial's attempt.
+    :param Phase phase: That configuration's phase.
+    :param optuna.trial.FrozenTrial trial: The trial, reloaded after its terminal transition.
+    :param int finished: Trials of the phase's study that count toward its target now.
+    """
+    duration = trial.user_attrs.get(DURATION_ATTR)
+    seconds = float(duration) if isinstance(duration, int | float) else None
+    _report_trial(experiment, phase, trial, finished, seconds=seconds, recovered=True)
+
+
+def _repeat_split(
+    phase: Phase, params: Mapping[str, object]
+) -> tuple[dict[str, object], tuple[str, object] | None]:
+    """Split a trial's parameters into its configuration and the repeat value it runs.
+
+    :param Phase phase: The trial's phase.
+    :param Mapping[str, object] params: The trial's parameters.
+    :return tuple[dict[str, object], tuple[str, object] | None]: The parameters without the
+        repeat key, and that key and value when the phase repeats.
+    """
     axis = repeat_axis(phase)
     repeat = None
-    if axis is not None and axis.key in trial.params:
-        repeat = (axis.key, trial.params[axis.key])
-    params = {key: value for key, value in trial.params.items() if axis is None or key != axis.key}
-    seconds = None if trial.duration is None else trial.duration.total_seconds()
+    if axis is not None and axis.key in params:
+        repeat = (axis.key, params[axis.key])
+    return {key: value for key, value in params.items() if axis is None or key != axis.key}, repeat
+
+
+def _report_trial(
+    experiment: Experiment,
+    phase: Phase,
+    trial: optuna.trial.FrozenTrial,
+    finished: int,
+    *,
+    seconds: float | None,
+    recovered: bool,
+) -> None:
+    """Report one finished trial's line.
+
+    :param Experiment experiment: The experiment the phase belongs to.
+    :param Phase phase: The phase the trial belongs to.
+    :param optuna.trial.FrozenTrial trial: The finished trial.
+    :param int finished: The trial's place in the phase's completion order.
+    :param float | None seconds: Trainer seconds, ``None`` when none were recorded.
+    :param bool recovered: Whether recovery settled the trial.
+    """
+    params, repeat = _repeat_split(phase, trial.params)
     report.info(
         trial_line(
             experiment,
             phase,
             number=trial.number,
-            state=_trial_count_state(trial),
+            state=_trial_count_state(trial, experiment),
             value=trial.value,
             seconds=seconds,
             finished=finished,
             params=params,
             repeat=repeat,
             rerun_of=trial.user_attrs.get(RERUN_OF_ATTR),
-            reason=_first_cause_line(trial),
+            reason=_first_cause_line(trial, experiment),
+            recovered=recovered,
         )
     )
 
 
-def _first_cause_line(trial: optuna.trial.FrozenTrial) -> str | None:
-    """Return the first line of a trial's recorded outcome cause.
+def _log_trial_start(
+    experiment: Experiment,
+    phase: Phase,
+    trial: optuna.Trial,
+    *,
+    gpu: str | None,
+    in_place: bool,
+) -> None:
+    """Report a trial whose trainer is about to start, and the trial a rerun in place resumes.
+
+    :param Experiment experiment: The experiment the phase belongs to.
+    :param Phase phase: The phase the trial belongs to.
+    :param optuna.Trial trial: The trial about to launch.
+    :param str | None gpu: The devices its trainer sees, ``None`` or empty when it leases none.
+    :param bool in_place: Whether it continues its source's trial directory.
+    """
+    params, repeat = _repeat_split(phase, trial.params)
+    report.info(
+        trial_start_line(
+            experiment,
+            phase,
+            number=trial.number,
+            gpu=gpu,
+            params=params,
+            repeat=repeat,
+            resumes=trial.user_attrs.get(RERUN_OF_ATTR) if in_place else None,
+        )
+    )
+
+
+def _first_cause_line(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> str | None:
+    """Return the first line of a trial's recorded outcome cause, or of its measurement's notes.
 
     :param optuna.trial.FrozenTrial trial: Trial whose outcome record is read.
-    :return str | None: The cause's first nonblank line, or None when it recorded none.
+    :param Experiment experiment: Config whose bounds judge a measured trial.
+    :return str | None: The cause's first nonblank line, else
+        :func:`~phasesweep.engine.bounds.measured_reason`, else None.
     """
     parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
-    lines = parsed.cause.strip().splitlines() if parsed and parsed.cause else []
+    cause = parsed.cause if parsed and parsed.cause else measured_reason(trial, experiment)
+    lines = cause.strip().splitlines() if cause else []
     return lines[0] if lines else None
 
 
@@ -149,6 +241,9 @@ def _log_reruns(
     reruns: Sequence[tuple[int, int]],
 ) -> None:
     """Report each interrupted rerun or failed grid-cell retry and its source's cause.
+
+    One further line warns when reruns launch in a directory that holds a finished attempt's
+    model, which an interrupted attempt's resume never does.
 
     :param Experiment experiment: The experiment the phase belongs to.
     :param Phase phase: The phase whose study scheduled the reruns.
@@ -166,6 +261,30 @@ def _log_reruns(
                 phase,
                 number=rerun,
                 source=source,
-                reason=_first_cause_line(trials[source]),
+                reason=_first_cause_line(trials[source], experiment),
             )
+        )
+    # The trial-directory rules import this module, so they load on first use.
+    from phasesweep.engine.ledger import phase_studies_for
+    from phasesweep.engine.paths import _phase_dir
+    from phasesweep.engine.trial_dirs import reruns_over_finished_results
+
+    overwriting = reruns_over_finished_results(
+        phase_studies_for(study), trials, [rerun for _, rerun in reruns]
+    )
+    if len(overwriting) == 1:
+        number, name = overwriting[0]
+        log.warning(
+            "[%s/trial_%d] Reruns in %s, where a finished attempt's model can be overwritten. "
+            'See docs/runtime.md ("Interrupted trials rerun").',
+            phase.name,
+            number,
+            _phase_dir(experiment, phase.name) / name,
+        )
+    elif overwriting:
+        log.warning(
+            "[%s] %d reruns write where finished attempts' models can be overwritten. "
+            'See docs/runtime.md ("Interrupted trials rerun").',
+            phase.name,
+            len(overwriting),
         )

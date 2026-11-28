@@ -16,10 +16,10 @@ from phasesweep.engine.state import METRIC_EXTRACTOR_LABEL
 from phasesweep.evidence.evaluation import ExtractorError, run_extractor
 from phasesweep.evidence.models import JsonEnvelopeExtractor, JsonExtractor
 from tests.conftest import (
+    addressed_phase_study,
     make_experiment,
     make_trial_context,
     no_winner_remedy,
-    phase_trials,
     write_trainer,
 )
 
@@ -36,15 +36,15 @@ def _remedy(tmp_path: Path, reasons: list[str], *, persistent: bool) -> str:
 def test_an_unreadable_objective_says_which_fix_continues_the_study_and_which_starts_one(
     tmp_path: Path,
 ) -> None:
-    """The retry step is preceded by the sentence that sends a wrong `metric` to a fresh study."""
+    """A wrong `metric` is re-read; the retry step is offered only as the alternative to that."""
     remedy = _remedy(tmp_path, [_KEY_MISSING] * 2, persistent=True)
 
     assert remedy.index(_UNREADABLE) < remedy.index(
-        "Fix the failure, then raise phases[p].n_trials"
+        "not retrained. Otherwise, fix the failure, then raise phases[p].n_trials"
     )
     assert (
-        f"{_UNREADABLE}; if the `metric` settings are wrong, correct them under a new "
-        "`experiment` name."
+        f"{_UNREADABLE}; if the `metric` settings are wrong, correct them and rerun: the "
+        "finished trials are re-read from their kept evidence, not retrained."
     ) in remedy
     assert "lossz" not in remedy
 
@@ -123,17 +123,25 @@ def test_an_aborted_phase_with_an_unreadable_objective_gives_steps_that_work(
         run_experiment(wrong)
     message = _operational_error_text(aborted.value)
     assert message.index(_UNREADABLE) < message.index(
-        "Fix the cause, then raise phases[p].n_trials"
+        "not retrained. Otherwise, fix the cause, then raise phases[p].n_trials"
     )
-    assert "correct them under a new `experiment` name" in message
+    assert "correct them and rerun" in message
 
-    renamed = experiment("t_fixed", "loss", 4)
-    run_experiment(renamed)
-    assert [trial.state.name for trial in phase_trials(renamed)] == ["COMPLETE"] * 4
+    def states_of(config: Experiment) -> list[str]:
+        study = addressed_phase_study(config)
+        return [trial.state.name for trial in study.get_trials(deepcopy=False)]
 
+    corrected = experiment("t", "loss", 4)
+    run_experiment(corrected)
+    assert states_of(corrected) == ["COMPLETE"] * 4
+
+    # The other branch, in an experiment whose only study is the aborted one.
+    unfixed = experiment("u", "lossz", 4)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(unfixed)
     _write_result_trainer(tmp_path, keys=["loss", "lossz"])
-    run_experiment(experiment("t", "lossz", 6))
-    states = [trial.state.name for trial in phase_trials(wrong)]
+    run_experiment(experiment("u", "lossz", 6))
+    states = states_of(unfixed)
     assert states.count("FAIL") == 2
     assert states.count("COMPLETE") == 4
 

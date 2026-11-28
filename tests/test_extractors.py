@@ -14,6 +14,7 @@ import pytest
 from pydantic import ValidationError
 
 from phasesweep.evidence.evaluation import (
+    EVIDENCE_PROVENANCE_SCHEMA_VERSION,
     DeadlineExceededError,
     EvidenceUnreadableError,
     ExtractorError,
@@ -29,11 +30,13 @@ from phasesweep.evidence.models import (
     LogRegexExtractor,
     MlflowExtractor,
     MlflowRequiredGate,
+    RequiredFileGate,
+    Sha256Gate,
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
 from tests.conftest import make_trial_context
-from tests.tracking_helpers import ManualClock
+from tests.tracking_helpers import ManualClock, attach_wandb_transport
 
 
 def _wandb_poll(**kwargs):
@@ -50,6 +53,36 @@ def _wandb_poll(**kwargs):
             **kwargs,
         }
     )
+
+
+def test_reread_artifact_gates_require_state_from_before_the_next_launch(tmp_path):
+    """A shared file, directory or digest from a later retry cannot pass an earlier gate."""
+    ctx = make_trial_context(tmp_path)
+    earlier = ctx.trial_dir / "earlier.txt"
+    earlier.write_bytes(b"checkpoint")
+    time.sleep(0.01)
+    with_later_contents = ctx.trial_dir / "checkpoints"
+    with_later_contents.mkdir()
+    file = with_later_contents / "new.pt"
+    file.write_bytes(b"checkpoint")
+    cutoff = (earlier.stat().st_ctime_ns + file.stat().st_ctime_ns) / 2e9
+    gates = [
+        RequiredFileGate(type="required_file", path="earlier.txt"),
+        RequiredFileGate(type="required_file", path="checkpoints/new.pt"),
+        Sha256Gate(
+            type="sha256",
+            path="checkpoints/new.pt",
+            sha256=hashlib.sha256(b"checkpoint").hexdigest(),
+        ),
+        ArtifactSizeGate(
+            type="artifact_size", source="file", path="checkpoints/new.pt", min_bytes=1
+        ),
+        ArtifactSizeGate(type="artifact_size", source="directory", path="checkpoints", min_bytes=1),
+    ]
+    assert all(gate.passed for gate in evaluate_gates(ctx, gates))
+    old, *new = evaluate_gates(replace(ctx, evidence_before=cutoff), gates)
+    assert old.passed
+    assert all(not gate.passed and "another attempt reused" in gate.detail for gate in new), new
 
 
 def test_json_float_overflow_is_invalid_evidence(tmp_path):
@@ -137,9 +170,7 @@ def test_wandb_real_sdk_decodes_refreshed_finished_summary(tmp_path, monkeypatch
     def initialize(self, overrides=None, timeout=None):
         assert overrides == {"base_url": "https://example.test"}
         self.settings = {"entity": "entity", "project": "project"}
-        self._runs = {}
-        self._service_api = Transport()
-        self.api_key = None
+        attach_wandb_transport(self, Transport())
 
     monkeypatch.setattr(public.Api, "__init__", initialize)
     capture = _wandb_poll(required_keys=["eval/loss"], presence_keys=["large", "absent"])
@@ -194,7 +225,7 @@ def test_wandb_real_sdk_error_causes_are_preserved(tmp_path, monkeypatch, status
         attempts.clear()
         monkeypatch.setattr(
             "phasesweep.evidence.evaluation.poll_wandb_summary",
-            lambda trial_dir, environment, **kwargs: _wandb_poll(**kwargs),
+            lambda attempt_dir, attempt_id, environment, **kwargs: _wandb_poll(**kwargs),
         )
         extractor = WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss")
         with pytest.raises(EvidenceUnreadableError, match=str(status)):
@@ -241,7 +272,8 @@ def test_wandb_invalid_scalar_is_not_retryable(monkeypatch, value):
         ("WandbPollTimeout", ("attempt", 1.0, False)),
         ("WandbRunTerminalError", ("attempt", "crashed")),
         ("WandbSetupError", ("attempt", "denied")),
-        ("WandbMissingKeysError", ("attempt", ["loss"], ["eval/loss"])),
+        ("WandbMissingKeysError", ("attempt", ["loss"], ["eval/loss"], 1.0)),
+        ("WandbNothingToScoreError", ("attempt", "was not found")),
     ],
 )
 def test_wandb_errors_unwind_through_context_managers(name, arguments):
@@ -262,44 +294,52 @@ def test_wandb_errors_unwind_through_context_managers(name, arguments):
 class _HistoryRun:
     """A finished run whose history, and the index describing it, a test controls.
 
-    ``indexed_steps`` are the index's last steps on successive loads before it
-    reaches the last row; ``visible`` slices the rows successive reads return
-    before all of them are visible, as reads just after a run finishes do.
+    The index looks like the live service's: it lists every logged key and every
+    summary key, aggregates such as ``eval/loss.min`` included although no row carries
+    them, each with a count of 2 whatever the row count. ``indexed_steps`` are the
+    index's last steps on successive loads before it reaches the last row, ``None`` for
+    a null index and -1 for one without keys, as W&B serves before indexing; ``visible``
+    slices the rows successive sampled reads return, as W&B has served scanned rows
+    before sampled ones; ``summaries`` are the summaries successive loads serve after the
+    one the lookup returned.
     """
 
-    def __init__(self, summary, rows, indexed_steps=(), visible=()):
+    def __init__(self, summary, rows, indexed_steps=(), visible=(), summaries=()):
         self.state = "finished"
         self.summary_metrics = summary
         self.rows = rows
         self.indexed_steps = iter(indexed_steps)
         self.visible = iter(visible)
+        self.summaries = iter(summaries)
         self.history_keys = None
         self.reads = []
 
     def load(self, force=False):
         assert force is True
-        counts: dict[str, int] = {}
-        for row in self.rows:
-            for key in row.keys() - {"_step"}:
-                counts[key] = counts.get(key, 0) + 1
-        last_step = max((row["_step"] for row in self.rows), default=-1)
-        self.history_keys = {
-            "lastStep": next(self.indexed_steps, last_step),
-            "keys": {
-                key: {"typeCounts": [{"type": "number", "count": count}]}
-                for key, count in counts.items()
-            },
-        }
+        self.summary_metrics = next(self.summaries, self.summary_metrics)
+        listed = {key for row in self.rows for key in row} | set(self.summary_metrics)
+        indexed = next(self.indexed_steps, max((row["_step"] for row in self.rows), default=-1))
+        self.history_keys = (
+            None
+            if indexed is None
+            else {
+                "lastStep": indexed,
+                "keys": {
+                    key: {"typeCounts": [{"type": "number", "count": 2}]}
+                    for key in listed | {"_runtime", "_timestamp"}
+                    if indexed >= 0
+                },
+            }
+        )
 
     def _logged(self, keys):
         # Like the server, only rows that logged every requested key.
-        rows = [row for row in self.rows if all(key in row for key in keys)]
-        return rows[next(self.visible, slice(None))]
+        return [row for row in self.rows if all(key in row for key in keys)]
 
     def history(self, keys, samples=500, pandas=True):
         assert pandas is False
         self.reads.append(("history", keys))
-        rows = self._logged(keys)
+        rows = self._logged(keys)[next(self.visible, slice(None))]
         # The server returns a series of at least ``samples`` rows as a sample.
         return rows if len(rows) < samples else rows[::2][:samples]
 
@@ -311,7 +351,13 @@ class _HistoryRun:
 
 
 def _history_position(
-    monkeypatch, run, metric_key="eval/loss", axis="_step", poll_seconds=0.001, timeout_seconds=1
+    monkeypatch,
+    run,
+    metric_key="eval/loss",
+    axis="_step",
+    poll_seconds=0.001,
+    timeout_seconds=1,
+    value=None,
 ):
     from phasesweep.evidence.wandb import _locate_wandb_position
 
@@ -325,7 +371,7 @@ def _history_position(
         poll_seconds=poll_seconds,
         metric_key=metric_key,
         axis=axis,
-        value=run.summary_metrics[metric_key],
+        value=run.summary_metrics[metric_key] if value is None else value,
         deadline=time.monotonic() + timeout_seconds,
     )
 
@@ -373,7 +419,53 @@ def test_wandb_locates_where_the_objective_summary_was_logged(
 ):
     run = _HistoryRun(summary, _EVAL_ROWS)
     assert _history_position(monkeypatch, run, metric_key, axis) == expected
-    assert {kind for kind, _ in run.reads} <= {"history"}
+
+
+def test_wandb_aggregate_key_listed_in_the_index_is_read_from_its_series(monkeypatch):
+    """An aggregate key the index lists but no row carries is read from its head series, after one scan confirms it is empty."""
+    run = _HistoryRun({"eval/loss.min": 0.2, "_step": 5}, _EVAL_ROWS)
+    run.load(force=True)
+    assert "eval/loss.min" in run.history_keys["keys"]
+    assert _history_position(monkeypatch, run, "eval/loss.min", "eval/step") == 400
+    assert run.reads == [
+        ("history", ["eval/loss.min", "_step"]),
+        ("scan", ["eval/loss.min", "_step"]),
+        ("history", ["eval/loss", "eval/step"]),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("evaluations", "expected"),
+    [([5, 10, 15, 20], 20), (list(range(1, 13)), 12)],
+    ids=["sweep-trainer", "resumed-trainer"],
+)
+def test_wandb_live_trainer_histories_are_positioned_at_their_last_evaluation(
+    monkeypatch, evaluations, expected
+):
+    """The live trainers' runs, one eval row per ``_step`` and an ``eval/loss.min`` summary, are positioned at their last ``eval/step``."""
+    rows = [
+        {"_step": step, "eval/loss": 1.0 / evaluation, "eval/step": evaluation}
+        for step, evaluation in enumerate(evaluations)
+    ]
+    summary = {"eval/loss.min": min(row["eval/loss"] for row in rows), "_step": len(rows) - 1}
+    run = _HistoryRun(summary, rows)
+    assert _history_position(monkeypatch, run, "eval/loss.min", "eval/step") == expected
+
+
+def test_wandb_axis_never_logged_settles_without_a_read(monkeypatch):
+    """An axis the index does not list leaves no position to find, so nothing is read or waited for."""
+    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS)
+    start = time.monotonic()
+    assert _history_position(monkeypatch, run, axis="tokens", timeout_seconds=60) is None
+    assert time.monotonic() - start < 5
+    assert run.reads == []
+
+
+def test_wandb_empty_sampled_read_is_scanned_once(monkeypatch):
+    """Rows the sampled call does not serve yet are read by one scan instead of a wait."""
+    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, visible=[slice(0, 0)])
+    assert _history_position(monkeypatch, run, axis="eval/step") == 400
+    assert [kind for kind, _ in run.reads] == ["history", "scan"]
 
 
 @pytest.mark.parametrize("direction", [-math.inf, math.inf])
@@ -431,37 +523,21 @@ def test_wandb_series_at_the_sample_cap_is_scanned_in_pages_never_sampled(monkey
     monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SAMPLES", 2)
     run = _HistoryRun({"eval/loss.min": 0.2, "_step": 5}, _EVAL_ROWS)
     assert _history_position(monkeypatch, run, "eval/loss.min", "eval/step") == 400
-    assert [kind for kind, _ in run.reads] == ["scan"]
+    # Six rows exceed the cap of two, so the aggregate key and then its head are scanned.
+    assert [kind for kind, _ in run.reads] == ["scan", "scan"]
     # A page of as many steps as the cap holds at most that many rows.
     assert run.page_size == 2
 
 
-@pytest.mark.parametrize(
-    ("visible", "metric_key", "expected"),
-    [
-        # Just after a run finishes, reads can return only the newest rows ...
-        pytest.param(slice(-2, None), "eval/loss", 400, id="newest-only"),
-        # ... or miss the newest ones, which would end the series early.
-        pytest.param(slice(0, 2), "eval/loss.min", 400, id="oldest-only"),
-    ],
-)
-def test_wandb_read_short_of_the_indexed_row_count_is_retried(
-    monkeypatch, visible, metric_key, expected
-):
-    run = _HistoryRun({metric_key: 0.2, "_step": 5}, _EVAL_ROWS, visible=[visible])
-    assert _history_position(monkeypatch, run, metric_key, "eval/step") == expected
-    assert [kind for kind, _ in run.reads] == ["history", "history"]
-
-
 def test_wandb_slow_summary_polling_still_retries_history(monkeypatch):
-    """A summary poll interval past the settle window must not leave one history read."""
+    """A summary poll interval as long as the budget must not leave one history read."""
     monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_RETRY_SECONDS", 0.001)
-    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, visible=[slice(-2, None)])
+    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=[3])
     position = _history_position(
         monkeypatch, run, "eval/loss", "eval/step", poll_seconds=60, timeout_seconds=60
     )
     assert position == 400
-    assert len(run.reads) == 2
+    assert len(run.reads) == 1
 
 
 @pytest.mark.parametrize(
@@ -469,41 +545,71 @@ def test_wandb_slow_summary_polling_still_retries_history(monkeypatch):
     [("best/loss", 0.1), ("eval/loss.selected", 0.123456), ("eval/loss.selected", 0.4)],
     ids=["absent-series", "custom-suffix-unlogged-value", "custom-suffix-matching-value"],
 )
-def test_wandb_summary_key_absent_from_history_settles_without_a_read(
+def test_wandb_summary_key_absent_from_history_settles_with_no_position(
     monkeypatch, metric_key, value
 ):
+    """A summary key no row carries settles after one sampled read and one scan, without waiting."""
     run = _HistoryRun({metric_key: value, "_step": 5}, _EVAL_ROWS)
-    assert _history_position(monkeypatch, run, metric_key, "eval/step") is None
-    assert run.reads == []
-
-
-def test_wandb_dotted_history_series_is_read_before_its_head(monkeypatch):
-    rows = [
-        {"_step": 0, "eval/loss": 0.2, "eval/loss.ema": 0.3, "eval/step": 10},
-        {"_step": 1, "eval/loss": 0.3, "eval/loss.ema": 0.2, "eval/step": 20},
+    assert _history_position(monkeypatch, run, metric_key, "eval/step", timeout_seconds=60) is None
+    assert run.reads == [
+        ("history", [metric_key, "eval/step"]),
+        ("scan", [metric_key, "eval/step"]),
     ]
-    run = _HistoryRun({"eval/loss.ema": 0.2, "_step": 1}, rows)
-    assert _history_position(monkeypatch, run, "eval/loss.ema", "eval/step") == 20
-    assert run.reads == [("history", ["eval/loss.ema", "eval/step"])]
 
 
-def test_wandb_waits_for_history_to_reach_the_summary_step(monkeypatch):
-    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=[3, 4])
+@pytest.mark.parametrize("suffix", ["ema", "min"])
+def test_wandb_dotted_history_series_is_read_before_its_head(monkeypatch, suffix):
+    """A series really logged under a dotted name, even an aggregate-looking one, is positioned by its own rows."""
+    key = f"eval/loss.{suffix}"
+    rows = [
+        {"_step": 0, "eval/loss": 0.2, key: 0.3, "eval/step": 10},
+        {"_step": 1, "eval/loss": 0.3, key: 0.2, "eval/step": 20},
+        {"_step": 2, "eval/loss": 0.4, key: 0.25, "eval/step": 30},
+    ]
+    run = _HistoryRun({key: 0.2, "_step": 2}, rows)
+    assert _history_position(monkeypatch, run, key, "eval/step") == 20
+    reads = [("history", [key, "eval/step"])]
+    if suffix == "min":
+        reads.insert(0, ("history", [key, "_step"]))
+    assert run.reads == reads
+
+
+def test_wandb_dotted_history_series_without_its_axis_has_no_position(monkeypatch):
+    """A literal metric without the axis cannot acquire its head's unrelated position."""
+    key = "eval/loss.min"
+    rows = [
+        {"_step": 0, key: 0.2},
+        {"_step": 1, "eval/loss": 0.9, "eval/step": 20},
+    ]
+    run = _HistoryRun({key: 0.2, "_step": 1}, rows)
+    assert _history_position(monkeypatch, run, key, "eval/step") is None
+
+
+@pytest.mark.parametrize("indexed_steps", [[3, 4], [None, -1, -1]], ids=["behind", "unindexed"])
+def test_wandb_waits_for_history_to_reach_the_summary_step(monkeypatch, indexed_steps):
+    """An index behind the summary, or not yet served at all, is waited for before any read."""
+    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=indexed_steps)
     assert _history_position(monkeypatch, run, axis="eval/step") == 400
     assert len(run.reads) == 1
 
 
-def test_wandb_history_that_never_settles_stops_at_the_settle_window(monkeypatch):
-    monkeypatch.setattr("phasesweep.evidence.wandb._FINISH_SETTLE_SECONDS", 0.05)
+def test_wandb_position_is_read_from_the_summary_each_load_serves(monkeypatch):
+    """A lookup that returned an unserved summary, and a first load that still does, are read again until the summary is served, never settled as no position from the first snapshot."""
+    served = {"eval/loss": 0.2, "_step": 5}
+    run = _HistoryRun({}, _EVAL_ROWS, summaries=[{}, served])
+    assert _history_position(monkeypatch, run, axis="eval/step", value=0.2) == 400
+
+
+def test_wandb_history_that_never_settles_stops_at_the_deadline(monkeypatch):
     run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=[3] * 10**6)
     start = time.monotonic()
-    assert _history_position(monkeypatch, run, timeout_seconds=60) is None
-    assert time.monotonic() - start < 30
+    assert _history_position(monkeypatch, run, timeout_seconds=0.2) is None
+    assert 0.1 < time.monotonic() - start < 30
     assert run.reads == []
 
 
-def test_wandb_transient_history_failure_retries_past_the_settle_window(monkeypatch):
-    """Only waiting for history to catch up is bounded by the settle window."""
+def test_wandb_transient_history_failure_retries_until_the_deadline(monkeypatch):
+    """A history read that fails in transport after a long wait is read again within the deadline."""
     clock = _fake_wandb_clock(monkeypatch)
 
     class FlakyRun(_HistoryRun):
@@ -521,10 +627,8 @@ def test_wandb_transient_history_failure_retries_past_the_settle_window(monkeypa
 
 
 @pytest.mark.parametrize(("timeout", "expected"), [(120, 400), (70, None)])
-def test_wandb_history_read_may_outlast_the_settle_window_but_not_the_deadline(
-    monkeypatch, timeout, expected
-):
-    """A history read may outlast the settle window, bounded by the deadline."""
+def test_wandb_history_read_is_bounded_by_the_deadline(monkeypatch, timeout, expected):
+    """A slow history read is used when it ends before the deadline."""
     clock = ManualClock()
     monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", clock.monotonic)
     monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SAMPLES", 1)
@@ -617,7 +721,7 @@ def _wandb_failures() -> dict[str, tuple[Exception, bool]]:
         "worker": (RuntimeError("worker exited"), True),
         "missing-run": (wandb_evidence.WandbRunMissingError(attempt), False),
         "terminal": (wandb_evidence.WandbRunTerminalError(attempt, "crashed"), False),
-        "missing-keys": (wandb_evidence.WandbMissingKeysError(attempt, ["loss"], []), False),
+        "missing-keys": (wandb_evidence.WandbMissingKeysError(attempt, ["loss"], [], 1.0), False),
         "invalid": (ValueError("not a finite number"), False),
     }
 
@@ -917,12 +1021,12 @@ def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monk
 
     def lookup(path):
         calls.append(path)
-        return SimpleNamespace(state="finished", summary_metrics={})
+        return SimpleNamespace(state="finished", summary_metrics={"other_key": 1})
 
     monkeypatch.setattr(public, "Api", lambda **kwargs: SimpleNamespace(run=lookup))
     monkeypatch.setattr(
         "phasesweep.evidence.evaluation.poll_wandb_summary",
-        lambda trial_dir, environment, **kwargs: _poll_wandb_summary(**kwargs),
+        lambda attempt_dir, attempt_id, environment, **kwargs: _poll_wandb_summary(**kwargs),
     )
     result = evaluate_gates(
         make_trial_context(tmp_path),
@@ -977,7 +1081,8 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
         class Run:
             state = "finished"
             summary_metrics = {"loss": 0.25, "_step": 7, "done": object(), "unrelated": object()}
-            history_keys = {"lastStep": 7, "keys": {"loss": {"typeCounts": [{"count": 1}]}}}
+            history_keys = {"lastStep": 7, "keys": {"loss": {"typeCounts": [{"count": 2}]},
+                                                    "_step": {"typeCounts": [{"count": 2}]}}}
             def load(self, force=False):
                 pass
             def history(self, keys, samples=500, pandas=True):
@@ -998,7 +1103,8 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
         "entity": "entity",
         "project": "project",
         "run_id": "attempt",
-        "trial_dir": tmp_path,
+        "attempt_id": "attempt",
+        "attempt_dir": tmp_path,
         "poll_seconds": 0.01,
         "timeout_seconds": 5,
         "environment": {"HTTPS_PROXY": "https://transport.test", "PYTHONHOME": "/trainer/python"},
@@ -1028,7 +1134,8 @@ def test_wandb_worker_crash_preserves_private_stderr(wandb_worker_sdk, tmp_path)
             entity="e",
             project="p",
             run_id="attempt",
-            trial_dir=tmp_path,
+            attempt_id="attempt",
+            attempt_dir=tmp_path,
             poll_seconds=0.01,
             timeout_seconds=5,
         )
@@ -1042,7 +1149,7 @@ def test_wandb_worker_crash_preserves_private_stderr(wandb_worker_sdk, tmp_path)
 def test_wandb_missing_summary_key_reports_available_names_after_polling(
     wandb_worker_sdk, tmp_path
 ):
-    """A settle window longer than the timeout ends as a timeout that names the keys."""
+    """A finished summary that never gains the key fails at the deadline, naming the missing and available keys."""
     calls = tmp_path / "lookup-count"
     wandb_worker_sdk(f"""
         from pathlib import Path
@@ -1103,10 +1210,6 @@ def test_wandb_finished_summary_can_gain_a_required_key(wandb_worker_sdk, tmp_pa
     assert run_extractor(make_trial_context(tmp_path), extractor) == 0.25
 
 
-# A trainer that logs ``train_runtime`` while the sweep asks for ``train/train_runtime``.
-_RUNTIME_SUMMARY = {"train_runtime": 812.5, "_runtime": 815}
-
-
 def _fake_wandb_clock(monkeypatch: pytest.MonkeyPatch) -> ManualClock:
     """Advance fake monotonic time by the poller's sleeps.
 
@@ -1117,165 +1220,6 @@ def _fake_wandb_clock(monkeypatch: pytest.MonkeyPatch) -> ManualClock:
     monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", clock.monotonic)
     monkeypatch.setattr("phasesweep.evidence.wandb.time.sleep", clock.sleep)
     return clock
-
-
-def _wandb_reads(monkeypatch, state, summary):
-    """Serve the run's ``state(read)`` and ``summary(read)`` on each zero-based read."""
-    public = pytest.importorskip("wandb.apis.public")
-    reads = []
-
-    def lookup(path):
-        reads.append(path)
-        index = len(reads) - 1
-        return SimpleNamespace(state=state(index), summary_metrics=summary(index))
-
-    monkeypatch.setattr(public, "Api", lambda **kwargs: SimpleNamespace(run=lookup))
-    return reads
-
-
-def test_wandb_finished_run_missing_a_key_fails_after_the_settle_window(monkeypatch):
-    """A finished run exposes missing keys after its full settle window."""
-    from phasesweep.evidence.wandb import _FINISH_SETTLE_SECONDS, WandbMissingKeysError
-
-    clock = _fake_wandb_clock(monkeypatch)
-    reads = _wandb_reads(monkeypatch, lambda read: "finished", lambda read: _RUNTIME_SUMMARY)
-    with pytest.raises(WandbMissingKeysError) as caught:
-        _wandb_poll(required_keys=["train/train_runtime"], poll_seconds=5, timeout_seconds=240)
-    assert caught.value.missing == ["train/train_runtime"]
-    assert caught.value.available == ["_runtime", "train_runtime"]
-    # The window opens at the first finished read; the last read is at its end.
-    assert clock.now == _FINISH_SETTLE_SECONDS < 240
-    assert len(reads) == _FINISH_SETTLE_SECONDS / 5 + 1
-
-
-@pytest.mark.parametrize("recovers", [False, True], ids=["outage", "recovers"])
-def test_wandb_unanswered_lookup_at_settle_boundary_keeps_polling(monkeypatch, recovers):
-    """An incomplete summary does not prove that the keys are missing through an outage."""
-    from phasesweep.evidence.wandb import _FINISH_SETTLE_SECONDS, WandbPollTimeout
-
-    clock = _fake_wandb_clock(monkeypatch)
-    recovered_at = _FINISH_SETTLE_SECONDS + 5
-    timeout = recovered_at + 5
-
-    def summary(read: int) -> dict[str, float]:
-        if read == 0:
-            return _RUNTIME_SUMMARY
-        if recovers and clock.now == recovered_at:
-            return {**_RUNTIME_SUMMARY, "loss": 0.25}
-        raise ConnectionError("tracker offline")
-
-    reads = _wandb_reads(monkeypatch, lambda read: "finished", summary)
-    if recovers:
-        capture = _wandb_poll(required_keys=["loss"], poll_seconds=5, timeout_seconds=timeout)
-        assert capture["values"] == {"loss": 0.25}
-        assert clock.now == recovered_at
-    else:
-        with pytest.raises(WandbPollTimeout) as caught:
-            _wandb_poll(required_keys=["loss"], poll_seconds=5, timeout_seconds=timeout)
-        assert not caught.value.reached
-        assert "ConnectionError" in str(caught.value.last_error)
-        assert clock.now == timeout
-    assert len(reads) == recovered_at / 5 + 1
-
-
-def test_wandb_missing_key_failure_reason_names_missing_and_available_keys(tmp_path, monkeypatch):
-    """A settled missing-key reply in the reporting reserve fails the trial with details."""
-    from phasesweep.evidence import wandb as wandb_evidence
-
-    clock = _fake_wandb_clock(monkeypatch)
-    settle_by = wandb_evidence._FINISH_SETTLE_SECONDS
-    poll_cutoff = settle_by + 0.5
-    deadline = poll_cutoff + wandb_evidence._REPORT_SECONDS
-
-    def summary(_read: int) -> dict[str, float]:
-        if clock.now == settle_by:
-            clock.sleep(0.75)
-        return _RUNTIME_SUMMARY
-
-    _wandb_reads(monkeypatch, lambda read: "finished", summary)
-
-    def in_process_worker(request, _worker_path, _backend, **_):
-        # The worker's own entry point, so the report crosses its JSON response.
-        directory = tmp_path / "worker"
-        directory.mkdir(mode=0o700)
-        request_path, response_path = directory / "request.json", directory / "response.json"
-        request_path.write_text(json.dumps(dict(request)))
-        assert wandb_evidence.main([str(request_path), str(response_path)]) == 0
-        response = json.loads(response_path.read_text())
-        assert response["status"] == "missing_keys"
-        return SimpleNamespace(timed_out=False, return_code=0), response, None
-
-    monkeypatch.setattr(wandb_evidence, "run_worker", in_process_worker)
-    extractor = WandbExtractor(
-        type="wandb",
-        entity="e",
-        project="p",
-        metric_key="train/train_runtime",
-        poll_seconds=5,
-        timeout_seconds=240,
-    )
-    ctx = make_trial_context(tmp_path)
-    with pytest.raises(ExtractorError) as caught:
-        run_extractor(ctx, extractor, deadline=deadline)
-    assert type(caught.value) is ExtractorError
-    assert str(caught.value) == (
-        f"W&B run https://api.wandb.ai/e/p/{ctx.attempt_id} finished without required "
-        "summary key(s) ['train/train_runtime']; available summary keys: "
-        "['_runtime', 'train_runtime']."
-    )
-    assert poll_cutoff < clock.now < deadline
-
-
-@pytest.mark.parametrize("appears_at_read", [3, 6], ids=["mid-window", "window-end"])
-def test_wandb_key_appearing_within_the_settle_window_is_accepted(monkeypatch, appears_at_read):
-    """A key arriving by the settle boundary is accepted without another wait."""
-    clock = _fake_wandb_clock(monkeypatch)
-    reads = _wandb_reads(
-        monkeypatch,
-        lambda read: "finished",
-        lambda read: (
-            {**_RUNTIME_SUMMARY, "train/train_runtime": 812.5}
-            if read >= appears_at_read
-            else _RUNTIME_SUMMARY
-        ),
-    )
-    capture = _wandb_poll(
-        required_keys=["train/train_runtime"], poll_seconds=5, timeout_seconds=240
-    )
-    assert capture["values"] == {"train/train_runtime": 812.5}
-    assert len(reads) == appears_at_read + 1
-    assert clock.now == 5 * appears_at_read
-
-
-@pytest.mark.parametrize("finished_from_read", [None, 44], ids=["running", "finished-late"])
-def test_wandb_missing_keys_without_a_full_window_poll_until_the_deadline(
-    monkeypatch, finished_from_read
-):
-    """A running run, or a window the deadline cuts short, keeps polling until the deadline."""
-    from phasesweep.evidence.wandb import WandbPollTimeout
-
-    clock = _fake_wandb_clock(monkeypatch)
-    _wandb_reads(
-        monkeypatch,
-        lambda read: (
-            "finished"
-            if finished_from_read is not None and read >= finished_from_read
-            else "running"
-        ),
-        lambda read: _RUNTIME_SUMMARY,
-    )
-    with pytest.raises(WandbPollTimeout) as caught:
-        _wandb_poll(required_keys=["train/train_runtime"], poll_seconds=5, timeout_seconds=240)
-    assert clock.now == 240
-    # The run answered every poll, so the timeout is a verdict on the trial.
-    assert caught.value.reached is True
-    if finished_from_read is None:
-        assert caught.value.last_error is None
-    else:
-        # The window opened at 220 s, so the deadline arrives first.
-        assert "available summary keys: ['_runtime', 'train_runtime']" in str(
-            caught.value.last_error
-        )
 
 
 @pytest.mark.parametrize("request_kind", ["summary", "position"])
@@ -1292,7 +1236,7 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch,
             stdout=output,
             stderr=output,
             timeout=5,
-            trial_dir=tmp_path,
+            attempt_dir=tmp_path,
             attempt_id="attempt",
         )
     assert result.cleanup_confirmed
@@ -1316,7 +1260,8 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch,
         "entity": "e",
         "project": "p",
         "run_id": "attempt",
-        "trial_dir": tmp_path,
+        "attempt_id": "attempt",
+        "attempt_dir": tmp_path,
         "poll_seconds": 0.01,
         "timeout_seconds": 5,
     }
@@ -1329,7 +1274,8 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch,
     assert lifecycle is not None and lifecycle.state == "exited"
     assert lifecycle.cleanup_confirmed is True
     assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds >= 0
-    assert lifecycle.return_code is not None and lifecycle.return_code != 0
+    assert lifecycle.ended_by == "not_started"
+    assert lifecycle.return_code is None
     assert aborted_groups
     assert all(not process._process_group_alive(pgid) for pgid in aborted_groups)
 
@@ -1362,7 +1308,8 @@ def test_wandb_supervision_bounds_blocked_sdk_and_descendants(wandb_worker_sdk, 
             entity="e",
             project="p",
             run_id="attempt",
-            trial_dir=tmp_path,
+            attempt_id="attempt",
+            attempt_dir=tmp_path,
             poll_seconds=0.01,
             timeout_seconds=2,
         )
@@ -1383,7 +1330,8 @@ def test_wandb_position_worker_stopped_at_its_deadline_records_no_position(
         class Run:
             state = "finished"
             summary_metrics = {"loss": 0.25, "_step": 7}
-            history_keys = {"lastStep": 7, "keys": {"loss": {"typeCounts": [{"count": 1}]}}}
+            history_keys = {"lastStep": 7, "keys": {"loss": {"typeCounts": [{"count": 2}]},
+                                                    "_step": {"typeCounts": [{"count": 2}]}}}
             def load(self, force=False):
                 pass
             def history(self, keys, samples=500, pandas=True):
@@ -1401,7 +1349,8 @@ def test_wandb_position_worker_stopped_at_its_deadline_records_no_position(
         entity="e",
         project="p",
         run_id="attempt",
-        trial_dir=tmp_path,
+        attempt_id="attempt",
+        attempt_dir=tmp_path,
         poll_seconds=0.01,
         timeout_seconds=2,
         metric_key="loss",
@@ -1691,7 +1640,7 @@ def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):
     value = run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
 
     assert value == pytest.approx(0.42)
-    assert provenance["schema_version"] == 4
+    assert provenance["schema_version"] == EVIDENCE_PROVENANCE_SCHEMA_VERSION
     assert provenance["extractor"]["kind"] == "json"
     assert provenance["extractor"]["config_sha256"] == extractor_config_fingerprint(cfg)
     assert provenance["source"] == {
@@ -1837,9 +1786,7 @@ def test_wandb_real_sdk_missing_run_polls_until_the_visibility_deadline(
 
     def initialize(self, overrides: object = None, timeout: object = None) -> None:
         self.settings = {"entity": "entity", "project": "project"}
-        self._runs = {}
-        self._service_api = Transport()
-        self.api_key = None
+        attach_wandb_transport(self, Transport())
 
     monkeypatch.setattr(public.Api, "__init__", initialize)
     with pytest.raises(WandbRunMissingError) as refused:
@@ -1847,6 +1794,23 @@ def test_wandb_real_sdk_missing_run_polls_until_the_visibility_deadline(
     assert refused.value.run_id == "attempt"
     assert clock.now == 15
     assert len(lookups) == 3
+
+
+def test_wandb_missing_run_is_recognized_from_the_sdk_wrapper_alone(monkeypatch) -> None:
+    """The service's ``CommError: Could not find run`` answers the lookup without its cause."""
+    public = pytest.importorskip("wandb.apis.public")
+    from wandb.errors import CommError
+
+    from phasesweep.evidence.wandb import WandbRunMissingError
+
+    _fake_wandb_clock(monkeypatch)
+
+    def lookup(path: str) -> None:
+        raise CommError(f"Could not find run <Run {path} (None)>")
+
+    monkeypatch.setattr(public, "Api", lambda **_: SimpleNamespace(run=lookup))
+    with pytest.raises(WandbRunMissingError):
+        _wandb_poll(required_keys=["loss"], poll_seconds=5, timeout_seconds=15)
 
 
 @pytest.mark.parametrize(
@@ -1860,7 +1824,11 @@ def test_wandb_missing_run_diagnostic_follows_the_last_observation(
     from requests import HTTPError, Response
     from wandb.errors import CommError
 
-    from phasesweep.evidence.wandb import WandbPollTimeout, WandbRunMissingError, WandbSetupError
+    from phasesweep.evidence.wandb import (
+        WandbPollTimeout,
+        WandbRunMissingError,
+        WandbSetupError,
+    )
 
     _fake_wandb_clock(monkeypatch)
     calls = 0
@@ -1900,8 +1868,8 @@ def test_wandb_missing_run_diagnostic_follows_the_last_observation(
     assert calls >= 2
     assert "private" not in str(refused.value)
     if isinstance(refused.value, WandbPollTimeout):
-        # Only a lookup that failed in transport leaves the run unanswered.
-        assert refused.value.reached is (last_observation != "network")
+        # A finished run with an empty summary gives no usable answer either.
+        assert refused.value.reached is (last_observation == "running")
         detail = str(refused.value.last_error)
         assert "private" not in detail
         assert "Could not find run" not in detail
@@ -1977,7 +1945,8 @@ def test_wandb_worker_reports_a_missing_run_before_the_supervisor_stops_it(
             entity="e",
             project="p",
             run_id="attempt",
-            trial_dir=tmp_path,
+            attempt_id="attempt",
+            attempt_dir=tmp_path,
             poll_seconds=0.01,
             timeout_seconds=_WORKER_POLL_BUDGET_SECONDS,
         )

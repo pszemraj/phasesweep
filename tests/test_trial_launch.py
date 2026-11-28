@@ -26,8 +26,16 @@ import yaml
 from phasesweep import run_experiment
 from phasesweep.config.models import ExecutionContext, Experiment, Metric
 from phasesweep.engine.artifacts import _warn_environment_drift
+from phasesweep.engine.optuna import _trial_run_state
+from phasesweep.engine.paths import _attempt_dir
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import ATTEMPT_ID_ATTR, FAILURE_REASON_ATTR, TRIAL_DIR_ATTR
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    FAILURE_REASON_ATTR,
+    RERUN_OF_ATTR,
+    TRIAL_DIR_ATTR,
+    _trial_attempt_dir,
+)
 from phasesweep.engine.trial import (
     EnvironmentIdentity,
     ExecutedTrial,
@@ -43,7 +51,7 @@ from phasesweep.evidence.evaluation import MlflowObjectiveMissingError
 from phasesweep.evidence.models import JsonEnvelopeExtractor, WandbSummaryRequiredGate
 from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import ProcessResult, fd_ready, read_attempt_lifecycle
-from phasesweep.tracking.session import write_record
+from phasesweep.tracking.session import attempt_tracking_dir, write_record
 from tests.conftest import make_experiment, make_trial_context, phase_study, write_trainer
 from tests.tracking_helpers import attempt_identity, mlflow_binding
 
@@ -65,6 +73,15 @@ SUPERVISOR_IMPORT_ALLOWLIST = frozenset(
         "types",
     }
 )
+
+
+def _launch_attempt_dir(tmp_path: Path) -> Path:
+    """Return the attempt directory ``_capture_launch_env`` launches into.
+
+    :param Path tmp_path: Directory holding the launched trial directory ``trial_0``.
+    :return Path: Attempt directory of ``attempt-test``, beside the trial directory.
+    """
+    return _attempt_dir(tmp_path, "attempt-test")
 
 
 def _capture_launch_env(
@@ -90,7 +107,7 @@ def _capture_launch_env(
         stdout: Any,
         stderr: Any,
         timeout: float | None,
-        trial_dir: Path,
+        attempt_dir: Path,
         attempt_id: str,
         wallclock_deadline: float | None = None,
         cwd: str | None = None,
@@ -133,6 +150,7 @@ def _capture_launch_env(
         generation_id="generation-test",
         attempt_id="attempt-test",
         trial_dir=tmp_path / "trial_0",
+        attempt_dir=_launch_attempt_dir(tmp_path),
         overrides=trial_overrides,
         timeout_seconds=None,
         gpu_id=gpu_id,
@@ -382,8 +400,8 @@ def test_launch_trial_cli_input_without_trainer_config_is_the_overrides_alone(
     assert (tmp_path / "trial_0" / "overrides_resolved.json").read_text() == expected
     assert captured["PHASESWEEP_OVERRIDES_SHA256"] == hashlib.sha256(expected.encode()).hexdigest()
     assert shlex.split(captured["command"])[2:] == [
-        "--zeta.depth=8",
         "--alpha=1",
+        "--zeta.depth=8",
         "--zeta.width=2",
     ]
 
@@ -1046,7 +1064,7 @@ def test_launch_trial_uses_prepared_environment_identity(
     )
 
     assert captured["TZ"] == "Europe/Berlin"
-    recorded = json.loads((tmp_path / "trial_0" / "environment.json").read_text())
+    recorded = json.loads((_launch_attempt_dir(tmp_path) / "environment.json").read_text())
     assert recorded["env"] == captured["process_env"]
     assert recorded["env"]["TZ"] == "Europe/Berlin"
     assert recorded["digest"] == identity.digest
@@ -1126,7 +1144,8 @@ def test_launch_trial_records_private_environment_json_when_opted_in(
         metric=metric,
     )
 
-    path = tmp_path / "trial_0" / "environment.json"
+    trial_dir = tmp_path / "trial_0"
+    path = _launch_attempt_dir(tmp_path) / "environment.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     identity = _environment_identity(
         make_experiment(env={"CONFIGURED": "value"}, execution=execution, metric=metric), "p"
@@ -1139,16 +1158,14 @@ def test_launch_trial_records_private_environment_json_when_opted_in(
     assert payload["env"]["PHASESWEEP_TEST_TOKEN"] == "ambient-secret"
     assert payload["env"]["CONFIGURED"] == "value"
     assert payload["env"] == captured["process_env"]
-    assert payload["env"]["PHASESWEEP_TRIAL_DIR"] == str(path.parent)
+    assert payload["env"]["PHASESWEEP_TRIAL_DIR"] == str(trial_dir)
     assert payload["env"]["PHASESWEEP_TRIAL_ID"] == "0"
     assert payload["env"]["PHASESWEEP_PHASE"] == "p"
     assert payload["env"]["PHASESWEEP_RUN_NAME"] == "t-p-0-attempt-test"
     assert payload["env"]["PHASESWEEP_GENERATION_ID"] == "generation-test"
     assert payload["env"]["PHASESWEEP_ATTEMPT_ID"] == "attempt-test"
     assert payload["env"]["PHASESWEEP_OVERRIDES_SHA256"] == hashlib.sha256(b"{}\n").hexdigest()
-    assert payload["env"]["PHASESWEEP_OBJECTIVE_PATH"] == str(
-        path.parent / "reports/objective.json"
-    )
+    assert payload["env"]["PHASESWEEP_OBJECTIVE_PATH"] == str(trial_dir / "reports/objective.json")
     assert payload["env"]["CUDA_VISIBLE_DEVICES"] == "2"
     assert payload["env"]["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
 
@@ -1168,7 +1185,7 @@ def test_recorded_environment_includes_wandb_attempt_binding(
             ]
         },
     )
-    recorded = json.loads((tmp_path / "trial_0" / "environment.json").read_text())
+    recorded = json.loads((_launch_attempt_dir(tmp_path) / "environment.json").read_text())
 
     assert recorded["env"] == captured["process_env"]
     assert recorded["env"]["WANDB_RUN_ID"] == "attempt-test"
@@ -1188,13 +1205,15 @@ def test_recorded_environment_resolves_mlflow_name_and_run_bindings(
             },
         }
     )
-    trial_dir = tmp_path / "trial_0"
-    trial_dir.mkdir()
-    write_record(trial_dir / "mlflow-expected.json", attempt_identity())
-    write_record(trial_dir / "mlflow-binding.json", mlflow_binding())
+    phase_dir = tmp_path / "p"
+    attempt_dir = _launch_attempt_dir(phase_dir)
+    attempt_dir.mkdir(parents=True)
+    tracking_dir = attempt_tracking_dir(tmp_path, "generation-test", "attempt-test")
+    write_record(tracking_dir / "mlflow-expected.json", attempt_identity())
+    write_record(tracking_dir / "mlflow-binding.json", mlflow_binding())
 
-    captured = _capture_launch_env(tmp_path, monkeypatch, experiment=experiment)
-    recorded = json.loads((trial_dir / "environment.json").read_text())
+    captured = _capture_launch_env(phase_dir, monkeypatch, experiment=experiment)
+    recorded = json.loads((attempt_dir / "environment.json").read_text())
 
     assert recorded["env"] == captured["process_env"]
     assert recorded["env"]["MLFLOW_EXPERIMENT_ID"] == "1"
@@ -1322,7 +1341,7 @@ def test_launch_trial_writes_no_environment_json_by_default(
     """The full composed environment can hold credentials, so no file is written unless the operator opts in."""
     _capture_launch_env(tmp_path, monkeypatch)
 
-    assert not (tmp_path / "trial_0" / "environment.json").exists()
+    assert not (_launch_attempt_dir(tmp_path) / "environment.json").exists()
 
 
 def test_launch_pipe_waits_accept_descriptors_past_select_limit() -> None:
@@ -1416,7 +1435,9 @@ def test_trial_directory_and_allocated_lifecycle_precede_launch(
         trial_dir = Path(str(kwargs["trial_dir"]))
         study = phase_study(experiment)
         trial = next(trial for trial in study.trials if trial.number == kwargs["trial_id"])
-        lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=str(kwargs["attempt_id"]))
+        lifecycle = read_attempt_lifecycle(
+            Path(str(kwargs["attempt_dir"])), expected_attempt_id=str(kwargs["attempt_id"])
+        )
         observed["trial_dir"] = str(trial_dir)
         observed["trial_dir_attr"] = trial.user_attrs.get(TRIAL_DIR_ATTR)
         observed["lifecycle"] = None if lifecycle is None else lifecycle.state
@@ -1431,10 +1452,10 @@ def test_trial_directory_and_allocated_lifecycle_precede_launch(
 
 
 @pytest.mark.integration
-def test_guardian_sigkill_fails_one_trial_and_continues_phase(
+def test_guardian_sigkill_interrupts_its_trial_which_reruns_in_place(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A killed guardian leaves its live trainer for direct cleanup and later trials still run."""
+    """A killed guardian leaves its live trainer for direct cleanup; the trial is interrupted, not failed, and reruns in its directory in the same run."""
     import phasesweep.runtime.process as process
     from phasesweep.runtime.reaper import _process_group_alive, read_stale_process_identity
 
@@ -1446,7 +1467,9 @@ def test_guardian_sigkill_fails_one_trial_and_continues_phase(
         parser = argparse.ArgumentParser()
         parser.add_argument("--out", required=True)
         args, _ = parser.parse_known_args()
-        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+        marker = Path(os.environ["PHASESWEEP_TRIAL_DIR"]) / "guardian-killed"
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0" and not marker.exists():
+            marker.touch()
             signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
             Path(args.out).write_text(json.dumps({"x": 0.25}))
             os.kill(os.getppid(), signal.SIGKILL)
@@ -1475,40 +1498,50 @@ def test_guardian_sigkill_fails_one_trial_and_continues_phase(
         *,
         grace_seconds: float,
         guardians: Mapping[int, subprocess.Popen[bytes]] | None = None,
+        cancel_signal: int = signal.SIGTERM,
     ) -> dict[int, bool]:
         assert guardians is None
+        assert not cleaned, "only the first attempt loses its guardian"
         first = phase_study(experiment).trials[0]
-        directory = first.user_attrs[TRIAL_DIR_ATTR]
+        attempt_dir = _trial_attempt_dir(first)
         attempt = first.user_attrs[ATTEMPT_ID_ATTR]
-        assert isinstance(directory, str) and isinstance(attempt, str)
-        lifecycle = read_attempt_lifecycle(Path(directory), expected_attempt_id=attempt)
+        assert attempt_dir is not None and isinstance(attempt, str)
+        lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt)
         assert lifecycle is not None and lifecycle.state == "terminating"
-        assert lifecycle.return_code == -signal.SIGTERM
+        assert (lifecycle.ended_by, lifecycle.return_code) == ("guardian_lost", None)
         cleaned.extend(pgids)
-        return real_terminate(pgids, grace_seconds=grace_seconds, guardians=guardians)
+        return real_terminate(
+            pgids, grace_seconds=grace_seconds, guardians=guardians, cancel_signal=cancel_signal
+        )
 
     monkeypatch.setattr(process, "_terminate_process_groups", terminate)
     try:
         winners = run_experiment(experiment)
     finally:
         for trial in phase_study(experiment).trials:
-            directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
+            attempt_dir = _trial_attempt_dir(trial)
             attempt = trial.user_attrs.get(ATTEMPT_ID_ATTR)
-            if isinstance(directory, str) and isinstance(attempt, str):
-                identity = read_stale_process_identity(Path(directory), expected_attempt_id=attempt)
+            if attempt_dir is not None and isinstance(attempt, str):
+                identity = read_stale_process_identity(attempt_dir, expected_attempt_id=attempt)
                 if _process_group_alive(identity.pgid):
                     real_terminate((identity.pgid,), grace_seconds=0.05)
 
-    first, second = phase_study(experiment).trials
-    assert [first.state.name, second.state.name] == ["FAIL", "COMPLETE"]
-    assert winners["p"].trial_number == second.number
+    first, second, rerun = phase_study(experiment).trials
+    assert [_trial_run_state(t) for t in (first, second, rerun)] == [
+        "INTERRUPTED",
+        "COMPLETE",
+        "COMPLETE",
+    ]
+    assert rerun.user_attrs[RERUN_OF_ATTR] == first.number
+    assert rerun.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
     assert winners["p"].metric == 0.5
     assert len(cleaned) == 1 and not _process_group_alive(cleaned[0])
+    first_attempt_dir = _trial_attempt_dir(first)
+    assert first_attempt_dir is not None
     lifecycle = read_attempt_lifecycle(
-        Path(first.user_attrs[TRIAL_DIR_ATTR]),
-        expected_attempt_id=first.user_attrs[ATTEMPT_ID_ATTR],
+        first_attempt_dir, expected_attempt_id=first.user_attrs[ATTEMPT_ID_ATTR]
     )
     assert lifecycle is not None and lifecycle.state == "exited" and lifecycle.cleanup_confirmed
-    assert lifecycle.return_code == -signal.SIGTERM
+    assert (lifecycle.ended_by, lifecycle.return_code) == ("guardian_lost", None)
     assert "Lease guardian" in caplog.text
     assert "root process exited with code -9" not in caplog.text

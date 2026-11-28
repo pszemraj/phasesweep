@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import phase_draws
 from phasesweep.engine.confound import _flagged_checks
-from phasesweep.engine.state import PhaseCounts, Winner
+from phasesweep.engine.state import InterruptedReruns, PhaseCounts, Winner
 from phasesweep.evidence.models import WandbExtractor
 from phasesweep.runtime.terminal import (
     GAP,
@@ -282,6 +282,7 @@ def trial_line(
     repeat: tuple[str, object] | None,
     rerun_of: object,
     reason: str | None,
+    recovered: bool = False,
 ) -> FactLine:
     """Build the line for one finished trial from its recorded values.
 
@@ -296,6 +297,7 @@ def trial_line(
     :param tuple[str, object] | None repeat: Repeat key and value this trial ran, if any.
     :param object rerun_of: Trial number this one reruns, ``None`` for a first attempt.
     :param str | None reason: First line of the recorded cause, if any.
+    :param bool recovered: Whether a later run's recovery settled the trial, not its own run.
     :return FactLine: The block to log.
     """
     facts = [
@@ -308,6 +310,8 @@ def trial_line(
     notes = [] if repeat is None else [f"repeat {repeat[0]}={param_text(repeat[1])}"]
     if rerun_of is not None:
         notes.append(f"rerun of {rerun_of}")
+    if recovered:
+        notes.append("recovered")
     style = _STATE_STYLES.get(state)
     return FactLine(
         phase.name,
@@ -316,6 +320,41 @@ def trial_line(
         tail=(*(f"{key}={param_text(item)}" for key, item in params.items()), *notes),
         reason=reason,
         marked=None if style is None else (state, style),
+    )
+
+
+def trial_start_line(
+    experiment: Experiment,
+    phase: Phase,
+    *,
+    number: int,
+    gpu: str | None,
+    params: dict[str, object],
+    repeat: tuple[str, object] | None,
+    resumes: object,
+) -> FactLine:
+    """Build the line for a trial whose trainer is about to start.
+
+    :param Experiment experiment: The experiment, for the label width.
+    :param Phase phase: The trial's phase.
+    :param int number: Trial number within the phase.
+    :param str | None gpu: The devices the trainer sees, ``None`` or empty when it leases none.
+    :param dict[str, object] params: Sampled configuration, repeat key excluded.
+    :param tuple[str, object] | None repeat: Repeat key and value this trial runs, if any.
+    :param object resumes: The interrupted trial this rerun continues in its directory, ``None``
+        for a trial that starts in a directory of its own.
+    :return FactLine: The block to log.
+    """
+    head = [f"trial {number}", "RUNNING", *([f"gpu {gpu}"] if gpu else [])]
+    notes = [] if repeat is None else [f"repeat {repeat[0]}={param_text(repeat[1])}"]
+    if resumes is not None:
+        notes.append(f"resumes trial {resumes}")
+    return FactLine(
+        phase.name,
+        phase_label_width(experiment),
+        head=tuple(head),
+        tail=(*(f"{key}={param_text(item)}" for key, item in params.items()), *notes),
+        reason=None,
     )
 
 
@@ -569,6 +608,31 @@ class SummaryPhase:
     winner_dirs: tuple[str, ...] = ()
     #: Confound checks the winner's selection flagged, in report order.
     flagged: tuple[str, ...] = ()
+    #: :func:`interrupted_clause` of the phase's results, ``None`` when no result reran.
+    interrupted: str | None = None
+
+
+#: The label of the line that says how many of a phase's results reran an interrupted trial.
+INTERRUPTED_LABEL = "interrupted:"
+
+
+def interrupted_clause(reruns: InterruptedReruns) -> str | None:
+    """Say how many of a phase's results reran an interrupted trial, as every report words it.
+
+    It is a fact, not a warning: a rerun continues its source's work by design.
+
+    :param InterruptedReruns reruns: The phase's counts (:func:`_interrupted_reruns`).
+    :return str | None: Such as ``2 of 13 results came from a rerun, the winner among them; 1
+        scored from an earlier attempt's result``, or ``None`` when no result reran.
+    """
+    if not reruns.reruns:
+        return None
+    text = f"{reruns.reruns} of {plural(reruns.results, 'result')} came from a rerun"
+    if reruns.winner:
+        text += ", the winner among them"
+    if reruns.earlier_attempt:
+        text += f"; {reruns.earlier_attempt} scored from an earlier attempt's result"
+    return text
 
 
 def _next_line(command: str, *, color: bool) -> str:
@@ -620,6 +684,11 @@ class Summary:
                 drawn[0] = paint_word(drawn[0], _WINNER_WORD, "winner", start=len(pad), color=color)
                 lines.extend(drawn)
                 lines.extend(self._flagged_lines(phase, pad, width, color=color))
+                if phase.interrupted is not None:
+                    indent = pad + " " * len(f"{_WINNER_WORD}{GAP}")
+                    drawn = wrap_labeled(INTERRUPTED_LABEL, phase.interrupted, width - len(indent))
+                    drawn[0] = paint_word(drawn[0], INTERRUPTED_LABEL, "label", color=color)
+                    lines.extend(indent + line for line in drawn)
                 lines.extend(
                     pad + line
                     for line in directory_lines(
@@ -772,6 +841,7 @@ def summary(
     written: Sequence[str],
     next_command: str,
     show_winners_command: str,
+    launch_free_generation_id: str | None = None,
 ) -> Summary:
     """Build the summary a successful run closes with.
 
@@ -785,6 +855,8 @@ def summary(
     :param Sequence[str] written: The files this run wrote, relative to ``written_root``.
     :param str next_command: The command that reads the result.
     :param str show_winners_command: The ``show-winners`` command a flagged winner points to.
+    :param str | None launch_free_generation_id: The generation a run that launched no trial
+        wrote only to publish its winners, which the headline names, defaults to None.
     :return Summary: The block to log.
     """
     reached = {phase.name for _index, phase in experiment.phases_from(from_phase)}
@@ -800,6 +872,11 @@ def summary(
         facts: tuple[str, ...] = ()
         directories: tuple[str, ...] = ()
         flagged: tuple[str, ...] = ()
+        interrupted = (
+            interrupted_clause(counts[phase.name].reruns)
+            if phase.name in reached and phase.name in counts
+            else None
+        )
         if winner is not None:
             head, tail = winner_facts(winner, experiment.metric.name)
             facts = (*head, *tail)
@@ -807,8 +884,13 @@ def summary(
                 flagged = tuple(_flagged_checks(winner.confound))
             if phase.name in counts:
                 directories = tuple(display_path(path) for path in counts[phase.name].winner_dirs)
-        phases.append(SummaryPhase(phase.name, clauses, facts, directories, flagged))
+        phases.append(SummaryPhase(phase.name, clauses, facts, directories, flagged, interrupted))
     headline = f"Finished in {duration_text(elapsed)}: {run_totals(counts)}"
+    if launch_free_generation_id is not None:
+        headline += (
+            f". No trial launched; generation {launch_free_generation_id} publishes these "
+            "winners under the current config."
+        )
     return Summary(
         headline, tuple(phases), written_root, tuple(written), next_command, show_winners_command
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import importlib
 import json
@@ -22,7 +23,7 @@ from phasesweep.evidence.mlflow import observation_id, select_observation
 from phasesweep.evidence.models import MlflowExtractor, MlflowRequiredGate
 from phasesweep.runtime.shutdown import ShutdownLaunchRefusedError
 from phasesweep.tracking.mlflow import (
-    ManagedObjectiveMissingError,
+    ObjectiveMissingError,
     OperationOutcomeUnknownError,
     OperationRejectedError,
     OperationUnavailableError,
@@ -160,6 +161,7 @@ def test_shared_history_once():
     selectors = [spec("last"), spec("min"), spec("step", step=1)]
     query = {
         "revision": 1,
+        "objective": selectors[0].model_dump(),
         "selections": {observation_id(s): s.model_dump() for s in selectors},
         "gates": [],
     }
@@ -177,6 +179,7 @@ def test_shared_history_once():
         client,
         {
             "binding": binding,
+            "earlier": [],
             "query": query,
             "settings": {"timeout_seconds": 1, "poll_seconds": 0.01},
             "timeout_at": time.monotonic() + 1,
@@ -203,9 +206,13 @@ def test_remote_identity_failures_name_their_cause(problem, message):
 
 
 @pytest.mark.parametrize("status", ["FAILED", "KILLED"])
-def test_unsuccessful_remote_cannot_be_finished(status):
+@pytest.mark.parametrize("delivered", [False, True], ids=["trainer", "outcome-tag-only"])
+def test_unsuccessful_remote_cannot_be_finished(status, delivered):
+    """A run the trainer ended unsuccessfully, or one with only an outcome tag, is never read."""
     binding = mlflow_binding()
-    client = SimpleNamespace(get_run=lambda _: mlflow_run(binding, status=status))
+    run = mlflow_run(binding, status=status)
+    run.data.tags.update({"phasesweep.outcome": status} if delivered else {})
+    client = SimpleNamespace(get_run=lambda _: run)
     with pytest.raises(ValueError, match="unsuccessfully"):
         _capture(
             client,
@@ -747,12 +754,12 @@ def test_creation_that_cannot_be_reconciled_keeps_its_record(
     deadline = time.monotonic() - 1 if expired else None
     worker = _ScriptedWorker(monkeypatch, create=[failure], find=[_ABSENT])
     with pytest.raises(error):
-        bind(deadline)
+        bind(deadline=deadline)
     assert worker.actions == ["create"]
     assert path.with_name(f"{path.stem}.pending.json").exists()
     # Later calls never create; an expired deadline does not even search.
     with pytest.raises(RuntimeError, match="unresolved"):
-        bind(deadline)
+        bind(deadline=deadline)
     assert worker.actions == later_actions
     assert path.with_name(f"{path.stem}.pending.json").exists()
 
@@ -799,22 +806,11 @@ def test_unreadable_creation_response_leaves_the_run_recoverable(
     tmp_path, monkeypatch, slot, reply, recovery
 ):
     """A response the controller cannot read says nothing about a creation, whatever it held."""
-    from phasesweep.engine.paths import _trial_dir_for
     from phasesweep.tracking import session
 
     experiment = native_experiment(tmp_path)
     identity = attempt_identity()
-    directory = _trial_dir_for(
-        experiment,
-        "p",
-        3,
-        generation_id=identity["generation_id"],
-        attempt_id=identity["attempt_id"],
-    )
-    directory.mkdir(parents=True)
-    bind, path = mlflow_binder(
-        tmp_path, slot, experiment=experiment, identity=identity, directory=directory
-    )
+    bind, path = mlflow_binder(tmp_path, slot, experiment=experiment, identity=identity)
     pending = path.with_name(f"{path.stem}.pending.json")
     binding = mlflow_binding()
     created = (
@@ -862,30 +858,31 @@ def test_sync_binds_late_runs_and_retires_expired_misses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Bind found runs at any age and retire absent ones outside the request window."""
-    from phasesweep.engine.paths import _trial_dir_for
+    from phasesweep.engine.paths import _experiment_dir
     from phasesweep.tracking import session
 
     experiment = native_experiment(tmp_path)
     first, second = "1" * 32, "2" * 32
     root = session.tracking_root(experiment)
 
-    def attempt_dir(generation, attempt):
-        return _trial_dir_for(experiment, "p", 3, generation_id=generation, attempt_id=attempt)
+    def pending_path(generation: str, attempt: str) -> Path:
+        directory = session.attempt_tracking_dir(_experiment_dir(experiment), generation, attempt)
+        return directory / session.PENDING_ATTEMPT_BINDING_FILE
 
     pending = {
         "generation": _write_pending(
             root / first / "generation-binding.pending.json", attempt_identity(first, first)
         ),
         "absent": _write_pending(
-            attempt_dir(first, "absent") / "mlflow-binding.pending.json",
+            pending_path(first, "absent"),
             attempt_identity(first, "absent"),
         ),
         "bound": _write_pending(
-            attempt_dir(first, "bound") / "mlflow-binding.pending.json",
+            pending_path(first, "bound"),
             attempt_identity(first, "bound"),
         ),
         "other": _write_pending(
-            attempt_dir(second, "late") / "mlflow-binding.pending.json",
+            pending_path(second, "late"),
             attempt_identity(second, "late"),
         ),
     }
@@ -1134,10 +1131,11 @@ def test_wrong_binding_is_rejected_before_remote_access(tmp_path, monkeypatch, f
         expected["run_id"] = "another-run"
     elif field != "unbound":
         binding[field] = "another-identity"
-    session.write_record(tmp_path / "mlflow-expected.json", expected)
-    if field != "unbound":
-        session.write_record(tmp_path / "mlflow-binding.json", binding)
     ctx = mlflow_trial_context(tmp_path)
+    directory = session.attempt_tracking_dir(tmp_path, ctx.generation_id, ctx.attempt_id)
+    session.write_record(directory / session.EXPECTED_BINDING_FILE, expected)
+    if field != "unbound":
+        session.write_record(directory / session.BINDING_FILE, binding)
 
     def remote(*args, **kwargs):
         pytest.fail("A foreign binding must not contact MLflow")
@@ -1176,6 +1174,7 @@ def _capture_request(binding, *, gates=(), timeout_seconds=120, timeout_at=100.0
     """Build a capture of metric ``loss`` plus the given presence gates, on the fake clock."""
     return {
         "binding": binding,
+        "earlier": [],
         "query": {
             "objective": spec().model_dump(),
             "selections": {observation_id(spec()): spec().model_dump()},
@@ -1275,21 +1274,30 @@ def test_item_logged_before_finishing_is_accepted_without_polling(clock):
     assert clock.sleeps == []
 
 
+@pytest.mark.parametrize("reused", [False, True], ids=["own-directory", "reused-directory"])
 def test_finished_without_a_required_metric_reaches_the_trial_as_the_extractor_error(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, reused
 ):
-    """The worker's report crosses the real entry point and response reader unchanged."""
+    """The worker's report crosses the real entry point and response reader unchanged, and in a directory an earlier attempt used it leaves nothing to score, so the attempt reruns with a fresh run instead of failing."""
     import mlflow
 
-    from phasesweep.evidence.evaluation import MlflowObjectiveMissingError, _capture_mlflow
+    from phasesweep.evidence.baseline import EvidenceBaseline
+    from phasesweep.evidence.evaluation import (
+        MlflowObjectiveMissingError,
+        NothingToScoreError,
+        _capture_mlflow,
+    )
 
     binding, ctx = bind_mlflow_attempt(tmp_path)
+    if reused:
+        ctx = dataclasses.replace(ctx, baseline=EvidenceBaseline(True, {}, 1.0))
     run = mlflow_run(binding, metrics={"cost": 1.0, "accuracy": 0.9})
     monkeypatch.setattr(
         mlflow, "MlflowClient", lambda tracking_uri: SimpleNamespace(get_run=lambda _: run)
     )
     run_mlflow_worker_in_process(monkeypatch)
-    with pytest.raises(MlflowObjectiveMissingError) as failure:
+    expected = NothingToScoreError if reused else MlflowObjectiveMissingError
+    with pytest.raises(expected) as failure:
         _capture_mlflow(ctx, deadline=None)
     assert str(failure.value) == (
         "MLflow run finished without metric 'eval/loss'; "
@@ -1300,7 +1308,7 @@ def test_finished_without_a_required_metric_reaches_the_trial_as_the_extractor_e
 def test_managed_missing_objective_is_a_diagnostic_without_advice(clock: ManualClock) -> None:
     """A missing managed objective names the key and the keys the run has, on one line, and carries no advice."""
     client = _states_client(mlflow_binding(), "FINISHED", metrics={"other": 0.9})
-    with pytest.raises(ManagedObjectiveMissingError) as failure:
+    with pytest.raises(ObjectiveMissingError) as failure:
         _capture(client, _capture_request(mlflow_binding()))
     assert str(failure.value) == (
         "MLflow run finished without metric 'loss'; available metric keys: ['other']."
@@ -1315,7 +1323,7 @@ def test_missing_param_in_a_managed_run_that_has_its_objective_is_a_plain_failur
     client = _states_client(mlflow_binding(), "FINISHED", metrics={"loss": 0.1})
     with pytest.raises(ValueError, match="finished without param 'lr'") as failure:
         _capture(client, _capture_request(mlflow_binding(), gates=[gate]))
-    assert not isinstance(failure.value, ManagedObjectiveMissingError)
+    assert not isinstance(failure.value, ObjectiveMissingError)
 
 
 def test_trainer_owned_missing_objective_keeps_the_key_diagnostic(clock: ManualClock) -> None:
@@ -1368,6 +1376,7 @@ def test_failed_trainer_never_reads_remote_metrics(tmp_path, monkeypatch):
         attempt_id="b" * 32,
         overrides_sha256="c" * 64,
         trial_dir=tmp_path,
+        attempt_dir=tmp_path,
         run_name="test",
         return_code=1,
         duration_seconds=1,
@@ -1404,7 +1413,9 @@ def test_pending_sync_uses_retained_projection(tmp_path, monkeypatch):
     claim_ledger(validate_ledger(experiment))
     trial_dir = tmp_path / "unfinished-training"
     trial_dir.mkdir()
-    write_attempt_lifecycle(trial_dir, attempt_id="d" * 32, state="allocated")
+    attempt_dir = tmp_path / "unfinished-attempt"
+    attempt_dir.mkdir()
+    write_attempt_lifecycle(attempt_dir, attempt_id="d" * 32, state="allocated")
     _register_active_attempt(
         experiment,
         attempt_id="d" * 32,
@@ -1412,6 +1423,7 @@ def test_pending_sync_uses_retained_projection(tmp_path, monkeypatch):
         study_name="training",
         trial_number=0,
         trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         generation_id=binding["generation_id"],
     )
 
@@ -1742,7 +1754,7 @@ def test_worker_crash_names_its_preserved_diagnostic(tmp_path, monkeypatch):
             0,
             False,
             {"status": "objective_missing", "message": "no objective"},
-            ManagedObjectiveMissingError,
+            ObjectiveMissingError,
         ),
         (1, False, {}, OperationOutcomeUnknownError),
         (0, False, {"status": "other"}, OperationOutcomeUnknownError),
@@ -1898,15 +1910,18 @@ def test_binding_helper_checks_target_and_preserves_parent(tmp_path, monkeypatch
     import sys
 
     from phasesweep.tracking import bind_mlflow_run
-    from phasesweep.tracking.session import read_binding, write_record
+    from phasesweep.tracking.session import attempt_tracking_dir, read_binding, write_record
 
     binding = {**mlflow_binding(), "run_mode": "trainer"}
+    trial_dir = tmp_path / "p" / "trial_00000__attempt"
+    attempt_dir = attempt_tracking_dir(tmp_path, binding["generation_id"], binding["attempt_id"])
+    attempt_dir.mkdir(parents=True)
     write_record(
-        tmp_path / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
+        attempt_dir / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
     )
     for key in ("attempt_id", "generation_id", "overrides_sha256"):
         monkeypatch.setenv("PHASESWEEP_" + key.upper(), binding[key])
-    monkeypatch.setenv("PHASESWEEP_TRIAL_DIR", str(tmp_path))
+    monkeypatch.setenv("PHASESWEEP_TRIAL_DIR", str(trial_dir))
     run = mlflow_run(binding, status="FINISHED" if problem == "finished" else "RUNNING")
     run.data.tags = {"mlflow.parentRunId": "trainer-parent"}
     if problem == "experiment":
@@ -1927,10 +1942,10 @@ def test_binding_helper_checks_target_and_preserves_parent(tmp_path, monkeypatch
         with pytest.raises(ValueError, match="different experiment|another attempt|RUNNING"):
             bind_mlflow_run(binding["run_id"])
         assert not updates
-        assert not (tmp_path / "mlflow-binding.json").exists()
+        assert not (attempt_dir / "mlflow-binding.json").exists()
     else:
         bind_mlflow_run(binding["run_id"])
-        assert read_binding(tmp_path) == binding
+        assert read_binding(attempt_dir) == binding
         assert run.data.tags["mlflow.parentRunId"] == "trainer-parent"
 
 
@@ -1940,12 +1955,12 @@ def test_accepted_projection_reports_observed_values() -> None:
 
     from phasesweep.engine.state import (
         DURATION_ATTR,
-        FEASIBLE_ATTR,
         OVERRIDES_ATTR,
         constraint_attr,
         observed_attr,
     )
     from phasesweep.tracking.publication import _accepted_projection
+    from tests.conftest import make_experiment
 
     def projection(**observed: float):
         return _accepted_projection(
@@ -1954,13 +1969,13 @@ def test_accepted_projection_reports_observed_values() -> None:
                 state=optuna.trial.TrialState.COMPLETE,
                 user_attrs={
                     OVERRIDES_ATTR: json.dumps({"lr": 0.1}),
-                    FEASIBLE_ATTR: True,
                     DURATION_ATTR: 1.5,
                     constraint_attr("memory"): 4.0,
                     **{observed_attr(name): value for name, value in observed.items()},
                 },
             ),
             {},
+            make_experiment(),
         )
 
     reported = projection(peak=7.5, steps=3)

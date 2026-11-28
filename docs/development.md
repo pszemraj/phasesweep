@@ -91,7 +91,7 @@ If tests fail under contention, wait for an idle machine and rerun only the fail
 > [!NOTE]
 > A `-m` on the command line *replaces* the `-m 'not live'` in `addopts` rather than adding to it, which is why every marker command on this page that leaves live tests out spells out `not live`.
 
-`@pytest.mark.live` tests use real host hardware or a live external service, so every run leaves them out unless `-m live` selects them. The W&B round trip in `tests/test_wandb_live.py` runs a two-phase W&B-only sweep with a pure-Python trainer. It checks the attempt-keyed remote captures, publication, inherited parameters, and a replay that reads no W&B state. It needs the W&B SDK installed and credentials that may write to the project you name, and skips when `PHASESWEEP_WANDB_ENTITY` or `PHASESWEEP_WANDB_PROJECT` is unset; `PHASESWEEP_WANDB_BASE_URL` selects another W&B server:
+`@pytest.mark.live` tests use real host hardware or a live external service, so every run leaves them out unless `-m live` selects them. The W&B round trip in `tests/test_wandb_live.py` runs a two-phase W&B-only sweep with a pure-Python trainer. It checks the trial-keyed remote captures, publication, inherited parameters, and a replay that reads no W&B state. Its resume test kills a trial's runner after the first attempt's rows reach W&B and checks that each attempt logs its own run, named by its attempt ID, and that the rerun is scored from both runs: an `eval/loss.min` objective over the history merged across the attempts; a failure prints the runs' URLs, states, summaries and histories. W&B can serve a finished run's summary minutes late, so each read may wait up to its 600-second budget and a test can take tens of minutes. It needs the W&B SDK installed and credentials that may write to the project you name, and skips when `PHASESWEEP_WANDB_ENTITY` or `PHASESWEEP_WANDB_PROJECT` is unset; `PHASESWEEP_WANDB_BASE_URL` selects another W&B server:
 
 ```bash
 PHASESWEEP_WANDB_ENTITY=YOUR_ENTITY PHASESWEEP_WANDB_PROJECT=YOUR_PROJECT \
@@ -116,7 +116,7 @@ The W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's summary decodi
 
 Use `tests/conftest.py` for isolation fixtures, model builders and trial records; `tests/experiments.py` for dictionary-based YAML configuration; `tests/ledger_fixtures.py` for golden publications and journal mutations; `tests/mcp_helpers.py` and `tests/recovery_helpers.py` for MCP and recovery setup; `tests/error_routing_helpers.py` for the case record and assertions the two routing contract modules share; and `tests/tracking_helpers.py` for shared tracking fakes and experiment setup. Import shared setup from these support modules rather than another test module. Keep assertions and scenario-specific malformed input or trainer programs with their tests. Helpers that other modules import have public names.
 
-The golden ledger fixture under `tests/fixtures/ledgers` is committed output of a real run. Regenerate it when a persisted format changes; the [fixture guide](../tests/fixtures/ledgers/README.md) gives the command and what churns.
+For a persisted format change, follow the [ledger fixture regeneration procedure](../tests/fixtures/ledgers/README.md#regeneration).
 
 ## PyPI releases
 
@@ -148,7 +148,7 @@ Versions already uploaded to PyPI cannot be replaced; duplicate uploads fail vis
 
 - `phasesweep.config`: Pydantic Experiment models, strict YAML loading, and shared config `--set` path edits (`run_overrides`).
 - `phasesweep.engine`: phase orchestration, fingerprints, local persistence, immutable generation publication, and read-only status.
-- `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates.
+- `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates, and the baseline (`evidence/baseline.py`) of each value file's metadata before an attempt runs, which lets a rerun in its trial's directory check for fresh results.
 - `phasesweep.reporting`: trainer-side JSON-envelope objective writer.
 - `phasesweep.tracking`: MLflow run bindings, supervised controller operations, result delivery, and upload retries.
 - `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, override rendering, and the terminal primitives of human-readable output (`runtime/terminal.py`: the colour decision, terminal width, prose wrapping, display paths). Keep `runtime/supervisor.py` stdlib-only; see the [launch ordering](invariants.md#9-nothing-runs-before-its-process-identity-is-durable).
@@ -174,6 +174,7 @@ Within `phasesweep.engine`, responsibilities map to modules as follows:
 | Trial launch, objective extraction and worker threads | `trial`, `workers` |
 | Samplers and trial identity | `optuna` |
 | Winner selection and repeat groups | `selection`, `repeats` |
+| Feasibility under the configured metric and constraint bounds | `bounds` |
 | Dry-run planning and the live progress report | `preview`, `progress` |
 | Artifact serialization and generation provenance | `artifacts`, `provenance` |
 | Typed engine failures | `errors` |
@@ -182,8 +183,12 @@ Within `phasesweep.engine`, responsibilities map to modules as follows:
 | Locks and stale-attempt cleanup | `locking`, `attempts`, `cleanup` |
 | Root ownership and retained evidence checks | `artifact_roots`, `evidence` |
 | Paths, state records, and fingerprints | `paths`, `state`, `fingerprints` |
+| Trial directory reuse, physical attempt lineage and the shared-evidence cutoff | `trial_dirs` |
+| Re-reading the kept attempts of other reading studies into the addressed study | `reread` |
+| Growing a search space in place, and the grid cell order across its recorded spaces | `growth`, `grid_order` |
 | Advisory confound verdicts on the ranked population, frozen at selection | `confound` |
 | Publication and read-only views | `generation`, `publication`, `publication_validation`, `read` |
+| Why a recorded phase refuses a run or waits, as `status` reports it | `status_refusals` |
 
 `mcp.recovery.recover_run` implements [operator recovery](mcp.md#run-state-and-recovery); the CLI owns its arguments and rendering.
 
@@ -196,8 +201,9 @@ flowchart TD
     cli["CLI or detached MCP runner"] --> run["run.run_experiment"]
     run --> preflight["take experiment lock, check and bind artifact root and ledger, preflight attempts"]
     preflight --> phase["phase._run_phase"]
-    phase --> work{"trials to launch?"}
-    work -->|yes| claim["claim the generation once"]
+    phase --> retained["re-read kept attempts of other reading studies when available"]
+    retained --> work{"trials to launch?"}
+    work -->|yes| claim["pass launch checks and claim the generation once"]
     work -->|no| select
     claim --> optimize["Optuna optimize"]
     optimize --> launch["supervise trainer"]
@@ -205,30 +211,25 @@ flowchart TD
     evidence --> select["select feasible winner"]
     select --> next{"more phases?"}
     next -->|yes| phase
-    next -->|no| changed{"claimed, or winners differ from the publication?"}
+    next -->|no| changed{"claimed, or no matching publication?"}
     changed -->|yes| generation["write immutable generation"]
-    changed -->|no| unchanged["leave both pointers as they were"]
+    changed -->|no| unchanged["make the matching publication current"]
     generation --> pointer["commit last-successful pointer"]
     pointer --> snapshot["freeze MCP terminal result when applicable"]
 ```
 
 ## Test map
 
-The principal test groups and what each covers:
+The [durability invariants](invariants.md) identify the code and tests for storage, publication, process supervision, recovery, reruns, and result reuse. For other changes, start with these suites.
 
 - `tests/test_e2e.py`: complete experiment and `--from-phase` replay.
 - `tests/test_config.py`, `tests/test_param_validation.py`, and `tests/test_overrides.py`: Experiment validation, composition, parameter domains, and retained input boundaries.
 - `tests/test_run_overrides.py`: shared `--set` key syntax, created-key notes, derived-config validation and study inspection with overrides.
 - `tests/test_config_reference.py` and `tests/test_explain.py`: the configuration reference against the schema, its parser's shared blocks and section rules, and `phasesweep explain`.
-- `tests/test_extractors.py`, `tests/test_trial_evidence.py`, and `tests/test_trial_launch.py`: scalar evidence, shared W&B captures, gates, supervised trials, and durable input verification.
-- `tests/test_attempt_lifecycle.py`, `tests/test_process_supervision.py` and `tests/test_guardian_settle.py`: lifecycle parsing, process identity and launch ordering, descendant cleanup including descendants the guardian adopts after they leave the trainer's group, the helper settle after a trainer root exits, and guardian completion evidence.
-- `tests/test_mlflow.py` and `tests/test_mlflow_terminal_delivery.py`: native history selection, run bindings, shared captures, and terminal delivery retries.
-- `tests/test_mlflow_integration.py`: both ownership modes against a temporary HTTP server, stopped-server replay, worker cleanup, and delivery retries.
-- Storage, publication, recovery, interrupted trials and sampler resume: owning code and representative tests are listed by [durability invariant](invariants.md).
+- `tests/test_extractors.py` covers scalar extractors, shared W&B captures and gates. `tests/test_mlflow.py` covers native history selection, run bindings and shared captures. `tests/test_mlflow_integration.py` covers both ownership modes and stopped-server replay against a temporary HTTP server.
 - `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots, detached launch, status, cancellation, and recovery.
-- `tests/test_terminal.py`, `tests/test_terminal_output.py`, `tests/test_trial_table.py` and `tests/test_cli_help.py`: the terminal primitives (the colour decision per stream, width, wrapping, display paths), the CLI's closing lines, refusal layout and the exit status a closed terminal leaves, the exact plain-text output of `status --trials`, command help text, and the quiet exit on a closed output pipe.
-- `tests/test_run_report_summary.py`: the closing summary and the nothing-to-run block of `phasesweep run`, as exact text at 80 and 60 columns (counts, winners, flagged checks, the winners' directories).
-- `tests/test_run_report.py`: what `phasesweep run` prints, as exact text at 80 and 60 columns for each report block (banner, phase start, trial, rerun, skipped, winner), the console handler (time prefix, warning and prose wrapping, styling, contiguous records from threads, the INFO lines of a dry run) and the CLI around it (`-v`, the closing `log:` line, a replay, a resume, the starter's pinned dry-run lines, and a phase abort, failed extraction or fatal error printing once).
+- `tests/test_terminal.py`, `tests/test_terminal_output.py`, `tests/test_trial_table.py` and `tests/test_cli_help.py` cover terminal formatting, `status --trials`, help text, and closed-terminal and closed-pipe behavior.
+- `tests/test_run_report.py` and `tests/test_run_report_summary.py` check exact live and closing report text at 80 and 60 columns, plus console logging and CLI integration.
 - `tests/test_init.py`, `tests/test_fake_train.py` and `tests/test_reporting.py`: template creation and runs, the toy trainer's seed noise, catalog scaffolding, and the objective-envelope writer (`report_objective` and `report-objective`).
 
 ## Tracked TODOs
@@ -236,21 +237,15 @@ The principal test groups and what each covers:
 - TODO(mcp): Replace the private FastMCP strict-schema patch when the SDK exposes a tested public closed-input-schema API; keep behavior-level request validation as the safety net until then.
 - TODO(mcp): Reword the engine steps written for the CLI that reach an MCP agent through the runner. `require_study` (`engine/read.py`) and `ORIGINAL_TARGET_STEP` (`tracking/session.py`) say "the same config and `--set` overrides", which an MCP run does not have, and the ownership step in `engine/run.py` names `phasesweep mcp recover-run` without its `--state-dir` and `--run-id`. The server's own remedies already build the full commands with `recover_run_step` and `sync_tracking_command`.
 - TODO(mcp): Resume a study started through the [SSH form](mcp_setup.md#over-ssh) from an interactive shell on the remote machine, to confirm that section's environment note on a real hop. Launching, a dropped connection, reconnecting from a new client and cancelling work between two machines.
+- TODO(mcp): A live read computes the edge advisory against the current catalog while the frozen result computed it under the run's own config, so a run whose config differs from the catalog's can read "unavailable" live and "not_at_edge" once frozen.
 - TODO(runtime): Design an explicit completion-budget mode only if its attempt accounting, failure cap, and timeout semantics are specified separately.
 - TODO(runtime): Add a deliberately scoped generation-pruning command only if it preserves the current last-successful pointer and all cited winner provenance.
-- TODO(runtime): Distinguish independent trainer failure from guardian cancellation or a failed launch before counting a recovered nonzero exit toward the phase budget and failure limit. The lifecycle exit code alone can represent any of these cases: the guardian records a cancelled trainer and one that somebody else's SIGTERM killed both as -15, and a launch that never reached the trainer as 75, 76 or 77, which a trainer can also exit with. The same gap makes a shutdown that lands in the helper wait after a trainer crashed record the trial as interrupted and rerun it, instead of keeping the crash's own reason. Closing it needs the lifecycle record to say that the guardian cancelled the attempt and to carry no exit code for a trainer that never started. Track with the lifecycle recovery work in [issue 33](https://github.com/pszemraj/phasesweep/issues/33).
-- TODO(runtime): Decide whether shutdown should briefly wait for a trainer root that has reported an objective but not yet exited. Once the root has exited, the guardian already finishes its helper settle regardless of shutdown. Recovery requires a successful exit before accepting the result. Track with [issue 33](https://github.com/pszemraj/phasesweep/issues/33).
 - TODO(runtime): During a live run, a dry run can encounter an ongoing extraction and refuse to predict a trial count. Show the phase as awaiting evidence and label its remaining work as an estimate.
 - TODO(runtime): Use the recorded phase's repeat grouping to rebuild its `trials.csv` after recovery with a renamed or incompatible phase. An interrupted in-memory run also needs its final CSV snapshot taken while the settled study is still available.
 - TODO(runtime): Recover draws whose bookkeeping failed before the trainer started. A fatal pre-launch write can currently spend the draw and require a top-up.
-- TODO(runtime): Print a recovered trial's kept result as a report line in the trial-line style. Recovery logs `Kept completed trial result: …` as a warning, which is the console's only record of the recovered value and carries the `warning:` label for good news.
-- TODO(runtime): Fit `validate`'s contract lines to the terminal and print the extractor without Python dict syntax. `run --dry-run` already wraps the same facts; `validate` prints them as single lines of up to several hundred columns.
-- TODO(runtime): Show a recorded phase abort in `status` and `status --trials`. After a failure-streak abort the phase reads as `3 of 8 trials` with three FAIL rows and no abort mark or `# fix:` line; only the next `run` or dry run says the phase is refused and prints the step.
-- TODO(runtime): Head `status --trials` with the metric the study recorded, or say that the config's differs. After `metric.name` or `metric.goal` is edited, the table labels the recorded values with the edited name and direction while still marking the recorded winner.
-- TODO(runtime): Account for repeated configuration–seed pairs so running the same seed twice does not inflate the pooled noise band's effective sample size.
+- TODO(runtime): Account for repeated configuration-seed pairs so running the same seed twice does not inflate the pooled noise band's effective sample size.
 - TODO(runtime): Recheck process identity in `_signal_members` so PID reuse between enumeration and signalling cannot redirect a signal to another group.
 - TODO(runtime): Withhold edge advice when a restored journal cannot be matched to the population that selected the published winner.
-- TODO(runtime): Reuse the phase trial reads behind `status` when computing winner advisories.
 - TODO(runtime): Let `_phase_counts` use the trials from the completed phase instead of reopening the journal for the closing summary.
 - TODO(tracking): Share the phase trial reads used to match MLflow attempts across generations within a delivery pass.
 - TODO(cli): Preserve argument boundaries when a dry-run command contains an argument with a newline.
@@ -262,10 +257,19 @@ The principal test groups and what each covers:
 - TODO(tracking): Distinguish unstaged or blocked terminal outcomes from an empty queue in `status`. A saved delivery count alone cannot represent either case, and a lock-free `status` cannot rederive them.
 - TODO(tracking): Recover the terminal verdict for a managed attempt whose binding appears after an in-memory generation has published. A published generation can contain both successful and failed trials.
 - TODO(tracking): Bound a managed attempt's MLflow run creation to one `timeout_seconds` during an outage. The create call times out and the reconciling search then spends a second full budget (`tracking/session.py`), so each trial that fails this way waits twice the configured timeout.
+- TODO(tracking): A trainer-owned MLflow rerun in its trial's directory that exits 0 without binding a run leaves nothing to score and reruns from step 0 in a fresh directory, though the earlier attempts' runs may hold the objective's selected point. Score it from those runs: write a reader-side binding that names the newest earlier run, let the capture read that run whatever its status (`CaptureRequest` in `tracking/records.py`, the status gate in `_attributed_capture`), and delivery (`tracking/publication.py`) and winner verification (`engine/evidence.py`) then read the binding as they do today.
+- TODO(tracking): A scoped `sync-tracking` indexes every generation's attempt and winner records (`_shown_attempts` in `tracking/publication.py`), so a malformed record of another generation blocks the selected generation's uploads. Index only the records of the attempts the delivery sends.
+- TODO(runtime): A grid that accepts a partial result at its timeout while its target equals its retry ceiling, which includes every full grid whose `n_trials` is its cell count, can never train the interrupted trial in that study. The same target replays the partial result even with the timeout raised or removed, the ceiling refuses a higher `n_trials`, and dropping `allow_incomplete_on_timeout` refuses the replay. Let a run at the accepted target without `allow_incomplete_on_timeout` continue the owed work instead of refusing.
+- TODO(runtime): With `n_jobs` above 1, a grid that still has undrawn cells and owes failed-cell retries launches the undrawn cells as a batch of their own (`launch_batch` in `engine/reread.py`), so workers idle for one trial duration before the retries start. The retries wait because `_failed_grid_cells` rotates by trial number, which depends on launch order. Rotate by attempts so far and then draw position, and queue retries of known failures beside the last cells.
+- TODO(cli): When the two projections of `run --dry-run` refuse a phase for different reasons, it prints both conditions and exits 0, even if the kept attempts leave no other outcome (one re-read and no launch). Refuse when the projections cover every outcome.
+- TODO(runtime): Remove the survivorship check's `untried` count and `_untried_grid_cells` (`engine/selection.py`). Allocation draws every grid cell before a retry, so a grid whose target covers it never has an untried cell. The count is stored with each winner, so removing it changes the confound record's format.
+- TODO(confound): The `code_revision` check compares commits, so a commit that only edits the sweep config in the trainer's repository flags the winner. Compare the trainer's tree without the config file, or say in the advisory which paths differ.
 
 ## Declined requests
 
 These have been requested and declined. Check this list before proposing one again, and reopen an item only with a reason its entry does not already answer.
+
+- **Rejecting a touched result file on a retry.** A trainer can legitimately rewrite identical bytes in place, and a value file in the trial directory is the trial's result whichever attempt wrote it.
 
 - **Extending pooled noise calculations to objectives near `1e155`.** These values fall outside the numerical range targeted for sweep advice.
 - **Distinguishing integers past `2**53` in numeric edge advice.** Sweep reporting does not require that precision for integer hyperparameters.
@@ -276,7 +280,7 @@ These have been requested and declined. Check this list before proposing one aga
 - **Reading or migrating trees and ledgers written in an older format.** PhaseSweep is still unstable and does not support backward compatibility until it stabilizes. Ledger and artifact format changes bump their record schemas and the respective study or artifact-root stamp; frozen MCP snapshot changes bump the MCP state-format marker. Older data is refused as an unsupported format with a fix line, and the checkout that produced it can still inspect it.
 - **Advice for removed config keys** such as `allow_seed_search`. A removed key fails as an unknown key, like any other; configs that use one stay on the revision that accepted it.
 - **An `await_run` limit above 600 seconds, or a streaming watch tool.** MCP tool calls are request and response, and clients bound how long one may block. An agent repeats `await_run` with the same `run_id`; [MCP](mcp.md) gives the loop.
-- **Importing trials from another experiment or a changed study.** A changed study fingerprint means the recorded trials answered a different question. Derive the new configuration with `run --set` under a new `experiment` name and run it.
+- **Importing trials from another experiment or a changed study.** A changed study fingerprint means the recorded trials trained something else; only a changed reading setting [re-reads](runtime.md#correct-a-reading-setting) them. Derive the new configuration with `run --set` under a new `experiment` name and run it.
 - **An audit-only mode for seed or repeat phases that publishes no winner.** `repeats` already publishes each group's spread with the winner, and a phase that publishes nothing would be a second phase kind for the same need.
 - **A launch queue that chains sweeps.** A scheduler is outside a single-node sweep tool. An agent waits on the blocking run with `await_run` and launches the next one.
 - **Per-item paired bootstrap.** This needs per-example evaluation data that PhaseSweep never collects. The tie warning reports each group's gap against a threshold from the sd pooled over every ranked group, and `show-winners` lists the groups' params; a phase's `cost_key` can advise a cheaper configuration within one pooled standard error from repeat-level objectives.
@@ -285,18 +289,21 @@ These have been requested and declined. Check this list before proposing one aga
 - **Rewriting raw package files and PyPI metadata to pin documentation URLs.** Those static files link to `main`; the installed `explain` and `init` surfaces select release-tag links at read time. Build-time rewriting would add a second link mechanism and a build hook solely to change the raw-file view; the installed surfaces already provide the version-aware links.
 - **Splitting `mcp/tools.py` by size alone.** Moving code without removing a responsibility or mechanism adds review scope without simplifying the implementation. A responsibility moves out as a unit when one is cohesive, as the read-time failure composition did into `mcp/failures.py`.
 - **A nonzero exit for an accepted incomplete winner or pending MLflow uploads.** Both are configured successes: an incomplete winner is published only under `allow_incomplete_on_timeout`, and its winner line says `INCOMPLETE`; pending uploads end with a closing line naming the next run or `sync-tracking`.
-- **Shorter trial directory names.** `trials.csv` is the interface for scripts, since `status --trials` is a table for people; the directory name carries the generation and attempt IDs that keep attempts apart.
+- **Shorter trial directory names.** `trials.csv` is the interface for scripts, since `status --trials` is a table for people; the directory name carries the trial number and the attempt that opened it, and each attempt's own records are kept apart under `attempts/<attempt-id>/`.
 - **Reporting a name missing from `mlflow_required` as a gate failure rather than an objective read error.** The gate and the objective read one shared capture, and a finished run that lacks a required name fails that capture at once, so the trial fails either way; the error names the missing key and lists the run's keys of that kind.
 - **Restricting `record_env` to `true` and `false`.** It is a plain boolean, and every boolean key accepts the same YAML forms.
 - **Treating a key that overrides a `<<:` merge as a duplicate key.** Keys written in a mapping win over merged ones under standard YAML merge semantics. A key written twice in one mapping, or a second `<<`, is still rejected.
 - **Dropping the experiment-level `trainer_config` check because each phase's composition check repeats it.** The experiment-level check names the `trainer_config` key the override format cannot carry; the phase check only reports that composition failed for that phase.
 - **A separate `slow` test marker with a counted budget.** `integration` is the slow tier: a test whose call phase takes at least one second carries it, and fast focused runs leave it out.
 - **One shared failure boundary for the `json_equals`, `json_scalar_bound` and JSON `artifact_size` gates.** Each handler's read-and-report block is four lines and converts a different value. A shared boundary needs a new exception type or a union return, which adds more indirection than the three copies cost.
-- **Keeping a finished trial pending when a phase or run deadline cuts its evidence read short.** The deadline is the configured budget, so the trial is recorded as interrupted with the deadline as its cause. A pending trial would settle on a later run, after `allow_incomplete_on_timeout` had frozen the phase's finished and completed counts into its accepted decision, and replaying that decision refuses a study whose counts changed.
+- **A shutdown wait for a trainer that has reported an objective but not exited.** Only the envelope extractor could know that an objective was reported before the trainer exits, a Ctrl-C asks the run to stop, and an interrupted trial resumes from its checkpoint in its own trial directory, so the stop costs only the steps since that checkpoint.
 - **Running tracker SDK calls in the controller instead of a supervised worker.** A blocked SDK call cannot be cancelled in-process, so only a process the supervisor can kill keeps the one deadline over SDK construction, requests and retries.
 - **`init` writing a toy `train.py` beside the config.** A project that already has a `train.py` would hit `init`'s no-overwrite refusal, and `init` would write two files. The local templates run the packaged `phasesweep-fake-train` console script and the mlflow template runs `phasesweep-mlflow-train`.
 - **Dropping the launch preflight's trial-program check.** Without it a missing program fails every trial after its draw is allocated and records each as a failure. The check judges only what it can read without running a shell and never refuses a command it cannot judge; the [trainer contract](config.md#trainer-contract) lists what that is.
 - **A failing exit status when every catalog entry fails to load.** The server starts in its stale-catalog state, where each response names the failing ids and their fix, whether one entry failed or all of them. A catalog that cannot be read as a whole still exits 2.
+- **Growing string, boolean or mixed choice lists in place, or any choices under `random` or `tpe`.** Optuna's journal rejects a changed categorical list: the writing process raises and a process replaying the journal drops the param. An inheriting phase may not search a key its parent sampled, so the route is a phase with no `inherits`, the original phase's other values in its own `fixed_overrides` and a grid over only the added choices; the two phases' winners are compared by reading both.
+- **Growing `repeats.values` in place.** Seeded random groups trials by draw position divided by the repeat count, so a new count regroups every recorded trial.
+- **Growing a search space in place under `cmaes`.** CMA-ES uses only params whose distribution is the same in every trial, so a widened param would silently fall back to random sampling for the rest of the study. The route is a seeded `random` or `tpe` phase over the wider range with no `inherits` and the original phase's other values in its own `fixed_overrides`, since an inheriting phase may not search a key its parent sampled.
 - **`validate` refusing an `n_trials` below a study's recorded target.** `validate` reads the ledger only to refuse a fixed-configuration or grid target above its retry ceiling. A lowered target is a resume refusal, which `run --dry-run` reports with the rest of the launch contract.
 - **A new MCP failure code once `recover-run` settles a `cleanup_uncertain` run.** The code names why the run stopped. Whether a step remains is `recovery_required`, which reads false after recovery, and the `remediation` says that cleanup is settled and that a new run resumes.
 - **Retrying a held lock inside `try_lock_file`.** Only a run taking its experiment locks must outlast a `status` probe. The probe, the GPU leases and the MCP launch and run leases need the immediate answer.
@@ -312,7 +319,7 @@ These have been requested and declined. Check this list before proposing one aga
 - **A directory line under every failed trial in `status --trials`.** The refusal after failed trials names the phase directory, and `trials.csv` there lists each trial's directory; a line per failure would bury the table.
 - **Dropping `0 from a previous run` from the summary headline of a run that replayed nothing.** The headline keeps one shape, so the count that tells a resumed run from a fresh one is always in the same place.
 - **Quoting the closing `log:` path.** It is a location to read, not a command; the lines meant to be pasted, the `Next:` command and the resume command, are shell-quoted.
-- **Naming `timeout_seconds_per_trial` in a trial's `timeout after Ns` reason.** The reason is the stored record of what happened; the `fix:` line after a phase in which a trial timed out names the key and the rename that raising it needs.
+- **Naming `timeout_seconds_per_trial` in a trial's `timeout after Ns` reason.** The reason is the stored record of what happened; the `fix:` line after a phase in which a trial timed out names the key to raise.
 - **A console line, or a shorter wait, for a second Ctrl-C during shutdown.** The first signal's line says the run is waiting for its trials to exit, and [interrupted trials](runtime.md#interrupted-trials-rerun) gives the bound. A second signal arrives inside the shutdown the first one started, where a line it printed could land in the middle of the write it interrupted, and cutting the wait would report cleanup that had not finished.
 - **Filling every refusal's `fix:` step with the invocation's exact command.** Only the CLI layer knows the command as typed, so the lines it builds itself (the `Next:` command, the resume command, `sync-tracking`'s steps) print it whole; a step raised by the engine names the command with `CONFIG` in place of the config path.
 - **Sending earlier generations' MLflow records oldest first.** Nothing on the delivery path reads a generation's start time, and MLflow orders runs by their own start times. Records go out in generation-ID order, and no order among earlier generations is documented.

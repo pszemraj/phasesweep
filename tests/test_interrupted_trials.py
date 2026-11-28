@@ -41,12 +41,13 @@ from phasesweep.engine.errors import (
     TrackingTargetUnavailableError,
     TrialEvidenceMissingError,
 )
-from phasesweep.engine.fingerprints import _phase_fingerprint
+from phasesweep.engine.fingerprints import _fresh_identity, _stamp_identity
 from phasesweep.engine.guards import _reconcile_existing_studies
 from phasesweep.engine.optuna import (
     _draw_positions,
     _finished_trial_count,
     _trial_count_state,
+    _trial_run_state,
 )
 from phasesweep.engine.paths import (
     _attempts_dir,
@@ -54,6 +55,7 @@ from phasesweep.engine.paths import (
     _generation_config_snapshot_path,
     _last_successful_generation_path,
     _phase_dir,
+    _trial_dir_for,
 )
 from phasesweep.engine.preview import _preview_ledger
 from phasesweep.engine.read import read_trial_tables
@@ -63,17 +65,15 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     DURATION_ATTR,
     FAILURE_REASON_ATTR,
-    FEASIBLE_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
-    PHASE_FINGERPRINT_ATTR,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
-    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
     _parsed_trial_outcome,
     _recovered_trial_state,
+    _trial_attempt_dir,
     _trial_interrupted,
 )
 from phasesweep.engine.study_policy import (
@@ -137,15 +137,14 @@ def test_outcome_parser_requires_a_finite_numeric_success_metric(metric: JsonVal
     assert _parsed_trial_outcome(payload) is None
 
 
-def test_outcome_parser_distinguishes_measured_and_unmeasured_failure() -> None:
-    """Zero is a valid measurement; failures, fatal errors, and interruptions can lack one."""
-    assert _parsed_trial_outcome(trial_outcome(1, "success", metric=0.0)) is not None
-    measured = _parsed_trial_outcome(trial_outcome(2, "failure", metric=0.0))
+def test_outcome_parser_accepts_a_measurement_only_on_a_success() -> None:
+    """A success records its measurement, zero included, whatever the bounds say; every other outcome records none."""
+    measured = _parsed_trial_outcome(trial_outcome(1, "success", metric=0.0))
     assert measured is not None and measured.metric == 0.0
+    assert _parsed_trial_outcome({**trial_outcome(1, "success"), "metric": None}) is None
     for outcome in ("failure", "fatal", "interrupted"):
         parsed = _parsed_trial_outcome(trial_outcome(3, outcome))
         assert parsed is not None and parsed.metric is None
-    for outcome in ("fatal", "interrupted"):
         assert _parsed_trial_outcome(trial_outcome(3, outcome, metric=1.0)) is None
 
 
@@ -221,7 +220,7 @@ def test_stale_recovery_records_interrupted_unless_the_objective_recorded_a_fail
     assert recovered.state == optuna.trial.TrialState.FAIL
     assert recovered.user_attrs[TRIAL_OUTCOME_ATTR] == expected
     assert _trial_interrupted(recovered) is interrupted
-    policy = _load_phase_policy_state(study)
+    policy = _load_phase_policy_state(study, make_experiment())
     assert policy.consecutive_failures == (2 if interrupted else 3)
     assert policy.abort == expected.get(TRIAL_OUTCOME_ABORT_KEY)
 
@@ -236,16 +235,16 @@ def test_an_interruption_between_two_failures_leaves_the_streak_at_two() -> None
     _finished(study, 3, "failure")
 
     assert _trial_interrupted(study.trials[stale.number])
-    assert _load_phase_policy_state(study).consecutive_failures == 2
+    assert _load_phase_policy_state(study, make_experiment()).consecutive_failures == 2
 
 
 @pytest.mark.parametrize("holder", ["peer", "itself"])
 def test_recovery_refuses_duplicate_sequences_without_erasing_outcomes(holder: str) -> None:
     """Disputed completion order leaves both saved measurements and aborts intact."""
-    phase = make_experiment(max_consecutive_failures=2).phases[0]
+    experiment = make_experiment(max_consecutive_failures=2)
     study = optuna.create_study(study_name="example::p")
     _finished(study, 1, "failure")
-    failed = _running_trial(study, trial_outcome(2, "failure", metric=3.0, abort=_abort(2)))
+    failed = _running_trial(study, trial_outcome(2, "failure", cause="exit 1", abort=_abort(2)))
     succeeded = _running_trial(study, trial_outcome(2, "success", metric=4.0))
     pending = _running_trial(study, None) if holder == "peer" else failed
     before = [trial.user_attrs for trial in study.get_trials()]
@@ -253,7 +252,13 @@ def test_recovery_refuses_duplicate_sequences_without_erasing_outcomes(holder: s
         StudySchemaMismatchError,
         match="study 'example::p', trials 1 and 2 both use completion sequence 2",
     ):
-        _record_stale_trial_outcome(study, pending, "failure", cause="crashed", policy_phase=phase)
+        _record_stale_trial_outcome(
+            study,
+            pending,
+            "failure",
+            cause="crashed",
+            policy=(experiment.phases[0], experiment),
+        )
     assert [trial.user_attrs for trial in study.get_trials()] == before
     assert all(trial.state == optuna.trial.TrialState.RUNNING for trial in (failed, succeeded))
 
@@ -291,7 +296,7 @@ def test_an_interrupted_trial_is_counted_apart_and_never_toward_the_target() -> 
     _record_reruns(study)
     trials = study.get_trials(deepcopy=False)
 
-    assert [_trial_count_state(t) for t in trials] == ["FAIL", "INTERRUPTED", "WAITING"]
+    assert [_trial_run_state(t) for t in trials] == ["FAIL", "INTERRUPTED", "WAITING"]
     assert _finished_trial_count(trials) == 1
     assert _draw_positions(trials) == {0: 0, 1: 1, 2: 1}
 
@@ -333,9 +338,11 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
     trainer = write_param_echo_trainer(tmp_path)
     control = make_experiment(persistent=tmp_path / "control", trainer=trainer, n_trials=3)
     exp = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=3)
-    study, trial_dir, _number = fabricate_stale_trial(exp, "p", attempt_id="killed-attempt")
-    study.set_user_attr(PHASE_FINGERPRINT_ATTR, _phase_fingerprint(exp, exp.phases[0], {}))
-    write_attempt_lifecycle(trial_dir, attempt_id="killed-attempt", state="allocated")
+    study, _trial_dir, _number, attempt_dir = fabricate_stale_trial(
+        exp, "p", attempt_id="killed-attempt"
+    )
+    _stamp_identity(study, _fresh_identity(exp, exp.phases[0], {}))
+    write_attempt_lifecycle(attempt_dir, attempt_id="killed-attempt", state="allocated")
 
     caplog.set_level(logging.INFO, logger="phasesweep")
     winner = run_experiment(exp)["p"]
@@ -383,10 +390,10 @@ def _cause(trial: optuna.trial.FrozenTrial) -> str | None:
 
 
 @pytest.mark.parametrize("serviced", [True, False], ids=["shutdown", "no-shutdown"])
-def test_a_trainer_that_fails_while_a_shutdown_is_serviced_is_interrupted_not_failed(
+def test_a_trainer_that_fails_while_a_shutdown_is_serviced_keeps_its_own_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, serviced: bool
 ) -> None:
-    """A worker sees its trainer die when the handler kills it; that counts as an interruption, not a failure."""
+    """A trainer that crashed by itself keeps its failure and stderr reason though a shutdown is serviced after it."""
     launched = tmp_path / "launched"
     trainer = write_trainer(
         tmp_path / "trainer.py",
@@ -394,6 +401,7 @@ def test_a_trainer_that_fails_while_a_shutdown_is_serviced_is_interrupted_not_fa
         import sys
         from pathlib import Path
         Path({str(launched)!r}).touch()
+        print("CUDA error: out of memory", file=sys.stderr)
         sys.exit(1)
         """,
     )
@@ -407,26 +415,16 @@ def test_a_trainer_that_fails_while_a_shutdown_is_serviced_is_interrupted_not_fa
         lambda: signal.SIGINT if serviced and launched.exists() else None,
     )
 
-    expected = (
-        (RuntimeError, "stopped after 0/1")
-        if serviced
-        else (NoFeasibleTrialError, "1 consecutive failed/infeasible trials")
-    )
-    with pytest.raises(expected[0], match=expected[1]):
+    with pytest.raises(NoFeasibleTrialError, match="1 consecutive failed/infeasible trials"):
         run_experiment(exp)
 
     (trial,) = phase_trials(exp)
     study = phase_study(exp)
     assert launched.exists()
-    if serviced:
-        assert _trial_count_state(trial) == "INTERRUPTED"
-        assert _cause(trial) == _SIGINT_CAUSE
-        assert _load_phase_policy_state(study).consecutive_failures == 0
-        assert _record_reruns(study) == [(0, 1)]
-    else:
-        assert _trial_count_state(trial) == "FAIL"
-        assert _load_phase_policy_state(study).consecutive_failures == 1
-        assert _record_reruns(study) == []
+    assert _trial_run_state(trial) == "FAIL"
+    assert _cause(trial) == "non-zero exit code 1; stderr: CUDA error: out of memory"
+    assert _load_phase_policy_state(study, make_experiment()).consecutive_failures == 1
+    assert _record_reruns(study) == []
 
 
 @pytest.mark.parametrize("refusing_check", [1, 2], ids=["before-allocation", "inside-the-lease"])
@@ -457,7 +455,7 @@ def test_no_trainer_starts_while_a_shutdown_is_serviced(
 
     (trial,) = phase_trials(exp)
     assert not launched.exists()
-    assert _trial_count_state(trial) == "INTERRUPTED"
+    assert _trial_run_state(trial) == "INTERRUPTED"
     assert _cause(trial) == _SIGINT_CAUSE
 
 
@@ -525,7 +523,7 @@ def test_a_shutdown_waits_for_parallel_workers_to_record_their_own_trials(
     sender.join(timeout=5.0)
 
     trials = phase_trials(exp)
-    assert [_trial_count_state(trial) for trial in trials] == ["INTERRUPTED", "INTERRUPTED"]
+    assert [_trial_run_state(trial) for trial in trials] == ["INTERRUPTED", "INTERRUPTED"]
     assert [_cause(trial) for trial in trials] == [_SIGINT_CAUSE, _SIGINT_CAUSE]
     with (_phase_dir(exp, "p") / "trials.csv").open(newline="") as handle:
         assert [row[f"user_attr:{FAILURE_REASON_ATTR}"] for row in csv.DictReader(handle)] == [
@@ -648,7 +646,7 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
         import time
         from pathlib import Path
         original = guardian.write_lifecycle_record
-        def fail_intent(path: Path, *, attempt_id: str, state: str, return_code: int | None, cleanup_confirmed: bool | None, duration_seconds: float | None) -> None:
+        def fail_intent(path: Path, *, attempt_id: str, state: str, ended_by: str | None, return_code: int | None, cleanup_confirmed: bool | None, duration_seconds: float | None) -> None:
             if state == "terminating" and {intent_write_fails!r}:
                 Path({str(failed)!r}).touch()
                 raise OSError("intent write unavailable")
@@ -656,7 +654,7 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
                 Path({str(failed)!r}).touch()
                 while not Path({str(publish)!r}).exists():
                     time.sleep(0.01)
-            original(path, attempt_id=attempt_id, state=state, return_code=return_code, cleanup_confirmed=cleanup_confirmed, duration_seconds=duration_seconds)
+            original(path, attempt_id=attempt_id, state=state, ended_by=ended_by, return_code=return_code, cleanup_confirmed=cleanup_confirmed, duration_seconds=duration_seconds)
         guardian.write_lifecycle_record = fail_intent
         if not {procfs_available!r}:
             def no_procfs(path):
@@ -722,7 +720,9 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
             fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
         lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="held-lease")
         assert lifecycle is not None and lifecycle.state == "exited"
-        assert lifecycle.return_code == (-signal.SIGTERM if cancelled else 0)
+        assert (lifecycle.ended_by, lifecycle.return_code) == (
+            ("cancelled", None) if cancelled else ("trainer", 0)
+        )
         assert lifecycle.cleanup_confirmed
         assert not reaper._process_group_alive(pgid)
     finally:
@@ -801,12 +801,17 @@ def test_completed_orphan_evidence_survives_runner_sigkill(
         f"""
         import argparse, json, os, signal, sys, time
         from pathlib import Path
+        from phasesweep.engine.paths import _attempt_dir
         parser = argparse.ArgumentParser()
         parser.add_argument("--out", required=True)
         args, _ = parser.parse_known_args()
         def terminate(*_):
+            print("stopping on SIGTERM", file=sys.stderr, flush=True)
             if {guardian_cancel!r}:
-                lifecycle = Path(args.out).parent / "attempt_lifecycle.json"
+                attempt_dir = _attempt_dir(
+                    Path(args.out).parent.parent, os.environ["PHASESWEEP_ATTEMPT_ID"]
+                )
+                lifecycle = attempt_dir / "attempt_lifecycle.json"
                 Path({str(termination_intent)!r}).write_text(lifecycle.read_text())
                 os.kill(int(Path({str(runner_pid)!r}).read_text()), signal.SIGKILL)
             sys.exit(0)
@@ -889,9 +894,12 @@ def extract_with_worker(ctx, cfg, **kwargs):
         "attempt_id": ctx.attempt_id,
         "overrides_sha256": ctx.overrides_sha256,
     }
-    session.write_record(ctx.trial_dir / "mlflow-binding.json", binding)
+    tracking_dir = session.attempt_tracking_dir(
+        ctx.trial_dir.parent.parent, ctx.generation_id, ctx.attempt_id
+    )
+    session.write_record(tracking_dir / session.BINDING_FILE, binding)
     session.write_record(
-        ctx.trial_dir / "mlflow-expected.json",
+        tracking_dir / session.EXPECTED_BINDING_FILE,
         {k: v for k, v in binding.items() if k != "run_id"},
     )
     remote = experiment.model_copy(update={
@@ -943,9 +951,11 @@ else:
             assert reached.exists()
             (trial,) = phase_trials(experiment)
             directory = Path(trial.user_attrs["phasesweep_trial_dir"])
+            attempt_dir = _trial_attempt_dir(trial)
+            assert attempt_dir is not None
             attempt = trial.user_attrs["phasesweep_attempt_id"]
             orphan_identity = reaper.read_stale_process_identity(
-                directory, expected_attempt_id=attempt
+                attempt_dir, expected_attempt_id=attempt
             )
             if shutdown_sdk or recovery_stage == "shutdown-trainer":
                 runner.send_signal(signal.SIGINT)
@@ -958,18 +968,21 @@ else:
                 assert runner.returncode == -signal.SIGKILL
                 intent = json_object(json.loads(termination_intent.read_text()))
                 assert intent["state"] == "terminating"
-                assert intent["return_code"] == -signal.SIGTERM
+                assert (intent["ended_by"], intent["return_code"]) == (
+                    "timed_out" if recovery_stage == "timeout-trainer" else "cancelled",
+                    None,
+                )
                 assert intent["cleanup_confirmed"] is False
             if not terminated:
                 release.touch()
             (trial,) = phase_trials(experiment)
             if (sdk_worker and not shutdown_sdk) or (terminated and not guardian_cancel):
-                lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
+                lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt)
                 assert lifecycle is not None and lifecycle.state == "launching"
                 assert reaper._process_group_alive(orphan_identity.pgid)
             else:
                 while time.monotonic() < deadline:
-                    lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
+                    lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt)
                     if lifecycle is not None and lifecycle.state == "exited":
                         break
                     time.sleep(0.02)
@@ -981,9 +994,7 @@ else:
                     assert trial.user_attrs[DURATION_ATTR] > 0
                     assert (_attempts_dir(experiment) / f"{attempt}.json").is_file()
                 else:
-                    assert lifecycle.return_code == (
-                        -signal.SIGTERM if guardian_cancel else return_code
-                    )
+                    assert lifecycle.return_code == (None if guardian_cancel else return_code)
                     assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds > 0
             assert (directory / "r.json").exists()
             if direct_recovery:
@@ -1084,9 +1095,9 @@ else:
                     assert TRIAL_OUTCOME_ATTR not in pending.user_attrs
                     assert (_attempts_dir(experiment) / f"{attempt}.json").is_file()
                 orphan_identity = reaper.read_stale_process_identity(
-                    directory, expected_attempt_id=attempt
+                    attempt_dir, expected_attempt_id=attempt
                 )
-                lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
+                lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt)
                 assert lifecycle is not None and lifecycle.state == (
                     "exited" if recovery_stage == "interrupt-extraction-signal" else "launching"
                 )
@@ -1126,7 +1137,7 @@ else:
                 assert pending.user_attrs[TRIAL_OUTCOME_ATTR]["metric"] == 1.0
                 saved_outcome = json_object(pending.user_attrs[TRIAL_OUTCOME_ATTR])
                 if recovery_stage == "finished":
-                    objective = directory / "stdout.log"
+                    objective = attempt_dir / "stdout.log"
                     original = objective.read_bytes()
                     objective.unlink()
                     with pytest.raises(TrialEvidenceMissingError, match="missing or unreadable"):
@@ -1231,7 +1242,10 @@ else:
                 expected_kept = 0 if terminated else 1
                 assert f"kept {expected_kept} completed trial result(s)" in recovered_run.output
                 if expected_kept:
-                    assert "Kept completed trial result: phase='p' trial=0 value=1" in caplog.text
+                    assert any(
+                        line.endswith("  recovered") and "p  trial 0  COMPLETE  " in line
+                        for line in caplog.text.splitlines()
+                    )
             else:
                 cleanup_report = _PreflightCleanupReport()
                 _reconcile_existing_studies(experiment, cleanup_report=cleanup_report)
@@ -1239,36 +1253,45 @@ else:
             (recovered,) = phase_trials(experiment)
             with (_phase_dir(experiment, "p") / "trials.csv").open(newline="") as handle:
                 (row,) = csv.DictReader(handle)
-            assert row["state"] == _trial_count_state(recovered)
+            assert row["state"] == _trial_count_state(recovered, experiment)
             assert recovered.state.name == (
                 "COMPLETE" if return_code == 0 and not terminated else "FAIL"
             )
             if return_code == 0 and not terminated:
                 assert recovered.value == 1.0
                 assert recovered.user_attrs[TRIAL_OUTCOME_ATTR] == saved_outcome
-                assert recovered.user_attrs[FEASIBLE_ATTR] is feasible
+                assert (_trial_count_state(recovered, experiment) == "COMPLETE") is feasible
                 if feasible:
                     assert _cause(recovered) is None
                     assert run_experiment(experiment)["p"].metric == 1.0
                     assert run_experiment(experiment)["p"].metric == 1.0
                 else:
-                    assert (
-                        _cause(recovered)
-                        == "recovered evidence violates metric or constraint bounds"
-                    )
+                    assert _cause(recovered) is None
                     with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
                         run_experiment(experiment)
                 assert len(phase_trials(experiment)) == 1
+            elif recovery_stage in {"finished", "timeout-trainer"}:
+                # A crash or a per-trial timeout is the trainer's own failure, kept though
+                # the runner died before recording it.
+                assert not _trial_interrupted(recovered)
+                # A timeout reads as the live one does, without the trainer's stderr.
+                assert (
+                    _cause(recovered) == "timeout after the phase's timeout_seconds_per_trial"
+                    if recovery_stage == "timeout-trainer"
+                    else (_cause(recovered) or "").startswith("non-zero exit code 7")
+                )
             else:
                 assert _trial_interrupted(recovered)
             assert launches.read_text() == "launch\n"
             assert not reaper._process_group_alive(orphan_identity.pgid)
             if terminated:
-                lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
-                assert lifecycle is not None and lifecycle.return_code == (
-                    None if direct_recovery else -signal.SIGTERM
+                lifecycle = read_attempt_lifecycle(attempt_dir, expected_attempt_id=attempt)
+                assert lifecycle is not None and lifecycle.return_code is None
+                assert lifecycle.ended_by == (
+                    "timed_out" if recovery_stage == "timeout-trainer" else "cancelled"
                 )
                 assert recovered.value is None
+            if terminated and recovery_stage != "timeout-trainer":
                 release.touch()
                 assert run_experiment(experiment)["p"].metric == 1.0
                 rerun = phase_trials(experiment)[1]
@@ -1284,9 +1307,9 @@ else:
                     recovery_runner.kill()
                 recovery_runner.wait(timeout=5)
             if orphan_identity is not None:
-                if (directory / reaper.PROCESS_IDENTITY_FILE).exists():
+                if (attempt_dir / reaper.PROCESS_IDENTITY_FILE).exists():
                     orphan_identity = reaper.read_stale_process_identity(
-                        directory, expected_attempt_id=attempt
+                        attempt_dir, expected_attempt_id=attempt
                     )
                 reaper.cleanup_stale_trial_process(orphan_identity, grace_seconds=0.2)
 
@@ -1325,7 +1348,10 @@ def _assert_restored_tracker_keeps_training(
     recovered = phase_trials(experiment)
     assert [trial.state.name for trial in recovered] == ["COMPLETE"] * len(pending)
     for trial in pending:
-        assert f"Kept completed trial result: phase='p' trial={trial.number} value=1" in caplog.text
+        assert any(
+            line.endswith("  recovered") and f"p  trial {trial.number}  COMPLETE  " in line
+            for line in caplog.text.splitlines()
+        )
     assert launches.read_text().splitlines() == ["launch"] * len(pending)
 
 
@@ -1408,9 +1434,9 @@ def test_a_pending_trial_whose_tracker_sdk_is_missing_names_installing_it(
         f"metric extractor: {WANDB_SDK_MISSING}"
     )
     assert refused.value.remediation == (
-        "Restore access to the tracker or install its SDK, then run the same config again; the "
-        "finished training is kept. If the tracker is gone for good, set a new `experiment` name "
-        "to start a fresh study."
+        "Run the same config again once the tracker serves the evidence. Finished training is kept. "
+        "If access failed, check credentials and SDK installation. If the tracker is gone for good, "
+        "set a new `experiment` name to start a fresh study."
     )
     assert "its tracker could not be read: metric extractor: W&B evidence requires" in caplog.text
     (trial,) = phase_trials(experiment)
@@ -1575,7 +1601,8 @@ def test_a_recovered_verdict_trips_the_failure_limit_as_a_live_one_does(
     first, second = phase_trials(experiment)
     assert second.state.name == ("FAIL" if verdict == "failure" else "COMPLETE")
     outcome = second.user_attrs[TRIAL_OUTCOME_ATTR]
-    assert outcome["outcome"] == "failure"
+    # A measurement records a success; the streak counts it as a failure under the bound.
+    assert outcome["outcome"] == ("failure" if verdict == "failure" else "success")
     assert outcome.get("metric") == (second.value if verdict == "infeasible" else None)
     assert outcome[TRIAL_OUTCOME_ABORT_KEY] == {
         "schema_version": 1,
@@ -1614,9 +1641,9 @@ def test_tracker_outage_preserves_a_parallel_peers_failure_limit_abort(
         original_stop_launches(run)
         launches_stopped.set()
 
-    def outage(*, run_id: str, trial_dir: Path, **_options: object) -> JsonObject:
+    def outage(*, run_id: str, **_options: object) -> JsonObject:
         both_reading.wait(10)
-        if trial_dir.name.startswith("trial_00000__"):
+        if _trial_dir_for(experiment, experiment.phases[0].name, 0, attempt_id=run_id).is_dir():
             raise WandbSetupError(run_id, "HTTP 401")
         # The peer's verdict comes after the outage has already stopped new launches.
         assert launches_stopped.wait(10)
@@ -1843,9 +1870,10 @@ def test_recovery_defers_a_killed_runs_finished_trial_while_its_tracker_is_unrea
             time.sleep(0.02)
         assert tracker.hung.exists()
         (trial,) = phase_trials(experiment)
-        directory = Path(trial.user_attrs[TRIAL_DIR_ATTR])
+        attempt_dir = _trial_attempt_dir(trial)
+        assert attempt_dir is not None
         reader = reaper.read_stale_process_identity(
-            directory, expected_attempt_id=trial.user_attrs[ATTEMPT_ID_ATTR]
+            attempt_dir, expected_attempt_id=trial.user_attrs[ATTEMPT_ID_ATTR]
         )
         runner.kill()
         runner.wait(timeout=5)
@@ -1920,7 +1948,7 @@ def test_recovery_preview_names_trial_group_liveness(
     monkeypatch.setattr(
         reaper, "_terminate_process_group", lambda pgid, **_: signalled.append(pgid) or True
     )
-    record = _AttemptRecord("preview", tmp_path, "generation", "p", 0)
+    record = _AttemptRecord("preview", tmp_path, tmp_path, "generation", "p", 0)
     attempts_module._resolve_attempt(
         record,
         context="RUNNING trial 0",

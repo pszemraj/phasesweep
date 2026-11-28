@@ -5,12 +5,17 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, TypeAlias
 
-from phasesweep.engine.read import PhaseWinnerView, ResultContext
+from phasesweep.engine.read import ResultContext
 from phasesweep.engine.state import FINISHED_TRIAL_STATES, TRIAL_STATE_NAMES
 from phasesweep.mcp.errors import sync_tracking_command
 from phasesweep.mcp.registry import VisibleParamsPolicy
-from phasesweep.mcp.snapshots import McpPublicationState, WinnerSnapshot
-from phasesweep.runtime.json import JsonObject, json_object
+from phasesweep.mcp.snapshots import (
+    McpPublicationState,
+    MetricSnapshot,
+    StatusSnapshot,
+    WinnerSnapshot,
+)
+from phasesweep.runtime.json import JsonObject, JsonValue, json_object
 
 ResultSource: TypeAlias = Literal[
     "current_shared_study",
@@ -60,28 +65,20 @@ def _visible_winner_params(
 
 
 def _tie_groups_payload(
-    view: PhaseWinnerView | WinnerSnapshot, policy: VisibleParamsPolicy
+    view: WinnerSnapshot, policy: VisibleParamsPolicy
 ) -> list[JsonObject] | None:
     """Apply the winner parameter policy to every overlapping configuration.
 
-    :param PhaseWinnerView | WinnerSnapshot view: Live or frozen phase winner.
+    :param WinnerSnapshot view: Live or frozen phase winner.
     :param VisibleParamsPolicy policy: Catalog parameter visibility.
     :return list[JsonObject] | None: Redacted comparisons, or null when trial details are unavailable.
     """
     if view.tie_groups is None:
         return None
-    groups = (
-        [group.model_dump(mode="json") for group in view.tie_groups]
-        if isinstance(view, WinnerSnapshot)
-        else [dict(group) for group in view.tie_groups]
-    )
     public: list[JsonObject] = []
-    for group in groups:
-        payload = json_object(group)
-        params = payload["params"]
-        if not isinstance(params, dict):
-            raise TypeError("tie-group parameters are not a mapping")
-        payload["params"] = json_object(_visible_winner_params(params, policy)[0])
+    for group in view.tie_groups:
+        payload = json_object(group.model_dump(mode="json"))
+        payload["params"] = json_object(_visible_winner_params(group.params, policy)[0])
         public.append(payload)
     return public
 
@@ -105,9 +102,9 @@ def _run_wrote_generation(
 
 def winners_payload(
     experiment_id: str,
-    views: Sequence[PhaseWinnerView | WinnerSnapshot],
+    views: Sequence[WinnerSnapshot],
     *,
-    metric: dict[str, Any],
+    metric: MetricSnapshot,
     declared_phases: list[str],
     result_source: ResultSource,
     publication_integrity: McpPublicationState,
@@ -118,15 +115,15 @@ def winners_payload(
     result_context: ResultContext = "current_config",
     published_config_matches_current: bool | None = None,
 ) -> dict[str, Any]:
-    """Build the ``get_run_results`` payload from live views or frozen winners.
+    """Build the ``get_run_results`` payload from live or frozen winners.
 
     Expose sampled params under the visibility policy; omit effective overrides, fixed
     values and inherited values.
 
     :param str experiment_id: Catalog id whose winners are being returned.
-    :param Sequence[PhaseWinnerView | WinnerSnapshot] views: Live engine views or
-        validated frozen winners.
-    :param dict[str, Any] metric: Optimization metric and objective-evidence
+    :param Sequence[WinnerSnapshot] views: Live winners projected by
+        :func:`phasesweep.mcp.snapshots.winner_snapshot`, or the frozen ones.
+    :param MetricSnapshot metric: Optimization metric and objective-evidence
         kind the represented generation recorded.
     :param list[str] declared_phases: Phase plan the represented generation
         published under, in execution order.
@@ -143,7 +140,6 @@ def winners_payload(
         represented generation, or current config when nothing is published.
     :param bool | None published_config_matches_current: Represented/current config
         fingerprint agreement, or ``None`` when undeterminable.
-    :raises RuntimeError: A winner view carries no source provenance.
     :return dict[str, Any]: MCP-safe winners payload.
     """
     winner_phases = {view.phase for view in views}
@@ -152,8 +148,6 @@ def winners_payload(
     for view in views:
         params, redacted = _visible_winner_params(view.params, visible_params)
         source = view.source
-        if source is None:
-            raise RuntimeError("Current-format winner is missing source provenance.")
         winner_source = {
             "kind": source.kind,
             "phase": source.phase,
@@ -176,17 +170,9 @@ def winners_payload(
                 "params_redacted": redacted,
                 "gates_passed": view.gates_passed,
                 "incomplete": view.incomplete,
-                "confound": (
-                    view.confound.model_dump(mode="json")
-                    if isinstance(view, WinnerSnapshot)
-                    else view.confound
-                ),
+                "confound": view.confound.model_dump(mode="json"),
                 "observed": dict(view.observed),
-                "repeats": (
-                    view.repeats.model_dump(mode="json")
-                    if isinstance(view, WinnerSnapshot) and view.repeats is not None
-                    else view.repeats
-                ),
+                "repeats": None if view.repeats is None else view.repeats.model_dump(mode="json"),
                 "cost_advisory": (
                     view.cost_advisory
                     if visible_params == "all" or view.cost_advisory is None
@@ -202,6 +188,9 @@ def winners_payload(
                     "operator can inspect show-winners for which one."
                 ),
                 "edge_advisory_status": view.edge_advisory_status,
+                "interrupted_reruns": view.interrupted_reruns,
+                "interrupted_reruns_earlier_attempt": view.interrupted_reruns_earlier_attempt,
+                "winner_interrupted_rerun": view.winner_interrupted_rerun,
             }
         )
     return {
@@ -213,7 +202,7 @@ def winners_payload(
         "publication_integrity": publication_integrity,
         "result_context": result_context,
         "published_config_matches_current": published_config_matches_current,
-        "metric": metric,
+        "metric": metric.model_dump(mode="json"),
         "declared_phase_count": len(declared_phases),
         "winner_count": len(views),
         "missing_phases": missing_phases,
@@ -248,42 +237,46 @@ def _tracking_delivery_payload(counts: Mapping[str, int], run: Mapping[str, obje
 
 def status_payload(
     experiment_id: str,
-    status: dict[str, Any],
-    run: dict[str, Any],
+    status: StatusSnapshot,
+    run: JsonObject,
     *,
+    tracking_delivery: Mapping[str, int] | None,
     result_source: ResultSource,
     elapsed_seconds: int | None,
-) -> dict[str, Any]:
-    """Map ``read_status`` and detached-run state to the ``get_run_status`` payload.
+) -> JsonObject:
+    """Map a live or frozen status and detached-run state to the ``get_run_status`` payload.
 
-    Omit operator-only free-text publication errors. The this-run counts come from
-    ``generation_trials``, which counts the trials of the run's own generation.
+    The this-run counts come from ``generation_trials``, which counts the trials of the
+    run's own generation.
 
     :param str experiment_id: Catalog id whose status is being returned.
-    :param dict[str, Any] status: Path-free status payload from ``read_status``.
-    :param dict[str, Any] run: Path-free detached-run state.
+    :param StatusSnapshot status: Live status projected by
+        :func:`phasesweep.mcp.snapshots.status_snapshot`, or the frozen one.
+    :param JsonObject run: Path-free detached-run state.
+    :param Mapping[str, int] | None tracking_delivery: This run's MLflow delivery counts,
+        or ``None`` when it uses no MLflow or its config is unavailable.
     :param ResultSource result_source: Whether status came from current shared
         state or a frozen terminal run snapshot.
     :param int | None elapsed_seconds: Seconds since launch (running) or total
         run duration (terminal); ``None`` without an associated run.
-    :return dict[str, Any]: MCP-safe status payload.
+    :return JsonObject: MCP-safe status payload.
     """
-    phases = []
-    for phase in status["phases"]:
-        available = phase["trial_data_available"]
-        raw_counts = phase["trials"]
-        counts = {state: int(raw_counts.get(state, 0)) for state in TRIAL_STATE_NAMES}
-        raw_generation_counts = phase.get("generation_trials") or {}
-        generation_counts = {
-            state: int(raw_generation_counts.get(state, 0)) for state in TRIAL_STATE_NAMES
+    phases: list[JsonValue] = []
+    for phase in status.phases:
+        available = phase.trial_data_available
+        counts: dict[str, JsonValue] = {
+            state: phase.trials.get(state, 0) for state in TRIAL_STATE_NAMES
         }
-        finished_trials_total = sum(counts[state] for state in FINISHED_TRIAL_STATES)
+        generation_counts = {
+            state: phase.generation_trials.get(state, 0) for state in TRIAL_STATE_NAMES
+        }
+        finished_trials_total = sum(phase.trials.get(state, 0) for state in FINISHED_TRIAL_STATES)
         finished_trials_this_run = sum(generation_counts[state] for state in FINISHED_TRIAL_STATES)
         finished_trials_before_run = max(0, finished_trials_total - finished_trials_this_run)
-        target_finished_trials = int(phase["n_trials"])
+        target_finished_trials = phase.n_trials
         phases.append(
             {
-                "phase": phase["phase"],
+                "phase": phase.phase,
                 "trials": counts if available else None,
                 "target_finished_trials": target_finished_trials,
                 "finished_trials_total": finished_trials_total if available else None,
@@ -296,33 +289,48 @@ def status_payload(
                 "target_already_satisfied": (
                     finished_trials_before_run >= target_finished_trials if available else None
                 ),
-                "winner_present": phase["winner_present"],
+                "interrupted_reruns": phase.interrupted_reruns if available else None,
+                "interrupted_reruns_earlier_attempt": (
+                    phase.interrupted_reruns_earlier_attempt if available else None
+                ),
+                "winner_present": phase.winner_present,
                 "trial_data_available": available,
-                "published_study_unavailable": phase.get("published_study_unavailable"),
+                "published_study_unavailable": phase.published_study_unavailable,
+                "reread_pending": (
+                    None
+                    if phase.reread_pending is None
+                    else {
+                        "statement": phase.reread_pending.statement,
+                        "finished_trials": phase.reread_pending.finished_trials,
+                    }
+                ),
             }
         )
+    run_id = run["run_id"]
     return {
         "experiment_id": experiment_id,
         "result_source": result_source,
         **(
-            {"tracking_delivery": _tracking_delivery_payload(status["tracking_delivery"], run)}
-            if "tracking_delivery" in status
+            {"tracking_delivery": _tracking_delivery_payload(tracking_delivery, run)}
+            if tracking_delivery is not None
             else {}
         ),
-        "current_generation_id": status["current_generation_id"],
-        "published_generation_id": status["published_generation_id"],
-        "represented_generation_id": status["represented_generation_id"],
-        "is_published": status["is_published"],
+        "current_generation_id": status.current_generation_id,
+        "published_generation_id": status.published_generation_id,
+        "represented_generation_id": status.represented_generation_id,
+        "is_published": status.is_published,
         "run_wrote_generation": _run_wrote_generation(
-            result_source, status["current_generation_id"], run["run_id"]
+            result_source,
+            status.current_generation_id,
+            run_id if isinstance(run_id, str) else None,
         ),
-        "publication_integrity": status["publication_integrity"],
-        "result_context": status["result_context"],
-        "published_config_matches_current": status["published_config_matches_current"],
-        "result_phase_plan": status["result_phase_plan"],
-        "metric": status["metric"],
+        "publication_integrity": status.publication_integrity,
+        "result_context": status.result_context,
+        "published_config_matches_current": status.published_config_matches_current,
+        "result_phase_plan": list(status.result_phase_plan),
+        "metric": status.metric.model_dump(mode="json"),
         "phases": phases,
-        "summary_present": status["summary_present"],
+        "summary_present": status.summary_present,
         "run": run,
         "elapsed_seconds": elapsed_seconds,
     }

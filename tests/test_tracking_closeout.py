@@ -8,7 +8,6 @@ import os
 import re
 import shlex
 import signal
-import threading
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -50,6 +49,7 @@ from tests.tracking_helpers import (
     leak_tracking_worker,
     native_experiment,
     remote_mlflow_example,
+    signal_when_uploads_start,
 )
 
 _PENDING_STEP = f"results are saved locally. Send them with {SYNC_TRACKING_STEP}."
@@ -448,20 +448,9 @@ def test_a_ctrl_c_while_trials_upload_stops_delivery_without_blaming_mlflow(
     experiment = Experiment.model_validate(config)
     requests: list[str] = []
 
-    def interrupt_once_every_upload_runs() -> None:
-        # A trial uploads once its trainer has exited, so then the registered children are the
-        # upload workers alone.
-        deadline = time.monotonic() + 30.0
-        while (
-            len(requests) < n_jobs or len(shutdown._active_children) < n_jobs
-        ) and time.monotonic() < deadline:
-            time.sleep(0.02)
-        os.kill(os.getpid(), signal.SIGINT)
-
     hang_uploads_until_killed(monkeypatch, requests)
-    sender = threading.Thread(target=interrupt_once_every_upload_runs, daemon=True)
     caplog.set_level(logging.INFO)
-    sender.start()
+    sender = signal_when_uploads_start(requests, signal.SIGINT, count=n_jobs)
     with pytest.raises(PhaseSweepShutdown):
         run_experiment(experiment)
     sender.join(timeout=5.0)
@@ -974,7 +963,10 @@ def test_sync_tracking_names_what_keeps_its_records_pending(
     capsys.readouterr()
     arguments = [str(config), "--set", "phases.0.n_trials=2", "--generation", sweep.generation]
 
-    assert invoke_cli_boundary(["sync-tracking", *arguments], monkeypatch) == 1
+    # A tracker that gave no answer exits 75, which a later identical run can clear; a refusal
+    # MLflow answered exits 1.
+    expected_status = 75 if failure == "no-answer" else 1
+    assert invoke_cli_boundary(["sync-tracking", *arguments], monkeypatch) == expected_status
 
     error = capsys.readouterr().err
     command = shlex.join(["phasesweep", "sync-tracking", *arguments]) + "\n"
@@ -1047,7 +1039,7 @@ def test_a_run_started_with_overrides_prints_the_sync_command_that_sends_what_it
         patch.setattr(worker, "request_operation", unsent)
         status = invoke_cli_boundary(["run", str(path), "--set", "experiment=tuned"], monkeypatch)
 
-    assert status == {"finished": 0, "failed": 1, "stopped": 130}[ending]
+    assert status == {"finished": 0, "failed": 75, "stopped": 130}[ending]
     lines = capsys.readouterr().err.splitlines()
     printed = shlex.join(["phasesweep", "sync-tracking", str(path), "--set", "experiment=tuned"])
     step = lines.index("MLflow: to send what is pending without training, run:")
@@ -1084,17 +1076,10 @@ def test_a_ctrl_c_during_sync_tracking_says_what_stays_pending_and_exits_130(
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
     uploading: list[str] = []
 
-    def interrupt_once_the_upload_runs() -> None:
-        deadline = time.monotonic() + 30.0
-        while (not uploading or not shutdown._active_children) and time.monotonic() < deadline:
-            time.sleep(0.02)
-        os.kill(os.getpid(), signal.SIGINT)
-
     hang_uploads_until_killed(monkeypatch, uploading)
     config = write_experiment_config(Path.cwd() / "experiment.yaml", sweep.experiment)
     capsys.readouterr()
-    sender = threading.Thread(target=interrupt_once_the_upload_runs, daemon=True)
-    sender.start()
+    sender = signal_when_uploads_start(uploading, signal.SIGINT)
 
     status = invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch)
     sender.join(timeout=5)
@@ -1157,7 +1142,7 @@ def test_sync_tracking_says_when_a_creation_inside_its_window_can_be_settled(
     config = write_experiment_config(Path.cwd() / "experiment.yaml", experiment)
     capsys.readouterr()
 
-    assert invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch) == 1
+    assert invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch) == 75
 
     error = capsys.readouterr().err
     until = time.strftime("%H:%M:%S", time.localtime(math.ceil(end)))
@@ -1189,7 +1174,8 @@ def test_a_run_whose_target_gives_no_answer_ends_with_the_retry_step(
     """`phasesweep run` against a tracker that gives no answer to its target check is told to retry.
 
     The refusal names the target and starts no trial, and the step is the retry `sync-tracking`
-    prints for the same tracker, not a configuration fix.
+    prints for the same tracker, not a configuration fix. The run exits 75, the status that tells
+    a process supervisor the same command can succeed later.
     """
     config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     experiment = Experiment.model_validate(config)
@@ -1203,7 +1189,7 @@ def test_a_run_whose_target_gives_no_answer_ends_with_the_retry_step(
     path = write_experiment_config(Path.cwd() / "experiment.yaml", experiment)
     capsys.readouterr()
 
-    assert invoke_cli_boundary(["run", str(path)], monkeypatch) == 1
+    assert invoke_cli_boundary(["run", str(path)], monkeypatch) == 75
 
     assert uploads == []
     assert (
@@ -1220,15 +1206,17 @@ def test_a_silent_search_names_a_creation_record_whatever_its_generation_id_hold
     """A search MLflow does not answer stops the pass at the first creation record and names it.
 
     An MCP run's generation id is named after its catalog id, which may hold ``__``. The
-    record's warning names the attempt and the generation read between the fixed markers of its
-    trial directory, no local error is reported, and the second record is not searched.
+    record's warning names the attempt and the generation that owns it, no local error is
+    reported, and the second record is not searched.
     """
     experiment = native_experiment(tmp_path)
     generation = "lr__sweep-" + "a" * 8
     attempts = ["b" * 32, "c" * 32]
-    for number, attempt in enumerate(attempts):
-        trial = f"trial_{number:05d}__generation_{generation}__attempt_{attempt}"
-        path = _experiment_dir(experiment) / "depth" / trial / "mlflow-binding.pending.json"
+    for attempt in attempts:
+        path = (
+            session.attempt_tracking_dir(_experiment_dir(experiment), generation, attempt)
+            / session.PENDING_ATTEMPT_BINDING_FILE
+        )
         path.parent.mkdir(parents=True)
         intent = {"identity": attempt_identity(generation, attempt), "run_name": "r"}
         session.write_record(path, {"schema_version": 1, **intent})

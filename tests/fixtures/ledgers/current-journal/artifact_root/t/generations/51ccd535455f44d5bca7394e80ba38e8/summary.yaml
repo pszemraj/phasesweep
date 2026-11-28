@@ -1,8 +1,8 @@
-schema_version: 6
+schema_version: 10
 experiment: t
-generation_id: fd77f77a027141e6956c740561941e7e
-phasesweep_version: 0.3.14
-config_fingerprint: 510eb146e62737707cbf637293fedb6a7f213d3715b3bada974b7f90d629f027
+generation_id: 51ccd535455f44d5bca7394e80ba38e8
+phasesweep_version: 0.3.15
+config_fingerprint: 5e3841ab81f6b9369f66641d0c806acfc732279481efd027453c58899481f811
 metric:
   name: objective
   goal: minimize
@@ -24,18 +24,19 @@ phases:
   completion:
     requested_trials: 2
     finished_trials: 2
-    completed_trials: 2
+    measured_trials: 2
     incomplete: false
     reason: null
     timeout_scope: null
-  generation_id: fd77f77a027141e6956c740561941e7e
-  attempt_id: ef059b646fe541fabe1dcd9247f1cd82
+  generation_id: 51ccd535455f44d5bca7394e80ba38e8
+  attempt_id: 4fbe0586f17f4f018328f64e51729097
+  trial_dir: trial_00000__4fbe0586f17f4f018328f64e51729097
   winner_source:
     kind: phase_trial
     phase: p
     trial_number: 0
-    generation_id: fd77f77a027141e6956c740561941e7e
-    attempt_id: ef059b646fe541fabe1dcd9247f1cd82
+    generation_id: 51ccd535455f44d5bca7394e80ba38e8
+    attempt_id: 4fbe0586f17f4f018328f64e51729097
   trainer_input:
     schema_version: 1
     format: argparse
@@ -43,7 +44,7 @@ phases:
     size_bytes: 13
     sha256: 5e36b6560513586ced65eca0e8b025fe88edbcab82ba2cb67a5fcb2d7b202383
   confound:
-    schema_version: 5
+    schema_version: 6
     ranked_trials:
     - 0
     - 1
@@ -68,6 +69,17 @@ phases:
           within_noise: null
           pooled_sd: null
           df: null
+      code_revision:
+        verdict: ok
+        detail:
+          generations:
+          - generation_id: 51ccd535455f44d5bca7394e80ba38e8
+            record: unknown
+            commit: null
+            dirty: null
+            trials:
+            - 0
+            - 1
   observed: {}
   repeats: null
 artifacts:
@@ -76,8 +88,8 @@ artifacts:
   sha256: 66ca9aa184e8b9780c9695fcc9db655dba75f6b5117ab47144878daca599fc69
 - kind: reproducibility
   path: reproducibility.json
-  sha256: f419b0933d11cb380dcf2be8750252c2ce64ffcb22648a16b614fb407a841faa
+  sha256: 7ff4cd7148705cd24ac56bdca2cc193e353bd32fbd300eb2183ad87697939d8c
 - kind: winner
   phase: p
-  sha256: e75db7f110dc4729d948b8c9f5647d4a1483ac0456e37ee3bf6f18361b8530d0
+  sha256: 0f12eccdb29d69e5ec004b63dd5c75ac60bb51fa1bac283d407dc30e6e12a1cb
 trainer_config: {}

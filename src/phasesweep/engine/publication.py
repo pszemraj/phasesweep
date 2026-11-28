@@ -11,6 +11,7 @@ import phasesweep.engine.publication_validation as validation_ops
 from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.state import PublicationState
+from phasesweep.errors import as_sentence
 
 log = logging.getLogger(__name__)
 
@@ -29,9 +30,7 @@ def raise_for_unusable_publication(
     """
     if state not in {"permission_denied", "failed"}:
         return
-    detail = str(error).rstrip()
-    if not detail.endswith((".", "!", "?")):
-        detail += "."
+    detail = as_sentence(error)
     subject = f"Experiment {experiment_name!r}"
     if state == "permission_denied":
         raise PublicationAccessError(

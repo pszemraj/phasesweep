@@ -14,6 +14,7 @@ from typing import TypeGuard
 
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import CategoricalParam, SearchParam, sampler_search_space
+from phasesweep.engine.evidence import pruned_trials_note
 from phasesweep.engine.paths import TRIALS_CSV_FILENAME
 from phasesweep.engine.read import (
     _REPEAT_GROUP_COLUMN,
@@ -22,7 +23,10 @@ from phasesweep.engine.read import (
     TrialTable,
     TrialTables,
 )
+from phasesweep.engine.reread import PendingRereadNotice
 from phasesweep.engine.state import OBSERVED_PREFIX
+from phasesweep.errors import operator_step
+from phasesweep.run_report import INTERRUPTED_LABEL, interrupted_clause
 from phasesweep.runtime.json import JsonObject, JsonValue, json_integer
 from phasesweep.runtime.terminal import (
     GAP,
@@ -40,6 +44,9 @@ from phasesweep.runtime.terminal import (
 _WINNER_WORD = "winner"
 _REPEAT_GROUPS_HEADING = "Repeat groups (statistics include infeasible measured members):"
 _REPEAT_GROUPS_NOTE = "Group numbers can change as members arrive."
+#: How a winner's generation is labelled when its recorded config does not match the current one,
+#: in the words ``show-winners`` uses for the same publication.
+_HISTORICAL = "does not match the current config"
 
 #: How a value sorts within one parameter column: listed choices, then unlisted values, then
 #: missing ones; the second and third fields order values within the first kind.
@@ -366,6 +373,24 @@ def _group_lines(
     ]
 
 
+def _source_text(tables: TrialTables, generation: str, published: bool) -> str:
+    """Name a generation the winner marks come from, its publication state and config match.
+
+    A generation whose recorded config does not match the current one marks the winner that
+    config selected, which a row's current state (``INFEASIBLE`` after a bound edit) can
+    contradict; ``show-winners`` labels the same publication historical, so this says it too.
+
+    :param TrialTables tables: The tables, for which generations are historical.
+    :param str generation: The generation id.
+    :param bool published: Whether it is the validated publication.
+    :return str: Such as ``published generation g1 (does not match the current config)``.
+    """
+    text = f"{'published' if published else 'unpublished'} generation {generation}"
+    if generation in tables.historical_generations:
+        text = f"{text} ({_HISTORICAL})"
+    return text
+
+
 def _generation_line(tables: TrialTables) -> str:
     """Say which generation the winner marks come from, once for the whole listing.
 
@@ -376,7 +401,7 @@ def _generation_line(tables: TrialTables) -> str:
     sources = set(tables.winner_generations.values())
     if len(sources) == 1:
         generation, published = next(iter(sources))
-        return f"{'published' if published else 'unpublished'} generation {generation}"
+        return _source_text(tables, generation, published)
     if len(sources) > 1:
         return "winners come from different generations; each phase names its own"
     represented = tables.represented_generation_id or tables.published_generation_id
@@ -384,6 +409,15 @@ def _generation_line(tables: TrialTables) -> str:
         return "no generation is published, so no winner is marked"
     state = "published" if represented == tables.published_generation_id else "unpublished"
     return f"{state} generation {represented}"
+
+
+def _direction(goal: str) -> str:
+    """Say which values are better under a metric goal.
+
+    :param str goal: ``minimize`` or ``maximize``.
+    :return str: ``lower`` for ``minimize``, else ``higher``.
+    """
+    return "lower" if goal == "minimize" else "higher"
 
 
 def _phase_lines(
@@ -395,19 +429,26 @@ def _phase_lines(
     csv_root: Path | None,
     width: int,
     color: bool,
+    rerun_command: str | None,
 ) -> list[str]:
     """Render one phase: its heading, any notes under it, its trials and its repeat groups.
 
     The heading reads ``finished of target trials``, then in parentheses the rows that do not
-    count toward the target, by state.
+    count toward the target, by state, then the configured metric name and the direction of its
+    goal, which addresses the study the rows come from. A phase a run would refuse prints that
+    refusal and its fix before any other note. Each search-space growth the study recorded then
+    gets a note naming the draw position it took effect at and the values it added, results that
+    reran an interrupted trial get an ``interrupted:`` note counting them, and finished trials
+    whose directory is gone get one naming them.
 
     :param TrialTable table: The phase's trials.
     :param Phase phase: The configured phase.
-    :param Experiment experiment: The experiment, for the metric's name and direction.
+    :param Experiment experiment: The experiment, for the configured metric's name and goal.
     :param TrialTables tables: All tables, for the winner generation of each phase.
     :param Path | None csv_root: Artifact directory of an experiment that keeps no ledger.
     :param int width: Terminal width the prose wraps to.
     :param bool color: Whether to style the winner rows.
+    :param str | None rerun_command: Shell-quoted run command for a phase waiting to re-read.
     :return list[str]: The phase's lines, without a leading blank line.
     """
     notes: list[str] = []
@@ -425,23 +466,43 @@ def _phase_lines(
         if table.uncounted:
             others = ", ".join(f"{rows} {state.lower()}" for state, rows in table.uncounted)
             count = f"{count} ({others})"
-    metric = experiment.metric
-    direction = "lower" if metric.goal == "minimize" else "higher"
+        if (interrupted := interrupted_clause(table.reruns)) is not None:
+            notes.append(f"{INTERRUPTED_LABEL} {interrupted}")
     lines = wrap(
-        f"{table.phase}: {count}, {metric.name} ({direction} is better)",
+        f"{table.phase}: {count}, {experiment.metric.name} "
+        f"({_direction(experiment.metric.goal)} is better)",
         width,
         subsequent_indent=INDENT,
     )
+    if table.refusal is not None:
+        lines.extend(wrap(str(table.refusal), width, indent=INDENT, subsequent_indent=INDENT))
+        lines.extend(wrap_labeled("fix:", operator_step(table.refusal), width, indent=INDENT))
+        if isinstance(table.refusal, PendingRereadNotice) and rerun_command is not None:
+            lines.append(f"{INDENT}{rerun_command}")
+    for position, gains in table.growth:
+        lines.extend(
+            wrap(
+                f"search_space grew at draw position {position}: {gains}",
+                width,
+                indent=INDENT,
+                subsequent_indent=INDENT * 2,
+            )
+        )
+    if table.pruned:
+        notes.append(pruned_trials_note(table.pruned))
+    notes.extend(table.checkpoint_warnings)
     sources = set(tables.winner_generations.values())
     source = tables.winner_generations.get(table.phase)
     if len(sources) > 1 and source is not None:
         generation, published = source
         state = "published" if published else "unpublished"
+        if generation in tables.historical_generations:
+            state = f"{state}, {_HISTORICAL}"
         notes.append(f"winner from generation {generation} ({state})")
     for note in notes:
         lines.extend(wrap(note, width, indent=INDENT, subsequent_indent=INDENT))
     if table.rows:
-        lines.extend(_trial_lines(table, phase, metric.name, width=width, color=color))
+        lines.extend(_trial_lines(table, phase, experiment.metric.name, width=width, color=color))
     if table.groups:
         lines.extend(_group_lines(table.groups, phase, width=width, color=color))
     return lines
@@ -454,6 +515,7 @@ def render_trial_tables(
     csv_root: Path | None,
     width: int,
     color: bool,
+    rerun_command: str | None = None,
 ) -> str:
     """Render every phase's trial table under a header that names where the winner marks come from.
 
@@ -465,6 +527,7 @@ def render_trial_tables(
         ledger holds them.
     :param int width: Terminal width that prose wraps to; tables keep their natural width.
     :param bool color: Whether to style the winner rows, from ``use_color`` on the output stream.
+    :param str | None rerun_command: Shell-quoted run command for a phase waiting to re-read.
     :return str: The experiment name, the generation line, then each phase's heading and table.
     """
     phases = {phase.name: phase for phase in experiment.phases}
@@ -480,22 +543,24 @@ def render_trial_tables(
                 csv_root=csv_root,
                 width=width,
                 color=color,
+                rerun_command=rerun_command,
             )
         )
     return "\n".join(lines)
 
 
-def unsettled_running_comment(running: int, width: int | None = None) -> str:
+def unsettled_running_comment(running: int, command: str, width: int | None = None) -> str:
     """Say that trials recorded RUNNING belong to no live run and what a rerun does with them.
 
     Such a trial was cut off, or finished with a result its run could not read. A rerun
     settles both, and stops a trainer that outlived its run, so the comment says to let
-    one finish first.
+    one finish first. The command that reruns follows on a line of its own, whole.
 
     :param int running: How many trials the ledger records as RUNNING while no run holds the locks.
+    :param str command: The shell-quoted ``phasesweep run`` command that repeats the invocation.
     :param int | None width: Terminal width to wrap to, ``# ``-prefixing each line; ``None`` keeps
-        the comment on one line.
-    :return str: The ``#`` comment.
+        the sentence on one line.
+    :return str: The ``#`` comment, its last line the command.
     """
     verb, pronoun = ("is", "it") if running == 1 else ("are", "them")
     text = (
@@ -503,6 +568,7 @@ def unsettled_running_comment(running: int, width: int | None = None) -> str:
         f"config to settle {pronoun}. A trainer still running is stopped, so let it exit first "
         "to keep its result."
     )
-    if width is None:
-        return f"# {text}"
-    return "\n".join(wrap(text, width, indent="# ", subsequent_indent="# "))
+    lines = (
+        [f"# {text}"] if width is None else wrap(text, width, indent="# ", subsequent_indent="# ")
+    )
+    return "\n".join([*lines, f"# {command}"])

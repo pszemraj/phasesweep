@@ -1,4 +1,4 @@
-"""Qualification against a temporary HTTP MLflow 3.17 server."""
+"""Qualification against a temporary HTTP MLflow server."""
 
 from __future__ import annotations
 
@@ -192,7 +192,6 @@ def _late_creation(server, tmp_path, monkeypatch, *, timeout_seconds):
     from mlflow import MlflowClient
     from mlflow.exceptions import MlflowException
 
-    from phasesweep.engine.paths import _trial_dir_for
     from phasesweep.runtime.json import json_object
     from phasesweep.tracking import mlflow as worker
     from phasesweep.tracking import session
@@ -232,15 +231,7 @@ def _late_creation(server, tmp_path, monkeypatch, *, timeout_seconds):
         "experiment": experiment.experiment,
         "experiment_id": server.experiment_id,
     }
-    trial_dir = _trial_dir_for(
-        experiment,
-        identity["phase"],
-        0,
-        generation_id=identity["generation_id"],
-        attempt_id=identity["attempt_id"],
-    )
-    trial_dir.mkdir(parents=True)
-    bind, path = mlflow_binder(trial_dir, "attempt", experiment=experiment, identity=identity)
+    bind, path = mlflow_binder(tmp_path, "attempt", experiment=experiment, identity=identity)
     return bind, path, calls, experiment
 
 
@@ -562,6 +553,65 @@ def _managed_loss_experiment(
     )
 
 
+def test_trainer_owned_failed_reread_clears_the_previous_winner(local_server, tmp_path: Path):
+    """A published reading owns the outcome and winner while the trainer owns run status."""
+    from phasesweep.tracking.records import OUTCOME_TAG, WINNER_TAG
+
+    uri, client, experiment_id, _process = local_server
+    trainer = tmp_path / "trainer.py"
+    trainer.write_text(
+        """import argparse
+import mlflow
+from phasesweep.tracking import bind_mlflow_run
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--x", type=int)
+x = parser.parse_args().x
+with mlflow.start_run() as run:
+    bind_mlflow_run(run.info.run_id)
+    mlflow.log_metric("loss", x, step=1)
+    if x == 1:
+        mlflow.log_metric("corrected_loss", 2, step=1)
+""",
+        encoding="utf-8",
+    )
+    config = _managed_loss_experiment(tmp_path, uri, experiment_id, trainer, n_trials=2).model_dump(
+        mode="json"
+    )
+    config["mlflow"]["run_mode"] = "trainer"
+    config["phases"][0]["sampler"] = {"type": "grid"}
+    original = Experiment.model_validate(config)
+    first = run_experiment(original)["p"]
+    first_run = first.objective_provenance["remote_capture"]["binding"]["run_id"]
+    initial_native = client.get_run(first_run)
+    assert initial_native.data.tags[WINNER_TAG] == "true"
+
+    config["metric"]["extractor"]["metric_key"] = "corrected_loss"
+    changed = Experiment.model_validate(config)
+    second = run_experiment(changed)["p"]
+    second_run = second.objective_provenance["remote_capture"]["binding"]["run_id"]
+    assert second_run != first_run
+    assert second.metric == 2
+    rejected = client.get_run(first_run)
+    assert rejected.info.status == initial_native.info.status == "FINISHED"
+    assert rejected.info.end_time == initial_native.info.end_time
+    assert rejected.data.tags[OUTCOME_TAG] == "FAILED"
+    assert rejected.data.metrics["phasesweep.objective"] == first.metric
+    assert WINNER_TAG not in rejected.data.tags
+    assert client.get_run(second_run).data.tags[WINNER_TAG] == "true"
+
+    assert run_experiment(original)["p"].attempt_id == first.attempt_id
+    accepted = client.get_run(first_run)
+    assert accepted.info.status == "FINISHED"
+    assert accepted.info.end_time == initial_native.info.end_time
+    assert OUTCOME_TAG not in accepted.data.tags
+    assert accepted.data.tags[WINNER_TAG] == "true"
+    assert WINNER_TAG not in client.get_run(second_run).data.tags
+    attempts = client.search_runs([experiment_id], filter_string="tags.`phasesweep.phase` = 'p'")
+    assert {run.info.run_id for run in attempts} == {first_run, second_run}
+    assert delivery_status(original)["pending"] == 0
+
+
 @pytest.mark.parametrize(
     "trainer_outcome", ["bare_crash", "ended_crash", "no_objective", "ended_then_logged"]
 )
@@ -581,7 +631,7 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     from phasesweep.engine.paths import _experiment_dir
     from phasesweep.engine.selection import NoFeasibleTrialError
     from phasesweep.engine.state import FAILURE_REASON_ATTR
-    from phasesweep.tracking.session import read_binding
+    from phasesweep.tracking.session import BINDING_FILE, attempt_tracking_records, read_binding
     from tests.conftest import phase_trials, write_experiment_config
 
     monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
@@ -599,8 +649,8 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(experiment)
 
-    (directory,) = (_experiment_dir(experiment) / "p").glob("trial_*")
-    binding = read_binding(directory)
+    (binding_path,) = attempt_tracking_records(experiment, BINDING_FILE, None)
+    binding = read_binding(binding_path.parent)
     remote = client.get_run(binding["run_id"])
     assert (remote.info.status, remote.data.tags["phasesweep.outcome"]) == ("FAILED", "FAILED")
     assert "phasesweep.objective" not in remote.data.metrics
@@ -624,6 +674,42 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     assert " ".join(shown.output.split()).count(reason) == 1
     assert any(line.lstrip().startswith("reason: ") for line in lines)
     assert max(map(len, lines)) <= 80
+
+
+def test_corrected_key_reads_the_managed_run_after_failed_delivery(local_server, tmp_path):
+    """A corrected key reads the original successful trainer, and its publication finishes the run PhaseSweep had failed."""
+    from phasesweep.engine.selection import NoFeasibleTrialError
+    from phasesweep.evidence.models import MlflowExtractor
+    from phasesweep.tracking.session import BINDING_FILE, attempt_tracking_records, read_binding
+
+    uri, client, experiment_id, _process = local_server
+    trainer = tmp_path / "trainer.py"
+    trainer.write_text(
+        "import mlflow\nwith mlflow.start_run():\n    mlflow.log_metric('loss', 0.25)\n",
+        encoding="utf-8",
+    )
+    corrected = _managed_loss_experiment(tmp_path, uri, experiment_id, trainer, n_trials=1)
+    typo = corrected.metric.model_copy(
+        update={"extractor": MlflowExtractor(type="mlflow", metric_key="typo", select="last")}
+    )
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(corrected.model_copy(update={"metric": typo}))
+    (record,) = attempt_tracking_records(corrected, BINDING_FILE, None)
+    binding = read_binding(record.parent)
+    assert client.get_run(binding["run_id"]).info.status == "FAILED"
+
+    winner = run_experiment(corrected)["p"]
+    assert (winner.metric, winner.attempt_id) == (0.25, binding["attempt_id"])
+    assert winner.objective_provenance is not None
+    capture = winner.objective_provenance["remote_capture"]
+    assert capture["run_state"] == "FAILED"
+    assert capture["tags"]["phasesweep.status_before_delivery"] == "FINISHED"
+    assert list(attempt_tracking_records(corrected, BINDING_FILE, None)) == [record]
+    run = client.get_run(binding["run_id"])
+    assert run.info.status == "FINISHED"
+    assert run.data.metrics["phasesweep.objective"] == 0.25
+    assert {"phasesweep.outcome", "phasesweep.status_before_delivery"}.isdisjoint(run.data.tags)
+    assert run.data.tags["phasesweep.winner"] == "true"
 
 
 def test_managed_missing_objective_hint_is_logged_once_per_phase(

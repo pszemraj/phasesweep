@@ -21,7 +21,7 @@ from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     DURATION_ATTR,
     FAILURE_REASON_ATTR,
-    FEASIBLE_ATTR,
+    RETURN_CODE_ATTR,
     TRIAL_OUTCOME_ATTR,
 )
 from phasesweep.engine.trial import _environment_identity
@@ -46,8 +46,32 @@ from tests.conftest import (
 
 def _trial_lines(experiment_log: Path, phase: str) -> list[str]:
     """Return every ``run.log`` line the phase logged for a finished trial, in order."""
-    finished = re.compile(rf" {re.escape(phase)}  trial \d+  [A-Z]+  ")
+    finished = re.compile(rf" {re.escape(phase)}  trial \d+  (?!RUNNING)[A-Z]+  ")
     return [line for line in experiment_log.read_text().splitlines() if finished.search(line)]
+
+
+def test_run_log_records_each_trial_as_it_starts(tmp_path: Path) -> None:
+    """Each trial's start line precedes its finished line and names its configuration."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=_x_trainer(tmp_path),
+        name="p",
+        n_trials=2,
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 4])},
+    )
+
+    run_experiment(experiment)
+
+    lines = (_experiment_dir(experiment) / "run.log").read_text().splitlines()
+    trials = [match[1] for line in lines if (match := re.search(r" p  (trial \d+  .*)$", line))]
+    assert [line.split("  ")[:2] for line in trials] == [
+        ["trial 0", "RUNNING"],
+        ["trial 0", "COMPLETE"],
+        ["trial 1", "RUNNING"],
+        ["trial 1", "COMPLETE"],
+    ]
+    assert re.fullmatch(r"trial 0  RUNNING  x=[14]", trials[0])
 
 
 def _field(line: str, pattern: str) -> str:
@@ -106,9 +130,9 @@ def test_in_memory_run_snapshots_every_finished_trial_before_optimize_returns(
     [
         (TRIAL_OUTCOME_ATTR, True),
         (DURATION_ATTR, True),
-        (FEASIBLE_ATTR, True),
+        (RETURN_CODE_ATTR, True),
         pytest.param(FAILURE_REASON_ATTR, True, id="crashed-trainer-diagnostic"),
-        pytest.param(FEASIBLE_ATTR, False, id="in-memory"),
+        pytest.param(RETURN_CODE_ATTR, False, id="in-memory"),
     ],
 )
 def test_trial_write_error_reports_cause_and_storage_specific_recovery(
@@ -153,7 +177,12 @@ def test_trial_write_error_reports_cause_and_storage_specific_recovery(
             assert "the next run recovers it" in diagnostic
         else:
             assert "The trial result was lost" in diagnostic
-            assert "RUNNING" not in diagnostic
+            # The trial's start line names RUNNING; nothing else may claim it is still running.
+            assert all(
+                "RUNNING" not in line
+                for line in diagnostic.splitlines()
+                if "trial 0  RUNNING" not in line
+            )
 
     if persistent:
         (original,) = phase_trials(experiment)
@@ -194,7 +223,7 @@ def test_run_log_records_one_line_per_finished_trial(tmp_path: Path) -> None:
     assert failed.endswith("  reason: non-zero exit code 3; stderr: second line")
     infeasible = by_state["INFEASIBLE"]
     assert "  INFEASIBLE  objective 52.5  " in infeasible
-    assert "reason: metric or evidence constraints were infeasible" in infeasible
+    assert "reason: outside the metric bounds or constraints" in infeasible
     feasible = [line for line in lines if "  COMPLETE  " in line]
     assert len(feasible) == 2
     assert all(re.search(r"  COMPLETE  objective \d", line) for line in feasible)
@@ -237,13 +266,15 @@ def test_infeasible_reason_names_measured_value_and_violated_bound(
     study = phase_study(experiment)
     rejected = next(trial for trial in study.trials if trial.value == value)
     assert rejected.state == optuna.trial.TrialState.COMPLETE
-    cause = rejected.user_attrs[TRIAL_OUTCOME_ATTR]["cause"]
+    # The outcome records the measurement; the reason is the bounds' verdict on it.
+    assert "cause" not in rejected.user_attrs[TRIAL_OUTCOME_ATTR]
+    lines = _trial_lines(_experiment_dir(experiment) / "run.log", "p")
+    (cause,) = [line.split("  reason: ", 1)[1] for line in lines if "  reason: " in line]
+    assert cause.startswith("outside the metric bounds or constraints: ")
     assert (metric.name if source == "metric" else constraint_name) in cause
     assert str(value) in cause
     assert bound in cause
     assert str(limit) in cause
-    lines = _trial_lines(_experiment_dir(experiment) / "run.log", "p")
-    assert any(line.endswith(f"  reason: {cause}") for line in lines)
 
 
 def test_run_log_names_the_configuration_and_repeat_value_of_each_trial(tmp_path: Path) -> None:
@@ -358,7 +389,7 @@ def test_failed_trials_carry_their_stderr_cause_and_the_hint_only_for_the_enviro
 
 
 def test_no_feasible_headline_covers_the_causes_of_infeasible_trials_too(tmp_path: Path) -> None:
-    """The fix line sends the operator to trials.csv, where each failed or infeasible row keeps its own cause."""
+    """The fix line sends the operator to trials.csv, where a failed row keeps its cause and an infeasible one its measured value."""
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=_x_trainer(tmp_path),
@@ -379,10 +410,11 @@ def test_no_feasible_headline_covers_the_causes_of_infeasible_trials_too(tmp_pat
         rows = {row["state"]: row for row in csv.DictReader(handle)}
     assert set(rows) == {"FAIL", "INFEASIBLE"}
     assert "non-zero exit code 3" in rows["FAIL"][f"user_attr:{FAILURE_REASON_ATTR}"]
-    # An infeasible trial finished without an execution failure, so its cause is in its outcome.
+    # An infeasible trial is a measurement: its state is judged under the bounds when the
+    # table is written, and its outcome records the value with no failure cause.
     assert rows["INFEASIBLE"][f"user_attr:{FAILURE_REASON_ATTR}"] == ""
-    assert "infeasible: metric" in rows["INFEASIBLE"][f"user_attr:{TRIAL_OUTCOME_ATTR}"]
-    assert "> max=1.0" in rows["INFEASIBLE"][f"user_attr:{TRIAL_OUTCOME_ATTR}"]
+    assert float(rows["INFEASIBLE"]["value"]) > 1.0
+    assert "'outcome': 'success'" in rows["INFEASIBLE"][f"user_attr:{TRIAL_OUTCOME_ATTR}"]
 
 
 @pytest.mark.parametrize("verbose", [False, True])
@@ -441,7 +473,6 @@ def _execution(tmp_path: Path) -> phase_ops._PhaseExecution:
 def _finish(run: phase_ops._PhaseExecution, outcome: str) -> int:
     """Record ``outcome`` for a new trial of ``run``'s study, as the objective does; return its number."""
     trial = run.study.ask()
-    trial.set_user_attr(FEASIBLE_ATTR, outcome == "success")
     trial.set_user_attr(
         TRIAL_OUTCOME_ATTR,
         trial_outcome(

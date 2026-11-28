@@ -374,27 +374,26 @@ def test_resume_refuses_an_unusable_publication_instead_of_reporting_no_winner(
     assert store.list_handles() == []
 
 
-@pytest.mark.parametrize(
-    ("lr_high", "incomplete"),
-    [
-        pytest.param(3, False, id="stale"),
-        pytest.param(2, True, id="incomplete"),
-    ],
-)
+@pytest.mark.parametrize("reason", ["stale", "incomplete", "bounds"])
 @pytest.mark.integration
 def test_resume_rejects_incompatible_winner_before_spawn(
     tmp_path: Path,
-    lr_high: int,
-    incomplete: bool,
+    reason: str,
 ) -> None:
+    """Refuse a skipped winner the current configuration cannot reuse.
+
+    :param Path tmp_path: Scratch experiment and catalog.
+    :param str reason: Which property makes the published winner incompatible.
+    """
     trainer = write_constant_trainer(tmp_path)
     published = drift_experiment(tmp_path, trainer)
     run_experiment(published)
-    if incomplete:
+    if reason == "incomplete":
         republish_as_incomplete(published)
     # The operator appends phase q, which resumes from p's published winner; a
     # wider p search space than the one published changes p's fingerprint.
     (p,) = published.phases
+    lr_high = 3 if reason == "stale" else 2
     p = p.model_copy(update={"search_space": {"lr": IntParam(type="int", low=1, high=lr_high)}})
     q = Phase(
         name="q",
@@ -404,12 +403,19 @@ def test_resume_rejects_incompatible_winner_before_spawn(
         search_space={"wd": FloatParam(type="float", low=0.0, high=0.1)},
     )
     config = tmp_path / "srv.yaml"
-    write_experiment_config(config, drift_experiment(tmp_path, trainer, phases=[p, q]))
+    current = drift_experiment(tmp_path, trainer, phases=[p, q])
+    message = "compatible winner"
+    if reason == "bounds":
+        current = current.model_copy(
+            update={"metric": current.metric.model_copy(update={"min": 0.1})}
+        )
+        message = "launch_run with from_phase='p' to reselect from recorded trials"
+    write_experiment_config(config, current)
     app, _registry, store = make_mcp_app(
         write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
     )
 
-    with pytest.raises(ResumeNotReadyError, match="compatible winner"):
+    with pytest.raises(ResumeNotReadyError, match=message):
         app.launch("srv", from_phase="q")
 
     assert store.list_handles() == []

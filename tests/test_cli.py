@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shlex
 import signal
 import stat
@@ -29,7 +30,6 @@ from phasesweep.config.search import CategoricalParam, FloatParam, Repeats, Samp
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     ExperimentLockBusyError,
-    StudyContextConflictError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -67,7 +67,13 @@ from tests.conftest import (
 )
 from tests.experiments import write_experiment
 from tests.ledger_fixtures import materialize, published_generation_id
-from tests.recovery_helpers import recover_run_cli
+from tests.recovery_helpers import recover_run_cli, stale_trial_rerun_config
+
+
+@pytest.fixture(autouse=True)
+def _wide_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give ``validate`` room to print each contract line whole, so a test reads it as one line."""
+    monkeypatch.setenv("COLUMNS", "500")
 
 
 @pytest.mark.parametrize(
@@ -996,6 +1002,22 @@ def test_show_winners_rejects_a_foreign_storage_ledger(tmp_path: Path) -> None:
     assert "trial_number" not in result.output
 
 
+def test_show_winners_says_how_many_results_reran_an_interrupted_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A winner that reran an interrupted trial carries the run summary's interrupted line among its comments."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    experiment, config = stale_trial_rerun_config(tmp_path)
+    run_experiment(experiment)
+
+    result = CliRunner().invoke(cli_main, ["show-winners", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "\n# interrupted: 1 of 2 results came from a rerun, the winner among them\n" in (
+        result.output
+    )
+
+
 def test_dry_run_does_not_launch(tmp_path, caplog, monkeypatch):
     """Dry-run should preview one coherent chain without launching anything."""
 
@@ -1027,7 +1049,7 @@ def test_dry_run_does_not_launch(tmp_path, caplog, monkeypatch):
         ],
     )
     monkeypatch.setattr(
-        "phasesweep.engine.preview._suggest",
+        "phasesweep.engine.optuna._suggest",
         lambda _trial, _name, param: param.low,
     )
     winners = run_experiment(exp, dry_run=True)
@@ -1474,6 +1496,7 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """``status --trials`` prints a table per phase, leaves plain status as YAML, and exits alike."""
+    monkeypatch.setenv("COLUMNS", "80")
     materialized = materialize("current-journal", tmp_path, mode="tree")
     config_path = materialized.config_path
     generation_id = published_generation_id(materialized.experiment)
@@ -1487,9 +1510,9 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     assert header.split() == ["trial", "objective", "a", "state", "time"]
     # The fixture's two trials tie on the metric, and the tie goes to the lower draw position.
     assert [row.split()[:3] for row in rows[:2]] == [["winner", "0", "0.5"], ["1", "0.5", "10"]]
-    # The winner's attempt directory is too wide to share a line with its label.
+    # The winner's trial directory is too wide to share a line with its label.
     assert rows[2] == "  winner trial 0 directory:"
-    assert Path(rows[3].strip()).name.startswith("trial_00000__generation_")
+    assert re.fullmatch(r"trial_00000__[0-9a-f]{32}", Path(rows[3].strip()).name)
 
     assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
     assert yaml.safe_load(capsys.readouterr().out)["kind"] == "experiment"
@@ -1746,7 +1769,7 @@ def test_cli_boundary_renders_action_once(
         raise translated
 
     monkeypatch.setattr(cli_main, "main", fail)
-    assert invoke_cli_boundary([], monkeypatch) == 1
+    assert invoke_cli_boundary([], monkeypatch) == (75 if action is OperatorAction.RETRY else 1)
     captured = capsys.readouterr()
     assert captured.out == ""
     diagnostic_line, fix_line = captured.err.splitlines()
@@ -1953,7 +1976,6 @@ def test_expected_operational_failures_share_one_base() -> None:
         UnsafeProcessCleanupError,
         ExperimentLockBusyError,
         GpuConfigurationError,
-        StudyContextConflictError,
         StudyFingerprintMismatchError,
         StudySchemaMismatchError,
         StudyStorageUnavailableError,

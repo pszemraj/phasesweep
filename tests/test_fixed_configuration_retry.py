@@ -22,7 +22,7 @@ from phasesweep.cli import cli as cli_main
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler, fixed_configuration_target_refusal
 from phasesweep.engine.errors import TrialTargetRefusedError
-from phasesweep.engine.fingerprints import _phase_fingerprint
+from phasesweep.engine.fingerprints import _fresh_identity, _stamp_identity
 from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
@@ -31,8 +31,9 @@ from phasesweep.engine.selection import (
     PhaseTrialsInfeasibleError,
     ReplayWithoutFeasibleTrialError,
 )
-from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, TRIAL_TARGET_ATTR
+from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_DIR_ATTR, TRIAL_TARGET_ATTR
 from phasesweep.engine.study_policy import _validate_trial_target
+from phasesweep.errors import REJUDGE_BOUNDS_STEP
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.runtime.process import write_attempt_lifecycle
@@ -131,6 +132,9 @@ def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
     assert _call_count(calls) == 2
     assert winners["p"].metric == 1.0
     assert _states(attempt(2)) == ["FAIL", "COMPLETE"]
+    first, retry = phase_trials(attempt(2))
+    assert retry.user_attrs[RERUN_OF_ATTR] == first.number
+    assert retry.user_attrs[TRIAL_DIR_ATTR] == first.user_attrs[TRIAL_DIR_ATTR]
 
     with pytest.raises(TrialTargetRefusedError) as repeated:
         run_experiment(attempt(3))
@@ -234,7 +238,7 @@ def test_measured_infeasible_fixed_configuration_says_nothing_can_continue(tmp_p
     for message in (_operational_error_text(aborted.value), _operational_error_text(refused.value)):
         assert "Its configuration was measured and is not feasible" in message
         assert "phases[p]" not in message
-        assert "new `experiment` name" in message
+        assert REJUDGE_BOUNDS_STEP in message
     assert _call_count(calls) == 1
 
 
@@ -308,9 +312,11 @@ def test_stale_recovered_fixed_configuration_attempt_reruns_at_the_same_target(
     """An attempt a kill or reboot left RUNNING recovers as interrupted and reruns without a raised target."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=0)
     exp = _fixed(tmp_path, trainer, 1)
-    study, trial_dir, _number = fabricate_stale_trial(exp, "p", attempt_id="killed-attempt")
-    study.set_user_attr(PHASE_FINGERPRINT_ATTR, _phase_fingerprint(exp, exp.phases[0], {}))
-    write_attempt_lifecycle(trial_dir, attempt_id="killed-attempt", state="allocated")
+    study, _trial_dir, _number, attempt_dir = fabricate_stale_trial(
+        exp, "p", attempt_id="killed-attempt"
+    )
+    _stamp_identity(study, _fresh_identity(exp, exp.phases[0], {}))
+    write_attempt_lifecycle(attempt_dir, attempt_id="killed-attempt", state="allocated")
 
     assert run_experiment(exp)["p"].metric == 1.0
     assert _call_count(calls) == 1

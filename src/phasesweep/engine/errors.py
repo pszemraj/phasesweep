@@ -22,14 +22,14 @@ class StudyFingerprintMismatchError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
 
 
+class ResumeBoundsChangedError(StudyFingerprintMismatchError):
+    """Raised when skipping a phase would reuse a winner selected under different bounds."""
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
+
+
 class StudySchemaMismatchError(PhaseSweepError):
     """Raised when populated storage uses an unsupported PhaseSweep schema."""
-
-    default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
-
-
-class StudyContextConflictError(PhaseSweepError):
-    """Raised when an upstream top-up would invalidate a bound descendant study."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
 
@@ -120,7 +120,8 @@ class IncompleteJournalRecordError(StudyStorageUnavailableError):
 
     Causes include lock timeout or replacement, backup or truncation failure,
     and journal changes during repair. Intact records remain;
-    lock replacement or concurrent changes carry ``OperatorAction.RETRY``.
+    a lock still held after the repair's wait, lock replacement or concurrent changes carry
+    ``OperatorAction.RETRY``.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_LEDGER
@@ -189,18 +190,22 @@ class TrackingTargetUnavailableError(PhaseSweepError):
 
 
 TRACKER_UNREADABLE_STEP = (
-    "Restore access to the tracker or install its SDK, then run the same config again; the "
-    f"finished training is kept. If the tracker is gone for good, {FRESH_STUDY}."
+    "Run the same config again once the tracker serves the evidence. Finished training is kept. "
+    f"If access failed, check credentials and SDK installation. If the tracker is gone for good, {FRESH_STUDY}."
 )
 
 
 def tracker_unreadable(message: str) -> TrackingTargetUnavailableError:
     """Attach the step that fixes the tracker read to a stop that keeps finished training pending.
 
+    The stop is a retry: the tracker answering again is all the same command needs.
+
     :param str message: Diagnostic naming the pending trials and the tracker's failure.
     :return TrackingTargetUnavailableError: Refusal shared by the live run and recovery.
     """
-    return TrackingTargetUnavailableError(message, remediation=TRACKER_UNREADABLE_STEP)
+    return TrackingTargetUnavailableError(
+        message, action=OperatorAction.RETRY, remediation=TRACKER_UNREADABLE_STEP
+    )
 
 
 class TrackingSyncRefusedError(PhaseSweepError):

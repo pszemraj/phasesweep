@@ -23,7 +23,12 @@ import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
 import phasesweep.mcp.tools as mcp_tools
 import phasesweep.runtime.reaper as reaper
-from phasesweep.errors import ForeignPidNamespaceError, OperatorAction, PhaseSweepError
+from phasesweep.errors import (
+    ForeignPidNamespaceError,
+    OperatorAction,
+    PhaseSweepError,
+    operator_step,
+)
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import CatalogError, ExperimentBusyError, RunNamespaceMismatchError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
@@ -434,8 +439,8 @@ def test_trial_launch_refuses_an_unreadable_pid_namespace_before_anything_exists
         "_spawn_blocked_supervisor",
         lambda **_kwargs: pytest.fail("no trial may start without a recorded namespace"),
     )
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
+    attempt_dir = tmp_path / "attempt"
+    attempt_dir.mkdir()
 
     with (tmp_path / "out.log").open("w") as out, pytest.raises(PhaseSweepError) as caught:
         run_supervised(
@@ -444,13 +449,13 @@ def test_trial_launch_refuses_an_unreadable_pid_namespace_before_anything_exists
             stdout=out,
             stderr=out,
             timeout=None,
-            trial_dir=trial_dir,
+            attempt_dir=attempt_dir,
             attempt_id="ns-attempt",
         )
 
     assert caught.value.action is OperatorAction.FIX_CONFIG
     assert "PID namespace" in str(caught.value)
-    assert list(trial_dir.iterdir()) == []
+    assert list(attempt_dir.iterdir()) == []
 
 
 def test_read_stale_process_identity_requires_pid_namespace(tmp_path: Path) -> None:
@@ -507,6 +512,10 @@ def test_cleanup_stale_trial_process_refuses_foreign_namespace_without_signallin
     assert NESTED_READER in message
     assert "cannot be cleaned from here" in message
     assert "kill -9" not in message
+    assert len(message) < 280 and "so run this from there" not in message
+    assert operator_step(caught.value).startswith(
+        "Run the same command from the host's initial PID namespace"
+    )
 
 
 def test_cleanup_stale_trial_process_settles_an_absent_trial_without_signalling(

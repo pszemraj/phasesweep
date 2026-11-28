@@ -56,17 +56,22 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 BINDING_FILE = "mlflow-binding.json"
-# The identity an attempt's run must carry, written in its trial directory before it launches.
+# The identity an attempt's run must carry, persisted before it launches.
 EXPECTED_BINDING_FILE = "mlflow-expected.json"
 GENERATION_BINDING_FILE = "generation-binding.json"
 INHERITS_FILE = "mlflow-inherits.json"
+_TRACKING_DIR = "tracking"
+# Attempt metadata is owned by its generation, even when its payload cannot be read.
+_TRACKING_ATTEMPTS_DIR = "attempts"
 # The target and experiment the tree's bound runs live in, under the tracking root.
 SOURCE_FILE = "source.json"
+SOURCE_SCHEMA_VERSION = 2
 # Delivery records live in this directory of their generation's tracking directory. The summary
 # run's is named SUMMARY_RECORD, the others attempt-<attempt id> and winner-<phase>.
 DELIVERY_DIR = "delivery"
 SUMMARY_RECORD = "generation"
 _PENDING_SUFFIX = ".pending.json"
+PENDING_ATTEMPT_BINDING_FILE = Path(BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
 PENDING_GENERATION_BINDING_FILE = Path(GENERATION_BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
 _PARENT_LOCK = threading.RLock()
 # Failures that say nothing about a request's subject: MLflow gave no answer, or the worker's
@@ -149,6 +154,41 @@ class DeliveryTally:
         self.refused.add(path)
         return "refused"
 
+    def warn_failure(
+        self,
+        experiment: Experiment,
+        path: Path,
+        exc: BaseException,
+        *,
+        state: str = "is pending",
+        waiting: str,
+    ) -> bool:
+        """Record one failed request, warn about it, and say whether the pass ends here.
+
+        A shutdown is not MLflow's failure, and a refusal this delivery met before is counted
+        by the closing line, so neither is warned about.
+
+        :param Experiment experiment: The delivery's MLflow-backed experiment.
+        :param Path path: The delivery record or creation intent the request was for.
+        :param BaseException exc: The request's error.
+        :param str state: What the warning says of ``path``, defaults to ``is pending``.
+        :param str waiting: What else waits when MLflow gave no answer, such as ``2 later
+            records must wait``, or an empty string when nothing does.
+        :return bool: Whether the pass ends: on a shutdown or when MLflow gave no answer.
+        """
+        failure = self.note_failure(experiment, path, exc)
+        if failure not in ("shutdown", "refused again"):
+            log.warning(
+                "MLflow: %s %s (%s).%s",
+                record_name(path),
+                state,
+                str(exc).rstrip("."),
+                f" MLflow did not answer, so {waiting} too."
+                if failure == "no answer" and waiting
+                else "",
+            )
+        return failure in ("shutdown", "no answer")
+
 
 def gave_no_answer(exc: BaseException) -> bool:
     """Tell a request MLflow gave no answer to from one it answered with a failure.
@@ -165,26 +205,31 @@ def gave_no_answer(exc: BaseException) -> bool:
 def record_name(path: Path) -> str:
     """Name a delivery record or creation intent by what it is, for the lines that report it.
 
-    :param Path path: A delivery record under ``tracking/<generation>/delivery``, a summary
-        run's creation intent under ``tracking/<generation>``, or an attempt run's creation
-        intent in its trial directory.
+    :param Path path: A delivery record or a pending creation in its generation's
+        tracking directory.
     :return str: For example ``the summary record of generation <id>`` or ``attempt record
         attempt-<id> of generation <id>``.
     """
-    if path.name == PENDING_GENERATION_BINDING_FILE:
-        return f"the summary-run creation record of generation {path.parent.name}"
     if is_creation_intent(path):
-        # pending_creation_records finds these only in trial_<n>__generation_<id>__attempt_<id>.
-        # The markers fix the parse, as a generation id may hold "__" itself: an MCP run's is
-        # named after its catalog id, which may. An attempt id is hex.
-        generation, _, attempt = path.parent.name.partition("__generation_")[2].rpartition(
-            "__attempt_"
-        )
-        return f"the run-creation record of attempt {attempt} of generation {generation}"
+        generation = _creation_generation(path)
+        if path.name == PENDING_GENERATION_BINDING_FILE:
+            return f"the summary-run creation record of generation {generation}"
+        return f"the run-creation record of attempt {path.parent.name} of generation {generation}"
     generation = path.parent.parent.name
     if path.stem == SUMMARY_RECORD:
         return f"the summary record of generation {generation}"
     return f"{path.stem.split('-', 1)[0]} record {path.stem} of generation {generation}"
+
+
+def _creation_generation(path: Path) -> str:
+    """Give the generation that owns a pending creation, identified by its location.
+
+    :param Path path: The summary or attempt creation intent.
+    :return str: The generation directory's name.
+    """
+    if path.name == PENDING_GENERATION_BINDING_FILE:
+        return path.parent.name
+    return path.parent.parent.parent.name
 
 
 def is_creation_intent(path: Path) -> bool:
@@ -256,7 +301,32 @@ def tracking_root(experiment: Experiment) -> Path:
     """
     from phasesweep.engine.paths import _experiment_dir
 
-    return _experiment_dir(experiment) / "tracking"
+    return _experiment_dir(experiment) / _TRACKING_DIR
+
+
+def attempt_tracking_dir(artifact_root: Path, generation_id: str, attempt_id: str) -> Path:
+    """Locate an attempt's native run metadata in its generation's tracking state.
+
+    :param Path artifact_root: Experiment's artifact directory.
+    :param str generation_id: Generation that owns this attempt.
+    :param str attempt_id: Attempt whose tracking metadata is addressed.
+    :return Path: Directory for the native binding, expected identity and inheritance record.
+    """
+    return artifact_root / _TRACKING_DIR / generation_id / _TRACKING_ATTEMPTS_DIR / attempt_id
+
+
+def attempt_tracking_records(
+    experiment: Experiment, filename: str, generation_id: str | None
+) -> list[Path]:
+    """List one kind of MLflow attempt record in the requested generation scope.
+
+    :param Experiment experiment: Experiment owning the tracking state.
+    :param str filename: File name within each attempt's metadata directory.
+    :param str | None generation_id: Generation to inspect, or ``None`` for all generations.
+    :return list[Path]: Matching files in path order, without opening their payloads.
+    """
+    scope = generation_id or "*"
+    return sorted(tracking_root(experiment).glob(f"{scope}/{_TRACKING_ATTEMPTS_DIR}/*/{filename}"))
 
 
 def summary_binding_path(experiment: Experiment, generation_id: str) -> Path:
@@ -294,16 +364,17 @@ def write_record(path: Path, record: Mapping[str, object]) -> None:
     )
 
 
-def read_record(path: Path) -> JsonObject:
+def read_record(path: Path, *, schema_version: int = 1) -> JsonObject:
     """Read a current-format tracking record.
 
     :param Path path: Record to read.
+    :param int schema_version: Required local record version, defaults to 1.
     :raises ValueError: The record does not use the current format.
     :return JsonObject: Decoded current-format record.
     """
     data: object = strict_json_loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or data.get("schema_version") != 1:
-        raise ValueError("Unsupported MLflow tracking record format.")
+    if not isinstance(data, dict) or data.get("schema_version") != schema_version:
+        raise ValueError(f"Unsupported MLflow tracking record format at {path}.")
     return json_object(data)
 
 
@@ -327,7 +398,11 @@ def bind_mlflow_run(run_id: str) -> None:
     """
     from mlflow import MlflowClient
 
-    directory = Path(os.environ["PHASESWEEP_TRIAL_DIR"])
+    directory = attempt_tracking_dir(
+        Path(os.environ["PHASESWEEP_TRIAL_DIR"]).parent.parent,
+        os.environ["PHASESWEEP_GENERATION_ID"],
+        os.environ["PHASESWEEP_ATTEMPT_ID"],
+    )
     expected = read_record(directory / EXPECTED_BINDING_FILE)
     if (
         expected["run_mode"] != "trainer"
@@ -357,7 +432,7 @@ def bind_mlflow_run(run_id: str) -> None:
 def read_inherits(directory: Path) -> dict[str, str]:
     """Load the native run of each parent winner an attempt inherited.
 
-    :param Path directory: Attempt directory.
+    :param Path directory: Attempt's tracking directory.
     :raises ValueError: The record is not a mapping of phase names to run IDs.
     :return dict[str, str]: Run ID by parent phase name.
     """
@@ -474,6 +549,7 @@ def _create_bound(
     *,
     run_name: str,
     deadline: float | None,
+    worker_generation: str | None = None,
 ) -> RunBinding:
     """Bind or create an identity's run, persisting intent before sending creation.
 
@@ -487,6 +563,8 @@ def _create_bound(
     :param Mapping[str, str] environment: Composed credentials and transport.
     :param str run_name: Display name for a newly created run.
     :param float | None deadline: Existing execution deadline.
+    :param str | None worker_generation: Invocation registering the workers, defaulting to the
+        identity's own generation.
     :raises OperationRejectedError: The worker reported that the request failed.
     :raises RuntimeError: The creation outcome is unresolved.
     :return RunBinding: Bound native run identity.
@@ -509,6 +587,7 @@ def _create_bound(
                 environment,
                 timeout_at=operation_deadline(experiment, deadline),
                 deadline=deadline,
+                worker_generation=worker_generation,
             )
             if found is not None:
                 return found
@@ -526,7 +605,11 @@ def _create_bound(
         request: CreateAction = {"action": "create", "binding": identity, "run_name": run_name}
         try:
             created = call_tracking(
-                experiment, identity["generation_id"], request, environment, deadline
+                experiment,
+                worker_generation or identity["generation_id"],
+                request,
+                environment,
+                deadline,
             )
         except OperationRejectedError:
             # A refused or unsent request created nothing, so a later call may send it afresh.
@@ -596,21 +679,13 @@ def pending_creation_records(
     :param str | None skip: Generation left out, a live invocation's own, defaults to none.
     :return list[Path]: Pending summary and attempt creation records, in that order.
     """
-    from phasesweep.engine.paths import _experiment_dir
-
     scope = generation_id or "*"
-    attempt_pending = Path(BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
     records = sorted(
         tracking_root(experiment).glob(f"{scope}/{PENDING_GENERATION_BINDING_FILE}")
-    ) + sorted(
-        _experiment_dir(experiment).glob(
-            f"*/trial_*__generation_{scope}__attempt_*/{attempt_pending}"
-        )
-    )
+    ) + attempt_tracking_records(experiment, PENDING_ATTEMPT_BINDING_FILE, generation_id)
     if skip is None:
         return records
-    skipped = set(pending_creation_records(experiment, skip))
-    return [path for path in records if path not in skipped]
+    return [path for path in records if _creation_generation(path) != skip]
 
 
 def creation_window_end(experiment: Experiment, pending: Path) -> float:
@@ -707,6 +782,8 @@ def _reconcile_creation(
         _settle_creation(pending, tally)
         return
     identity = validate_identity(read_record(pending).get("identity"))
+    if identity["generation_id"] != _creation_generation(pending):
+        raise ValueError("MLflow creation record belongs to a different generation.")
     # A search started inside the window may see absence even if it returns after the window.
     expired = time.time() >= creation_window_end(experiment, pending)
     try:
@@ -721,18 +798,14 @@ def _reconcile_creation(
     except PhaseSweepError:
         raise
     except (TimeoutError, ValueError, RuntimeError) as exc:  # every NO_ANSWER error included
-        failure = tally.note_failure(experiment, pending, exc)
-        # Nothing blames MLflow for a shutdown, and a refusal met before is counted already.
-        if failure not in ("shutdown", "refused again"):
-            # After no answer the pass sends nothing more, so this is its only outage warning.
-            log.warning(
-                "MLflow: %s is still unresolved (%s).%s",
-                record_name(pending),
-                str(exc).rstrip("."),
-                " MLflow did not answer, so later searches and uploads wait too."
-                if failure == "no answer"
-                else "",
-            )
+        # After no answer the pass sends nothing more, so this is its only outage warning.
+        tally.warn_failure(
+            experiment,
+            pending,
+            exc,
+            state="is still unresolved",
+            waiting="later searches and uploads wait",
+        )
         return
     if binding is not None:
         write_record(path, binding)
@@ -776,11 +849,14 @@ def _resolve_source(
         experiment_id = json_text(resolved, "experiment_id")
         source_path = tracking_root(experiment) / SOURCE_FILE
         source = {
-            "schema_version": 1,
+            "schema_version": SOURCE_SCHEMA_VERSION,
             "source": experiment.mlflow.evidence_identity(),
             "experiment_id": experiment_id,
         }
-        if source_path.exists() and read_record(source_path) != source:
+        if (
+            source_path.exists()
+            and read_record(source_path, schema_version=SOURCE_SCHEMA_VERSION) != source
+        ):
             raise ValueError("MLflow experiment resolution changed within this scientific cohort.")
         write_record(source_path, source)
         return experiment_id
@@ -792,13 +868,23 @@ def prepare_generation(
     generation_id: str,
     environment: Mapping[str, str],
     deadline: float | None,
+    config_fingerprint: str | None = None,
+    worker_generation: str | None = None,
 ) -> RunBinding:
-    """Resolve the source experiment and bind this generation's summary run once.
+    """Resolve the source experiment and bind a generation's summary run once.
+
+    A run binds its own before its first trial; a generation that published without launching
+    has its summary run bound by a delivery pass.
 
     :param Experiment experiment: MLflow-backed experiment.
-    :param str generation_id: Current invocation identity.
+    :param str generation_id: Generation whose summary run is bound.
     :param Mapping[str, str] environment: Composed trainer environment.
     :param float | None deadline: Existing phase/run deadline.
+    :param str | None config_fingerprint: The generation's recorded config fingerprint, for a
+        published generation the configured experiment may not describe; ``None`` takes the
+        configured experiment's.
+    :param str | None worker_generation: Invocation registering the workers, defaulting to
+        ``generation_id``.
     :return RunBinding: The generation summary run's binding.
     """
     assert experiment.mlflow is not None
@@ -807,7 +893,10 @@ def prepare_generation(
         if parent_path.is_file():
             return read_binding(parent_path.parent, parent_path.name)
         experiment_id = _resolve_source(
-            experiment, generation_id=generation_id, environment=environment, deadline=deadline
+            experiment,
+            generation_id=worker_generation or generation_id,
+            environment=environment,
+            deadline=deadline,
         )
         from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 
@@ -816,7 +905,7 @@ def prepare_generation(
             "tracking_uri": experiment.mlflow.tracking_uri,
             "experiment": experiment.experiment,
             "generation_id": generation_id,
-            "overrides_sha256": _experiment_semantic_fingerprint(experiment),
+            "overrides_sha256": config_fingerprint or _experiment_semantic_fingerprint(experiment),
             "run_mode": "managed",
             "experiment_id": experiment_id,
             "phase": "generation",
@@ -829,6 +918,7 @@ def prepare_generation(
             environment,
             run_name=f"{experiment.experiment}-generation-{generation_id}",
             deadline=deadline,
+            worker_generation=worker_generation,
         )
 
 
@@ -844,7 +934,8 @@ def require_tracking_target(
 
     A generation whose summary run is bound only resolves the target, as does a check for a
     caller that only sends recovered outcomes, so a run that launches nothing binds no summary
-    run. Its worker is registered under ``generation_id`` either way.
+    run here; its delivery creates one if it publishes. Its worker is registered under
+    ``generation_id`` either way.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param str generation_id: Generation of the run checking the target, whose summary run is
@@ -926,7 +1017,6 @@ def prepare_attempt(
     run_name: str,
     overrides_sha256: str,
     inherited: Mapping[str, Winner],
-    directory: Path,
     environment: Mapping[str, str],
     deadline: float | None,
 ) -> RunIdentity:
@@ -941,12 +1031,14 @@ def prepare_attempt(
     :param str run_name: The trainer's ``PHASESWEEP_RUN_NAME``, reused for a managed run.
     :param str overrides_sha256: Existing prepared-input identity.
     :param Mapping[str, Winner] inherited: Parent-phase winners fixed into this attempt.
-    :param Path directory: Registered attempt directory.
     :param Mapping[str, str] environment: Composed trainer environment.
     :param float | None deadline: Existing phase/run deadline.
     :return RunIdentity: Expected identity, a full binding with a run ID in managed mode.
     """
+    from phasesweep.engine.paths import _experiment_dir
+
     assert experiment.mlflow is not None
+    directory = attempt_tracking_dir(_experiment_dir(experiment), generation_id, attempt_id)
     parent = prepare_generation(
         experiment, generation_id=generation_id, environment=environment, deadline=deadline
     )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 from copy import deepcopy
 from pathlib import Path
@@ -18,8 +19,8 @@ from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Constraint, ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialEvidenceMissingError
-from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.optuna import _phase_study_name
+from phasesweep.engine.fingerprints import phase_study_name
+from phasesweep.engine.ledger import _resolve_storage, validate_ledger
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
@@ -28,11 +29,12 @@ from phasesweep.engine.paths import (
     _phase_dir,
     _trial_dir_for,
 )
-from phasesweep.engine.read import read_result, read_status
+from phasesweep.engine.read import inspect_status, read_result, read_status, read_trial_tables
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_INPUT_ATTR,
+    _trial_attempt_dir,
 )
 from phasesweep.errors import NEW_STUDY_STEP, OTHER_FORMAT_STEP, OperatorAction
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
@@ -102,7 +104,6 @@ def test_json_primary_external_trainer_inherits_replays_and_verifies_source(tmp_
             experiment,
             "first",
             winner.trial_number,
-            generation_id=winner.generation_id,
             attempt_id=winner.attempt_id,
         )
         / "r.json"
@@ -136,7 +137,8 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
                     {{"eval/loss": 0.25, "memory": 3.0, "complete": True, "secret": "never persisted",
                       "_step": 9}},
                     "history_keys": {{"lastStep": 9,
-                        "keys": {{"eval/loss": {{"typeCounts": [{{"count": 1}}]}}}}}},
+                        "keys": {{"eval/loss": {{"typeCounts": [{{"count": 2}}]}},
+                                  "_step": {{"typeCounts": [{{"count": 2}}]}}}}}},
                     "load": lambda self, force=False: None,
                     "history": lambda self, keys, samples=500, pandas=True:
                         [{{"eval/loss": 0.25, "_step": 9}}]}})()
@@ -231,7 +233,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
         winner = winners[phase.name]
         capture = winner.objective_provenance["remote_capture"]
         assert capture["run_id"] == winner.attempt_id
-        assert capture["run_state"] == "finished"
+        assert "run_state" not in capture
         assert "secret" not in json.dumps(capture)
         if consumers in {"primary", "combined"}:
             assert winner.objective_provenance["source"]["evaluation"] == {
@@ -372,6 +374,19 @@ def _sole_trial_dir(experiment: Experiment) -> Path:
     return directories[0]
 
 
+def _captured_stdout(experiment: Experiment, number: int = 0, phase_name: str = "p") -> Path:
+    """Return the captured stdout of one trial, kept in its attempt directory.
+
+    :param Experiment experiment: Experiment whose ledger is read.
+    :param int number: Trial number within the phase.
+    :param str phase_name: Phase holding the trial.
+    :return Path: The ``stdout.log`` of the trial's attempt.
+    """
+    attempt_dir = _trial_attempt_dir(phase_trials(experiment, phase_name)[number])
+    assert attempt_dir is not None
+    return attempt_dir / "stdout.log"
+
+
 _MARKED_TRAINER = """
 import argparse
 from pathlib import Path
@@ -493,7 +508,7 @@ def test_cli_trainer_input_record_is_the_merged_trainer_config(
 @pytest.mark.parametrize(
     ("damage", "expected"),
     [
-        pytest.param("directory", "has no evidence directory", id="whole-trial-directory"),
+        pytest.param("directory", "would select trial 0, whose directory", id="winner-directory"),
         pytest.param(
             "overrides",
             "missing its 'overrides_resolved.json' audit artifact",
@@ -505,9 +520,12 @@ def test_cli_trainer_input_record_is_the_merged_trainer_config(
             id="objective-source-only",
         ),
         pytest.param(
+            "attempt_directory", "has no evidence directory", id="whole-attempt-directory"
+        ),
+        pytest.param(
             "emptied",
             "has no attempt lifecycle record",
-            id="same-named-empty-directory",
+            id="same-named-empty-attempt-directory",
         ),
     ],
 )
@@ -519,10 +537,11 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
     """Missing candidate evidence fails the next top-up closed, before it launches.
 
     Each variant removes a different piece of the one completed trial's
-    evidence: the whole directory, the resolved-overrides audit artifact, the
-    objective source the metric was extracted from, and the directory replaced
-    by an empty one of the same name (which passes a bare existence check but
-    lacks the current-format lifecycle record).
+    evidence: the whole trial directory (the winner's), the resolved-overrides audit artifact,
+    the objective source the metric was extracted from, the whole attempt
+    directory, and the attempt directory replaced by an empty one of the same
+    name (which passes a bare existence check but lacks the current-format
+    lifecycle record).
     """
     experiment = _evidence_experiment(tmp_path)
     run_experiment(experiment)
@@ -534,10 +553,13 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
     elif damage == "overrides":
         (trial_dir / "overrides_resolved.json").unlink()
     elif damage == "objective_source":
-        (trial_dir / "stdout.log").unlink()
+        _captured_stdout(experiment).unlink()
+    elif damage == "attempt_directory":
+        shutil.rmtree(_captured_stdout(experiment).parent)
     else:
-        shutil.rmtree(trial_dir)
-        trial_dir.mkdir()
+        attempt_dir = _captured_stdout(experiment).parent
+        shutil.rmtree(attempt_dir)
+        attempt_dir.mkdir()
 
     topup = _evidence_experiment(tmp_path, n_trials=2)
     with pytest.raises(TrialEvidenceMissingError) as excinfo:
@@ -550,6 +572,100 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
     # whose evidence was broken, and nothing published over the damaged tree.
     assert len(phase_trials(topup)) == 1
     assert _pointer_bytes(topup) == pointer_before
+
+
+def test_reread_checks_losing_candidates_before_publication(tmp_path: Path) -> None:
+    """A root's re-read verifies retained audit files before publishing its new selection."""
+    experiment = _evidence_experiment(tmp_path, n_trials=2)
+    assert run_experiment(experiment)["p"].trial_number == 0
+    losing_trial = phase_trials(experiment)[1]
+    attempt_dir = _trial_attempt_dir(losing_trial)
+    assert attempt_dir is not None
+    attempts_before = set(attempt_dir.parent.iterdir())
+    command = attempt_dir / "command.txt"
+    command_bytes = command.read_bytes()
+    command.unlink()
+    pointer_before = _pointer_bytes(experiment)
+    reread = experiment.model_copy(
+        update={"metric": experiment.metric.model_copy(update={"goal": "maximize"})}
+    )
+
+    for dry_run in (False, True):
+        with pytest.raises(
+            TrialEvidenceMissingError,
+            match=r"trial 1 .* is missing its 'command.txt' audit artifact",
+        ):
+            run_experiment(reread, dry_run=dry_run)
+
+    assert _pointer_bytes(experiment) == pointer_before
+    assert read_status(reread)["phases"][0]["trials"] == {"COMPLETE": 2}
+    command.write_bytes(command_bytes)
+    assert run_experiment(reread)["p"].trial_number == 0
+    assert _pointer_bytes(experiment) != pointer_before
+    assert set(attempt_dir.parent.iterdir()) == attempts_before
+
+
+def _losing_trial_dir(experiment: Experiment, number: int) -> Path:
+    """Return the trial directory one trial of phase ``p`` recorded."""
+    (directory,) = _phase_dir(experiment, "p").glob(f"trial_{number:05d}__*")
+    return directory
+
+
+@pytest.mark.parametrize("prune", ["deleted", "dangling_link"])
+def test_a_pruned_losing_trial_keeps_its_rank_in_every_command(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, prune: str
+) -> None:
+    """A loser whose directory is gone keeps its value and rank; nothing refuses, one note says so.
+
+    The run, its dry run and both status reads judge it from one rule, and the top-up launches
+    only its one new trial.
+    """
+    experiment = _evidence_experiment(tmp_path, n_trials=2)
+    run_experiment(experiment)
+    pruned = _losing_trial_dir(experiment, 1)
+    shutil.rmtree(pruned)
+    if prune == "dangling_link":
+        pruned.symlink_to(tmp_path / "moved-away", target_is_directory=True)
+    topup = _evidence_experiment(tmp_path, n_trials=3)
+    note = "1 finished trial has no directory (trial 1); it ranks by its recorded value"
+
+    run_experiment(topup, dry_run=True)
+    inspection = inspect_status(topup, validate_ledger(topup))
+    assert inspection.refusals == {}
+    assert inspection.pruned == {"p": (1,)}
+    (table,) = read_trial_tables(topup).phases
+    assert (table.refusal, table.pruned) == (None, (1,))
+    caplog.clear()
+    winners = run_experiment(topup)
+
+    assert caplog.text.count(note) == 1
+    assert winners["p"].trial_number == 0
+    trials = phase_trials(topup)
+    assert [trial.number for trial in trials] == [0, 1, 2]
+    assert trials[1].value == trials[0].value
+
+
+def test_a_pruned_winner_refuses_every_command_with_its_path(tmp_path: Path) -> None:
+    """The trial selection picks must keep its directory; the refusal's fix names that path."""
+    experiment = _evidence_experiment(tmp_path, n_trials=2)
+    run_experiment(experiment)
+    pruned = _losing_trial_dir(experiment, 0)
+    shutil.rmtree(pruned)
+    pointer_before = _pointer_bytes(experiment)
+    expected = f"phase 'p' would select trial 0, whose directory {str(pruned)!r} is gone"
+    fix = f"Restore {pruned}, or rename phase 'p' to retrain its trials in a new study"
+
+    for dry_run in (True, False):
+        with pytest.raises(TrialEvidenceMissingError, match=re.escape(expected)) as excinfo:
+            run_experiment(experiment, dry_run=dry_run)
+        assert excinfo.value.remediation is not None
+        assert excinfo.value.remediation.startswith(fix)
+    refusal = inspect_status(experiment, validate_ledger(experiment)).refusals["p"]
+    assert expected in str(refusal)
+    (table,) = read_trial_tables(experiment).phases
+    assert expected in str(table.refusal)
+    assert len(phase_trials(experiment)) == 2
+    assert _pointer_bytes(experiment) == pointer_before
 
 
 @pytest.mark.parametrize(
@@ -738,12 +854,15 @@ def test_republishing_refuses_a_winner_whose_objective_bytes_changed(tmp_path: P
     experiment = _evidence_experiment(tmp_path)
     run_experiment(experiment)
     pointer_before = _pointer_bytes(experiment)
-    source = _sole_trial_dir(experiment) / "stdout.log"
+    source = _captured_stdout(experiment)
     original = source.read_bytes()
     source.write_bytes(b"y" + original[1:])
     assert source.stat().st_size == len(original)
 
-    with pytest.raises(TrialEvidenceMissingError, match="now hashes to .*: its bytes have changed"):
+    with pytest.raises(
+        TrialEvidenceMissingError,
+        match=f"now hashes to .* at {re.escape(repr(str(source)))}: its bytes have changed",
+    ):
         run_experiment(_evidence_experiment(tmp_path))
 
     assert _pointer_bytes(experiment) == pointer_before
@@ -778,14 +897,14 @@ def test_from_phase_refuses_damaged_skipped_winner_before_downstream_launch(
     run_experiment(_from_phase_evidence_experiment(tmp_path, resumed_trials=2)[0])
     shutil.rmtree(_generations_dir(_experiment_dir(original)) / source_generation)
     marker.unlink()
-    source = _sole_trial_dir(original)
+    source = _captured_stdout(original)
     pointer_before = _pointer_bytes(original)
     if damage == "changed":
-        original_bytes = (source / "stdout.log").read_bytes()
-        (source / "stdout.log").write_bytes(b"y" + original_bytes[1:])
-        assert (source / "stdout.log").stat().st_size == len(original_bytes)
+        original_bytes = source.read_bytes()
+        source.write_bytes(b"y" + original_bytes[1:])
+        assert source.stat().st_size == len(original_bytes)
     else:
-        (source / "stdout.log").unlink()
+        source.unlink()
 
     resumed, _ = _from_phase_evidence_experiment(tmp_path, resumed_trials=3)
     with pytest.raises(TrialEvidenceMissingError, match=expected):
@@ -832,8 +951,7 @@ def test_group_winner_verifies_every_member_evidence(tmp_path: Path) -> None:
     run_experiment(carrying)
     shutil.rmtree(_generations_dir(_experiment_dir(original)) / winner.generation_id)
     marker.unlink()
-    first_member = next(_phase_dir(original, "p").glob("trial_00000__*"))
-    source = first_member / "stdout.log"
+    source = _captured_stdout(original)
     original_bytes = source.read_bytes()
     source.write_bytes(b"y" + original_bytes[1:])
     pointer_before = _pointer_bytes(original)
@@ -873,7 +991,7 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     payload = winner_payload(experiment, generation_id)
     assert payload["trainer_input"] == phase_trials(experiment)[0].user_attrs[TRAINER_INPUT_ATTR]
     optuna.delete_study(
-        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        study_name=phase_study_name(experiment, experiment.phases[0], {}),
         storage=_resolve_storage(experiment.storage),
     )
 

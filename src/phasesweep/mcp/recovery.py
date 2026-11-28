@@ -40,14 +40,20 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.ledger import (
     ValidatedLedger,
-    open_existing_study,
+    open_existing_studies,
     repair_incomplete_journal_record,
     validate_ledger,
 )
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.state import ATTEMPT_ID_ATTR, GENERATION_ID_ATTR, TrialStateName
+from phasesweep.engine.state import (
+    GENERATION_ID_ATTR,
+    InterruptedReruns,
+    TrialStateName,
+    _interrupted_reruns,
+)
+from phasesweep.engine.trial_dirs import producing_attempts
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.mcp.errors import NEW_RUN_RESUMES, live_runner_step, sync_tracking_command
 from phasesweep.mcp.runner import FailurePayload
@@ -107,6 +113,8 @@ class _CleanupEvidence:
     reaped_attempt_locations: dict[str, tuple[str, int, str]]
     registered_recovery_attempt_ids: set[str] = field(default_factory=set)
     reaped_attempt_states: dict[str, TrialStateName] = field(default_factory=dict)
+    # What each settled attempt adds to the frozen interrupted-rerun counters, read from its row.
+    reaped_attempt_reruns: dict[str, InterruptedReruns] = field(default_factory=dict)
     reaped: int = 0
     registered_attempts_reconciled: int = 0
     cleanup_recovered: int = 0
@@ -696,12 +704,14 @@ def _publication_recovery_action(
 
 def _load_recovery_studies(
     config: Experiment, needs: _RecoveryNeeds, *, confirm: bool = False
-) -> tuple[ValidatedLedger, dict[str, optuna.Study]]:
+) -> tuple[ValidatedLedger, dict[str, tuple[optuna.Study, ...]]]:
     """Validate study ownership and load phases needed for trial cleanup recovery.
 
     Validate before opening or writing. Confirmed recovery holds the experiment lock and
     repairs an incomplete final journal record; inspection leaves it unchanged. Reject
-    studies bound to another artifact root and leave unclaimed studies unclaimed.
+    studies bound to another artifact root and leave unclaimed studies unclaimed. Every study
+    of each phase is loaded, whatever values its parents' winners addressed it by, since the
+    run may have left a trial RUNNING in any of them.
 
     When ownership storage was unavailable, verify published phase history before treating
     the run as owning no trials. Preserve engine refusal messages and remediation.
@@ -713,8 +723,8 @@ def _load_recovery_studies(
     :raises RunRecoveryError: The ledger is refused, a phase study belongs to
         another artifact root, or required storage or published studies cannot
         be read.
-    :return tuple[ValidatedLedger, dict[str, optuna.Study]]: The validated ledger, and its
-        loadable phase studies keyed by phase name.
+    :return tuple[ValidatedLedger, dict[str, tuple[optuna.Study, ...]]]: The validated ledger,
+        and every loadable study of each phase, oldest first, keyed by phase name.
     """
     # A storage refusal gains a recover-run retry here, but that retry cannot
     # succeed until the ledger is back, so these wraps route to restoring it.
@@ -735,15 +745,15 @@ def _load_recovery_studies(
         raise RunRecoveryError(
             f"{exc}{recovery_step}", action=OperatorAction.RESTORE_LEDGER
         ) from exc
-    loaded_studies = {}
+    loaded_studies: dict[str, tuple[optuna.Study, ...]] = {}
     for phase in config.phases:
         try:
-            study = open_existing_study(ledger, phase)
+            studies = open_existing_studies(ledger, phase.name)
         except StudyStorageUnavailableError as exc:
             raise RunRecoveryError(
                 f"{exc}{recovery_step}", action=OperatorAction.RESTORE_LEDGER
             ) from exc
-        if study is not None:
+        for study in studies:
             try:
                 _check_study_artifact_root(study, config)
             except ArtifactRootConflictError as exc:
@@ -754,7 +764,8 @@ def _load_recovery_studies(
                 raise RunRecoveryError.rewrap(
                     exc, str(exc), action=OperatorAction.RESTORE_TREE
                 ) from exc
-            loaded_studies[phase.name] = study
+        if studies:
+            loaded_studies[phase.name] = tuple(studies)
     if needs.ownership_storage_unavailable:
         try:
             _check_published_phase_studies(
@@ -806,7 +817,7 @@ def _recover_trial_evidence(
     causal_attempt_ids = store.cleanup_uncertain_attempt_ids(handle)
     inspected_attempts: dict[str, _AttemptRecord] = {}
     inspected_studies = 0
-    loaded_studies: dict[str, optuna.Study] = {}
+    loaded_studies: dict[str, tuple[optuna.Study, ...]] = {}
     if needs.cleanup_needed:
         ledger, loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
         active_report = _PreflightCleanupReport(inspection_messages={} if not confirm else None)
@@ -839,19 +850,17 @@ def _recover_trial_evidence(
             for operation_id, generation_id in _tracking_cleanup_receipts(config).items()
             if generation_id == run_id or operation_id in causal_attempt_ids
         )
-        for phase in config.phases:
-            study = loaded_studies.get(phase.name)
-            if study is None:
-                continue
-            inspected_studies += 1
-            # The study ledger precedes the run recovery record. Read evidence
-            # left by an interrupted pass before this pass can append to it.
-            previously_recovered = _previously_recovered_attempt_locations(
-                study, phase.name, run_id, causal_attempt_ids=causal_attempt_ids
-            )
-            evidence.reaped_attempt_ids.update(previously_recovered)
-            evidence.reaped_attempt_locations.update(previously_recovered)
-            try:
+        every = [(each, s) for each in config.phases for s in loaded_studies.get(each.name, ())]
+        try:
+            for phase, study in every:
+                inspected_studies += 1
+                # The study ledger precedes the run recovery record. Read evidence
+                # left by an interrupted pass before this pass can append to it.
+                previously_recovered = _previously_recovered_attempt_locations(
+                    study, phase.name, run_id, causal_attempt_ids=causal_attempt_ids
+                )
+                evidence.reaped_attempt_ids.update(previously_recovered)
+                evidence.reaped_attempt_locations.update(previously_recovered)
                 evidence.cleanup_recovered += _recover_cleanup_uncertain_trials(
                     study,
                     config,
@@ -871,9 +880,14 @@ def _recover_trial_evidence(
                     inspection_messages=active_report.inspection_messages,
                     report=active_report,
                 )
-            finally:
-                if confirm:
-                    _refresh_recovered_trials_csv(study, config, phase)
+        finally:
+            if confirm and (
+                evidence.reaped
+                or evidence.cleanup_recovered
+                or inspected_attempts
+                or evidence.reaped_attempt_locations
+            ):
+                _refresh_recovered_trials_csv(loaded_studies, config)
         evidence.terminated = sum(active_report.process_actions.values())
         evidence.retained_results = active_report.retained_results
         evidence.pending_evidence = active_report.unreadable_evidence
@@ -911,29 +925,40 @@ def _recover_trial_evidence(
         evidence.terminated = sum(tracking_report.process_actions.values())
         evidence.inspection_messages = tracking_report.inspection_messages or {}
     if confirm and needs.stored_snapshot is not None:
-        pending_ids = {
-            attempt.attempt_id
+        captured = [
+            attempt
             for phase in needs.stored_snapshot.status.phases
             for attempt in phase.running_attempts or ()
+        ]
+        pending_ids = {
+            attempt.attempt_id
+            for attempt in captured
             if attempt.recovers_as == "EVIDENCE_PENDING" and attempt.attempt_id is not None
         } & evidence.reaped_attempt_ids
-        if pending_ids:
+        # Each settled result also adds what the frozen interrupted-rerun counters count of it.
+        if captured and evidence.reaped_attempt_locations:
             if not loaded_studies:
                 _ledger, loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
-            for phase_name, study in loaded_studies.items():
-                for trial in study.get_trials(deepcopy=False):
-                    trial_attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+            for phase_name, studies in loaded_studies.items():
+                producers = producing_attempts(studies)
+                for attempt_id, owner in producers.items():
+                    trial = owner.trial
                     if (
-                        not isinstance(trial_attempt_id, str)
-                        or trial_attempt_id not in pending_ids
+                        attempt_id not in evidence.reaped_attempt_ids
                         or not trial.state.is_finished()
                     ):
                         continue
-                    location = evidence.reaped_attempt_locations.get(trial_attempt_id)
+                    location = evidence.reaped_attempt_locations.get(attempt_id)
                     generation = trial.user_attrs.get(GENERATION_ID_ATTR)
                     if location != (phase_name, trial.number, generation):
                         continue
-                    evidence.reaped_attempt_states[trial_attempt_id] = _trial_count_state(trial)
+                    if attempt_id in pending_ids:
+                        evidence.reaped_attempt_states[attempt_id] = _trial_count_state(
+                            trial, config
+                        )
+                    evidence.reaped_attempt_reruns[attempt_id] = _interrupted_reruns(
+                        owner.rows.values(), producers=producers, counted={trial.number}
+                    )
     _require_cleanup_evidence(needs, evidence, inspected_studies)
     return evidence
 
@@ -1126,6 +1151,7 @@ def _finish_result_recovery(
             confirmed_attempt_ids=evidence.reaped_attempt_ids,
             confirmed_attempt_locations=evidence.reaped_attempt_locations,
             confirmed_attempt_states=evidence.reaped_attempt_states,
+            confirmed_attempt_reruns=evidence.reaped_attempt_reruns,
         )
         emit(f"Finalized stored terminal result snapshot for {run_id}.")
     elif needs.snapshot_unavailable:
@@ -1143,6 +1169,7 @@ def _finalize_stored_terminal_result_snapshot(
     confirmed_attempt_ids: set[str],
     confirmed_attempt_locations: dict[str, tuple[str, int, str]],
     confirmed_attempt_states: Mapping[str, TrialStateName] | None = None,
+    confirmed_attempt_reruns: Mapping[str, InterruptedReruns] | None = None,
 ) -> None:
     """Finalize and persist the stored snapshot without losing a completed prior view.
 
@@ -1152,6 +1179,8 @@ def _finalize_stored_terminal_result_snapshot(
     :param set[str] confirmed_attempt_ids: Exact attempts durably reconciled to terminal states.
     :param dict[str, tuple[str, int, str]] confirmed_attempt_locations: Phase, trial, and generation of reconciled attempts.
     :param Mapping[str, TrialStateName] | None confirmed_attempt_states: Actual terminal state of pending evidence.
+    :param Mapping[str, InterruptedReruns] | None confirmed_attempt_reruns: What each reconciled
+        attempt adds to the interrupted-rerun counters, defaults to nothing.
     :raises RunRecoveryError: The stored snapshot is unavailable or persistence fails.
     """
     snapshot = parse_result_snapshot(terminal_status)
@@ -1168,6 +1197,7 @@ def _finalize_stored_terminal_result_snapshot(
             confirmed_attempt_ids=confirmed_attempt_ids,
             confirmed_attempt_locations=confirmed_attempt_locations,
             confirmed_attempt_states=confirmed_attempt_states,
+            confirmed_attempt_reruns=confirmed_attempt_reruns,
         )
         terminal_status["result_snapshot_state"] = "complete"
         write_status_file(store.status_path(run_id), terminal_status)

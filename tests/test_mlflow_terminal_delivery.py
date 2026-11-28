@@ -7,10 +7,11 @@ import os
 import shlex
 import signal
 import sys
+from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
-import optuna
 import pytest
 import yaml
 from optuna.trial import TrialState, create_trial
@@ -27,11 +28,12 @@ from phasesweep.engine.ledger import (
     validate_ledger,
 )
 from phasesweep.engine.paths import (
+    _attempts_dir,
     _experiment_dir,
     _generation_dir,
     _generation_record_path,
-    _trial_dir_for,
 )
+from phasesweep.engine.provenance import _write_generation_provenance
 from phasesweep.engine.read import experiment_status, read_status
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -40,15 +42,14 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     DURATION_ATTR,
-    FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     OVERRIDES_ATTR,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
-    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
+    _trial_attempt_dir,
     _trial_interrupted,
     constraint_attr,
 )
@@ -70,7 +71,12 @@ from phasesweep.tracking.session import (
     tracking_root,
     write_record,
 )
-from tests.conftest import lose_record_writes, patch_path_method_failure, trial_outcome
+from tests.conftest import (
+    lose_record_writes,
+    patch_path_method_failure,
+    study_name,
+    trial_outcome,
+)
 from tests.tracking_helpers import (
     FakeWorkerProcess,
     RunnerKilled,
@@ -146,7 +152,7 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
                     stdout=sink,
                     stderr=sink,
                     timeout=10,
-                    trial_dir=directory,
+                    attempt_dir=directory,
                     attempt_id=operation_id,
                 )
             if outcome == "uncertain":
@@ -154,7 +160,7 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
                     directory,
                     attempt_id=operation_id,
                     state="terminating",
-                    return_code=-15,
+                    ended_by="cancelled",
                     cleanup_confirmed=False,
                 )
                 raise UnsafeProcessCleanupError("creation worker cleanup is uncertain")
@@ -174,22 +180,32 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
             stopped.setattr(phase_module, "_record_outcome", lambda *args, **kwargs: None)
         with pytest.raises(RunnerKilled if outcome == "completed" else UnsafeProcessCleanupError):
             run_experiment(experiment)
-    (original,) = read_phase_trials(validate_ledger(experiment), "depth").trials
+    (original,) = read_phase_trials(
+        validate_ledger(experiment), study_name(experiment, "depth")
+    ).trials
     assert original.state == TrialState.RUNNING
-    trial_dir = Path(original.user_attrs[TRIAL_DIR_ATTR])
-    lifecycle = process.read_attempt_lifecycle(trial_dir, expected_attempt_id=created["attempt_id"])
+    attempt_dir = _trial_attempt_dir(original)
+    assert attempt_dir is not None
+    lifecycle = process.read_attempt_lifecycle(
+        attempt_dir, expected_attempt_id=created["attempt_id"]
+    )
     assert lifecycle is not None and lifecycle.state == "allocated"
     assert experiment_status(experiment)["tracking_delivery"]["pending"] == 1
 
     reports = []
     run_experiment(experiment, terminal_callback=reports.append)
-    original, retried = read_phase_trials(validate_ledger(experiment), "depth").trials
+    original, retried = read_phase_trials(
+        validate_ledger(experiment), study_name(experiment, "depth")
+    ).trials
     assert _trial_interrupted(original)
     assert retried.state == TrialState.COMPLETE
     assert retried.params == original.params
     assert retried.user_attrs[RERUN_OF_ATTR] == original.number
     assert search_generations == [reports[0].generation_id]
-    assert session.read_binding(trial_dir) == created
+    tracking_dir = session.attempt_tracking_dir(
+        _experiment_dir(experiment), created["generation_id"], created["attempt_id"]
+    )
+    assert session.read_binding(tracking_dir) == created
     assert _sent(uploads, [created["attempt_id"]]) == ["KILLED"]
     assert publication.delivery_status(experiment)["pending"] == 0
 
@@ -248,7 +264,10 @@ def test_failed_trial_finishes_its_managed_run(tmp_path, monkeypatch):
         }
     )
 
-    def prepare(experiment, *, phase, generation_id, attempt_id, directory, **kwargs):
+    def prepare(experiment, *, phase, generation_id, attempt_id, **kwargs):
+        directory = session.attempt_tracking_dir(
+            _experiment_dir(experiment), generation_id, attempt_id
+        )
         binding = {
             **mlflow_binding(),
             "phase": phase,
@@ -316,13 +335,17 @@ def test_unresolved_attempt_upload_worker_fails_the_run(
 def _add_bound_attempt(
     experiment, study, phase, generation, attempt, number, *, trial, run_mode="managed"
 ):
-    """Persist a fresh trial and its native binding in the same attempt directory."""
-    directory = _trial_dir_for(
-        experiment, phase, number, generation_id=generation, attempt_id=attempt
-    )
+    """Persist a fresh trial and its generation-owned native run binding."""
+    directory = session.attempt_tracking_dir(_experiment_dir(experiment), generation, attempt)
     write_record(
         directory / BINDING_FILE,
-        {**mlflow_binding(), "phase": phase, "attempt_id": attempt, "run_mode": run_mode},
+        {
+            **mlflow_binding(),
+            "phase": phase,
+            "generation_id": generation,
+            "attempt_id": attempt,
+            "run_mode": run_mode,
+        },
     )
     trial.user_attrs.update({ATTEMPT_ID_ATTR: attempt, GENERATION_ID_ATTR: generation})
     study.add_trial(trial)
@@ -338,7 +361,9 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
         {**mlflow_binding(), "phase": "generation", "attempt_id": generation},
     )
     ledger = claim_ledger(validate_ledger(experiment))
-    study = open_phase_study(ledger, experiment.phases[0])
+    study = open_phase_study(
+        ledger, experiment.phases[0], study_name(experiment, experiment.phases[0].name)
+    )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     attempts = {
         "1": ("managed", TrialState.RUNNING),  # no outcome until recovery records one
@@ -361,7 +386,6 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
                 value=0.5 if state == TrialState.COMPLETE else None,
                 user_attrs={
                     OVERRIDES_ATTR: json.dumps({"model.depth": 2}),
-                    FEASIBLE_ATTR: True,
                     DURATION_ATTR: 3.0,
                     constraint_attr("cost"): 1.0,
                 },
@@ -379,7 +403,7 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
     assert requests == []
     saved = [read_record(path) for path in publication._pending_records(experiment, generation)]
     assert [(r["binding"]["attempt_id"][0], r["finish"]) for r in saved] == [
-        ("4", None),
+        ("4", "FINISHED"),
         ("a", "KILLED"),
     ]
     accepted = saved[0]["projection"]
@@ -414,7 +438,7 @@ def test_failed_invocation_leaves_a_pending_trials_managed_run_open_only_when_pe
         {**mlflow_binding(), "phase": "generation", "attempt_id": generation},
     )
     ledger = claim_ledger(validate_ledger(experiment))
-    study = open_phase_study(ledger, phase)
+    study = open_phase_study(ledger, phase, study_name(experiment, phase.name))
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     attempt = "1" * 32
     directory = _add_bound_attempt(
@@ -447,13 +471,13 @@ def test_failed_invocation_leaves_a_pending_trials_managed_run_open_only_when_pe
         return
     assert [(r["binding"]["attempt_id"], r["finish"]) for r in requests] == [(generation, "FAILED")]
     assert not (delivery / f"attempt-{attempt}.json").exists()
-    # Recovery later accepts the completed training.
+    # Recovery later accepts the completed training; the claim's config snapshot judges it.
     (pending,) = study.get_trials()
-    optuna.Trial(study, pending._trial_id).set_user_attr(FEASIBLE_ATTR, True)
     study.tell(pending.number, 0.5)
+    _write_generation_provenance(experiment, generation, caller_owned_id=True)
     publication._rebuild_attempt_intents(experiment, validate_ledger(experiment), [generation])
     record = read_record(delivery / f"attempt-{attempt}.json")
-    assert record["finish"] is None
+    assert record["finish"] == "FINISHED"
     assert record["projection"]["metrics"]["phasesweep.objective"] == 0.5
 
 
@@ -466,7 +490,11 @@ def test_recovered_cleanup_settles_only_the_attempt_of_its_own_study(tmp_path, m
     ledger = claim_ledger(validate_ledger(experiment))
     # Trial 0 failed with unconfirmed cleanup in both studies; only depth's was recovered.
     for phase, digit, recovered in (("depth", "1", [0]), ("rate", "2", [])):
-        study = open_phase_study(ledger, next(p for p in experiment.phases if p.name == phase))
+        study = open_phase_study(
+            ledger,
+            next(p for p in experiment.phases if p.name == phase),
+            study_name(experiment, phase),
+        )
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
         if recovered:
             study.set_user_attr(CLEANUP_RECOVERED_TRIALS_ATTR, recovered)
@@ -493,7 +521,9 @@ def test_interrupted_attempt_finishes_its_managed_run_killed(tmp_path, monkeypat
     experiment = Experiment.model_validate(config)
     phase = experiment.phases[0]
     generation = "a" * 32
-    study = open_phase_study(claim_ledger(validate_ledger(experiment)), phase)
+    study = open_phase_study(
+        claim_ledger(validate_ledger(experiment)), phase, study_name(experiment, phase.name)
+    )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     for number, (digit, outcome) in enumerate((("1", "interrupted"), ("2", "failure"))):
         attempt = digit * 32
@@ -535,7 +565,7 @@ def test_unsaved_accepted_attempt_keeps_its_accepted_projection(tmp_path, monkey
         run_experiment(experiment, terminal_callback=reports.append)
     [path] = failed
     record = read_record(path)
-    assert record["finish"] is None
+    assert record["finish"] == "FINISHED"
     assert record["projection"]["metrics"]["phasesweep.objective"] == 1.0
     assert "phasesweep.outcome" not in record["projection"]["tags"]
     assert [r["projection"] for r in uploads if r["name"] == path.stem] == [record["projection"]]
@@ -550,7 +580,11 @@ def test_unsaved_accepted_attempt_keeps_its_accepted_projection(tmp_path, monkey
 
 
 def test_sync_rebuilds_accepted_attempt_records_from_the_ledger(tmp_path, monkeypatch):
-    """A controller that dies between Optuna's commit and its callback saved no record."""
+    """A published generation's lost attempt records are rebuilt from its ledger rows.
+
+    The closeout saves what no trial callback saved, and sync-tracking rebuilds a record deleted
+    later even while the generation's summary record is still present.
+    """
     config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["storage"] = f"journal:///{tmp_path}/study.journal"
     experiment = Experiment.model_validate(config)
@@ -558,7 +592,10 @@ def test_sync_rebuilds_accepted_attempt_records_from_the_ledger(tmp_path, monkey
     run_experiment(experiment)
     [generation] = [path.name for path in tracking_root(experiment).iterdir() if path.is_dir()]
     delivery = tracking_root(experiment) / generation / "delivery"
-    assert not list(delivery.glob("attempt-*.json"))
+    saved = sorted(delivery.glob("attempt-*.json"))
+    assert len(saved) == 4 and all(read_record(path)["state"] == "delivered" for path in saved)
+    for path in saved:
+        path.unlink()
     journal = (tmp_path / "study.journal").read_bytes()
 
     assert publication.sync_tracking(experiment, generation) == {"pending": 0, "delivered": 7}
@@ -566,11 +603,64 @@ def test_sync_rebuilds_accepted_attempt_records_from_the_ledger(tmp_path, monkey
     records = [read_record(path) for path in sorted(delivery.glob("attempt-*.json"))]
     assert len(records) == 4
     for record in records:
-        assert record["finish"] is None
+        assert record["finish"] == "FINISHED"
         assert record["projection"]["metrics"]["phasesweep.objective"] == 1.0
     rate = [r for r in records if r["binding"]["phase"] == "rate"]
     depth_runs = {r["binding"]["run_id"] for r in records if r["binding"]["phase"] == "depth"}
     assert all(r["projection"]["tags"]["phasesweep.inherits.depth"] in depth_runs for r in rate)
+
+
+@pytest.mark.integration
+def test_each_generation_delivers_its_own_reading_of_a_reread_attempt(tmp_path, monkeypatch):
+    """A reread generation sends its objective; a rebuilt older record keeps its own, as history."""
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config.update(storage="auto", phases=config["phases"][:1])
+    respond = worker.request_operation
+
+    def capture_cost(request, **kwargs):
+        result = respond(request, **kwargs)
+        if request["action"] == "capture":
+            for key, observation in result["observations"].items():
+                if "cost" in key:
+                    observation["value"] = 3.0
+        return result
+
+    monkeypatch.setattr(worker, "request_operation", capture_cost)
+    original = Experiment.model_validate(config)
+    winner = run_experiment(original)["depth"]
+    assert winner.generation_id is not None and winner.attempt_id is not None
+    record = publication.delivery_record_path(
+        original, winner.generation_id, f"attempt-{winner.attempt_id}"
+    )
+    delivered = read_record(record)
+    assert delivered["projection"]["metrics"]["phasesweep.objective"] == 1.0
+
+    config = deepcopy(config)
+    config["metric"]["extractor"]["metric_key"] = "cost"
+    reports = []
+    reread = run_experiment(Experiment.model_validate(config), terminal_callback=reports.append)[
+        "depth"
+    ]
+    assert reread.attempt_id == winner.attempt_id
+    assert reread.metric == 3.0
+    newer = read_record(
+        publication.delivery_record_path(
+            original, reports[0].generation_id, f"attempt-{winner.attempt_id}"
+        )
+    )
+    assert (newer["state"], newer["binding"]) == ("delivered", delivered["binding"])
+    assert newer["projection"]["metrics"]["phasesweep.objective"] == 3.0
+    assert newer["projection"]["timestamp"] > delivered["projection"]["timestamp"]
+    uploads.clear()
+    record.unlink()
+
+    publication.sync_tracking(original, winner.generation_id)
+    rebuilt = read_record(record)
+    assert rebuilt["binding"] == delivered["binding"]
+    assert rebuilt["projection"]["metrics"]["phasesweep.objective"] == 1.0
+    assert rebuilt["projection"]["timestamp"] < newer["projection"]["timestamp"]
+    assert rebuilt["state"] == "delivered"
+    assert [(u["name"], u["historical"]) for u in uploads] == [(record.stem, True)]
 
 
 def test_the_run_that_confirms_an_attempts_cleanup_finishes_its_managed_run(tmp_path, monkeypatch):
@@ -598,7 +688,7 @@ def test_the_run_that_confirms_an_attempts_cleanup_finishes_its_managed_run(tmp_
     assert journal.read_bytes() == before
 
     run_experiment(experiment)
-    read = read_phase_trials(validate_ledger(experiment), "depth")
+    read = read_phase_trials(validate_ledger(experiment), study_name(experiment, "depth"))
     failed = next(trial for trial in read.trials if trial.user_attrs[ATTEMPT_ID_ATTR] == attempt)
     assert failed.state == TrialState.FAIL
     assert failed.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
@@ -1014,6 +1104,115 @@ def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_pa
 
 
 @pytest.mark.integration
+def test_scoped_sync_reads_only_its_generations_attempt_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ended generation's sync ignores other bindings and reports its own unreadable intents."""
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config["phases"] = config["phases"][:1]
+    config["phases"][0].update(n_trials=1, gpu_policy="none", sampler={"type": "random", "seed": 1})
+    experiment = Experiment.model_validate(config)
+    run_experiment(experiment, generation_id="older")
+    run_experiment(experiment, generation_id="newer")
+    assert not experiment.persistent
+
+    (older_binding,) = session.attempt_tracking_records(experiment, BINDING_FILE, "older")
+    older_binding.write_text("{}", encoding="utf-8")
+    summary = session.delivery_record_path(experiment, "newer", session.SUMMARY_RECORD)
+    write_record(summary, {**read_record(summary), "state": "pending"})
+    uploads.clear()
+
+    reopened = Experiment.model_validate(config)
+    assert publication.sync_tracking(reopened, "newer") == {"pending": 0, "delivered": 3}
+    assert [request["binding"]["generation_id"] for request in uploads] == ["newer"]
+
+    orphan = session.attempt_tracking_dir(_experiment_dir(experiment), "newer", "orphan")
+    orphan.mkdir()
+    pending = orphan / session.PENDING_ATTEMPT_BINDING_FILE
+    pending.write_text("{}", encoding="utf-8")
+    assert publication.delivery_status(reopened, "newer") == {"pending": 1, "delivered": 3}
+    with pytest.raises(
+        TrackingSyncRefusedError, match="Could not reconcile local MLflow creation record"
+    ) as refused:
+        publication.sync_tracking(reopened, "newer")
+    assert str(pending) in str(refused.value)
+    assert pending.read_text(encoding="utf-8") == "{}"
+
+    source = tracking_root(experiment) / session.SOURCE_FILE
+    recorded = read_record(source, schema_version=session.SOURCE_SCHEMA_VERSION)
+    write_record(source, {**recorded, "schema_version": 1})
+    with pytest.raises(ValueError, match="Unsupported MLflow tracking record format"):
+        publication.sync_tracking(reopened, "newer")
+
+
+def test_scoped_sync_confirms_workers_from_other_generations_before_retrying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An earlier record waits for a later run's worker to clear before its upload can retry."""
+    experiment = native_experiment(tmp_path)
+    ledger = validate_ledger(experiment)
+    claim_ledger(ledger)
+    binding = {**mlflow_binding(), "generation_id": "older"}
+    record = publication._save_intent(
+        experiment,
+        "older",
+        "attempt-probe",
+        binding,
+        publication._projection(metrics={}, params={}, tags={}, summary={}),
+    )
+    write_record(
+        session.summary_binding_path(experiment, "newer"),
+        {**binding, "generation_id": "newer", "attempt_id": "newer"},
+    )
+    uploads: list[tuple[str, Path]] = []
+
+    def upload(
+        request: Mapping[str, object], *, operation_id: str, directory: Path, **_: object
+    ) -> dict[str, object]:
+        """Leave the newer run's worker unresolved as it sends the older record."""
+        assert request["action"] == "publish"
+        assert request["binding"] == binding
+        uploads.append((operation_id, directory))
+        if directory.parent.parent.name == "newer":
+            process.write_attempt_lifecycle(
+                directory,
+                attempt_id=operation_id,
+                state="terminating",
+                ended_by="cancelled",
+                cleanup_confirmed=False,
+            )
+            raise ProcessCleanupUncertainError("The upload worker's cleanup is unconfirmed.")
+        return {}
+
+    monkeypatch.setattr(worker, "require_mlflow_sdk", lambda: None)
+    monkeypatch.setattr(session, "request_operation", upload)
+    with pytest.raises(ProcessCleanupUncertainError, match="upload worker's cleanup"):
+        publication.deliver_ended_generations(experiment, ledger, "newer", DeliveryTally())
+    ((operation_id, directory),) = uploads
+    entry = _attempts_dir(experiment) / f"{operation_id}.json"
+    with pytest.raises(ProcessCleanupUncertainError, match="durable process identity is missing"):
+        publication.sync_tracking(experiment, "older")
+    assert entry.is_file()
+    assert uploads == [(operation_id, directory)]
+    assert read_record(record)["state"] == "pending"
+
+    process.write_attempt_lifecycle(
+        directory,
+        attempt_id=operation_id,
+        state="exited",
+        ended_by="cancelled",
+        cleanup_confirmed=True,
+        duration_seconds=1.0,
+    )
+    assert publication.sync_tracking(experiment, "older") == {"pending": 0, "delivered": 1}
+    assert not entry.exists()
+    assert [path.parent.parent.name for _, path in uploads] == ["newer", "older"]
+    assert read_record(record)["state"] == "delivered"
+    assert publication.sync_tracking(experiment, "older") == {"pending": 0, "delivered": 1}
+    assert len(uploads) == 2
+
+
+@pytest.mark.integration
 def test_sync_leaves_superseded_publication_unresolved_when_its_record_cannot_be_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1129,8 +1328,10 @@ def test_sync_binds_and_finishes_a_run_created_after_its_attempt_gave_up(
     reports = []
     run_experiment(experiment, terminal_callback=reports.append)
     generation = reports[0].generation_id
-    pattern = f"*/trial_*__generation_{generation}__attempt_{late['attempt_id']}"
-    [attempt_directory] = _experiment_dir(experiment).glob(pattern)
+    attempt_directory = session.attempt_tracking_dir(
+        _experiment_dir(experiment), generation, late["attempt_id"]
+    )
+    assert attempt_directory.is_dir()
     pending = attempt_directory / "mlflow-binding.pending.json"
     # An existing run is bound before sync, directly or by the search that follows an unreadable
     # reply. A run that does not exist yet leaves its pending record for sync to resolve.
@@ -1205,7 +1406,9 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     monkeypatch.setattr(worker, "request_operation", capture_after_outage)
     with pytest.raises(TrackingTargetUnavailableError):
         run_experiment(experiment)
-    (pending,) = read_phase_trials(validate_ledger(experiment), "depth").trials
+    (pending,) = read_phase_trials(
+        validate_ledger(experiment), study_name(experiment, "depth")
+    ).trials
     assert pending.state == TrialState.RUNNING
     attempt = pending.user_attrs[ATTEMPT_ID_ATTR]
     generation = pending.user_attrs[GENERATION_ID_ATTR]
@@ -1223,7 +1426,9 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     else:
         with pytest.raises(NoFeasibleTrialError):
             run_experiment(experiment)
-    (recovered,) = read_phase_trials(validate_ledger(experiment), "depth").trials
+    (recovered,) = read_phase_trials(
+        validate_ledger(experiment), study_name(experiment, "depth")
+    ).trials
     assert recovered.state == (TrialState.COMPLETE if answer == "accepted" else TrialState.FAIL)
     record_path = delivery / f"attempt-{attempt}.json"
     if answer == "objective-missing":
@@ -1251,7 +1456,7 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     assert record["state"] == "delivered"
     assert delivered["projection"] == record["projection"]
     if answer == "accepted":
-        assert delivered["finish"] is None
+        assert delivered["finish"] == "FINISHED"
         assert delivered["projection"]["metrics"]["phasesweep.objective"] == 1.0
     else:
         assert not _trial_interrupted(recovered)
@@ -1312,10 +1517,9 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
         assert (sorted(tracking_root(experiment).rglob("*")), uploads) == (tree, [])
         reports = []
         run_experiment(experiment, terminal_callback=reports.append)
-        # Only a trial killed in flight is rerun, so only then does the run bind its own
-        # summary run, which its publication finishes.
-        own = [(reports[0].generation_id, "FINISHED")] if in_flight else []
-        assert sorted(_summaries(uploads)) == sorted([(generation, "KILLED"), *own])
+        # The run publishes whether or not it reruns a trial, so its summary run is finished.
+        own = (reports[0].generation_id, "FINISHED")
+        assert sorted(_summaries(uploads)) == sorted([(generation, "KILLED"), own])
         uploads.clear()
         run_experiment(experiment)
         assert uploads == []
@@ -1404,8 +1608,13 @@ def test_only_an_in_memory_generation_ends_an_attempt_its_ledger_lost(
         {**mlflow_binding(), "phase": "generation", "attempt_id": generation},
     )
     attempt = "1" * 32
-    directory = _trial_dir_for(experiment, "depth", 0, generation_id=generation, attempt_id=attempt)
-    binding = {**mlflow_binding(), "phase": "depth", "attempt_id": attempt}
+    directory = session.attempt_tracking_dir(_experiment_dir(experiment), generation, attempt)
+    binding = {
+        **mlflow_binding(),
+        "phase": "depth",
+        "generation_id": generation,
+        "attempt_id": attempt,
+    }
     write_record(directory / BINDING_FILE, binding)
 
     publication._rebuild_attempt_intents(experiment, ledger, [generation])
@@ -1539,7 +1748,7 @@ def test_recovery_sends_nothing_to_a_tracker_that_is_down(tmp_path, monkeypatch)
     with pytest.raises(TrackingTargetUnavailableError):
         run_experiment(experiment)
     assert requests == ["resolve"]
-    trials = read_phase_trials(validate_ledger(experiment), "depth").trials
+    trials = read_phase_trials(validate_ledger(experiment), study_name(experiment, "depth")).trials
     assert all(_trial_interrupted(trial) for trial in trials)
     [generation] = {trial.user_attrs[GENERATION_ID_ATTR] for trial in trials}
     delivery = tracking_root(experiment) / generation / "delivery"
@@ -1611,7 +1820,9 @@ def test_an_upload_workers_unconfirmed_cleanup_is_not_charged_to_the_recovered_a
     assert report.failure_stage == "preflight"
     [recovered] = [
         trial
-        for trial in read_phase_trials(validate_ledger(experiment), "depth").trials
+        for trial in read_phase_trials(
+            validate_ledger(experiment), study_name(experiment, "depth")
+        ).trials
         if trial.user_attrs[ATTEMPT_ID_ATTR] == attempt
     ]
     assert recovered.state == TrialState.FAIL
@@ -1643,7 +1854,9 @@ def test_a_run_killed_before_delivering_a_recovered_outcome_leaves_it_for_sync(
             run_experiment(experiment)
     [recovered] = [
         trial
-        for trial in read_phase_trials(validate_ledger(experiment), "depth").trials
+        for trial in read_phase_trials(
+            validate_ledger(experiment), study_name(experiment, "depth")
+        ).trials
         if trial.user_attrs[ATTEMPT_ID_ATTR] == attempt
     ]
     assert _trial_interrupted(recovered)

@@ -11,17 +11,19 @@ import hashlib
 import json
 import threading
 import warnings
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, assert_never
+from typing import TYPE_CHECKING, Any, Literal, assert_never
 
 import optuna
+from optuna._transform import _SearchSpaceTransform
 from optuna.exceptions import ExperimentalWarning
 from optuna.samplers._lazy_random_state import LazyRandomState
 
-from phasesweep.config.common import StrictJsonScalar
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import (
+    _OPTUNA_EXACT_INT_LIMIT,
     CategoricalParam,
     FloatParam,
     IntParam,
@@ -29,24 +31,37 @@ from phasesweep.config.search import (
     Sampler,
     SearchParam,
     grid_search_space,
+    sampler_search_space,
+)
+from phasesweep.engine.bounds import trial_bound_violations
+from phasesweep.engine.grid_order import (
+    GridCell,
+    grid_axis_names,
+    grid_cell_order,
+    recorded_search_space,
 )
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FAILURE_REASON_ATTR,
-    FEASIBLE_ATTR,
     FINISHED_TRIAL_STATES,
     GENERATION_ID_ATTR,
     METRIC_EXTRACTOR_LABEL,
     RERUN_OF_ATTR,
     TRIAL_STATE_NAMES,
+    InterruptedReruns,
     RecoveredTrialState,
+    SearchSpaceEntry,
     TrialStateName,
+    _recorded_identity,
     _trial_interrupted,
 )
+from phasesweep.runtime.json import dump_json, json_object
 from phasesweep.runtime.process import TIMEOUT_REASON_PREFIX
 
 if TYPE_CHECKING:
     from optuna.samplers._cmaes import CmaClass
+
+    from phasesweep.engine.publication_validation import ValidatedWinner
 
 
 @dataclass(frozen=True)
@@ -57,7 +72,7 @@ class _TrialRef:
     which trial it is, and which generation/attempt claimed it.
     Values are ``None`` for an allocation interrupted before its identity
     attributes were written. Published references additionally
-    carry their finished and completed count boundary, and a RUNNING row the
+    carry their selecting study and finished and measured count boundary, and a RUNNING row the
     state stale recovery will record for it. Those fields are not part of a
     trial-row identity comparison.
     """
@@ -66,8 +81,9 @@ class _TrialRef:
     generation_id: str | None
     attempt_id: str | None
     finished_trials: int | None = field(default=None, compare=False)
-    completed_trials: int | None = field(default=None, compare=False)
+    measured_trials: int | None = field(default=None, compare=False)
     recovers_as: RecoveredTrialState | None = field(default=None, compare=False)
+    study_name: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -77,9 +93,14 @@ class _PhaseTrialStats:
     ``running_attempts`` is part of the *same* snapshot as ``counts``, not a
     second read: it lists the RUNNING trials those counts describe, and is
     ``None`` exactly when ``available`` is ``False`` (the counts are unknown).
-    A confirmed absent study has known zero counts and an empty attempt list.
-    ``published_trial_available`` checks the requested published trial identity
-    in that same snapshot; false also covers unreadable or absent storage.
+    A confirmed absent addressed study has zero progress and an empty attempt list.
+    ``generation_counts`` counts producing rows from every study, without counting their copies.
+    ``published_trial_available`` says whether the same snapshot holds the requested published
+    trial identity, in whichever of the phase's studies it was selected from, with that study's
+    recorded count boundary met; false also covers unreadable or absent storage.
+    ``studies`` holds every study of the phase in that snapshot, oldest first, so a status
+    read can tell from the same capture whether the addressed one waits to be filled from
+    another (:func:`phasesweep.engine.reread.pending_reread`).
     """
 
     counts: dict[str, int]
@@ -87,27 +108,24 @@ class _PhaseTrialStats:
     generation_counts: dict[str, dict[str, int]]
     running_attempts: list[_TrialRef] | None
     published_trial_available: bool = False
+    studies: tuple[optuna.Study, ...] = ()
+    #: The addressed study's results that reran an interrupted trial.
+    reruns: InterruptedReruns = InterruptedReruns()
 
 
-def _trial_count_state(trial: optuna.trial.FrozenTrial) -> TrialStateName:
-    """Return the state a trial is counted and reported under.
+def _trial_run_state(trial: optuna.trial.FrozenTrial) -> TrialStateName:
+    """Return the state a run left a trial in, before any bound is applied.
 
-    The one classifier behind every state-keyed count, run log line and trial table, so
-    an interrupted trial (:func:`~phasesweep.engine.state._trial_interrupted`) is never
-    counted as finished anywhere, and a trial that completed out of bounds reads
-    ``INFEASIBLE`` wherever it is shown. A run records the feasibility attr before a
-    trial completes, so a COMPLETE trial without a truthy one never ranks either.
+    An interrupted trial (:func:`~phasesweep.engine.state._trial_interrupted`) reads
+    ``INTERRUPTED``, so it is never counted as finished anywhere. A trial that measured its
+    values reads ``COMPLETE`` whatever the bounds say; :func:`_trial_count_state` judges it.
 
     :param optuna.trial.FrozenTrial trial: Trial to classify.
-    :return TrialStateName: ``INTERRUPTED`` for an interrupted trial, ``INFEASIBLE`` for a
-        COMPLETE trial without a truthy feasibility attr, otherwise the Optuna state name.
+    :return TrialStateName: ``INTERRUPTED`` for an interrupted trial, otherwise the Optuna
+        state name; never ``INFEASIBLE``.
     """
     if _trial_interrupted(trial):
         return "INTERRUPTED"
-    if trial.state == optuna.trial.TrialState.COMPLETE and not trial.user_attrs.get(
-        FEASIBLE_ATTR, False
-    ):
-        return "INFEASIBLE"
     name = trial.state.name
     for state in TRIAL_STATE_NAMES:
         if state == name:
@@ -115,36 +133,73 @@ def _trial_count_state(trial: optuna.trial.FrozenTrial) -> TrialStateName:
     raise ValueError(f"Trial {trial.number} has an unknown Optuna state {name!r}.")
 
 
+def _trial_count_state(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> TrialStateName:
+    """Return the state a trial is counted and reported under.
+
+    The one classifier behind every state-keyed count, run log line and trial table. A
+    measured trial whose recorded values violate a current bound
+    (:func:`~phasesweep.engine.bounds.trial_bound_violations`) reads ``INFEASIBLE``.
+
+    :param optuna.trial.FrozenTrial trial: Trial to classify.
+    :param Experiment experiment: Config supplying the current metric and constraint bounds.
+    :return TrialStateName: ``INFEASIBLE`` for a measured trial outside the bounds,
+        otherwise :func:`_trial_run_state`.
+    """
+    state = _trial_run_state(trial)
+    if state == "COMPLETE" and trial_bound_violations(trial, experiment):
+        return "INFEASIBLE"
+    return state
+
+
 def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
     """Return the number of trials that count toward ``n_trials``.
 
     A trial counts once it is finished: an interrupted trial reruns instead, so it
-    never consumes the trial target.
+    never consumes the trial target. No bound changes the count.
 
     :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
     :return int: Number of trials in a state of :data:`~phasesweep.engine.state.FINISHED_TRIAL_STATES`.
     """
-    return sum(1 for trial in trials if _trial_count_state(trial) in FINISHED_TRIAL_STATES)
-
-
-def _completed_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
-    """Return the number of trials that finished inside every metric bound and constraint.
-
-    A publication and an accepted partial decision record this count as ``completed_trials``.
-
-    :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
-    :return int: Number of trials :func:`_trial_count_state` counts as ``COMPLETE``.
-    """
-    return sum(1 for trial in trials if _trial_count_state(trial) == "COMPLETE")
+    return sum(1 for trial in trials if _trial_run_state(trial) in FINISHED_TRIAL_STATES)
 
 
 def _measured_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
     """Return the Optuna COMPLETE trial count of ``trials``, infeasible ones included.
 
+    No bound changes it, so a publication and an accepted partial decision record it as
+    ``measured_trials`` and later reads compare a recount with that record.
+
     :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
     :return int: Number of trials in :attr:`optuna.trial.TrialState.COMPLETE`.
     """
     return sum(1 for trial in trials if trial.state == optuna.trial.TrialState.COMPLETE)
+
+
+def _measured_draw_count(
+    trials: Sequence[optuna.trial.FrozenTrial],
+    *,
+    excluded: Collection[int] = (),
+    assumed_complete: Collection[int] = (),
+) -> int:
+    """Count draws already measured, even if a reread recovered several attempts per draw.
+
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
+    :param Collection[int] excluded: Trial numbers still awaiting a measurement verdict.
+    :param Collection[int] assumed_complete: Trial numbers counted as COMPLETE to bound the
+        capacity left after re-reading their evidence.
+    :return int: Distinct draw positions that have a COMPLETE trial, feasible or not.
+    """
+    positions = _draw_positions(trials)
+    return len(
+        {
+            positions[trial.number]
+            for trial in trials
+            if trial.number not in excluded
+            and (
+                trial.state == optuna.trial.TrialState.COMPLETE or trial.number in assumed_complete
+            )
+        }
+    )
 
 
 def _any_trial_timed_out(trials: Iterable[optuna.trial.FrozenTrial]) -> bool:
@@ -182,12 +237,16 @@ def _any_objective_unreadable(trials: Iterable[optuna.trial.FrozenTrial]) -> boo
 
 def _published_phase_trial_refs(
     summary: Mapping[str, Any] | None,
+    *,
+    winners: Mapping[str, ValidatedWinner] | None = None,
 ) -> dict[str, _TrialRef | None]:
     """Return each published phase's local winning-trial identity.
 
     :param Mapping[str, Any] | None summary: Already-resolved publication summary.
+    :param Mapping[str, ValidatedWinner] | None winners: Validated winner artifacts that
+        name their selecting studies, for callers checking the ledger.
     :return dict[str, _TrialRef | None]: Local trial identities by phase, with
-        their known finished and completed count boundary; None when a published
+        their known finished and measured count boundary; None when a published
         phase does not record a complete identity.
     """
     refs: dict[str, _TrialRef | None] = {}
@@ -206,15 +265,23 @@ def _published_phase_trial_refs(
             and completion["finished_trials"] >= 0
             else None
         )
-        completed_trials = (
-            completion.get("completed_trials")
+        measured_trials = (
+            completion.get("measured_trials")
             if isinstance(completion, Mapping)
-            and type(completion.get("completed_trials")) is int
-            and completion["completed_trials"] >= 0
+            and type(completion.get("measured_trials")) is int
+            and completion["measured_trials"] >= 0
             else None
         )
+        winner = None if winners is None else winners.get(name)
         refs[name] = (
-            _TrialRef(number, generation, attempt, finished_trials, completed_trials)
+            _TrialRef(
+                number,
+                generation,
+                attempt,
+                finished_trials,
+                measured_trials,
+                study_name=None if winner is None else winner.study_name,
+            )
             if isinstance(number, int)
             and not isinstance(number, bool)
             and isinstance(generation, str)
@@ -227,19 +294,19 @@ def _published_phase_trial_refs(
 
 
 def _meets_published_trial_history_boundary(
-    finished: int, completed: int, expected: _TrialRef
+    finished: int, measured: int, expected: _TrialRef
 ) -> bool:
     """Return whether a study still holds the history a publication recorded.
 
     :param int finished: Finished trials the study holds now.
-    :param int completed: Completed trials the study holds now, those inside every metric
-        bound and constraint.
+    :param int measured: Trials the study holds now that measured their values
+        (:func:`_measured_trial_count`).
     :param _TrialRef expected: Published trial whose recorded counts, when
         present, are the minimum.
     :return bool: ``True`` when both counts meet the recorded boundary.
     """
     return (expected.finished_trials is None or finished >= expected.finished_trials) and (
-        expected.completed_trials is None or completed >= expected.completed_trials
+        expected.measured_trials is None or measured >= expected.measured_trials
     )
 
 
@@ -252,12 +319,7 @@ def _published_trial_history_available(
     :param _TrialRef | None published_trial: Published trial and count boundary.
     :return bool: ``True`` when identity and every recorded count boundary survive.
     """
-    if not stats.available or not stats.published_trial_available or published_trial is None:
-        return False
-    finished = sum(stats.counts.get(state, 0) for state in FINISHED_TRIAL_STATES)
-    return _meets_published_trial_history_boundary(
-        finished, stats.counts.get("COMPLETE", 0), published_trial
-    )
+    return stats.available and stats.published_trial_available and published_trial is not None
 
 
 def _published_trial_matches(trial: optuna.trial.FrozenTrial, expected: _TrialRef) -> bool:
@@ -321,7 +383,8 @@ def _position_seed(base_seed: int, study_name: str, position: int, label: str) -
     """Derive the seed of one random choice from the draw position that owns it.
 
     :param int base_seed: The phase's ``sampler.seed``.
-    :param str study_name: The phase's study name.
+    :param str study_name: The phase's namespace (:func:`_study_namespace`), so every study of
+        a phase draws the same configurations whatever values it inherits.
     :param int position: The trial's draw position.
     :param str label: What the seed is for, such as a parameter name.
     :return int: A 32-bit seed, the same in every process for the same inputs.
@@ -331,6 +394,54 @@ def _position_seed(base_seed: int, study_name: str, position: int, label: str) -
         separators=(",", ":"),
     ).encode()
     return int.from_bytes(hashlib.sha256(material).digest()[:4], "big")
+
+
+def _distribution(param: SearchParam) -> optuna.distributions.BaseDistribution:
+    """Return the Optuna distribution ``_suggest`` registers for a search parameter.
+
+    :param SearchParam param: A search parameter.
+    :return optuna.distributions.BaseDistribution: Its distribution.
+    """
+    if isinstance(param, FloatParam):
+        return optuna.distributions.FloatDistribution(
+            param.low, param.high, log=param.log, step=param.step
+        )
+    if isinstance(param, IntParam):
+        return optuna.distributions.IntDistribution(
+            param.low, param.high, log=param.log, step=param.step
+        )
+    return optuna.distributions.CategoricalDistribution(param.choices)
+
+
+def _distribution_at(
+    study: optuna.Study,
+    position: int,
+    param_name: str,
+    current: optuna.distributions.BaseDistribution,
+) -> optuna.distributions.BaseDistribution:
+    """Return the distribution a configuration starting at ``position`` draws ``param_name`` from.
+
+    A configuration belongs to the search space that was in effect at its first position, so a
+    repeats slot drawn partly before its range widened draws its remaining members from the
+    range its first members drew from. Every other new draw is at or past the newest space's
+    first position and draws from ``current``.
+
+    :param optuna.Study study: The active study, whose identity record holds its search spaces.
+    :param int position: The configuration's first draw position.
+    :param str param_name: The parameter being drawn.
+    :param optuna.distributions.BaseDistribution current: The configured distribution.
+    :return optuna.distributions.BaseDistribution: The distribution to draw from.
+    """
+    record = _recorded_identity(study)
+    if record is None:
+        return current
+    entries = [entry for entry in record["search_spaces"] if entry["first_position"] <= position]
+    if not entries or entries[-1] is record["search_spaces"][-1]:
+        return current
+    recorded = entries[-1]["search_space"].get(param_name)
+    if recorded is None:
+        return current
+    return _distribution(recorded_search_space({param_name: recorded})[param_name])
 
 
 class _PositionRandomSampler(optuna.samplers.RandomSampler):
@@ -372,52 +483,83 @@ class _PositionRandomSampler(optuna.samplers.RandomSampler):
         :param optuna.distributions.BaseDistribution param_distribution: The
             parameter's distribution.
         :return object: The repeat value for the repeat key, otherwise the value a
-            fresh ``RandomSampler`` seeded by :func:`_position_seed` draws.
+            fresh ``RandomSampler`` seeded by :func:`_position_seed` draws from the search space
+            in effect at the configuration's first position (:func:`_distribution_at`).
         """
         position = _draw_position(study, trial)
+        first = position
         if self._repeats is not None:
             count = len(self._repeats.values)
             if param_name == self._repeats.key:
                 return self._repeats.values[position % count]
             position //= count
-        seed = _position_seed(self._base_seed, study.study_name, position, param_name)
+            first = position * count
+        seed = _position_seed(
+            self._base_seed, _study_namespace(study.study_name), position, param_name
+        )
         sampler = optuna.samplers.RandomSampler(seed=seed)
-        return sampler.sample_independent(study, trial, param_name, param_distribution)
+        distribution = _distribution_at(study, first, param_name, param_distribution)
+        return sampler.sample_independent(study, trial, param_name, distribution)
 
 
 class _PositionGridSampler(optuna.samplers.GridSampler):
-    """Grid sampler that gives each trial the grid point at its draw position and never stops a study."""
+    """Grid sampler that gives each trial the cell at its draw position and never stops a study.
+
+    The cell order comes from the study's search-space history
+    (:func:`~phasesweep.engine.grid_order.grid_cell_order`), so a grown grid keeps every drawn
+    position's cell and runs only cells it has not drawn. A study with no recorded identity,
+    such as a dry run's in-memory sample, orders the sampler's own search space alone.
+    """
 
     def __init__(
         self,
-        search_space: Mapping[str, Sequence[StrictJsonScalar]],
+        search_space: Mapping[str, SearchParam],
         *,
         seed: int | None,
         repeats: Repeats | None = None,
     ) -> None:
         """Keep configurations shuffled and their repeat values consecutive.
 
-        :param Mapping[str, Sequence[StrictJsonScalar]] search_space: Enumerated grid axes.
+        :param Mapping[str, SearchParam] search_space: The phase's sampler search space,
+            repeat axis included.
         :param int | None seed: Seed for the configuration shuffle; None uses zero.
         :param Repeats | None repeats: Repeat axis to group in its configured value order.
         """
-        super().__init__(search_space, seed=seed)
-        self._grid_ids = list(range(len(self._all_grids)))
-        if repeats is not None:
-            repeat_index = self._param_names.index(repeats.key)
-            groups: dict[tuple[object, ...], dict[object, int]] = {}
-            for grid_id, point in enumerate(self._all_grids):
-                configuration = point[:repeat_index] + point[repeat_index + 1 :]
-                groups.setdefault(configuration, {})[point[repeat_index]] = grid_id
-            self._grid_ids = [group[value] for group in groups.values() for value in repeats.values]
+        super().__init__(grid_search_space(dict(search_space)), seed=seed)
+        self._seed = seed
+        self._repeats = repeats
+        own = {
+            name: dump_json(param)
+            for name, param in search_space.items()
+            if repeats is None or name != repeats.key
+        }
+        self._own_history: list[SearchSpaceEntry] = [
+            {"search_space": json_object(own), "first_position": 0}
+        ]
+        self._names = grid_axis_names(list(own), repeats)
+        self._orders: dict[str, list[GridCell]] = {}
+
+    def _order(self, study: optuna.Study) -> list[GridCell]:
+        """Return the study's cell order, computed once per recorded history.
+
+        :param optuna.Study study: The active study.
+        :return list[GridCell]: Cells by draw position.
+        """
+        record = _recorded_identity(study)
+        history = self._own_history if record is None else record["search_spaces"]
+        key = json.dumps(history, sort_keys=True, separators=(",", ":"))
+        if key not in self._orders:
+            self._orders[key] = grid_cell_order(
+                history, seed=self._seed, repeats=self._repeats, phase_name=study.study_name
+            )
+        return self._orders[key]
 
     def before_trial(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        """Assign the grid point at the trial's draw position, unless the trial already has one.
+        """Assign the cell at the trial's draw position, unless the trial already has one.
 
-        A rerun copies its source's ``grid_id``. New draws take positions
-        ``0..M-1`` in the grid's seeded configuration shuffle, with repeat values
-        consecutive, so no two trials that are not reruns share a point under
-        any ``n_jobs``.
+        The ``grid_id`` is the draw position itself, an index into the study's cell order. A
+        rerun copies its source's ``grid_id``. New draws take positions ``0..M-1``, so no two
+        trials that are not reruns share a cell under any ``n_jobs``.
 
         :param optuna.Study study: The active study.
         :param optuna.trial.FrozenTrial trial: The trial about to run.
@@ -427,14 +569,36 @@ class _PositionGridSampler(optuna.samplers.GridSampler):
         if "grid_id" in trial.system_attrs:
             return
         position = _draw_position(study, trial)
-        if position >= len(self._grid_ids):
+        cells = len(self._order(study))
+        if position >= cells:
             raise RuntimeError(
                 f"Trial {trial.number} of study {study.study_name!r} has draw position "
-                f"{position}, past the {len(self._all_grids)}-point grid."
+                f"{position}, past the {cells}-point grid."
             )
-        grid_id = self._grid_ids[position]
-        study._storage.set_trial_system_attr(trial._trial_id, "search_space", self._search_space)
-        study._storage.set_trial_system_attr(trial._trial_id, "grid_id", grid_id)
+        study._storage.set_trial_system_attr(trial._trial_id, "grid_id", position)
+
+    def sample_independent(
+        self,
+        study: optuna.Study,
+        trial: optuna.trial.FrozenTrial,
+        param_name: str,
+        param_distribution: optuna.distributions.BaseDistribution,
+    ) -> object:
+        """Return the value of ``param_name`` in the cell at the trial's ``grid_id``.
+
+        :param optuna.Study study: The active study.
+        :param optuna.trial.FrozenTrial trial: The trial being sampled for.
+        :param str param_name: Name of the axis being sampled.
+        :param optuna.distributions.BaseDistribution param_distribution: The axis's
+            distribution, which the cell's value lies in.
+        :raises RuntimeError: The trial has no ``grid_id``, which :meth:`before_trial` or its
+            rerun source always assigns.
+        :return object: The cell's value for the axis.
+        """
+        grid_id = trial.system_attrs.get("grid_id")
+        if type(grid_id) is not int:
+            raise RuntimeError(f"Trial {trial.number} has no grid_id to sample from.")
+        return self._order(study)[grid_id][self._names.index(param_name)]
 
     def after_trial(
         self,
@@ -532,7 +696,7 @@ class _PositionTPESampler(optuna.samplers.TPESampler):
         position = _draw_position(study, trial)
         label = f"tpe:{param_name}"
         self._rng = LazyRandomState(
-            _position_seed(self._base_seed, study.study_name, position, label)
+            _position_seed(self._base_seed, _study_namespace(study.study_name), position, label)
         )
         return super().sample_independent(study, trial, param_name, param_distribution)
 
@@ -554,6 +718,10 @@ class _PositionCmaEsSampler(optuna.samplers.CmaEsSampler):
         :param int seed: Base seed supplied by the phase's sampler config.
         """
         self._thread_rng = _ThreadRandomState()
+        self._draw_space: ContextVar[
+            tuple[dict[str, optuna.distributions.BaseDistribution], optuna.study.StudyDirection]
+            | None
+        ] = ContextVar("cmaes_draw_space", default=None)
         super().__init__(seed=seed, independent_sampler=_PositionRandomSampler(seed=seed))
         self._base_seed = seed
 
@@ -582,7 +750,8 @@ class _PositionCmaEsSampler(optuna.samplers.CmaEsSampler):
         """Sample as CMA-ES does, with the ask seeded by the draw position instead of the trial number.
 
         The trial handed on is a copy numbered by position; its trial id is the
-        real one, so every storage write lands on the real trial.
+        real one, so every storage write lands on the real trial. The current direction and
+        search space reach :meth:`_restore_optimizer`, which refits batches no snapshot covers.
 
         :param optuna.Study study: The active study; its name is part of the seed.
         :param optuna.trial.FrozenTrial trial: The trial being sampled for.
@@ -593,11 +762,15 @@ class _PositionCmaEsSampler(optuna.samplers.CmaEsSampler):
         """
         position = _draw_position(study, trial)
         self._cma_rng = LazyRandomState(
-            _position_seed(self._base_seed, study.study_name, position, "cmaes")
+            _position_seed(self._base_seed, _study_namespace(study.study_name), position, "cmaes")
         )
         positioned = copy.copy(trial)
         positioned.number = position
-        return super().sample_relative(study, positioned, search_space)
+        token = self._draw_space.set((search_space, study.direction))
+        try:
+            return super().sample_relative(study, positioned, search_space)
+        finally:
+            self._draw_space.reset(token)
 
     def _restore_optimizer(
         self, completed_trials: list[optuna.trial.FrozenTrial]
@@ -610,25 +783,80 @@ class _PositionCmaEsSampler(optuna.samplers.CmaEsSampler):
         a generation told meanwhile; the newest generation wins, ties to the
         highest number.
 
+        Adopted rows carry no snapshot (:func:`_sampling_trial_for_reread`), so a study can hold
+        several complete batches after its newest one. Replay all but the last consecutive
+        complete batch, which Optuna tells and saves as part of the ask, using this study's own
+        values and direction. When an observation is missing, the first incomplete batch
+        receives new draws before any later batch can affect the optimizer. In a study whose
+        every row it asked itself the replay tells nothing: each complete generation after the
+        newest completed snapshot was asked by trials that each saved one.
+
         :param list[optuna.trial.FrozenTrial] completed_trials: The study's
             completed trials.
-        :return CmaClass | None: The restored optimizer, or None before any tell.
+        :return CmaClass | None: Optimizer immediately before Optuna's next ask, or None
+            outside a draw, when no snapshot is restored.
         """
         carriers = [
             completed
             for completed in completed_trials
             if any(key.startswith(self._attr_key_optimizer) for key in completed.system_attrs)
         ]
-        if not carriers:
-            return None
-        newest = max(
-            carriers,
-            key=lambda carrier: (
-                carrier.system_attrs[self._attr_key_generation],
-                carrier.number,
-            ),
-        )
-        return super()._restore_optimizer([newest])
+        optimizer = None
+        if carriers:
+            newest = max(
+                carriers,
+                key=lambda carrier: (
+                    carrier.system_attrs[self._attr_key_generation],
+                    carrier.number,
+                ),
+            )
+            optimizer = super()._restore_optimizer([newest])
+        replay = self._draw_space.get()
+        if replay is None:
+            return optimizer
+
+        search_space, direction = replay
+        transform = _SearchSpaceTransform(search_space, transform_step=True, transform_0_1=True)
+        if optimizer is None:
+            optimizer = self._init_optimizer(transform, direction)
+        population = optimizer.population_size
+        sign = 1 if direction == optuna.study.StudyDirection.MINIMIZE else -1
+        batch = self._get_solution_trials(completed_trials, optimizer.generation)
+        while len(batch) >= population:
+            following = self._get_solution_trials(completed_trials, optimizer.generation + 1)
+            if len(following) < population:
+                break
+            solutions = []
+            for trial in batch[:population]:
+                assert trial.value is not None
+                solutions.append((transform.transform(trial.params), sign * trial.value))
+            optimizer.tell(solutions)
+            batch = following
+        return optimizer
+
+
+def _sampling_trial_for_reread(
+    trial: optuna.trial.FrozenTrial, sampler: optuna.samplers.BaseSampler
+) -> optuna.trial.FrozenTrial:
+    """Keep measured draw positions without importing a fitted optimizer.
+
+    CMA-ES's generation identifies the draw batch. Its optimizer snapshot stores the
+    updates learned from scores and direction; later asks reconstruct updates from the
+    new study's batches and values. TPE fits directly from the new study's history.
+
+    :param optuna.trial.FrozenTrial trial: The trial the new reading study will add.
+    :param optuna.samplers.BaseSampler sampler: The new reading study's sampler.
+    :return optuna.trial.FrozenTrial: A trial carrying only reusable sampling state.
+    """
+    if not isinstance(sampler, _PositionCmaEsSampler):
+        return trial
+    retained = copy.copy(trial)
+    retained.system_attrs = {
+        key: value
+        for key, value in trial.system_attrs.items()
+        if not key.startswith(sampler._attr_key_optimizer)
+    }
+    return retained
 
 
 def _build_sampler(
@@ -678,7 +906,7 @@ def _build_sampler(
             return optuna.samplers.RandomSampler()
         return _PositionRandomSampler(seed=cfg.seed, repeats=repeats)
     if cfg.type == "grid":
-        return _PositionGridSampler(grid_search_space(search_space), seed=cfg.seed, repeats=repeats)
+        return _PositionGridSampler(search_space, seed=cfg.seed, repeats=repeats)
     if cfg.type == "cmaes":
         if cfg.seed is None:
             return optuna.samplers.CmaEsSampler()
@@ -704,12 +932,92 @@ def _suggest(trial: optuna.Trial, name: str, p: SearchParam) -> Any:
     assert_never(p)
 
 
-def _phase_study_name(experiment: Experiment, phase: Phase | str) -> str:
-    """Return the stable Optuna study name for a phase.
+GridAxisKind = Literal["int", "float", "categorical"]
+"""How a grid axis of choices is registered with Optuna."""
 
-    :param Experiment experiment: Parsed experiment config supplying the experiment name.
-    :param Phase | str phase: Phase or historical phase name appended to the namespace.
-    :return str: Stable Optuna study name for the experiment/phase pair.
+
+def _grid_axis_kind(values: Sequence[object]) -> GridAxisKind:
+    """Say how a grid axis's choices are registered: as an int or float range, or as choices.
+
+    Optuna requires a categorical parameter's choices to be identical across a study's trials
+    but lets an int or float range change its bounds, so a numeric axis registered as a range
+    can gain values in place. Booleans are not numbers here, and an int past Optuna's exact
+    float range stays a choice.
+
+    :param Sequence[object] values: The axis's choices.
+    :return GridAxisKind: ``int`` when every choice is an int within +-2^53, ``float`` when
+        every choice is a float, otherwise ``categorical``.
     """
-    name = phase if isinstance(phase, str) else phase.name
-    return f"{experiment.experiment}::{name}"
+    if all(type(value) is int and abs(value) <= _OPTUNA_EXACT_INT_LIMIT for value in values):
+        return "int"
+    if all(type(value) is float for value in values):
+        return "float"
+    return "categorical"
+
+
+def _suggest_all(trial: optuna.Trial, phase: Phase) -> dict[str, object]:
+    """Suggest every sampler axis of a phase, the one path a trial's params are drawn through.
+
+    A grid's numeric choices register as an int or float range spanning them
+    (:func:`_grid_axis_kind`); the grid sampler returns the cell's value, so the trial records
+    the configured value with its type. A param the trial already holds, as a rerun holds its
+    source's, is returned as recorded.
+
+    :param optuna.Trial trial: The active Optuna trial.
+    :param Phase phase: Phase whose ``search_space`` and repeat axis are drawn.
+    :return dict[str, object]: The drawn value of every axis, by name.
+    """
+    grid = phase.sampler.type == "grid"
+    recorded = trial.params
+    sampled: dict[str, object] = {}
+    for name, param in sampler_search_space(phase).items():
+        if name in recorded:
+            # A rerun carries its source's value under its source's distribution, which a grown
+            # space widened; suggesting it again would return the same value and only warn.
+            sampled[name] = recorded[name]
+            continue
+        if grid and isinstance(param, CategoricalParam):
+            kind = _grid_axis_kind(param.choices)
+            if kind == "int":
+                sampled[name] = trial.suggest_int(name, min(param.choices), max(param.choices))
+                continue
+            if kind == "float":
+                sampled[name] = trial.suggest_float(name, min(param.choices), max(param.choices))
+                continue
+        sampled[name] = _suggest(trial, name, param)
+    return sampled
+
+
+def _phase_namespace(experiment_name: str, phase_name: str) -> str:
+    """Return the name every study of one phase starts with.
+
+    Each study of the phase appends ``::`` and a digest of the values it inherits and of its
+    reading settings (:func:`phasesweep.engine.fingerprints.phase_study_name`); the namespace
+    alone seeds the phase's draws, so every study of a phase draws alike. Experiment and phase
+    names are safe names, so they hold no ``:``.
+
+    :param str experiment_name: The experiment's name.
+    :param str phase_name: The phase's name, configured or historical.
+    :return str: ``<experiment>::<phase>``.
+    """
+    return f"{experiment_name}::{phase_name}"
+
+
+def _study_namespace(study_name: str) -> str:
+    """Return the phase namespace a study name starts with, without its address digest.
+
+    :param str study_name: A phase study's name.
+    :return str: Its ``<experiment>::<phase>`` part.
+    """
+    return "::".join(study_name.split("::")[:2])
+
+
+def _belongs_to_phase(study_name: str, experiment_name: str, phase_name: str) -> bool:
+    """Say whether a study holds trials of one phase, under any inherited values and reading.
+
+    :param str study_name: Study name read from storage.
+    :param str experiment_name: The experiment's name.
+    :param str phase_name: The phase's name.
+    :return bool: Whether the name is the phase's namespace with an address digest.
+    """
+    return study_name.startswith(f"{_phase_namespace(experiment_name, phase_name)}::")

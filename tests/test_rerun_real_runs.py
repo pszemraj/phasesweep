@@ -10,15 +10,8 @@ and every trainer group its trials recorded, is killed on exit when still alive.
 
 from __future__ import annotations
 
-import contextlib
-import json
-import os
 import shlex
 import signal
-import subprocess
-import time
-from collections.abc import Iterator
-from pathlib import Path
 
 import optuna
 import pytest
@@ -28,9 +21,8 @@ from phasesweep import run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, Repeats, Sampler
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
-from phasesweep.engine.optuna import _draw_positions, _finished_trial_count, _trial_count_state
+from phasesweep.engine.optuna import _draw_positions, _finished_trial_count, _trial_run_state
 from phasesweep.engine.read import read_result
 from phasesweep.engine.state import (
     RERUN_OF_ATTR,
@@ -39,173 +31,19 @@ from phasesweep.engine.state import (
     _trial_interrupted,
 )
 from phasesweep.engine.study_policy import _load_phase_policy_state
-from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE, kill_stale_group
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
-    console_script,
-    copy_fake_train,
+    addressed_phase_study,
     make_experiment,
     phase_trials,
-    write_experiment_config,
-    write_trainer,
 )
+from tests.recovery_helpers import RerunHarness
 
 pytestmark = pytest.mark.integration
-
-#: How long a run may take to reach a held trial, or to finish, before the test fails.
-_WAIT_SECONDS = 120.0
 
 _LR = FloatParam(type="float", low=1e-5, high=1e-2, log=True)
 _WEIGHT_DECAY = FloatParam(type="float", low=0.0, high=0.3)
 _DROPOUT = FloatParam(type="float", low=0.0, high=0.3)
-
-
-class _Harness:
-    """One test's workdirs, gated trainer and spawned runs."""
-
-    def __init__(self, root: Path) -> None:
-        """Write the gated trainer under ``root``.
-
-        :param Path root: The test's scratch directory.
-        """
-        self.root = root
-        self.gate = root / "gate"
-        self.gate.mkdir()
-        fake_train = copy_fake_train(root)
-        self.trainer = write_trainer(
-            root / "gated_train.py",
-            f"""
-            import os, sys, time
-            from pathlib import Path
-            gate = Path({str(self.gate)!r})
-            trial = os.environ["PHASESWEEP_TRIAL_ID"]
-            if (gate / f"hold-{{trial}}").exists():
-                (gate / f"reached-{{trial}}").touch()
-                while (gate / f"hold-{{trial}}").exists():
-                    time.sleep(0.05)
-            os.execv(sys.executable, [sys.executable, {str(fake_train)!r}, *sys.argv[1:]])
-            """,
-        )
-        self.spawned: list[subprocess.Popen[bytes]] = []
-        self.log = root / "runs.log"
-
-    def experiment(self, name: str, phase: Phase) -> Experiment:
-        """Build a persistent experiment ``t`` under ``root/name`` running the gated trainer.
-
-        :param str name: Directory holding this copy's ledger and workdir.
-        :param Phase phase: The experiment's one phase.
-        :return Experiment: The experiment.
-        """
-        return make_experiment(
-            persistent=self.root / name,
-            trial_command=f"python {self.trainer} {{overrides}}",
-            metric=FAKE_TRAIN_METRIC,
-            phases=[phase],
-        )
-
-    def config(self, experiment: Experiment) -> Path:
-        """Write ``experiment`` as the YAML file a ``phasesweep run`` subprocess loads.
-
-        :param Experiment experiment: The experiment to write.
-        :return Path: The config path.
-        """
-        assert experiment.workdir is not None
-        path = Path(experiment.workdir).parent / "experiment.yaml"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_experiment_config(path, experiment)
-        return path
-
-    def _spawn(self, config: Path) -> subprocess.Popen[bytes]:
-        """Start ``phasesweep run`` on ``config`` as its own session.
-
-        :param Path config: Config to run.
-        :return subprocess.Popen[bytes]: The run.
-        """
-        with self.log.open("a") as handle:
-            proc = subprocess.Popen(
-                [str(console_script("phasesweep")), "run", str(config)],
-                stdin=subprocess.DEVNULL,
-                stdout=handle,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                # A wide terminal keeps the closing ``log:`` path on one line.
-                env={**os.environ, "COLUMNS": "500"},
-            )
-        self.spawned.append(proc)
-        return proc
-
-    def interrupt(self, config: Path, trial: int, sig: signal.Signals) -> None:
-        """Run ``config`` until ``trial`` is in flight, then stop the run with ``sig``.
-
-        SIGINT, SIGHUP and SIGTERM go to the run's process group, as a terminal's Ctrl-C and
-        hangup do; SIGKILL goes to the orchestrator alone, so its trainer survives it.
-
-        :param Path config: Config to run.
-        :param int trial: Trial number the trainer holds in flight.
-        :param signal.Signals sig: ``SIGINT``, ``SIGHUP``, ``SIGTERM`` or ``SIGKILL``.
-        """
-        (self.gate / f"hold-{trial}").touch()
-        proc = self._spawn(config)
-        reached = self.gate / f"reached-{trial}"
-        deadline = time.monotonic() + _WAIT_SECONDS
-        while not reached.exists():
-            if proc.poll() is not None:
-                raise AssertionError(
-                    f"run exited ({proc.returncode}) before trial {trial} started:\n"
-                    f"{self.log.read_text()}"
-                )
-            if time.monotonic() > deadline:
-                raise AssertionError(f"trial {trial} never started:\n{self.log.read_text()}")
-            time.sleep(0.05)
-        if sig == signal.SIGKILL:
-            os.kill(proc.pid, signal.SIGKILL)
-        else:
-            os.killpg(proc.pid, sig)
-        assert proc.wait(timeout=_WAIT_SECONDS) != 0, self.log.read_text()
-
-    def complete(self, config: Path) -> None:
-        """Run ``config`` to completion and require success.
-
-        :param Path config: Config to run.
-        """
-        proc = self._spawn(config)
-        assert proc.wait(timeout=_WAIT_SECONDS) == 0, self.log.read_text()
-
-    def release(self) -> None:
-        """Remove every hold, so a trainer still waiting on one finishes."""
-        for hold in self.gate.glob("hold-*"):
-            hold.unlink()
-
-    def kill_survivors(self) -> None:
-        """Kill every spawned run still alive and every trainer group its trials recorded."""
-        for proc in self.spawned:
-            if proc.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=10)
-        for path in self.root.rglob(PROCESS_IDENTITY_FILE):
-            identity = json.loads(path.read_text())
-            kill_stale_group(
-                identity["pid"],
-                identity["proc_starttime"],
-                pgid=identity["pgid"],
-                grace_seconds=1.0,
-            )
-
-
-@pytest.fixture
-def harness(tmp_path: Path) -> Iterator[_Harness]:
-    """Yield a harness and kill whatever its runs leave alive.
-
-    :param Path tmp_path: The test's scratch directory.
-    :return Iterator[_Harness]: The harness.
-    """
-    built = _Harness(tmp_path)
-    try:
-        yield built
-    finally:
-        built.kill_survivors()
-        built.release()
 
 
 def _finished_draws(trials: list[optuna.trial.FrozenTrial]) -> dict[int, dict[str, object]]:
@@ -240,13 +78,12 @@ def _assert_matches_control(experiment: Experiment, control: Experiment) -> list
         if trial.number in interrupted:
             parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
             assert parsed is not None and parsed.outcome == "interrupted"
-            assert _trial_count_state(trial) == "INTERRUPTED"
+            assert _trial_run_state(trial) == "INTERRUPTED"
     assert "WAITING" not in {t.state.name for t in trials}
     phase = experiment.phases[0]
     assert _finished_trial_count(trials) == phase.n_trials
-    storage = _resolve_storage(experiment.resolved_storage)
-    study = optuna.load_study(study_name="t::p", storage=storage)
-    assert _load_phase_policy_state(study).consecutive_failures == 0
+    study = addressed_phase_study(experiment)
+    assert _load_phase_policy_state(study, experiment).consecutive_failures == 0
     _, (winner,) = read_result(experiment, phase_names=["p"])
     _, (expected,) = read_result(control, phase_names=["p"])
     assert winner is not None and expected is not None
@@ -274,7 +111,7 @@ def _sources(experiment: Experiment) -> dict[int, int]:
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
 def test_grid_reruns_points_interrupted_by_sigint_and_sigkill(
-    harness: _Harness, n_jobs: int
+    harness: RerunHarness, n_jobs: int
 ) -> None:
     """A grid stopped by SIGINT, then by SIGKILL, covers every point once, as one uninterrupted run does."""
     phase = Phase(
@@ -306,7 +143,7 @@ def test_grid_reruns_points_interrupted_by_sigint_and_sigkill(
     assert sorted(grid_ids) == list(range(6))
 
 
-def test_seeded_random_repeats_rerun_a_chain_of_interruptions(harness: _Harness) -> None:
+def test_seeded_random_repeats_rerun_a_chain_of_interruptions(harness: RerunHarness) -> None:
     """A rerun interrupted again gets its own rerun, and every repeat group completes as in the control."""
     phase = Phase(
         name="p",
@@ -354,7 +191,7 @@ def test_seeded_random_repeats_rerun_a_chain_of_interruptions(harness: _Harness)
     ],
 )
 def test_model_samplers_resume_real_runs_exactly(
-    harness: _Harness,
+    harness: RerunHarness,
     sampler: Sampler,
     space: dict[str, FloatParam],
     n_trials: int,
@@ -377,7 +214,7 @@ def test_model_samplers_resume_real_runs_exactly(
     assert _assert_matches_control(experiment, control) == [first, second]
 
 
-def test_fixed_configuration_killed_mid_trial_reruns_its_one_attempt(harness: _Harness) -> None:
+def test_fixed_configuration_killed_mid_trial_reruns_its_one_attempt(harness: RerunHarness) -> None:
     """A fixed configuration whose orchestrator was killed reruns at the same target and publishes."""
     phase = Phase(name="p", n_trials=1, gpu_policy="none", fixed_overrides={"model.n_layers": 8})
     control = harness.experiment("control", phase)
@@ -394,7 +231,7 @@ def test_fixed_configuration_killed_mid_trial_reruns_its_one_attempt(harness: _H
 
 
 def test_phase_deadline_interrupts_a_trial_that_reruns_once_the_phase_continues(
-    harness: _Harness,
+    harness: RerunHarness,
 ) -> None:
     """A deadline's interrupted trial leaves the phase short, then reruns first when it continues."""
     phase = Phase(
@@ -424,7 +261,7 @@ def test_phase_deadline_interrupts_a_trial_that_reruns_once_the_phase_continues(
     harness.release()
     # The same target replays the accepted partial and schedules nothing.
     run_experiment(accepted)
-    assert [_trial_count_state(t) for t in phase_trials(accepted)] == [
+    assert [_trial_run_state(t) for t in phase_trials(accepted)] == [
         "COMPLETE",
         "INTERRUPTED",
     ]
@@ -456,7 +293,7 @@ def test_phase_deadline_interrupts_a_trial_that_reruns_once_the_phase_continues(
     ],
 )
 def test_model_samplers_top_up_real_runs_exactly(
-    harness: _Harness,
+    harness: RerunHarness,
     sampler: Sampler,
     space: dict[str, FloatParam],
     first: int,
@@ -475,13 +312,30 @@ def test_model_samplers_top_up_real_runs_exactly(
 
 
 _NO_RUN_ACTIVE = (
-    "# No run is active; 1 trial is recorded RUNNING. Rerun the same config to settle it. "
+    "No run is active; 1 trial is recorded RUNNING. Rerun the same config to settle it. "
     "A trainer still running is stopped, so let it exit first to keep its result."
 )
+_RUN_ACTIVE = "A run is active on this experiment; counts and winners are as of this read."
 
 
-def test_status_tells_a_killed_run_from_a_live_one(harness: _Harness) -> None:
-    """After SIGKILL both status views say no run is active; a live lock silences them and a rerun clears them."""
+def _leading_comment(output: str, expected: str) -> tuple[str, str]:
+    """Join the leading ``# `` lines of status output up to the end of ``expected``.
+
+    A comment wraps to the terminal width in the table form, each line still a comment.
+
+    :return tuple[str, str]: The joined sentence and the line that follows it.
+    """
+    joined = ""
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if not line.startswith("# ") or joined == expected:
+            return joined, lines[index]
+        joined = f"{joined} {line[2:]}".strip()
+    return joined, ""
+
+
+def test_status_tells_a_killed_run_from_a_live_one(harness: RerunHarness) -> None:
+    """Both status views warn about a killed run across reading settings until recovery."""
     phase = Phase(
         name="p",
         n_trials=2,
@@ -495,26 +349,32 @@ def test_status_tells_a_killed_run_from_a_live_one(harness: _Harness) -> None:
     harness.interrupt(config, 0, signal.SIGKILL)
 
     assert [t.state.name for t in phase_trials(experiment)] == ["RUNNING"]
-    for arguments in (["status"], ["status", "--trials"]):
-        shown = CliRunner().invoke(cli, [*arguments, str(config)])
+    commands = [
+        ["status", str(config), *options, *settings]
+        for options in ([], ["--trials"])
+        for settings in ([], ["--set", 'metric.extractor.split="test"'])
+    ]
+    for command in commands:
+        shown = CliRunner().invoke(cli, command)
         assert shown.exit_code == 0, shown.output
-        # The table form wraps the comment to the terminal width, each line still a comment.
-        comment = [line for line in shown.output.splitlines() if line.startswith("# ")]
-        assert " ".join(line.removeprefix("# ") for line in comment) == _NO_RUN_ACTIVE.removeprefix(
-            "# "
-        )
-        assert shown.output.splitlines()[0] == comment[0]
+        settings = command[command.index("--set") :] if "--set" in command else []
+        rerun = f"# {shlex.join(['phasesweep', 'run', str(config), *settings])}"
+        assert _leading_comment(shown.output, _NO_RUN_ACTIVE) == (_NO_RUN_ACTIVE, rerun)
         assert shown.output.count("No run is active") == 1
         with _experiment_lock(experiment):
-            live = CliRunner().invoke(cli, [*arguments, str(config)])
+            live = CliRunner().invoke(cli, command)
         assert live.exit_code == 0, live.output
+        assert _leading_comment(live.output, _RUN_ACTIVE)[0] == _RUN_ACTIVE
         assert "No run is active" not in live.output
+        # A pending re-read's command would start a second run beside the active one.
+        assert "phasesweep run" not in live.output
+        assert "fix:" not in live.output
 
     harness.release()
     harness.complete(config)
 
-    for arguments in (["status"], ["status", "--trials"]):
-        recovered = CliRunner().invoke(cli, [*arguments, str(config)])
+    for command in commands:
+        recovered = CliRunner().invoke(cli, command)
         assert recovered.exit_code == 0, recovered.output
         assert "No run is active" not in recovered.output
 
@@ -522,7 +382,7 @@ def test_status_tells_a_killed_run_from_a_live_one(harness: _Harness) -> None:
 @pytest.mark.parametrize("persistent", [True, False], ids=["persistent", "in-memory"])
 @pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGHUP, signal.SIGTERM])
 def test_a_stopped_run_ends_with_the_next_step_once(
-    harness: _Harness, sig: signal.Signals, persistent: bool
+    harness: RerunHarness, sig: signal.Signals, persistent: bool
 ) -> None:
     """After SIGINT, SIGHUP or SIGTERM the line before the log path says to rerun, and what that keeps."""
     phase = Phase(

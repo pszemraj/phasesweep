@@ -438,16 +438,15 @@ def search_space_warnings(phase: Phase) -> list[str]:
 def retry_target_ceiling(phase: Phase, *, finished: int, measured: int) -> int | None:
     """Return the largest ``n_trials`` a fixed configuration or grid may be raised to.
 
-    A fixed configuration keeps at most one COMPLETE result, feasible or not, so
-    its ceiling is one attempt beyond its failures until one completes and its
-    finished attempts afterwards. A grid applies that rule per cell: one new
-    attempt for each cell without a COMPLETE result. Other sampled phases have
-    no ceiling.
+    A fixed configuration allows one attempt beyond its failures until it has a
+    COMPLETE result and no new attempts afterwards. A grid applies that rule per
+    cell: one new attempt for each cell without a COMPLETE result. Other sampled
+    phases have no ceiling.
 
     :param Phase phase: Phase whose ceiling is computed.
     :param int finished: Finished attempts its study holds, interrupted ones left
         out, zero when the study does not exist yet.
-    :param int measured: How many of those attempts are COMPLETE, feasible or not.
+    :param int measured: Draws that have a COMPLETE attempt, feasible or not.
     :return int | None: The ceiling, or ``None`` when the phase is unrestricted.
     """
     if not phase_draws(phase):
@@ -462,7 +461,7 @@ def fixed_configuration_target_refusal(
 ) -> tuple[str, str] | None:
     """Refuse extra measurements of an already completed fixed configuration.
 
-    A fixed configuration keeps at most one COMPLETE result, feasible or not.
+    A COMPLETE result closes a fixed configuration, whether it was feasible or not.
     Without one, the target may allow one attempt beyond its finished failures
     (:func:`retry_target_ceiling`). Interrupted reruns do not count. Sampled
     phases are unrestricted here.
@@ -470,8 +469,7 @@ def fixed_configuration_target_refusal(
     :param Phase phase: Phase whose ``n_trials`` is checked.
     :param int finished: Finished attempts its study already holds, interrupted
         ones left out, zero when the study does not exist yet.
-    :param int measured: How many of those attempts are COMPLETE, whether or
-        not they are feasible.
+    :param int measured: Draws that have a COMPLETE attempt, feasible or not.
     :return tuple[str, str] | None: Refusal diagnosis and remedy, or ``None`` when the target is allowed.
     """
     if phase_draws(phase):
@@ -529,8 +527,8 @@ def grid_target_refusal(phase: Phase, *, finished: int, measured: int) -> tuple[
     Finished failures remain spent. Raising the target may retry each failed
     cell once, or visit an unvisited cell; a completed cell is closed even if
     its metric was infeasible. With nothing finished there are no failures to count or retry,
-    so the diagnosis says only that the target exceeds the grid's cells. A larger grid is a
-    changed search space, which the study's fingerprint refusal answers with its own step.
+    so the diagnosis says only that the target exceeds the grid's cells. A grid that gained
+    values continues its study, and its ceiling counts the new cells.
 
     :param Phase phase: Phase whose target is checked.
     :param int finished: Finished attempts, excluding interruptions.

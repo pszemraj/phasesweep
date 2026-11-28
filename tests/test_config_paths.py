@@ -241,7 +241,9 @@ def test_runner_snapshot_resolves_against_recorded_config_dir(tmp_path: Path) ->
     assert not (snapshot.parent / "runs").exists()
     trial_dirs = list((project / "runs" / "anchored" / "p").glob("trial_*"))
     assert len(trial_dirs) == 1
-    assert "x=0.5" in (trial_dirs[0] / "stdout.log").read_text()
+    attempt_dirs = list((project / "runs" / "anchored" / "p" / "attempts").iterdir())
+    assert len(attempt_dirs) == 1
+    assert "x=0.5" in (attempt_dirs[0] / "stdout.log").read_text()
 
 
 def test_handle_config_dir_is_immutable(tmp_path: Path) -> None:

@@ -5,29 +5,46 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
+import sys
 from pathlib import Path
 
+import optuna
 import pytest
+import yaml
 from click.testing import CliRunner
 
 from phasesweep import run_experiment
 from phasesweep.cli import cli
-from phasesweep.config.models import ExecutionContext, Experiment
+from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
+from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_dir,
     _generation_reproducibility_path,
 )
 from phasesweep.engine.provenance import _code_revision
-from phasesweep.engine.state import REPRODUCIBILITY_SCHEMA_VERSION
+from phasesweep.engine.selection import _ranked_code_revisions, _ranked_revision_sources
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    GENERATION_ID_ATTR,
+    REPRODUCIBILITY_SCHEMA_VERSION,
+    RERUN_OF_ATTR,
+    TRIAL_DIR_ATTR,
+)
+from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import (
+    invoke_cli_boundary,
     make_experiment,
+    phase_trials,
     write_experiment_config,
     write_param_echo_trainer,
+    write_trainer,
     write_trial_zero_trainer,
 )
-from tests.ledger_fixtures import published_generation_id
+from tests.ledger_fixtures import published_generation_id, winner_payload
+from tests.recovery_helpers import runner_once
 
 
 @pytest.fixture
@@ -287,6 +304,278 @@ def _carried_winner_study(tmp_path: Path) -> tuple[Path, Experiment, str, str, s
     assert second_generation != first_generation
     config_path = write_experiment_config(tmp_path / "experiment.yaml", experiment)
     return config_path, experiment, first_generation, second_generation, first_head, second_head
+
+
+def test_a_ranked_generation_without_a_readable_record_reads_as_unreadable(
+    tmp_path: Path,
+) -> None:
+    """Selection never raises over a missing or damaged generation record; it reports ``unreadable``."""
+    experiment = make_experiment(persistent=tmp_path, trainer=tmp_path / "trainer.py")
+    study = optuna.create_study()
+    for number in range(2):
+        study.add_trial(
+            optuna.trial.create_trial(
+                value=0.5,
+                params={"x": number},
+                distributions={"x": optuna.distributions.IntDistribution(0, 9)},
+                user_attrs={GENERATION_ID_ATTR: f"missing-{number}"},
+            )
+        )
+    trials = study.get_trials(deepcopy=False)
+
+    assert _ranked_code_revisions(experiment, trials, sources={}) == {
+        "missing-0": "unreadable",
+        "missing-1": "unreadable",
+    }
+    assert _ranked_code_revisions(experiment, trials[:1], sources={}) == {}
+
+
+def test_ranked_revision_sources_read_every_generation_in_the_rerun_chain(tmp_path: Path) -> None:
+    """Each ancestor in a ranked trial's rerun chain that recorded its directory and a generation adds that generation, oldest first; one that recorded no directory adds none."""
+    directory = str(tmp_path / "trial_00000__opener")
+    failed = optuna.trial.TrialState.FAIL
+    study = optuna.create_study()
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=failed,
+            user_attrs={
+                GENERATION_ID_ATTR: "opener",
+                ATTEMPT_ID_ATTR: "opener",
+                TRIAL_DIR_ATTR: directory,
+            },
+        )
+    )
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=failed, user_attrs={GENERATION_ID_ATTR: "no-directory", RERUN_OF_ATTR: 0}
+        )
+    )
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=failed,
+            user_attrs={
+                GENERATION_ID_ATTR: "rerun",
+                ATTEMPT_ID_ATTR: "rerun",
+                RERUN_OF_ATTR: 1,
+                TRIAL_DIR_ATTR: directory,
+            },
+        )
+    )
+    study.add_trial(
+        optuna.trial.create_trial(
+            value=0.5,
+            user_attrs={
+                GENERATION_ID_ATTR: "final",
+                ATTEMPT_ID_ATTR: "final",
+                RERUN_OF_ATTR: 2,
+                TRIAL_DIR_ATTR: directory,
+            },
+        )
+    )
+    study.add_trial(optuna.trial.create_trial(value=0.6))
+    trials = study.get_trials(deepcopy=False)
+
+    assert _ranked_revision_sources(study, trials, trials[3:]) == {3: ["opener", "rerun"]}
+
+
+def test_ranked_revision_sources_include_sibling_checkpoint_writers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selection records the revision that produced a checkpoint in a sibling reading study."""
+    stage = tmp_path / "stage"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse
+        import os
+        from pathlib import Path
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--x", type=int)
+        args, _ = ap.parse_known_args()
+        checkpoint = Path(os.environ["PHASESWEEP_TRIAL_DIR"]) / "checkpoint"
+        stage = Path({str(stage)!r}).read_text()
+        if stage == "1" and args.x == 2:
+            print("first=0.9")
+            print("second=0.9")
+        elif stage == "2" and args.x == 1:
+            checkpoint.write_text("sibling checkpoint")
+            print("second=0.1")
+        elif stage == "3" and args.x == 1:
+            assert checkpoint.read_text() == "sibling checkpoint"
+            print("first=0.2")
+        """,
+    )
+    phase = Phase(
+        name="p",
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
+    )
+    # Returning to the first reading adopts the sibling's retry, which that reading cannot
+    # measure, so a fourth trial retries the cell from the sibling's checkpoint.
+    for revision, key, target, expected in (
+        ("1", "first", 2, 0.9),
+        ("2", "second", 3, 0.1),
+        ("3", "first", 4, 0.2),
+    ):
+        stage.write_text(revision)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                "phasesweep.engine.provenance._code_revision",
+                lambda _, commit=revision: {"commit": commit * 40, "dirty": False},
+            )
+            experiment = make_experiment(
+                persistent=tmp_path,
+                trainer=trainer,
+                metric=Metric(
+                    extractor=LogRegexExtractor(
+                        type="log_regex", pattern=key + r"=(?P<value>[0-9.]+)"
+                    )
+                ),
+                phases=[phase.model_copy(update={"n_trials": target})],
+            )
+            winner = run_experiment(experiment)["p"]
+        assert winner.metric == expected
+
+    assert winner.confound is not None
+    check = winner.confound["checks"]["code_revision"]
+    assert check["verdict"] == "heterogeneous"
+    assert [entry["commit"] for entry in check["detail"]["generations"]] == [
+        "1" * 40,
+        "2" * 40,
+        "3" * 40,
+    ]
+
+
+@pytest.mark.integration
+def test_a_top_up_under_another_commit_is_disclosed_on_the_winner(
+    tmp_path: Path,
+    hermetic_git: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Trials ranked across two commits flag ``code_revision`` in the winner, the run summary and ``show-winners``."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("COLUMNS", "500")
+    repo = tmp_path / "repo"
+    first_head = _committed_repo(repo)
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_trial_zero_trainer(tmp_path, otherwise='print("x=9.0")'),
+        n_trials=1,
+        gpu_policy="none",
+        execution=ExecutionContext(cwd=str(repo)),
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 0
+    (repo / "tracked.txt").write_text("v2\n")
+    _git(repo, "commit", "-q", "-am", "change the trainer")
+    second_head = _git(repo, "rev-parse", "HEAD")
+    capsys.readouterr()
+
+    top_up = ["--set", "phases[p].n_trials=2"]
+    assert invoke_cli_boundary(["run", str(config), *top_up], monkeypatch) == 0
+
+    err = capsys.readouterr().err
+    assert (
+        "code_revision: ranked trials span 2 generations with 2 distinct trainer revisions "
+        f"whose code may differ: {first_head[:12]} (trial 0), {second_head[:12]} (trial 1)"
+    ) in err
+    assert "flagged: code_revision\n" in err
+    experiment = experiment.model_copy(
+        update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 2})]}
+    )
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    check = winner_payload(experiment, generation_id)["confound"]["checks"]["code_revision"]
+    assert check["verdict"] == "heterogeneous"
+    assert [(entry["commit"], entry["trials"]) for entry in check["detail"]["generations"]] == [
+        (first_head, [0]),
+        (second_head, [1]),
+    ]
+    shown = CliRunner().invoke(cli, ["show-winners", str(config), *top_up])
+    assert shown.exit_code == 0, shown.output
+    summary = yaml.safe_load(shown.output.split("=== p ===", 1)[1])["confound"]["code_revision"]
+    assert summary["verdict"] == "heterogeneous"
+    assert (summary["generations"], summary["commits"], summary["dirty"]) == (2, 2, 0)
+    assert "rename" not in summary["remedy"] and "retrain" not in summary["remedy"]
+
+
+@pytest.mark.integration
+def test_ranked_rerun_discloses_prior_training_in_its_directory(
+    tmp_path: Path, hermetic_git: None
+) -> None:
+    """Every generation in a ranked rerun's chain is disclosed as one that may have trained in its directory, including an attempt stopped before launch."""
+    repo = tmp_path / "repo"
+    first_head = _committed_repo(repo)
+    marker = tmp_path / "first-ready"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+import os, time
+from pathlib import Path
+
+checkpoint = Path(os.environ["PHASESWEEP_TRIAL_DIR"]) / "checkpoint"
+marker = Path({str(marker)!r})
+if not marker.exists():
+    checkpoint.write_text("first attempt trained")
+    marker.touch()
+    time.sleep(60)
+print("x=0.7" if checkpoint.is_file() else "x=0.9")
+""",
+    )
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        n_trials=2,
+        gpu_policy="none",
+        execution=ExecutionContext(cwd=str(repo)),
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    with runner_once(config, marker):
+        pass
+
+    (repo / "tracked.txt").write_text("v2\n")
+    _git(repo, "commit", "-q", "-am", "allocate a rerun")
+    allocated_head = _git(repo, "rev-parse", "HEAD")
+    # This runner persists the rerun's directory and allocated lifecycle, then stops at launch.
+    program = """
+import os, signal, sys
+from phasesweep import run_experiment
+from phasesweep.config.io import load_experiment
+from phasesweep.engine import phase
+
+def interrupt_launch(*args, **kwargs):
+    os.kill(os.getpid(), signal.SIGKILL)
+
+phase.launch_trial = interrupt_launch
+run_experiment(load_experiment(sys.argv[1]))
+"""
+    runner = subprocess.run(
+        [sys.executable, "-c", program, str(config)], capture_output=True, timeout=15, check=False
+    )
+    assert runner.returncode == -signal.SIGKILL, runner.stderr.decode()
+    (repo / "tracked.txt").write_text("v3\n")
+    _git(repo, "commit", "-q", "-am", "resume the trainer")
+    final_head = _git(repo, "rev-parse", "HEAD")
+
+    winner = run_experiment(experiment)["p"]
+    first, allocated, rerun, peer = phase_trials(experiment)
+    assert rerun.user_attrs[RERUN_OF_ATTR] == allocated.number
+    assert winner.metric == 0.7 and winner.trial_number == rerun.number
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    check = winner_payload(experiment, generation_id)["confound"]["checks"]["code_revision"]
+    assert check["verdict"] == "heterogeneous"
+    assert [
+        (entry["generation_id"], entry["commit"], entry["trials"])
+        for entry in check["detail"]["generations"]
+    ] == [
+        (first.user_attrs[GENERATION_ID_ATTR], first_head, [rerun.number]),
+        (allocated.user_attrs[GENERATION_ID_ATTR], allocated_head, [rerun.number]),
+        (generation_id, final_head, [rerun.number, peer.number]),
+    ]
 
 
 @pytest.mark.integration

@@ -16,7 +16,9 @@ class OperatorAction(StrEnum):
     directory every launching context shares, or moves the work to the host.
     RUN_RECOVER_RUN retries process cleanup through the appropriate CLI or MCP
     recovery entry point. FIX_CONFIG corrects configuration or environment;
-    RETRY repeats the operation after its blocker resolves; INSPECT_LOGS requires diagnosis.
+    RETRY repeats the operation after its blocker resolves, with no change to the command or
+    config, so the CLI exits 75 for it and a process supervisor can rerun the same command;
+    an error that needs an operator step first never carries it. INSPECT_LOGS requires diagnosis.
     Defects do not inherit PhaseSweepError or an operator remediation.
     """
 
@@ -99,6 +101,11 @@ FRESH_STUDY = "set a new `experiment` name to start a fresh study"
 
 NEW_STUDY_STEP = f"{FRESH_STUDY[0].upper()}{FRESH_STUDY[1:]}."
 
+REJUDGE_BOUNDS_STEP = (
+    "A corrected metric.min, metric.max or constraint bound re-judges the recorded trials on "
+    "the next run without retraining them."
+)
+
 
 def restore_or_new_study(recorded: str) -> str:
     """Offer restoring what a refusal found changed, or starting a fresh study.
@@ -134,57 +141,44 @@ def phase_names(names: Sequence[str]) -> str:
     return ", ".join(f"`{name}`" for name in names)
 
 
-def rename_step(names: Sequence[str]) -> str:
-    """Say how to start phases over under new names, which give them new studies.
+def rename_step(name: str) -> str:
+    """Say how to start a phase over under a new name, which gives it a new study.
 
-    A phase's study is named after the phase, so a new name is a new study for it, and a phase
-    that inherits a renamed one records that name in its own study identity, so the caller
-    passes every inheriting phase too. Only the ``inherits`` entries that name a renamed phase
-    change. A new study keeps none of the old one's trials, so the clause says the renamed
-    phases run again.
+    A phase's study is named after the phase, so a new name is a new study for it. Phases that
+    inherit it keep their names: their studies are addressed by the values they inherit, so a
+    renamed phase whose winner changes sends them to new studies of their own. A new study keeps
+    none of the old one's trials, so the clause says the renamed phase runs again.
 
-    :param Sequence[str] names: The phases to rename, at least one: a phase followed by the
-        phases inheriting it (:meth:`~phasesweep.config.models.Experiment.phases_inheriting`),
-        or the inheriting phases alone.
-    :return str: A clause for a step to lead into, such as ``give `a` and `b` new names and
-        update the `inherits` that name them, which runs them again from scratch``.
+    :param str name: The phase to rename.
+    :return str: A clause for a step to lead into, such as ``give `a` a new `name`, which runs
+        it again from scratch``.
     """
-    quoted = [f"`{name}`" for name in names]
-    if len(quoted) == 1:
-        return f"give {quoted[0]} a new `name`, which runs it again from scratch"
-    listed = f"{', '.join(quoted[:-1])} and {quoted[-1]}"
-    return (
-        f"give {listed} new names and update the `inherits` that name them, which runs them "
-        "again from scratch"
-    )
+    return f"give `{name}` a new `name`, which runs it again from scratch"
 
 
-def timeout_step(phase_name: str, dependents: Sequence[str]) -> str:
+def timeout_step(phase_name: str) -> str:
     """Say how to give a phase whose trials timed out a longer per-trial timeout.
 
-    The timeout is part of the phase's study identity, so a raised value is refused over the
-    recorded trials; a new phase name is the step that loses the least work.
+    The timeout bounds a run without changing what a trial measures, so a raised value
+    continues the study, and a retried trial resumes in its own trial directory.
 
     :param str phase_name: Phase whose trials timed out.
-    :param Sequence[str] dependents: The phases that inherit it.
-    :return str: The operator's step, one sentence.
+    :return str: The clause a step leads with, such as ``Raise
+        phases[p].timeout_seconds_per_trial for the timed-out trials``.
     """
-    return (
-        f"For the timed-out trials, raise phases[{phase_name}].timeout_seconds_per_trial and "
-        f"{rename_step([phase_name, *dependents])}."
-    )
+    return f"Raise phases[{phase_name}].timeout_seconds_per_trial for the timed-out trials"
 
 
 def unreadable_objective_step(*, persistent: bool) -> str:
     """Say what to fix when a trainer ran but its objective could not be read.
 
-    The cause is the trainer's output or the config's ``metric`` settings. The settings are
-    part of a persistent study's identity, so correcting them is refused over the recorded
-    trials and starts a fresh study instead; a fixed trainer output retries in place, by the
-    retry step that follows this sentence in a persistent study.
+    The cause is the trainer's output or the config's ``metric`` settings. Corrected settings
+    in a persistent study re-read every finished trainer's kept evidence without retraining it
+    (:mod:`phasesweep.engine.reread`); a fixed trainer output retries in place, by the retry
+    step that follows this sentence in a persistent study.
 
-    :param bool persistent: Whether the study is recorded, which decides whether a corrected
-        ``metric`` can continue it.
+    :param bool persistent: Whether the study is recorded, which decides whether corrected
+        ``metric`` settings re-read its finished trials.
     :return str: One sentence that leads the retry step.
     """
     if not persistent:
@@ -194,7 +188,8 @@ def unreadable_objective_step(*, persistent: bool) -> str:
         )
     return (
         "A trainer ran but its objective could not be read; if the `metric` settings are wrong, "
-        "correct them under a new `experiment` name."
+        "correct them and rerun: the finished trials are re-read from their kept evidence, "
+        "not retrained."
     )
 
 
@@ -208,6 +203,18 @@ OTHER_FORMAT_STEP = "Set a new `experiment` name, and a new ledger if `storage` 
 #: The step for a recorded result that stopped short at a timeout, on every surface that
 #: refuses to use it while ``allow_incomplete_on_timeout`` is off.
 ACCEPT_INCOMPLETE_STEP = "Set allow_incomplete_on_timeout: true to use the incomplete result."
+
+
+def as_sentence(text: object) -> str:
+    """End recorded text as a sentence, so the text after it starts a new one.
+
+    :param object text: A recorded cause or diagnostic, which an exception's text may leave
+        unpunctuated.
+    :return str: ``text`` without trailing whitespace, with a period added unless it already
+        ends in sentence punctuation.
+    """
+    ended = str(text).rstrip()
+    return ended if ended.endswith((".", "!", "?")) else f"{ended}."
 
 
 def short_digest(digest: str) -> str:

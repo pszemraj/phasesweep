@@ -10,7 +10,7 @@ import pytest
 from optuna.exceptions import ExperimentalWarning
 from pydantic import ValidationError
 
-from phasesweep.config.common import _find_prefix_collisions, check_bounds, is_sha256_hex
+from phasesweep.config.common import _find_prefix_collisions, is_sha256_hex
 from phasesweep.config.models import Constraint, Phase
 from phasesweep.config.search import (
     CategoricalParam,
@@ -22,6 +22,7 @@ from phasesweep.config.search import (
     grid_search_space,
     sampler_search_space,
 )
+from phasesweep.engine.bounds import bound_violations
 from phasesweep.engine.optuna import _build_sampler, _suggest
 from phasesweep.evidence.models import JsonExtractor
 from tests.conftest import make_experiment
@@ -132,12 +133,17 @@ def test_int_param_accepts_exact_boundaries_and_large_categorical_choices() -> N
     assert CategoricalParam(type="categorical", choices=choices).choices == choices
 
 
-def test_check_bounds_rejects_non_finite_values():
-    """NaN/inf are always out of bounds."""
-    assert check_bounds(50.0, min_value=0.0, max_value=100.0) is True
-    assert check_bounds(float("nan"), min_value=0.0, max_value=100.0) is False
-    assert check_bounds(float("inf"), min_value=0.0, max_value=100.0) is False
-    assert check_bounds(float("-inf"), min_value=0.0, max_value=100.0) is False
+def test_bound_violations_reject_non_finite_values():
+    """NaN and infinity violate every bound, and a finite value inside them violates none."""
+    experiment = make_experiment()
+    experiment = experiment.model_copy(
+        update={"metric": experiment.metric.model_copy(update={"min": 0.0, "max": 100.0})}
+    )
+    assert bound_violations(50.0, {}, experiment) == []
+    for value in (float("nan"), float("inf"), float("-inf")):
+        assert bound_violations(value, {}, experiment) == [
+            f"metric {experiment.metric.name!r}={value} is not finite"
+        ]
 
 
 def test_sampler_rejects_negative_n_startup_trials():

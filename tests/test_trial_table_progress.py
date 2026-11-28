@@ -15,7 +15,6 @@ from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.read import TrialTables, _trial_table
 from phasesweep.engine.state import (
     DURATION_ATTR,
-    FEASIBLE_ATTR,
     RERUN_OF_ATTR,
     TRIAL_OUTCOME_ATTR,
 )
@@ -51,7 +50,7 @@ def _complete(
     x: int, value: float, *, seed: int | None = None, **attrs: JsonValue
 ) -> optuna.trial.FrozenTrial:
     """Build a COMPLETE trial inside every bound, which is what counts toward the target."""
-    return _trial(_STATE.COMPLETE, x, value, seed=seed, **{FEASIBLE_ATTR: True}, **attrs)
+    return _trial(_STATE.COMPLETE, x, value, seed=seed, **attrs)
 
 
 def _interrupted(x: int) -> optuna.trial.FrozenTrial:
@@ -125,25 +124,17 @@ def test_an_interrupted_trial_is_named_beside_the_progress_it_does_not_add_to(
     ]
 
 
-@pytest.mark.parametrize(
-    ("width", "heading"),
-    [
-        (80, ["learning_rate: 2 of 2 trials (1 interrupted), eval_loss (lower is better)"]),
-        (60, ["learning_rate: 2 of 2 trials (1 interrupted), eval_loss", "  (lower is better)"]),
-    ],
-)
-def test_a_finished_phase_with_a_rerun_still_names_the_interrupted_original(
-    width: int, heading: list[str]
-) -> None:
-    """The rerun counts and the trial it replaced does not, so the phase is done with one row aside."""
+def test_an_interrupted_trial_its_rerun_replaced_is_not_named_as_pending() -> None:
+    """The rerun counts and the trial it replaced stays a row; the heading names no pending interruption, and the line under it counts the result that came from the rerun."""
     lines = _heading_and_rows(
         [_interrupted(5), _complete(5, 0.4, **{RERUN_OF_ATTR: 0}), _complete(4, 0.3)],
-        width,
+        80,
         n_trials=2,
     )
 
     assert lines == [
-        *heading,
+        "learning_rate: 2 of 2 trials, eval_loss (lower is better)",
+        "  interrupted: 1 of 2 results came from a rerun",
         "          trial  eval_loss  x  state        time  rerun of",
         "              2        0.3  4  COMPLETE     0.5s         -",
         "              0          -  5  INTERRUPTED  0.5s         -",

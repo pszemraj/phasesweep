@@ -11,7 +11,10 @@ import time
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
+from phasesweep import load_experiment
+from phasesweep.cli import cli as cli_main
 from phasesweep.config.models import Experiment
 from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.publication import _resolve_publication_pointer
@@ -20,11 +23,13 @@ from tests.conftest import (
     console_script,
     invoke_cli_boundary,
     make_experiment,
+    study_name,
     terminal_stream,
     write_constant_trainer,
     write_experiment_config,
     write_trainer,
 )
+from tests.experiments import phase_payload, write_experiment
 
 _DIAGNOSIS = (
     "Phase 'phase' aborted: 2 consecutive failed/infeasible trials reached "
@@ -54,10 +59,10 @@ _AT_60 = [
 
 _PAD = " " * 10
 _STARTER_DRY_RUN_AT_80 = [
-    "HH:MM:SS  DRY RUN metric='eval_loss' goal=minimize extractor={'type':",
-    f"{_PAD}'json_envelope', 'path': 'result.json', 'objective_name': 'eval_loss',",
-    f"{_PAD}'split': 'validation', 'policy': 'synthetic', 'checkpoint':",
-    f"{_PAD}'toy_formula', 'expected_step': 100, 'evaluation_axis': 'step'}}",
+    "HH:MM:SS  DRY RUN metric='eval_loss' goal=minimize extractor=json_envelope",
+    f"{_PAD}path=result.json objective_name=eval_loss split=validation",
+    f"{_PAD}policy=synthetic checkpoint=toy_formula expected_step=100",
+    f"{_PAD}evaluation_axis=step",
     "HH:MM:SS  DRY RUN evaluation_point check: supported (axis 'step' from the",
     f"{_PAD}envelope; any other axis from evaluation.progress)",
     "HH:MM:SS  DRY RUN environment: inherit_env=none (digested: PATH, HOME, LANG,",
@@ -74,8 +79,8 @@ _STARTER_DRY_RUN_AT_80 = [
     "HH:MM:SS  DRY RUN phase 'learning_rate': sampler=grid (resumable, reproducible)",
     "HH:MM:SS  DRY RUN grid order: configurations are shuffled by sampler.seed, not",
     f"{_PAD}listed choice order.",
-    "HH:MM:SS  phase=depth study=phasesweep_starter::depth finished=0 remaining=2",
-    f"{_PAD}reruns=0 n_jobs=1",
+    "HH:MM:SS  phase=depth study={depth}",
+    f"{_PAD}finished=0 remaining=2 reruns=0 n_jobs=1",
     "HH:MM:SS  GPU isolation disabled by gpu_policy='none'.",
     "HH:MM:SS  DRY RUN phase=depth would launch 2 trials",
     "HH:MM:SS  DRY RUN example command:",
@@ -185,7 +190,171 @@ def test_a_dry_run_wraps_its_lines_to_the_terminal_and_keeps_its_commands_whole(
         re.sub(r"^\d\d:\d\d:\d\d", "HH:MM:SS", line).replace(root, "TMP")
         for line in stderr.text.splitlines()
     ]
-    assert lines == _STARTER_DRY_RUN_AT_80
+    starter = load_experiment(config)
+    expected = [
+        line.replace("{depth}", study_name(starter, "depth")) for line in _STARTER_DRY_RUN_AT_80
+    ]
+    assert lines == expected
+
+
+def test_validate_wraps_its_contract_lines_under_their_prefix_without_dict_syntax(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``validate`` prints the extractor as ``key=value`` words and wraps each line, hanging two columns in."""
+    config = tmp_path / "starter.yaml"
+    assert invoke_cli_boundary(["init", "-o", str(config)], monkeypatch) == 0
+
+    with terminal_stream("stdout", 60) as stdout:
+        assert invoke_cli_boundary(["validate", str(config)], monkeypatch) == 0
+
+    lines = stdout.text.splitlines()
+    assert lines[1:5] == [
+        "  metric='eval_loss' goal=minimize extractor=json_envelope",
+        "    path=result.json objective_name=eval_loss",
+        "    split=validation policy=synthetic checkpoint=toy_formula",
+        "    expected_step=100 evaluation_axis=step",
+    ]
+    assert "{" not in "\n".join(lines[1:5])
+    # The experiment's contract lines up to the trainer cwd, whose path stays whole.
+    assert all(len(line) <= 60 for line in lines[1:11])
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["validate", "dry-run"])
+def test_launch_contract_keeps_extractor_literals_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    """Narrow terminals keep literal spaces, quotes and backslashes in each extractor field."""
+    pattern = r"throughput \{tok/s\}:  (?P<value>\d+\.\d+) \[avg over last 100 steps\]"
+    quoted = r'say "hi" (?P<value>\d+)'
+    multiline = "score:\n  " + r"(?P<value>\d+)"
+    config = write_experiment(
+        tmp_path / "exp.yaml",
+        metric={"extractor": {"type": "log_regex", "pattern": pattern}},
+        phases=[phase_payload(gpu_policy="none")],
+        observe=[
+            {
+                "name": "multiline",
+                "extractor": {"type": "log_regex", "file": "stdout.log", "pattern": multiline},
+            },
+            {
+                "name": "greeting",
+                "extractor": {"type": "log_regex", "file": "stdout.log", "pattern": quoted},
+            },
+        ],
+    )
+    monkeypatch.setenv("COLUMNS", "40")
+
+    command = ["run", str(config), "--dry-run"] if dry_run else ["validate", str(config)]
+    result = CliRunner().invoke(cli_main, command)
+
+    assert result.exit_code == 0, result.output
+    assert f'pattern="{pattern}"' in result.output
+    assert 'pattern="say \\"hi\\" (?P<value>\\d+)"' in result.output
+    assert f"pattern={multiline!r}" in result.output
+
+
+_LONG_PHASES = [
+    phase_payload(gpu_policy="none", name="first_phase_with_a_long_name"),
+    phase_payload(
+        gpu_policy="none",
+        name="second_phase_with_a_long_name",
+        inherits=["first_phase_with_a_long_name"],
+        search_space={"y": {"type": "int", "low": 0, "high": 3}},
+    ),
+    phase_payload(
+        gpu_policy="none",
+        name="third_phase_with_long_name_and_many_inherits",
+        inherits=["first_phase_with_a_long_name", "second_phase_with_a_long_name"],
+        search_space={"z": {"type": "int", "low": 0, "high": 3}},
+    ),
+]
+_PHASE_HEADERS_AT_80 = [
+    "  - first_phase_with_a_long_name: n_trials=1 sampler=random",
+    "  - second_phase_with_a_long_name: n_trials=1 sampler=random",
+    "    inherits=first_phase_with_a_long_name",
+    "  - third_phase_with_long_name_and_many_inherits: n_trials=1 sampler=random",
+    "    inherits=first_phase_with_a_long_name,second_phase_with_a_long_name",
+]
+_PHASE_HEADERS_AT_60 = [
+    "  - first_phase_with_a_long_name: n_trials=1 sampler=random",
+    "  - second_phase_with_a_long_name: n_trials=1 sampler=random",
+    "    inherits=first_phase_with_a_long_name",
+    "  - third_phase_with_long_name_and_many_inherits: n_trials=1",
+    "    sampler=random",
+    "    inherits=first_phase_with_a_long_name,second_phase_with_a_long_name",
+]
+
+
+@pytest.mark.parametrize(
+    ("columns", "expected"), [(80, _PHASE_HEADERS_AT_80), (60, _PHASE_HEADERS_AT_60)]
+)
+def test_validate_wraps_a_phase_header_hanging_under_its_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, columns: int, expected: list[str]
+) -> None:
+    """A phase header that overruns the terminal breaks at spaces and hangs under the text after its dash, a long name or inherits list staying whole."""
+    config = write_experiment(tmp_path / "exp.yaml", phases=_LONG_PHASES)
+
+    with terminal_stream("stdout", columns) as stdout:
+        assert invoke_cli_boundary(["validate", str(config)], monkeypatch) == 0
+
+    lines = stdout.text.splitlines()
+    first = next(index for index, line in enumerate(lines) if line.startswith("  - "))
+    headers = [line for line in lines[first:] if re.match(r"(  - |    \S)", line)]
+    assert headers == expected
+
+
+def test_validate_wraps_a_warning_under_its_label_at_80_columns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A long warning breaks at spaces and hangs under the text after ``warning:``."""
+    choices = ["1e-4", "3e-4", "1e-3", "3e-3"]
+    config = write_experiment(
+        tmp_path / "exp.yaml",
+        phases=[
+            phase_payload(
+                gpu_policy="none",
+                name="wd_sweep",
+                n_trials=4,
+                sampler={"type": "grid"},
+                search_space={"lr": {"type": "categorical", "choices": choices}},
+            )
+        ],
+    )
+
+    with terminal_stream("stdout", 80) as stdout:
+        assert invoke_cli_boundary(["validate", str(config)], monkeypatch) == 0
+
+    lines = stdout.text.splitlines()
+    first = next(index for index, line in enumerate(lines) if "warning:" in line)
+    assert lines[first : first + 4] == [
+        "      warning: Phase 'wd_sweep': search_space 'lr' has categorical choices that",
+        "               load as strings, not numbers: '1e-4', '3e-4', '1e-3', '3e-3'",
+        "               (YAML 1.1 reads an exponent without a decimal point and sign as",
+        "               text). Write 1e-4 as 1.0e-4 or 0.0001, and the rest likewise.",
+    ]
+
+
+def test_validate_names_inherited_phases_without_list_syntax(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A phase header lists the phases it inherits as bare names, comma-separated."""
+    config = write_experiment(
+        tmp_path / "exp.yaml",
+        phases=[
+            {"name": "a", "n_trials": 1, "fixed_overrides": {"x": 1}},
+            {"name": "b", "n_trials": 1, "fixed_overrides": {"y": 2}},
+            {"name": "c", "n_trials": 1, "inherits": ["a"]},
+            {"name": "d", "n_trials": 1, "inherits": ["a", "b"]},
+        ],
+    )
+    monkeypatch.setenv("COLUMNS", "500")
+
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "- c: n_trials=1 (fixed configuration) inherits=a\n" in result.output
+    assert "- d: n_trials=1 (fixed configuration) inherits=a,b\n" in result.output
+    assert "[" not in result.output
 
 
 @pytest.mark.integration

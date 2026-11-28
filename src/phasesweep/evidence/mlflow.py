@@ -7,6 +7,7 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
+from phasesweep.evidence.history import merge_attempt_histories
 from phasesweep.evidence.models import (
     Gate,
     MlflowExtractor,
@@ -86,6 +87,33 @@ def compile_query(experiment: Experiment, gates: list[Gate]) -> MlflowQuery | No
         "gates": [dump_json(g) for g in required],
         "selections": {observation_id(s): dump_json(s) for s in selections},
     }
+
+
+def merge_histories(
+    histories: Sequence[Sequence[Mapping[str, object]]],
+) -> list[Mapping[str, object]]:
+    """Merge one metric's histories from a trial's attempts into the trial's history.
+
+    The first step logged by a newer attempt replaces the earlier history from that step
+    onward, including steps the resumed trainer never reaches again.
+
+    :param Sequence[Sequence[Mapping[str, object]]] histories: Each attempt's records,
+        oldest attempt first.
+    :raises ValueError: A history record has no valid step.
+    :return list[Mapping[str, object]]: The merged records, for :func:`select_observation`.
+    """
+    positioned = []
+    for history in histories:
+        points = []
+        for record in history:
+            step = record.get("step")
+            if type(step) is not int or step < 0:
+                raise ValueError(
+                    "MLflow history requires nonnegative integer steps and timestamps."
+                )
+            points.append((step, record))
+        positioned.append(points)
+    return merge_attempt_histories(positioned)
 
 
 def select_observation(
@@ -171,11 +199,19 @@ def validate_capture(capture: Mapping[str, object]) -> MlflowCapture:
     :raises ValueError: Capture structure or required evidence disagrees.
     :return MlflowCapture: The narrowed evidence.
     """
-    from phasesweep.tracking.records import validate_binding
+    from phasesweep.tracking.records import readable_run_state, validate_binding
 
-    if capture.get("kind") != "mlflow" or capture.get("run_state") != "FINISHED":
-        raise ValueError("MLflow capture must name a finished run.")
     binding = validate_binding(capture.get("binding"))
+    status = capture.get("run_state")
+    tags = json_text_map(capture.get("tags"))
+    if tags is None:
+        raise ValueError("Invalid MLflow metadata subset.")
+    if capture.get("kind") != "mlflow" or not readable_run_state(status, binding["run_mode"], tags):
+        raise ValueError("MLflow capture must name a finished run.")
+    raw_earlier = capture.get("earlier_bindings")
+    if not isinstance(raw_earlier, list):
+        raise ValueError("MLflow capture must name the earlier runs it merged.")
+    earlier = [validate_binding(item) for item in raw_earlier]
     query = parse_query(capture.get("query"))
     raw_observations = capture.get("observations")
     if not isinstance(raw_observations, dict):
@@ -195,8 +231,8 @@ def validate_capture(capture: Mapping[str, object]) -> MlflowCapture:
     retrieved_at = capture.get("retrieved_at")
     if not isinstance(retrieved_at, str) or not retrieved_at:
         raise ValueError("Missing MLflow retrieval timestamp.")
-    params, tags = json_text_map(capture.get("params")), json_text_map(capture.get("tags"))
-    if params is None or tags is None:
+    params = json_text_map(capture.get("params"))
+    if params is None:
         raise ValueError("Invalid MLflow metadata subset.")
     for gate in (MlflowRequiredGate.model_validate(g) for g in query["gates"]):
         if any(key not in params for key in gate.params) or any(
@@ -206,7 +242,8 @@ def validate_capture(capture: Mapping[str, object]) -> MlflowCapture:
     return {
         "kind": "mlflow",
         "binding": binding,
-        "run_state": "FINISHED",
+        "earlier_bindings": earlier,
+        "run_state": status,
         "query": query,
         "observations": observations,
         "retrieved_at": retrieved_at,

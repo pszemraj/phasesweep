@@ -8,13 +8,13 @@ current-journal/ledger/study.journal   journal ledger
 current-journal/artifact_root/t/...    the artifact tree that claimed that ledger
 ```
 
-Use `golden_publication` or `materialize` from [`ledger_fixtures.py`](../../ledger_fixtures.py) to copy the fixture into a temporary directory. The helper rebuilds its config, relocates artifact-root and study bindings in `tree` mode, and snapshots bytes before the read. [`test_ledger_read_paths.py`](../../test_ledger_read_paths.py) runs the read-path matrix.
+Use `golden_publication` from [`ledger_fixtures.py`](../../ledger_fixtures.py) for a temporary copy of the published tree and its generation ID. The [read-path matrix](../../test_ledger_read_paths.py) uses `materialize` from the same module to configure each mode, relocate bindings in `tree` mode, and snapshot bytes before the read.
 
 ## Inventory
 
 | Fixture | Backend | Modes | Binding schema | tree verdict | ledger-only verdict |
 | --- | --- | --- | --- | --- | --- |
-| `current-journal` | journal | tree, ledger-only | 18 | ok | ok |
+| `current-journal` | journal | tree, ledger-only | 35 | ok | ok |
 
 `tree` reads the fixture's own artifact root, so the artifact-root binding is validated first. `ledger-only` points the same ledger at a workdir that has never existed, testing the ledger format scan without a binding. The table reports direct-reader format verdicts; CLI `status`, `status --trials` and `show-winners` instead refuse the missing study directory, which the read-path matrix classifies as `study-absent`.
 
@@ -28,7 +28,7 @@ The fixture is regenerated, never hand-edited. From the repository root:
 python -m tests.fixtures.make_ledger_fixtures
 ```
 
-`--out DIR` writes the fixture to another directory, `--notes TEXT` replaces its manifest notes, and `-v` raises log verbosity. Generation fails if the produced bytes disagree with the expected read verdicts. A persisted record change bumps its own schema and its enclosing stamp in the same change: `STUDY_SCHEMA_VERSION` for ledger records or `ARTIFACT_ROOT_BINDING_SCHEMA_VERSION` for artifact-root records. Set `TARGET_STUDY_SCHEMA_VERSION` and `TARGET_BINDING_SCHEMA_VERSION` in [`make_ledger_fixtures.py`](../make_ledger_fixtures.py) to the matching source constants before regenerating, and update the `Binding schema` column above.
+`--out DIR` writes the fixture to another directory, `--notes TEXT` replaces its manifest notes, and `-v` raises log verbosity. Generation fails if the produced bytes disagree with the expected read verdicts. The first change on a branch to a persisted record sets its own schema and its enclosing stamp to one above `main`'s: `STUDY_SCHEMA_VERSION` for ledger records or `ARTIFACT_ROOT_BINDING_SCHEMA_VERSION` for artifact-root records. Then set `TARGET_STUDY_SCHEMA_VERSION` and `TARGET_BINDING_SCHEMA_VERSION` in [`make_ledger_fixtures.py`](../make_ledger_fixtures.py) to the matching source constants, and update the `Binding schema` column above. Later changes to a record's layout on the same branch keep those numbers; regenerate the fixture each time.
 
 The generator keeps the fixture tracked and independent of the generating host:
 

@@ -11,15 +11,16 @@ from typing import Any
 import optuna
 import pytest
 import yaml
+from click.testing import CliRunner
 
 from phasesweep import run_experiment
-from phasesweep.cli import _operational_error_text
-from phasesweep.config.models import Experiment, Phase
+from phasesweep.cli import _operational_error_text, cli
+from phasesweep.config.models import Experiment
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import StudySchemaMismatchError, TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.paths import _last_successful_generation_path, _run_log_path
-from phasesweep.engine.preview import _recorded_phase
+from phasesweep.engine.paths import _attempt_dir, _last_successful_generation_path, _run_log_path
+from phasesweep.engine.preview import _read_recorded_phases
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -43,7 +44,9 @@ from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
     phase_study,
+    study_name,
     trial_outcome,
+    write_experiment_config,
     write_flag_gated_trainer,
     write_flaky_trainer,
     write_trainer,
@@ -117,7 +120,7 @@ def test_parallel_outcome_write_with_lost_acknowledgment(
                     worker.result(timeout=10)
 
     replay = optuna.load_study(study_name=study.study_name, storage=_resolve_storage(storage_url))
-    state = _load_phase_policy_state(replay)
+    state = _load_phase_policy_state(replay, experiment)
     assert state.abort is not None
     assert state.abort["completion_sequence"] == 1
     assert state.abort_streak == (first.number,)
@@ -165,21 +168,33 @@ def test_cli_abort_advice_is_logged_once_per_invocation(
     assert len(phase_study(experiment).trials) == 1
 
 
-def test_evidence_pending_preview_routes_to_resume(tmp_path: Path) -> None:
+def test_evidence_pending_preview_routes_to_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Completed trainer evidence makes dry-run request recovery rather than a config edit."""
     directory = tmp_path / "trial"
     directory.mkdir()
+    attempt_dir = _attempt_dir(directory.parent, "attempt")
+    attempt_dir.mkdir(parents=True)
     write_attempt_lifecycle(
-        directory, attempt_id="attempt", state="exited", return_code=0, duration_seconds=1.0
+        attempt_dir,
+        attempt_id="attempt",
+        state="exited",
+        ended_by="trainer",
+        return_code=0,
+        duration_seconds=1.0,
     )
     study = optuna.create_study()
     running = study.ask()
     running.set_user_attr(ATTEMPT_ID_ATTR, "attempt")
     running.set_user_attr(TRIAL_DIR_ATTR, str(directory))
+    monkeypatch.setattr(
+        "phasesweep.engine.preview.read_every_phase_study", lambda *_: {"p": [study]}
+    )
     with pytest.raises(
         PhaseSweepError, match="completed trainer evidence awaiting recovery"
     ) as caught:
-        _recorded_phase(Phase(name="p", n_trials=1, gpu_policy="none"), study)
+        _read_recorded_phases(make_experiment(persistent=tmp_path))
 
     error = caught.value
     assert error.action is OperatorAction.RUN_RECOVER_RUN
@@ -230,8 +245,10 @@ def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) 
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(exp)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-    record = _load_phase_policy_state(study).abort
+    study = optuna.load_study(
+        study_name=study_name(exp), storage=_resolve_storage(f"journal:///{db}")
+    )
+    record = _load_phase_policy_state(study, make_experiment()).abort
     assert record is not None
     assert record["policy"] == "max_consecutive_failures"
     assert record["consecutive_failures"] == 2
@@ -264,7 +281,9 @@ def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(experiment(3))
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
+    study = optuna.load_study(
+        study_name=study_name(experiment(3)), storage=_resolve_storage(storage)
+    )
     cohort_digest = study.trials[0].user_attrs[TRAINER_ENV_DIGEST_ATTR]
     for sequence in (3, 4):
         study.add_trial(
@@ -313,9 +332,9 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(
 
         def crash_in_selection(*args: object, **kwargs: object) -> None:
             study = optuna.load_study(
-                study_name="t::p", storage=_resolve_storage(f"journal:///{db}")
+                study_name=study_name(_exp(3)), storage=_resolve_storage(f"journal:///{db}")
             )
-            assert _load_phase_policy_state(study).abort is None
+            assert _load_phase_policy_state(study, make_experiment()).abort is None
             raise RuntimeError("simulated crash during winner selection")
 
         with monkeypatch.context() as patch:
@@ -325,14 +344,18 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(
             ) as caught:
                 run_experiment(_exp(6))
             assert type(caught.value) is RuntimeError
-        study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-        assert _load_phase_policy_state(study).abort is None
+        study = optuna.load_study(
+            study_name=study_name(_exp(6)), storage=_resolve_storage(f"journal:///{db}")
+        )
+        assert _load_phase_policy_state(study, make_experiment()).abort is None
 
     winners = run_experiment(_exp(6))
 
     assert winners["p"].metric == pytest.approx(0.5)
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-    assert _load_phase_policy_state(study).abort is None
+    study = optuna.load_study(
+        study_name=study_name(_exp(6)), storage=_resolve_storage(f"journal:///{db}")
+    )
+    assert _load_phase_policy_state(study, make_experiment()).abort is None
 
 
 @pytest.mark.integration
@@ -367,7 +390,9 @@ def test_supported_topup_preserves_consecutive_failure_streak(tmp_path: Path) ->
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(_exp(4))
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+    study = optuna.load_study(
+        study_name=study_name(_exp(4)), storage=_resolve_storage(f"journal:///{db}")
+    )
     assert [trial.state.name for trial in study.trials] == ["COMPLETE", "FAIL", "FAIL", "FAIL"]
     assert [trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in study.trials] == [
         1,
@@ -375,7 +400,7 @@ def test_supported_topup_preserves_consecutive_failure_streak(tmp_path: Path) ->
         3,
         4,
     ]
-    abort = _load_phase_policy_state(study).abort
+    abort = _load_phase_policy_state(study, make_experiment()).abort
     assert abort is not None
     assert abort["consecutive_failures"] == 3
     assert _last_successful_generation_path(_exp(4)).read_text() == published_before
@@ -404,7 +429,9 @@ def test_retry_that_fails_again_aborts_after_a_fresh_failure_count(tmp_path: Pat
 
     def policy_state() -> tuple[list[str], _PhasePolicyState]:
         study = phase_study(grid(2))
-        return [trial.state.name for trial in study.trials], _load_phase_policy_state(study)
+        return [trial.state.name for trial in study.trials], _load_phase_policy_state(
+            study, make_experiment()
+        )
 
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(grid(2))
@@ -449,8 +476,8 @@ def test_changing_the_failure_limit_never_reinterprets_recorded_outcomes(tmp_pat
     first = run_experiment(original)
     assert run_experiment(lowered)["p"].attempt_id == first["p"].attempt_id
     study = phase_study(original)
-    assert _load_phase_policy_state(study).consecutive_failures == 1
-    assert _load_phase_policy_state(study).abort is None
+    assert _load_phase_policy_state(study, make_experiment()).consecutive_failures == 1
+    assert _load_phase_policy_state(study, make_experiment()).abort is None
     assert run_experiment(original)["p"].attempt_id == first["p"].attempt_id
 
 
@@ -492,7 +519,7 @@ def test_raised_failure_limit_retires_a_streak_abort_while_trials_remain(tmp_pat
     assert run_experiment(raised)["p"].metric == pytest.approx(0.5)
     study = phase_study(initial)
     assert [trial.state.name for trial in study.trials] == ["FAIL", "FAIL", "COMPLETE", "COMPLETE"]
-    state = _load_phase_policy_state(study)
+    state = _load_phase_policy_state(study, make_experiment())
     assert (state.abort, state.consecutive_failures) == (None, 0)
     # The recovery keeps the accepted target and spends it: nothing else was raised.
     assert study.user_attrs[PHASE_RECOVERY_ATTR]["trial_target"] == 4
@@ -521,6 +548,54 @@ def test_raised_failure_limit_leaves_an_abort_with_no_trials_left(tmp_path: Path
         assert "phases[p].n_trials above 2" in message
         assert "max_consecutive_failures above" not in message
     assert len(phase_study(initial).trials) == 2
+
+
+@pytest.mark.parametrize("kind", ["recorded abort", "streak at the lowered limit"])
+def test_status_prints_the_refusal_the_next_run_prints(tmp_path: Path, kind: str) -> None:
+    """``status`` and ``status --trials`` give a recorded refusal and its fix as ``run`` words them, active run or not."""
+    failing = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
+    if kind == "recorded abort":
+        experiment = make_experiment(
+            persistent=tmp_path,
+            trainer=failing,
+            n_trials=3,
+            max_consecutive_failures=2,
+            gpu_policy="none",
+            sampler={"type": "random", "seed": 7},
+        )
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(experiment)
+    else:
+        experiment = make_experiment(
+            persistent=tmp_path,
+            trainer=failing,
+            n_trials=2,
+            max_consecutive_failures=5,
+            gpu_policy="none",
+            sampler={"type": "random", "seed": 7},
+        )
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(experiment)
+        # An interrupted run leaves a target above the finished trials; lowering the limit
+        # to the recorded streak then refuses new work at that target.
+        phase_study(experiment).set_user_attr(TRIAL_TARGET_ATTR, 3)
+        phase = experiment.phases[0].model_copy(
+            update={"n_trials": 3, "max_consecutive_failures": 2}
+        )
+        experiment = experiment.model_copy(update={"phases": [phase]})
+    with pytest.raises(PhaseAbortRefusedError) as refused:
+        run_experiment(experiment)
+    expected = _operational_error_text(refused.value).splitlines()
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+
+    shown = CliRunner().invoke(cli, ["status", str(config)])
+    assert shown.exit_code == 0, shown.output
+    comments = [line for line in shown.output.splitlines() if line.startswith("# ")]
+    assert comments == [f"# {line}" for line in expected]
+
+    table = CliRunner().invoke(cli, ["status", str(config), "--trials"], env={"COLUMNS": "500"})
+    assert table.exit_code == 0, table.output
+    assert "\n".join(f"  {line}" for line in expected) in table.output
 
 
 def _abort_fatally(
@@ -560,7 +635,7 @@ def _abort_fatally(
         patch.setattr(phase_module, "prepare_trainer_input", explode)
         with pytest.raises(RuntimeError, match="simulated objective defect"):
             run_experiment(experiment)
-    abort = _load_phase_policy_state(phase_study(experiment)).abort
+    abort = _load_phase_policy_state(phase_study(experiment), experiment).abort
     assert abort is not None
     assert abort["policy"] == "unexpected_objective_exception"
     return experiment, calls

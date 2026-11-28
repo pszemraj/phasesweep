@@ -65,12 +65,12 @@ def test_argparse_renders_the_documented_wire_forms():
     )
 
     assert shlex.split(s) == [
-        "--none=None",
         "--flag=true",
+        "--items=[1,a,false]",
         "--n=3",
+        "--none=None",
         "--ratio=2.5",
         "--tag=s",
-        "--items=[1,a,false]",
     ]
 
 
@@ -267,28 +267,24 @@ def test_trainer_config_is_the_base_for_every_format(tmp_path: Path) -> None:
     output_dir = f"{trial_dir}/out/depth-3"
 
     argparse_command = render_command("train {overrides}", _CLI_OVERRIDES, "argparse", **render)
-    assert sorted(shlex.split(argparse_command)[1:]) == sorted(
-        [
-            "--model.name=tiny",
-            "--model.depth=8",
-            "--optimizer.lr=0.0003",
-            "--layers=[1,2]",
-            f"--output_dir={output_dir}",
-            "--trainer.seed=17",
-        ]
-    )
+    assert shlex.split(argparse_command)[1:] == [
+        "--layers=[1,2]",
+        "--model.depth=8",
+        "--model.name=tiny",
+        "--optimizer.lr=0.0003",
+        f"--output_dir={output_dir}",
+        "--trainer.seed=17",
+    ]
 
     hydra_command = render_command("train {overrides}", _CLI_OVERRIDES, "hydra", **render)
-    assert sorted(shlex.split(hydra_command)[1:]) == sorted(
-        [
-            'model.name="tiny"',
-            "model.depth=8",
-            "optimizer.lr=0.0003",
-            "layers=[1,2]",
-            f'output_dir="{output_dir}"',
-            "trainer.seed=17",
-        ]
-    )
+    assert shlex.split(hydra_command)[1:] == [
+        "layers=[1,2]",
+        "model.depth=8",
+        'model.name="tiny"',
+        "optimizer.lr=0.0003",
+        f'output_dir="{output_dir}"',
+        "trainer.seed=17",
+    ]
 
     json_input = compose_trainer_input(
         _CLI_BASE,

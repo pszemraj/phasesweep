@@ -40,9 +40,11 @@ def test_successful_cleanup_summary_is_informational(
 ) -> None:
     experiment = make_experiment(persistent=tmp_path)
     fabricate = fabricate_registered_attempt if via_registry else fabricate_stale_trial
-    study, trial_dir, number = fabricate(experiment, "p", attempt_id="stopped-attempt")
+    study, _trial_dir, number, attempt_dir = fabricate(
+        experiment, "p", attempt_id="stopped-attempt"
+    )
     write_trial_identity(
-        trial_dir,
+        attempt_dir,
         attempt_id="stopped-attempt",
         pid=reaped_pid(),
         starttime=222,
@@ -86,17 +88,20 @@ def test_confirm_does_not_count_an_already_complete_trial_as_a_recovered_result(
     """Confirm counts terminal cleanup once and names only newly recovered results as kept."""
     config = write_srv_config(tmp_path)
     experiment = load_experiment(config)
-    study, directory, number = fabricate_registered_attempt(
+    study, _trial_dir, number, attempt_dir = fabricate_registered_attempt(
         experiment, "p", attempt_id="completed-attempt"
     )
     trial = optuna.Trial(study, study.get_trials()[number]._trial_id)
     trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
     study.tell(number, 0.5)
-    write_trial_identity(directory, attempt_id="completed-attempt", pid=reaped_pid(), starttime=111)
+    write_trial_identity(
+        attempt_dir, attempt_id="completed-attempt", pid=reaped_pid(), starttime=111
+    )
     write_attempt_lifecycle(
-        directory,
+        attempt_dir,
         attempt_id="completed-attempt",
         state="exited",
+        ended_by="trainer",
         return_code=0,
         cleanup_confirmed=True,
     )
@@ -111,7 +116,7 @@ def test_confirm_does_not_count_an_already_complete_trial_as_a_recovered_result(
     assert confirmed.exit_code == 0, confirmed.output
     assert "kept 0 completed trial result(s)" in confirmed.output
     assert "confirmed 1 cleanup-uncertain trial(s)" in confirmed.output
-    assert "Kept completed trial result" not in caplog.text
+    assert not any(line.endswith("  recovered") for line in caplog.text.splitlines())
     retained = study.get_trials()[number]
     assert retained.state == optuna.trial.TrialState.COMPLETE
     assert retained.value == 0.5

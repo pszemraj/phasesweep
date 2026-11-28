@@ -22,6 +22,7 @@ from phasesweep.config.models import (
 from phasesweep.config.search import Sampler, sampler_capability_line
 from phasesweep.evidence.models import (
     JsonEnvelopeExtractor,
+    JsonExtractor,
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
@@ -119,14 +120,50 @@ def test_evaluation_axis_defaults_and_misplacements_are_rejected():
     for axis in ("eval/loss.min", "eval/loss"):
         with pytest.raises(ValueError, match="names the metric's own series"):
             wandb.model_validate({**wandb.model_dump(), "evaluation_axis": axis})
-    for extractor in (
-        envelope.model_copy(update={"evaluation_axis": "tokens"}),
-        wandb.model_copy(update={"evaluation_axis": "eval/step"}),
+    for extractor, message in (
+        (
+            envelope.model_copy(update={"evaluation_axis": "tokens"}),
+            "only the metric extractor's evaluation_point",
+        ),
+        (
+            wandb.model_copy(update={"evaluation_axis": "eval/step"}),
+            "Configure the trainer progress axis on the W&B objective",
+        ),
     ):
-        with pytest.raises(ValueError, match="only the metric extractor's evaluation_point"):
+        with pytest.raises(ValueError, match=message):
             Constraint.model_validate(
                 {"name": "memory", "extractor": extractor.model_dump(), "max": 5}
             )
+
+
+def test_an_envelope_at_a_captured_stream_fails_config_load() -> None:
+    """A ``json_envelope`` path naming a captured stream is refused: report_objective cannot write it."""
+    with pytest.raises(ValidationError, match="'stderr.log' names a captured stream"):
+        JsonEnvelopeExtractor(
+            type="json_envelope",
+            path="stderr.log",
+            objective_name="loss",
+            split="validation",
+            policy="final",
+        )
+
+
+def test_config_load_normalizes_evidence_paths_and_refuses_one_outside_the_trial(
+    tmp_path: Path,
+) -> None:
+    """Load stores ``./x.json`` as ``x.json`` and refuses a path that is absolute or has a ``..`` part."""
+    payload = make_experiment(
+        metric=Metric(extractor=JsonExtractor(type="json", path="x.json", key="loss"))
+    ).model_dump(mode="json")
+    payload["metric"]["extractor"]["path"] = "./x.json"
+    loaded = load_experiment(write_yaml(tmp_path, yaml.safe_dump(payload)))
+    assert isinstance(loaded.metric.extractor, JsonExtractor)
+    assert loaded.metric.extractor.path == "x.json"
+
+    for outside in ("/tmp/x.json", "a/../x.json"):
+        payload["metric"]["extractor"]["path"] = outside
+        with pytest.raises(ValidationError, match="trial-relative path required"):
+            load_experiment(write_yaml(tmp_path, yaml.safe_dump(payload)))
 
 
 def test_evaluation_axis_is_part_of_study_identity():
@@ -1101,12 +1138,12 @@ def test_metric_bounds_are_optional_finite_and_ordered() -> None:
     with pytest.raises(ValidationError, match="must be numbers, not booleans"):
         metric(max=True)
 
-    plain = experiment_contract_lines(make_experiment(metric=unbounded))[0]
-    bounded = experiment_contract_lines(make_experiment(metric=metric(min=0.5, max=2)))[0]
-    assert "bounds" not in plain
-    assert "bounds={'max': 2.0, 'min': 0.5}" in bounded
-    only_max = experiment_contract_lines(make_experiment(metric=metric(max=2)))[0]
-    assert "bounds={'max': 2.0}" in only_max
+    plain = str(experiment_contract_lines(make_experiment(metric=unbounded))[0])
+    bounded = str(experiment_contract_lines(make_experiment(metric=metric(min=0.5, max=2)))[0])
+    assert "max=" not in plain and "min=" not in plain
+    assert " max=2.0 min=0.5 " in bounded
+    only_max = str(experiment_contract_lines(make_experiment(metric=metric(max=2)))[0])
+    assert " max=2.0 " in only_max and "min=" not in only_max
 
 
 _LOG_EXTRACTOR: JsonObject = {"type": "log_regex", "pattern": r"m=(?P<value>[0-9.]+)"}

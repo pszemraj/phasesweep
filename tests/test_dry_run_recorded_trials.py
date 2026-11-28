@@ -9,6 +9,7 @@ what it read, in the run's order.
 from __future__ import annotations
 
 import logging
+import shlex
 from pathlib import Path
 
 import optuna
@@ -16,29 +17,34 @@ import pytest
 
 import phasesweep.engine.ledger as ledger_module
 from phasesweep import run_experiment
-from phasesweep.config.models import ExecutionContext, Experiment, Phase
+from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
+    PhaseTimeoutError,
     PublicationIntegrityError,
     PublishedStudyMissingError,
     ResumeWinnerMissingError,
-    StudyContextConflictError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     TrialEvidenceMissingError,
     TrialTargetRefusedError,
     WinnerIntegrityError,
 )
-from phasesweep.engine.fingerprints import _phase_fingerprint
+from phasesweep.engine.fingerprints import (
+    _fresh_identity,
+    _inherited_override_payload,
+    _stamp_identity,
+    phase_study_name,
+)
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
-from phasesweep.engine.paths import _last_successful_generation_path, _trial_dir_for
+from phasesweep.engine.paths import _attempt_dir, _last_successful_generation_path, _trial_dir_for
 from phasesweep.engine.preview import _placeholder_winner, validate_trial_targets
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
-    PHASE_FINGERPRINT_ATTR,
+    RERUN_OF_ATTR,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRIAL_DIR_ATTR,
@@ -46,21 +52,30 @@ from phasesweep.engine.state import (
     TRIAL_TARGET_ATTR,
     Winner,
 )
+from phasesweep.engine.study_policy import _record_reruns
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import PhaseSweepError
+from phasesweep.evidence.models import JsonExtractor
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
+    addressed_phase_study,
     bounded_metric,
+    invoke_cli_boundary,
     make_experiment,
+    new_phase_study,
     phase_study,
     phase_trials,
     record_accepted_partial_timeout,
     requires_nonroot,
+    study_name,
     trial_outcome,
+    write_experiment_config,
     write_flaky_trainer,
+    write_trainer,
+    write_trial_zero_trainer,
 )
 from tests.ledger_fixtures import forbid_file_backed_storage, tree_changes, tree_snapshot
-from tests.recovery_helpers import new_phase_study, stamp_artifact_root
+from tests.recovery_helpers import stamp_artifact_root
 
 _STATE = optuna.trial.TrialState
 
@@ -79,9 +94,8 @@ _LEDGER_REFUSED = (
 _PLACEHOLDERS = "placeholders until 'a' publishes a winner: a_x"
 
 _RUNNING_WARNING = (
-    "DRY RUN warning: phase={name} has 1 RUNNING attempt, counted the way a real run recovers "
-    "RUNNING attempts (failed if the trial recorded a failure, otherwise interrupted and "
-    "rerun); its accepted target, abort state and partial decision are not checked"
+    "DRY RUN warning: phase={name} has 1 RUNNING attempt; the preview projects recovery "
+    "before planning its trials"
 )
 
 
@@ -152,10 +166,9 @@ def _record(
     stamp_artifact_root(study, experiment)
     study.set_user_attr(TRIAL_TARGET_ATTR, target)
     recorded_phase = next(item for item in experiment.phases if item.name == phase)
-    study.set_user_attr(
-        PHASE_FINGERPRINT_ATTR,
-        _phase_fingerprint(experiment, recorded_phase, _stand_ins(experiment, recorded_phase)),
-    )
+    stand_ins = _stand_ins(experiment, recorded_phase)
+    inherited = {name: winner.effective_overrides for name, winner in stand_ins.items()}
+    _stamp_identity(study, _fresh_identity(experiment, recorded_phase, inherited))
     identity = _environment_identity(experiment, phase)
     for sequence, state in enumerate(states, 1):
         attrs: dict[str, object] = {
@@ -243,12 +256,16 @@ def test_finished_phase_previews_a_replay_and_hands_its_child_the_real_winner(
     finished = run_experiment(_persistent(tmp_path, first, maximize=True))
     appended = _persistent(tmp_path, first, _phase("b", 2, inherits=("a",)), maximize=True)
     assert finished["a"].params["a_x"] != 0
+    child = appended.phases[1]
+    addressed = phase_study_name(
+        appended, child, _inherited_override_payload(child, {"a": finished["a"]})
+    )
 
     assert _preview(appended, tmp_path, caplog) == [
-        "phase=a study=t::a finished=3 remaining=0 reruns=0 n_jobs=1",
+        f"phase=a study={study_name(appended, 'a')} finished=3 remaining=0 reruns=0 n_jobs=1",
         "DRY RUN phase=a target met (3 of 3 trials recorded): would replay its existing "
         "result and launch no trials",
-        "phase=b study=t::b finished=0 remaining=2 reruns=0 n_jobs=1",
+        f"phase=b study={addressed} finished=0 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=b would launch 2 trials",
     ]
     (command,) = _commands(caplog)
@@ -269,7 +286,7 @@ def test_raised_target_previews_only_the_trials_it_adds(
     raised = _persistent(tmp_path, _phase("a", 4))
 
     assert _preview(raised, tmp_path, caplog) == [
-        "phase=a study=t::a finished=2 remaining=2 reruns=0 n_jobs=1",
+        f"phase=a study={study_name(raised, 'a')} finished=2 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 2 trials",
     ]
 
@@ -295,7 +312,7 @@ def test_aborted_phase_is_refused_at_its_target_and_previews_a_raised_one(
 
     raised = attempt(6)
     assert _preview(raised, tmp_path, caplog) == [
-        "phase=a study=t::a finished=2 remaining=4 reruns=0 n_jobs=1",
+        f"phase=a study={study_name(raised, 'a')} finished=2 remaining=4 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 4 trials",
     ]
     assert len(calls.read_text().splitlines()) == 2
@@ -343,6 +360,36 @@ def test_accepted_partial_timeout_previews_a_replay_and_launches_nothing(
 
 
 @pytest.mark.integration
+def test_status_respects_accepted_partial_replay_before_reporting_a_failure_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Both status formats honor a phase's accepted target ahead of the current failure limit."""
+    trainer = write_trial_zero_trainer(tmp_path, otherwise="raise SystemExit(1)")
+    original = _persistent(tmp_path, _phase("a", 2), trainer=trainer)
+    run_experiment(original)
+    study = phase_study(original, "a")
+    accepting = _persistent(
+        tmp_path,
+        _phase("a", 4, allow_incomplete_on_timeout=True, max_consecutive_failures=1),
+        trainer=trainer,
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", accepting)
+
+    record_accepted_partial_timeout(study, 4)
+    assert _preview(accepting, tmp_path, caplog) == [
+        "DRY RUN phase=a accepted a partial result at 2 of 4 trials: would replay it and "
+        "launch no trials",
+    ]
+    for mode in ([], ["--trials"]):
+        assert invoke_cli_boundary(["status", str(config), *mode], monkeypatch) == 0
+        output = capsys.readouterr().out
+        assert "consecutive failed/infeasible trials" not in output
+
+
+@pytest.mark.integration
 def test_accepted_partial_replay_proves_the_winners_evidence_but_the_preview_leaves_it(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -354,16 +401,10 @@ def test_accepted_partial_replay_proves_the_winners_evidence_but_the_preview_lea
     """
     accepting, winner = _accept_partial_timeout(tmp_path)
     assert winner.source is not None
-    source = (
-        _trial_dir_for(
-            accepting,
-            "a",
-            winner.source.trial_number,
-            generation_id=winner.source.generation_id,
-            attempt_id=winner.source.attempt_id,
-        )
-        / "stdout.log"
+    trial_dir = _trial_dir_for(
+        accepting, "a", winner.source.trial_number, attempt_id=winner.source.attempt_id
     )
+    source = _attempt_dir(trial_dir.parent, winner.source.attempt_id) / "stdout.log"
     original = source.read_bytes()
     source.write_bytes(b"y" + original[1:])
     assert source.stat().st_size == len(original)
@@ -395,12 +436,13 @@ def test_dry_run_counts_a_failed_attempt_as_spent(
     _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=target)
 
     assert _preview(experiment, tmp_path, caplog) == [
-        f"phase=a study=t::a finished=2 remaining={remaining} reruns=0 n_jobs=1",
+        f"phase=a study={study_name(experiment, 'a')} finished=2 remaining={remaining} reruns=0 "
+        "n_jobs=1",
         expected_launch,
     ]
 
 
-def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
+def test_running_attempt_is_noted_and_its_phase_previews_after_recovery(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A real run recovers a RUNNING attempt first, so the dry run counts it as recovery will and says so."""
@@ -408,7 +450,7 @@ def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
     _record(experiment, "a", _STATE.COMPLETE, _STATE.RUNNING, target=2, running_outcome="failure")
 
     assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a finished=2 remaining=0 reruns=0 n_jobs=1",
+        f"phase=a study={study_name(experiment, 'a')} finished=2 remaining=0 reruns=0 n_jobs=1",
         _RUNNING_WARNING.format(name="a"),
         "DRY RUN phase=a target met (2 of 2 trials recorded): would replay its existing "
         "result and launch no trials",
@@ -423,6 +465,64 @@ def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
     assert "DRY RUN warning: another operation is active" in caplog.text
     assert "In-flight trials can still finish without a rerun" in caplog.text
     assert "DRY RUN hypothetical restart total:" in caplog.text
+
+
+@pytest.mark.integration
+def test_a_stale_queued_rerun_uses_its_siblings_finished_trial_without_a_program(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A queued slot interrupted during adoption still costs zero launches to fill."""
+    trainer = write_trainer(
+        tmp_path / "trainer",
+        """
+        import argparse
+        import time
+        from pathlib import Path
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", type=Path)
+        args = parser.parse_args()
+        checkpoint = args.out.with_name("checkpoint")
+        if not checkpoint.exists():
+            checkpoint.touch()
+            time.sleep(30)
+        args.out.write_text('{"loss": 1, "acc": 2}')
+        """,
+    )
+    phase = _phase("a", 1, fixed=True)
+    objective = JsonExtractor(type="json", path="r.json", key="loss")
+    metric = Metric(name="score", goal="minimize", extractor=objective)
+    original = make_experiment(
+        persistent=tmp_path,
+        trial_command=f"{shlex.quote(str(trainer))} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=metric,
+        phases=[phase.model_copy(update={"timeout_seconds_per_phase": 2.0})],
+    )
+    with pytest.raises(PhaseTimeoutError):
+        run_experiment(original)
+    study = phase_study(original, "a")
+    _record_reruns(study, phase)
+    queued = study.get_trials(deepcopy=False)[-1]
+    assert queued.state == _STATE.WAITING
+    other = objective.model_copy(update={"key": "acc"})
+    sibling = original.model_copy(update={"metric": metric.model_copy(update={"extractor": other})})
+    run_experiment(sibling)
+    donor = addressed_phase_study(sibling, "a").get_trials(deepcopy=False)[-1]
+    # The transient state between the queue's WAITING claim and its interrupted verdict.
+    study._storage.set_trial_state_values(queued._trial_id, _STATE.RUNNING)
+    trainer.chmod(0o600)
+    before = tree_snapshot(tmp_path)
+
+    caplog.set_level(logging.INFO)
+    run_experiment(original, dry_run=True)
+    assert "would launch 0 trials" in caplog.text
+    assert tree_changes(before, tree_snapshot(tmp_path)) == {}
+    assert run_experiment(original)["a"].metric == 1.0
+
+    adopted = study.get_trials(deepcopy=False)[-1]
+    assert adopted.user_attrs[ATTEMPT_ID_ATTR] == donor.user_attrs[ATTEMPT_ID_ATTR]
+    assert adopted.user_attrs[RERUN_OF_ATTR] == queued.number
+    assert adopted.user_attrs[TRIAL_DIR_ATTR] == donor.user_attrs[TRIAL_DIR_ATTR]
 
 
 def test_dry_run_labels_the_warning_that_it_could_not_check_for_an_active_run(
@@ -452,7 +552,7 @@ def test_dry_run_labels_the_warning_that_it_could_not_check_for_an_active_run(
             _STATE.RUNNING,
             2,
             [
-                "phase=a study=t::a finished=1 remaining=1 reruns=1 n_jobs=1",
+                "finished=1 remaining=1 reruns=1 n_jobs=1",
                 _RUNNING_WARNING.format(name="a"),
                 "DRY RUN phase=a would launch 1 trial, 1 of them a rerun",
             ],
@@ -462,7 +562,7 @@ def test_dry_run_labels_the_warning_that_it_could_not_check_for_an_active_run(
             _STATE.FAIL,
             3,
             [
-                "phase=a study=t::a finished=1 remaining=2 reruns=1 n_jobs=1",
+                "finished=1 remaining=2 reruns=1 n_jobs=1",
                 "DRY RUN phase=a would launch 2 trials, 1 of them a rerun",
             ],
             id="interrupted",
@@ -482,7 +582,9 @@ def test_interrupted_attempts_preview_as_reruns(
         experiment, "a", _STATE.COMPLETE, recorded_state, target=target, fail_outcome="interrupted"
     )
 
-    assert _preview(experiment, tmp_path, caplog) == expected_lines
+    counts, *rest = expected_lines
+    expected = [f"phase=a study={study_name(experiment, 'a')} {counts}", *rest]
+    assert _preview(experiment, tmp_path, caplog) == expected
 
 
 def test_total_line_sums_the_launches_the_phase_lines_print(
@@ -594,7 +696,7 @@ def test_fresh_experiment_previews_every_phase_as_before(
     )
 
     assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a finished=0 remaining=3 reruns=0 n_jobs=1",
+        f"phase=a study={study_name(experiment, 'a')} finished=0 remaining=3 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 3 trials",
         "phase=b study=t::b finished=0 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=b would launch 2 trials",
@@ -662,89 +764,46 @@ def test_uninspectable_ledger_on_an_unbound_tree_previews_fresh_phases_and_says_
     assert not (tmp_path / "elsewhere").exists()
 
 
-def test_raised_upstream_target_over_a_bound_descendant_is_refused_as_a_run_refuses(
-    tmp_path: Path,
-) -> None:
-    """Raising a finished phase's target under studies bound to its winner is refused, not previewed."""
-    recorded = _persistent(
-        tmp_path,
-        _phase("a", 2),
-        _phase("b", 2, inherits=("a",)),
-        _phase("c", 2, inherits=("b",)),
-    )
-    for name in ("a", "b", "c"):
-        _record(recorded, name, _STATE.FAIL, _STATE.FAIL, target=2)
-    raised = _persistent(
-        tmp_path,
-        _phase("a", 3),
-        _phase("b", 2, inherits=("a",)),
-        _phase("c", 2, inherits=("b",)),
-    )
-
-    refusal = _refusals_match(
-        raised,
-        tmp_path,
-        StudyContextConflictError,
-        r"1 top-up trial remaining, but 2 dependent phases \(`b`, `c`\) are bound",
-    )
-
-    # The rename step names only the dependents, so the enlarged phase keeps its trials.
-    assert isinstance(refusal, StudyContextConflictError)
-    assert refusal.remediation == (
-        "Give `b` and `c` new names and update the `inherits` that name them, which runs them "
-        "again from scratch; `a` keeps its trials and runs the rest."
-    )
-
-
 @pytest.mark.integration
 @pytest.mark.parametrize("changed", ["a", "b"])
 def test_a_top_up_of_a_changed_phase_is_refused_as_a_changed_study_first(
     tmp_path: Path, changed: str
 ) -> None:
-    """A raised target on a phase whose search space also changed is refused as a changed study.
+    """A raised target on a phase whose search space also lost values is refused as a changed study.
 
-    The top-up refusal says the phase keeps its trials, which a changed study does not, so the
-    run and its dry run both refuse the change first, for the first phase or a later one. With
-    the search space restored, the top-up refusal is what remains, and it is then true.
+    The run and its dry run check each phase's own identity before starting any top-up.
     """
     chain = {"a": (), "b": ("a",), "c": ("b",)}
     run_experiment(
         _persistent(tmp_path, *(_phase(name, 2, inherits=up) for name, up in chain.items()))
     )
 
-    def edited(*, widen: bool) -> Experiment:
-        phases = []
-        for name, up in chain.items():
-            phase = _phase(name, 3 if name == changed else 2, inherits=up)
-            if widen and name == changed:
-                space = {f"{name}_x": IntParam(type="int", low=0, high=20)}
-                phase = phase.model_copy(update={"search_space": space})
-            phases.append(phase)
-        return _persistent(tmp_path, *phases)
+    phases = []
+    for name, up in chain.items():
+        phase = _phase(name, 3 if name == changed else 2, inherits=up)
+        if name == changed:
+            space = {f"{name}_x": IntParam(type="int", low=0, high=5)}
+            phase = phase.model_copy(update={"search_space": space})
+        phases.append(phase)
 
     refusal = _refusals_match(
-        edited(widen=True),
+        _persistent(tmp_path, *phases),
         tmp_path,
         StudyFingerprintMismatchError,
-        rf"Study 't::{changed}' was created with a different config\. Changed: "
-        rf"phase\.search_space\.{changed}_x\.high: 10 -> 20\.$",
+        rf"Study 't::{changed}(::[0-9a-f]{{16}})?' was created with a different config\. Changed: "
+        rf"phase\.search_space\.{changed}_x\.high: 10 -> 5\. search_space '{changed}_x' dropped "
+        r"high 10; added values alone keep the study and run only the new ones\.$",
     )
     assert isinstance(refusal, StudyFingerprintMismatchError)
     assert refusal.remediation is not None
-    assert refusal.remediation.startswith("Restore the recorded value(s), or give ")
-    _refusals_match(
-        edited(widen=False),
-        tmp_path,
-        StudyContextConflictError,
-        rf"Phase '{changed}' has 1 top-up trial remaining",
-    )
+    assert refusal.remediation.startswith(f"Put back {changed}_x high 10, or give ")
 
 
 @pytest.mark.integration
 def test_a_top_up_under_another_environment_is_refused_for_the_environment_first(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The run and its dry run refuse a changed trainer environment before a bound top-up."""
+    """The run and its dry run refuse a changed trainer environment before starting a top-up."""
 
     def experiment(n_trials: int) -> Experiment:
         return make_experiment(
@@ -762,24 +821,8 @@ def test_a_top_up_under_another_environment_is_refused_for_the_environment_first
         experiment(3),
         tmp_path,
         StudyFingerprintMismatchError,
-        r"Study 't::a' ran its trials under a different trainer environment",
-    )
-
-
-def test_the_bound_descendant_refusal_counts_in_the_singular_without_list_syntax(
-    tmp_path: Path,
-) -> None:
-    """One bound dependent and several top-up trials read as plain words, with the phase named as the rename step names it."""
-    recorded = _persistent(tmp_path, _phase("a", 2), _phase("b", 2, inherits=("a",)))
-    for name in ("a", "b"):
-        _record(recorded, name, _STATE.FAIL, _STATE.FAIL, target=2)
-    raised = _persistent(tmp_path, _phase("a", 5), _phase("b", 2, inherits=("a",)))
-
-    refusal = _refusals_match(raised, tmp_path, StudyContextConflictError, "top-up")
-
-    assert str(refusal) == (
-        "Phase 'a' has 3 top-up trials remaining, but 1 dependent phase (`b`) is bound to its "
-        "published winner."
+        rf"Study '{study_name(experiment(3), 'a')}' ran its trials under a different trainer "
+        r"environment",
     )
 
 
@@ -815,18 +858,6 @@ def test_several_refused_studies_are_reported_together_as_a_run_reports_them(
         tmp_path,
         TrialTargetRefusedError,
         r"multiple unsafe studies: Phase 'a' .*; Phase 'b' ",
-    )
-
-
-def test_flipped_goal_is_refused_as_a_run_refuses(tmp_path: Path) -> None:
-    """A study that optimizes the other direction is refused, not replayed under the wrong goal."""
-    _record(_persistent(tmp_path, _phase("a", 2)), "a", _STATE.FAIL, _STATE.FAIL, target=2)
-
-    _refusals_match(
-        _persistent(tmp_path, _phase("a", 2), maximize=True),
-        tmp_path,
-        StudySchemaMismatchError,
-        "optimizes minimize, but the config requires maximize",
     )
 
 
@@ -915,13 +946,13 @@ def test_empty_unstamped_study_previews_as_a_fresh_phase(
     """A study a crash left empty and unstamped is one the launch would stamp; the preview just reads it."""
     experiment = _persistent(tmp_path, _phase("a", 2))
     optuna.create_study(
-        study_name="t::a",
+        study_name=study_name(experiment, "a"),
         storage=_resolve_storage(experiment.resolved_storage),
         direction="minimize",
     )
 
     assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a finished=0 remaining=2 reruns=0 n_jobs=1",
+        f"phase=a study={study_name(experiment, 'a')} finished=0 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 2 trials",
     ]
 
@@ -957,8 +988,15 @@ def test_validate_counts_a_running_failure_as_finished_as_a_launch_does(tmp_path
 def _add_pending_evidence(experiment: Experiment, phase: str, directory: Path) -> None:
     """Add a RUNNING trial whose trainer exited cleanly, so its evidence awaits extraction."""
     directory.mkdir()
+    attempt_dir = _attempt_dir(directory.parent, "pending")
+    attempt_dir.mkdir(parents=True)
     write_attempt_lifecycle(
-        directory, attempt_id="pending", state="exited", return_code=0, duration_seconds=1.0
+        attempt_dir,
+        attempt_id="pending",
+        state="exited",
+        ended_by="trainer",
+        return_code=0,
+        duration_seconds=1.0,
     )
     phase_study(experiment, phase).add_trial(
         optuna.trial.create_trial(

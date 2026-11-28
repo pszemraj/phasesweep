@@ -5,12 +5,14 @@ storage URL, the workdir, or any env value.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from phasesweep.config.models import Metric
 from phasesweep.config.search import FloatParam
+from phasesweep.engine.confound import _confound_summary
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.read import PhaseWinnerView, read_status
 from phasesweep.engine.repeats import RepeatsSummary
@@ -24,9 +26,21 @@ from phasesweep.mcp.redaction import (
     status_payload,
     winners_payload,
 )
-from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.mcp.snapshots import (
+    MetricSnapshot,
+    ObjectiveEvidenceSnapshot,
+    WinnerSnapshot,
+    capture_result_snapshot,
+    status_snapshot,
+    winner_snapshot,
+)
 from phasesweep.runtime.json import json_object
-from tests.conftest import make_experiment, write_experiment_config, write_trainer
+from tests.conftest import (
+    make_experiment,
+    single_trial_confound,
+    write_experiment_config,
+    write_trainer,
+)
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     assert_no_sensitive,
@@ -38,6 +52,21 @@ from tests.mcp_helpers import (
     write_run_status,
 )
 
+_METRIC = MetricSnapshot(
+    name="loss", goal="minimize", objective_evidence=ObjectiveEvidenceSnapshot(kind="json")
+)
+
+
+def _winner(view: PhaseWinnerView) -> WinnerSnapshot:
+    """Project a hand-built read view as a live read does, with one-trial confound verdicts."""
+    confound = _confound_summary(
+        single_trial_confound(view.trial_number),
+        winner_trial=view.trial_number,
+        extractor_kind="json",
+        persistent=False,
+    )
+    return winner_snapshot(replace(view, confound=confound))
+
 
 def _winners_payload(
     experiment_id: str,
@@ -47,8 +76,8 @@ def _winners_payload(
 ) -> dict[str, object]:
     return winners_payload(
         experiment_id,
-        views,
-        metric={"name": "loss", "goal": "minimize"},
+        [_winner(view) for view in views],
+        metric=_METRIC,
         declared_phases=["p"],
         result_source="current_shared_study",
         publication_integrity="ok",
@@ -297,24 +326,26 @@ def test_winners_payload_computes_phase_completeness_and_provenance() -> None:
     payload = winners_payload(
         "exp",
         [
-            PhaseWinnerView(
-                "p1",
-                2,
-                0.1,
-                {},
-                {},
-                None,
-                False,
-                source=WinnerSource(
-                    kind="phase_trial",
-                    phase="p1",
-                    trial_number=2,
-                    generation_id="generation-old",
-                    attempt_id="attempt-old",
-                ),
+            _winner(
+                PhaseWinnerView(
+                    "p1",
+                    2,
+                    0.1,
+                    {},
+                    {},
+                    None,
+                    False,
+                    source=WinnerSource(
+                        kind="phase_trial",
+                        phase="p1",
+                        trial_number=2,
+                        generation_id="generation-old",
+                        attempt_id="attempt-old",
+                    ),
+                )
             )
         ],
-        metric={"name": "loss", "goal": "minimize"},
+        metric=_METRIC,
         declared_phases=["p1", "p2"],
         result_source="frozen_run_snapshot",
         publication_integrity="ok",
@@ -352,12 +383,14 @@ def test_winners_payload_exposes_observed_values() -> None:
     payload = winners_payload(
         "exp",
         [
-            PhaseWinnerView(
-                "p1", 2, 0.1, {}, {}, None, False, source=source, observed={"peak": 7.5}
+            _winner(
+                PhaseWinnerView(
+                    "p1", 2, 0.1, {}, {}, None, False, source=source, observed={"peak": 7.5}
+                )
             ),
-            PhaseWinnerView("p2", 3, 0.2, {}, {}, None, False, source=source),
+            _winner(PhaseWinnerView("p2", 3, 0.2, {}, {}, None, False, source=source)),
         ],
-        metric={"name": "loss", "goal": "minimize"},
+        metric=_METRIC,
         declared_phases=["p1", "p2"],
         result_source="frozen_run_snapshot",
         publication_integrity="ok",
@@ -391,11 +424,21 @@ def test_winner_payload_exposes_repeats_spread_but_not_repeat_key() -> None:
     payload = winners_payload(
         "exp",
         [
-            PhaseWinnerView(
-                "p1", 5, 0.3, {"lr": 0.1}, {"lr": 0.1}, None, False, source=source, repeats=summary
+            _winner(
+                PhaseWinnerView(
+                    "p1",
+                    5,
+                    0.3,
+                    {"lr": 0.1},
+                    {"lr": 0.1},
+                    None,
+                    False,
+                    source=source,
+                    repeats=summary,
+                )
             )
         ],
-        metric={"name": "loss", "goal": "minimize"},
+        metric=_METRIC,
         declared_phases=["p1"],
         result_source="frozen_run_snapshot",
         publication_integrity="ok",
@@ -461,8 +504,9 @@ def test_trial_failure_reasons_and_their_stderr_quote_never_reach_status_or_snap
         status,
         status_payload(
             "srv",
-            status,
+            status_snapshot(status),
             {"run_id": "run-1"},
+            tracking_delivery=None,
             result_source="current_shared_study",
             elapsed_seconds=None,
         ),

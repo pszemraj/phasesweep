@@ -12,18 +12,19 @@ gates: []
 completion:
   requested_trials: 2
   finished_trials: 2
-  completed_trials: 2
+  measured_trials: 2
   incomplete: false
   reason: null
   timeout_scope: null
-generation_id: fd77f77a027141e6956c740561941e7e
-attempt_id: ef059b646fe541fabe1dcd9247f1cd82
+generation_id: 51ccd535455f44d5bca7394e80ba38e8
+attempt_id: 4fbe0586f17f4f018328f64e51729097
+trial_dir: trial_00000__4fbe0586f17f4f018328f64e51729097
 winner_source:
   kind: phase_trial
   phase: p
   trial_number: 0
-  generation_id: fd77f77a027141e6956c740561941e7e
-  attempt_id: ef059b646fe541fabe1dcd9247f1cd82
+  generation_id: 51ccd535455f44d5bca7394e80ba38e8
+  attempt_id: 4fbe0586f17f4f018328f64e51729097
 trainer_input:
   schema_version: 1
   format: argparse
@@ -31,7 +32,7 @@ trainer_input:
   size_bytes: 13
   sha256: 5e36b6560513586ced65eca0e8b025fe88edbcab82ba2cb67a5fcb2d7b202383
 confound:
-  schema_version: 5
+  schema_version: 6
   ranked_trials:
   - 0
   - 1
@@ -56,15 +57,28 @@ confound:
         within_noise: null
         pooled_sd: null
         df: null
+    code_revision:
+      verdict: ok
+      detail:
+        generations:
+        - generation_id: 51ccd535455f44d5bca7394e80ba38e8
+          record: unknown
+          commit: null
+          dirty: null
+          trials:
+          - 0
+          - 1
 observed: {}
 repeats: null
-phase_fingerprint: 832e0119fefa26cb674c8c6231ed8dd0102c8971b8e390e2811e6024bb151a02
+phase_fingerprint: 42c2fccca64d01ff20496a99dc0de7eb679f0ad7c8f08071f925ecff67c67790
+study_name: t::p::7577ebe79cdcb473
+study_outcome_sequence: 2
 objective_provenance:
   extractor:
     config_sha256: 600d03da027bd207d565a7cd606ddc0dd3c5b90ab73870b828f9de4819308def
     kind: log_regex
-  recorded_at: '2026-11-22T05:39:45+00:00'
-  schema_version: 4
+  recorded_at: '2026-11-27T20:54:18+00:00'
+  schema_version: 9
   source:
     kind: file
     match_count: 1

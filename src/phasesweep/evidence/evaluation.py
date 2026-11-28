@@ -16,7 +16,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from phasesweep.config.common import TRACKER_READ_CONTROLS, is_sha256_hex
 from phasesweep.errors import UnsafeProcessCleanupError
+from phasesweep.evidence.baseline import (
+    EVIDENCE_BASELINE_FILE,
+    EvidenceBaseline,
+    FileStamp,
+    read_evidence_baseline,
+)
 from phasesweep.evidence.models import (
     ArtifactSizeGate,
     Gate,
@@ -34,18 +41,21 @@ from phasesweep.evidence.models import (
     WandbQuery,
     WandbSummaryRequiredGate,
     _WandbSummarySource,
+    is_captured_stream,
 )
 from phasesweep.evidence.wandb import (
     WANDB_SDK_MISSING,
     WandbMissingKeysError,
+    WandbNothingToScoreError,
     WandbPollTimeout,
+    WandbRunAddress,
     WandbRunMissingError,
     WandbRunTerminalError,
     WandbSetupError,
     locate_wandb_position,
     poll_wandb_summary,
 )
-from phasesweep.runtime.files import file_sha256
+from phasesweep.runtime.files import broken_symlink_detail, file_sha256, resolved_file_change_ns
 from phasesweep.runtime.json import (
     NonFiniteJsonConstantError,
     finite_nonnegative,
@@ -55,12 +65,14 @@ from phasesweep.runtime.time import utc_now_iso
 
 if TYPE_CHECKING:
     from phasesweep.runtime.json import JsonObject
-    from phasesweep.tracking.records import MlflowCapture, MlflowQuery, MlflowTarget
+    from phasesweep.tracking.records import MlflowCapture, MlflowQuery, MlflowTarget, RunBinding
 
 log = logging.getLogger(__name__)
 
 # Objective-evidence provenance schema version.
-EVIDENCE_PROVENANCE_SCHEMA_VERSION = 4
+EVIDENCE_PROVENANCE_SCHEMA_VERSION = 9
+# Retained evidence is indexed by configured path and named by its recorded file digest.
+RETAINED_EVIDENCE_SCHEMA_VERSION = 1
 # Log-regex evaluation revision included in the extractor contract.
 LOG_REGEX_EVALUATION_REVISION = 3
 
@@ -68,11 +80,13 @@ LOG_REGEX_EVALUATION_REVISION = 3
 def extractor_config_fingerprint(cfg: ObjectiveExtractor) -> str:
     """Hash the extractor configuration and applicable evaluation revision.
 
+    A tracker's read controls bound how long the read waits, not what it reads, so they stay out.
+
     :param ObjectiveExtractor cfg: Concrete extractor config to fingerprint.
-    :return str: Hex SHA-256 of the canonical configuration and, for log-regex,
-        its evaluation revision.
+    :return str: Hex SHA-256 of the canonical configuration without its tracker read controls
+        and, for log-regex, its evaluation revision.
     """
-    payload = cfg.model_dump(mode="json")
+    payload = cfg.model_dump(mode="json", exclude=set(TRACKER_READ_CONTROLS))
     if isinstance(cfg, LogRegexExtractor):
         payload["evaluation_revision"] = LOG_REGEX_EVALUATION_REVISION
     dumped = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -88,58 +102,265 @@ def _file_digest(raw: bytes) -> dict[str, Any]:
     return {"sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}
 
 
-class OutsideAttemptError(OSError):
-    """A trial-relative evidence path resolves outside its attempt directory."""
+class TrialPathError(OSError):
+    """The configured evidence path cannot supply a file from its owning directory."""
+
+
+class StaleEvidenceError(OSError):
+    """The evidence cannot be attributed to the current attempt."""
+
+
+def _link_refusal(owner: Path, relative: str | Path, *, directory: bool) -> str | None:
+    """Name a link in a configured path whose target is missing or not the kind required.
+
+    :param Path owner: The directory the configured path is relative to.
+    :param str | Path relative: Configured path.
+    :param bool directory: The path must reach a directory rather than a regular file.
+    :return str | None: The diagnostic naming the link and its target, or ``None``.
+    """
+    detail = broken_symlink_detail(
+        owner, relative, require_directory=directory, require_file=not directory
+    )
+    return None if detail is None else f"Could not read `{relative}` because {detail}."
 
 
 def attempt_file(trial_dir: Path, relative: str | Path) -> Path:
-    """Return a trial-relative evidence path, refusing one that resolves outside the attempt.
+    """Return a trial-relative evidence path, refusing one the attempt may not be scored from.
 
     PhaseSweep reads a trial's objective, constraints, observations, gate values and
-    digests only from files inside that attempt's directory. Config load already refuses
+    digests only from files inside that trial's directory. Config load already refuses
     absolute and ``..`` paths, so a link is the only way out, and several trials whose
     links name one shared file would all be scored from whichever trainer wrote it last.
-    A link that stays inside the attempt, such as ``latest -> checkpoint-500``, reads as
-    usual. A missing file resolves inside and keeps the caller's own not-found handling.
+    A link that stays inside the trial, such as ``latest -> checkpoint-500``, reads as
+    usual. A link whose target is missing or is not the kind of file required names the
+    link and its target. An ordinary missing file keeps the caller's own not-found handling.
 
-    :param Path trial_dir: The attempt directory the file must resolve inside.
-    :param str | Path relative: Configured trial-relative path.
-    :raises OutsideAttemptError: The path resolves outside ``trial_dir``.
+    :param Path trial_dir: The trial directory the file must resolve inside.
+    :param str | Path relative: Configured trial-relative path of a regular file.
+    :raises TrialPathError: A link is unusable or the path resolves outside ``trial_dir``.
     :return Path: ``trial_dir / relative``, unchanged, for the caller to read.
     """
     path = trial_dir / relative
+    if refusal := _link_refusal(trial_dir, relative, directory=False):
+        raise TrialPathError(refusal)
     try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        if isinstance(exc, RuntimeError):
+            raise TrialPathError(f"Could not resolve {path}: {exc}") from exc
         resolved = path.resolve()
-    except RuntimeError:
-        # A symlink loop, which raises here before Python 3.13. It names no file, so the
-        # caller's own not-found handling reports it, as on later versions.
-        return path
     if not resolved.is_relative_to(trial_dir.resolve()):
-        raise OutsideAttemptError(
-            f"`{relative}` in attempt directory {trial_dir} resolves to {resolved}, outside the "
-            "attempt. Have the trainer write it under PHASESWEEP_TRIAL_DIR."
+        if is_captured_stream(relative):
+            raise TrialPathError(
+                f"Captured stream `{relative}` resolves to {resolved}, outside its attempt "
+                f"directory {trial_dir}. Restore the attempt's captured stream."
+            )
+        raise TrialPathError(
+            f"`{relative}` in trial directory {trial_dir} resolves to {resolved}, outside the "
+            "trial. Have the trainer write it under PHASESWEEP_TRIAL_DIR."
         )
     return path
 
 
+def trial_file(
+    trial_dir: Path,
+    attempt_dir: Path,
+    relative: str | Path,
+    *,
+    checked: bool = True,
+) -> Path:
+    """Return where a configured trial path is read from.
+
+    Every extractor, gate and verification of a configured path resolves it here, so they
+    agree on the file. A captured stream (:func:`is_captured_stream`) is the attempt's own,
+    kept in its attempt directory; any other path is a trainer file inside the trial
+    directory, as :func:`attempt_file` resolves and checks it.
+
+    :param Path trial_dir: The trial directory the trainer writes into.
+    :param Path attempt_dir: The attempt's directory, holding its captured streams.
+    :param str | Path relative: Configured trial-relative path.
+    :param bool checked: Check the path against the directory that owns it. ``False``
+        only locates it: for a gate that tests an artifact wherever its links lead, or to
+        name the file in a diagnostic.
+    :raises TrialPathError: A checked path contains an unusable link or resolves outside its
+        directory.
+    :return Path: The path to read.
+    """
+    if is_captured_stream(relative):
+        return attempt_file(attempt_dir, relative) if checked else attempt_dir / relative
+    if not checked:
+        return trial_dir / relative
+    return attempt_file(trial_dir, relative)
+
+
+def retained_evidence_dir(attempt_dir: Path, relative: str) -> Path:
+    """Locate this attempt's saved measurement bytes for a configured file path.
+
+    :param Path attempt_dir: Producing attempt's audit directory.
+    :param str relative: Configured path, relative to the trial directory.
+    :return Path: Directory whose filenames are the original file digests.
+    """
+    path_key = hashlib.sha256(Path(relative).as_posix().encode()).hexdigest()
+    return attempt_dir / f"retained-evidence-v{RETAINED_EVIDENCE_SCHEMA_VERSION}" / path_key
+
+
+def retained_evidence_file(
+    attempt_dir: Path, relative: str, *, digest: str | None = None
+) -> Path | None:
+    """Find the retained score file for this attempt and path, if a rerun saved it.
+
+    :param Path attempt_dir: Producing attempt's audit directory.
+    :param str relative: Configured path, relative to the trial directory.
+    :param str | None digest: Expected digest for a frozen objective, or None while re-reading.
+    :raises TrialPathError: The retained file has no unambiguous, readable original contents.
+    :return Path | None: The retained file, or None if this attempt has no capture of that path.
+    """
+    directory = retained_evidence_dir(attempt_dir, relative)
+    if digest is not None:
+        path = directory / digest
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return None
+    else:
+        try:
+            paths = [entry for entry in directory.iterdir() if is_sha256_hex(entry.name)]
+        except FileNotFoundError:
+            return None
+        if not paths:
+            return None
+        if len(paths) != 1:
+            raise TrialPathError(f"Several retained files claim {relative!r} in {attempt_dir}.")
+        path = paths[0]
+    retained = attempt_file(attempt_dir, path.relative_to(attempt_dir))
+    if digest is None and file_sha256(retained) != retained.name:
+        raise TrialPathError(f"Retained evidence at {retained} no longer has its original bytes.")
+    return retained
+
+
+def unusable_link(
+    trial_dir: Path, attempt_dir: Path, relative: str | Path, *, directory: bool = False
+) -> str | None:
+    """Name an unusable link for a gate that locates its path unchecked.
+
+    The same rule :func:`attempt_file` refuses with, applied in the directory
+    :func:`trial_file` locates the path in.
+
+    :param Path trial_dir: The trial directory the trainer writes into.
+    :param Path attempt_dir: The attempt's directory, holding its captured streams.
+    :param str | Path relative: Configured trial-relative path.
+    :param bool directory: The path must reach a directory rather than a regular file,
+        defaults to False.
+    :return str | None: The diagnostic naming the link and its target, or ``None``.
+    """
+    owner = attempt_dir if is_captured_stream(relative) else trial_dir
+    return _link_refusal(owner, relative, directory=directory)
+
+
+def _require_before_next_launch(
+    trial_dir: Path, relative: str, target: Path, evidence_before: float | str | None
+) -> None:
+    """Refuse a shared artifact whose state cannot be attributed to the earlier attempt.
+
+    :param Path trial_dir: Directory shared by a trial's attempts.
+    :param str relative: Configured trial-relative artifact path.
+    :param Path target: Location already resolved by the evidence reader.
+    :param float | str | None evidence_before: Next launch time, an attribution failure, or None.
+    :raises StaleEvidenceError: The artifact can no longer be attributed to this attempt.
+    :raises OSError: The artifact or a link to it could not be inspected.
+    """
+    if evidence_before is None or is_captured_stream(relative):
+        return
+    if isinstance(evidence_before, str):
+        raise StaleEvidenceError(
+            f"`{target}` cannot be attributed to this attempt: {evidence_before}."
+        )
+    if resolved_file_change_ns(trial_dir, target) >= round(evidence_before * 1e9):
+        raise StaleEvidenceError(
+            f"`{target}` changed after this attempt finished and another attempt reused its "
+            "directory. The earlier value cannot be recovered from this path."
+        )
+
+
+def _written_before_launch(
+    baseline: EvidenceBaseline | None,
+    trial_dir: Path,
+    attempt_dir: Path,
+    relative: str,
+    target: Path,
+    *,
+    evidence_before: float | str | None = None,
+) -> bool:
+    """Say whether a value file an attempt reads was written by an earlier attempt of its trial.
+
+    Only the trial's own attempts write in its directory, so a value file there is the trial's
+    result whichever of them wrote it; the answer only decides what the trial discloses, and
+    what a read that finds no value there implies.
+    A recorded file is this attempt's when its size or modification time changes, or when its
+    change time changes while its hard-link count stays the same. This compares the file to
+    its own earlier stamp and covers copies that preserve modification time.
+    A file at a target that held none at launch was created during the attempt. Any other
+    target, such as one reached through a retargeted link or one the baseline could not
+    inspect, is this attempt's when its modification time is after the baseline write, or its
+    change time is at or after that write. A write can share the baseline's clock tick. This
+    comparison assumes the trial and attempt directories share a clock.
+
+    :param EvidenceBaseline | None baseline: Value paths and file stamps recorded at launch.
+    :param Path trial_dir: Directory containing trainer files.
+    :param Path attempt_dir: The attempt's directory, holding the baseline record.
+    :param str relative: Configured trial-relative path.
+    :param Path target: Current location of evidence after containment checks.
+    :param float | str | None evidence_before: Unix time the shared value file must predate,
+        or the reason it cannot be attributed to the attempt, defaults to None.
+    :raises StaleEvidenceError: The file changed after a later launch in its directory.
+    :raises OSError: The current file or the baseline record could not be inspected.
+    :return bool: Whether the file predates this attempt in a directory an earlier one used.
+    """
+    if is_captured_stream(relative):
+        return False
+    _require_before_next_launch(trial_dir, relative, target, evidence_before)
+    if baseline is None or not baseline.reused:
+        return False
+    info = target.stat()
+    current = target.resolve().relative_to(trial_dir.resolve()).as_posix()
+    recorded = baseline.files.values()
+    prior = next((s for s in recorded if isinstance(s, FileStamp) and s.path == current), None)
+    if prior is not None:
+        return prior.unchanged(info)
+    if current == baseline.files.get(relative) or current in recorded:
+        return False
+    launch_stamp = (attempt_dir / EVIDENCE_BASELINE_FILE).stat().st_mtime_ns
+    return not (info.st_mtime_ns > launch_stamp or info.st_ctime_ns >= launch_stamp)
+
+
 def load_json_value(
     trial_dir: Path,
+    attempt_dir: Path,
     relative_path: str,
     key: str,
     *,
     digest: dict[str, Any] | None = None,
+    baseline: EvidenceBaseline | None = None,
+    evidence_before: float | str | None = None,
+    earlier: list[str] | None = None,
 ) -> tuple[Path, Any]:
-    """Load a dotted JSON value from a trial-relative file.
+    """Load a dotted JSON value from a configured trial path, as :func:`trial_file` locates it.
 
     :param Path trial_dir: Directory containing the trial outputs.
-    :param str relative_path: JSON file path relative to ``trial_dir``.
+    :param Path attempt_dir: The attempt's directory, holding its captured streams.
+    :param str relative_path: Configured trial-relative JSON file path.
     :param str key: Dot-separated key path to read from the JSON object.
     :param dict[str, Any] | None digest: Optional sink that receives the
         ``sha256``/``size_bytes`` of the exact bytes parsed, for evidence
         provenance.
-    :raises OutsideAttemptError: If ``relative_path`` resolves outside ``trial_dir``.
-    :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular
-        file under ``trial_dir``.
+    :param EvidenceBaseline | None baseline: Value paths and file stamps recorded at launch.
+    :param float | str | None evidence_before: Unix time the shared JSON file must predate,
+        or the reason it cannot be attributed to the attempt, defaults to None.
+    :param list[str] | None earlier: Sink that receives ``relative_path`` before the file is
+        parsed when an earlier attempt of the trial wrote it (:func:`_written_before_launch`).
+    :raises TrialPathError: If the path contains a broken link or resolves outside its directory.
+    :raises StaleEvidenceError: If the file changed after a later launch in its directory.
+    :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular file.
     :raises JsonKeyMissingError: If a segment of the dotted ``key`` path is missing, with the
         failing segment as the argument and what the file holds there.
     :raises OSError: If the resolved file exists but cannot be read.
@@ -148,9 +369,18 @@ def load_json_value(
         duplicate object keys, or a rejected JSON constant).
     :return tuple[Path, Any]: Resolved JSON file path and loaded value.
     """
-    target = attempt_file(trial_dir, relative_path)
+    retained = retained_evidence_file(attempt_dir, relative_path)
+    target = retained if retained is not None else trial_file(trial_dir, attempt_dir, relative_path)
     if not target.is_file():
         raise FileNotFoundError(target)
+    if (
+        retained is None
+        and _written_before_launch(
+            baseline, trial_dir, attempt_dir, relative_path, target, evidence_before=evidence_before
+        )
+        and earlier is not None
+    ):
+        earlier.append(relative_path)
     raw = target.read_bytes()
     if digest is not None:
         digest.update(_file_digest(raw))
@@ -254,6 +484,47 @@ class EvidenceUnreadableError(ExtractorError):
     """
 
 
+class NothingToScoreError(ExtractorError):
+    """Raised when an attempt in a directory an earlier attempt used left nothing to score there.
+
+    The trainer exited 0, but the value file is missing, or an earlier attempt of the trial
+    wrote it and it does not parse, or the attempt's own captured stream has no match, or at
+    the deadline its W&B run and its trial's earlier runs leave no result to score. Such an
+    attempt can never succeed in that directory, which says nothing about the
+    configuration, so it is owed a rerun in a fresh directory instead of failing.
+    """
+
+
+def _in_reused_directory(ctx: TrialContext) -> bool:
+    """Say whether an attempt ran in a directory an earlier attempt of its trial used.
+
+    :param TrialContext ctx: The attempt being read.
+    :return bool: Whether its baseline records a reused directory.
+    """
+    return ctx.baseline is not None and ctx.baseline.reused
+
+
+def _read_failure(ctx: TrialContext, relative: str, exc: BaseException) -> type[ExtractorError]:
+    """Choose the extractor error for a value file that gave no value.
+
+    A missing file, or one an earlier attempt of the trial wrote that is not valid UTF-8 or
+    JSON, leaves nothing to score in a reused directory. A file that parses is evidence: a
+    missing key or a non-number in it fails the trial as in a fresh directory, where a
+    corrected reading setting can still re-read it, and so does a refused location.
+
+    :param TrialContext ctx: The attempt being read.
+    :param str relative: Configured trial-relative path of the file.
+    :param BaseException exc: Why the read gave no value.
+    :return type[ExtractorError]: :class:`NothingToScoreError` or :class:`ExtractorError`.
+    """
+    if not _in_reused_directory(ctx):
+        return ExtractorError
+    if isinstance(exc, FileNotFoundError):
+        return NothingToScoreError
+    unparsed = isinstance(exc, ValueError) and not isinstance(exc, NonFiniteJsonConstantError)
+    return NothingToScoreError if unparsed and relative in ctx.earlier_files else ExtractorError
+
+
 class MlflowObjectiveMissingError(ExtractorError):
     """Raised when a finished managed MLflow run lacks the configured objective metric."""
 
@@ -267,23 +538,38 @@ def _non_finite_text(constant: str) -> str:
     return f"holds {constant}, which is not a finite number; a diverged run writes it"
 
 
-def _gate_unavailable(path: str, key: str, exc: Exception) -> str:
-    """Describe a JSON gate whose value could not be read.
+def _gate_unavailable(
+    ctx: TrialContext, gate_type: str, path: str, key: str, exc: Exception
+) -> GateResult:
+    """Fail a JSON gate whose file could not be read or parsed.
 
+    :param TrialContext ctx: The attempt being read.
+    :param str gate_type: The gate's configured type.
     :param str path: Trial-relative file the gate reads.
     :param str key: Dotted key the gate reads.
     :param Exception exc: Failure raised while reading it.
-    :return str: The gate result's detail.
+    :return GateResult: The failed result, marked when the attempt left nothing to score.
     """
     if isinstance(exc, NonFiniteJsonConstantError):
-        return f"{path}:{key} unavailable: the file {_non_finite_text(exc.constant)}"
-    return f"{path}:{key} unavailable: {exc}"
+        detail = f"{path}:{key} unavailable: the file {_non_finite_text(exc.constant)}"
+    else:
+        detail = f"{path}:{key} unavailable: {exc}"
+    return GateResult(
+        gate_type,
+        False,
+        detail,
+        nothing_to_score=_read_failure(ctx, path, exc) is NothingToScoreError,
+    )
 
 
 @contextmanager
-def _trial_json_read_errors(target: Path, *, noun: str, trainer_step: str) -> Iterator[None]:
+def _trial_json_read_errors(
+    ctx: TrialContext, relative: str, target: Path, *, noun: str, trainer_step: str
+) -> Iterator[None]:
     """Translate file-read and JSON-decoding failures into extractor diagnostics.
 
+    :param TrialContext ctx: The attempt being read.
+    :param str relative: Configured trial-relative path of the file.
     :param Path target: Trial-relative file being read.
     :param str noun: ``JSON`` or ``JSON envelope`` diagnostic label.
     :param str trainer_step: What the trainer must do for the file to exist, a clause without
@@ -291,12 +577,13 @@ def _trial_json_read_errors(target: Path, *, noun: str, trainer_step: str) -> It
         that exits 0 without it fails here. The path ends the diagnostic's own words, so no
         punctuation sticks to it when a reader copies it.
     :raises ExtractorError: The file is missing, unreadable, malformed, or outside the
-        attempt; the last carries the refusal's own text as the trial's failure reason.
+        attempt; the last carries the refusal's own text as the trial's failure reason. It is
+        a :class:`NothingToScoreError` when :func:`_read_failure` says so.
     :return Iterator[None]: Context covering the read and parse of the same bytes.
     """
     try:
         yield
-    except OutsideAttemptError as exc:
+    except (TrialPathError, StaleEvidenceError) as exc:
         raise ExtractorError(str(exc)) from exc
     except FileNotFoundError as exc:
         missing = (
@@ -304,13 +591,15 @@ def _trial_json_read_errors(target: Path, *, noun: str, trainer_step: str) -> It
             if noun == "JSON"
             else f"{noun} not found: {target}"
         )
-        raise ExtractorError(f"{missing} ({trainer_step})") from exc
+        raise _read_failure(ctx, relative, exc)(f"{missing} ({trainer_step})") from exc
     except UnicodeError as exc:
-        raise ExtractorError(f"{noun} at {target} is not valid UTF-8: {exc}") from exc
+        raise _read_failure(ctx, relative, exc)(
+            f"{noun} at {target} is not valid UTF-8: {exc}"
+        ) from exc
     except NonFiniteJsonConstantError as exc:
         raise ExtractorError(f"{noun} at {target} {_non_finite_text(exc.constant)}.") from exc
     except ValueError as exc:
-        raise ExtractorError(f"Invalid {noun} at {target}: {exc}") from exc
+        raise _read_failure(ctx, relative, exc)(f"Invalid {noun} at {target}: {exc}") from exc
     except OSError as exc:
         raise ExtractorError(f"Could not read {noun} at {target}: {exc}") from exc
 
@@ -325,7 +614,9 @@ class TrialContext:
     generation_id: str
     attempt_id: str
     overrides_sha256: str
+    # The trainer's directory, and beside it the attempt's own records and process slot.
     trial_dir: Path
+    attempt_dir: Path
     run_name: str  # "{experiment}-{phase}-{trial_id}-{attempt_id}"
     return_code: int
     duration_seconds: float
@@ -338,6 +629,27 @@ class TrialContext:
     mlflow_query: MlflowQuery | None = None
     mlflow_environment: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
     mlflow_capture: JsonObject = field(default_factory=dict, compare=False)
+    # Value paths and file stamps recorded before the attempt ran.
+    baseline: EvidenceBaseline | None = field(default=None, compare=False)
+    # Configured value paths read so far from a file an earlier attempt of the trial wrote, and
+    # ``wandb:<run id>`` once an earlier attempt's W&B run scored the capture.
+    earlier_files: list[str] = field(default_factory=list, compare=False)
+    # End of the attributable period for mutable evidence in a directory another attempt reused.
+    evidence_before: float | str | None = None
+    managed_envelope_path: str | None = None
+    # (generation ID, attempt ID) of the earlier attempts that trained in trial_dir, oldest
+    # first, whose tracker histories are the start of this trial's.
+    earlier_attempts: tuple[tuple[str, str], ...] = ()
+    # Reading a terminal attempt uses a separately registered worker process.
+    worker_process: tuple[str, Path] | None = None
+
+    @property
+    def process_slot(self) -> tuple[str, Path]:
+        """Return the process identity and directory a tracker worker may claim.
+
+        :return tuple[str, Path]: The registered reader slot, or the active attempt's slot.
+        """
+        return self.worker_process or (self.attempt_id, self.attempt_dir)
 
 
 def _extract_json(
@@ -347,7 +659,8 @@ def _extract_json(
 ) -> float:
     """Read a trial-relative JSON file and extract its numeric value.
 
-    :param TrialContext ctx: Trial identity; the file is read from its ``trial_dir``.
+    :param TrialContext ctx: Trial identity; the file is read from its ``trial_dir``, or its
+        ``attempt_dir`` for a captured stream.
     :param JsonExtractor cfg: Relative file path and dotted numeric key.
     :param dict | None provenance: Optional source-evidence sink.
     :raises ExtractorError: The file or key is missing, the file resolves outside the attempt,
@@ -355,9 +668,11 @@ def _extract_json(
     :return float: Configured numeric value.
     """
     digest: dict[str, Any] = {}
-    target = ctx.trial_dir / cfg.path
+    target = trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.path, checked=False)
     try:
         with _trial_json_read_errors(
+            ctx,
+            cfg.path,
             target,
             noun="JSON",
             trainer_step=(
@@ -365,7 +680,16 @@ def _extract_json(
                 f"with the numeric key `{cfg.key}`"
             ),
         ):
-            _, cur = load_json_value(ctx.trial_dir, cfg.path, cfg.key, digest=digest)
+            _, cur = load_json_value(
+                ctx.trial_dir,
+                ctx.attempt_dir,
+                cfg.path,
+                cfg.key,
+                digest=digest,
+                baseline=ctx.baseline,
+                evidence_before=ctx.evidence_before,
+                earlier=ctx.earlier_files,
+            )
     except JsonKeyMissingError as exc:
         raise ExtractorError(
             f"Key {cfg.key!r} not found in {target} (failed at {exc.segment!r}; {exc.found})."
@@ -399,25 +723,43 @@ def _extract_json_envelope(
 ) -> float:
     """Validate and extract an attempt-bound JSON result envelope.
 
+    The envelope names the attempt that wrote it: this one, or an earlier attempt that
+    trained in the trial's directory, whose envelope is the trial's result and is listed in
+    ``ctx.earlier_files``. A missing envelope in a reused directory leaves nothing to score,
+    and so does one that does not parse when its stamps show an earlier attempt wrote it
+    (:func:`_written_before_launch`), as for a JSON file.
+
     :param TrialContext ctx: Current trial identity and resolved-overrides digest.
     :param JsonEnvelopeExtractor cfg: Expected objective and evaluation policy.
     :param dict[str, Any] | None provenance: Optional sink that receives the
         frozen evidence ``source`` payload — envelope digest plus the
         validated evaluation metadata — on success.
     :raises ExtractorError: If the envelope is missing, resolves outside the attempt
-        directory, is malformed, or belongs to another execution attempt.
+        directory, is malformed, or belongs to an attempt that is not this trial's.
     :return float: Validated objective value from the envelope.
     """
-    target = ctx.trial_dir / cfg.path
+    path = ctx.managed_envelope_path or cfg.path
+    target = trial_file(ctx.trial_dir, ctx.attempt_dir, path, checked=False)
     with _trial_json_read_errors(
+        ctx,
+        path,
         target,
         noun="JSON envelope",
         trainer_step=(
             "the trainer must call `phasesweep.report_objective(...)` before it exits, from rank "
-            f"0 only; it writes `{cfg.path}` under PHASESWEEP_TRIAL_DIR"
+            f"0 only; it writes `{path}` under PHASESWEEP_TRIAL_DIR"
         ),
     ):
-        raw = attempt_file(ctx.trial_dir, cfg.path).read_bytes()
+        retained = retained_evidence_file(ctx.attempt_dir, path)
+        source = (
+            retained if retained is not None else trial_file(ctx.trial_dir, ctx.attempt_dir, path)
+        )
+        # Bytes that do not parse name no attempt, so the file's stamps say whose they are.
+        if retained is None and _written_before_launch(
+            ctx.baseline, ctx.trial_dir, ctx.attempt_dir, path, source
+        ):
+            ctx.earlier_files.append(path)
+        raw = source.read_bytes()
         data = strict_json_loads(raw.decode("utf-8"))
 
     if not isinstance(data, dict):
@@ -426,11 +768,13 @@ def _extract_json_envelope(
         raise ExtractorError(f"JSON envelope at {target} must use schema_version 1.")
     if data.get("status") != "complete":
         raise ExtractorError(f"JSON envelope at {target} must report status='complete'.")
-    if data.get("generation_id") != ctx.generation_id:
+    # An earlier attempt of the trial that trained in its directory wrote the trial's result.
+    earlier = (data.get("generation_id"), data.get("attempt_id")) in ctx.earlier_attempts
+    if not earlier and data.get("generation_id") != ctx.generation_id:
         raise ExtractorError(
             f"JSON envelope at {target} does not match generation {ctx.generation_id!r}."
         )
-    if data.get("attempt_id") != ctx.attempt_id:
+    if not earlier and data.get("attempt_id") != ctx.attempt_id:
         raise ExtractorError(
             f"JSON envelope at {target} does not match attempt {ctx.attempt_id!r}."
         )
@@ -502,7 +846,7 @@ def _extract_json_envelope(
     if provenance is not None:
         provenance["source"] = {
             "kind": "file",
-            "path": cfg.path,
+            "path": path,
             **_file_digest(raw),
             # Evaluation metadata as validated from the envelope body — the
             # checkpoint, step, and progress position are the envelope's own
@@ -516,6 +860,8 @@ def _extract_json_envelope(
                 "progress": {"axis": cfg.evaluation_axis, "value": position},
             },
         }
+    if earlier and path not in ctx.earlier_files:
+        ctx.earlier_files.append(path)
     return value
 
 
@@ -526,27 +872,38 @@ def _extract_log_regex(
 ) -> float:
     """Select a numeric regex match and digest the complete log file.
 
-    First selection stops matching after its first numeric hit but continues reading for
-    the digest. Warn when a numeric result leaves unparseable captures behind.
+    A trainer log kept across a trial's attempts is the trial's log, so every line counts,
+    whichever attempt wrote it. First selection
+    stops matching after its first numeric hit but continues reading for the digest.
+    Warn when a numeric result leaves unparseable captures behind.
     Provenance includes the selected 1-based line and numeric match count.
 
-    :param TrialContext ctx: Trial identity; the log is read from its ``trial_dir``.
+    :param TrialContext ctx: Trial identity; the log is read from its ``trial_dir``, or its
+        ``attempt_dir`` for a captured stream.
     :param LogRegexExtractor cfg: Log path, named value group, and first/last/min/max selector.
     :param dict | None provenance: Optional source-evidence sink.
-    :raises ExtractorError: The log is missing, outside the attempt, unreadable, has no
-        numeric match, has a non-finite match under ``min`` or ``max``, or a line eligible
-        for matching is invalid UTF-8.
+    :raises ExtractorError: The log is missing, outside the attempt, unreadable, changed after
+        a later launch, has no numeric match, has a non-finite match under ``min`` or ``max``,
+        or a line eligible for matching is invalid UTF-8; a :class:`NothingToScoreError` for a
+        missing log or a captured stream with no match in a reused directory.
     :return float: Selected match value.
     """
     try:
-        target = attempt_file(ctx.trial_dir, cfg.file)
-    except OutsideAttemptError as exc:
-        raise ExtractorError(str(exc)) from exc
-    if not target.is_file():
-        raise ExtractorError(
-            f"Log file not found: {target} (the trainer must write `{cfg.file}` under "
-            "PHASESWEEP_TRIAL_DIR; `stdout.log` and `stderr.log` are written automatically)"
+        retained = retained_evidence_file(ctx.attempt_dir, cfg.file)
+        target = (
+            retained
+            if retained is not None
+            else trial_file(ctx.trial_dir, ctx.attempt_dir, cfg.file)
         )
+        if not target.is_file():
+            raise _read_failure(ctx, cfg.file, FileNotFoundError(target))(
+                f"Log file not found: {target} (the trainer must write `{cfg.file}` under "
+                "PHASESWEEP_TRIAL_DIR; `stdout.log` and `stderr.log` are written automatically)"
+            )
+    except TrialPathError as exc:
+        raise ExtractorError(str(exc)) from exc
+    except OSError as exc:
+        raise ExtractorError(f"Could not inspect log file {cfg.file!r}: {exc}") from exc
 
     pattern = re.compile(cfg.pattern)
 
@@ -558,10 +915,18 @@ def _extract_log_regex(
     result_line: int | None = None
     count = 0
     first_unparseable: str | None = None
-    line_no = 0
     try:
+        if retained is None and _written_before_launch(
+            ctx.baseline,
+            ctx.trial_dir,
+            ctx.attempt_dir,
+            cfg.file,
+            target,
+            evidence_before=ctx.evidence_before,
+        ):
+            ctx.earlier_files.append(cfg.file)
         with target.open("r", encoding="utf-8", errors="surrogateescape", newline="") as fh:
-            for raw_text in fh:
+            for line_no, raw_text in enumerate(fh, 1):
                 raw_line = raw_text.encode("utf-8", errors="surrogateescape")
                 hasher.update(raw_line)
                 size_bytes += len(raw_line)
@@ -574,7 +939,6 @@ def _extract_log_regex(
                     line = line[:-2] + "\n"
                 elif line.endswith("\r"):
                     line = line[:-1] + "\n"
-                line_no += 1
                 for match in pattern.finditer(line):
                     captured = match.group("value")
                     try:
@@ -607,9 +971,12 @@ def _extract_log_regex(
                         break
     except UnicodeError as exc:
         raise ExtractorError(f"Log file is not valid UTF-8 at {target}: {exc}") from exc
+    except StaleEvidenceError as exc:
+        raise ExtractorError(str(exc)) from exc
     except OSError as exc:
         raise ExtractorError(f"Could not read log file at {target}: {exc}") from exc
 
+    sha256 = hasher.hexdigest()
     if first_unparseable is not None:
         if result is None:
             raise ExtractorError(
@@ -623,12 +990,17 @@ def _extract_log_regex(
             first_unparseable,
         )
     if result is None:
-        raise ExtractorError(f"No matches for {cfg.pattern!r} in {target}")
+        # A resumed trainer that skips finished work prints nothing to its own stream. A
+        # trainer log in the trial directory is the trial's, which a corrected pattern re-reads.
+        unscored = _in_reused_directory(ctx) and is_captured_stream(cfg.file)
+        raise (NothingToScoreError if unscored else ExtractorError)(
+            f"No matches for {cfg.pattern!r} in {target}"
+        )
     if provenance is not None:
         provenance["source"] = {
             "kind": "file",
             "path": cfg.file,
-            "sha256": hasher.hexdigest(),
+            "sha256": sha256,
             "size_bytes": size_bytes,
             "matched_line": result_line,
             "match_count": count,
@@ -636,19 +1008,60 @@ def _extract_log_regex(
     return result
 
 
+def _earlier_wandb_runs(ctx: TrialContext) -> list[WandbRunAddress]:
+    """Name the W&B runs of the earlier attempts that trained in the trial's directory.
+
+    Each attempt logs to a run named by its attempt ID, at the destination its launch
+    recorded. An earlier attempt that recorded no managed destination logged no run to read.
+
+    :param TrialContext ctx: Attempt naming its earlier attempts, oldest first.
+    :raises ExtractorError: An earlier attempt's launch record is unreadable.
+    :return list[WandbRunAddress]: The earlier runs, oldest first.
+    """
+    runs: list[WandbRunAddress] = []
+    for _, attempt_id in ctx.earlier_attempts:
+        directory = ctx.attempt_dir.with_name(attempt_id)
+        if not (directory / EVIDENCE_BASELINE_FILE).is_file():
+            continue
+        try:
+            recorded = read_evidence_baseline(directory).wandb_destination
+        except ValueError as exc:
+            raise ExtractorError(
+                f"The W&B run of earlier attempt {attempt_id} cannot be located: {exc}"
+            ) from exc
+        if recorded is not None:
+            runs.append(
+                {
+                    "base_url": recorded.base_url,
+                    "entity": recorded.entity,
+                    "project": recorded.project,
+                    "run_id": attempt_id,
+                }
+            )
+    return runs
+
+
 def _capture_wandb(
     ctx: TrialContext, cfg: _WandbSummarySource, *, deadline: float | None = None
 ) -> dict[str, Any]:
     """Share one W&B capture or capture failure between the attempt's consumers.
 
+    The attempt's own run is the capture's identity. A rerun's capture is assembled from that
+    run and the runs of its trial's earlier attempts (:func:`poll_wandb_summary`); one an
+    earlier run scored lists that run in ``ctx.earlier_files``.
+
     :param TrialContext ctx: Trial identity and optional shared query/capture.
     :param _WandbSummarySource cfg: Source for a one-off query if needed.
     :param float | None deadline: Absolute monotonic deadline, also bounded by the source timeout.
-    :raises DeadlineExceededError: The execution deadline prevents capture.
+    :raises DeadlineExceededError: The execution deadline prevents capture, or cut short the
+        poll that a deadline verdict needs.
     :raises EvidenceUnreadableError: W&B gave no answer: authentication or setup failed, the
-        SDK is missing, the reader worker failed, or every poll failed in transport.
-    :raises ExtractorError: The run is missing, ended unsuccessfully or never finished, the
-        finished summary lacks required keys, or evidence is invalid.
+        SDK is missing, the reader worker failed, or the last poll failed in transport or found
+        a finished summary still being ingested.
+    :raises ExtractorError: The run is missing, ended unsuccessfully or never finished, no
+        run's summary holds a required key, or evidence is invalid; a
+        :class:`NothingToScoreError` when at the deadline a rerun's run and its trial's earlier
+        runs leave no result to score.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     :return dict: Finished run identity, numeric values, present keys, and retrieval time.
     """
@@ -660,28 +1073,50 @@ def _capture_wandb(
         cfg,
         (cfg.metric_key,) if isinstance(cfg, WandbExtractor) else (),
         tuple(cfg.keys) if isinstance(cfg, WandbSummaryRequiredGate) else (),
+        objective_key=cfg.metric_key if isinstance(cfg, WandbExtractor) else None,
     )
     source = query.source
+    run_id = ctx.attempt_id
     poll_deadline = time.monotonic() + source.timeout_seconds
     capped = deadline is not None and deadline <= poll_deadline
     if deadline is not None:
         poll_deadline = min(poll_deadline, deadline)
-    target = f"{source.base_url}/{source.entity}/{source.project}/{ctx.attempt_id}"
     try:
+        destination = source.destination if ctx.baseline is None else ctx.baseline.wandb_destination
+        if destination is None:
+            raise ExtractorError(
+                f"Attempt {ctx.attempt_id!r} had no managed W&B destination at launch."
+            )
+        target = f"{destination.base_url}/{destination.entity}/{destination.project}/{run_id}"
         try:
+            worker_id, worker_dir = ctx.process_slot
             capture = poll_wandb_summary(
-                base_url=source.base_url,
-                entity=source.entity,
-                project=source.project,
-                run_id=ctx.attempt_id,
-                trial_dir=ctx.trial_dir,
+                base_url=destination.base_url,
+                entity=destination.entity,
+                project=destination.project,
+                run_id=run_id,
+                attempt_id=worker_id,
+                attempt_dir=worker_dir,
                 poll_seconds=source.poll_seconds,
                 timeout_seconds=source.timeout_seconds,
                 required_keys=query.numeric_keys,
                 presence_keys=query.presence_keys,
+                objective_key=query.objective_key,
+                earlier=_earlier_wandb_runs(ctx),
+                evaluation_axis=(
+                    source.evaluation_axis if isinstance(source, WandbExtractor) else "_step"
+                ),
                 environment=ctx.wandb_environment,
                 deadline=poll_deadline,
             )
+            # The worker's marks are not part of the stored capture. A capture decided at the
+            # poll's deadline, when an execution deadline was the binding limit, was cut short.
+            deadline_verdict = capture.pop("deadline_verdict", None) is True
+            if capped and deadline_verdict:
+                raise DeadlineExceededError(
+                    f"W&B run {target} had not settled its trial's result when the phase or run "
+                    "deadline ended its evidence read."
+                )
         except (WandbPollTimeout, WandbRunMissingError) as exc:
             unanswered = isinstance(exc, WandbPollTimeout) and not exc.reached
             # The worker stops polling a reserve before its deadline so that its report arrives
@@ -697,7 +1132,7 @@ def _capture_wandb(
             )
             if isinstance(exc, WandbRunMissingError):
                 message = (
-                    f"No W&B run {ctx.attempt_id!r} was found in {source.entity}/{source.project} "
+                    f"No W&B run {run_id!r} was found in {destination.entity}/{destination.project} "
                     "at the evidence deadline. The trainer should call wandb.init() without "
                     "its own project, entity or id."
                 )
@@ -719,10 +1154,16 @@ def _capture_wandb(
             raise ExtractorError(
                 f"W&B run {target} ended in {exc.state!r}; only finished runs can provide evidence."
             ) from exc
+        # A verdict reached only at the deadline, so an execution deadline that was the binding
+        # limit cut the wait short instead.
+        except WandbNothingToScoreError as exc:
+            raise (DeadlineExceededError if capped else NothingToScoreError)(
+                f"W&B run {target} {exc.cause}."
+            ) from exc
         except WandbMissingKeysError as exc:
-            raise ExtractorError(
-                f"W&B run {target} finished without required summary key(s) {exc.missing!r}; "
-                f"available summary keys: {exc.available!r}."
+            raise (DeadlineExceededError if capped else ExtractorError)(
+                f"W&B run {target} finished without required summary key(s) {exc.missing!r} "
+                f"after {exc.waited_seconds:.0f} s; available summary keys: {exc.available!r}."
             ) from exc
         except ImportError as exc:
             raise EvidenceUnreadableError(WANDB_SDK_MISSING) from exc
@@ -737,14 +1178,16 @@ def _capture_wandb(
     except ExtractorError as exc:
         ctx.wandb_capture_failure.append(exc)
         raise
+    # An earlier run that scored the capture discloses the trial's result the way an earlier
+    # attempt's value file does.
+    source_run = capture.pop("earlier_attempt", None)
+    if isinstance(source_run, str):
+        ctx.earlier_files.append(f"wandb:{source_run}")
     ctx.wandb_capture.update(
         {
             "kind": "wandb",
-            "base_url": source.base_url,
-            "entity": source.entity,
-            "project": source.project,
-            "run_id": ctx.attempt_id,
-            "run_state": "finished",
+            **destination._asdict(),
+            "run_id": run_id,
             "constraint_keys": dict(query.constraint_keys),
             "gate_keys": {identity: list(keys) for identity, keys in query.gate_keys},
             **capture,
@@ -780,9 +1223,13 @@ def _extract_wandb(
     if not math.isfinite(value):
         raise ExtractorError(f"W&B key {cfg.metric_key!r} is non-finite.")
     if provenance is not None:
+        # Only the objective records provenance; the run that supplied it is the attempt's own
+        # unless an earlier attempt's run scored the capture.
+        marks = [mark for mark in ctx.earlier_files if mark.startswith("wandb:")]
         provenance["source"] = {
             "kind": "wandb",
             "metric_key": cfg.metric_key,
+            "run_id": marks[0].removeprefix("wandb:") if marks else capture["run_id"],
             "evaluation": {"progress": {"axis": cfg.evaluation_axis, "value": None}},
         }
         provenance["remote_capture"] = dict(capture)
@@ -811,24 +1258,69 @@ def locate_objective_position(
     if not isinstance(cfg, WandbExtractor):
         return
     progress = provenance["source"]["evaluation"]["progress"]
+    capture = provenance["remote_capture"]
+    # The position is read in the run whose summary supplied the objective.
+    source_run = provenance["source"]["run_id"]
+    location = next(
+        (run for run in _earlier_wandb_runs(ctx) if run["run_id"] == source_run),
+        capture,
+    )
+    worker_id, worker_dir = ctx.process_slot
     progress["value"] = locate_wandb_position(
-        base_url=cfg.base_url,
-        entity=cfg.entity,
-        project=cfg.project,
-        run_id=ctx.attempt_id,
-        trial_dir=ctx.trial_dir,
+        base_url=location["base_url"],
+        entity=location["entity"],
+        project=location["project"],
+        run_id=source_run,
+        attempt_id=worker_id,
+        attempt_dir=worker_dir,
         poll_seconds=cfg.poll_seconds,
         timeout_seconds=cfg.timeout_seconds,
         metric_key=cfg.metric_key,
         axis=cfg.evaluation_axis,
-        value=provenance["remote_capture"]["values"][cfg.metric_key],
+        value=capture["values"][cfg.metric_key],
         environment=ctx.wandb_environment,
         deadline=deadline,
     )
 
 
+def _earlier_mlflow_bindings(ctx: TrialContext, binding: RunBinding) -> list[RunBinding]:
+    """Collect the bound runs of the earlier attempts that trained in the trial's directory.
+
+    An earlier attempt that never bound a run logged nothing to merge.
+
+    :param TrialContext ctx: Attempt naming its earlier attempts, oldest first.
+    :param RunBinding binding: This attempt's verified binding.
+    :raises ValueError: An earlier binding is unreadable or names another target or trial input.
+    :return list[RunBinding]: The earlier bindings, oldest first.
+    """
+    from phasesweep.tracking.session import BINDING_FILE, attempt_tracking_dir, read_binding
+
+    earlier: list[RunBinding] = []
+    for generation_id, attempt_id in ctx.earlier_attempts:
+        directory = attempt_tracking_dir(ctx.trial_dir.parent.parent, generation_id, attempt_id)
+        if not (directory / BINDING_FILE).is_file():
+            continue
+        prior = read_binding(directory)
+        if (
+            prior["attempt_id"] != attempt_id
+            or prior["tracking_uri"] != binding["tracking_uri"]
+            or prior["experiment_id"] != binding["experiment_id"]
+            or prior["experiment"] != binding["experiment"]
+            or prior["phase"] != binding["phase"]
+            or prior["overrides_sha256"] != binding["overrides_sha256"]
+        ):
+            raise ValueError(
+                f"MLflow binding of earlier attempt {attempt_id} names another target or trial."
+            )
+        earlier.append(prior)
+    return earlier
+
+
 def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCapture:
     """Read each native history once, after verifying the exact bound run.
+
+    A resumed trial's histories include its earlier attempts' runs, so every selector reads
+    the trial's whole history.
 
     :param TrialContext ctx: Attempt and configured capture contract.
     :param float | None deadline: Existing execution deadline.
@@ -836,14 +1328,17 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
     :raises DeadlineExceededError: The execution deadline stopped the capture.
     :raises EvidenceUnreadableError: MLflow gave no answer: it was unreachable, refused
         access, lacked its SDK, timed out, or the reader's outcome is unknown.
-    :raises MlflowObjectiveMissingError: A finished managed run lacks the objective metric.
+    :raises MlflowObjectiveMissingError: A finished managed run and its trial's merged history
+        lack the objective's point; a :class:`NothingToScoreError` instead for an attempt in a
+        reused directory, as for one that never bound a run.
     :raises ExtractorError: Binding or remote evidence cannot be accepted.
     """
     from phasesweep.evidence.mlflow import validate_capture
-    from phasesweep.tracking.mlflow import ManagedObjectiveMissingError, request_operation
+    from phasesweep.tracking.mlflow import ObjectiveMissingError, request_operation
     from phasesweep.tracking.session import (
         BINDING_FILE,
         EXPECTED_BINDING_FILE,
+        attempt_tracking_dir,
         gave_no_answer,
         read_binding,
         read_record,
@@ -853,15 +1348,23 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
         return validate_capture(ctx.mlflow_capture)
     if ctx.mlflow_settings is None or ctx.mlflow_query is None:
         raise ExtractorError("MLflow capture requires a configured target and query.")
+    tracking_dir = attempt_tracking_dir(
+        ctx.trial_dir.parent.parent, ctx.generation_id, ctx.attempt_id
+    )
+    # Managed runs are bound before launch, so only a trainer-owned run can be missing. A
+    # rerun in a reused directory that never opened a run skipped work, so it reruns afresh.
+    unbound = not (tracking_dir / BINDING_FILE).is_file()
+    never_bound = (
+        "The trainer never bound its MLflow run; call "
+        "phasesweep.tracking.bind_mlflow_run(run_id) inside its active run."
+    )
+    if unbound and _in_reused_directory(ctx):
+        raise NothingToScoreError(never_bound)
     try:
-        # Managed runs are bound before launch, so only a trainer-owned run can be missing.
-        if not (ctx.trial_dir / BINDING_FILE).is_file():
-            raise ValueError(
-                "The trainer never bound its MLflow run; call "
-                "phasesweep.tracking.bind_mlflow_run(run_id) inside its active run."
-            )
-        binding = read_binding(ctx.trial_dir)
-        expected = read_record(ctx.trial_dir / EXPECTED_BINDING_FILE)
+        if unbound:
+            raise ValueError(never_bound)
+        binding = read_binding(tracking_dir)
+        expected = read_record(tracking_dir / EXPECTED_BINDING_FILE)
         if (
             any(binding.get(k) != v for k, v in expected.items())
             or binding["attempt_id"] != ctx.attempt_id
@@ -869,22 +1372,34 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
             or binding["overrides_sha256"] != ctx.overrides_sha256
         ):
             raise ValueError("MLflow binding belongs to a different attempt or target.")
+        earlier = _earlier_mlflow_bindings(ctx, binding)
         stop = time.monotonic() + ctx.mlflow_settings["timeout_seconds"]
+        worker_id, worker_dir = ctx.process_slot
         retrieved = request_operation(
             {
                 "action": "capture",
                 "settings": ctx.mlflow_settings,
                 "binding": binding,
+                "earlier": earlier,
                 "query": ctx.mlflow_query,
                 "timeout_at": stop,
             },
-            operation_id=ctx.attempt_id,
-            directory=ctx.trial_dir,
+            operation_id=worker_id,
+            directory=worker_dir,
             environment=ctx.mlflow_environment or {},
             deadline=min(stop, deadline) if deadline is not None else stop,
         )
+        source_run = retrieved.pop("objective_run_id", binding["run_id"])
+        if not isinstance(source_run, str):
+            raise ValueError("MLflow capture names no run for its objective.")
         capture = validate_capture(retrieved)
-    except ManagedObjectiveMissingError as exc:
+    except ObjectiveMissingError as exc:
+        # The run lacks the objective and so does the trial's merged history: in a reused
+        # directory the trainer skipped work no earlier run recorded, so it reruns afresh.
+        if _in_reused_directory(ctx):
+            raise NothingToScoreError(str(exc)) from exc
+        if binding["run_mode"] != "managed":
+            raise ExtractorError(str(exc)) from exc
         raise MlflowObjectiveMissingError(str(exc)) from exc
     except (OSError, ValueError, RuntimeError) as exc:  # every NO_ANSWER error included
         if isinstance(exc, UnsafeProcessCleanupError):
@@ -894,6 +1409,10 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
         if isinstance(exc, TimeoutError) and deadline is not None and time.monotonic() >= deadline:
             raise DeadlineExceededError(str(exc)) from exc
         raise EvidenceUnreadableError(str(exc)) from exc
+    # The objective's selected point in an earlier attempt's run discloses the trial's result
+    # the way an earlier attempt's value file does; delivery still goes to the bound run.
+    if source_run != binding["run_id"]:
+        ctx.earlier_files.append(f"mlflow:{source_run}")
     ctx.mlflow_capture.update(retrieved)
     return capture
 
@@ -918,10 +1437,13 @@ def _extract_mlflow(
     capture = _capture_mlflow(ctx, deadline=deadline)
     point = capture["observations"][observation_id(cfg)]
     if provenance is not None:
+        # Only the objective records provenance, and only its point can be an earlier run's.
+        marks = [mark for mark in ctx.earlier_files if mark.startswith("mlflow:")]
         provenance["source"] = {
             "kind": "mlflow",
             "metric_key": cfg.metric_key,
             "selection": observation_id(cfg),
+            "run_id": marks[0].removeprefix("mlflow:") if marks else capture["binding"]["run_id"],
             "evaluation": {
                 "progress": {"axis": "step", "value": point["step"]},
                 "timestamp": point["timestamp"],
@@ -999,6 +1521,19 @@ class GateResult:
     deadline_exhausted: bool = False
     # The tracker gave no answer about the evidence this gate reads; never persisted.
     evidence_unreadable: bool = False
+    # The gate's file is missing or unparsed in a reused directory (:class:`NothingToScoreError`).
+    nothing_to_score: bool = False
+
+
+def _missing_file(ctx: TrialContext, gate: Gate, detail: str) -> GateResult:
+    """Fail a gate whose file is missing, marked when a reused directory leaves nothing to score.
+
+    :param TrialContext ctx: The attempt being read.
+    :param Gate gate: The gate.
+    :param str detail: What is missing.
+    :return GateResult: The failed result.
+    """
+    return GateResult(gate.type, False, detail, nothing_to_score=_in_reused_directory(ctx))
 
 
 def _required_file(ctx: TrialContext, gate: RequiredFileGate) -> GateResult:
@@ -1008,10 +1543,17 @@ def _required_file(ctx: TrialContext, gate: RequiredFileGate) -> GateResult:
     :param RequiredFileGate gate: Gate config naming the required file path.
     :return GateResult: Pass/fail result and human-readable detail.
     """
-    path = ctx.trial_dir / gate.path
+    path = trial_file(ctx.trial_dir, ctx.attempt_dir, gate.path, checked=False)
     if path.is_file():
+        try:
+            _require_before_next_launch(ctx.trial_dir, gate.path, path, ctx.evidence_before)
+        except (OSError, StaleEvidenceError) as exc:
+            return GateResult(gate.type, False, str(exc))
         return GateResult(gate.type, True, f"{gate.path} exists")
-    return GateResult(gate.type, False, f"{gate.path} is missing")
+    refusal = unusable_link(ctx.trial_dir, ctx.attempt_dir, gate.path)
+    if refusal is not None:
+        return GateResult(gate.type, False, refusal)
+    return _missing_file(ctx, gate, f"{gate.path} is missing")
 
 
 def _json_equals(ctx: TrialContext, gate: JsonEqualsGate) -> GateResult:
@@ -1022,9 +1564,17 @@ def _json_equals(ctx: TrialContext, gate: JsonEqualsGate) -> GateResult:
     :return GateResult: Pass/fail result and human-readable detail.
     """
     try:
-        _, actual = load_json_value(ctx.trial_dir, gate.path, gate.key)
+        _, actual = load_json_value(
+            ctx.trial_dir,
+            ctx.attempt_dir,
+            gate.path,
+            gate.key,
+            baseline=ctx.baseline,
+            evidence_before=ctx.evidence_before,
+            earlier=ctx.earlier_files,
+        )
     except Exception as exc:
-        return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
+        return _gate_unavailable(ctx, gate.type, gate.path, gate.key, exc)
     if type(actual) is type(gate.value) and actual == gate.value:
         return GateResult(gate.type, True, f"{gate.key} == {gate.value!r}")
     return GateResult(
@@ -1043,10 +1593,21 @@ def _json_scalar_bound(ctx: TrialContext, gate: JsonScalarBoundGate) -> GateResu
     :return GateResult: Pass/fail result and human-readable detail.
     """
     try:
-        _, raw_value = load_json_value(ctx.trial_dir, gate.path, gate.key)
-        value = json_float(raw_value, label=gate.key)
+        _, raw_value = load_json_value(
+            ctx.trial_dir,
+            ctx.attempt_dir,
+            gate.path,
+            gate.key,
+            baseline=ctx.baseline,
+            evidence_before=ctx.evidence_before,
+            earlier=ctx.earlier_files,
+        )
     except Exception as exc:
-        return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
+        return _gate_unavailable(ctx, gate.type, gate.path, gate.key, exc)
+    try:
+        value = json_float(raw_value, label=gate.key)
+    except ValueError as exc:
+        return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
     if not math.isfinite(value):
         return GateResult(gate.type, False, f"{gate.key} was non-finite: {value!r}")
     if gate.min is not None and value < gate.min:
@@ -1063,18 +1624,31 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
     :param ArtifactSizeGate gate: Gate config for file, directory, or JSON byte size.
     :return GateResult: Pass/fail result and human-readable detail.
     """
-    path = ctx.trial_dir / gate.path
+    path = trial_file(ctx.trial_dir, ctx.attempt_dir, gate.path, checked=False)
+    if gate.source != "json" and (
+        refusal := unusable_link(
+            ctx.trial_dir, ctx.attempt_dir, gate.path, directory=gate.source == "directory"
+        )
+    ):
+        return GateResult(gate.type, False, refusal)
     if gate.source == "file":
         try:
             if not path.is_file():
+                if not path.exists():
+                    return _missing_file(ctx, gate, f"{gate.path} is not a file")
                 return GateResult(gate.type, False, f"{gate.path} is not a file")
+            _require_before_next_launch(ctx.trial_dir, gate.path, path, ctx.evidence_before)
             size = path.stat().st_size
+        except StaleEvidenceError as exc:
+            return GateResult(gate.type, False, str(exc))
         except OSError as exc:
             return GateResult(gate.type, False, f"could not inspect {gate.path}: {exc}")
         label = f"{gate.path} file size"
     elif gate.source == "directory":
         try:
             root = path.stat(follow_symlinks=False)
+        except FileNotFoundError as exc:
+            return _missing_file(ctx, gate, f"could not inspect {gate.path}: {path}: {exc}")
         except OSError as exc:
             return GateResult(gate.type, False, f"could not inspect {gate.path}: {path}: {exc}")
         if not stat.S_ISDIR(root.st_mode):
@@ -1084,6 +1658,9 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
         while directories:
             directory = directories.pop()
             try:
+                _require_before_next_launch(
+                    ctx.trial_dir, gate.path, directory, ctx.evidence_before
+                )
                 with os.scandir(directory) as entries:
                     for entry in entries:
                         entry_path = Path(entry.path)
@@ -1092,6 +1669,9 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
                                 directories.append(entry_path)
                             # Count file-symlink targets without traversing directory symlinks.
                             elif entry.is_file():
+                                _require_before_next_launch(
+                                    ctx.trial_dir, gate.path, entry_path, ctx.evidence_before
+                                )
                                 size += entry_path.stat().st_size
                         except OSError as exc:
                             return GateResult(
@@ -1099,6 +1679,8 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
                                 False,
                                 f"could not inspect {gate.path}: {entry_path}: {exc}",
                             )
+            except StaleEvidenceError as exc:
+                return GateResult(gate.type, False, str(exc))
             except OSError as exc:
                 return GateResult(
                     gate.type,
@@ -1109,9 +1691,17 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
     else:
         assert gate.key is not None
         try:
-            _, raw_size = load_json_value(ctx.trial_dir, gate.path, gate.key)
+            _, raw_size = load_json_value(
+                ctx.trial_dir,
+                ctx.attempt_dir,
+                gate.path,
+                gate.key,
+                baseline=ctx.baseline,
+                evidence_before=ctx.evidence_before,
+                earlier=ctx.earlier_files,
+            )
         except Exception as exc:
-            return GateResult(gate.type, False, _gate_unavailable(gate.path, gate.key, exc))
+            return _gate_unavailable(ctx, gate.type, gate.path, gate.key, exc)
         if not isinstance(raw_size, int) or isinstance(raw_size, bool):
             return GateResult(gate.type, False, f"{gate.key} was not an integer byte count")
         if raw_size < 0:
@@ -1133,10 +1723,13 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
     :return GateResult: Pass/fail result and human-readable detail.
     """
     try:
-        path = attempt_file(ctx.trial_dir, gate.path)
+        path = trial_file(ctx.trial_dir, ctx.attempt_dir, gate.path)
         if not path.is_file():
-            return GateResult(gate.type, False, f"{gate.path} is missing")
+            return _missing_file(ctx, gate, f"{gate.path} is missing")
+        _require_before_next_launch(ctx.trial_dir, gate.path, path, ctx.evidence_before)
         digest = file_sha256(path)
+    except (TrialPathError, StaleEvidenceError) as exc:
+        return GateResult(gate.type, False, str(exc))
     except OSError as exc:
         return GateResult(gate.type, False, f"could not read {gate.path}: {exc}")
     if digest == gate.sha256:
@@ -1164,6 +1757,7 @@ def _mlflow_required(
             str(exc),
             deadline_exhausted=isinstance(exc, DeadlineExceededError),
             evidence_unreadable=isinstance(exc, EvidenceUnreadableError),
+            nothing_to_score=isinstance(exc, NothingToScoreError),
         )
     return GateResult(gate.type, True, "MLflow metrics, parameters, and tags are present")
 
@@ -1191,6 +1785,7 @@ def _wandb_summary_required(
             False,
             str(exc),
             evidence_unreadable=isinstance(exc, EvidenceUnreadableError),
+            nothing_to_score=isinstance(exc, NothingToScoreError),
         )
     missing = sorted(set(gate.keys) - set(capture["present_keys"]))
     return GateResult(

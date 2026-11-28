@@ -10,13 +10,11 @@ from pathlib import Path
 import optuna
 import pytest
 
-from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.state import Winner, WinnerSource
 from phasesweep.mcp.redaction import status_payload
 from phasesweep.mcp.runs import RunState, RunStore
-from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.mcp.snapshots import StatusSnapshot, capture_result_snapshot
 from phasesweep.mcp.tools import (
     AWAIT_DEFAULT_TIMEOUT_SECONDS,
     AWAIT_MAX_TIMEOUT_SECONDS,
@@ -26,7 +24,7 @@ from phasesweep.mcp.tools import (
 )
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.time import utc_now_iso
-from tests.conftest import mark_current_format, phase_study, single_trial_confound, tell_feasible
+from tests.conftest import mark_current_format, new_phase_study, phase_study, single_trial_confound
 from tests.mcp_helpers import (
     make_dead_run_handle,
     make_mcp_app,
@@ -38,14 +36,9 @@ from tests.mcp_helpers import (
 
 
 def _complete_trials(experiment, *, n: int) -> None:
-    study = optuna.create_study(
-        study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=_resolve_storage(experiment.resolved_storage),
-        direction="minimize",
-    )
-    mark_current_format(experiment, study)
+    study = new_phase_study(experiment, experiment.phases[0].name)
     for i in range(n):
-        tell_feasible(study, study.ask(), float(i))
+        study.tell(study.ask(), float(i))
 
 
 def test_elapsed_seconds_running_counts_from_launch(tmp_path: Path) -> None:
@@ -77,7 +70,7 @@ def test_elapsed_seconds_terminal(
 
 
 def _status_payload(phase_counts: dict[str, dict[str, int]]) -> JsonObject:
-    """Map a one-phase ``read_status`` payload with the given counts to the MCP status."""
+    """Map a one-phase status snapshot with the given counts to the MCP status."""
     status = {
         "current_generation_id": "generation-current",
         "published_generation_id": None,
@@ -87,13 +80,15 @@ def _status_payload(phase_counts: dict[str, dict[str, int]]) -> JsonObject:
         "result_context": "current_config",
         "published_config_matches_current": None,
         "result_phase_plan": ["p"],
-        "metric": {"name": "loss", "goal": "minimize"},
+        "metric": {"name": "loss", "goal": "minimize", "objective_evidence": {"kind": "json"}},
         "summary_present": False,
         "phases": [
             {
                 "phase": "p",
                 "n_trials": 3,
                 **phase_counts,
+                "interrupted_reruns": 0,
+                "interrupted_reruns_earlier_attempt": 0,
                 "winner_present": False,
                 "trial_data_available": True,
             }
@@ -101,8 +96,9 @@ def _status_payload(phase_counts: dict[str, dict[str, int]]) -> JsonObject:
     }
     return status_payload(
         "srv",
-        status,
+        StatusSnapshot.model_validate(status),
         {"run_id": "run-1"},
+        tracking_delivery=None,
         result_source="current_shared_study",
         elapsed_seconds=None,
     )
@@ -285,12 +281,7 @@ def test_await_run_reports_failed_trial_progress_at_timeout(
 
     async def sleep_then_fail_trial(seconds: float) -> None:
         clock["now"] += seconds
-        study = optuna.create_study(
-            study_name=_phase_study_name(experiment, experiment.phases[0]),
-            storage=_resolve_storage(experiment.resolved_storage),
-            direction="minimize",
-        )
-        mark_current_format(experiment, study)
+        study = new_phase_study(experiment, experiment.phases[0].name)
         study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
 
     monkeypatch.setattr("phasesweep.mcp.tools.time.monotonic", lambda: clock["now"])
@@ -487,7 +478,7 @@ def test_await_run_storage_read_does_not_block_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app, _registry, _store = _app_with_run(tmp_path)
-    target_id, status, run, handle, result_source = app._read_status_target(
+    target_id, status, run, handle, result_source, delivery = app._read_status_target(
         run_id="r1",
     )
     assert run is not None and handle is not None
@@ -498,7 +489,7 @@ def test_await_run_storage_read_does_not_block_event_loop(
     def blocked_read(**_kwargs: object):
         entered.set()
         release.wait(timeout=2.0)
-        return target_id, status, terminal_run, handle, result_source
+        return target_id, status, terminal_run, handle, result_source, delivery
 
     monkeypatch.setattr(app, "_read_status_target", blocked_read)
 

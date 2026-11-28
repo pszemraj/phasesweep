@@ -6,9 +6,8 @@ current W&B credentials may write to::
     PHASESWEEP_WANDB_ENTITY=<entity> PHASESWEEP_WANDB_PROJECT=<project> \\
         pytest -m live tests/test_wandb_live.py
 
-``PHASESWEEP_WANDB_BASE_URL`` selects another W&B server. The test makes four
-sequential CPU trainer runs, each a few seconds, and polls W&B for at most two
-minutes per run.
+``PHASESWEEP_WANDB_BASE_URL`` selects another W&B server. The sweep test makes four
+sequential CPU trainer runs, each a few seconds, and waits about a minute per run for W&B to serve the finished run's summary. The rerun test interrupts one trial after its first attempt's rows reach W&B and reruns it from its checkpoint in a second run, a few minutes in all.
 """
 
 from __future__ import annotations
@@ -27,14 +26,47 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, Sampler
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.read import read_result
-from phasesweep.engine.state import ATTEMPT_ID_ATTR, OBJECTIVE_PROVENANCE_ATTR, TRIAL_DIR_ATTR
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    EARLIER_ATTEMPT_RESULT_ATTR,
+    OBJECTIVE_PROVENANCE_ATTR,
+    RERUN_OF_ATTR,
+    TRIAL_DIR_ATTR,
+)
 from phasesweep.evidence.models import WandbExtractor
+from tests.conftest import phase_trials, write_experiment_config
+from tests.recovery_helpers import runner_once
+from tests.wandb_live_trainer import CURVE_STEPS, INTERRUPT_STEP, curve_loss
 
 pytestmark = pytest.mark.live
 
 _TRAINER = Path(__file__).with_name("wandb_live_trainer.py")
+_PASSTHROUGH = [
+    "WANDB_API_KEY",
+    "WANDB_IDENTITY_TOKEN_FILE",
+    "WANDB_CREDENTIALS_FILE",
+    "WANDB_MODE",
+    "WANDB_DISABLED",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_FILE",
+]
+
+
+def _live_target() -> tuple[str, str, str]:
+    """Return the W&B server, entity and project the live tests write to, or skip.
+
+    :return tuple[str, str, str]: Base URL, entity and project.
+    """
+    pytest.importorskip("wandb")
+    entity = os.environ.get("PHASESWEEP_WANDB_ENTITY")
+    project = os.environ.get("PHASESWEEP_WANDB_PROJECT")
+    if not entity or not project:
+        pytest.skip("set PHASESWEEP_WANDB_ENTITY and PHASESWEEP_WANDB_PROJECT to run")
+    return os.environ.get("PHASESWEEP_WANDB_BASE_URL", "https://api.wandb.ai"), entity, project
 
 
 def _grid_phase(name: str, key: str, choices: list[float], **kwargs: object) -> Phase:
@@ -52,27 +84,24 @@ def _grid_phase(name: str, key: str, choices: list[float], **kwargs: object) -> 
         gpu_policy="none",
         sampler=Sampler(type="grid"),
         timeout_seconds_per_trial=120,
-        timeout_seconds_per_phase=600,
+        # Each of the two trials' reads may wait out W&B's summary lag.
+        timeout_seconds_per_phase=1800,
         search_space={key: CategoricalParam(type="categorical", choices=choices)},
         **kwargs,
     )
 
 
 def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: Path) -> None:
-    """Every objective comes from W&B, keyed by attempt, and a replay reads none of it."""
-    pytest.importorskip("wandb")
-    entity = os.environ.get("PHASESWEEP_WANDB_ENTITY")
-    project = os.environ.get("PHASESWEEP_WANDB_PROJECT")
-    if not entity or not project:
-        pytest.skip("set PHASESWEEP_WANDB_ENTITY and PHASESWEEP_WANDB_PROJECT to run")
+    """Every objective comes from its trial's W&B run, and a replay reads none of it."""
+    base_url, entity, project = _live_target()
     extractor = WandbExtractor(
         type="wandb",
-        base_url=os.environ.get("PHASESWEEP_WANDB_BASE_URL", "https://api.wandb.ai"),
+        base_url=base_url,
         entity=entity,
         project=project,
         metric_key="eval/loss.min",
         evaluation_axis="eval/step",
-        timeout_seconds=120,
+        timeout_seconds=600,
         poll_seconds=2,
     )
     experiment = Experiment(
@@ -85,23 +114,9 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
             f"{shlex.join([sys.executable, str(_TRAINER)])} "
             "--receipt {trial_dir}/parameters.json {overrides}"
         ),
-        execution=ExecutionContext(
-            inherit_env="none",
-            passthrough_env=[
-                "WANDB_API_KEY",
-                "WANDB_IDENTITY_TOKEN_FILE",
-                "WANDB_CREDENTIALS_FILE",
-                "WANDB_MODE",
-                "WANDB_DISABLED",
-                "HTTP_PROXY",
-                "HTTPS_PROXY",
-                "NO_PROXY",
-                "REQUESTS_CA_BUNDLE",
-                "SSL_CERT_FILE",
-            ],
-        ),
+        execution=ExecutionContext(inherit_env="none", passthrough_env=_PASSTHROUGH),
         metric=Metric(name="eval_loss", goal="minimize", extractor=extractor),
-        timeout_seconds_per_run=1200,
+        timeout_seconds_per_run=3600,
         phases=[
             _grid_phase("learning_rate", "learning_rate", [0.01, 0.1]),
             _grid_phase("regularization", "weight_decay", [0.0, 0.01], inherits=["learning_rate"]),
@@ -109,14 +124,10 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
     )
     winners = run_experiment(experiment)
 
-    storage = _resolve_storage(experiment.resolved_storage)
-
     assert winners["learning_rate"].effective_overrides["learning_rate"] == 0.1
     attempts: dict[str, list[str]] = {}
     for phase in experiment.phases:
-        trials = optuna.load_study(
-            study_name=f"{experiment.experiment}::{phase.name}", storage=storage
-        ).trials
+        trials = phase_trials(experiment, phase.name)
         assert [trial.state for trial in trials] == [optuna.trial.TrialState.COMPLETE] * 2
         assert all(trial.value is not None and math.isfinite(trial.value) for trial in trials)
         winner = winners[phase.name]
@@ -126,7 +137,6 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
             provenance = json.loads(trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR])
             capture = provenance["remote_capture"]
             assert capture["run_id"] == trial.user_attrs[ATTEMPT_ID_ATTR]
-            assert capture["run_state"] == "finished"
             assert capture["values"]["eval/loss.min"] == trial.value
             # Loss falls monotonically, so the min is the last evaluation.
             assert provenance["source"]["evaluation"] == {
@@ -168,7 +178,101 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
         replayed = run_experiment(experiment)
     for phase in experiment.phases:
         assert replayed[phase.name].attempt_id == winners[phase.name].attempt_id
-        trials = optuna.load_study(
-            study_name=f"{experiment.experiment}::{phase.name}", storage=storage
-        ).trials
+        trials = phase_trials(experiment, phase.name)
         assert [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials] == attempts[phase.name]
+
+
+def test_a_rerun_from_a_checkpoint_logs_its_own_run_and_is_scored_over_both(
+    tmp_path: Path,
+) -> None:
+    """An interrupted trial's rerun logs to a new W&B run of its own, and its native min is reduced over both attempts' runs merged by the evaluation axis.
+
+    The first attempt logs steps 1 to 6 of a curve whose minimum is at step 3, waits until
+    W&B serves those rows, and is killed with its runner; the next run reruns the trial,
+    whose trainer continues from its checkpoint and logs steps 7 to 12 to its own run.
+    """
+    import wandb
+
+    base_url, entity, project = _live_target()
+    marker = tmp_path / "interrupt"
+    extractor = WandbExtractor(
+        type="wandb",
+        base_url=base_url,
+        entity=entity,
+        project=project,
+        metric_key="eval/loss.min",
+        evaluation_axis="eval/step",
+        # W&B can serve a finished run's summary minutes after the run ends.
+        timeout_seconds=600,
+        poll_seconds=2,
+    )
+    experiment = Experiment(
+        experiment="wandb_live_resume",
+        workdir=str(tmp_path / "runs"),
+        storage="auto",
+        provenance={"trainer": "tests/wandb_live_trainer.py"},
+        override_format="argparse",
+        trial_command=(
+            f"{shlex.join([sys.executable, str(_TRAINER)])} --receipt {{trial_dir}}/parameters.json "
+            f"--interrupt_marker {shlex.quote(str(marker))} {{overrides}}"
+        ),
+        execution=ExecutionContext(
+            inherit_env="none", passthrough_env=_PASSTHROUGH, cwd=str(tmp_path)
+        ),
+        metric=Metric(name="eval_loss", goal="minimize", extractor=extractor),
+        timeout_seconds_per_run=3600,
+        phases=[
+            Phase(
+                name="resume",
+                n_trials=1,
+                gpu_policy="none",
+                sampler=Sampler(type="grid"),
+                # The first attempt waits up to 600 s for W&B to serve its rows.
+                timeout_seconds_per_trial=1200,
+                timeout_seconds_per_phase=2400,
+                search_space={"learning_rate": CategoricalParam(type="categorical", choices=[0.1])},
+            )
+        ],
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    with runner_once(config, marker, timeout=900):
+        pass
+
+    winner = run_experiment(experiment)["resume"]
+    first, rerun = phase_trials(experiment, "resume")
+    opener, rerun_id = first.user_attrs[ATTEMPT_ID_ATTR], rerun.user_attrs[ATTEMPT_ID_ATTR]
+    api = wandb.Api(overrides={"base_url": base_url}, timeout=60)
+    runs = {attempt: api.run(f"{entity}/{project}/{attempt}") for attempt in (opener, rerun_id)}
+    histories = {
+        attempt: list(run.scan_history(keys=["_step", "eval/step", "eval/loss"]))
+        for attempt, run in runs.items()
+    }
+    details = "; ".join(
+        f"W&B run {run.url}: state {run.state!r}, summary {dict(run.summary_metrics)!r}, "
+        f"history {histories[attempt]!r}"
+        for attempt, run in runs.items()
+    )
+    assert rerun.user_attrs[RERUN_OF_ATTR] == first.number, details
+    assert winner.trial_number == rerun.number, details
+    assert runs[rerun_id].state == "finished", details
+    # Each attempt's steps in its own run, and W&B's own step restarting in the rerun's.
+    split = INTERRUPT_STEP + 1
+    assert [row["eval/step"] for row in histories[opener]] == list(range(1, split)), details
+    assert [row["eval/step"] for row in histories[rerun_id]] == list(
+        range(split, CURVE_STEPS + 1)
+    ), details
+    assert [row["_step"] for row in histories[rerun_id]] == list(
+        range(CURVE_STEPS - INTERRUPT_STEP)
+    )
+    # The rerun's own summary holds only its own minimum; the trial's comes from both runs.
+    own_min = runs[rerun_id].summary_metrics["eval/loss.min"]
+    assert own_min == pytest.approx(curve_loss(split)), details
+    expected = min(curve_loss(step) for step in range(1, CURVE_STEPS + 1))
+    provenance = json.loads(rerun.user_attrs[OBJECTIVE_PROVENANCE_ATTR])
+    capture = provenance["remote_capture"]
+    assert capture["run_id"] == provenance["source"]["run_id"] == rerun_id, details
+    assert EARLIER_ATTEMPT_RESULT_ATTR not in rerun.user_attrs, details
+    assert rerun.value == capture["values"]["eval/loss.min"] == expected, details
+    assert provenance["source"]["evaluation"] == {
+        "progress": {"axis": "eval/step", "value": CURVE_STEPS}
+    }, details

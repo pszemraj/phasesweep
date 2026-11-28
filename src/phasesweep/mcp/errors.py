@@ -506,8 +506,8 @@ class RunCapacityUnknownError(McpToolError):
                 if any(is_file for _label, is_file in shown_records)
                 else ""
             )
-            # A trial carries the run id in its arguments only when its command uses
-            # {trial_dir}, but always in its environment as PHASESWEEP_GENERATION_ID. The
+            # A trial's directory name carries no generation, so a trial carries the run id
+            # only in its environment, as PHASESWEEP_GENERATION_ID. The
             # listing prints PIDs alone: its input holds each process's whole environment,
             # credentials included, and only for the processes of the user who runs it.
             remaining = (

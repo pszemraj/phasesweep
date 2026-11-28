@@ -2,28 +2,84 @@
 
 from __future__ import annotations
 
-from phasesweep.config.models import Observation, Phase
+from phasesweep.config.models import Constraint, Experiment, Metric, Observation, Phase
 from phasesweep.config.search import Repeats, Sampler
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
-from phasesweep.evidence.models import LogRegexExtractor
+from phasesweep.evidence.evaluation import extractor_config_fingerprint
+from phasesweep.evidence.models import LogRegexExtractor, WandbExtractor, WandbSummaryRequiredGate
 from tests.conftest import bounded_metric, make_experiment
 
 
-def test_metric_bounds_are_semantic() -> None:
-    """Selection reads the bounds, so moving or adding one changes both fingerprints."""
+def test_bounds_judge_results_so_only_a_published_result_records_them() -> None:
+    """Moving or adding a metric or constraint bound keeps the phase fingerprint, so the study's measured trials are re-judged, and moves the experiment fingerprint a published winner was selected under; adding a constraint moves both."""
+
+    def constraint(**bounds: float) -> Constraint:
+        return Constraint(
+            name="c",
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"c=(?P<value>.+)"),
+            **bounds,
+        )
+
     variants = {
-        "unbounded": make_experiment(metric=bounded_metric()),
-        "max": make_experiment(metric=bounded_metric(max=2.0)),
-        "max_moved": make_experiment(metric=bounded_metric(max=3.0)),
-        "min": make_experiment(metric=bounded_metric(min=0.5)),
-        "both": make_experiment(metric=bounded_metric(min=0.5, max=2.0)),
+        "unbounded": make_experiment(metric=bounded_metric(), constraints=[constraint(max=1.0)]),
+        "max": make_experiment(metric=bounded_metric(max=2.0), constraints=[constraint(max=1.0)]),
+        "max_moved": make_experiment(
+            metric=bounded_metric(max=3.0), constraints=[constraint(max=1.0)]
+        ),
+        "min": make_experiment(metric=bounded_metric(min=0.5), constraints=[constraint(max=1.0)]),
+        "constraint_moved": make_experiment(
+            metric=bounded_metric(), constraints=[constraint(max=5.0)]
+        ),
+        "constraint_min": make_experiment(
+            metric=bounded_metric(), constraints=[constraint(min=0.1, max=1.0)]
+        ),
     }
 
-    phase_fps = {n: _phase_fingerprint(e, e.phases[0], {}) for n, e in variants.items()}
-    experiment_fps = {n: _experiment_semantic_fingerprint(e) for n, e in variants.items()}
+    phase_fps = {_phase_fingerprint(e, e.phases[0], {}) for e in variants.values()}
+    experiment_fps = {_experiment_semantic_fingerprint(e) for e in variants.values()}
 
-    assert len(set(phase_fps.values())) == len(variants)
-    assert len(set(experiment_fps.values())) == len(variants)
+    assert len(phase_fps) == 1
+    assert len(experiment_fps) == len(variants)
+    unconstrained = make_experiment(metric=bounded_metric())
+    assert _phase_fingerprint(unconstrained, unconstrained.phases[0], {}) not in phase_fps
+
+
+def test_tracker_read_controls_and_the_metric_name_are_not_semantic() -> None:
+    """A W&B source's poll and timeout bound the read and the metric name only labels output, so neither moves a study, experiment or extractor identity."""
+
+    def experiment(*, name: str, poll: float, timeout: float) -> Experiment:
+        source = {"entity": "e", "project": "p", "poll_seconds": poll, "timeout_seconds": timeout}
+        gate = WandbSummaryRequiredGate(type="wandb_summary_required", keys=["k"], **source)
+        return make_experiment(
+            metric=Metric(
+                name=name, extractor=WandbExtractor(type="wandb", metric_key="m", **source)
+            ),
+            constraints=[
+                Constraint(
+                    name="c",
+                    extractor=WandbExtractor(type="wandb", metric_key="c", **source),
+                    max=1,
+                )
+            ],
+            gates=[gate],
+        )
+
+    variants = [
+        experiment(name="loss", poll=2.0, timeout=120.0),
+        experiment(name="loss", poll=0.5, timeout=600.0),
+        experiment(name="eval_loss", poll=2.0, timeout=120.0),
+    ]
+
+    assert len({_phase_fingerprint(e, e.phases[0], {}) for e in variants}) == 1
+    assert len({_experiment_semantic_fingerprint(e) for e in variants}) == 1
+    assert len({extractor_config_fingerprint(e.metric.extractor) for e in variants}) == 1
+    moved = experiment(name="loss", poll=2.0, timeout=120.0)
+    moved = moved.model_copy(
+        update={"metric": moved.metric.model_copy(update={"goal": "maximize"})}
+    )
+    assert _phase_fingerprint(moved, moved.phases[0], {}) != _phase_fingerprint(
+        variants[0], variants[0].phases[0], {}
+    )
 
 
 def test_observe_is_not_semantic() -> None:

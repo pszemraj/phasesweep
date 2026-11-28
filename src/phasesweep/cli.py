@@ -13,6 +13,7 @@ import time
 import traceback
 from collections.abc import Iterator, Sequence
 from contextvars import ContextVar
+from dataclasses import replace
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn, TextIO
@@ -28,7 +29,7 @@ from phasesweep.config.io import (
     describe_validation_error,
     load_experiment,
 )
-from phasesweep.config.models import Experiment, experiment_disclosures
+from phasesweep.config.models import Experiment, Phase, experiment_disclosures
 from phasesweep.config.reference import (
     ReferenceEntry,
     explain_command,
@@ -50,6 +51,7 @@ from phasesweep.config.run_overrides import (
 )
 from phasesweep.config.search import phase_draws
 from phasesweep.engine.errors import WinnerIntegrityError
+from phasesweep.engine.evidence import pruned_trials_note
 from phasesweep.engine.fingerprints import _recorded_config_matches
 from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.locking import experiment_is_busy
@@ -58,8 +60,8 @@ from phasesweep.engine.paths import (
     _generation_dir,
     _generation_summary_path,
     _generation_winner_path,
+    _phase_dir,
     _run_log_path,
-    _trial_dir_for,
     _trials_csv_path,
 )
 from phasesweep.engine.preview import validate_trial_targets
@@ -74,12 +76,17 @@ from phasesweep.engine.publication import (
 from phasesweep.engine.read import (
     _read_generation_selection,
     _represented_winners,
-    experiment_status,
+    inspect_status,
     read_trial_tables,
     require_study,
+)
+from phasesweep.engine.reread import PendingRereadNotice
+from phasesweep.engine.run import TerminalReport, run_experiment
+from phasesweep.engine.status_refusals import (
+    PendingParentNotice,
+    PhaseRefusal,
     unpublished_winner_step,
 )
-from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.engine.study_policy import _require_launch_target
 from phasesweep.errors import (
     STORAGE_NULL_KEEPS_NOTHING,
@@ -100,11 +107,13 @@ from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.tool_names import TOOL_NAMES
 from phasesweep.reporting import _progress_values, report_objective
 from phasesweep.run_report import (
+    INTERRUPTED_LABEL,
     Banner,
     LogLine,
     NothingToRun,
     Summary,
     banner,
+    interrupted_clause,
     nothing_to_run,
     summary,
 )
@@ -126,8 +135,10 @@ from phasesweep.runtime.shutdown import (
     install_signal_handlers,
 )
 from phasesweep.runtime.terminal import (
+    ReportFields,
     command_line,
     display_path,
+    fit_lines,
     plural,
     terminal_width,
     use_color,
@@ -165,6 +176,7 @@ MCP_CATALOG = click.option(
 _USAGE_EXIT = 2  # bad input: config or arguments
 _FAILURE_EXIT = 1  # the run itself failed
 _INTERNAL_EXIT = 70  # sysexits EX_SOFTWARE: a phasesweep bug
+_RETRY_EXIT = 75  # sysexits EX_TEMPFAIL: the same command can succeed later, unchanged
 _ABORT_EXIT = 130  # 128 + SIGINT
 
 # Column limits for the `explain` listing.
@@ -221,6 +233,16 @@ def _operational_error_text(exc: PhaseSweepError) -> str:
     :return str: Diagnostic followed by its operator step.
     """
     return f"{exc}\nfix: {operator_step(exc)}"
+
+
+def _refusal_exit(exc: PhaseSweepError) -> int:
+    """Choose the exit status of a refusal from its routed action.
+
+    :param PhaseSweepError exc: Operational failure being reported.
+    :return int: ``_RETRY_EXIT`` when rerunning the same command later can succeed with no
+        operator change, otherwise ``_FAILURE_EXIT``.
+    """
+    return _RETRY_EXIT if exc.action is OperatorAction.RETRY else _FAILURE_EXIT
 
 
 def _print_operational_error(exc: PhaseSweepError) -> None:
@@ -320,9 +342,9 @@ def main() -> None:
     exited or a terminal that hung up is discarded, so the status stays the command's own.
 
     :raises SystemExit: Always, carrying one of ``_USAGE_EXIT`` (bad input),
-        ``_FAILURE_EXIT`` (the run failed), ``_INTERNAL_EXIT`` (a phasesweep
-        bug), ``_ABORT_EXIT`` (interrupted), or the status the command or
-        Click chose.
+        ``_FAILURE_EXIT`` (the run failed), ``_RETRY_EXIT`` (the same command can succeed
+        later), ``_INTERNAL_EXIT`` (a phasesweep bug), ``_ABORT_EXIT`` (interrupted), or the
+        status the command or Click chose.
     """
     _RUN_LOG.set(None)
     sys.stdout = _discard_unreadable_output(sys.stdout)
@@ -384,7 +406,7 @@ def _error_boundary() -> None:
         sys.exit(_USAGE_EXIT)
     except PhaseSweepError as exc:
         _print_operational_error(exc)
-        sys.exit(_FAILURE_EXIT)
+        sys.exit(_refusal_exit(exc))
     except OSError as exc:
         click.echo(f"phasesweep: operational error: {exc}", err=True)
         sys.exit(_FAILURE_EXIT)
@@ -809,6 +831,9 @@ def _closing_block(
         show_winners_command=command_line(
             "show-winners", *_config_arguments(config_path, settings)
         ),
+        launch_free_generation_id=(
+            outcome.generation_id if outcome.published_without_launch else None
+        ),
     )
 
 
@@ -959,23 +984,45 @@ def validate(config_path: Path, settings: tuple[str, ...]) -> None:
     click.echo("\n".join([*wrap(sentence, terminal_width(sys.stdout)), dry_run]))
 
 
+def _phase_header(phase: Phase) -> str:
+    """Name a phase with its trial budget, how it samples and the phases it inherits from.
+
+    :param Phase phase: Phase to describe.
+    :return str: The header, such as ``depth: n_trials=2 sampler=grid inherits=a,b``.
+    """
+    sampling = f"sampler={phase.sampler.type}" if phase_draws(phase) else "(fixed configuration)"
+    inherits = f" inherits={','.join(phase.inherits)}" if phase.inherits else ""
+    return f"{phase.name}: n_trials={phase.n_trials} {sampling}{inherits}"
+
+
 def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> None:
     """Render phase summaries and sampler capability lines for ``validate``.
+
+    The phase header and each contract line wrap to the terminal under their own prefix, later
+    lines hanging two more columns in, and each warning wraps under its ``warning:`` label.
 
     :param Experiment experiment: Experiment whose phases should be printed.
     :param str indent: Prefix to place before each rendered phase line.
     """
+    width = terminal_width(sys.stdout)
     for phase, lines in experiment_disclosures(experiment):
         prefix = indent
         if phase is not None:
-            deps = f" inherits={phase.inherits}" if phase.inherits else ""
-            sampling = (
-                f"sampler={phase.sampler.type}" if phase_draws(phase) else "(fixed configuration)"
-            )
-            click.echo(f"{indent}- {phase.name}: n_trials={phase.n_trials} {sampling}{deps}")
+            header = fit_lines(f"- {_phase_header(phase)}", width - len(indent), hanging="  ")
+            click.echo("\n".join(f"{indent}{part}" for part in header))
             prefix += "    "
         for warning, line in lines:
-            click.echo(f"{prefix}{'warning: ' if warning else ''}{line}")
+            if warning:
+                shown = wrap_labeled("warning:", str(line), width, indent=prefix)
+            else:
+                room = width - len(prefix)
+                parts = (
+                    line.render(room, color=False, hanging="  ")
+                    if isinstance(line, ReportFields)
+                    else fit_lines(line, room, hanging="  ")
+                )
+                shown = [f"{prefix}{part}" for part in parts]
+            click.echo("\n".join(shown))
         if phase is not None:
             _render_phase_comment(phase.comment, prefix=f"{indent}    # ")
 
@@ -1239,6 +1286,10 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                     "# Historical published phase result: does not match the current config."
                 )
             _render_phase_comment(comment, prefix="# ")
+            for warning in winner.checkpoint_warnings:
+                click.echo(f"# WARNING: {warning}")
+            if (interrupted := interrupted_clause(winner.reruns)) is not None:
+                click.echo(f"# {INTERRUPTED_LABEL} {interrupted}")
             if winner.repeats is not None:
                 repeats = winner.repeats
                 click.echo(f"# metric is the {repeats['reduce']} over {repeats['n']} repeats.")
@@ -1278,15 +1329,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                         {
                             "trial_number": member["trial_number"],
                             "repeat": member["repeat"],
-                            "trial_dir": str(
-                                _trial_dir_for(
-                                    experiment,
-                                    name,
-                                    member["trial_number"],
-                                    generation_id=member["generation_id"],
-                                    attempt_id=member["attempt_id"],
-                                )
-                            ),
+                            "trial_dir": str(_phase_dir(experiment, name) / member["trial_dir"]),
                         }
                         for member in detail["members"]
                     ]
@@ -1320,18 +1363,34 @@ class _WinnerDumper(yaml.SafeDumper):
 _WinnerDumper.add_representer(float, _WinnerDumper.represent_float)
 
 
-def _status_can_suggest_resume(config: Experiment) -> bool:
-    """Check whether status can confirm the experiment is idle before suggesting a resume.
+def _status_run_is_active(config: Experiment) -> bool | None:
+    """Probe the experiment's run locks once for status.
 
     A lock probe that cannot run leaves the trial data and publication verdict readable.
 
     :param Experiment config: Experiment whose run locks are probed.
-    :return bool: Whether the lock probe found no active run.
+    :return bool | None: Whether another operation holds the locks, ``None`` when the probe
+        could not run, which status treats as neither idle nor active.
     """
     try:
-        return not experiment_is_busy(config)
+        return experiment_is_busy(config)
     except (OSError, UnsafeLockPathError, PlatformCapabilityError):
-        return False
+        return None
+
+
+#: What status says instead of a command that would start a second run, while one is active.
+_RUN_ACTIVE_COMMENT = (
+    "# A run is active on this experiment; counts and winners are as of this read."
+)
+
+
+def _is_settled_by_a_run(refusal: PhaseRefusal | None) -> bool:
+    """Say whether a status notice only asks for a run, which the active run is.
+
+    :param PhaseRefusal | None refusal: A phase's refusal or notice from status.
+    :return bool: Whether it is a pending parent or re-read notice.
+    """
+    return isinstance(refusal, (PendingParentNotice, PendingRereadNotice))
 
 
 @cli.command(
@@ -1360,11 +1419,15 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     The payload is printed first and in full even when it reports a corrupt
     publication: the operator needs the trial counts and generation identity
     to decide what to inspect, and the boundary's one-line diagnostic follows
-    on stderr. An unpublished winner gets a comment explaining how to resume publication,
+    on stderr. A phase whose accepted trial target, recorded abort, failure streak or invalid
+    failure-policy state would refuse a run gets a comment with that refusal and its fix, active run or not.
+    While a run holds the experiment's locks, one comment says so and replaces every notice
+    whose fix is a run command. Otherwise an unpublished winner gets a comment explaining how to resume publication,
     and trials recorded RUNNING while no run holds the experiment's locks get a comment
-    saying that a rerun settles them. These comments require a successful idle lock probe.
-    ``--trials`` prints the trial tables in its place, from one publication resolution,
-    styled only on a terminal, and exits the same way.
+    saying that a rerun settles them; both
+    require a successful idle lock probe. ``--trials`` prints the trial tables in its place,
+    from one publication resolution, with each refusal under its phase's heading, styled only
+    on a terminal, and exits the same way.
 
     :param Path config_path: Experiment YAML file to inspect.
     :param bool show_trials: Print per-phase trial tables instead of the YAML status.
@@ -1375,12 +1438,23 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     """
     config = _command_config(config_path, settings=settings)
     require_study(config)
+    rerun_command = _rerun_command(config_path, settings, None)
+    active = _status_run_is_active(config)
     if show_trials:
         tables = read_trial_tables(config, latest=True)
         width = terminal_width(sys.stdout)
-        running = sum(row["state"] == "RUNNING" for table in tables.phases for row in table.rows)
-        if running and _status_can_suggest_resume(config):
-            click.echo(unsettled_running_comment(running, width))
+        running = tables.unsettled_trials
+        if active:
+            click.echo(_RUN_ACTIVE_COMMENT)
+            tables = replace(
+                tables,
+                phases=tuple(
+                    replace(table, refusal=None) if _is_settled_by_a_run(table.refusal) else table
+                    for table in tables.phases
+                ),
+            )
+        elif running and active is False:
+            click.echo(unsettled_running_comment(running, rerun_command, width))
         click.echo(
             render_trial_tables(
                 tables,
@@ -1388,6 +1462,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
                 csv_root=None if config.persistent else _experiment_dir(config),
                 width=width,
                 color=use_color(sys.stdout),
+                rerun_command=rerun_command,
             )
         )
         raise_for_unusable_publication(
@@ -1398,33 +1473,46 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
         )
         return
     ledger = validate_ledger(config)
-    payload = experiment_status(config, ledger=ledger)
+    inspection = inspect_status(config, ledger)
+    payload = inspection.payload
     phases = payload.get("phases")
     phase_payloads = (
         [phase for phase in phases if isinstance(phase, dict)] if isinstance(phases, list) else []
     )
-    running = 0
-    for phase in phase_payloads:
-        counts = phase.get("trials")
-        recorded = counts.get("RUNNING") if isinstance(counts, dict) else None
-        if isinstance(recorded, int):
-            running += recorded
+    running = inspection.unsettled_trials
     retained = any(
         phase.get("winner") is not None and phase.get("winner_is_published") is False
         for phase in phase_payloads
     )
-    # One probe serves both comments: flock cannot test a lock without taking it.
-    suggest_resume = _status_can_suggest_resume(config) if running or retained else False
-    if running and suggest_resume:
-        click.echo(unsettled_running_comment(running))
-    if retained and suggest_resume:
-        step = unpublished_winner_step(config, ledger)
-        if step is not None:
-            click.echo(
-                "# Winner retained but not published"
-                f"{'.' if step.cause is None else f'; {step.cause}'}"
-            )
-            click.echo(f"# fix: {step.fix}")
+    # One probe serves every comment: flock cannot test a lock without taking it.
+    suggest_resume = active is False
+    if active:
+        click.echo(_RUN_ACTIVE_COMMENT)
+    elif running and suggest_resume:
+        click.echo(unsettled_running_comment(running, rerun_command))
+    # A recorded refusal needs no idle probe: it holds whether or not a run is active, unless
+    # it only asks for the run that is active.
+    refusals = {
+        name: refusal
+        for name, refusal in inspection.refusals.items()
+        if not (active and _is_settled_by_a_run(refusal))
+    }
+    for refusal in refusals.values():
+        for line in _operational_error_text(refusal).splitlines():
+            click.echo(f"# {line}")
+        if isinstance(refusal, PendingRereadNotice):
+            _render_phase_comment(rerun_command, prefix="# ")
+    for phase_name, pruned in inspection.pruned.items():
+        click.echo(f"# {phase_name}: {pruned_trials_note(pruned)}")
+    trial_data_available = not config.persistent or all(
+        phase.get("trial_data_available") is True for phase in phase_payloads
+    )
+    if retained and suggest_resume and not refusals and trial_data_available:
+        step = unpublished_winner_step(config, inspection.studies)
+        click.echo(
+            f"# Winner retained but not published{'.' if step.cause is None else f'; {step.cause}'}"
+        )
+        click.echo(f"# fix: {step.fix}")
     click.echo(yaml.dump(payload, Dumper=_WinnerDumper, sort_keys=False).rstrip())
     raise_for_unusable_publication(
         str(payload["experiment"]),
@@ -1446,7 +1534,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     "--generation",
     "generation_id",
     default=None,
-    help="Limit reconciliation and uploads to this generation.",
+    help="Retry delivery for this generation, including any shared attempt upload it needs.",
 )
 def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[str, ...]) -> None:
     """Reconcile pending native MLflow runs and retry result delivery.
@@ -1538,7 +1626,7 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
     raise PhaseSweepError(
         f"MLflow delivery remains pending: {count_text(records, len(creations))} could not be "
         "sent or settled; the warnings above give each cause.",
-        action=OperatorAction.RETRY,
+        action=OperatorAction.INSPECT_LOGS,
         remediation=f"Once those causes are resolved, {again}",
     )
 
@@ -1555,7 +1643,7 @@ def _sync_stopped_text(config: Experiment, generation_id: str | None, command: s
     from phasesweep.tracking.session import count_text
 
     try:
-        counts = delivery_counts(config, generation_id)
+        counts = delivery_counts(config, generation_id, shared=True)
     except (OSError, ValueError) as exc:
         stopped = f"phasesweep: stopped; what stays pending could not be counted ({exc})."
     else:
@@ -1645,7 +1733,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
             recover_run(state_dir, run_id, confirm=confirm, emit=click.echo)
         except RunRecoveryError as exc:
             _print_operational_error(exc)
-            raise click.exceptions.Exit(_FAILURE_EXIT) from None
+            raise click.exceptions.Exit(_refusal_exit(exc)) from None
         except PhaseSweepShutdown:
             # A stopped pass leaves the run recovery-required unless it had already cleared it,
             # and either way the same command finishes or confirms the recovery.

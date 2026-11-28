@@ -3,20 +3,23 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Container, Iterable, Mapping
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast, get_args
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, get_args
 
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.engine.errors import StudySchemaMismatchError
 from phasesweep.runtime.json import JsonObject, finite_nonnegative, json_object
 
 if TYPE_CHECKING:
+    from optuna import Study
     from optuna.trial import FrozenTrial, Trial
 
     from phasesweep.engine.confound import ConfoundBlock
     from phasesweep.engine.repeats import RepeatsRecord
+    from phasesweep.engine.trial_dirs import ProducingAttempt
     from phasesweep.runtime.process import AttemptLifecycle
 
 WinnerSourceKind = Literal["phase_trial"]
@@ -130,8 +133,14 @@ class Winner:
     gates: list[dict[str, Any]] = field(default_factory=list)
     completion: dict[str, Any] = field(default_factory=dict)
     phase_fingerprint: str | None = None
+    # Address of the study that selected this winner, including its reading settings.
+    study_name: str | None = None
+    # Highest terminal outcome sequence when this study selected the winner.
+    study_outcome_sequence: int | None = None
     generation_id: str | None = None
     attempt_id: str | None = None
+    # Name of the trial directory inside its phase that the source attempt ran in.
+    trial_dir: str | None = None
     source: WinnerSource | None = None
     # Frozen evidence provenance captured when the winning objective was
     # extracted: extractor config fingerprint plus source digest / frozen
@@ -163,13 +172,33 @@ class Winner:
 
 
 @dataclass(frozen=True)
+class InterruptedReruns:
+    """How far a phase's results lean on reruns of interrupted trials (:func:`_interrupted_reruns`).
+
+    ``results`` counts the trials in a state of :data:`FINISHED_TRIAL_STATES`, ``reruns`` those
+    of them whose :data:`RERUN_OF_ATTR` chain, followed through the study that launched each
+    attempt, reaches an interrupted trial, ``earlier_attempt``
+    those reruns scored from a value an earlier attempt wrote
+    (:data:`EARLIER_ATTEMPT_RESULT_ATTR`), and ``winner`` whether a trial the winner stands on
+    is among the reruns. Computed from the ledger at read time and never saved.
+    """
+
+    results: int = 0
+    reruns: int = 0
+    earlier_attempt: int = 0
+    winner: bool = False
+
+
+@dataclass(frozen=True)
 class PhaseCounts:
     """A phase's trials by recorded state when the phase ended, as the run's summary reports them.
 
     ``earlier`` counts the trials of a state in :data:`FINISHED_TRIAL_STATES` that a previous run
-    recorded, so it is a part of :attr:`counted`. ``winner_dirs`` holds the attempt directory of
+    recorded, so it is a part of :attr:`counted`. ``winner_dirs`` holds the trial directory of
     each trial the phase's winner stands on, in trial order, leaving out one that recorded none;
-    it is read for the summary and never saved.
+    it is read for the summary and never saved. ``interrupted`` counts the interrupted trials
+    still waiting for a rerun (:func:`_unreplaced_attempts`), as the status heading does, and
+    ``reruns`` the results that reran one.
     """
 
     complete: int = 0
@@ -178,6 +207,7 @@ class PhaseCounts:
     interrupted: int = 0
     earlier: int = 0
     winner_dirs: tuple[Path, ...] = ()
+    reruns: InterruptedReruns = InterruptedReruns()
 
     @property
     def counted(self) -> int:
@@ -200,28 +230,33 @@ class PhaseCounts:
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"
 GENERATION_ID_ATTR = "phasesweep_generation_id"
 ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
-PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
-# The canonical payload PHASE_FINGERPRINT_ATTR is the digest of, recorded beside
-# it so a refusal can name which keys changed instead of two opaque hashes.
-PHASE_FINGERPRINT_PAYLOAD_ATTR = "phasesweep_fingerprint_payload"
+# A phase study's identity: its fingerprint, the canonical payload that fingerprint digests
+# (so a refusal can name which keys changed instead of two opaque hashes), and every search
+# space the study has run under with the draw position each took effect at. One attr, so a
+# crash cannot leave a fingerprint beside a payload or history it does not describe.
+PHASE_IDENTITY_ATTR = "phasesweep_phase_identity"
+PHASE_IDENTITY_SCHEMA_VERSION = 4
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 12
+STUDY_SCHEMA_VERSION = 27
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The
 # outcome that trips a phase abort carries that abort record under
 # ``TRIAL_OUTCOME_ABORT_KEY``, so the decision is as durable as the outcome and
 # a restarted orchestrator cannot reinterpret the same terminal trials as a
-# completed phase.
+# completed phase. A trial whose values were measured records ``success`` with its metric,
+# whatever the bounds say: the failure policy judges the values when it replays the outcomes.
 TRIAL_OUTCOME_ATTR = "phasesweep_trial_outcome"
-TRIAL_OUTCOME_SCHEMA_VERSION = 3
+TRIAL_OUTCOME_SCHEMA_VERSION = 4
 TRIAL_OUTCOME_ABORT_KEY = "abort"
 # ``interrupted`` is the one label for a trial whose orchestrator stopped it before it
 # could finish: a signal, a phase or run deadline, or recovery after the orchestrator died.
 # The outcome's ``cause`` says which.
 _TRIAL_OUTCOMES = frozenset({"success", "failure", "interrupted", "fatal"})
 # On an interrupted rerun or failed grid-cell retry: the source's trial number,
-# written in the new attempt's creation record. It takes its source's draw position.
+# written in the new attempt's creation record. It takes its source's draw position. On a row
+# adopted from another study of the phase it names the row of this study the adopted attempt
+# reruns, never a row of the study that launched it.
 RERUN_OF_ATTR = "phasesweep_rerun_of"
 # Durable boundary established when the operator explicitly raises n_trials
 # after an abort. Outcomes through this sequence belong to the aborted attempt;
@@ -230,8 +265,7 @@ PHASE_RECOVERY_ATTR = "phasesweep_phase_recovery"
 PHASE_RECOVERY_SCHEMA_VERSION = 1
 # Accepted partial-timeout decision; replay selects without allocating the remaining trials.
 PHASE_DECISION_ATTR = "phasesweep_phase_decision"
-PHASE_DECISION_SCHEMA_VERSION = 2
-FEASIBLE_ATTR = "phasesweep_feasible"
+PHASE_DECISION_SCHEMA_VERSION = 3
 GATES_ATTR = "phasesweep_gates"
 # JSON-encoded frozen objective evidence provenance; written when metric
 # extraction succeeds.
@@ -258,6 +292,14 @@ OVERRIDES_ATTR = "phasesweep_overrides"
 CLEANUP_CONFIRMED_ATTR = "phasesweep_cleanup_confirmed"
 CLEANUP_RECOVERED_TRIALS_ATTR = "phasesweep_cleanup_recovered_trials"
 FAILURE_REASON_ATTR = "phasesweep_failure_reason"
+# ``True`` on an interrupted trial whose trainer exited 0 in a directory an earlier attempt
+# used and left nothing to score there. Its rerun opens a fresh directory
+# (:func:`phasesweep.engine.trial_dirs._rerun_directory_sources`), where nothing predates the
+# attempt, so the same verdict cannot recur.
+LEFT_NOTHING_TO_SCORE_ATTR = "phasesweep_left_nothing_to_score"
+# ``True`` on a measured trial whose value evidence includes a file an earlier attempt of the
+# trial wrote and the measured attempt did not rewrite; its reason line says so.
+EARLIER_ATTEMPT_RESULT_ATTR = "phasesweep_earlier_attempt_result"
 # How the metric extractor names itself in a failed trial's reason: ``<label>: <cause>`` when
 # the objective could not be read. The producer and the remedy that recognizes the reason
 # share this one string.
@@ -281,6 +323,91 @@ def _study_schema_supported(version: object, has_trials: bool) -> bool:
     return (type(version) is int and version == STUDY_SCHEMA_VERSION) or (
         version is None and not has_trials
     )
+
+
+class SearchSpaceEntry(TypedDict):
+    """One search space a phase's study ran under, from the draw position it took effect at."""
+
+    #: The phase's ``search_space`` as its fingerprint payload holds it, key by key.
+    search_space: JsonObject
+    #: The first draw position drawn under this space; zero for the study's first entry.
+    first_position: int
+
+
+class PhaseIdentityRecord(TypedDict):
+    """The identity a phase's study was bound to, under :data:`PHASE_IDENTITY_ATTR`."""
+
+    schema_version: int
+    #: SHA-256 of ``payload``.
+    fingerprint: str
+    #: The canonical fingerprint payload of the config the study is bound to.
+    payload: JsonObject
+    #: Every search space the study ran under, oldest first; the last is ``payload``'s.
+    search_spaces: list[SearchSpaceEntry]
+
+
+def _parsed_search_space_entry(value: object, *, previous: int | None) -> SearchSpaceEntry:
+    """Parse one recorded search-space entry.
+
+    :param object value: Decoded entry.
+    :param int | None previous: The previous entry's ``first_position``, or None for the first.
+    :raises ValueError: The entry is malformed, or its position does not follow the previous one.
+    :return SearchSpaceEntry: The entry.
+    """
+    if not isinstance(value, dict) or set(value) != {"search_space", "first_position"}:
+        raise ValueError("a search-space entry needs exactly search_space and first_position")
+    position = value["first_position"]
+    if type(position) is not int or (position != 0 if previous is None else position < previous):
+        raise ValueError(f"first_position {position!r} does not follow {previous!r}")
+    return {"search_space": json_object(value["search_space"]), "first_position": position}
+
+
+def _recorded_identity(study: Study) -> PhaseIdentityRecord | None:
+    """Read the identity a phase's study was bound to.
+
+    :param Study study: A phase's study, live or a read-only snapshot.
+    :raises StudySchemaMismatchError: The recorded identity is malformed.
+    :return PhaseIdentityRecord | None: The record, or None when the study has none yet.
+    """
+    return _parsed_phase_identity(study.user_attrs.get(PHASE_IDENTITY_ATTR), study.study_name)
+
+
+def _parsed_phase_identity(value: object, study_name: str) -> PhaseIdentityRecord | None:
+    """Parse a study's recorded identity.
+
+    :param object value: Stored identity record, or None.
+    :param str study_name: Study named in a schema refusal.
+    :raises StudySchemaMismatchError: The identity is malformed.
+    :return PhaseIdentityRecord | None: The identity, or None when absent.
+    """
+    if value is None:
+        return None
+    try:
+        if not isinstance(value, dict) or set(value) != PhaseIdentityRecord.__required_keys__:
+            raise ValueError("the record's fields differ from the current format")
+        if value["schema_version"] != PHASE_IDENTITY_SCHEMA_VERSION:
+            raise ValueError(f"schema_version {value['schema_version']!r}")
+        fingerprint, payload, entries = (
+            value["fingerprint"],
+            value["payload"],
+            value["search_spaces"],
+        )
+        if not isinstance(fingerprint, str) or not isinstance(entries, list) or not entries:
+            raise ValueError("fingerprint or search_spaces is malformed")
+        parsed: list[SearchSpaceEntry] = []
+        for entry in entries:
+            previous = parsed[-1]["first_position"] if parsed else None
+            parsed.append(_parsed_search_space_entry(entry, previous=previous))
+        return {
+            "schema_version": PHASE_IDENTITY_SCHEMA_VERSION,
+            "fingerprint": fingerprint,
+            "payload": json_object(payload),
+            "search_spaces": parsed,
+        }
+    except (KeyError, ValueError) as exc:
+        raise StudySchemaMismatchError(
+            f"Study {study_name!r} has a malformed {PHASE_IDENTITY_ATTR!r} record: {exc}."
+        ) from exc
 
 
 def constraint_attr(name: str) -> str:
@@ -381,7 +508,7 @@ def _trial_outcome_payload(
 
     :param int sequence: Completion sequence assigned under the outcome lock.
     :param str outcome: Terminal outcome category.
-    :param float | None metric: Accepted scalar to tell Optuna, including measured infeasibility.
+    :param float | None metric: Measured scalar to tell Optuna, set exactly on a ``success``.
     :param str | None cause: Failure explanation when present.
     :param str | None policy: Fatal policy when present.
     :param JsonObject | None abort: Phase abort tripped by this outcome.
@@ -409,8 +536,8 @@ def _parsed_trial_outcome(value: object) -> _ParsedTrialOutcome | None:
     :param object value: Raw ``TRIAL_OUTCOME_ATTR`` user-attr value to validate.
     :return _ParsedTrialOutcome | None: Validated outcome, including the fatal
         policy needed to distinguish cleanup uncertainty from ordinary errors
-        and the abort record a failure or fatal outcome tripped; ``None`` when
-        the payload is malformed.
+        and the abort record a failure, fatal or out-of-bounds success outcome tripped;
+        ``None`` when the payload is malformed.
     """
     if not isinstance(value, dict):
         return None
@@ -427,18 +554,14 @@ def _parsed_trial_outcome(value: object) -> _ParsedTrialOutcome | None:
         or sequence < 1
         or not isinstance(outcome, str)
         or outcome not in _TRIAL_OUTCOMES
-        or (outcome == "success" and metric is None)
-        or (metric is not None and outcome not in {"success", "failure"})
+        or (outcome == "success") != (metric is not None)
         or (cause is not None and not isinstance(cause, str))
         or (
             policy is not None and (outcome != "fatal" or not isinstance(policy, str) or not policy)
         )
         or (
             abort is not None
-            and (
-                outcome not in {"failure", "fatal"}
-                or not _valid_abort_record(abort, sequence=sequence)
-            )
+            and (outcome == "interrupted" or not _valid_abort_record(abort, sequence=sequence))
         )
     ):
         return None
@@ -490,24 +613,38 @@ def _unique_trial_outcomes(
 
 
 def _completed_trainer_duration(
-    trial: FrozenTrial | Trial, lifecycle: AttemptLifecycle | None
+    trial: FrozenTrial | Trial,
+    lifecycle: AttemptLifecycle | None,
+    *,
+    rechecking_evidence: bool = False,
 ) -> float | None:
     """Return completed trainer time without confusing SDK worker exits with trainer exits.
 
     Evidence workers reuse the process slot after trainer exit. The ledger records
-    trainer metadata before extraction; the guardian record covers an earlier runner death.
+    trainer metadata before extraction; the guardian record covers an earlier runner death,
+    and only a record of the trainer's own ending carries its exit.
 
     :param FrozenTrial | Trial trial: Trial carrying trainer exit attributes, when committed.
     :param AttemptLifecycle | None lifecycle: Current process-slot evidence, or None to require trainer ledger attributes.
+    :param bool rechecking_evidence: A committed outcome can record an extraction failure
+        after a successful trainer exit. Count that trainer for a re-read, but skip a trainer
+        interrupted by its per-trial timeout, even if it exited cleanly on termination.
     :return float | None: Successful trainer duration, or None when exit evidence is incomplete or invalid.
     """
     if FAILURE_REASON_ATTR in trial.user_attrs:
-        return None
+        from phasesweep.runtime.process import TIMEOUT_REASON_PREFIX
+
+        reason = trial.user_attrs[FAILURE_REASON_ATTR]
+        if not rechecking_evidence or (
+            isinstance(reason, str) and reason.startswith(TIMEOUT_REASON_PREFIX)
+        ):
+            return None
+    record = lifecycle if lifecycle is not None and lifecycle.ended_by == "trainer" else None
     return_code = trial.user_attrs.get(
-        RETURN_CODE_ATTR, None if lifecycle is None else lifecycle.return_code
+        RETURN_CODE_ATTR, None if record is None else record.return_code
     )
     duration = trial.user_attrs.get(
-        DURATION_ATTR, None if lifecycle is None else lifecycle.duration_seconds
+        DURATION_ATTR, None if record is None else record.duration_seconds
     )
     if type(return_code) is not int or return_code != 0:
         return None
@@ -519,18 +656,35 @@ def _trial_lifecycle(trial: FrozenTrial | Trial) -> AttemptLifecycle | None:
     """Read the attempt lifecycle record in the directory a trial recorded for its attempt.
 
     :param FrozenTrial | Trial trial: Trial whose directory and attempt id attributes name the record.
-    :raises ValueError: The record is unreadable, malformed or belongs to another attempt. A
-        caller that acts on the process treats that as cleanup uncertainty, not as absence.
+    :raises ValueError: The recorded trial directory is malformed, or the record is
+        unreadable, malformed or belongs to another attempt. A caller that acts on the process
+        treats that as cleanup uncertainty, not as absence.
     :return AttemptLifecycle | None: The validated record, or ``None`` when the trial recorded
         no directory or attempt id, or its directory holds no record.
     """
     from phasesweep.runtime.process import read_attempt_lifecycle
 
-    directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
+    directory = _trial_attempt_dir(trial)
     attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
-    if not isinstance(directory, str) or not isinstance(attempt_id, str):
+    if directory is None or not isinstance(attempt_id, str):
         return None
-    return read_attempt_lifecycle(Path(directory), expected_attempt_id=attempt_id)
+    return read_attempt_lifecycle(directory, expected_attempt_id=attempt_id)
+
+
+def _trial_attempt_dir(trial: FrozenTrial | Trial) -> Path | None:
+    """Return the records directory of the attempt a trial recorded, beside its trial directory.
+
+    :param FrozenTrial | Trial trial: Trial whose directory and attempt id attributes name it.
+    :raises ValueError: The recorded trial directory is malformed.
+    :return Path | None: The attempt directory, or ``None`` when either attribute is missing.
+    """
+    from phasesweep.engine.paths import _attempt_dir
+
+    directory = _recorded_trial_dir(trial)
+    attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+    if directory is None or not isinstance(attempt_id, str) or not attempt_id:
+        return None
+    return _attempt_dir(directory.parent, attempt_id)
 
 
 def _recovered_trial_state(
@@ -543,18 +697,24 @@ def _recovered_trial_state(
 
     :param FrozenTrial trial: Trial whose finished training may await extraction.
     :param _ParsedTrialOutcome | None outcome: Its unique committed outcome, if any.
-    :return RecoveredTrialState: Pending evidence, a recorded failure, or an interruption.
+    :return RecoveredTrialState: Pending evidence, a recorded failure or a trainer's own
+        crash, or an interruption.
     """
     if outcome is not None:
         if outcome.metric is not None:
             return "EVIDENCE_PENDING"
         return "INTERRUPTED" if outcome.outcome == "interrupted" else "FAIL"
+    from phasesweep.engine.trial import _trainer_failure_reason
+
     try:
         lifecycle = _trial_lifecycle(trial)
     except ValueError:
         return "INTERRUPTED"
     if lifecycle is not None and _completed_trainer_duration(trial, lifecycle) is not None:
         return "EVIDENCE_PENDING"
+    directory = _trial_attempt_dir(trial)
+    if directory is not None and _trainer_failure_reason(trial, lifecycle, directory) is not None:
+        return "FAIL"
     return "INTERRUPTED"
 
 
@@ -595,6 +755,61 @@ def _unreplaced_attempts(trials: Iterable[FrozenTrial], *, interrupted: bool) ->
     ]
 
 
+def _interrupted_reruns(
+    trials: Iterable[FrozenTrial],
+    standing: Mapping[int, str | None] | None = None,
+    *,
+    producers: Mapping[str, ProducingAttempt],
+    counted: Container[int] | None = None,
+) -> InterruptedReruns:
+    """Count a phase's results that rerun an interrupted trial, the one rule every report uses.
+
+    A result is a trial that counts toward ``n_trials``. It reran an interrupted trial when
+    any attempt its physical :data:`RERUN_OF_ATTR` chain names was interrupted
+    (:func:`phasesweep.engine.trial_dirs._rerun_chain`), so a failed grid cell's retry of an
+    interrupted cell counts too, and so does an attempt another reading of the phase adopted
+    into a slot that names no rerun. A frozen MCP result that recovery settles adds what its
+    settled trials count here (``counted``).
+
+    :param Iterable[FrozenTrial] trials: Every trial of one study.
+    :param Mapping[int, str | None] | None standing: The winner's trials
+        (:func:`_winning_trials`), or ``None`` where the caller has no winner, defaults to None.
+    :param Mapping[str, ProducingAttempt] producers: The phase's launching rows by attempt ID
+        (:func:`phasesweep.engine.trial_dirs.producing_attempts`), from the same capture as
+        ``trials``.
+    :param Container[int] | None counted: The trial numbers to count, defaults to every result.
+    :raises ProcessCleanupUncertainError: A rerun link does not name an earlier trial.
+    :return InterruptedReruns: The counts, all zero for a phase no interruption touched.
+    """
+    from phasesweep.engine.trial_dirs import _rerun_chain
+
+    by_number = {trial.number: trial for trial in trials}
+    results = [
+        trial
+        for trial in by_number.values()
+        if trial.state.name in FINISHED_TRIAL_STATES
+        and not _trial_interrupted(trial)
+        and (counted is None or trial.number in counted)
+    ]
+    reruns = [
+        trial
+        for trial in results
+        if any(
+            _trial_interrupted(source)
+            for source in islice(_rerun_chain(by_number, trial, attempts=producers), 1, None)
+        )
+    ]
+    return InterruptedReruns(
+        results=len(results),
+        reruns=len(reruns),
+        earlier_attempt=sum(
+            1 for trial in reruns if trial.user_attrs.get(EARLIER_ATTEMPT_RESULT_ATTR) is True
+        ),
+        winner=standing is not None
+        and any(_stands_under_winner(trial, standing) for trial in reruns),
+    )
+
+
 def _winning_trials(
     trial_number: int, attempt_id: str | None, repeats: RepeatsRecord | None
 ) -> dict[int, str | None]:
@@ -629,23 +844,44 @@ def _stands_under_winner(trial: FrozenTrial, standing: Mapping[int, str | None])
     return attempt is None or trial.user_attrs.get(ATTEMPT_ID_ATTR) == attempt
 
 
-def _recorded_trial_dir(trial: FrozenTrial) -> Path | None:
-    """Return the attempt directory a trial recorded when it launched.
+def _recorded_trial_dir(trial: FrozenTrial | Trial) -> Path | None:
+    """Return the trial directory a trial recorded when it launched, if it recorded one.
 
-    :param FrozenTrial trial: Trial to read.
-    :return Path | None: The directory, or ``None`` when none was recorded.
+    :param FrozenTrial | Trial trial: Trial to read.
+    :raises ValueError: The attribute is present but malformed (:func:`_required_trial_dir`);
+        a damaged record is never read as no record.
+    :return Path | None: The directory, or ``None`` when the attribute is absent.
     """
-    directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
-    return Path(directory) if isinstance(directory, str) and directory else None
+    if TRIAL_DIR_ATTR not in trial.user_attrs:
+        return None
+    return _required_trial_dir(trial)
 
 
-GENERATION_SUMMARY_SCHEMA_VERSION = 6
+def _required_trial_dir(trial: FrozenTrial | Trial) -> Path:
+    """Return the trial directory a trial recorded when it launched.
+
+    PhaseSweep records the absolute path of the directory it built, so any other value is a
+    damaged ledger.
+
+    :param FrozenTrial | Trial trial: Trial to read.
+    :raises ValueError: The attribute is absent, or not a non-empty absolute path string.
+    :return Path: The directory.
+    """
+    stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
+    if not isinstance(stored, str) or not stored or not Path(stored).is_absolute():
+        raise ValueError(
+            f"its {TRIAL_DIR_ATTR!r} user attribute is missing or invalid ({stored!r})"
+        )
+    return Path(stored)
+
+
+GENERATION_SUMMARY_SCHEMA_VERSION = 10
 PUBLICATION_POINTER_SCHEMA_VERSION = 2
 # Configuration and reproducibility files frozen into every generation namespace at claim time.
 GENERATION_CONFIG_SNAPSHOT_FILENAME = "config.snapshot.yaml"
 GENERATION_REPRODUCIBILITY_FILENAME = "reproducibility.json"
 # generation_id_source records whether the caller supplied the generation ID or the engine minted it.
-REPRODUCIBILITY_SCHEMA_VERSION = 3
+REPRODUCIBILITY_SCHEMA_VERSION = 4
 
 WINNER_FILENAME = "winner.yaml"
 # Manifest kinds that name a file in the generation namespace root rather than

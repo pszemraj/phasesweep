@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.attempts as attempt_ops
-import phasesweep.engine.evidence as evidence_ops
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.generation as generation_ops
 import phasesweep.engine.guards as guard_ops
@@ -34,6 +33,7 @@ from phasesweep.config.models import (
 from phasesweep.engine.artifact_roots import _artifact_path_mode
 from phasesweep.engine.errors import (
     IncompleteJournalRecordError,
+    PhaseTimeoutError,
     StudyStorageUnavailableError,
     TrackingTargetUnavailableError,
 )
@@ -41,7 +41,7 @@ from phasesweep.engine.optuna import _finished_trial_count, _trial_count_state
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.preview import (
     PhasePreview,
-    RecordedPhase,
+    RecordedStudies,
     _dry_run_total_line,
     _preview_ledger,
     _preview_phase,
@@ -53,10 +53,13 @@ from phasesweep.engine.state import (
     GENERATION_SUMMARY_SCHEMA_VERSION,
     PhaseCounts,
     Winner,
+    _interrupted_reruns,
     _recorded_trial_dir,
     _stands_under_winner,
+    _unreplaced_attempts,
     _winning_trials,
 )
+from phasesweep.engine.trial_dirs import producing_attempts, reused_checkpoint_warnings
 from phasesweep.errors import (
     OperatorAction,
     PhaseSweepError,
@@ -75,6 +78,7 @@ from phasesweep.runtime.shutdown import (
     service_pending_shutdown,
     signal_handler_scope,
 )
+from phasesweep.runtime.terminal import ReportFields
 
 if TYPE_CHECKING:
     from phasesweep.tracking.session import DeliveryTally
@@ -94,7 +98,8 @@ class TerminalReport:
     on success, so a terminal-result consumer need not re-read storage. It is
     ``None`` on every failure path. ``replayed_generation_id`` names the published
     generation whose winners a successful invocation replayed without writing a
-    generation, and is ``None`` otherwise. ``phase_counts`` holds the trial counts of
+    generation, and is ``None`` otherwise. ``published_without_launch`` says that a successful
+    invocation wrote its generation only to publish, launching no trial. ``phase_counts`` holds the trial counts of
     each phase a successful invocation ran, read from its ledger, so a run on in-memory
     storage reports them too.
     """
@@ -109,6 +114,7 @@ class TerminalReport:
     failure_stage: str | None = None
     winners: Mapping[str, Winner] | None = None
     replayed_generation_id: str | None = None
+    published_without_launch: bool = False
     phase_counts: Mapping[str, PhaseCounts] = field(default_factory=dict)
 
 
@@ -153,6 +159,7 @@ def _terminal_report_from_cleanup(
     failure_stage: str | None,
     winners: Mapping[str, Winner] | None = None,
     replayed_generation_id: str | None = None,
+    published_without_launch: bool = False,
     phase_counts: Mapping[str, PhaseCounts] | None = None,
 ) -> TerminalReport:
     """Freeze accumulated cleanup evidence into one terminal report.
@@ -164,6 +171,8 @@ def _terminal_report_from_cleanup(
     :param Mapping[str, Winner] | None winners: Successful published winners.
     :param str | None replayed_generation_id: Published generation whose winners a successful
         invocation replayed without writing a generation.
+    :param bool published_without_launch: Whether a successful invocation wrote its generation
+        only to publish, launching no trial, defaults to False.
     :param Mapping[str, PhaseCounts] | None phase_counts: Trial counts of each phase the
         invocation ran, for a successful one.
     :return TerminalReport: Immutable terminal outcome snapshot.
@@ -179,6 +188,7 @@ def _terminal_report_from_cleanup(
         failure_stage=failure_stage,
         winners=MappingProxyType(dict(winners)) if winners is not None else None,
         replayed_generation_id=replayed_generation_id,
+        published_without_launch=published_without_launch,
         phase_counts=MappingProxyType(dict(phase_counts or {})),
     )
 
@@ -282,8 +292,8 @@ def _run_experiment_outcome(
     """Run the phases and publish their winners while holding the experiment lock.
 
     The invocation's generation is created only when a phase launches a trial or the
-    winners differ from the current publication; a refusal or a no-op replay leaves
-    no generation and leaves both generation pointers as they were.
+    winners differ from the current publication. A refusal leaves both pointers untouched.
+    A matching replay restores the current pointer to that publication without a new generation.
 
     :param Experiment experiment: Parsed experiment config.
     :param str | None from_phase: Optional resume point; see :func:`run_experiment`.
@@ -385,13 +395,6 @@ def _run_experiment_outcome(
             if cleanup.unreadable_evidence:
                 # New trials would bury finished training the tracker has yet to report.
                 raise attempt_ops._pending_evidence_refusal(cleanup.unreadable_evidence)
-            # Validate candidate evidence after recovery and before launching new work.
-            evidence_ops._validate_selection_evidence(experiment, existing_studies)
-            resume_ops._reject_bound_descendant_topups(
-                experiment,
-                from_phase=from_phase,
-                existing_studies=existing_studies,
-            )
             resume_ops._reject_fixed_targets_without_study(
                 experiment,
                 from_phase=from_phase,
@@ -424,9 +427,10 @@ def _run_experiment_outcome(
             if generation.claimed:
                 # Only a claimed generation launched work whose studies need reconciling.
                 reconciliation = attempt_ops._PreflightCleanupReport()
-                if isinstance(exc, TrackingTargetUnavailableError):
-                    # The run just found its tracker unreadable; keep pending training
-                    # without spending another read's timeout before reporting it.
+                if isinstance(exc, (TrackingTargetUnavailableError, PhaseTimeoutError)):
+                    # The run just found its tracker unreadable or spent its budget; keep
+                    # pending training for the next run's read instead of spending another
+                    # read's timeout here, so the close confirms process cleanup only.
                     reconciliation.unreadable_tracker = str(exc)
                 try:
                     guard_ops._reconcile_existing_studies(
@@ -541,6 +545,7 @@ def _run_experiment_outcome(
                     failure_stage=None,
                     winners=result,
                     replayed_generation_id=generation.replayed_generation_id,
+                    published_without_launch=generation.published_without_launch,
                     phase_counts=generation.phase_counts,
                 )
             # Pairs with the start line, so a log that holds several runs shows which finished.
@@ -626,29 +631,40 @@ def _mirror_publication(
 
 
 def _phase_counts(
-    ledger: ledger_ops.ValidatedLedger, phase: Phase, generation_id: str, winner: Winner
+    ledger: ledger_ops.ValidatedLedger,
+    experiment: Experiment,
+    phase: Phase,
+    study_name: str,
+    generation_id: str,
+    winner: Winner,
 ) -> PhaseCounts | None:
     """Count a finished phase's trials by recorded state, and the counted ones an earlier run recorded.
 
-    The counts also carry the attempt directory of each trial the phase's winner stands on, so
-    the summary names them from the same read. Reporting never fails a run whose result is
+    The counts also carry the attempt directory of each trial the phase's winner stands on and
+    the results that reran an interrupted trial, so the summary names them from the same read. Reporting never fails a run whose result is
     already decided, so a ledger that cannot be read back here costs the summary its counts for
     the phase and nothing else.
 
     :param ledger_ops.ValidatedLedger ledger: The run's ledger, memory-backed or journal-backed.
+    :param Experiment experiment: Config whose bounds judge the measured trials.
     :param Phase phase: The phase that just ended.
+    :param str study_name: The study the phase ran in.
     :param str generation_id: This run's generation, which its own trials carry.
     :param Winner winner: The phase's winner, whose trials' directories the counts carry.
     :return PhaseCounts | None: The counts, or ``None`` when the phase's trials cannot be read.
     """
     try:
-        read = ledger_ops.read_phase_trials(ledger, phase)
+        studies = ledger_ops.read_every_phase_study(ledger, [phase.name])[phase.name]
+        study = next((item for item in studies if item.study_name == study_name), None)
+        standing = _winning_trials(winner.trial_number, winner.attempt_id, winner.repeats)
+        producers = producing_attempts(studies)
+        for warning in reused_checkpoint_warnings(studies, standing):
+            log.warning("[%s] %s", phase.name, warning)
     except (PhaseSweepError, OSError) as exc:
         log.warning("Could not count phase %r's trials for the run summary: %s", phase.name, exc)
         return None
-    trials = [] if read is None else read.trials
-    states = Counter(_trial_count_state(trial) for trial in trials)
-    standing = _winning_trials(winner.trial_number, winner.attempt_id, winner.repeats)
+    trials = [] if study is None else study.get_trials(deepcopy=False)
+    states = Counter(_trial_count_state(trial, experiment) for trial in trials)
     standing_dirs = (
         _recorded_trial_dir(trial)
         for trial in sorted(trials, key=lambda trial: trial.number)
@@ -658,11 +674,12 @@ def _phase_counts(
         complete=states["COMPLETE"],
         infeasible=states["INFEASIBLE"],
         failed=states["FAIL"],
-        interrupted=states["INTERRUPTED"],
+        interrupted=len(_unreplaced_attempts(trials, interrupted=True)),
         earlier=_finished_trial_count(
             trial for trial in trials if trial.user_attrs.get(GENERATION_ID_ATTR) != generation_id
         ),
         winner_dirs=tuple(directory for directory in standing_dirs if directory is not None),
+        reruns=_interrupted_reruns(trials, standing, producers=producers),
     )
 
 
@@ -679,8 +696,8 @@ def _run_experiment_inner(
 ) -> dict[str, Winner]:
     """Execute the phase sequence under the caller's locks and signal handlers.
 
-    A live run that launched no trial claims its generation and publishes only when its
-    winners differ from the validated publication, or nothing validates as published.
+    A live run that launched no trial claims its generation and publishes unless the validated
+    publication holds the same winners under a config that matches the current one.
 
     :param Experiment experiment: Parsed experiment config.
     :param str | None from_phase: Resume point whose earlier winners are loaded from disk.
@@ -704,7 +721,7 @@ def _run_experiment_inner(
     dry_run = ledger is None
     skip_until = from_phase is not None
     winners: dict[str, Winner] = {}
-    recorded: dict[str, RecordedPhase | None] = {}
+    recorded: RecordedStudies | None = None
     previews: list[PhasePreview] = []
     preview_context = ""
     if run_deadline is None and not dry_run and experiment.timeout_seconds_per_run is not None:
@@ -729,6 +746,8 @@ def _run_experiment_inner(
             for warning, line in lines:
                 if warning:
                     warn_dry_run("%s", line)
+                elif isinstance(line, ReportFields):
+                    report.info(ReportFields(("DRY RUN", *line.fields)))
                 else:
                     report.info("DRY RUN %s", line)
         preloaded_winners = resume_ops._preflight_skipped_winners(
@@ -764,7 +783,14 @@ def _run_experiment_inner(
         skip_until = False
 
         if ledger is None:
-            previews.append(_preview_phase(experiment, phase, inherited, recorded.get(phase.name)))
+            previews.append(
+                _preview_phase(
+                    experiment,
+                    phase,
+                    inherited,
+                    None if recorded is None else recorded[phase.name],
+                )
+            )
             winner = previews[-1].winner
         else:
             assert generation is not None
@@ -777,7 +803,12 @@ def _run_experiment_inner(
                 run_deadline=run_deadline,
                 tracking=tracking,
             )
-            counts = _phase_counts(ledger, phase, generation.generation_id, winner)
+            study_name = fingerprint_ops.phase_study_name(
+                experiment, phase, fingerprint_ops._inherited_override_payload(phase, inherited)
+            )
+            counts = _phase_counts(
+                ledger, experiment, phase, study_name, generation.generation_id, winner
+            )
             if counts is not None:
                 generation.phase_counts[phase.name] = counts
         if generation is not None:
@@ -797,8 +828,9 @@ def _run_experiment_inner(
                 "No trial launched and generation %s already publishes these winners.",
                 published_id,
             )
-            generation.replayed_generation_id = published_id
+            generation.replay(published_id)
             return winners
+        generation.published_without_launch = True
     generation_id = generation.claim()
     summary_path = path_ops._generation_summary_path(experiment, generation_id)
     summary_path.parent.mkdir(parents=True, exist_ok=True)

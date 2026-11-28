@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Annotated, Literal, NotRequired, TypeAlias
+from typing import Annotated, Literal, NotRequired, TypeAlias, TypeGuard
 
 from pydantic import Field, TypeAdapter, ValidationError
 from typing_extensions import TypedDict
@@ -14,6 +14,31 @@ from phasesweep.runtime.json import JsonObject
 RunMode: TypeAlias = Literal["managed", "trainer"]
 """Whether PhaseSweep creates the attempt's MLflow run or the trainer does."""
 IdentityText: TypeAlias = Annotated[str, Field(min_length=1)]
+CaptureRunState: TypeAlias = Literal["FINISHED", "FAILED", "KILLED"]
+STATUS_BEFORE_DELIVERY = "phasesweep.status_before_delivery"
+# The terminal status PhaseSweep delivered to a run whose attempt or generation it did not accept.
+OUTCOME_TAG = "phasesweep.outcome"
+# Marks the run the newest reading that names it selected as a phase winner.
+WINNER_TAG = "phasesweep.winner"
+WINNER_GENERATION_TAG_PREFIX = "phasesweep.winner_generation."
+
+
+def readable_run_state(
+    status: object, mode: RunMode, tags: Mapping[str, str]
+) -> TypeGuard[CaptureRunState]:
+    """Recognize a finished trainer's native status or the outcome PhaseSweep applied to it.
+
+    :param object status: MLflow status at capture.
+    :param RunMode mode: Owner of the bound run.
+    :param Mapping[str, str] tags: Native tags at capture, or their retained subset.
+    :return bool: Whether MLflow permits reading evidence after successful local training.
+    """
+    return status == "FINISHED" or (
+        mode == "managed"
+        and status in ("FAILED", "KILLED")
+        and tags.get(OUTCOME_TAG) == status
+        and tags.get(STATUS_BEFORE_DELIVERY) in ("RUNNING", "FINISHED")
+    )
 
 
 class SourceIdentity(TypedDict):
@@ -72,11 +97,16 @@ class MlflowQuery(TypedDict):
 
 
 class MlflowCapture(TypedDict):
-    """Frozen native evidence captured from one finished run."""
+    """Frozen native evidence captured from one finished run and the trial's earlier runs.
+
+    ``earlier_bindings`` names, oldest first, the runs of the earlier attempts that ran in
+    the same trial directory, whose metric histories were merged under the bound run's.
+    """
 
     kind: Literal["mlflow"]
     binding: RunBinding
-    run_state: Literal["FINISHED"]
+    earlier_bindings: list[RunBinding]
+    run_state: CaptureRunState
     query: MlflowQuery
     observations: dict[str, Observation]
     retrieved_at: str
@@ -129,13 +159,15 @@ class FindAction(TypedDict):
 
 
 class PublishAction(TypedDict):
-    """Controller request to mirror a retained delivery record, as persisted."""
+    """Controller request to mirror a retained delivery record."""
 
     action: Literal["publish"]
     name: str
     binding: JsonObject
     projection: JsonObject
     finish: str | None
+    historical: bool
+    current_winner: NotRequired[bool]
 
 
 TrackingAction: TypeAlias = ResolveAction | CreateAction | FindAction | PublishAction
@@ -170,11 +202,12 @@ class PendingCreation(TypedDict):
 
 
 class CaptureRequest(TypedDict):
-    """Worker request to fetch finished evidence for a bound run."""
+    """Worker request to fetch finished evidence for a bound run and the trial's earlier runs."""
 
     action: Literal["capture"]
     settings: MlflowTarget
     binding: RunBinding
+    earlier: list[RunBinding]
     query: MlflowQuery
     timeout_at: float
 
@@ -188,6 +221,8 @@ class PublishRequest(TypedDict):
     binding: RunBinding
     projection: Projection
     finish: str | None
+    historical: NotRequired[bool]
+    current_winner: NotRequired[bool | None]
 
 
 _IDENTITY_ADAPTER: TypeAdapter[RunIdentity] = TypeAdapter(RunIdentity)

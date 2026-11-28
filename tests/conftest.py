@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal, NoReturn, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, ParamSpec, TypeVar
 
 import optuna
 import pytest
@@ -47,14 +47,14 @@ from phasesweep.engine.artifact_roots import (
     _write_artifact_root_binding,
 )
 from phasesweep.engine.confound import CONFOUND_SCHEMA_VERSION
+from phasesweep.engine.fingerprints import phase_study_name
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
+from phasesweep.engine.optuna import _finished_trial_count, _measured_trial_count
 from phasesweep.engine.paths import _last_successful_generation_path, _run_log_path
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     FAILURE_REASON_ATTR,
-    FEASIBLE_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
@@ -64,7 +64,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
 )
-from phasesweep.engine.study_policy import _load_phase_policy_state
+from phasesweep.engine.study_policy import _recorded_outcome_sequence
 from phasesweep.engine.trial import EnvironmentIdentity
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION, TrialContext
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
@@ -72,6 +72,9 @@ from phasesweep.runtime.darwin import read_process_info
 from phasesweep.runtime.files import file_url_path
 from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.runtime.reaper import _read_proc_stat
+
+if TYPE_CHECKING:
+    from tests.recovery_helpers import RerunHarness
 
 # Repository root, derived from the conftest location. Tests that copy/edit
 # the example experiment.yaml read this so they don't hard-code paths.
@@ -341,20 +344,6 @@ def mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
         _write_artifact_root_binding(experiment)
 
 
-def tell_feasible(study: optuna.Study, trial: optuna.Trial, value: float = 0.5) -> None:
-    """Complete a hand-built trial as a run completes one inside every bound.
-
-    A run records the feasibility attr before a trial completes, and a COMPLETE trial
-    without it reads ``INFEASIBLE`` in counts and tables.
-
-    :param optuna.Study study: Study that owns ``trial``.
-    :param optuna.Trial trial: Asked trial to complete.
-    :param float value: Objective value to tell.
-    """
-    trial.set_user_attr(FEASIBLE_ATTR, True)
-    study.tell(trial, value)
-
-
 def stamped_environment_attrs(
     identity: EnvironmentIdentity, *, mapping: bool = True
 ) -> dict[str, object]:
@@ -397,17 +386,53 @@ def bounded_metric(**bounds: float) -> Metric:
     )
 
 
+def study_name(
+    experiment: Experiment,
+    phase_name: str = "p",
+    inherited: Mapping[str, object] | None = None,
+) -> str:
+    """Return the name of the study that holds a phase's trials, given the values it inherits."""
+    return phase_study_name(experiment, experiment.phase(phase_name), inherited or {})
+
+
+def new_phase_study(experiment: Experiment, phase_name: str) -> optuna.Study:
+    """Create one phase's minimizing study."""
+    study = optuna.create_study(
+        study_name=study_name(experiment, phase_name),
+        storage=_resolve_storage(experiment.resolved_storage),
+        direction="minimize",
+    )
+    mark_current_format(experiment, study)
+    return study
+
+
+def addressed_phase_study(experiment: Experiment, phase_name: str = "p") -> optuna.Study:
+    """Open the configured reading of a phase with no inherited values, even among sibling studies."""
+    return optuna.load_study(
+        study_name=study_name(experiment, phase_name),
+        storage=_resolve_storage(experiment.resolved_storage),
+    )
+
+
 def phase_study(experiment: Experiment, phase_name: str = "p") -> optuna.Study:
-    """Read one phase's study from the experiment's ledger.
+    """Read a phase's one study from the experiment's ledger.
+
+    A phase that inherits has one study per set of inherited values, named after the phase's
+    namespace; this reads the only one.
 
     :param Experiment experiment: Experiment whose ledger is read.
     :param str phase_name: Phase whose study is read.
     :return optuna.Study: Its recorded study.
+    :raises AssertionError: The phase has no study or more than one.
     """
-    return optuna.load_study(
-        study_name=f"{experiment.experiment}::{phase_name}",
-        storage=_resolve_storage(experiment.resolved_storage),
-    )
+    storage = _resolve_storage(experiment.resolved_storage)
+    namespace = f"{experiment.experiment}::{phase_name}"
+    (name,) = [
+        name
+        for name in optuna.get_all_study_names(storage=storage)
+        if name == namespace or name.startswith(f"{namespace}::")
+    ]
+    return optuna.load_study(study_name=name, storage=storage)
 
 
 def phase_trials(experiment: Experiment, phase_name: str = "p") -> list[optuna.trial.FrozenTrial]:
@@ -465,9 +490,9 @@ def record_accepted_partial_timeout(study: optuna.Study, target: int) -> None:
             "schema_version": PHASE_DECISION_SCHEMA_VERSION,
             "decision": "accepted_partial_timeout",
             "trial_target": target,
-            "outcome_sequence": _load_phase_policy_state(study).max_sequence,
+            "outcome_sequence": _recorded_outcome_sequence(study),
             "finished_trials": _finished_trial_count(trials),
-            "completed_trials": _completed_trial_count(trials),
+            "measured_trials": _measured_trial_count(trials),
             "timeout_scope": "phase",
             "recovered_abort_sequence": None,
         },
@@ -674,8 +699,9 @@ def console_script(name: str) -> Path:
     return script
 
 
-#: The names of a short trial directory and of a real one, which is wider than a terminal; the
-#: report and trial-table tests each put them under their own parent.
+#: The names of a short trial directory and of an arbitrary one wider than an 80-column line, which
+#: the layout tests of the report and the trial table put under their own parent. The wide name
+#: is not a name PhaseSweep builds; it only has to overrun the terminal.
 SHORT_TRIAL_NAME = "trial_00001"
 ATTEMPT_TRIAL_NAME = (
     "trial_00001__generation_6413d5c1edd5475998cfadd4d3b59980"
@@ -1006,6 +1032,7 @@ def single_trial_confound(trial_number: int) -> dict[str, Any]:
                 },
             },
             "tie": {"verdict": "n/a", "reason": "only one trial was ranked"},
+            "code_revision": {"verdict": "n/a", "reason": "only one trial was ranked"},
         },
     }
 
@@ -1200,6 +1227,7 @@ def make_trial_context(
         attempt_id="attempt-test",
         overrides_sha256="a" * 64,
         trial_dir=tmp_path,
+        attempt_dir=tmp_path,
         run_name=run_name or f"{experiment}-{phase}-{trial_id}-attempt-test",
         return_code=0,
         duration_seconds=0.0,
@@ -1220,7 +1248,9 @@ def wandb_worker_sdk(tmp_path, monkeypatch):
     apis.mkdir(parents=True)
     (root / "wandb" / "__init__.py").write_text("")
     (root / "wandb" / "errors.py").write_text(
-        "class AuthenticationError(Exception): pass\nclass UsageError(Exception): pass\n"
+        "class CommError(Exception): pass\n"
+        "class AuthenticationError(CommError): pass\n"
+        "class UsageError(Exception): pass\n"
     )
     (apis / "__init__.py").write_text("")
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(root), os.environ.get("PYTHONPATH", "")]))
@@ -1229,3 +1259,21 @@ def wandb_worker_sdk(tmp_path, monkeypatch):
         (apis / "public.py").write_text(textwrap.dedent(source))
 
     return install
+
+
+@pytest.fixture
+def harness(tmp_path: Path) -> Iterator[RerunHarness]:
+    """Yield a harness and kill whatever its runs leave alive.
+
+    :param Path tmp_path: The test's scratch directory.
+    :return Iterator[RerunHarness]: The harness.
+    """
+    # recovery_helpers imports this module, so the class is imported at call time.
+    from tests.recovery_helpers import RerunHarness
+
+    built = RerunHarness(tmp_path)
+    try:
+        yield built
+    finally:
+        built.kill_survivors()
+        built.release()

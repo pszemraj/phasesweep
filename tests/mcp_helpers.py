@@ -56,6 +56,7 @@ def fail_prepared_snapshot_reads(monkeypatch: pytest.MonkeyPatch, generation_id:
     def transient_capture_failure(
         ledger: engine_ledger.ValidatedLedger,
         published_trials: Mapping[str, engine_optuna._TrialRef | None],
+        study_names: Mapping[str, str],
     ) -> dict[str, engine_optuna._PhaseTrialStats]:
         if _generation_summary_path(ledger.experiment, generation_id).is_file():
             capture_reads.append(None)
@@ -65,9 +66,9 @@ def fail_prepared_snapshot_reads(monkeypatch: pytest.MonkeyPatch, generation_id:
 
             with monkeypatch.context() as capture_patch:
                 capture_patch.setattr(engine_ledger, "_journal_snapshot_storage", locked_read)
-                return original_stats(ledger, published_trials)
+                return original_stats(ledger, published_trials, study_names)
 
-        return original_stats(ledger, published_trials)
+        return original_stats(ledger, published_trials, study_names)
 
     monkeypatch.setattr("phasesweep.engine.read.read_trial_stats", transient_capture_failure)
     return capture_reads

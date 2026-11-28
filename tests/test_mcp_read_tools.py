@@ -11,7 +11,6 @@ import shutil
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -28,7 +27,7 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
     _last_successful_generation_path,
 )
-from phasesweep.engine.read import EngineStatus, PhaseWinnerView, read_result
+from phasesweep.engine.read import read_result
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
@@ -50,7 +49,12 @@ from phasesweep.mcp.server import (
     GetRunResultsResult,
     GetRunStatusResult,
 )
-from phasesweep.mcp.snapshots import RunResultSnapshot, capture_result_snapshot
+from phasesweep.mcp.snapshots import (
+    RunResultSnapshot,
+    StatusSnapshot,
+    WinnerSnapshot,
+    capture_result_snapshot,
+)
 from phasesweep.mcp.tools import PhaseSweepMCP
 from tests.conftest import (
     phase_study,
@@ -74,6 +78,7 @@ from tests.mcp_helpers import (
     write_srv_config,
     write_unsafe_cleanup_status,
 )
+from tests.recovery_helpers import stale_trial_rerun_config
 
 
 def _record_published_run_snapshot(
@@ -102,6 +107,41 @@ def _record_published_run_snapshot(
         result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
     )
     return run_id, trainer, config, catalog
+
+
+def test_run_status_and_results_count_the_results_that_reran_an_interrupted_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A frozen run snapshot of a phase whose winner reran an interrupted trial counts that rerun in status and results, and says the winner is among them."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    experiment, config = stale_trial_rerun_config(tmp_path, name="srv")
+    app, registry, store = make_mcp_app(write_srv_catalog(tmp_path, config))
+    run_id = "srv-rerun-winner"
+    stage_dead_run(store, run_id, config, registry.get("srv").id, cleanup_uncertain=False)
+    run_experiment(experiment, generation_id=run_id)
+    write_run_status(
+        store,
+        run_id,
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot_state="complete",
+        result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
+    )
+
+    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
+
+    assert status.result_source == results.result_source == "frozen_run_snapshot"
+    (phase,) = status.phases
+    assert (phase.interrupted_reruns, phase.interrupted_reruns_earlier_attempt) == (1, 0)
+    (winner,) = results.phases
+    assert winner.winner_source.trial_number == 1
+    assert (
+        winner.interrupted_reruns,
+        winner.interrupted_reruns_earlier_attempt,
+        winner.winner_interrupted_rerun,
+    ) == (1, 0, True)
 
 
 def _published_run_terminal(
@@ -275,6 +315,30 @@ def test_decataloged_live_run_leaves_config_drift_unknown(tmp_path: Path) -> Non
     assert results.published_config_matches_current is None
 
 
+def test_run_status_says_a_phase_with_no_trials_waits_to_re_read_its_kept_evidence(
+    tmp_path: Path,
+) -> None:
+    """After a goal flip the phase counts nothing yet, and status says the next run re-reads it."""
+    trainer = write_constant_trainer(tmp_path)
+    measured = drift_experiment(tmp_path, trainer)
+    run_experiment(measured)
+    config = tmp_path / "srv.yaml"
+    write_experiment_config(config, drift_experiment(tmp_path, trainer, goal="maximize"))
+    app, _registry, store = make_mcp_app(write_srv_catalog(tmp_path, config))
+    stage_live_run(store, "srv-after-goal-flip", config, "srv")
+
+    phase = GetRunStatusResult.model_validate(app.status(run_id="srv-after-goal-flip")).phases[0]
+
+    assert measured.phases[0].n_trials == 1
+    assert phase.finished_trials_total == 0
+    assert phase.reread_pending is not None
+    assert phase.reread_pending.finished_trials == 1
+    assert phase.reread_pending.statement == (
+        "Phase 'p' has not started under the current reading settings (metric.goal changed); "
+        "the next run re-reads 1 finished trial from kept evidence without retraining them."
+    )
+
+
 @pytest.mark.parametrize("method_name", ["status", "winners", "await_run"])
 def test_run_tools_reject_config_snapshot_hash_mismatch(
     tmp_path: Path,
@@ -381,7 +445,7 @@ def test_mcp_winners_hide_unusable_frozen_publications_before_and_after_live_rea
         experiment_id: str,
         experiment: Experiment,
         saved: RunHandle,
-    ) -> tuple[dict[str, Any], list[PhaseWinnerView]]:
+    ) -> tuple[StatusSnapshot, list[WinnerSnapshot]]:
         nonlocal finalized
         result = original_live_result(experiment_id, experiment, saved)
         assert not finalized
@@ -933,7 +997,7 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
 
     def finish_during_live_read(
         experiment_id: str, experiment: Experiment, saved: RunHandle
-    ) -> tuple[dict[str, Any], list[PhaseWinnerView]]:
+    ) -> tuple[StatusSnapshot, list[WinnerSnapshot]]:
         nonlocal finalized, runner_live
         result = original_live(experiment_id, experiment, saved)
         if not finalized:
@@ -1003,7 +1067,7 @@ def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
 
     def reserve_after_snapshot_payload(
         experiment_id: str, snapshot: RunResultSnapshot, *, result_source: ResultSource
-    ) -> EngineStatus:
+    ) -> StatusSnapshot:
         nonlocal marked
         status = original_status_payload(experiment_id, snapshot, result_source=result_source)
         if not marked:

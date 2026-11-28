@@ -6,26 +6,27 @@
 # Precedence, lowest to highest: built-in defaults, the YAML, then CLI --set KEY=VALUE (https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#run-time-overrides). No environment variable sets a key.
 # The file is one UTF-8 YAML mapping. An unknown or duplicate key, or a value that breaks a constraint stated here, fails config load with an error naming it.
 # Paths: a relative workdir, journal path or execution.cwd resolves against the config file's directory, after symlinks. A leading ~ expands from HOME.
-# Trial paths (extractor path and file, gate path) are relative to the attempt directory, nonempty, without NUL or .. segments, and name a file below it.
-# A file read for a value or a digest must also resolve inside the attempt directory: a symlink out of it fails the read, while one that stays inside works.
+# Local extractor and gate paths must be relative, nonempty and contain no NUL or .. segments. stdout.log and stderr.log name the captured streams of the attempt being read. Other paths name trainer artifacts in the trial directory.
+# A file read for a value or digest must resolve inside its owning directory. An artifact_size gate with source: directory can use . for the trial directory itself.
 # JSON evidence is parsed strictly: duplicate names or NaN and Infinity tokens invalidate the file. A JSON key is a dotted path of nonempty object keys.
 # YAML scalars follow PyYAML (YAML 1.1) typing: 1e-3 and 1.0e3 load as strings, 1.0e-3, 0.001 and 1.0e+3 as floats.
 # Numeric keys accept numeric strings, reject booleans and must be finite. Bounds are inclusive, and a lower bound may not exceed its upper bound.
 # Values passed to the trainer unchanged (trainer_config, fixed_overrides, choices, repeats.values) keep their YAML type, so quote what must stay a string.
-# Every key is in the study fingerprint, which a study with trials refuses to change, except storage, workdir, observe and timeout_seconds_per_run.
-# Also outside it: execution.record_env, mlflow.poll_seconds, mlflow.timeout_seconds and the run-control keys listed under Phases.
+# Each phase's effective inherited values and reading settings (metric.goal, metric.extractor, constraint names and extractors, and that phase's gates) select its study. A changed reading reuses eligible attempts up to the target. Returning to a reading resumes its study: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#correct-a-reading-setting.
+# Metric and constraint bounds re-judge recorded values in the same study. Metric labels, tracker polling and timeout settings, observe, execution.record_env, timeout_seconds_per_run and the run controls listed under Phases are outside the study fingerprint. Storage and workdir locate the ledger and artifact tree.
 # Notation: a `| null = null` key may be omitted, which turns its feature off unless an Unset: line says otherwise. TitleCase types are shared blocks.
 # Environment variables PhaseSweep reads: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#environment-variables. The MCP catalog is a separate file: https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md#the-catalog.
 
 # ---------- Experiment ----------
 
 # Name of the experiment, for example bart_search: nonempty, with only the characters A-Z a-z 0-9 _ and -.
-# It names the artifact directory under workdir and every study, <experiment>::<phase>, and it keys the experiment lock.
+# It names the artifact directory under workdir, keys the experiment lock, and supplies the experiment part of <experiment>::<phase>::<digest> in each study name.
 # Warning: renaming starts new studies and a new artifact directory, and results recorded under the old name are not reused.
 experiment: string (required)
 
 # Shell command template that runs one trainer attempt under /bin/sh -c in execution.cwd, with the trainer environment rather than the shell's. It must exit 0 and leave nothing it started running.
-# {trial_dir} is the absolute attempt directory, {trial_id} the phase's trial number, {phase} its name, {run_name} <experiment>-<phase>-<trial_id>-<attempt ID>.
+# Warning: an attempt that exits 0 is scored from the value files in its trial directory, even ones an earlier attempt of the trial wrote, so never exit 0 while a value file holds an unfinished result.
+# {trial_dir} is the absolute trial directory, {trial_id} the trial's number in its phase study (a phase that inherits starts a new study, numbered from 0, when its inherited values change; {trial_dir} and {run_name} stay unique), {phase} its name, {run_name} <experiment>-<phase>-<trial_id>-<attempt ID>; a rerun of an interrupted or failed trial keeps all four, those of the attempt that opened the directory.
 # {config_path}, {overrides} or {overrides_path} carries the trainer input, as override_format says, for example python train.py --config {config_path}.
 # PhaseSweep shell-quotes every placeholder but {trial_id}. Write {{ and }} for literal braces and $VAR or ${{VAR}} for a shell variable.
 # Unknown placeholders, attribute or index access, format specs such as {trial_id:05d}, conversions such as {phase!r}, or unbalanced braces fail config load.
@@ -43,7 +44,7 @@ metric: object (required)
   # Requires: distinct from every constraints[].name and observe[].name, which are distinct from each other too.
   name: string = "objective"
 
-  # Direction in which trials rank and the sampler optimizes: minimize prefers the smallest value. A persistent study stored with the other direction is refused.
+  # Direction in which trials rank and the sampler optimizes: minimize prefers the smallest value. Changing the goal selects the study for the new direction. It can reuse finished trials up to its target.
   # It never changes select on a log_regex or mlflow extractor, which chooses within one trial.
   goal: "minimize" | "maximize" = "minimize"
 
@@ -53,6 +54,7 @@ metric: object (required)
   # Viability ceiling in the metric's units: a larger value makes the attempt infeasible. It keeps its real value for the sampler but cannot win.
   # Use a bound to refuse a degenerate score, such as a loss of exactly 0 from a leaked evaluation set. It never ranks or steers the search.
   # Warning: an infeasible attempt counts toward phases[].max_consecutive_failures, so a bound inside the ordinary spread can abort the phase.
+  # Bounds judge recorded measurements: correcting metric.min, metric.max or a constraint bound on a study with trials re-judges them on the next run, without retraining.
   max: float | null = null
 
   # Viability floor in the metric's units: a smaller value makes the attempt infeasible, with the same consequences as metric.max.
@@ -67,20 +69,20 @@ metric: object (required)
 # On storage null a grid's n_trials is at most the grid size, and a fixed configuration (empty search_space, no repeats) needs n_trials 1.
 # With repeats under seeded random, n_trials is a multiple of the number of repeat values, and exactly that number when search_space is empty.
 # On persistent storage, validate, the dry run and launch refuse an n_trials above the grid size plus the study's failed attempts. A fixed configuration is a one-cell grid.
-# Run-control keys, outside the fingerprint: n_trials, comment, cost_key, n_jobs, gpu_ids, gpu_devices, max_consecutive_failures, timeout_seconds_per_phase, allow_*.
+# Run-control keys, outside the fingerprint: n_trials, comment, cost_key, n_jobs, gpu_ids, gpu_devices, max_consecutive_failures, timeout_seconds_per_phase, timeout_seconds_per_trial, allow_*.
 # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#phase-composition
 
 # Ordered list of phase objects, at least one.
 phases: list[object] (required)
   # Phase name, for example learning_rate: nonempty, with only A-Z a-z 0-9 _ and -, unique ignoring case, and not attempts, generations or tracking in any case.
-  # Warning: renaming a phase starts a new study, <experiment>::<phase>.
+  # Warning: renaming a phase starts a new study under the new phase name.
   - name: string (required)
 
     # Target number of finished attempts, an integer >= 1. COMPLETE, INFEASIBLE and FAIL attempts count, and interrupted ones do not.
-    # An interrupted attempt reruns from scratch as a new attempt in a new directory, so the trainer's own checkpoint-resume logic does not find the earlier attempt's files.
+    # A finished sibling attempt with the required parameters can fill a queued rerun. If the trainer must run again, it gets the same command and trial directory so it can resume its checkpoint.
     # When the target is reached with no eligible feasible attempt, the phase fails.
-    # On persistent storage a raised target runs the remaining attempts in the same study, and a lowered one is refused.
-    # While a phase that inherits from this one, even indirectly, has trials, a run that would add trials here is refused. Give each phase that inherits this one a new `name`, updating every `inherits` to match: this phase keeps its finished trials and runs the rest, and the renamed phases start new studies and run again. A new experiment name reruns every phase.
+    # With persistent storage, raising the target continues the same study and uses eligible kept attempts before launching more. Lowering the target is refused.
+    # A parent top-up keeps its trials and selects its winner first. Each child reuses or starts the study for its inherited values.
     # Recommended: one trial per configuration, spending the budget on more distinct values, such as 7 to 8 log-spaced learning rates.
     # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation for retries, aborts and partial results.
     n_trials: int (required)
@@ -97,7 +99,7 @@ phases: list[object] (required)
     # Earlier phases whose winners' effective overrides, their inherited, fixed and sampled keys, become fixed inputs here. Nothing is inherited unless listed.
     # Only phases declared before this one can be listed. trainer_config is not inherited, and an inherited value keeps the phase that produced it as its origin.
     # Warning: only override values are inherited, never weights or checkpoints. Load a checkpoint explicitly through trainer_config or fixed_overrides.
-    # Warning: the parents' winners are part of this phase's study fingerprint, so a changed parent winner stops a populated study of this phase from being reused.
+    # The values this phase inherits address its study, so a changed inherited value starts another study and a returning one reuses the study recorded under it; the parents' names are not part of it.
     inherits: list[string] = []
 
     # Fixed trainer-defined values for every trial of the phase, keyed by dotted paths of nonempty A-Z a-z 0-9 _ - segments, for example optimizer.lr.
@@ -111,6 +113,8 @@ phases: list[object] (required)
     # validate and run --dry-run warn about such an n_trials above 1, and refuse, as a launch does, one above the recorded failed attempts plus one.
     # Empty with repeats: a seed audit, one configuration run once per repeat value.
     # A key whose last component is seed, data_seed or random_state, matched case-sensitively, fails config load, because a searched seed lets noise win.
+    # Once the phase has trials, the search space may only gain values: a grid's numeric choices or ranges may add values (raise n_trials to the new grid size), and a seeded random or tpe int or float range may widen. The study keeps its finished trials and runs only the new configurations.
+    # Removing or changing a recorded value, adding or removing a key, and changing string, boolean or mixed choices, choices under random or tpe, or anything under cmaes are refused as a changed study.
     search_space: map[string, categorical | float | int] = {}
       # Example dotted trainer key; replace optimizer.lr with your parameter name.
       optimizer.lr: categorical | float | int (required)
@@ -183,8 +187,8 @@ phases: list[object] (required)
 
       # Sampler seed, an integer from 0 to 4294967295, independent of any trainer seed.
       # Requires: set when the phase draws with random, tpe or cmaes on persistent storage.
-      # Seeded random, tpe and cmaes draws also use the study name <experiment>::<phase>, so renaming either changes them.
-      # For grid the seed alone fixes the matrix order, which also decides which points a partial grid runs. An unset grid seed orders it as seed 0 does.
+      # Seeded random, tpe and cmaes draws also use the phase namespace <experiment>::<phase>, so renaming either changes them.
+      # For grid the seed alone fixes the matrix order, which also decides which points a partial grid runs. An unset grid seed orders it as seed 0 does. A grid that gains values keeps every drawn point in place and shuffles the rest of the grown grid after them.
       # Unset: random, tpe and cmaes draw unseeded.
       seed: int | null = null
 
@@ -242,7 +246,7 @@ phases: list[object] (required)
 
     # ---------- Phase limits ----------
     # The earliest of the per-trial, phase and run deadlines ends the work it covers. Cleanup and publication can run past a deadline.
-    # A failure a deadline causes, such as an evidence read cut short, records the attempt as interrupted, which counts toward neither n_trials nor the streak.
+    # A failure a deadline causes records the attempt as interrupted, which counts toward neither n_trials nor the streak. An evidence read it cuts short after the trainer exited 0 leaves the trial pending under persistent storage, and the next run extracts it without retraining.
     # When a deadline and a failure-streak abort stop the same phase short of n_trials, the deadline decides the outcome and the abort is retired.
     # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation
 
@@ -256,7 +260,7 @@ phases: list[object] (required)
     # Wallclock limit for one trainer process, in seconds, > 0. null means no limit.
     # Its clock starts at the supervised launch, after the GPU lease is held, so it excludes the lease wait and the evidence reads.
     # A trainer it kills fails the attempt. A trainer that a phase or run deadline stops first is interrupted instead, and it reruns.
-    # Unlike timeout_seconds_per_phase, this key is part of the phase's study identity: changing it after the phase has trials is refused as a changed study, so give the phase, and each phase that inherits it, a new `name`, updating every `inherits` to match, to run it under another value.
+    # Changing it continues a populated study; a grid cell or fixed configuration that timed out retries in its own trial directory when n_trials is raised.
     # Requires: phases[].allow_unbounded_trials true for null.
     timeout_seconds_per_trial: float | null = 259200.0
 
@@ -273,10 +277,11 @@ phases: list[object] (required)
     allow_incomplete_on_timeout: bool = false
 
     # ---------- Phase gates ----------
-    # Gates run after the trainer exits 0 and the objective and every constraint were read, in that order. Local gates read the attempt directory.
+    # Gates run after the trainer exits 0 and the objective and every constraint were read, in that order. Local gates read the trial directory.
     # Every gate runs and failures are joined into one message. A failed gate fails the attempt, even one a violated constraint already made infeasible.
 
     # Hard checks on the attempt's evidence, selected by type. Each item is one gate.
+    # A gate path is relative to the trial directory, except stdout.log and stderr.log, which name the attempt's own captured streams.
     gates: list[artifact_size | json_equals | json_scalar_bound | mlflow_required | required_file | sha256 | wandb_summary_required] = []
       # Variant artifact_size: require an artifact's size in bytes within min_bytes and max_bytes, at least one of which is set.
       - type: "artifact_size" (required)
@@ -287,9 +292,9 @@ phases: list[object] (required)
         # Requires: key exactly when source is json.
         source: "file" | "directory" | "json" (required)
 
-        # Trial path, which names a directory when source is directory. There . names the attempt directory itself.
-        # Warning: . counts the files PhaseSweep writes there, such as stdout.log, stderr.log, command.txt and the trainer input.
-        # With source json the file must resolve inside the attempt directory, so a symlink out of it fails the gate. file and directory sizes read no value.
+        # Trial path, which names a directory when source is directory. There . names the trial directory itself.
+        # Warning: . counts the files PhaseSweep writes there, the trainer input.
+        # With source json the file must resolve inside the trial directory, so a symlink out of it fails the gate. file and directory sizes read no value.
         path: string (required)
 
         # JSON key of the byte count, for example artifact.bytes.
@@ -304,7 +309,7 @@ phases: list[object] (required)
       # Variant json_equals: require a JSON value to equal a scalar of the same JSON type, so true, 1 and 1.0 differ. A missing file or key fails the gate.
       - type: "json_equals" (required)
 
-        # JSON file to read, for example result.json. It must resolve inside the attempt directory, so a symlink out of it fails the gate.
+        # JSON file to read, for example result.json. It must resolve inside the trial directory, so a symlink out of it fails the gate.
         path: string (required)
 
         # JSON key of the value, for example eval.loss.
@@ -316,7 +321,7 @@ phases: list[object] (required)
       # Variant json_scalar_bound: require a finite JSON number within min and max, at least one of which is set. A boolean or a string fails the gate.
       - type: "json_scalar_bound" (required)
 
-        # JSON file holding the number, for example result.json. It must resolve inside the attempt directory, so a symlink out of it fails the gate.
+        # JSON file holding the number, for example result.json. It must resolve inside the trial directory, so a symlink out of it fails the gate.
         path: string (required)
 
         # JSON key of the number, for example eval.loss.
@@ -351,14 +356,14 @@ phases: list[object] (required)
       # Variant sha256: require the exact SHA-256 digest of a file, hashed after the trainer exits. A directory or a missing file fails the gate.
       - type: "sha256" (required)
 
-        # File to hash, for example model.safetensors. It must resolve inside the attempt directory, so a symlink out of it fails the gate.
+        # File to hash, for example model.safetensors. It must resolve inside the trial directory, so a symlink out of it fails the gate.
         path: string (required)
 
         # Expected digest: 64 hexadecimal characters. Uppercase is accepted and lowercased. A mismatch fails the gate.
         sha256: string (required)
 
       # Variant wandb_summary_required: require summary keys, of any value type, in the finished W&B capture the phase's other W&B readers share.
-      # Without a W&B objective or constraint, the capture takes the first finished summary, so a missing key fails the gate at once.
+      # Without a W&B objective or constraint, the capture takes the first populated finished summary that matches its history. A key missing from that capture fails the gate.
       # Such gate-only phases may use different W&B targets from one another.
       - type: "wandb_summary_required" (required)
         <<: WandbTarget
@@ -371,7 +376,7 @@ phases: list[object] (required)
 #   json_file  {overrides_path}  overrides.json, with dotted keys expanded into nested objects. Values must be strict JSON.
 #   argparse   {overrides}       flattened leaves as shell-quoted --key=value tokens: null as None, a boolean as true or false, a string as written.
 #   hydra      {overrides}       flattened leaves as shell-quoted key=value tokens, strings double-quoted. A string with ${ or a control character fails.
-# Under argparse and hydra a float renders with Python's str() and a list as [a,b], recursively.
+# Argparse and Hydra tokens are sorted by dotted key. A float renders with Python's str() and a list as [a,b], recursively.
 # trial_command may not carry another format's placeholder, and yaml_file always needs its own.
 # The other formats need theirs once a phase has an inherited, fixed, sampled or repeat key, or trainer_config is nonempty.
 # Under argparse and hydra every flattened leaf must render: no mapping inside a list, no empty mapping, no dotted literal key colliding with a nested mapping.
@@ -399,11 +404,11 @@ storage: string | null = null
 
 # Directory for per-experiment generations, attempt directories, logs and winner files. Write . for the config file's directory; "" fails config load.
 # Warning: changing execution.cwd does not move it. Give trainer outputs a trial-specific path through trainer_config or trial_command.
-# Warning: nothing under it is pruned. Every trial, interrupted attempt and rerun keeps its directory, so have the trainer bound its own checkpoints.
+# Warning: nothing under it is pruned. Every trial keeps its directory, which its rerun reuses, and every attempt keeps its records, so have the trainer bound its own checkpoints.
 workdir: string = "./runs"
 
 # Operator-defined identifiers of inputs outside this YAML that git does not capture, such as dataset_revision and dependency versions.
-# Keys and values are nonblank strings. Each generation records the trainer's git revision apart and never compares it, so trainer code needs no entry.
+# Keys and values are nonblank strings. Each generation records the trainer's git revision apart and a resume never compares it, so trainer code needs no entry. Selection discloses a winner chosen among trials that ran under different revisions as a code_revision confound verdict.
 # Warning: values are copied into each generation's shareable reproducibility.json, so they must not hold secrets.
 # Recommended: change a value whenever its input changes. A study with trials then refuses the changed fingerprint, so run under a new experiment name.
 provenance: map[string, string] = {}
@@ -477,7 +482,7 @@ mlflow: object | null = null
   # Seconds each controller tracking operation may take, at least 1. It never limits training time.
   # Experiment resolution, run creation, evidence capture and each result upload get a separate budget of this length.
   # A creation whose outcome is unconfirmed is never sent again; a search for its identity tags gets a fresh budget of this length to find the run.
-  # Phase and run deadlines also cap resolution, creation and capture, and a capture cut short fails the trial. An upload that runs out waits for the next run or sync-tracking.
+  # Phase and run deadlines also cap resolution, creation and capture. If a deadline cuts capture short after training succeeds, persistent storage keeps the trial pending for the next run to retry capture. A timed-out upload waits for the next run or sync-tracking.
   # Recommended: leave room for SDK startup and a slow server. The default suits most servers.
   timeout_seconds: float = 120.0
 
@@ -530,11 +535,13 @@ timeout_seconds_per_run: float | null = null
 # ---------- Shared blocks ----------
 
 JsonExtractor:
-  # Variant json: read one number from a JSON file in the attempt directory. A null, boolean, string, container or non-finite number fails the read.
+  # Variant json: read one number from a JSON file in the trial directory. A null, boolean, string, container or non-finite number fails the read.
   type: "json" (required)
 
-  # JSON file, for example result.json. The trainer finds the attempt directory through {trial_dir} or PHASESWEEP_TRIAL_DIR.
-  # It must resolve inside the attempt directory, so a symlink to a results file outside it fails the read; copy such a file in instead.
+  # JSON file, for example result.json. The trainer finds the trial directory through {trial_dir} or PHASESWEEP_TRIAL_DIR.
+  # stdout.log and stderr.log name the attempt's own captured streams, for a trainer that prints one JSON document.
+  # Any other file must resolve inside the trial directory, so a symlink to a results file outside it fails the read; copy such a file in instead.
+  # A rerun in its trial's directory must write the file again, if only with identical bytes: a file it left untouched fails the read.
   path: string (required)
 
   # JSON key of the number, for example eval.loss. List indexes and keys that contain a dot cannot be addressed.
@@ -549,7 +556,7 @@ JsonEnvelopeExtractor:
 
   # Envelope file. report_objective() writes the metric.extractor path, exported as PHASESWEEP_OBJECTIVE_PATH only for a json_envelope metric.extractor.
   # A constraint's or observation's envelope at another path is the trainer's to write. At the same path it reads the metric's envelope.
-  # It must resolve inside the attempt directory, so a symlink out of it fails the read.
+  # It must resolve inside the trial directory, so a symlink out of it fails the read. stdout.log and stderr.log, the captured streams, fail config load.
   path: string = "result.json"
 
   # Exact nonempty objective.name the envelope must report, for example eval_loss.
@@ -574,17 +581,18 @@ JsonEnvelopeExtractor:
   evaluation_axis: string = "step"
 
 LogRegexExtractor:
-  # Variant log_regex: extract numbers from a log file in the attempt directory with a regular expression.
+  # Variant log_regex: extract numbers from a log file in the trial directory with a regular expression.
   # A missing or unreadable file, a searched line that is not valid UTF-8, or no numeric match fails the read.
   type: "log_regex" (required)
 
-  # Log file, for example stdout.log. stdout.log and stderr.log hold the trainer's two streams, and Python logging writes to stderr by default.
-  # It must resolve inside the attempt directory, so a symlink out of it, including one a trainer puts in place of stdout.log, fails the read.
+  # Log file, for example stdout.log. stdout.log and stderr.log name the attempt's own captured streams, kept beside the trial directory; Python logging writes to stderr by default.
+  # Any other file must resolve inside the trial directory, so a symlink out of it fails the read.
+  # A trainer log kept across a trial's attempts counts every line once the rerun writes to it; a trainer that starts over should truncate it.
   file: string = "stdout.log"
 
   # Python regular expression whose required group (?P<value>...) captures the whole metric token. Use loss=(?P<value>\S+) for whitespace delimiters or loss=(?P<value>[^\s,]+) when a comma can follow.
   # Lines split at \n, \r\n and bare \r and are searched one at a time, so a match cannot span lines. Inline flags such as (?i) work.
-  # Each numeric match is an observation. The reader skips captures that float() cannot parse and accepts nan, inf and 1_0. On a persistent study a changed pattern needs a new experiment name, because the pattern is part of the study identity.
+  # Each numeric match is an observation. The reader skips captures that float() cannot parse and accepts nan, inf and 1_0. With persistent storage, changing the pattern lets the study read eligible attempts' logs under the new pattern.
   pattern: string (required)
 
   # Which observation is used: last or first by position in the file, min or max by value, the first of equal extremes. first decodes no line after its match.
@@ -612,8 +620,8 @@ MlflowExtractor:
   step: int | null = null
 
 WandbExtractor:
-  # Variant wandb: read one finite number from the finished summary of the W&B run PhaseSweep manages for this attempt, <entity>/<project>/<attempt ID>.
-  # The trainer must log to that run under the managed WANDB_RUN_ID and finish it.
+  # Variant wandb: read one finite number from the finished summary of the W&B run PhaseSweep manages for the attempt, <entity>/<project>/<the attempt's ID>.
+  # The trainer must log to that run under the managed WANDB_RUN_ID and finish it. Every attempt, including a rerun from a checkpoint, logs its own run; a rerun is scored from its attempts' runs, oldest first. See docs/config.md for the rules.
   # Seed ranking: phases[].repeats.
   # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#wb-evidence
   type: "wandb" (required)
@@ -621,21 +629,22 @@ WandbExtractor:
 
   # Exact nonempty key in the finished summary, for example eval/loss, or eval/loss.min for a define_metric summary=min aggregate.
   # A bare key never stands in for its aggregate.
-  # Warning: a metric_key missing from the finished summary is polled up to 30 more seconds, then fails the read, so a misspelled key costs that every trial.
+  # Warning: a metric_key missing from a populated, history-consistent finished summary is polled until timeout_seconds runs out, then fails the read, so a misspelled key costs that every trial.
   metric_key: string (required)
 
   # Nonempty history key logged with metric_key that marks where it was measured, for example eval/step or tokens. _step is W&B's own step.
   # Log it in the same log() call. It may be neither metric_key nor, for a dotted metric_key, the text before its last dot.
   # An aggregate key such as eval/loss.min is positioned at the end of its history series.
+  # On a rerun, a trainer axis logged with every measurement also lets native .min and .max drop history from the first progress a rerun repeats; the default _step restarts in each run, so they reduce the attempts' summary values. See docs/config.md for unobservable rollback.
   # Only used when: this is metric.extractor, as for the json_envelope evaluation_axis.
   evaluation_axis: string = "_step"
 
 # The W&B target and polling fields of the wandb reader and the wandb_summary_required gate. Within a phase, every W&B reader and gate agrees on all five.
 # For seed ranking, phases[].repeats creates one trial and tracked run per seed and ranks configuration groups.
-# A run that ends failed, crashed, killed or preempted fails the read at once, and one that has not finished is polled until timeout_seconds runs out.
-# Requires: the phasesweep[wandb] extra. The trainer's wandb.init() picks up the managed WANDB_* variables, including WANDB_RESUME never.
-# Pass no project, entity or id to wandb.init(); log into that one run, and call wandb.finish() only after the final log.
-# Requires: env.WANDB_BASE_URL, WANDB_ENTITY and WANDB_PROJECT, when set, match the target, env.WANDB_RESUME, when set, is never, and env has no WANDB_RUN_ID.
+# A run that ends failed, crashed, killed or preempted fails the read at once, and one that has not finished is polled until timeout_seconds runs out. A finished summary counts once its _step matches the last indexed step and its history accounts for every row W&B counts. A rerun that logged zero rows and no user summary keys, or whose run is missing, is scored from the newest earlier attempt's run when that run is closed, consistent and holds the objective. An unsettled closed earlier run or outstanding history for the retry's native aggregate keeps the trial pending at the deadline. If the rerun logged data without the objective or has no earlier result to score, the trial reruns once in a fresh directory and W&B run.
+# Requires: the phasesweep[wandb] extra. The trainer's wandb.init() picks up the managed WANDB_* variables: WANDB_RUN_ID is the attempt's own ID, with WANDB_RESUME never.
+# Pass no project, entity, id or resume to wandb.init(). Log into that one run and call wandb.finish() only after the final log.
+# Requires: env.WANDB_BASE_URL, WANDB_ENTITY and WANDB_PROJECT, when set, match the target, and env has no WANDB_RUN_ID or WANDB_RESUME.
 # Requires: no WANDB_MODE of offline, dryrun or disabled and no WANDB_DISABLED of 1, true, yes or on, in any case, in env or, at launch, inherited.
 WandbTarget:
   # W&B API endpoint: an http or https URL with a host. Scheme and host are lowercased and trailing slashes stripped. Credentials, a query or a fragment fail.
@@ -644,14 +653,16 @@ WandbTarget:
   # W&B account or team, for example research-team: nonempty, without slash or whitespace. The trainer environment's credentials must be able to read it.
   entity: string (required)
 
-  # W&B project, for example bart-search: nonempty, without slash or whitespace.
+  # W&B project, for example bart-search: nonempty, without slash or whitespace. Each attempt records its destination at launch, so a changed project applies to new draws and finished trials are read from the project they ran in.
   project: string (required)
 
   # Seconds between polls of the run state and summary, greater than 0.
   poll_seconds: float = 2.0
 
   # Seconds one attempt may spend capturing the finished summary, at least 1, worker startup, SDK calls and polling included. Phase and run deadlines cap it too.
+  # If W&B still serves an empty summary or its step disagrees with the history index at the deadline, rerun the same persistent config to read the finished trial.
+  # Warning: a required numeric key missing from a populated, history-consistent summary costs the full polling budget.
   # After the objective is accepted, locating its history position gets a fresh budget of this length, capped by the same deadlines.
-  # History has up to 30 seconds of that to catch up with the summary, and reading it may use the rest.
-  # A capture that runs out fails the read. A position lookup that runs out only leaves the position unrecorded.
-  timeout_seconds: float = 120.0
+  # Only a history index behind the summary is waited for; rows that carry no position settle at once with none.
+  # A position lookup that runs out only leaves the position unrecorded.
+  timeout_seconds: float = 600.0

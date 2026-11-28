@@ -49,6 +49,11 @@ INITIAL_PID_NAMESPACE_LINK = "pid:[4026531836]"
 #: time. The pair distinguishes namespace-inode reuse within one boot.
 _PID_NAMESPACE_PATTERN = re.compile(r"pid:\[[1-9][0-9]*\]@(?:0|[1-9][0-9]*)")
 _PROC = Path("/proc")
+#: The step that clears a foreign-namespace refusal: either namespace can settle the attempt.
+FOREIGN_NAMESPACE_STEP = (
+    "Run the same command from the host's initial PID namespace or the container that recorded "
+    "the attempt, after any host process the error names has exited."
+)
 
 
 @dataclass(frozen=True)
@@ -227,10 +232,7 @@ def recorded_process_blocker(
     if read_pid_namespace() == "darwin":
         return "macOS cannot inspect processes recorded in a Linux PID namespace"
     if not in_initial_pid_namespace():
-        return (
-            "only the host's initial PID namespace can see another namespace's processes, "
-            "so run this from there"
-        )
+        return "only the host's initial PID namespace can see another namespace's processes"
     link = _pid_namespace_link(pid_namespace)
     if link == INITIAL_PID_NAMESPACE_LINK:
         # That namespace is never freed, so a differing PID 1 start time means
@@ -307,10 +309,7 @@ def foreign_pid_namespace_reason(pid_namespace: str, blocker: str) -> str:
     :return str: A clause naming both namespaces and what blocked the proof.
     """
     current = read_pid_namespace() or "unreadable"
-    return (
-        f"it was recorded in PID namespace {pid_namespace}, but this process is in {current}, "
-        f"and {blocker}"
-    )
+    return f"recorded in PID namespace {pid_namespace}, this process is in {current}; {blocker}"
 
 
 @dataclass(frozen=True)
@@ -478,20 +477,20 @@ def reap_child(pid: int) -> bool:
 
 
 def read_stale_process_identity(
-    trial_dir: Path,
+    attempt_dir: Path,
     *,
     expected_attempt_id: str,
 ) -> StaleProcessIdentity:
     """Load and validate the atomic identity for a possibly-stale trial.
 
-    :param Path trial_dir: Trial directory containing ``process_identity.json``.
+    :param Path attempt_dir: Attempt directory containing ``process_identity.json``.
     :param str expected_attempt_id: Attempt identity stored on the Optuna trial.
     :raises OSError: The identity record is missing or unreadable.
     :raises ValueError: The identity record is malformed, partial, of an unsupported schema, or
         belongs to another attempt.
     :return StaleProcessIdentity: A complete, attempt-bound identity.
     """
-    path = trial_dir / PROCESS_IDENTITY_FILE
+    path = attempt_dir / PROCESS_IDENTITY_FILE
     try:
         payload = strict_json_loads(path.read_text(encoding="utf-8"))
     except ValueError as exc:
@@ -590,7 +589,8 @@ def stale_trial_process_decision(identity: StaleProcessIdentity) -> StaleProcess
             )
         raise ForeignPidNamespaceError(
             f"Attempt {identity.attempt_id} (pid={identity.pid}) cannot be cleaned from here: "
-            f"{foreign_pid_namespace_reason(identity.pid_namespace, blocker)}."
+            f"{foreign_pid_namespace_reason(identity.pid_namespace, blocker)}.",
+            remediation=FOREIGN_NAMESPACE_STEP,
         )
     if identity.boot_id is None or current_boot_id is None:
         return StaleProcessDecision("refuse", "robust process-birth identity is unavailable")
@@ -760,6 +760,7 @@ def _terminate_process_groups(
     *,
     grace_seconds: float,
     guardians: Mapping[int, subprocess.Popen[bytes]] | None = None,
+    cancel_signal: int = signal.SIGTERM,
 ) -> dict[int, bool]:
     """Request group cleanup with shared waits, delegating guarded groups to their guardians.
 
@@ -775,6 +776,7 @@ def _terminate_process_groups(
     :param tuple[int, ...] pgids: Target process-group IDs.
     :param float grace_seconds: Shared wait after requesting cancellation, before direct SIGKILL for unguarded groups or continued observation of guardians.
     :param Mapping[int, subprocess.Popen[bytes]] | None guardians: Group-to-guardian processes whose cancellation protocol owns durable intent and trainer signals while they remain alive.
+    :param int cancel_signal: Signal a live guardian receives, which it records as how the attempt ended; an unguarded group always receives SIGTERM.
     :return dict[int, bool]: Confirmation verdict per requested pgid, ``True`` only when that
         group and any assigned guardian are confirmed dead, so lifecycle publication has finished.
     """
@@ -803,7 +805,7 @@ def _terminate_process_groups(
         try:
             guardian = active_guardians.get(pgid)
             if guardian is not None and guardian_alive(pgid):
-                guardian.send_signal(signal.SIGTERM)
+                guardian.send_signal(cancel_signal)
                 if guardian_alive(pgid):
                     return True
             active_guardians.pop(pgid, None)

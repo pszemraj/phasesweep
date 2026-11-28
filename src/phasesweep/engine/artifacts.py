@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import csv
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -15,6 +15,7 @@ import yaml
 
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
+from phasesweep.config.io import load_experiment_bytes
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import (
     ResumeWinnerMissingError,
@@ -22,6 +23,7 @@ from phasesweep.engine.errors import (
     WinnerIntegrityError,
 )
 from phasesweep.engine.optuna import _trial_count_state
+from phasesweep.engine.paths import _valid_trial_dir_name
 from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.repeats import (
@@ -31,9 +33,10 @@ from phasesweep.engine.repeats import (
     repeat_axis,
 )
 from phasesweep.engine.state import (
-    PHASE_FINGERPRINT_PAYLOAD_ATTR,
     TRAINER_ENV_ATTR,
     Winner,
+    _recorded_identity,
+    _trial_attempt_dir,
 )
 from phasesweep.engine.study_policy import _describe_environment_changes
 from phasesweep.engine.trial import _environment_identity
@@ -126,22 +129,29 @@ def _file_log_handler(path: Path) -> Iterator[None]:
 
 
 def _write_trials_csv(
-    study: optuna.Study, path: Path, *, repeats: RepeatAxis | None = None
+    study: optuna.Study,
+    path: Path,
+    experiment: Experiment,
+    *,
+    repeats: RepeatAxis | None = None,
 ) -> None:
     """Snapshot every trial in ``study`` to ``path`` as stdlib CSV.
 
     The ``state`` column is the label run logs and status tables use, so an
-    interrupted trial reads ``INTERRUPTED`` and an infeasible one ``INFEASIBLE``.
+    interrupted trial reads ``INTERRUPTED`` and one outside the current bounds ``INFEASIBLE``.
     A repeats phase gets a ``repeat_group`` column: the highest trial number
     in the trial's group so far, grouped by the same key selection uses. An
     incomplete group's label moves as more members are allocated.
 
     Every user attribute is a column except the tracked trainer environment, which is
     ledger provenance: its ``PATH`` and ``HOME`` values are noise in a results table.
-    A rerun's source therefore shows as ``user_attr:phasesweep_rerun_of``.
+    A rerun's source therefore shows as ``user_attr:phasesweep_rerun_of``. The
+    ``attempt_dir`` column names the directory holding the attempt's own logs and records;
+    ``user_attr:phasesweep_trial_dir`` is the trainer's directory.
 
     :param optuna.Study study: Study whose trials are serialized.
     :param Path path: Destination CSV path.
+    :param Experiment experiment: Config whose bounds judge each measured trial.
     :param RepeatAxis | None repeats: The phase's repeat axis, or ``None`` without repeats.
     """
     trials = study.get_trials(deepcopy=False)
@@ -157,6 +167,7 @@ def _write_trials_csv(
         "datetime_start",
         "datetime_complete",
         "duration",
+        "attempt_dir",
         *(["repeat_group"] if repeats is not None else []),
         *[f"param:{n}" for n in param_names],
         *[f"user_attr:{n}" for n in attr_names],
@@ -168,11 +179,12 @@ def _write_trials_csv(
         for t in trials:
             row: dict[str, Any] = {
                 "number": t.number,
-                "state": _trial_count_state(t),
+                "state": _trial_count_state(t, experiment),
                 "value": t.value,
                 "datetime_start": t.datetime_start,
                 "datetime_complete": t.datetime_complete,
                 "duration": t.duration,
+                "attempt_dir": _trial_attempt_dir(t),
             }
             if repeats is not None:
                 row["repeat_group"] = labels.get(t.number)
@@ -184,28 +196,48 @@ def _write_trials_csv(
 
 
 def _refresh_recovered_trials_csv(
-    study: optuna.Study, experiment: Experiment, phase: Phase
+    studies: Mapping[str, Sequence[optuna.Study]], experiment: Experiment
 ) -> None:
-    """Refresh the recovered study's CSV when the supplied phase matches its semantics.
+    """Refresh the same addressed studies as status, from the studies recovery opened.
 
-    :param optuna.Study study: Study whose recovery ran under the experiment lock.
-    :param Experiment experiment: Owner of the phase artifact directory.
-    :param Phase phase: Phase to use for group labels if its semantics agree with the study.
+    :param Mapping[str, Sequence[optuna.Study]] studies: Every recovered study by phase.
+    :param Experiment experiment: Config that locates the CSV and checks the study semantics.
     """
-    # Recovery can settle earlier work even when the supplied phase will be refused at launch.
-    # Keep the prior projection when that phase cannot supply the study's repeat grouping.
+    from phasesweep.engine.preview import replay_study_names
+    from phasesweep.engine.read import _latest_parent_overrides, _read_generation_selection
+
+    if not studies:
+        return
     try:
-        recorded: object = study.user_attrs.get(PHASE_FINGERPRINT_PAYLOAD_ATTR)
-        if isinstance(recorded, dict) and recorded.get(
-            "phase"
-        ) == fingerprint_ops._semantic_phase_dump(phase):
-            _write_trials_csv(
-                study,
-                path_ops._trials_csv_path(experiment, phase.name),
-                repeats=repeat_axis(phase),
-            )
+        current, _, publication = _read_generation_selection(experiment)
+        latest = _latest_parent_overrides(experiment, publication, current)
+        addressed, _ = replay_study_names(experiment, studies, latest)
     except Exception as exc:
-        log.warning("Could not refresh trials.csv for study %r: %s", study.study_name, exc)
+        log.warning("Could not address recovered studies for trials.csv: %s", exc)
+        return
+
+    for phase in experiment.phases:
+        name = addressed.get(phase.name)
+        study = next(
+            (item for item in studies.get(phase.name, ()) if item.study_name == name), None
+        )
+        if study is None:
+            continue
+        # Recovery can settle work even when a launch would refuse the supplied phase.
+        # Keep the prior projection when that phase cannot supply the study's repeat grouping.
+        try:
+            recorded = _recorded_identity(study)
+            if recorded is not None and recorded["payload"].get(
+                "phase"
+            ) == fingerprint_ops._identity_phase_dump(phase):
+                _write_trials_csv(
+                    study,
+                    path_ops._trials_csv_path(experiment, phase.name),
+                    experiment,
+                    repeats=repeat_axis(phase),
+                )
+        except Exception as exc:
+            log.warning("Could not refresh trials.csv for study %r: %s", study.study_name, exc)
 
 
 def _save_winner(
@@ -245,6 +277,8 @@ def _winner_payload(experiment: Experiment, phase_name: str, winner: Winner) -> 
         "metric": {experiment.metric.name: winner.metric, "goal": experiment.metric.goal},
         **_winner_common_payload(winner),
         "phase_fingerprint": winner.phase_fingerprint,
+        "study_name": winner.study_name,
+        "study_outcome_sequence": winner.study_outcome_sequence,
         "objective_provenance": winner.objective_provenance,
         "trainer_env_digest": winner.trainer_env_digest,
     }
@@ -267,6 +301,7 @@ def _winner_common_payload(winner: Winner) -> dict[str, Any]:
         "completion": winner.completion,
         "generation_id": winner.generation_id,
         "attempt_id": winner.attempt_id,
+        "trial_dir": winner.trial_dir,
         "winner_source": asdict(source),
         "trainer_input": winner.trainer_input,
         "confound": winner.confound,
@@ -321,6 +356,37 @@ def _warn_environment_drift(
     )
 
 
+def _matches_with_previous_reading(
+    experiment: Experiment,
+    phase: Phase,
+    inherited_winners: dict[str, Winner],
+    publication: ValidatedPublication,
+    stored_fingerprint: str,
+) -> bool:
+    """Test whether restoring the published reading accounts for the whole mismatch.
+
+    :param Experiment experiment: Current experiment supplying training inputs.
+    :param Phase phase: Skipped phase whose fingerprint differs.
+    :param dict[str, Winner] inherited_winners: Current parent winners.
+    :param ValidatedPublication publication: The captured publication supplying the old reading.
+    :param str stored_fingerprint: Fingerprint on the published winner.
+    :return bool: Whether the previous reading restores the fingerprint.
+    """
+    path = path_ops._generation_config_snapshot_path(
+        path_ops._experiment_dir(experiment), publication.generation_id
+    )
+    try:
+        previous = load_experiment_bytes(publication.config_snapshot, path, config_dir=path.parent)
+    except ValueError:
+        # The snapshot may support publication inspection without loading as a full config.
+        return False
+    previous_reader, previous_phase = fingerprint_ops.with_reading_of(experiment, phase, previous)
+    return (
+        fingerprint_ops._phase_fingerprint(previous_reader, previous_phase, inherited_winners)
+        == stored_fingerprint
+    )
+
+
 def _load_winner(
     experiment: Experiment,
     phase: Phase,
@@ -371,6 +437,14 @@ def _load_winner(
     current_fp = fingerprint_ops._phase_fingerprint(experiment, phase, inherited_winners)
     stored_fp = data["phase_fingerprint"]
     if stored_fp != current_fp:
+        if experiment.persistent and _matches_with_previous_reading(
+            experiment, phase, inherited_winners, publication, stored_fp
+        ):
+            raise StudyFingerprintMismatchError(
+                f"Skipped phase {phase.name!r} was selected under different reading settings.",
+                action=OperatorAction.FIX_CONFIG,
+                remediation=f"Run with `--from-phase {phase.name}` to re-read the phase's kept trials.",
+            )
         # A winner file records only the hash, so the refusal can name no changed key. MCP shows
         # the step without the message, so the step names the winner it means.
         produced = f"the config that produced the winner of `{phase.name}`"
@@ -379,7 +453,9 @@ def _load_winner(
             f"{short_digest(stored_fp)} != current {short_digest(current_fp)}).",
             action=OperatorAction.FIX_CONFIG,
             remediation=(
-                fingerprint_ops.restore_or_rename_step(experiment, phase, recorded=produced)
+                f"{fingerprint_ops.restore_or_rename_step(phase, recorded=produced)} "
+                f"If its search_space only gained values, run from `{phase.name}` "
+                f"(`--from-phase {phase.name}`)."
                 if experiment.persistent
                 else f"Restore {produced}, or run {_WITHOUT_FROM_PHASE_IN_MEMORY}."
             ),
@@ -405,8 +481,11 @@ def _load_winner(
             gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
             completion=dict(completion),
             phase_fingerprint=stored_fp,
+            study_name=validated.study_name,
+            study_outcome_sequence=validated.study_outcome_sequence,
             generation_id=data["generation_id"],
             attempt_id=data["attempt_id"],
+            trial_dir=_valid_trial_dir_name(data["trial_dir"], label="winner trial_dir"),
             source=validated.source,
             objective_provenance=dict(data["objective_provenance"]),
             trainer_input=dict(data["trainer_input"]),

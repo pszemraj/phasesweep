@@ -25,6 +25,11 @@ SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 #: being loaded. Relative path fields resolve against it.
 CONFIG_DIR_CONTEXT = "config_dir"
 
+#: Fields of a W&B or MLflow source that bound or pace PhaseSweep's read of it and never change
+#: what it reads, so no study or extractor identity holds them; ``MlflowSettings.evidence_identity``
+#: leaves out the same two.
+TRACKER_READ_CONTROLS = frozenset({"poll_seconds", "timeout_seconds"})
+
 
 def _normalize_http_endpoint(parsed: SplitResult) -> str | None:
     """Normalize an HTTP(S) endpoint, or return None when invalid.
@@ -127,21 +132,6 @@ def _require_finite(label: str, value: float) -> None:
     """
     if not math.isfinite(value):
         raise ValueError(f"{label} must be finite; got {value!r}")
-
-
-def check_bounds(value: float, *, min_value: float | None, max_value: float | None) -> bool:
-    """Test finiteness and optional inclusive bounds.
-
-    :param float value: Number to compare against the bounds.
-    :param float | None min_value: Inclusive lower bound, or None to leave it unbounded.
-    :param float | None max_value: Inclusive upper bound, or None to leave it unbounded.
-    :return bool: Whether the value is finite and satisfies both supplied bounds.
-    """
-    if not math.isfinite(value):
-        return False
-    if min_value is not None and value < min_value:
-        return False
-    return not (max_value is not None and value > max_value)
 
 
 def _validate_optional_bounds(

@@ -43,7 +43,7 @@ from phasesweep.engine.paths import (
     _generation_path,
     _generation_record_path,
     _generation_summary_path,
-    _trial_dir_for,
+    _phase_dir,
 )
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
@@ -86,7 +86,9 @@ from tests.conftest import (
     lose_record_writes,
     make_experiment,
     mark_current_format,
+    new_phase_study,
     requires_nonroot,
+    study_name,
     write_constant_trainer,
     write_experiment_config,
     write_trainer,
@@ -109,7 +111,7 @@ from tests.mcp_helpers import (
     write_srv_catalog,
     write_srv_config,
 )
-from tests.recovery_helpers import recover_run_cli
+from tests.recovery_helpers import make_stale_trial_dirs, recover_run_cli
 
 
 @pytest.mark.integration
@@ -179,10 +181,11 @@ def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path
             )
         status = read_status(experiment)
         if status["phases"][0]["trials"].get("RUNNING", 0) >= 1:
-            phase_dir = _trial_dir_for(experiment, "p", 0).parent
-            for trial_dir in phase_dir.glob("trial_00000__*"):
-                if (trial_dir / PROCESS_IDENTITY_FILE).is_file():
-                    return trial_dir
+            identities = sorted(
+                _phase_dir(experiment, "p").glob(f"attempts/*/{PROCESS_IDENTITY_FILE}")
+            )
+            if identities:
+                return identities[0].parent
         time.sleep(0.2)
     raise AssertionError(f"trial never reached RUNNING; log:\n{log_path.read_text()}")
 
@@ -396,7 +399,8 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         run_experiment(experiment)
         if from_phase is not None:
             optuna.delete_study(
-                study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
+                study_name=study_name(experiment),
+                storage=_resolve_storage(experiment.resolved_storage),
             )
         # A later configured phase legitimately has no study to restore yet.
         experiment = experiment.model_copy(
@@ -726,7 +730,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     assert isinstance(experiment, Experiment)
     for phase in experiment.phases:
         study = optuna.create_study(
-            study_name=f"{experiment.experiment}::{phase.name}",
+            study_name=study_name(experiment, phase.name),
             storage=engine_ledger._resolve_storage(experiment.resolved_storage),
             direction="minimize",
         )
@@ -1161,25 +1165,13 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     phase = experiment.phases[0]
-    study = optuna.create_study(
-        study_name=f"{experiment.experiment}::{phase.name}",
-        storage=_resolve_storage(experiment.resolved_storage),
-        direction="minimize",
-    )
-    mark_current_format(experiment, study)
+    study = new_phase_study(experiment, phase.name)
     _bind_study_artifact_root(study, experiment)
     trial = study.ask()
     attempt_id = "terminal-identity-attempt"
     generation_id = "earlier-generation"
-    trial_dir = _trial_dir_for(
-        experiment,
-        phase.name,
-        trial.number,
-        generation_id=generation_id,
-        attempt_id=attempt_id,
-    )
-    trial_dir.mkdir(parents=True)
-    write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+    trial_dir, attempt_dir = make_stale_trial_dirs(experiment, phase.name, trial.number, attempt_id)
+    write_attempt_lifecycle(attempt_dir, attempt_id=attempt_id, state="allocated")
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
     trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
     trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
@@ -1191,6 +1183,7 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
         study_name=study.study_name,
         trial_number=trial.number,
         trial_dir=trial_dir,
+        attempt_dir=attempt_dir,
         generation_id=generation_id,
     )
 
@@ -1896,8 +1889,8 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
     status_path = store.status_path(run_id)
     log_path = store.log_path(run_id)
     with _spawned_runner(store, run_id, config, cwd=tmp_path) as proc:
-        trial_dir = _wait_for_running_trial(config, proc, log_path)
-        trial_pgid = json.loads((trial_dir / PROCESS_IDENTITY_FILE).read_text())["pgid"]
+        attempt_dir = _wait_for_running_trial(config, proc, log_path)
+        trial_pgid = json.loads((attempt_dir / PROCESS_IDENTITY_FILE).read_text())["pgid"]
 
         # The manual stop targets the runner; its handler stops the separate trial group.
         proc.terminate()

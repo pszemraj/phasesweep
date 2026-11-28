@@ -7,9 +7,17 @@ from pathlib import Path
 
 import pytest
 
+from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Repeats, Sampler
-from phasesweep.engine.read import RepeatGroupView, TrialTable, TrialTables
+from phasesweep.engine.read import (
+    RepeatGroupView,
+    TrialTable,
+    TrialTables,
+    read_trial_tables,
+)
+from phasesweep.engine.selection import PhaseAbortRefusedError
+from phasesweep.engine.status_refusals import PhaseRefusal
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.trial_table import render_trial_tables, unsettled_running_comment
@@ -19,7 +27,9 @@ from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
     terminal_stream,
+    write_constant_trainer,
 )
+from tests.recovery_helpers import stale_trial_rerun_config
 
 GENERATION = "6413d5c1edd5475998cfadd4d3b59980"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -76,6 +86,8 @@ def _table(
     available: bool = True,
     finished: int | None = None,
     uncounted: tuple[tuple[str, int], ...] = (),
+    refusal: PhaseRefusal | None = None,
+    growth: tuple[tuple[int, str], ...] = (),
 ) -> TrialTable:
     """Build a table whose columns are the core ones plus every optional key any row carries.
 
@@ -95,6 +107,8 @@ def _table(
         finished=len(rows) if finished is None else finished,
         uncounted=uncounted,
         groups=groups,
+        refusal=refusal,
+        growth=growth,
     )
 
 
@@ -228,6 +242,89 @@ def test_a_phase_without_trials_says_so() -> None:
             "depth: no trials yet, eval_loss (lower is better)",
         ]
     )
+
+
+def test_a_recorded_refusal_and_its_fix_print_under_the_heading() -> None:
+    """A phase a run would refuse says why and what to do under its heading, wrapped to the width."""
+    phase = _phase("search", n_trials=8, x=IntParam(type="int", low=0, high=9))
+    refusal = PhaseAbortRefusedError(
+        "Phase 'search' previously aborted at its accepted n_trials=8: 3 consecutive "
+        "failed/infeasible trials reached max_consecutive_failures=3.",
+        remediation="Fix the cause, then raise phases[search].n_trials above 8 and rerun.",
+    )
+    rows = [_row(index, None, {"x": index}, state="FAIL", duration=0.1) for index in range(3)]
+    tables = _tables(
+        _table("search", rows, refusal=refusal), represented=None, published=None, winners={}
+    )
+
+    lines = _render(tables, phase).splitlines()
+
+    assert lines[3:8] == [
+        "search: 3 of 8 trials, eval_loss (lower is better)",
+        "  Phase 'search' previously aborted at its accepted n_trials=8: 3 consecutive",
+        "  failed/infeasible trials reached max_consecutive_failures=3.",
+        "  fix: Fix the cause, then raise phases[search].n_trials above 8 and rerun.",
+        "          trial  eval_loss  x  state  time",
+    ]
+
+
+def test_each_search_space_growth_prints_under_the_heading_after_the_refusal() -> None:
+    """A grown phase names each growth's first draw position and added values, after any refusal and its fix."""
+    phase = _phase("search", n_trials=16, lr=CategoricalParam(type="categorical", choices=[0.001]))
+    refusal = PhaseAbortRefusedError(
+        "Phase 'search' previously aborted.",
+        remediation="Raise phases[search].n_trials and rerun.",
+    )
+    rows = [_row(index, 0.5, {"lr": 0.001}) for index in range(2)]
+    growth = ((12, "lr +0.003, +0.01"), (14, "lr +0.03"))
+    tables = _tables(
+        _table("search", rows, refusal=refusal, growth=growth),
+        represented=None,
+        published=None,
+        winners={},
+    )
+
+    lines = _render(tables, phase).splitlines()
+
+    assert lines[3:8] == [
+        "search: 2 of 16 trials, eval_loss (lower is better)",
+        "  Phase 'search' previously aborted.",
+        "  fix: Raise phases[search].n_trials and rerun.",
+        "  search_space grew at draw position 12: lr +0.003, +0.01",
+        "  search_space grew at draw position 14: lr +0.03",
+    ]
+
+
+def test_a_wrapped_growth_note_hangs_under_its_first_line() -> None:
+    """A growth note too long for the width continues on lines indented past the note, so it never reads as another item."""
+    phase = _phase("search", n_trials=16, lr=CategoricalParam(type="categorical", choices=[0.001]))
+    growth = ((12, "lr " + ", ".join(f"+{n / 1000}" for n in range(3, 12))),)
+    tables = _tables(
+        _table("search", [_row(0, 0.5, {"lr": 0.001})], growth=growth),
+        represented=None,
+        published=None,
+        winners={},
+    )
+
+    lines = _render(tables, phase, width=40).splitlines()
+
+    start = next(i for i, line in enumerate(lines) if "search_space grew" in line)
+    assert lines[start].startswith("  search_space grew at draw position 12:")
+    assert lines[start + 1].startswith("    ") and not lines[start + 1].startswith("     ")
+
+
+def test_a_renamed_metric_relabels_the_heading_of_the_same_study(tmp_path: Path) -> None:
+    """The metric's name only labels values, so a rename reads the same study under the new name."""
+    experiment = make_experiment(persistent=tmp_path, trainer=write_constant_trainer(tmp_path))
+    run_experiment(experiment)
+    edited = experiment.model_copy(
+        update={"metric": experiment.metric.model_copy(update={"name": "renamed"})}
+    )
+
+    tables = read_trial_tables(edited)
+    heading = render_trial_tables(tables, edited, csv_root=None, width=200, color=False)
+
+    assert "p: 2 of 2 trials, renamed (lower is better)" in heading
 
 
 def test_unreadable_trial_data_is_reported_without_a_table() -> None:
@@ -601,15 +698,14 @@ def test_the_generation_line_covers_every_publication_state(
 
 @pytest.mark.parametrize("width", [80, 60])
 def test_the_unsettled_running_comment_wraps_as_comment_lines(width: int) -> None:
-    """Wrapped lines each keep the ``# `` prefix and the words are the one-line comment's."""
-    single = unsettled_running_comment(2)
+    """Wrapped lines each keep the ``# `` prefix, the words are the one-line comment's, and the command follows whole on its own line."""
+    command = "phasesweep run " + "x" * 90 + ".yaml"
+    single, single_command = unsettled_running_comment(2, command).splitlines()
 
-    wrapped = unsettled_running_comment(2, width)
+    *lines, wrapped_command = unsettled_running_comment(2, command, width).splitlines()
 
-    assert "\n" not in single and single.startswith(
-        "# No run is active; 2 trials are recorded RUNNING."
-    )
-    lines = wrapped.splitlines()
+    assert single.startswith("# No run is active; 2 trials are recorded RUNNING.")
+    assert single_command == wrapped_command == f"# {command}"
     assert len(lines) > 1 and all(line.startswith("# ") and len(line) <= width for line in lines)
     assert " ".join(line.removeprefix("# ") for line in lines) == single.removeprefix("# ")
 
@@ -772,3 +868,21 @@ def test_status_trials_styles_the_winner_on_a_terminal_unless_no_color_is_set(
     assert "\x1b" not in shown["1"]
     assert "\x1b" not in shown[""]
     assert ANSI.sub("", shown[None]) == shown["1"] == shown[""]
+
+
+def test_status_trials_says_how_many_results_reran_an_interrupted_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The heading of a phase whose winner reran an interrupted trial is followed by the run summary's interrupted line."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    experiment, _config = stale_trial_rerun_config(tmp_path)
+    run_experiment(experiment)
+
+    tables = read_trial_tables(experiment, latest=True)
+    lines = render_trial_tables(tables, experiment, csv_root=None, width=80, color=False)
+    lines = lines.splitlines()
+
+    heading = lines.index("p: 2 of 2 trials, objective (lower is better)")
+    assert lines[heading + 1] == (
+        "  interrupted: 1 of 2 results came from a rerun, the winner among them"
+    )

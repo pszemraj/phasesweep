@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Protocol
 from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.json import (
     JsonObject,
+    JsonValue,
     json_integer,
     json_number,
     json_number_map,
@@ -25,6 +26,13 @@ from phasesweep.runtime.json import (
 )
 from phasesweep.runtime.remote_worker import report_reserve, run_worker
 from phasesweep.runtime.time import utc_now_iso
+from phasesweep.tracking.records import (
+    OUTCOME_TAG,
+    STATUS_BEFORE_DELIVERY,
+    WINNER_GENERATION_TAG_PREFIX,
+    WINNER_TAG,
+    readable_run_state,
+)
 
 if TYPE_CHECKING:
     from mlflow.entities import Metric, Param, RunTag
@@ -83,10 +91,12 @@ class OperationUnavailableError(OperationRejectedError):
     """
 
 
-class ManagedObjectiveMissingError(ValueError):
-    """A finished managed run lacks the configured objective metric.
+class ObjectiveMissingError(ValueError):
+    """A finished bound run, managed or trainer-owned, lacks the configured objective metric.
 
-    The trainer logged the objective under another key, into another run, or not at all.
+    The trainer logged the objective under another key, into another run, or not at all, and
+    the trial's earlier runs hold no point the objective selects. Only a managed run's reader
+    adds advice on logging into the supplied run.
     """
 
 
@@ -267,6 +277,14 @@ class _SdkClient(Protocol):
         """
         ...
 
+    def delete_tag(self, run_id: str, key: str) -> None:
+        """Remove one tag from an existing run.
+
+        :param str run_id: Remote run identifier.
+        :param str key: Tag name.
+        """
+        ...
+
     def log_batch(
         self,
         run_id: str,
@@ -335,8 +353,8 @@ def request_operation(
         or trusted, or it reported that a creation may have taken effect.
     :raises OperationUnavailableError: The worker reported that the tracker gave no answer.
     :raises OperationRejectedError: The worker reported that the request failed.
-    :raises ManagedObjectiveMissingError: The worker reported that a finished managed run lacks
-        the configured objective metric.
+    :raises ObjectiveMissingError: The worker reported that a finished run lacks the
+        configured objective metric.
     :return JsonObject: Successful public-client response.
     """
     try:
@@ -346,7 +364,7 @@ def request_operation(
             "mlflow",
             statuses=_STATUSES,
             run_id=operation_id,
-            trial_dir=directory,
+            attempt_dir=directory,
             environment=environment,
             deadline=deadline,
         )
@@ -376,7 +394,7 @@ def request_operation(
     if status == "error":
         raise OperationRejectedError(message)
     if status == "objective_missing":
-        raise ManagedObjectiveMissingError(message)
+        raise ObjectiveMissingError(message)
     if status == "unavailable":
         raise OperationUnavailableError(message)
     raise OperationOutcomeUnknownError(message)
@@ -601,7 +619,12 @@ def _find(client: _SdkClient, request: FindRequest) -> FindResult:
 
 
 def _finished_without(
-    data: _SdkRunData, *, metrics: Iterable[str], params: Iterable[str], tags: Iterable[str]
+    data: _SdkRunData,
+    *,
+    metrics: Iterable[str],
+    params: Iterable[str],
+    tags: Iterable[str],
+    earlier: tuple[Iterable[str], Iterable[str], Iterable[str]],
 ) -> str | None:
     """Name the required metrics, params and tags a finished run lacks, and the keys it has.
 
@@ -609,14 +632,16 @@ def _finished_without(
     :param Iterable[str] metrics: Required metric names.
     :param Iterable[str] params: Required param names.
     :param Iterable[str] tags: Required tag names.
+    :param tuple[Iterable[str], Iterable[str], Iterable[str]] earlier: Metric, param and tag
+        keys the trial's earlier runs logged, which count as present.
     :return str | None: The failure text, or ``None`` when the run has everything required.
     """
     lacking: list[str] = []
     available: list[str] = []
     for kind, wanted, present in (
-        ("metric", metrics, data.metrics),
-        ("param", params, data.params),
-        ("tag", tags, data.tags),
+        ("metric", metrics, set(data.metrics).union(earlier[0])),
+        ("param", params, set(data.params).union(earlier[1])),
+        ("tag", tags, set(data.tags).union(earlier[2])),
     ):
         absent = sorted({key for key in wanted if key not in present})
         if absent:
@@ -627,21 +652,67 @@ def _finished_without(
     return f"MLflow run finished without {', '.join(lacking)}; available {'; '.join(available)}."
 
 
+def _metric_records(client: _SdkClient, run_id: str, key: str) -> list[Mapping[str, object]]:
+    """Read one run's complete history of a metric as plain records.
+
+    :param _SdkClient client: Public MLflow client in the supervised worker.
+    :param str run_id: Run whose history is read.
+    :param str key: Metric name.
+    :return list[Mapping[str, object]]: One record per logged point.
+    """
+    return [
+        {
+            "value": m.value,
+            "step": m.step,
+            "timestamp": m.timestamp,
+            "model_id": getattr(m, "model_id", None),
+            "dataset_name": getattr(m, "dataset_name", None),
+            "dataset_digest": getattr(m, "dataset_digest", None),
+            "run_id": run_id,
+        }
+        for m in client.get_metric_history(run_id, key)
+    ]
+
+
 def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     """Fetch finished evidence, sharing complete histories across selectors.
 
-    FINISHED runs fail immediately when required evidence is missing. Unfinished
-    runs are polled until just before ``timeout_at``.
+    :param _SdkClient client: Public MLflow client in the supervised worker.
+    :param CaptureRequest request: Trusted target, bound run, the trial's earlier runs
+        oldest first, and shared query.
+    :return MlflowCapture: Frozen shared native evidence, as :func:`_attributed_capture`
+        reads it.
+    """
+    return _attributed_capture(client, request)[0]
+
+
+def _attributed_capture(client: _SdkClient, request: CaptureRequest) -> tuple[MlflowCapture, str]:
+    """Fetch finished evidence, sharing complete histories across selectors.
+
+    A managed run may carry the failed outcome PhaseSweep delivered after successful training.
+    Its history can still answer a corrected reader. Finished runs fail immediately when required evidence is missing.
+    Unfinished runs are polled until just before ``timeout_at``. Each metric's history is the bound
+    run's merged over the earlier runs of the trial's resumed attempts, whatever their
+    status, so a rerun whose trainer skipped finished training and logged nothing is read from
+    them. A gate's param or tag the bound run lacks can come from the newest earlier run that
+    logged it. A run that lacks the objective left nothing to score when its trainer logged
+    other metrics, since it then ran without reporting the objective, or when the merged
+    history holds no selected point either.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
-    :param CaptureRequest request: Trusted target, bound run, and shared query.
-    :raises ValueError: The run no longer matches its binding, ended FAILED or KILLED,
-        restarted during capture, or finished without a required metric, param or tag
-        (the message names it and the keys the run has) or without a metric's history.
+    :param CaptureRequest request: Trusted target, bound run, the trial's earlier runs
+        oldest first, and shared query.
+    :raises ObjectiveMissingError: A finished run lacks the objective metric, and its
+        trial's merged history holds no point the objective selects.
+    :raises ValueError: The run or an earlier run no longer matches its binding, the run ended
+        FAILED or KILLED independently of delivery, restarted during capture, or finished without a required metric,
+        param or tag (the message names it and the keys the run has) or without a metric's
+        history.
     :raises TimeoutError: The run is still not finished when ``timeout_seconds`` runs out.
-    :return MlflowCapture: Frozen shared native evidence.
+    :return tuple[MlflowCapture, str]: Frozen shared native evidence, and the run whose
+        history holds the objective's selected point.
     """
-    from phasesweep.evidence.mlflow import select_observation
+    from phasesweep.evidence.mlflow import merge_histories, observation_id, select_observation
     from phasesweep.evidence.models import MlflowExtractor, MlflowRequiredGate
 
     binding, query = request["binding"], request["query"]
@@ -652,67 +723,118 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     while True:
         run = client.get_run(binding["run_id"])
         verify_remote(run, binding)
-        if run.info.status in {"FAILED", "KILLED"}:
-            raise ValueError("MLflow run ended unsuccessfully; remote metrics cannot rescue it.")
         if run.info.status == "RUNNING" and binding["run_mode"] == "managed":
             client.set_terminated(binding["run_id"], status="FINISHED")
             run = client.get_run(binding["run_id"])
-        if run.info.status == "FINISHED":
+            verify_remote(run, binding)
+        status = run.info.status
+        if readable_run_state(status, binding["run_mode"], run.data.tags):
             selections = {
                 identity: MlflowExtractor.model_validate(specification)
                 for identity, specification in query["selections"].items()
             }
             gates = [MlflowRequiredGate.model_validate(gate) for gate in query["gates"]]
             keys = sorted({spec.metric_key for spec in selections.values()})
+            objective = MlflowExtractor.model_validate(query["objective"])
+            objective_key, objective_run = objective.metric_key, binding["run_id"]
+            gate_params = {key for gate in gates for key in gate.params}
+            gate_tags = {key for gate in gates for key in gate.tags}
+            earlier = request["earlier"]
+            earlier_metrics: set[str] = set()
+            # A newer run's value wins; the bound run's own values win over every earlier one.
+            params: dict[str, str] = {}
+            tags: dict[str, str] = {}
+            for prior in earlier:
+                prior_run = client.get_run(prior["run_id"])
+                verify_remote(prior_run, prior)
+                earlier_metrics.update(prior_run.data.metrics)
+                params.update((k, v) for k, v in prior_run.data.params.items() if k in gate_params)
+                tags.update((k, v) for k, v in prior_run.data.tags.items() if k in gate_tags)
             lacking = _finished_without(
                 run.data,
                 metrics=keys,
-                params=[key for gate in gates for key in gate.params],
-                tags=[key for gate in gates for key in gate.tags],
+                params=gate_params,
+                tags=gate_tags,
+                earlier=(earlier_metrics, params, tags),
             )
             if lacking is not None:
-                if (
-                    binding["run_mode"] == "managed"
-                    and MlflowExtractor.model_validate(query["objective"]).metric_key
-                    not in run.data.metrics
-                ):
-                    raise ManagedObjectiveMissingError(lacking)
+                if objective_key not in earlier_metrics.union(run.data.metrics):
+                    raise ObjectiveMissingError(lacking)
                 raise ValueError(lacking)
+            logged = sorted(key for key in run.data.metrics if not key.startswith("phasesweep."))
+            if objective_key not in run.data.metrics and logged:
+                # A trainer that logged metrics ran and did not report the objective, so an
+                # earlier run's point is not its result; only a run that logged nothing
+                # skipped finished training.
+                raise ObjectiveMissingError(
+                    f"MLflow run finished without metric {objective_key!r} though its trainer "
+                    f"logged {', '.join(logged)}, so its trial's earlier runs do not score it."
+                )
             observations: dict[str, Observation] = {}
             for key in keys:
-                history = client.get_metric_history(binding["run_id"], key)
-                if not history:
-                    raise ValueError(
-                        f"MLflow run finished with metric {key!r} but no history for it."
-                    )
-                records: list[Mapping[str, object]] = [
-                    {
-                        "value": m.value,
-                        "step": m.step,
-                        "timestamp": m.timestamp,
-                        "model_id": getattr(m, "model_id", None),
-                        "dataset_name": getattr(m, "dataset_name", None),
-                        "dataset_digest": getattr(m, "dataset_digest", None),
-                    }
-                    for m in history
-                ]
+                history = []
+                if key in run.data.metrics:
+                    history = _metric_records(client, binding["run_id"], key)
+                    if not history:
+                        raise ValueError(
+                            f"MLflow run finished with metric {key!r} but no history for it."
+                        )
+                records = merge_histories(
+                    [*(_metric_records(client, prior["run_id"], key) for prior in earlier), history]
+                )
                 for identity, spec in selections.items():
-                    if spec.metric_key == key:
+                    if spec.metric_key != key:
+                        continue
+                    if identity != observation_id(objective):
                         observations[identity] = select_observation(records, spec)
+                        continue
+                    try:
+                        point = select_observation(records, spec)
+                    except ValueError as exc:
+                        # Only a missing point means the rerun left nothing; any other
+                        # refusal is the trial's own evidence failing.
+                        missing = not any(
+                            spec.select != "step" or record.get("step") == spec.step
+                            for record in records
+                        )
+                        if not history and missing:
+                            raise ObjectiveMissingError(
+                                f"MLflow run finished without metric {key!r}, and its trial's "
+                                f"earlier runs lack the selected point: {exc}"
+                            ) from exc
+                        raise
+                    observations[identity] = point
+                    objective_run = next(
+                        str(record["run_id"])
+                        for record in records
+                        if (record.get("step"), record.get("timestamp"), record.get("value"))
+                        == (point["step"], point["timestamp"], point["value"])
+                    )
             final = client.get_run(binding["run_id"])
             verify_remote(final, binding)
-            if final.info.status != "FINISHED":
+            if final.info.status != status or not readable_run_state(
+                status, binding["run_mode"], final.data.tags
+            ):
                 raise ValueError("MLflow run restarted during evidence capture.")
-            return {
+            params.update(final.data.params)
+            tags.update(final.data.tags)
+            tag_keys = set(gate_tags)
+            if status != "FINISHED":
+                tag_keys.update((STATUS_BEFORE_DELIVERY, OUTCOME_TAG))
+            capture: MlflowCapture = {
                 "kind": "mlflow",
                 "binding": binding,
-                "run_state": "FINISHED",
+                "earlier_bindings": earlier,
+                "run_state": status,
                 "query": query,
                 "observations": observations,
                 "retrieved_at": utc_now_iso(),
-                "params": {key: final.data.params[key] for gate in gates for key in gate.params},
-                "tags": {key: final.data.tags[key] for gate in gates for key in gate.tags},
+                "params": {key: params[key] for gate in gates for key in gate.params},
+                "tags": {key: tags[key] for key in sorted(tag_keys)},
             }
+            return capture, objective_run
+        if status in {"FAILED", "KILLED"}:
+            raise ValueError("MLflow run ended unsuccessfully; remote metrics cannot rescue it.")
         if time.monotonic() >= stop:
             raise TimeoutError(
                 f"MLflow run was still {run.info.status} when timeout_seconds ran out."
@@ -723,12 +845,20 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
 def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
     """Upload a retained projection and apply its managed run's terminal outcome.
 
-    The retained outcome takes precedence over the status left by the trainer.
+    The retained outcome takes precedence over the status left by the trainer. An accepted
+    reading finishes a run PhaseSweep had delivered FAILED or KILLED. A run the trainer itself
+    ended unsuccessfully is never finished. An accepted reading drops earlier outcome tags
+    for either ownership mode. An attempt
+    record that does not name its run a winner drops the winner tag an earlier reading set.
     Projection-specific artifact names keep winner uploads distinct from trial summaries.
+    Historical uploads preserve metric points and generation-specific winner tags. The shared
+    artifacts, tags and status belong to the newest reading, even when an older upload retries.
+    An upload shared by equivalent attempts takes the newest reading's winner verdict.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param PublishRequest request: Trusted target, bound run, and projection.
-    :raises ValueError: Termination was requested for a trainer-owned run.
+    :raises ValueError: Termination was requested for a trainer-owned run, or a FINISHED
+        outcome for a run the trainer ended unsuccessfully.
     :return JsonObject: Empty success response.
     """
     from mlflow.entities import Metric, Param, RunTag
@@ -736,26 +866,62 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
     binding, projection = request["binding"], request["projection"]
     run = client.get_run(binding["run_id"])
     verify_remote(run, binding)
-    finish = request.get("finish")
+    historical = request.get("historical", False)
+    finish = None if historical else request.get("finish")
     if finish and binding["run_mode"] != "managed":
         raise ValueError("Only runs PhaseSweep created may be terminated.")
+    status = run.info.status
+    attempt = request["name"].startswith("attempt-")
+    if (
+        attempt
+        and finish == "FINISHED"
+        and status != "RUNNING"
+        and not readable_run_state(status, binding["run_mode"], run.data.tags)
+    ):
+        raise ValueError("MLflow run ended unsuccessfully; it cannot be finished.")
+    tags = dict(projection["tags"])
+    current_winner = request.get("current_winner")
+    if current_winner is True:
+        tags[WINNER_TAG] = "true"
+    elif current_winner is False:
+        tags.pop(WINNER_TAG, None)
+    if historical:
+        tags = {
+            key: value
+            for key, value in tags.items()
+            if key.startswith(WINNER_GENERATION_TAG_PREFIX)
+        }
+        if not projection["metrics"] and not tags:
+            return {}
+    if attempt and finish in ("FAILED", "KILLED") and status in ("RUNNING", "FINISHED"):
+        tags[STATUS_BEFORE_DELIVERY] = status
     client.log_batch(
         binding["run_id"],
         metrics=[
             Metric(k, v, projection["timestamp"], 0) for k, v in projection["metrics"].items()
         ],
-        params=[Param(k, v) for k, v in projection["params"].items()],
-        tags=[RunTag(k, v) for k, v in projection["tags"].items()],
+        params=[] if historical else [Param(k, v) for k, v in projection["params"].items()],
+        tags=[RunTag(k, v) for k, v in tags.items()],
         synchronous=True,
     )
+    if historical:
+        return {}
+    if attempt and WINNER_TAG not in tags and WINNER_TAG in run.data.tags:
+        # The record is the run's newest reading, and that reading did not select it.
+        client.delete_tag(binding["run_id"], WINNER_TAG)
     with TemporaryDirectory(prefix="phasesweep-mlflow-summary-") as directory:
         path = Path(directory) / f"{request['name']}.json"
         path.write_text(
             json.dumps(projection["summary"], sort_keys=True, allow_nan=False), encoding="utf-8"
         )
         client.log_artifact(binding["run_id"], str(path), artifact_path="phasesweep")
-    if finish and run.info.status != finish:
+    if finish and status != finish:
         client.set_terminated(binding["run_id"], status=finish)
+    if attempt and OUTCOME_TAG not in tags:
+        # Clear the previous outcome after applying any status change, so it is readable on retry.
+        for key in (OUTCOME_TAG, STATUS_BEFORE_DELIVERY):
+            if key in run.data.tags:
+                client.delete_tag(binding["run_id"], key)
     return {}
 
 
@@ -779,6 +945,19 @@ def _projection(value: object) -> Projection:
         "tags": tags,
         "summary": json_object(projection["summary"]),
     }
+
+
+def _earlier_bindings(request: JsonObject) -> list[JsonValue]:
+    """Return a capture request's list of earlier run bindings, before each is validated.
+
+    :param JsonObject request: Trusted capture request.
+    :raises ValueError: The request carries no list of earlier bindings.
+    :return list[JsonValue]: The undecoded bindings, oldest first.
+    """
+    earlier = request["earlier"]
+    if not isinstance(earlier, list):
+        raise ValueError("MLflow capture request lacks its earlier run bindings.")
+    return earlier
 
 
 def _dispatch(request: JsonObject) -> JsonObject:
@@ -823,18 +1002,21 @@ def _dispatch(request: JsonObject) -> JsonObject:
         )
         return json_object(found)
     if action == "capture":
-        captured = _capture(
+        captured, objective_run = _attributed_capture(
             client,
             {
                 "action": "capture",
                 "settings": settings,
                 "binding": validate_binding(request["binding"]),
+                "earlier": [validate_binding(item) for item in _earlier_bindings(request)],
                 "query": parse_query(request["query"]),
                 "timeout_at": json_number(request, "timeout_at"),
             },
         )
-        return json_object(captured)
+        # Not part of the stored capture: the reader records it as the objective's source.
+        return {**json_object(captured), "objective_run_id": objective_run}
     if action == "publish":
+        current_winner = request.get("current_winner")
         return _publish(
             client,
             {
@@ -844,6 +1026,8 @@ def _dispatch(request: JsonObject) -> JsonObject:
                 "binding": validate_binding(request["binding"]),
                 "projection": _projection(request["projection"]),
                 "finish": json_optional_text(request, "finish"),
+                "historical": request.get("historical") is True,
+                "current_winner": current_winner if isinstance(current_winner, bool) else None,
             },
         )
     raise ValueError("Unknown internal MLflow operation.")
@@ -886,7 +1070,7 @@ def main(argv: list[str] | None = None) -> int:
         }
     except OperationOutcomeUnknownError as exc:
         response = {"status": "unknown", "message": str(exc)}
-    except ManagedObjectiveMissingError as exc:
+    except ObjectiveMissingError as exc:
         response = {"status": "objective_missing", "message": str(exc)}
     except (ValueError, TimeoutError) as exc:
         response = {"status": "error", "message": str(exc)}

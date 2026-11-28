@@ -432,6 +432,13 @@ class GetLatestRunResult(_ToolPayload):
     run: RunPayload | None
 
 
+class RereadPendingPayload(_ToolPayload):
+    """Finished trials the next run re-reads from kept evidence instead of retraining."""
+
+    statement: str = Field(description="Which settings changed and what the next run re-reads.")
+    finished_trials: int = Field(ge=0, description="Finished trials the next run re-reads.")
+
+
 class PhaseStatusPayload(_ToolPayload):
     """Per-phase status without filesystem paths."""
 
@@ -480,6 +487,17 @@ class PhaseStatusPayload(_ToolPayload):
             "null when counts are unavailable."
         )
     )
+    interrupted_reruns: int | None = Field(
+        ge=0,
+        description="Finished trials that rerun an interrupted trial; null when unavailable.",
+    )
+    interrupted_reruns_earlier_attempt: int | None = Field(
+        ge=0,
+        description=(
+            "Of those, the ones scored from a result an earlier attempt of the trial wrote; "
+            "null when unavailable."
+        ),
+    )
     winner_present: bool = Field(description="Whether this phase has a winner artifact.")
     published_study_unavailable: bool | None = Field(
         description=(
@@ -496,6 +514,14 @@ class PhaseStatusPayload(_ToolPayload):
             "persistent observation is available; trial counts and derived progress "
             "fields are then null."
         )
+    )
+    reread_pending: RereadPendingPayload | None = Field(
+        default=None,
+        description=(
+            "Set when a reading setting (metric extractor or goal, constraints, gates) changed "
+            "since this phase's trials were measured: its counts are empty until the next run "
+            "re-reads them from kept evidence, which launches no trainer. Null otherwise."
+        ),
     )
 
 
@@ -659,6 +685,17 @@ class WinnerPhasePayload(_ToolPayload):
     )
     edge_advisory_status: EdgeAdvisoryStatus = Field(
         description="unavailable when the trials or the producing config cannot be read, not_at_edge when no parameter qualifies, available with an edge_advisory."
+    )
+    interrupted_reruns: int = Field(
+        ge=0,
+        description="The phase's finished trials that rerun an interrupted trial; 0 when the trials cannot be read.",
+    )
+    interrupted_reruns_earlier_attempt: int = Field(
+        ge=0,
+        description="Of those, the ones scored from a result an earlier attempt of the trial wrote.",
+    )
+    winner_interrupted_rerun: bool = Field(
+        description="Whether a trial this winner stands on is among those reruns."
     )
     confound: ConfoundSummary = Field(
         description="Verdicts on the population this winner was selected from, frozen at selection."

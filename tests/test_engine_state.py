@@ -18,8 +18,7 @@ from phasesweep.engine.state import (
     _stands_under_winner,
     _winning_trials,
 )
-from tests.conftest import make_experiment, phase_trials
-from tests.recovery_helpers import new_phase_study
+from tests.conftest import make_experiment, new_phase_study, phase_trials
 
 
 def test_trial_state_names_match_optuna_trial_state() -> None:

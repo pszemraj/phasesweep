@@ -30,7 +30,12 @@ from phasesweep.engine.ledger import (
     open_phase_study,
     validate_ledger,
 )
-from phasesweep.engine.optuna import _build_sampler, _suggest, _trial_count_state
+from phasesweep.engine.optuna import (
+    _build_sampler,
+    _suggest,
+    _trial_count_state,
+    _trial_run_state,
+)
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
@@ -51,7 +56,6 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     DURATION_ATTR,
-    FEASIBLE_ATTR,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
     STUDY_SCHEMA_ATTR,
@@ -82,7 +86,7 @@ from phasesweep.errors import (
     ProcessCleanupUncertainError,
     UnsafeProcessCleanupError,
 )
-from phasesweep.evidence.evaluation import DeadlineExceededError, ExtractorError
+from phasesweep.evidence.evaluation import DeadlineExceededError, ExtractorError, run_extractor
 from phasesweep.evidence.models import (
     Gate,
     JsonExtractor,
@@ -100,6 +104,7 @@ from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 from phasesweep.runtime.remote_worker import run_worker
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
+    addressed_phase_study,
     bounded_metric,
     copy_fake_train,
     make_experiment,
@@ -108,6 +113,7 @@ from tests.conftest import (
     phase_study,
     phase_trials,
     requires_nonroot,
+    study_name,
     trial_outcome,
     write_constant_trainer,
     write_param_echo_trainer,
@@ -141,7 +147,6 @@ def test_json_primary_invalid_evidence_fails_trial(tmp_path, payload):
     try:
         result = extract_trial_result(experiment=experiment, executed=executed)
         assert result.metric is None
-        assert not result.feasible
         assert result.failure_reason.startswith("metric extractor")
     finally:
         if source.exists():
@@ -303,12 +308,12 @@ def test_stale_trial_holding_last_grid_point_recovers(tmp_path: Path) -> None:
             Phase(name="p", n_trials=1, sampler=Sampler(type="grid"), search_space=search_space)
         ],
     )
-    _, _trial_dir, stale_number = fabricate_stale_trial(exp, "p", attempt_id="grid-attempt")
+    stale_number = fabricate_stale_trial(exp, "p", attempt_id="grid-attempt").number
     # Recovery reopens the phase study with its configured GridSampler, as the
     # engine does; the stale trial must also hold a grid point, so give it the
     # attrs GridSampler.before_trial would have written at ask time.
     study = optuna.load_study(
-        study_name="gridstale::p",
+        study_name=study_name(exp),
         storage=_resolve_storage(exp.resolved_storage),
         sampler=_build_sampler(Sampler(type="grid"), search_space),
     )
@@ -385,7 +390,7 @@ def test_persistent_execution_reattaches_configured_sampler_and_pruner(
         workdir=tmp_path / "runs",
         phases=[phase],
     )
-    study = open_phase_study(claim_ledger(validate_ledger(exp)), phase)
+    study = open_phase_study(claim_ledger(validate_ledger(exp)), phase, study_name(exp))
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     observed: dict[str, object] = {}
 
@@ -787,7 +792,6 @@ def test_non_finite_extracted_value_returns_failed_result(
     result = extract_trial_result(experiment=experiment, executed=executed)
 
     assert result.metric is None
-    assert result.feasible is False
     assert result.failure_reason == failure_reason
 
 
@@ -829,12 +833,12 @@ def test_abort_after_gpu_acquire_prevents_queued_trials(
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(exp)
 
-    # Count actual subprocess launches (each launch creates a stdout.log).
+    # Count actual subprocess launches (each launch creates a stdout.log in its attempt directory).
     # With the post-acquire recheck, the first failure aborts queued threads
     # before they launch their subprocess. Without it, all 4 would launch.
     runs_dir = Path(exp.workdir).expanduser().resolve() / exp.experiment / exp.phases[0].name
-    trial_dirs = sorted(runs_dir.glob("trial_*"))
-    launched = [d for d in trial_dirs if (d / "stdout.log").exists()]
+    attempt_dirs = sorted((runs_dir / "attempts").glob("*"))
+    launched = [d for d in attempt_dirs if (d / "stdout.log").exists()]
     assert 1 <= len(launched) <= 2, (
         f"With max_consecutive_failures=1 and a 1-slot GPU pool, expected at "
         f"least 1 and at most 2 trial launches (1 failing + at most 1 in-flight "
@@ -935,7 +939,7 @@ def test_parallel_abort_stamps_environment_before_stopping_a_queued_trial(tmp_pa
 
     study = phase_study(experiment)
     previous = study.trials
-    assert [_trial_count_state(trial) for trial in previous] == ["FAIL", "INTERRUPTED"]
+    assert [_trial_run_state(trial) for trial in previous] == ["FAIL", "INTERRUPTED"]
     stopped = _parsed_trial_outcome(previous[1].user_attrs[TRIAL_OUTCOME_ATTR])
     assert stopped is not None and "before this trial's trainer launched" in stopped.cause
     for trial in previous:
@@ -1161,11 +1165,11 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
                 "fake-sdk",
                 statuses=frozenset({"ok"}),
                 run_id=ctx.attempt_id,
-                trial_dir=ctx.trial_dir,
+                attempt_dir=ctx.attempt_dir,
                 environment={},
                 deadline=time.monotonic() + 10,
             )
-            lifecycle = read_attempt_lifecycle(ctx.trial_dir, expected_attempt_id=ctx.attempt_id)
+            lifecycle = read_attempt_lifecycle(ctx.attempt_dir, expected_attempt_id=ctx.attempt_id)
             assert result.return_code == worker_return_code
             assert lifecycle is not None and lifecycle.return_code == worker_return_code
         return original_extract(
@@ -1200,12 +1204,12 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     trials = study.get_trials(deepcopy=False)
     if recovered_complete:
         assert [trial.state for trial in trials] == [optuna.trial.TrialState.COMPLETE] * 2
-        assert trials[0].user_attrs[FEASIBLE_ATTR] is (constraints is None)
-        assert trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == (
-            "success" if constraints is None else "failure"
+        assert _trial_count_state(trials[0], exp) == (
+            "COMPLETE" if constraints is None else "INFEASIBLE"
         )
+        assert trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "success"
         assert not any(RERUN_OF_ATTR in trial.user_attrs for trial in trials)
-        assert _load_phase_policy_state(study).max_sequence == 2
+        assert _load_phase_policy_state(study, exp).max_sequence == 2
         assert launches.read_text().splitlines() == ["0", "1"]
         assert trials[0].user_attrs[DURATION_ATTR] == trainer_durations[0]
         assert len(trainer_durations) == 1
@@ -1213,17 +1217,16 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
         assert [trial.state for trial in trials] == [
             optuna.trial.TrialState.FAIL,
             optuna.trial.TrialState.COMPLETE,
-            optuna.trial.TrialState.COMPLETE,
         ]
         assert trials[0].user_attrs[TRIAL_OUTCOME_ATTR] == {
             "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
             "sequence": 1,
-            "outcome": "interrupted",
-            "cause": "stale RUNNING trial recovered after its orchestrator stopped",
+            "outcome": "failure",
+            "cause": "non-zero exit code 1",
         }
-        assert trials[1].user_attrs[RERUN_OF_ATTR] == 0
-        assert _load_phase_policy_state(study).max_sequence == 3
-        assert launches.read_text().splitlines() == ["0", "1", "2"]
+        assert not any(RERUN_OF_ATTR in trial.user_attrs for trial in trials)
+        assert _load_phase_policy_state(study, exp).max_sequence == 2
+        assert launches.read_text().splitlines() == ["0", "1"]
 
 
 @pytest.mark.integration
@@ -1305,14 +1308,14 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
             # fault injection. Restore a durable pre-exit shape: with an identity,
             # preflight must consult it and our cleanup verdict; without one, the
             # identity write failed before any payload crossed.
-            trial_dir = Path(str(kwargs["trial_dir"]))
+            attempt_dir = Path(str(kwargs["attempt_dir"]))
             write_attempt_lifecycle(
-                trial_dir,
+                attempt_dir,
                 attempt_id=str(kwargs["attempt_id"]),
                 state="allocated" if identity_persists else "launching",
             )
             if not identity_persists:
-                (trial_dir / PROCESS_IDENTITY_FILE).unlink()
+                (attempt_dir / PROCESS_IDENTITY_FILE).unlink()
         return result
 
     def maybe_refuse_cleanup_attr(
@@ -1333,8 +1336,10 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     with pytest.raises(ProcessCleanupUncertainError, match="cleanup could not be confirmed"):
         run_experiment(_exp(2))
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-    record = _load_phase_policy_state(study).abort
+    study = optuna.load_study(
+        study_name=study_name(_exp(2)), storage=_resolve_storage(f"journal:///{db}")
+    )
+    record = _load_phase_policy_state(study, _exp(2)).abort
     assert record is not None
     assert record["policy"] == "unsafe_process_cleanup"
     assert "cleanup could not be confirmed" in record["cause"]
@@ -1381,7 +1386,9 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     before = len(study.trials)
     with pytest.raises(ProcessCleanupUncertainError):
         run_experiment(_exp(3))
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+    study = optuna.load_study(
+        study_name=study_name(_exp(3)), storage=_resolve_storage(f"journal:///{db}")
+    )
     assert len(study.trials) == before
     assert list(_attempts_dir(_exp(3)).glob("*.json"))
     assert CLEANUP_RECOVERED_TRIALS_ATTR not in study.user_attrs
@@ -1398,7 +1405,9 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_exp(3))
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+    study = optuna.load_study(
+        study_name=study_name(_exp(3)), storage=_resolve_storage(f"journal:///{db}")
+    )
     assert len(study.trials) == before + 1
     assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [unsafe_trial.number]
     assert list(_attempts_dir(_exp(3)).glob("*.json")) == []
@@ -1476,7 +1485,9 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(exp)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+    study = optuna.load_study(
+        study_name=study_name(exp), storage=_resolve_storage(f"journal:///{db}")
+    )
     outcomes = sorted(
         (trial.user_attrs[TRIAL_OUTCOME_ATTR] for trial in study.trials),
         key=lambda outcome: outcome["sequence"],
@@ -1488,7 +1499,7 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
     record = outcomes[1][TRIAL_OUTCOME_ABORT_KEY]
     assert record["completion_sequence"] == 2
     assert record["consecutive_failures"] == 2
-    replayed = _load_phase_policy_state(study)
+    replayed = _load_phase_policy_state(study, exp)
     assert replayed.consecutive_failures == 0
     assert replayed.abort == record
 
@@ -1546,7 +1557,7 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
             run.abort_recorded = True
             first_abort = abort
             abort_streak = tuple(streak)
-        replayed = _load_phase_policy_state(study)
+        replayed = _load_phase_policy_state(study, experiment)
         assert run.completion_sequence == replayed.max_sequence
         assert run.consecutive_failures == replayed.consecutive_failures
         assert replayed.abort_streak == abort_streak
@@ -1554,7 +1565,7 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
     assert first_abort is not None
 
     _record_recovery_boundary(study, phase, run.completion_sequence)
-    replayed = _load_phase_policy_state(study)
+    replayed = _load_phase_policy_state(study, experiment)
     run.resume_from(replayed)
     assert run.completion_sequence == len(outcomes)
     assert run.consecutive_failures == 0
@@ -1634,7 +1645,7 @@ def test_gpu_unavailability_preserves_accepted_target_and_old_config(
         phase = experiment.phases[0].model_copy(update={"n_trials": 2})
         with pytest.raises(RuntimeError, match="no GPUs detected"):
             run_experiment(experiment.model_copy(update={"phases": [phase]}))
-        study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
+        study = addressed_phase_study(experiment)
         assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
         assert len(study.trials) == 1
 
@@ -1642,7 +1653,7 @@ def test_gpu_unavailability_preserves_accepted_target_and_old_config(
     assert rerun["p"].trial_number == first["p"].trial_number
     assert rerun["p"].metric == first["p"].metric
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
+    study = addressed_phase_study(experiment)
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
     assert len(study.trials) == 1
 
@@ -1745,7 +1756,7 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
         live[trial.number] = value
         return value
 
-    monkeypatch.setattr("phasesweep.engine.phase._suggest", recording_suggest)
+    monkeypatch.setattr("phasesweep.engine.optuna._suggest", recording_suggest)
 
     winners = run_experiment(exp)
 
@@ -1863,12 +1874,10 @@ def test_metric_outside_bounds_is_complete_and_infeasible(tmp_path: Path) -> Non
     trials = phase_trials(exp)
     assert [t.state for t in trials] == [optuna.trial.TrialState.COMPLETE] * 3
     assert [t.value for t in trials] == [0.5, 20.0, 5.0]
-    assert [t.user_attrs[FEASIBLE_ATTR] for t in trials] == [False, False, True]
-    assert [t.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] for t in trials] == [
-        "failure",
-        "failure",
-        "success",
-    ]
+    assert [_trial_count_state(t, exp) for t in trials] == ["INFEASIBLE", "INFEASIBLE", "COMPLETE"]
+    # The outcomes record measurements; the failure streak judges them under the bounds.
+    assert [t.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] for t in trials] == ["success"] * 3
+    assert _load_phase_policy_state(phase_study(exp), exp).consecutive_failures == 0
 
     always_out = make_experiment(
         experiment="aborts",
@@ -1887,7 +1896,7 @@ def test_metric_outside_bounds_is_complete_and_infeasible(tmp_path: Path) -> Non
 def test_required_constraint_failure_preserves_prior_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    """Required extraction retains prior constraints and objective-only provenance."""
+    """A failed constraint keeps the values read from earlier constraint files."""
     experiment = make_experiment(
         constraints=[
             Constraint(
@@ -1896,12 +1905,12 @@ def test_required_constraint_failure_preserves_prior_values(
             for name in ("first", "second")
         ]
     )
-    provenance_calls: list[bool] = []
+    (tmp_path / "stdout.log").write_text("x=1\n")
+    (tmp_path / "r.json").write_text('{"first": 2}')
 
-    def extract(_ctx, _cfg, *, provenance=None, **_kwargs):
-        provenance_calls.append(provenance is not None)
-        if len(provenance_calls) < 3:
-            return float(len(provenance_calls))
+    def extract(ctx, cfg, **kwargs):
+        if cfg != experiment.constraints[1].extractor:
+            return run_extractor(ctx, cfg, **kwargs)
         if failure == "extractor":
             raise ExtractorError("stopped")
         if failure == "deadline":
@@ -1916,10 +1925,9 @@ def test_required_constraint_failure_preserves_prior_values(
     result = extract_trial_result(experiment=experiment, executed=executed)
 
     assert result.metric is None
-    assert result.feasible is False
+    assert result.failure_reason is not None
     assert result.constraints == {"first": 2.0}
     assert result.deadline_exhausted is (failure == "deadline")
-    assert provenance_calls == [True, False, False]
     assert result.failure_reason == (
         "constraint extractor 'second' returned non-finite value: inf"
         if failure == "nonfinite"
@@ -1942,7 +1950,7 @@ def test_sdk_worker_ignores_the_user_site_exactly_when_its_controller_does(
     monkeypatch.setattr(process_module, "run_supervised", launch)
     with pytest.raises(InterruptedError) as launched:
         run_worker(
-            {}, worker, "sdk", statuses=frozenset(), run_id="a", trial_dir=tmp_path,
+            {}, worker, "sdk", statuses=frozenset(), run_id="a", attempt_dir=tmp_path,
             environment={}, deadline=time.monotonic() + 10,
         )  # fmt: skip
     # The flags must precede the script, or the interpreter passes them to the script.

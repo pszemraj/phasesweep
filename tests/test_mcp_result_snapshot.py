@@ -19,9 +19,9 @@ from pydantic import ValidationError
 
 import phasesweep.mcp.recovery as mcp_recovery
 from phasesweep.config.io import load_experiment
-from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.models import Experiment, Metric, Phase, Repeats
+from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.errors import StudyStorageUnavailableError
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _experiment_dir,
@@ -36,23 +36,34 @@ from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     CLEANUP_RECOVERED_TRIALS_ATTR,
-    FEASIBLE_ATTR,
     TRIAL_OUTCOME_ATTR,
     TrialStateName,
     Winner,
     WinnerSource,
 )
+from phasesweep.evidence.models import JsonExtractor
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.redaction import winners_payload
-from phasesweep.mcp.snapshots import RunResultSnapshot, capture_pre_generation_result_snapshot
+from phasesweep.mcp.registry import Registry
+from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.snapshots import (
+    RunningAttemptSnapshot,
+    RunResultSnapshot,
+    capture_pre_generation_result_snapshot,
+    capture_result_snapshot,
+)
+from phasesweep.mcp.tools import PhaseSweepMCP
 from tests.conftest import (
+    addressed_phase_study,
     fail_pointer_commit,
     make_experiment,
     mark_current_format,
+    new_phase_study,
     phase_study,
     single_trial_confound,
     trial_outcome,
     write_constant_trainer,
+    write_experiment_config,
     write_trainer,
 )
 from tests.experiments import write_experiment
@@ -60,10 +71,12 @@ from tests.ledger_fixtures import published_generation_id
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     SEEDED_RANDOM,
+    assert_no_sensitive,
     fail_prepared_snapshot_reads,
     make_mcp_app,
     run_claimed_runner,
     stage_dead_run,
+    stage_live_run,
     write_run_status,
     write_slow_mcp_config,
     write_srv_catalog,
@@ -86,7 +99,7 @@ def _frozen_result_payload(snapshot: RunResultSnapshot) -> dict[str, object]:
     return winners_payload(
         "t",
         snapshot.winners,
-        metric=snapshot.status.metric.model_dump(mode="json"),
+        metric=snapshot.status.metric,
         declared_phases=snapshot.status.result_phase_plan,
         result_source="frozen_run_snapshot",
         publication_integrity=snapshot.status.publication_integrity,
@@ -337,9 +350,7 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
         storage=f"journal:///{tmp_path / 'studies.journal'}",
         phases=[Phase(name="p", n_trials=1, sampler=SEEDED_RANDOM, search_space={})],
     )
-    journal = _resolve_storage(experiment.resolved_storage)
-    study = optuna.create_study(study_name="t::p", storage=journal, direction="minimize")
-    mark_current_format(experiment, study)
+    study = new_phase_study(experiment, "p")
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "old-generation")
     trial.set_user_attr("phasesweep_attempt_id", "old-attempt")
@@ -585,9 +596,7 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
             )
         ],
     )
-    journal = _resolve_storage(experiment.resolved_storage)
-    study = optuna.create_study(study_name="t::p", storage=journal, direction="minimize")
-    mark_current_format(experiment, study)
+    study = new_phase_study(experiment, "p")
     identified = study.ask()
     identified.set_user_attr("phasesweep_generation_id", "current-generation")
     identified.set_user_attr("phasesweep_attempt_id", "current-attempt")
@@ -886,6 +895,11 @@ def test_pending_snapshot_uses_actual_recovered_state_without_changing_frozen_co
     """Recovered pending evidence updates only its frozen row, including a finalization retry."""
     run_id = "srv-pending-result"
     config = write_srv_config(tmp_path)
+    if terminal_state == "INFEASIBLE":
+        # The trial below measures 1.0, outside this bound.
+        fields = yaml.safe_load(config.read_text())
+        fields["metric"]["max"] = 0.5
+        config.write_text(yaml.safe_dump(fields))
     number = write_launched_stale_trial(config, cleanup_confirmed=False, generation_id=run_id)
     experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
@@ -916,7 +930,6 @@ def test_pending_snapshot_uses_actual_recovered_state_without_changing_frozen_co
     study = phase_study(experiment)
     pending = study.get_trials()[number]
     active = optuna.Trial(study, pending._trial_id)
-    active.set_user_attr(FEASIBLE_ATTR, terminal_state != "INFEASIBLE")
     active.set_user_attr(
         TRIAL_OUTCOME_ATTR,
         trial_outcome(
@@ -957,6 +970,69 @@ def test_pending_snapshot_uses_actual_recovered_state_without_changing_frozen_co
     assert len(study.get_trials()) == 2
 
 
+@pytest.mark.integration
+def test_recover_run_keeps_the_producing_verdict_after_a_reread(tmp_path: Path) -> None:
+    """A frozen pending trial takes its verdict from the study that launched it."""
+    metric = Metric(extractor=JsonExtractor(type="json", path="r.json", key="x"))
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_constant_trainer(tmp_path),
+        metric=metric,
+        phases=[Phase(name="p", n_trials=1, gpu_policy="none")],
+    )
+    config = write_experiment_config(tmp_path / "srv.yaml", experiment)
+    winner = run_experiment(experiment)["p"]
+    run_id = winner.generation_id
+    assert run_id is not None and winner.attempt_id is not None
+
+    original = phase_study(experiment)
+    original.set_user_attr(CLEANUP_RECOVERED_TRIALS_ATTR, [winner.trial_number])
+    _app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
+    stage_dead_run(store, run_id, config, registry.get("srv").id, cleanup_uncertain=True)
+    snapshot = RunResultSnapshot.model_validate(
+        capture_result_snapshot(experiment, generation_id=run_id)
+    )
+    [phase] = snapshot.status.phases
+    phase.trials = {"RUNNING": 1}
+    phase.generation_trials = {"RUNNING": 1}
+    phase.running_attempts = [
+        RunningAttemptSnapshot(
+            trial_number=winner.trial_number,
+            generation_id=run_id,
+            attempt_id=winner.attempt_id,
+            recovers_as="EVIDENCE_PENDING",
+        )
+    ]
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+        result_snapshot_state="complete",
+        result_snapshot=snapshot.model_dump(mode="json"),
+    )
+    reread = experiment.model_copy(
+        update={
+            "metric": Metric(extractor=JsonExtractor(type="json", path="r.json", key="missing")),
+        }
+    )
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(reread)
+    study = addressed_phase_study(reread, "p")
+    [copy] = study.get_trials()
+    assert copy.state == optuna.trial.TrialState.FAIL
+    assert original.get_trials()[winner.trial_number].state == optuna.trial.TrialState.COMPLETE
+
+    mcp_recovery.recover_run(registry.state_dir, run_id, confirm=True, emit=lambda _: None)
+    outcome = json.loads(store.status_path(run_id).read_text())
+    [phase_result] = outcome["result_snapshot"]["status"]["phases"]
+    assert phase_result["trials"] == {"RUNNING": 0, "COMPLETE": 1}
+    assert phase_result["generation_trials"] == {"RUNNING": 0, "COMPLETE": 1}
+
+
 def test_run_results_say_whether_the_run_wrote_its_generation(tmp_path: Path) -> None:
     """get_run_results reports run_wrote_generation as get_run_status does: false for a replay whose winners are the earlier generation's."""
     config = write_experiment(
@@ -987,3 +1063,90 @@ def test_run_results_say_whether_the_run_wrote_its_generation(tmp_path: Path) ->
         assert results["run_wrote_generation"] == app.status(run_id)["run_wrote_generation"]
     assert replay["represented_generation_id"] == "srv-first"
     assert [phase["winner_generation"] for phase in replay["phases"]] == ["represented_generation"]
+
+
+def _repeats_run_read_live_then_frozen(
+    tmp_path: Path,
+) -> tuple[dict[str, object], dict[str, object], Path, Path, RunStore, str]:
+    """Read one repeats run's winners while it runs, then after its snapshot is frozen.
+
+    Its two grid cells tie within noise, so the winner carries a tie group whose params
+    include the configuration-only value ``SECRET_ARCH``.
+    """
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--epochs', type=int)
+        parser.add_argument('--seed', type=int)
+        args, _ = parser.parse_known_args()
+        print(f'x={(0.48 if args.seed == 1 else 0.52) + (0.005 if args.epochs == 8 else 0)}')
+        """,
+    )
+    phase = Phase(
+        name="epochs",
+        n_trials=4,
+        gpu_policy="none",
+        repeats=Repeats(key="seed", values=[1, 2]),
+        sampler=Sampler(type="grid", seed=0),
+        search_space={
+            "epochs": CategoricalParam(type="categorical", choices=[8, 16]),
+            "arch": CategoricalParam(type="categorical", choices=["SECRET_ARCH"]),
+        },
+    )
+    config = tmp_path / "srv.yaml"
+    write_experiment_config(
+        config, make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
+    )
+    catalog = write_srv_catalog(tmp_path, config, visible_params="all")
+    registry = Registry.load(catalog)
+    # The run executes the catalog's own config, so the catalog matches what it produced.
+    experiment = registry.get("srv").experiment
+    store = RunStore(registry.state_dir)
+    run_id = "srv-repeats"
+    stage_live_run(store, run_id, config, "srv", visible_params_at_launch="all")
+    run_experiment(experiment, generation_id=run_id)
+    app = PhaseSweepMCP(registry, store)
+    live = app.winners(run_id)
+    write_run_status(
+        store,
+        run_id,
+        returncode=0,
+        error_class=None,
+        result_snapshot_state="complete",
+        result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
+    )
+    return live, app.winners(run_id), catalog, config, store, run_id
+
+
+@pytest.mark.integration
+def test_live_and_frozen_results_of_one_run_are_the_same_payload(tmp_path: Path) -> None:
+    """get_run_results gives the same winners, advice and tie groups live as frozen; only result_source differs."""
+    live, frozen, *_ = _repeats_run_read_live_then_frozen(tmp_path)
+
+    assert (live["result_source"], frozen["result_source"]) == (
+        "current_shared_study",
+        "frozen_run_snapshot",
+    )
+    assert frozen["published_config_matches_current"] is True
+    (phase,) = frozen["phases"]
+    assert phase["tie_groups"][0]["params"] == {"epochs": 8, "arch": "SECRET_ARCH"}
+    assert {key: value for key, value in live.items() if key != "result_source"} == {
+        key: value for key, value in frozen.items() if key != "result_source"
+    }
+
+
+@pytest.mark.integration
+def test_frozen_tie_groups_follow_a_narrowed_catalog_policy(tmp_path: Path) -> None:
+    """A frozen run's tie-group params are redacted by the current catalog when it narrows visible_params."""
+    _live, _frozen, catalog, config, store, run_id = _repeats_run_read_live_then_frozen(tmp_path)
+
+    write_srv_catalog(tmp_path, config, visible_params=["epochs"])
+    payload = PhaseSweepMCP(Registry.load(catalog), store).winners(run_id)
+
+    assert payload["result_source"] == "frozen_run_snapshot"
+    (phase,) = payload["phases"]
+    assert phase["params_redacted"] is True
+    assert phase["tie_groups"][0]["params"] == {"epochs": 8, "arch": "<redacted>"}
+    assert_no_sensitive(payload, ["SECRET_ARCH"])

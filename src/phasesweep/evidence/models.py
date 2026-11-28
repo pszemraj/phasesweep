@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal, TypeAlias, get_args
+from typing import Annotated, Literal, NamedTuple, TypeAlias, get_args
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -28,19 +29,39 @@ from phasesweep.config.common import (
     _validate_optional_bounds,
 )
 
+#: Configured paths that name the attempt's own captured streams in its attempt directory,
+#: so every extractor, gate and verification reading one sees only what this attempt printed.
+CAPTURED_STREAMS = frozenset({"stdout.log", "stderr.log"})
+
+
+def is_captured_stream(relative: str | Path) -> bool:
+    """Say whether a configured path names one of the attempt's captured streams.
+
+    Config load normalizes every configured path, so an exact name match is the whole test.
+
+    :param str | Path relative: Configured trial-relative path.
+    :return bool: Whether it is in :data:`CAPTURED_STREAMS`.
+    """
+    return str(relative) in CAPTURED_STREAMS
+
 
 def _validate_trial_path(value: str) -> str:
-    """Require a non-empty path inside the trial directory.
+    """Require a non-empty path inside the trial directory, normalized.
+
+    The normalized spelling is the one stored and fingerprinted, so ``./stdout.log`` names
+    the captured stream exactly as ``stdout.log`` does and both are one config.
 
     :param str value: Candidate trial-relative path.
-    :raises ValueError: If ``value`` is empty, absolute, escapes upward, or
-        contains a NUL byte that no filesystem call can accept.
-    :return str: Validated trial-relative path.
+    :raises ValueError: If ``value`` is empty, absolute, has a ``..`` part, or contains a
+        NUL byte that no filesystem call can accept.
+    :return str: The normalized trial-relative path.
     """
     path = Path(value)
     if not value or "\0" in value or path.is_absolute() or ".." in path.parts:
         raise ValueError(f"trial-relative path required; got {value!r}.")
-    return value
+    # With no `..` part, normalizing only drops `.` parts and repeated slashes, so the
+    # result names the same file whatever links the path crosses.
+    return posixpath.normpath(value)
 
 
 def _validate_trial_file_path(value: str) -> str:
@@ -51,7 +72,7 @@ def _validate_trial_file_path(value: str) -> str:
     :param str value: Candidate trial-relative file path.
     :raises ValueError: If ``value`` violates the shared path contract or
         resolves to the trial directory itself.
-    :return str: Validated descendant file path.
+    :return str: The normalized descendant file path.
     """
     validated = _validate_trial_path(value)
     if not Path(validated).parts:
@@ -111,6 +132,22 @@ class JsonEnvelopeExtractor(_Frozen):
         ),
     )
 
+    @field_validator("path")
+    @classmethod
+    def _not_a_captured_stream(cls, value: str) -> str:
+        """Refuse a captured stream's name, which PhaseSweep writes and report_objective cannot.
+
+        :param str value: Validated trial-relative envelope path.
+        :raises ValueError: ``value`` is ``stdout.log`` or ``stderr.log``.
+        :return str: ``value``, unchanged.
+        """
+        if is_captured_stream(value):
+            raise ValueError(
+                f"json_envelope path {value!r} names a captured stream; report_objective() "
+                "writes the envelope under PHASESWEEP_TRIAL_DIR, so name another file."
+            )
+        return value
+
 
 class LogRegexExtractor(_Frozen):
     """Extract a scalar from a log file via regex with a named 'value' group."""
@@ -119,8 +156,8 @@ class LogRegexExtractor(_Frozen):
     file: _TrialFilePath = Field(
         default="stdout.log",
         description=(
-            "File relative to trial_dir. 'stdout.log' and 'stderr.log' are written "
-            "automatically; supply a custom path if your trainer logs elsewhere."
+            "File relative to trial_dir. 'stdout.log' and 'stderr.log' name the attempt's "
+            "own captured streams; supply a custom path if your trainer logs elsewhere."
         ),
     )
     pattern: str = Field(
@@ -149,6 +186,24 @@ class LogRegexExtractor(_Frozen):
         return value
 
 
+WANDB_DESTINATION_ENV = ("WANDB_BASE_URL", "WANDB_ENTITY", "WANDB_PROJECT")
+
+
+class WandbDestination(NamedTuple):
+    """Public location of the run a managed attempt logs to."""
+
+    base_url: str
+    entity: str
+    project: str
+
+    def environment(self) -> dict[str, str]:
+        """Provide the managed trainer's destination bindings.
+
+        :return dict[str, str]: The endpoint, entity and project as W&B environment variables.
+        """
+        return dict(zip(WANDB_DESTINATION_ENV, self, strict=True))
+
+
 class _WandbSummarySource(_Frozen):
     """One normalized remote target and a bounded finished-summary query."""
 
@@ -156,7 +211,17 @@ class _WandbSummarySource(_Frozen):
     entity: str = Field(min_length=1, pattern=r"^[^/\s]+$")
     project: str = Field(min_length=1, pattern=r"^[^/\s]+$")
     poll_seconds: ConfigFloat = Field(default=2.0, gt=0, allow_inf_nan=False)
-    timeout_seconds: ConfigFloat = Field(default=120.0, ge=1, allow_inf_nan=False)
+    # W&B can serve a finished run's summary minutes after the run finished, so the default
+    # rides out that lag.
+    timeout_seconds: ConfigFloat = Field(default=600.0, ge=1, allow_inf_nan=False)
+
+    @property
+    def destination(self) -> WandbDestination:
+        """Return the configured run location separately from the reading settings.
+
+        :return WandbDestination: Normalized endpoint, entity and project.
+        """
+        return WandbDestination(self.base_url, self.entity, self.project)
 
     @field_validator("base_url")
     @classmethod
@@ -188,8 +253,9 @@ class WandbExtractor(_WandbSummarySource):
         description=(
             "History key logged alongside metric_key that marks where it was "
             "measured, e.g. 'eval/step' under define_metric('eval/*', "
-            "step_metric='eval/step'); selection's evaluation_point check compares "
-            "ranked objectives on it. '_step' is W&B's own history step."
+            "step_metric='eval/step'). The W&B objective's axis marks its evaluation "
+            "position and the progress used to retain min/max history on reruns. "
+            "'_step' is W&B's own history step."
         ),
     )
 
@@ -370,11 +436,11 @@ class ArtifactSizeGate(_Frozen):
     @field_validator("path")
     @classmethod
     def _trial_path_is_relative(cls, value: str) -> str:
-        """Validate the trial-relative artifact path.
+        """Validate and normalize the trial-relative artifact path.
 
         :param str value: Candidate trial-relative path.
         :raises ValueError: The path is empty, absolute, escapes upward, or contains NUL.
-        :return str: Validated trial-relative path.
+        :return str: The normalized trial-relative path.
         """
         return _validate_trial_path(value)
 
@@ -455,6 +521,9 @@ class WandbQuery:
     presence_keys: tuple[str, ...]
     constraint_keys: tuple[tuple[str, str], ...] = ()
     gate_keys: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # The objective's summary key when W&B supplies the objective; a rerun's result is
+    # assembled around it from its trial's runs.
+    objective_key: str | None = None
 
 
 def compose_wandb_environment(
@@ -466,20 +535,17 @@ def compose_wandb_environment(
 ) -> dict[str, str]:
     """Bind remote evidence before environment identity, preserving other settings.
 
+    The run ID and resume policy are the attempt's, bound at launch: every attempt, a rerun
+    from its trial's checkpoint included, starts a new run named by its attempt ID.
+
     :param WandbQuery query: Phase's agreed target and evidence requirements.
     :param Mapping[str, str] configured: Explicit experiment environment entries.
     :param Mapping[str, str] environment: Already composed trainer environment.
     :param bool require_online: Whether disabled/offline ambient logging is invalid for this use.
-    :return dict[str, str]: Bound base environment, before the generated attempt ID.
+    :return dict[str, str]: Bound base environment, before the attempt's run bindings.
     :raises ValueError: Explicit managed settings conflict, or remote logging is disabled.
     """
-    source = query.source
-    bindings = {
-        "WANDB_BASE_URL": source.base_url,
-        "WANDB_ENTITY": source.entity,
-        "WANDB_PROJECT": source.project,
-        "WANDB_RESUME": "never",
-    }
+    bindings = query.source.destination.environment()
     for key, expected in bindings.items():
         if key in configured:
             actual = configured[key]
@@ -490,7 +556,14 @@ def compose_wandb_environment(
                     f"env.{key} conflicts with managed W&B evidence; remove it or match the evidence target."
                 )
     if "WANDB_RUN_ID" in configured:
-        raise ValueError("env.WANDB_RUN_ID conflicts with the generated W&B attempt ID; remove it.")
+        raise ValueError(
+            "env.WANDB_RUN_ID conflicts with the W&B run ID PhaseSweep sets per attempt; remove it."
+        )
+    if "WANDB_RESUME" in configured:
+        raise ValueError(
+            "env.WANDB_RESUME conflicts with the resume policy PhaseSweep sets: every attempt "
+            "starts a new W&B run; remove it."
+        )
     if require_online and (
         environment.get("WANDB_MODE", "online").lower() in {"offline", "dryrun", "disabled"}
         or environment.get("WANDB_DISABLED", "").lower() in {"1", "true", "yes", "on"}
@@ -501,6 +574,7 @@ def compose_wandb_environment(
     result = dict(environment)
     result.update(bindings)
     result.pop("WANDB_RUN_ID", None)
+    result.pop("WANDB_RESUME", None)
     return result
 
 

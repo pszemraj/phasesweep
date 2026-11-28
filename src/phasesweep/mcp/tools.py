@@ -38,13 +38,14 @@ from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     PublicationAccessError,
     PublicationIntegrityError,
+    ResumeBoundsChangedError,
     ResumeWinnerMissingError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     WinnerIntegrityError,
 )
 from phasesweep.engine.fingerprints import _recorded_config_matches
-from phasesweep.engine.read import EngineStatus, PhaseWinnerView, read_result
+from phasesweep.engine.read import read_result
 from phasesweep.engine.resume import _preflight_skipped_winners
 from phasesweep.mcp.audit import AUDIT_LOG_NAME, AuditLogger
 from phasesweep.mcp.errors import (
@@ -107,9 +108,12 @@ from phasesweep.mcp.runs import (
 from phasesweep.mcp.snapshots import (
     McpPublicationState,
     RunResultSnapshot,
+    StatusSnapshot,
     WinnerSnapshot,
     capture_pre_generation_result_snapshot,
     parse_result_snapshot,
+    status_snapshot,
+    winner_snapshot,
 )
 from phasesweep.mcp.tool_names import TOOL_CANCEL_RUN, TOOL_LAUNCH_RUN
 from phasesweep.runtime.files import ensure_private_dir, open_private_text
@@ -294,38 +298,38 @@ def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int 
     return max(0, round((ended - started).total_seconds()))
 
 
+_AwaitFacts = tuple[str, bool, tuple[tuple[str, bool, tuple[tuple[str, int], ...]], ...]]
+"""Run state, recovery requirement, and each phase's winner presence and trial counts."""
+
+
 def _await_snapshot(
     state: str,
     recovery_required: bool,
-    status: dict[str, Any],
-) -> tuple[Any, ...]:
+    status: StatusSnapshot,
+) -> _AwaitFacts:
     """Reduce a status read to the comparable facts await_run watches.
 
     :param str state: Derived run state at read time.
     :param bool recovery_required: Whether the run needs operator recovery.
-    :param dict[str, Any] status: Path-free ``read_status`` payload.
-    :return tuple[Any, ...]: Hashable snapshot of run state, recovery requirement,
+    :param StatusSnapshot status: Live or frozen status of the run.
+    :return _AwaitFacts: Hashable snapshot of run state, recovery requirement,
         and per-phase winner presence and dense trial-state counts.
     """
     return (
         state,
         recovery_required,
         tuple(
-            (
-                phase["phase"],
-                phase["winner_present"],
-                tuple(sorted(phase["trials"].items())),
-            )
-            for phase in status["phases"]
+            (phase.phase, phase.winner_present, tuple(sorted(phase.trials.items())))
+            for phase in status.phases
         ),
     )
 
 
-def _phase_gained_winner(baseline: tuple[Any, ...], snapshot: tuple[Any, ...]) -> bool:
+def _phase_gained_winner(baseline: _AwaitFacts, snapshot: _AwaitFacts) -> bool:
     """Return whether any phase gained a winner between two await snapshots.
 
-    :param tuple[Any, ...] baseline: Snapshot taken when the wait began.
-    :param tuple[Any, ...] snapshot: Snapshot from the latest recheck.
+    :param _AwaitFacts baseline: Snapshot taken when the wait began.
+    :param _AwaitFacts snapshot: Snapshot from the latest recheck.
     :return bool: ``True`` when a phase's winner artifact appeared mid-wait.
     """
     had_winner = {phase: winner for phase, winner, _counts in baseline[2]}
@@ -725,8 +729,10 @@ class PhaseSweepMCP:
         """
         # Config drift and visibility below compare against the reread catalog.
         self._serving_registry()
-        target_id, status, run, handle, result_source = self._read_status_target(run_id=run_id)
-        return self._status_result(target_id, status, run, handle, result_source)
+        target_id, status, run, handle, result_source, delivery = self._read_status_target(
+            run_id=run_id
+        )
+        return self._status_result(target_id, status, run, handle, result_source, delivery)
 
     async def await_run(
         self,
@@ -751,20 +757,16 @@ class PhaseSweepMCP:
         )
         deadline = time.monotonic() + timeout
         await asyncio.to_thread(self._serving_registry)
-        baseline: tuple[Any, ...] | None = None
+        baseline: _AwaitFacts | None = None
         read_seconds = 0.0
         while True:
             read_started = time.monotonic()
-            target_id, status, run, handle, result_source = await asyncio.to_thread(
+            target_id, status, run, handle, result_source, delivery = await asyncio.to_thread(
                 self._read_status_target,
                 run_id=run_id,
             )
             read_seconds = time.monotonic() - read_started
-            snapshot = _await_snapshot(
-                run["state"],
-                run["recovery_required"],
-                dict(status),
-            )
+            snapshot = _await_snapshot(run["state"], run["recovery_required"], status)
             if baseline is None:
                 baseline = snapshot
             if run["recovery_required"]:
@@ -786,7 +788,7 @@ class PhaseSweepMCP:
                 await asyncio.sleep(min(AWAIT_RECHECK_SECONDS, remaining_before_next_read))
                 continue
             break
-        result = self._status_result(target_id, status, run, handle, result_source)
+        result = self._status_result(target_id, status, run, handle, result_source, delivery)
         result["changed"] = snapshot != baseline
         result["reason"] = reason
         return result
@@ -797,15 +799,17 @@ class PhaseSweepMCP:
         run_id: str,
     ) -> tuple[
         str,
-        EngineStatus,
+        StatusSnapshot,
         dict[str, Any],
         RunHandle,
         ResultSource,
+        dict[str, int] | None,
     ]:
-        """Resolve one run-specific status read to its current or frozen payload.
+        """Resolve one run-specific status read to its current or frozen status.
 
         :param str run_id: Persisted run id for the read.
-        :return tuple: Target id, status data, run state, handle and result provenance.
+        :return tuple: Target id, status, run state, handle, result provenance and the
+            run's MLflow delivery counts.
         """
         target_id, experiment, status, _winners, handle, view, result_source = (
             self._read_result_target(run_id)
@@ -815,12 +819,10 @@ class PhaseSweepMCP:
             handle,
             view,
             force_snapshot_unavailable=result_source == "terminal_snapshot_unavailable",
-            publication_integrity=status["publication_integrity"],
+            publication_integrity=status.publication_integrity,
         )
         delivery = self._tracking_delivery(handle, experiment)
-        if delivery is not None:
-            status["tracking_delivery"] = delivery
-        return target_id, status, run, handle, result_source
+        return target_id, status, run, handle, result_source, delivery
 
     def _require_run_handle(self, run_id: str) -> RunHandle:
         """Load the exact run or explain why its persisted handle is unavailable.
@@ -842,8 +844,8 @@ class PhaseSweepMCP:
     ) -> tuple[
         str,
         Experiment | None,
-        EngineStatus,
-        Sequence[PhaseWinnerView | WinnerSnapshot],
+        StatusSnapshot,
+        Sequence[WinnerSnapshot],
         RunHandle,
         RunnerView,
         ResultSource,
@@ -866,7 +868,7 @@ class PhaseSweepMCP:
         # unavailable-result placeholders need the sibling configuration.
         experiment = None if snapshot is not None else self._load_run_experiment(handle)
         snapshot, result_source = self._result_snapshot_view(experiment, handle, snapshot, view)
-        winners: Sequence[PhaseWinnerView | WinnerSnapshot]
+        winners: Sequence[WinnerSnapshot]
         if snapshot is None:
             assert experiment is not None
             status, winners = self._live_result(target_id, experiment, handle)
@@ -876,14 +878,14 @@ class PhaseSweepMCP:
         if snapshot is not None:
             status = self._snapshot_status_payload(target_id, snapshot, result_source=result_source)
             winners = snapshot.winners
-        if status["publication_integrity"] in {"failed", "permission_denied", "unknown"}:
+        if status.publication_integrity in {"failed", "permission_denied", "unknown"}:
             winners = []
         return target_id, experiment, status, winners, handle, view, result_source
 
     def _tracking_delivery(
         self, handle: RunHandle, experiment: Experiment | None
     ) -> dict[str, int] | None:
-        """Count this run's own MLflow creation and delivery records from its launch config.
+        """Count this run's MLflow creations and records, and an older pending upload it shares.
 
         Delivery records are mutable, so only status reads them; frozen result
         reads never depend on them. A terminal read loads the run's config
@@ -903,7 +905,7 @@ class PhaseSweepMCP:
             return None
         from phasesweep.tracking.publication import delivery_counts
 
-        return delivery_counts(experiment, handle.run_id)._asdict()
+        return delivery_counts(experiment, handle.run_id, shared=True)._asdict()
 
     def _catalog_comparison_experiment(self, experiment_id: str) -> Experiment | None:
         """Return the config a future catalog launch would execute, if available.
@@ -921,7 +923,7 @@ class PhaseSweepMCP:
         experiment_id: str,
         experiment: Experiment,
         handle: RunHandle,
-    ) -> tuple[EngineStatus, list[PhaseWinnerView]]:
+    ) -> tuple[StatusSnapshot, list[WinnerSnapshot]]:
         """Read run-pinned generation status and winners using the saved run config.
 
         After decataloging, that config still locates artifacts but cannot establish current
@@ -930,8 +932,8 @@ class PhaseSweepMCP:
         :param str experiment_id: Catalog id associated with the read target.
         :param Experiment experiment: Live run snapshot config.
         :param RunHandle handle: Live run pinning the represented generation.
-        :return tuple[EngineStatus, list[PhaseWinnerView]]: Path-free live
-            status payload and the represented generation's winners.
+        :return tuple[StatusSnapshot, list[WinnerSnapshot]]: Live status and the represented
+            generation's winners, projected onto the models frozen reads use.
         """
         comparison = self._catalog_comparison_experiment(experiment_id)
         try:
@@ -949,7 +951,7 @@ class PhaseSweepMCP:
             self._raise_persistent_read_error(handle, exc)
         if comparison is None:
             status["published_config_matches_current"] = None
-        return status, winners
+        return status_snapshot(status), [winner_snapshot(winner) for winner in winners]
 
     @staticmethod
     def _raise_persistent_read_error(
@@ -974,7 +976,7 @@ class PhaseSweepMCP:
         snapshot: RunResultSnapshot,
         *,
         result_source: ResultSource,
-    ) -> EngineStatus:
+    ) -> StatusSnapshot:
         """Return frozen result facts with only config drift recomputed from the current catalog.
 
         Publication pointers and integrity remain frozen; reads require no mutable result artifacts.
@@ -983,11 +985,10 @@ class PhaseSweepMCP:
         :param RunResultSnapshot snapshot: Validated frozen result snapshot.
         :param ResultSource result_source: Snapshot provenance, including the
             unavailable placeholder case.
-        :return EngineStatus: Frozen status with a current config-drift verdict.
+        :return StatusSnapshot: Frozen status with a current config-drift verdict.
         """
-        status = snapshot.status_payload()
         comparison = self._catalog_comparison_experiment(experiment_id)
-        status["published_config_matches_current"] = (
+        matches = (
             _recorded_config_matches(
                 comparison,
                 snapshot.represented_config_fingerprint,
@@ -996,30 +997,34 @@ class PhaseSweepMCP:
             if comparison is not None and result_source != "terminal_snapshot_unavailable"
             else None
         )
-        return status
+        return snapshot.status.model_copy(update={"published_config_matches_current": matches})
 
     def _status_result(
         self,
         target_id: str,
-        status: EngineStatus,
+        status: StatusSnapshot,
         run: dict[str, Any],
         handle: RunHandle,
         result_source: ResultSource,
+        tracking_delivery: dict[str, int] | None,
     ) -> dict[str, Any]:
         """Build the common path-free response for status and await_run.
 
         :param str target_id: Experiment id represented by ``status``.
-        :param EngineStatus status: Current or frozen engine status payload.
+        :param StatusSnapshot status: Live or frozen status.
         :param dict[str, Any] run: Derived detached-run state.
         :param RunHandle handle: Already-resolved detached-run handle.
         :param ResultSource result_source: Current shared state or frozen run snapshot.
+        :param dict[str, int] | None tracking_delivery: The run's MLflow delivery counts, or
+            ``None`` without MLflow.
         :return dict[str, Any]: Agent-safe status response.
         """
         elapsed_seconds = _run_elapsed_seconds(self._runs, handle, run["state"])
         result = status_payload(
             target_id,
-            dict(status),
+            status,
             run,
+            tracking_delivery=tracking_delivery,
             result_source=result_source,
             elapsed_seconds=elapsed_seconds,
         )
@@ -1073,22 +1078,21 @@ class PhaseSweepMCP:
             )
             winner_views = []
             result_source = "terminal_snapshot_unavailable"
-        represented_generation_id: str | None = status["represented_generation_id"]
-        publication_integrity: McpPublicationState = status["publication_integrity"]
+        publication_integrity = status.publication_integrity
         visible_params = self._effective_visible_params(target_id, handle)
         result = winners_payload(
             target_id,
             winner_views,
-            metric=status["metric"],
-            declared_phases=status["result_phase_plan"],
+            metric=status.metric,
+            declared_phases=list(status.result_phase_plan),
             result_source=result_source,
             publication_integrity=publication_integrity,
-            current_generation_id=status["current_generation_id"],
+            current_generation_id=status.current_generation_id,
             run_id=run_id,
-            represented_generation_id=represented_generation_id,
+            represented_generation_id=status.represented_generation_id,
             visible_params=visible_params,
-            result_context=status["result_context"],
-            published_config_matches_current=status["published_config_matches_current"],
+            result_context=status.result_context,
+            published_config_matches_current=status.published_config_matches_current,
         )
         result["failure"] = response_failure(
             self._runs,
@@ -1594,6 +1598,19 @@ class PhaseSweepMCP:
                 return ResumePublicationUnusableError(reg.id, from_phase, state)
             if isinstance(exc, ResumeWinnerMissingError):
                 return ResumeNotReadyError(reg.id, from_phase, phase_name)
+            if isinstance(exc, ResumeBoundsChangedError):
+                return ResumeNotReadyError(
+                    reg.id,
+                    from_phase,
+                    phase_name,
+                    reason=(
+                        "was selected under different metric or constraint bounds. Call "
+                        f"launch_run with from_phase={phase_name!r} to reselect from recorded trials"
+                        if reg.experiment.persistent
+                        else "was selected under different metric or constraint bounds. Call "
+                        "launch_run without from_phase to restart"
+                    ),
+                )
             if isinstance(
                 exc, (RuntimeError, KeyError, TypeError, ValueError, AttributeError, OSError)
             ):

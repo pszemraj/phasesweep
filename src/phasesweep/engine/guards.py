@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import optuna
 
-from phasesweep.config.models import Experiment
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.artifacts import _refresh_recovered_trials_csv
 from phasesweep.engine.attempts import (
     _AttemptRecord,
@@ -25,6 +25,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
     TrialTargetRefusedError,
 )
+from phasesweep.engine.fingerprints import _recorded_goal, phase_study_name
 from phasesweep.engine.ledger import ClaimedLedger, claim_ledger, validate_ledger
 from phasesweep.engine.study_policy import (
     ReachedStudy,
@@ -40,12 +41,33 @@ from phasesweep.errors import (
 )
 
 
+def _validate_known_study_direction(
+    experiment: Experiment, phase: Phase, study: optuna.Study
+) -> None:
+    """Check a saved study's direction when its goal is known before phase selection.
+
+    :param Experiment experiment: Config that determines the reached root study.
+    :param Phase phase: Config for the phase that owns the study.
+    :param optuna.Study study: Existing study, which may be waiting for its identity.
+    :raises StudySchemaMismatchError: The study's stored direction contradicts its known goal.
+    """
+    goal = _recorded_goal(study)
+    if (
+        goal is None
+        and not phase.inherits
+        and study.study_name == phase_study_name(experiment, phase, {})
+    ):
+        goal = experiment.metric.goal
+    if goal is not None:
+        _validate_study_direction(study, goal)
+
+
 def _reconcile_existing_studies(
     experiment: Experiment,
     *,
     cleanup_report: _PreflightCleanupReport,
     from_phase: str | None = None,
-) -> dict[str, optuna.Study]:
+) -> dict[str, tuple[optuna.Study, ...]]:
     """Rediscover and reconcile every existing study after a run has ended.
 
     Validate and claim a fresh ledger so post-run preflight includes studies
@@ -56,7 +78,8 @@ def _reconcile_existing_studies(
         cleanup evidence accumulates into.
     :param str | None from_phase: Optional resume point, as for
         :func:`_preflight_existing_studies`.
-    :return dict[str, optuna.Study]: Existing studies keyed by phase name.
+    :return dict[str, tuple[optuna.Study, ...]]: Every existing study of each phase, by phase
+        name.
     :raises ArtifactRootConflictError: The tree or a phase's persistent study
         is bound to a different owner; raised before any reaping.
     :raises StudyStorageUnavailableError: A phase's persistent storage could not
@@ -84,8 +107,12 @@ def _preflight_existing_studies(
     *,
     cleanup_report: _PreflightCleanupReport | None = None,
     from_phase: str | None = None,
-) -> dict[str, optuna.Study]:
-    """Validate and reap every existing declared phase study before launch.
+) -> dict[str, tuple[optuna.Study, ...]]:
+    """Validate and reap every existing study of every declared phase before launch.
+
+    A phase that inherits has a study for each set of values it inherited, and a trial a
+    crashed run left RUNNING in any of them is settled here, with its process confirmed gone,
+    even when the current config addresses another one.
 
     :param ClaimedLedger ledger: Handle from :func:`phasesweep.engine.ledger.claim_ledger`;
         its ``studies`` are the only studies inspected.
@@ -93,8 +120,8 @@ def _preflight_existing_studies(
         accumulate cleanup evidence into; a fresh one is created if omitted.
     :param str | None from_phase: Optional resume point. Recovery and schema checks
         still cover every phase; trial-target validation starts at this reached phase.
-    :return dict[str, optuna.Study]: Existing studies keyed by phase name (phases
-        with no durable study yet are omitted).
+    :return dict[str, tuple[optuna.Study, ...]]: Every checked study of each phase, oldest
+        first, by phase name (phases with no durable study yet are omitted).
     :raises StudyStorageUnavailableError: A phase's persistent storage could not
         be read while its stale trials were recovered.
     :raises StudySchemaMismatchError: A phase's study uses an incompatible
@@ -118,7 +145,7 @@ def _preflight_existing_studies(
     experiment = ledger.experiment
     report = cleanup_report or _PreflightCleanupReport()
     loaded = ledger.studies
-    studies: dict[str, optuna.Study] = {}
+    studies: dict[str, tuple[optuna.Study, ...]] = {}
     errors: list[Exception] = []
     # The registry scan runs FIRST and is independent of the declared phase
     # list, so attempts from renamed/removed phases or changed storage URLs
@@ -129,10 +156,8 @@ def _preflight_existing_studies(
         if isinstance(exc, (ProcessCleanupUncertainError, StudyStorageUnavailableError)):
             report.mark_uncertain(exc)
         errors.append(exc)
-    for phase in experiment.phases:
-        study = loaded.get(phase.name)
-        if study is None:
-            continue
+    every = [(each, study) for each in experiment.phases for study in loaded.get(each.name, ())]
+    for phase, study in every:
         try:
             # Each attempt is collected as soon as its trial's durable state
             # changes, so a later trial's refusal must not drop the evidence
@@ -170,30 +195,71 @@ def _preflight_existing_studies(
                 report.mark_uncertain(exc)
             errors.append(exc)
             continue
-        finally:
-            _refresh_recovered_trials_csv(study, experiment, phase)
         try:
-            _validate_study_direction(study, experiment.metric.goal)
+            _validate_known_study_direction(experiment, phase, study)
             _initialize_study_schema(study)
         except Exception as exc:
             errors.append(exc)
         else:
-            studies[phase.name] = study
+            studies[phase.name] = (*studies.get(phase.name, ()), study)
+    _refresh_recovered_trials_csv(loaded, experiment)
     # An unreadable tracker leaves finished training pending. Until it answers, neither the
     # retry ceiling nor the need for a trainer is known, and the run reports pending evidence.
     if not report.unreadable_evidence:
+        known = known_studies(experiment, studies)
         errors.extend(
             _reached_study_refusals(
                 experiment,
                 [
-                    ReachedStudy(phase, studies[phase.name])
+                    ReachedStudy(phase, known[phase.name], siblings=studies[phase.name])
                     for _, phase in experiment.phases_from(from_phase)
-                    if phase.name in studies
+                    if phase.name in known
                 ],
             )
         )
     _raise_collected_errors(errors)
     return studies
+
+
+def known_studies(
+    experiment: Experiment, studies: Mapping[str, Sequence[optuna.Study]]
+) -> dict[str, optuna.Study]:
+    """Return the studies a launch can name before any phase runs.
+
+    A phase that inherits addresses the study its parents' winners pick
+    (:func:`phasesweep.engine.fingerprints.phase_study_name`), which is known only once they
+    are selected, so the run checks its study when it reaches the phase. A phase that inherits
+    nothing has one study.
+
+    :param Experiment experiment: Current experiment config.
+    :param Mapping[str, Sequence[optuna.Study]] studies: Every study of each phase.
+    :return dict[str, optuna.Study]: The study of each phase that inherits nothing and has one,
+        by phase name.
+    """
+    known: dict[str, optuna.Study] = {}
+    for phase in experiment.phases:
+        if phase.inherits:
+            continue
+        study = addressed_study(studies, phase.name, phase_study_name(experiment, phase, {}))
+        if study is not None:
+            known[phase.name] = study
+    return known
+
+
+def addressed_study(
+    studies: Mapping[str, Sequence[optuna.Study]], phase_name: str, study_name: str
+) -> optuna.Study | None:
+    """Pick the study a phase addresses out of every study it has.
+
+    :param Mapping[str, Sequence[optuna.Study]] studies: Every study of each phase.
+    :param str phase_name: The phase.
+    :param str study_name: The study it addresses
+        (:func:`phasesweep.engine.fingerprints.phase_study_name`).
+    :return optuna.Study | None: That study, or ``None`` when the phase has none by that name.
+    """
+    return next(
+        (study for study in studies.get(phase_name, ()) if study.study_name == study_name), None
+    )
 
 
 def _collected_remediation(errors: Sequence[Exception]) -> str | None:

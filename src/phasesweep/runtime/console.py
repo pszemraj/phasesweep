@@ -16,11 +16,11 @@ from phasesweep.runtime.terminal import (
     REPORT_LOGGER,
     ReportBlock,
     Style,
+    fit_lines,
     hang,
     paint_word,
     terminal_width,
     use_color,
-    wrap,
     wrap_labeled,
 )
 
@@ -94,30 +94,10 @@ class ConsoleHandler(logging.Handler):
         if isinstance(block, ReportBlock):
             body = block.render(room, color=color)
         elif record.name == REPORT_LOGGER or record.levelno < logging.WARNING:
-            body = _plain_lines(record.getMessage(), room)
+            body = fit_lines(record.getMessage(), room)
         else:
             body = _diagnostic(record, room, color)
         return [line.rstrip() for line in hang(stamp, body)]
-
-
-def _plain_lines(message: str, width: int) -> list[str]:
-    """Draw a record's own lines, wrapping each flush-left one that is wider than ``width``.
-
-    A wrapped line breaks at spaces and hangs under its first line, which the handler's time
-    prefix already indents; a word wider than the line, such as a path, stays whole. A line that
-    starts with whitespace holds text to copy, such as the example command, so it stays whole.
-
-    :param str message: The formatted record text.
-    :param int width: Columns available after the time.
-    :return list[str]: The lines to print, at least one.
-    """
-    lines: list[str] = []
-    for line in message.splitlines() or [""]:
-        if len(line) <= width or line[0].isspace():
-            lines.append(line)
-        else:
-            lines.extend(wrap(line, width))
-    return lines
 
 
 def _diagnostic(record: logging.LogRecord, width: int, color: bool) -> list[str]:

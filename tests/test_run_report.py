@@ -16,25 +16,33 @@ from pathlib import Path
 import optuna
 import pytest
 
-from phasesweep import run_experiment
+from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import _console_logging, _rerun_command, _resume_hint
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Repeats, Sampler
 from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import _phase_dir
-from phasesweep.engine.read import read_trial_tables
+from phasesweep.engine.read import read_result, read_trial_tables
 from phasesweep.engine.run import _phase_counts
 from phasesweep.engine.selection import PhaseTrialsFailedError
-from phasesweep.engine.state import GENERATION_ID_ATTR, TRIAL_OUTCOME_ATTR, Winner
+from phasesweep.engine.state import (
+    GENERATION_ID_ATTR,
+    RERUN_OF_ATTR,
+    TRIAL_OUTCOME_ATTR,
+    InterruptedReruns,
+    Winner,
+)
 from phasesweep.errors import UnsafeProcessCleanupError, operator_step
 from phasesweep.evidence.models import RequiredFileGate, WandbExtractor
 from phasesweep.run_report import (
     LogLine,
     banner,
+    interrupted_clause,
     phase_start,
     rerun_line,
     skipped_line,
     trial_line,
+    trial_start_line,
     winner_line,
 )
 from phasesweep.runtime.console import ConsoleHandler
@@ -51,11 +59,13 @@ from tests.conftest import (
     phase_study,
     run_log_text,
     stub_run_command,
+    study_name,
     trial_outcome,
     write_constant_trainer,
     write_experiment_config,
     write_param_echo_trainer,
 )
+from tests.recovery_helpers import stale_trial_rerun_config
 
 STAMP = "12:00:00  "
 OOM = "non-zero exit code 1; stderr: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB"
@@ -254,6 +264,134 @@ def test_infeasible_and_interrupted_trials_keep_what_was_recorded(experiment: Ex
         "depth  trial 4  INTERRUPTED  3/4  model.n_layers=8  "
         "reason: orchestrator interrupted by SIGINT"
     )
+
+
+@pytest.mark.parametrize(
+    ("width", "kept", "crashed"),
+    [
+        pytest.param(
+            80,
+            [
+                "12:00:00  depth          trial 3  COMPLETE  eval_loss 0.3  0.5s  3/4",
+                "                         model.n_layers=8  recovered",
+            ],
+            [
+                "12:00:00  depth          trial 0  FAIL  0.5s  1/4  model.n_layers=8  recovered",
+                "                         reason: non-zero exit code 1; stderr: loading the",
+                "                                 dataset failed: shard 3 is truncated",
+            ],
+            id="80",
+        ),
+        pytest.param(
+            60,
+            [
+                "12:00:00  depth          trial 3  COMPLETE  eval_loss 0.3",
+                "                         0.5s  3/4",
+                "                         model.n_layers=8  recovered",
+            ],
+            [
+                "12:00:00  depth          trial 0  FAIL  0.5s  1/4",
+                "                         model.n_layers=8  recovered",
+                "                         reason: non-zero exit code 1;",
+                "                                 stderr: loading the dataset",
+                "                                 failed: shard 3 is",
+                "                                 truncated",
+            ],
+            id="60",
+        ),
+    ],
+)
+def test_a_trial_recovery_settled_is_a_trial_line_marked_recovered(
+    experiment: Experiment, width: int, kept: list[str], crashed: list[str]
+) -> None:
+    """A result recovery kept and a crash it recorded print as trial lines noted ``recovered``."""
+    depth = experiment.phases[0]
+    result = trial_line(
+        experiment,
+        depth,
+        number=3,
+        state="COMPLETE",
+        value=0.3,
+        seconds=0.5,
+        finished=3,
+        params={"model.n_layers": 8},
+        repeat=None,
+        rerun_of=None,
+        reason=None,
+        recovered=True,
+    )
+    crash = trial_line(
+        experiment,
+        depth,
+        number=0,
+        state="FAIL",
+        value=None,
+        seconds=0.5,
+        finished=1,
+        params={"model.n_layers": 8},
+        repeat=None,
+        rerun_of=None,
+        reason="non-zero exit code 1; stderr: loading the dataset failed: shard 3 is truncated",
+        recovered=True,
+    )
+    assert console(result, width) == kept
+    assert console(crash, width) == crashed
+    assert (
+        str(result)
+        == "depth  trial 3  COMPLETE  eval_loss 0.3  0.5s  3/4  model.n_layers=8  recovered"
+    )
+
+
+@pytest.mark.parametrize(
+    ("width", "fresh", "resumed"),
+    [
+        pytest.param(
+            80,
+            ["12:00:00  depth          trial 3  RUNNING  gpu 1  model.n_layers=8"],
+            [
+                "12:00:00  depth          trial 5  RUNNING  gpu 1",
+                "                         model.n_layers=8  resumes trial 3",
+            ],
+            id="80",
+        ),
+        pytest.param(
+            60,
+            [
+                "12:00:00  depth          trial 3  RUNNING  gpu 1",
+                "                         model.n_layers=8",
+            ],
+            [
+                "12:00:00  depth          trial 5  RUNNING  gpu 1",
+                "                         model.n_layers=8  resumes trial 3",
+            ],
+            id="60",
+        ),
+    ],
+)
+def test_a_launching_trial_names_its_gpu_and_the_trial_it_resumes(
+    experiment: Experiment, width: int, fresh: list[str], resumed: list[str]
+) -> None:
+    """A trial's start line names the devices it sees and, for a rerun in place, the trial it resumes."""
+    depth = experiment.phases[0]
+    started = trial_start_line(
+        experiment,
+        depth,
+        number=3,
+        gpu="1",
+        params={"model.n_layers": 8},
+        repeat=None,
+        resumes=None,
+    )
+    resuming = trial_start_line(
+        experiment, depth, number=5, gpu="1", params={"model.n_layers": 8}, repeat=None, resumes=3
+    )
+    assert console(started, width) == fresh
+    assert console(resuming, width) == resumed
+    for unleased in (None, ""):
+        cpu = trial_start_line(
+            experiment, depth, number=0, gpu=unleased, params={}, repeat=("seed", 1), resumes=None
+        )
+        assert str(cpu) == "depth  trial 0  RUNNING  repeat seed=1"
 
 
 def test_rerun_and_skipped_lines(experiment: Experiment) -> None:
@@ -702,9 +840,7 @@ def test_verbose_leaves_the_console_unchanged_and_deepens_run_log(
     assert transcripts["plain"] == transcripts["verbose"]
     assert "trial 1  COMPLETE" in transcripts["plain"]
     # The summary names the winning trial's directory, relative to the working directory or whole.
-    assert re.search(
-        r"(?m)^ +\S*/NAME/runs/t/p/trial_00000__generation_ID__attempt_ID$", transcripts["plain"]
-    )
+    assert re.search(r"(?m)^ +\S*/NAME/runs/t/p/trial_00000__ID$", transcripts["plain"])
     assert not re.search(r"^\S+ \S+ D ", logs["plain"], re.MULTILINE)
     assert re.search(r"^\S+ \S+ D phasesweep\.", logs["verbose"], re.MULTILINE)
 
@@ -715,12 +851,14 @@ def test_a_dry_run_prints_its_lines_on_stderr_alone(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A dry run keeps its message text, prefixed only by the time, and prints nothing on stdout."""
+    monkeypatch.setenv("COLUMNS", "500")
     config = _run_config(tmp_path, "dry")
     assert invoke_cli_boundary(["run", str(config), "--dry-run"], monkeypatch) == 0
     captured = capsys.readouterr()
     assert captured.out == ""
     lines = [re.sub(r"^\d\d:\d\d:\d\d  ", "", line) for line in captured.err.splitlines()]
-    assert "phase=p study=t::p finished=0 remaining=2 reruns=0 n_jobs=1" in lines
+    study = study_name(load_experiment(config))
+    assert f"phase=p study={study} finished=0 remaining=2 reruns=0 n_jobs=1" in lines
     assert "DRY RUN phase=p would launch 2 trials" in lines
     assert lines[-1] == "DRY RUN complete. No trials launched, no summary written."
     assert not any(line.startswith(("phasesweep run", "Finished in", "log:")) for line in lines)
@@ -738,6 +876,7 @@ def test_a_dry_run_prints_every_info_line_of_the_starter(
     capsys.readouterr()
 
     assert invoke_cli_boundary(["run", str(config), "--dry-run"], monkeypatch) == 0
+    starter = load_experiment(config)
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -745,10 +884,9 @@ def test_a_dry_run_prints_every_info_line_of_the_starter(
     # A later line of a record sits under the text, where the first line has the time.
     lines = [re.sub(r"^(\d\d:\d\d:\d\d| {8})  ", "", line) for line in captured.err.splitlines()]
     assert [line.replace(root, "TMP") for line in lines] == [
-        "DRY RUN metric='eval_loss' goal=minimize extractor={'type': 'json_envelope', "
-        "'path': 'result.json', 'objective_name': 'eval_loss', 'split': 'validation', "
-        "'policy': 'synthetic', 'checkpoint': 'toy_formula', 'expected_step': 100, "
-        "'evaluation_axis': 'step'}",
+        "DRY RUN metric='eval_loss' goal=minimize extractor=json_envelope path=result.json "
+        "objective_name=eval_loss split=validation policy=synthetic checkpoint=toy_formula "
+        "expected_step=100 evaluation_axis=step",
         "DRY RUN evaluation_point check: supported (axis 'step' from the envelope; "
         "any other axis from evaluation.progress)",
         "DRY RUN environment: inherit_env=none (digested: PATH, HOME, LANG, LC_ALL, USER, "
@@ -759,7 +897,8 @@ def test_a_dry_run_prints_every_info_line_of_the_starter(
         "DRY RUN grid order: configurations are shuffled by sampler.seed, not listed choice order.",
         "DRY RUN phase 'learning_rate': sampler=grid (resumable, reproducible)",
         "DRY RUN grid order: configurations are shuffled by sampler.seed, not listed choice order.",
-        "phase=depth study=phasesweep_starter::depth finished=0 remaining=2 reruns=0 n_jobs=1",
+        f"phase=depth study={study_name(starter, 'depth')} finished=0 remaining=2 reruns=0 "
+        "n_jobs=1",
         "GPU isolation disabled by gpu_policy='none'.",
         "DRY RUN phase=depth would launch 2 trials",
         "DRY RUN example command:",
@@ -1308,9 +1447,9 @@ def test_a_repeats_run_summary_lists_each_winning_member_under_one_parent(
     assert len(members) == 2
     written = next(i for i, line in enumerate(lines) if line.startswith("Written under"))
     summary_lines = lines[lines.index("  p  4 complete") : written - 1]
-    names = [line for line in summary_lines if "__generation_" in line]
+    names = [line for line in summary_lines if re.match(r"\s+trial_\d{5}__", line)]
     assert [int(name.strip().split("__")[0].removeprefix("trial_")) for name in names] == members
-    assert all(re.fullmatch(r"\s+trial_\d{5}__generation_\w{32}__attempt_\w{32}", n) for n in names)
+    assert all(re.fullmatch(r"\s+trial_\d{5}__\w{32}", n) for n in names)
     parent = str(_phase_dir(experiment, "p")) + "/"
     assert summary_lines.count(f"     {parent}") == 1
     assert not any(parent + "trial_" in line for line in summary_lines)
@@ -1380,6 +1519,7 @@ def test_a_resumed_run_counts_the_trials_a_previous_run_recorded(
         n_trials=2,
         gpu_policy="none",
         sampler=Sampler(type="random", seed=0),
+        execution=ExecutionContext(cwd=str(tmp_path)),
     )
     config = write_experiment_config(tmp_path / "grown.yaml", experiment)
     assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 0
@@ -1394,7 +1534,8 @@ def test_a_resumed_run_counts_the_trials_a_previous_run_recorded(
     assert re.search(r"Finished in \d+\.\ds: 1 phase, 4 trials, 2 from a previous run", err)
     assert f"Next: phasesweep status {config} --set 'phases[p].n_trials=4' --trials" in err
     # The constant trainer ties every trial, so the winner's flagged line gives the command
-    # that prints the tie's numbers, with the overrides the run was typed with.
+    # that prints the tie's numbers, with the overrides the run was typed with. The trainer's
+    # directory is no git work tree, so neither generation records a revision to compare.
     assert "flagged: tie\n" in err
     assert f"details: phasesweep show-winners {config} --set 'phases[p].n_trials=4'\n" in err
 
@@ -1418,8 +1559,96 @@ def test_phase_counts_keep_an_interrupted_trial_out_of_the_counted_and_earlier_t
         )
     )
 
-    counts = _phase_counts(validate_ledger(experiment), experiment.phases[0], "this-run", winner)
+    counts = _phase_counts(
+        validate_ledger(experiment),
+        experiment,
+        experiment.phases[0],
+        study_name(experiment),
+        "this-run",
+        winner,
+    )
 
     assert counts is not None
     assert (counts.complete, counts.interrupted) == (2, 1)
     assert (counts.counted, counts.earlier) == (2, 2)
+
+
+def test_phase_counts_name_no_interrupted_trial_that_a_rerun_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted trial its rerun completed is no pending work, so the summary counts none."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=write_constant_trainer(tmp_path), n_trials=2, gpu_policy="none"
+    )
+    winner = run_experiment(experiment)["p"]
+    study = phase_study(experiment)
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=optuna.trial.TrialState.FAIL,
+            user_attrs={
+                TRIAL_OUTCOME_ATTR: trial_outcome(9, "interrupted", cause="interrupted by SIGINT")
+            },
+        )
+    )
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=optuna.trial.TrialState.COMPLETE,
+            value=0.5,
+            user_attrs={RERUN_OF_ATTR: 2, TRIAL_OUTCOME_ATTR: trial_outcome(10, "success")},
+        )
+    )
+
+    counts = _phase_counts(
+        validate_ledger(experiment),
+        experiment,
+        experiment.phases[0],
+        study_name(experiment),
+        "this-run",
+        winner,
+    )
+
+    assert counts is not None
+    assert (counts.complete, counts.interrupted) == (3, 0)
+
+
+def test_the_summary_says_how_many_results_reran_an_interrupted_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A phase whose winner reran an interrupted trial says so under the winner's flagged line, as a fact without a remedy; each zero or false clause is left out."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("COLUMNS", "500")
+    _experiment, config = stale_trial_rerun_config(tmp_path)
+
+    assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 0
+
+    lines = capsys.readouterr().err.splitlines()
+    details = next(i for i, line in enumerate(lines) if line.lstrip().startswith("details: "))
+    assert lines[details + 1] == (
+        "             interrupted: 1 of 2 results came from a rerun, the winner among them"
+    )
+    assert sum("interrupted:" in line for line in lines) == 1
+    assert interrupted_clause(InterruptedReruns(results=13, reruns=2, earlier_attempt=1)) == (
+        "2 of 13 results came from a rerun; 1 scored from an earlier attempt's result"
+    )
+
+
+def test_a_phase_no_interruption_touched_prints_no_interrupted_line_and_counts_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without a rerun, ``run``, ``status --trials`` and ``show-winners`` print no interrupted line, and the status and result reads MCP serves count zero."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=write_constant_trainer(tmp_path), n_trials=2, gpu_policy="none"
+    )
+    config = write_experiment_config(tmp_path / "plain.yaml", experiment)
+
+    for command in (["run"], ["status", "--trials"], ["show-winners"]):
+        assert invoke_cli_boundary([command[0], str(config), *command[1:]], monkeypatch) == 0
+
+    captured = capsys.readouterr()
+    assert "interrupted:" not in captured.out + captured.err
+    status, (winner,) = read_result(experiment)
+    (phase,) = status["phases"]
+    assert (phase["interrupted_reruns"], phase["interrupted_reruns_earlier_attempt"]) == (0, 0)
+    assert winner.reruns == InterruptedReruns(results=2)
