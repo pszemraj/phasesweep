@@ -1249,8 +1249,8 @@ def _summary_matches_history(run: object, summary: Mapping[str, object]) -> bool
 
     W&B can serve an empty summary before either the summary or the index is visible.
     A populated summary can also arrive before or after its matching history index.
-    A positive row count guarantees there is a history step to wait for, even when both
-    the summary step and the index are still absent.
+    Each row occupies a distinct nonnegative W&B step. Even a matching summary and
+    index can trail the row count. Sparse steps can put the index ahead of that count.
 
     :param object run: Public-API run.
     :param Mapping[str, object] summary: Its decoded summary.
@@ -1258,7 +1258,8 @@ def _summary_matches_history(run: object, summary: Mapping[str, object]) -> bool
         A summary written directly can have values without a history step.
     """
     last_step = _last_history_step(run)
-    if last_step is None and _row_count(run):
+    rows = _row_count(run)
+    if rows and (last_step is None or rows > last_step + 1):
         return False
     return bool(summary) and finite_nonnegative(summary.get("_step")) == last_step
 

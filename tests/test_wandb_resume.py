@@ -320,6 +320,31 @@ def test_a_closed_earlier_runs_unserved_aggregate_remains_pending_until_recovery
     assert recovered["values"] == {key: 0.05}
 
 
+def test_matching_summary_and_index_must_account_for_the_counted_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A closed opener may still serve just its first row. Its final W&B steps can be sparse."""
+    from phasesweep.evidence.wandb import WandbPollTimeout
+
+    key = "eval/loss.min"
+    first, second = _rows(0.8, 0.1, axis=(1, 2))
+    second["_step"] = 10
+    opener = _run("killed", {"_step": 0, key: 0.8}, (first,))
+    opener.historyLineCount = 2
+    runs = {
+        "opener": opener,
+        "rerun": _run("finished", {"_step": 0, key: 0.9}, _rows(0.9, axis=(8,))),
+    }
+    _serve(monkeypatch, runs)
+    with pytest.raises(WandbPollTimeout) as caught:
+        _poll("opener", required=(key,), objective_key=key, evaluation_axis="eval/step")
+    assert not caught.value.reached
+
+    runs["opener"] = _run("killed", {"_step": 10, key: 0.1}, (first, second))
+    capture = _poll("opener", required=(key,), objective_key=key, evaluation_axis="eval/step")
+    assert capture["values"] == {key: 0.1}
+
+
 @pytest.mark.parametrize("summary_only", ["rerun", "second"])
 def test_a_summary_only_run_without_the_objective_does_not_inherit_it(
     monkeypatch: pytest.MonkeyPatch, summary_only: str
