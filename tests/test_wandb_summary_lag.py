@@ -401,6 +401,57 @@ def test_a_reruns_verdict_stands_when_no_lookup_completes_near_the_deadline(
     assert paths == ["e/p/rerun", "e/p/opener"]
 
 
+@pytest.mark.parametrize("changed", ["rerun", "opener", "unchanged"])
+def test_a_partial_deadline_poll_can_invalidate_a_borrowed_constraint(
+    monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    """A reply that changes a borrowed constraint invalidates the verdict even if the next lookup cannot start."""
+    from phasesweep.evidence.wandb import WandbPollTimeout
+
+    public = pytest.importorskip("wandb.apis.public")
+    runs = {
+        "opener": wandb_run(
+            "killed",
+            {"_step": 0, _KEY: 0.2, "cost": 2},
+            ({"_step": 0, "eval/loss": 0.2, "epoch": 1},),
+        ),
+        "second": wandb_run("killed", {}),
+        "rerun": wandb_run(
+            "finished", {"_step": 0, _KEY: 0.1}, ({"_step": 0, "eval/loss": 0.1, "epoch": 8},)
+        ),
+    }
+    clock, paths = serve_wandb_runs(monkeypatch, runs)
+    lookup = public.Api.run
+    delayed_id = "rerun" if changed == "unchanged" else changed
+
+    def reply_at_deadline(api: object, path: str) -> object:
+        run = lookup(api, path)
+        if clock.now == 5 and path.endswith("/" + delayed_id):
+            if changed != "unchanged":
+                run.summary_metrics["cost"] = 8
+            clock.now = 240
+        return run
+
+    monkeypatch.setattr(public.Api, "run", reply_at_deadline)
+
+    def poll() -> dict[str, object]:
+        return _poll_rerun("opener", "second", required=(_KEY, "cost"), evaluation_axis="epoch")
+
+    if changed == "unchanged":
+        assert poll()["values"] == {_KEY: 0.1, "cost": 2}
+    else:
+        with pytest.raises(WandbPollTimeout) as caught:
+            poll()
+        assert not caught.value.reached
+        assert "evidence changed" in str(caught.value.last_error)
+    assert paths == ["e/p/rerun", "e/p/opener", "e/p/second", "e/p/rerun"] + (
+        ["e/p/opener"] if changed == "opener" else []
+    )
+    assert clock.now == 240
+    if changed != "unchanged":
+        assert poll()["values"] == {_KEY: 0.1, "cost": 8}
+
+
 def test_a_waiting_verdict_reads_the_earlier_histories_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

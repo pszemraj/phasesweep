@@ -1011,22 +1011,21 @@ def _lookup(clients: dict[str, _Api], address: WandbRunAddress, deadline: float)
         raise _NoAnswer(_error_detail(exc)) from exc
 
 
-def _answer_key(runs: Sequence[_Run]) -> str:
-    """Fingerprint what lookups answered about runs, to reuse a scoring of the same answers.
+def _answer_key(run: _Run | None) -> str | None:
+    """Snapshot one lookup so later polls can tell whether its evidence changed.
 
-    :param Sequence[_Run] runs: Runs in a scoring.
-    :return str: Their states, row counts, indexed steps and summaries, as JSON.
+    :param _Run | None run: The run returned by the lookup, or None for a missing run.
+    :return str | None: The run's state, row counts, indexed step and summary, or None.
     """
+    if run is None:
+        return None
     return json.dumps(
         [
-            [
-                run.state,
-                _row_count(run),
-                _last_history_step(run),
-                _indexed_row_count(run),
-                dict(run.summary_metrics),
-            ]
-            for run in runs
+            run.state,
+            _row_count(run),
+            _last_history_step(run),
+            _indexed_row_count(run),
+            dict(run.summary_metrics),
         ],
         sort_keys=True,
         default=str,
@@ -1078,8 +1077,8 @@ def _poll_wandb_summary(
     4. A rerun's finished run whose summary matches its history but lacks the objective at the
        deadline ran without reporting it, so no earlier run scores it.
 
-    Rules 3 and 4 and a key taken from an earlier run are verdicts the latest answered poll
-    decides at the deadline. Such a capture carries ``deadline_verdict``. A closed run whose
+    Rules 3 and 4 and a key taken from an earlier run are decided by the last complete poll,
+    provided no later lookup changed its evidence. The capture carries ``deadline_verdict``. A closed run whose
     summary or history is unsettled leaves the read pending. An earlier run that is not
     closed is read as W&B holds it, since a session killed outright stays ``crashed`` and
     never uploads its remaining rows. A rerun whose own summary holds every required key
@@ -1133,7 +1132,8 @@ def _poll_wandb_summary(
     # The latest settled scoring and the answers it read, so unchanged runs waited on to the
     # deadline are not read through their histories again on every poll. An unsettled one
     # is read again, since history W&B serves late changes no answer the key sees.
-    cache: list[tuple[str, _Scored]] = []
+    cache: tuple[list[str | None], _Scored] | None = None
+    previous_answers: list[str | None] = []
 
     # Once every counted row of a closed run is served, its coverage stays valid while its
     # count and indexed step are unchanged. Summary values are still read afresh.
@@ -1162,10 +1162,9 @@ def _poll_wandb_summary(
         return True
 
     def score(scoring: _Run, older: Sequence[tuple[WandbRunAddress, _Run]]) -> _Scored:
-        prior = [run for _, run in older]
-        key = _answer_key((*prior, scoring))
-        if cache and cache[0][0] == key:
-            return cache[0][1]
+        nonlocal cache
+        if cache is not None and answers == cache[0]:
+            return cache[1]
         for address, run in older:
             if (
                 run.state in _CLOSED_STATES
@@ -1177,13 +1176,13 @@ def _poll_wandb_summary(
                 )
         scored = _score(
             scoring,
-            prior,
+            [run for _, run in older],
             required=required,
             presence=presence,
             axis=evaluation_axis,
             deadline=deadline,
         )
-        cache[:] = [(key, scored)]
+        cache = answers, scored
         return scored
 
     def capture(scored: _Scored) -> dict[str, object]:
@@ -1193,16 +1192,19 @@ def _poll_wandb_summary(
             "retrieved_at": utc_now_iso(timespec="microseconds"),
         }
 
-    def earlier_runs(clients: dict[str, _Api]) -> list[tuple[WandbRunAddress, _Run]]:
-        found = ((address, _lookup(clients, address, deadline)) for address in earlier)
+    def lookup(address: WandbRunAddress) -> _Run | None:
+        run = _lookup(clients, address, deadline)
+        answers.append(_answer_key(run))
+        return run
+
+    def earlier_runs() -> list[tuple[WandbRunAddress, _Run]]:
+        found = ((address, lookup(address)) for address in earlier)
         return [(address, prior) for address, prior in found if prior is not None]
 
-    def judge_earlier(
-        clients: dict[str, _Api], subject: str
-    ) -> tuple[dict[str, object] | str | None, list[str], list[str]]:
+    def judge_earlier(subject: str) -> tuple[dict[str, object] | str | None, list[str], list[str]]:
         runs = [
             (address, run)
-            for address, run in earlier_runs(clients)
+            for address, run in earlier_runs()
             if not (run.state in _CLOSED_STATES and _logged_nothing(run))
         ]
         if not runs:
@@ -1236,25 +1238,25 @@ def _poll_wandb_summary(
 
     while time.monotonic() < deadline:
         clients: dict[str, _Api] = {}
+        # Lookup order is fixed: own run first, then earlier attempts oldest first.
+        answers: list[str | None] = []
         poll_error: Exception | None = None
         poll_verdict: dict[str, object] | str | None = None
         poll_missing: list[str] = []
         poll_available: list[str] = []
         try:
-            run = _lookup(clients, own, deadline)
+            run = lookup(own)
             if run is None:
                 poll_error = WandbRunMissingError(run_id)
                 if earlier:
-                    poll_verdict, poll_missing, poll_available = judge_earlier(
-                        clients, "was not found"
-                    )
+                    poll_verdict, poll_missing, poll_available = judge_earlier("was not found")
             else:
                 summary = run.summary_metrics
                 finished = run.state == "finished"
                 unreported = objective_key is not None and objective_key not in summary
                 if earlier and finished and unreported and _logged_nothing(run):
                     poll_verdict, poll_missing, poll_available = judge_earlier(
-                        clients, "finished without logging any rows or user summary keys"
+                        "finished without logging any rows or user summary keys"
                     )
                 elif finished and not summary_matches_history(run_id, run):
                     raise _NoAnswer(
@@ -1275,7 +1277,7 @@ def _poll_wandb_summary(
                     needs_earlier = any(
                         key not in summary or key.endswith((".min", ".max")) for key in required
                     ) or any(key not in summary for key in presence)
-                    older = earlier_runs(clients) if needs_earlier else []
+                    older = earlier_runs() if needs_earlier else []
                     scored = score(run, older)
                     if scored.missing:
                         poll_missing, poll_available = scored.missing, sorted(summary)
@@ -1284,7 +1286,12 @@ def _poll_wandb_summary(
                     else:
                         poll_verdict = {**capture(scored), "deadline_verdict": True}
         except _PastDeadline:
-            # The latest answered poll still decides.
+            # The last complete poll can decide only while every new answer agrees with it.
+            if reached and answers != previous_answers[: len(answers)]:
+                reached, verdict, missing = False, None, []
+                last_error = RuntimeError(
+                    "W&B evidence changed before the remaining runs could be read."
+                )
             break
         except (WandbSetupError, WandbRunTerminalError):
             raise
@@ -1300,6 +1307,7 @@ def _poll_wandb_summary(
             # reserve before the supervisor's deadline exists to report it.
             reached, last_error, verdict = True, poll_error, poll_verdict
             missing, available = poll_missing, poll_available
+            previous_answers = answers
         time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
     waited = time.monotonic() - started
     if isinstance(verdict, dict):
