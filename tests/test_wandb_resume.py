@@ -232,7 +232,11 @@ def _late_runs(
     """
     served: list[dict[str, int | float]] = []
     opener = _run("killed", opener_summary, served, on_read)
-    opener.history_keys = {"lastStep": 2, "keys": {"_step": {}}}
+    opener.historyLineCount = 3
+    opener.history_keys = {
+        "lastStep": 2,
+        "keys": {"_step": {"typeCounts": [{"type": "number", "count": 3}]}},
+    }
     rerun = _run(
         "finished", {"_step": 2, "eval/loss.min": 0.1}, _rows(0.2, 0.1, 0.15, axis=(25, 30, 40))
     )
@@ -320,27 +324,43 @@ def test_a_closed_earlier_runs_unserved_aggregate_remains_pending_until_recovery
     assert recovered["values"] == {key: 0.05}
 
 
+@pytest.mark.parametrize("first_step", [0, 1, 100])
+@pytest.mark.parametrize("empty_retry", [False, True])
+@pytest.mark.parametrize("indexed_count", [False, True])
 def test_matching_summary_and_index_must_account_for_the_counted_rows(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, first_step: int, empty_retry: bool, indexed_count: bool
 ) -> None:
-    """A closed opener may still serve just its first row. Its final W&B steps can be sparse."""
+    """A stale sparse prefix cannot score a measured or empty retry, even as history catches up."""
     from phasesweep.evidence.wandb import WandbPollTimeout
 
     key = "eval/loss.min"
     first, second = _rows(0.8, 0.1, axis=(1, 2))
-    second["_step"] = 10
-    opener = _run("killed", {"_step": 0, key: 0.8}, (first,))
+    first["_step"], second["_step"] = first_step, first_step + 100
+    opener = _run("killed", {"_step": first_step, key: 0.8}, (first,))
     opener.historyLineCount = 2
+    if not indexed_count:
+        opener.history_keys["keys"]["_step"].clear()
     runs = {
         "opener": opener,
-        "rerun": _run("finished", {"_step": 0, key: 0.9}, _rows(0.9, axis=(8,))),
+        "rerun": _run("finished", {})
+        if empty_retry
+        else _run("finished", {"_step": 0, key: 0.9}, _rows(0.9, axis=(8,))),
     }
     _serve(monkeypatch, runs)
     with pytest.raises(WandbPollTimeout) as caught:
         _poll("opener", required=(key,), objective_key=key, evaluation_axis="eval/step")
     assert not caught.value.reached
 
-    runs["opener"] = _run("killed", {"_step": 10, key: 0.1}, (first, second))
+    # The scan can advance before the summary and index in the run lookup.
+    complete = _run("killed", {"_step": second["_step"], key: 0.1}, (first, second))
+    if not indexed_count:
+        complete.history_keys["keys"]["_step"].clear()
+    opener.scan_history = complete.scan_history
+    with pytest.raises(WandbPollTimeout) as caught:
+        _poll("opener", required=(key,), objective_key=key, evaluation_axis="eval/step")
+    assert not caught.value.reached
+
+    runs["opener"] = complete
     capture = _poll("opener", required=(key,), objective_key=key, evaluation_axis="eval/step")
     assert capture["values"] == {key: 0.1}
 

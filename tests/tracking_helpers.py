@@ -537,7 +537,12 @@ def wandb_run(
     return SimpleNamespace(
         state=state,
         summary_metrics=summary,
-        history_keys=None if last is None else {"lastStep": last, "keys": {"_step": {}}},
+        history_keys=None
+        if last is None
+        else {
+            "lastStep": last,
+            "keys": {"_step": {"typeCounts": [{"type": "number", "count": len(rows)}]}},
+        },
         historyLineCount=len(rows),
         history=read,
         scan_history=read,

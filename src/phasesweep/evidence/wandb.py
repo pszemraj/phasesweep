@@ -850,41 +850,45 @@ def _merged_extrema(
                 # If every counted row measured the series, the keyed scan is already complete.
                 unconfirmed[key] = values[key]
     if unconfirmed:
-        _confirm_summary_only(runs[-1], unconfirmed, deadline=deadline)
+        _confirm_history(runs[-1], deadline=deadline, summary_only=unconfirmed)
     return reduced
 
 
-def _confirm_summary_only(run: _Run, values: Mapping[str, float], *, deadline: float) -> None:
-    """Confirm that complete history distinguishes a direct summary scalar from a late native extremum.
+def _confirm_history(
+    run: _Run, *, deadline: float, summary_only: Mapping[str, float] | None = None
+) -> None:
+    """Check the count and final step of the served rows against the run lookup.
 
-    A keyed scan omits rows that logged other metrics. Only this ambiguous case needs an
-    unfiltered scan. Count the rows and reduce their values from that same read, since history
-    can catch up between requests.
+    Only the step column is needed to confirm coverage. When distinguishing direct summary
+    values from native extrema, reduce the values in the same scan that proves it complete.
 
-    :param _Run run: The scoring run.
-    :param Mapping[str, float] values: Summary extrema its keyed reads did not reproduce.
+    :param _Run run: Closed run whose summary and history index were fetched together.
     :param float deadline: Monotonic deadline for history queries.
-    :raises _NoAnswer: The history is incomplete or the keyed read missed a native extremum.
-    :raises TimeoutError: History could not be read before the deadline.
+    :param Mapping[str, float] | None summary_only: Summary extrema the keyed reads did not reproduce.
+    :raises _NoAnswer: The scan is incomplete or the keyed read missed a native extremum.
+    :raises TimeoutError: The history read exceeded the deadline.
     """
+    indexed = _last_history_step(run)
     expected: int | float | None = _row_count(run)
     if expected is None:
-        last_step = _last_history_step(run)
-        if last_step is None:
-            raise _NoAnswer(
-                "W&B has not reported the scoring run's history row count or last step."
-            )
+        if indexed is None:
+            raise _NoAnswer("W&B has not reported the run's history row count or last step.")
         # Without a count, only a row at every possible step proves the scan is complete.
-        expected = last_step + 1
+        expected = indexed + 1
+    values = summary_only or {}
     operations = {key: key.rsplit(".", 1) for key in values}
     extrema: dict[str, float] = {}
     served = 0
+    last_step = None
     if time.monotonic() >= deadline:
         raise TimeoutError("W&B history read expired.")
-    for row in run.scan_history(keys=[], page_size=_HISTORY_SAMPLES, use_cache=False):
+    for row in run.scan_history(
+        keys=[] if values else ["_step"], page_size=_HISTORY_SAMPLES, use_cache=False
+    ):
         if time.monotonic() >= deadline:
             raise TimeoutError("W&B history read expired.")
         served += 1
+        last_step = row.get("_step")
         for key, (series, operation) in operations.items():
             metric = _finite_metric(row, series)
             if metric is not None:
@@ -892,9 +896,10 @@ def _confirm_summary_only(run: _Run, values: Mapping[str, float], *, deadline: f
                 extrema[key] = reduce(extrema.get(key, metric), metric)
     if time.monotonic() >= deadline:
         raise TimeoutError("W&B history read expired.")
-    if served != expected:
+    if served != expected or last_step != indexed:
         raise _NoAnswer(
-            f"W&B serves {served} history rows for the scoring run; {expected} are needed to confirm the summary value."
+            f"W&B serves {served} history rows through step {last_step!r}; "
+            f"the run lookup requires {expected} rows through step {indexed!r}."
         )
     for key, extremum in extrema.items():
         if _matches_extremum(extremum, values[key]):
@@ -934,13 +939,6 @@ def _score(
     """
     from phasesweep.evidence.evaluation import json_float
 
-    for run in older:
-        if (
-            run.state in _CLOSED_STATES
-            and not _logged_nothing(run)
-            and not _summary_matches_history(run, run.summary_metrics)
-        ):
-            raise _NoAnswer("A closed earlier run's summary does not yet match its history index.")
     runs = (*older, scoring)
     values: dict[str, float] = {}
     sources: dict[str, int] = {}
@@ -1021,7 +1019,13 @@ def _answer_key(runs: Sequence[_Run]) -> str:
     """
     return json.dumps(
         [
-            [run.state, _row_count(run), _last_history_step(run), dict(run.summary_metrics)]
+            [
+                run.state,
+                _row_count(run),
+                _last_history_step(run),
+                _indexed_row_count(run),
+                dict(run.summary_metrics),
+            ]
             for run in runs
         ],
         sort_keys=True,
@@ -1050,7 +1054,7 @@ def _poll_wandb_summary(
     API can report a run ``finished`` before it serves the history index or the summary, and
     the summary may take minutes to arrive, so nothing short of the deadline establishes that
     a finished summary lacks a key. A summary counts only once it is as far as the history the
-    same answer reports (:func:`_summary_matches_history`), so a half-ingested one is never
+    same answer reports, including the number of rows served, so a half-ingested one is never
     captured.
 
     Every attempt logs to a run of its own. A rerun continues its trial's earlier attempts
@@ -1131,13 +1135,49 @@ def _poll_wandb_summary(
     # is read again, since history W&B serves late changes no answer the key sees.
     cache: list[tuple[str, _Scored]] = []
 
-    def score(scoring: _Run, older: Sequence[_Run]) -> _Scored:
-        key = _answer_key((*older, scoring))
+    # Once every counted row of a closed run is served, its coverage stays valid while its
+    # count and indexed step are unchanged. Summary values are still read afresh.
+    verified: dict[str, tuple[int, int | float]] = {}
+
+    def summary_matches_history(run_id: str, run: _Run) -> bool:
+        summary = run.summary_metrics
+        indexed = _last_history_step(run)
+        if not summary or finite_nonnegative(summary.get("_step")) != indexed:
+            return False
+        count = _row_count(run)
+        if count is None:
+            return True
+        if count == 0:
+            return indexed is None
+        if indexed is None or count > indexed + 1:
+            return False
+        indexed_count = _indexed_row_count(run)
+        if indexed_count is not None:
+            return indexed_count == count
+        # A single indexed row accounts for a count of one. With two or more, gaps in
+        # explicit W&B steps can let even a matching summary and index hide a missing row.
+        if count > 1 and verified.get(run_id) != (count, indexed):
+            _confirm_history(run, deadline=deadline)
+            verified[run_id] = (count, indexed)
+        return True
+
+    def score(scoring: _Run, older: Sequence[tuple[WandbRunAddress, _Run]]) -> _Scored:
+        prior = [run for _, run in older]
+        key = _answer_key((*prior, scoring))
         if cache and cache[0][0] == key:
             return cache[0][1]
+        for address, run in older:
+            if (
+                run.state in _CLOSED_STATES
+                and not _logged_nothing(run)
+                and not summary_matches_history(address["run_id"], run)
+            ):
+                raise _NoAnswer(
+                    "A closed earlier run's summary does not yet match its history index."
+                )
         scored = _score(
             scoring,
-            older,
+            prior,
             required=required,
             presence=presence,
             axis=evaluation_axis,
@@ -1177,7 +1217,7 @@ def _poll_wandb_summary(
                 [],
                 [],
             )
-        if not _summary_matches_history(newest, summary):
+        if not summary_matches_history(address["run_id"], newest):
             raise _NoAnswer(
                 f"The closed earlier run {name}'s summary does not yet match its history index."
             )
@@ -1188,7 +1228,7 @@ def _poll_wandb_summary(
                 [],
                 [],
             )
-        scored = score(newest, [prior for _, prior in runs[:-1]])
+        scored = score(newest, runs[:-1])
         if scored.missing:
             return None, scored.missing, sorted(summary)
         found = {**capture(scored), "deadline_verdict": True, "earlier_attempt": address["run_id"]}
@@ -1216,7 +1256,7 @@ def _poll_wandb_summary(
                     poll_verdict, poll_missing, poll_available = judge_earlier(
                         clients, "finished without logging any rows or user summary keys"
                     )
-                elif finished and not _summary_matches_history(run, summary):
+                elif finished and not summary_matches_history(run_id, run):
                     raise _NoAnswer(
                         "The finished run's summary is still empty."
                         if not summary
@@ -1235,7 +1275,7 @@ def _poll_wandb_summary(
                     needs_earlier = any(
                         key not in summary or key.endswith((".min", ".max")) for key in required
                     ) or any(key not in summary for key in presence)
-                    older = [prior for _, prior in earlier_runs(clients)] if needs_earlier else []
+                    older = earlier_runs(clients) if needs_earlier else []
                     scored = score(run, older)
                     if scored.missing:
                         poll_missing, poll_available = scored.missing, sorted(summary)
@@ -1293,24 +1333,16 @@ def _last_history_step(run: object) -> int | float | None:
     return finite_nonnegative(index.get("lastStep"))
 
 
-def _summary_matches_history(run: object, summary: Mapping[str, object]) -> bool:
-    """Say whether a finished run's summary and history index are both fully served.
+def _indexed_row_count(run: object) -> int | None:
+    """Read the index's count of numeric W&B steps, one per indexed row.
 
-    W&B can serve an empty summary before either the summary or the index is visible.
-    A populated summary can also arrive before or after its matching history index.
-    Each row occupies a distinct nonnegative W&B step. Even a matching summary and
-    index can trail the row count. Sparse steps can put the index ahead of that count.
-
-    :param object run: Public-API run.
-    :param Mapping[str, object] summary: Its decoded summary.
-    :return bool: Whether the summary is populated and its step matches the index.
-        A summary written directly can have values without a history step.
+    :param object run: Public-API run fetched with its history index.
+    :return int | None: Indexed rows when the index includes a count for the step column.
     """
-    last_step = _last_history_step(run)
-    rows = _row_count(run)
-    if rows and (last_step is None or rows > last_step + 1):
-        return False
-    return bool(summary) and finite_nonnegative(summary.get("_step")) == last_step
+    match getattr(run, "history_keys", None):
+        case {"keys": {"_step": {"typeCounts": [{"type": "number", "count": count}]}}}:
+            return count if type(count) is int and count >= 0 else None
+    return None
 
 
 def _row_count(run: object) -> int | None:
